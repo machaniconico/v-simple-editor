@@ -643,7 +643,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "export-meta", "VEDITOR_EXPORT_META_SELFTEST", runExportMetaSelftest, true,
       "Container metadata GUI wiring, encoding, defaults and presets (6 gates)" },
     { "export-presets", "VEDITOR_EXPORT_PRESETS_SELFTEST", runExportPresetsSelftest, true,
-      "Export user preset persistence and name resolution (5 gates)" },
+      "Export user preset persistence, name resolution and dialog restore (9 gates)" },
     { "export-pro",        "VEDITOR_EXPORT_PRO_SELFTEST",         runExportProSelftest,         false,
       "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,

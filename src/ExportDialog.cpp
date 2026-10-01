@@ -471,12 +471,12 @@ void ExportDialog::setupUI()
     connect(m_audioOnlyCheckbox, &QCheckBox::toggled, this, [this]() {
         updateAudioOnlyControls();
         const QFileInfo output(m_outputEdit->text());
-        if (!m_outputEdit->text().isEmpty())
+        if (!m_outputEdit->text().isEmpty() && m_exportTypeCombo->currentData().toInt() != static_cast<int>(ExportType::ImageSequence))
             m_outputEdit->setText(output.dir().filePath(output.completeBaseName() + "." + defaultExtension()));
     });
     connect(m_audioContainerCombo, &QComboBox::currentIndexChanged, this, [this]() {
         const QFileInfo output(m_outputEdit->text());
-        if (!m_outputEdit->text().isEmpty())
+        if (!m_outputEdit->text().isEmpty() && m_exportTypeCombo->currentData().toInt() != static_cast<int>(ExportType::ImageSequence))
             m_outputEdit->setText(output.dir().filePath(output.completeBaseName() + "." + defaultExtension()));
         updateSummary();
     });
@@ -741,6 +741,33 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
     updateMarkedRangeCheckboxEnabled();
     updateAudioOnlyControls(true);
+
+    // The output field is a file for video and a folder for sequences; convert on the transition itself.
+    const QString current = m_outputEdit->text();
+    if (type == ExportType::ImageSequence && m_lastExportType == ExportType::Video) {
+        m_videoOutputBeforeSequence = current;
+        if (!m_sequenceOutputBeforeVideo.isEmpty()) {
+            m_outputEdit->setText(m_sequenceOutputBeforeVideo);
+        } else if (!current.isEmpty()) {
+            // An existing directory is a folder even when its name has a dot (frames.v2).
+            const QFileInfo info(current);
+            if (!info.isDir() && (!info.suffix().isEmpty() || info.isFile()))
+                m_outputEdit->setText(info.absolutePath());
+        }
+    } else if (type == ExportType::Video && m_lastExportType == ExportType::ImageSequence) {
+        m_sequenceOutputBeforeVideo = current;
+        if (QFileInfo(m_videoOutputBeforeSequence).isDir()) {
+            // The video field held an existing directory; a video target must be a file inside it.
+            m_outputEdit->setText(QDir(m_videoOutputBeforeSequence).filePath(QStringLiteral("export.") + defaultExtension()));
+        } else if (!m_videoOutputBeforeSequence.isEmpty()) {
+            m_outputEdit->setText(m_videoOutputBeforeSequence);
+        } else {
+            QDir base(current.isEmpty() ? QDir::homePath() : current);
+            while (!base.exists() && base.cdUp()) {}
+            m_outputEdit->setText(base.filePath(QStringLiteral("export.") + defaultExtension()));
+        }
+    }
+    m_lastExportType = type;
 }
 
 void ExportDialog::onBrowseOutput()
@@ -888,7 +915,26 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
     m_subtitleModeCombo->setCurrentIndex(static_cast<int>(config.subtitleMode));
     m_keepAlphaCheckbox->setChecked(config.keepAlpha);
     m_markedRangeCheckbox->setChecked(config.exportMarkedRangeOnly);
-    m_outputEdit->setText(output);
+    // Restore the saved output type. Changing it rewrites controls, so the output field is set after.
+    // Type changes go through onExportTypeChanged, which converts the output between file and folder.
+    const bool wantSequence = config.imageSequence;
+    const auto currentType = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt());
+    const int targetIndex = m_exportTypeCombo->findData(static_cast<int>(
+        wantSequence ? ExportType::ImageSequence : ExportType::Video));
+    QString restoredOutput = output;
+    if (wantSequence || currentType == ExportType::ImageSequence) {
+        if (targetIndex >= 0 && targetIndex != m_exportTypeCombo->currentIndex())
+            m_exportTypeCombo->setCurrentIndex(targetIndex);
+        restoredOutput = m_outputEdit->text();
+    }
+    if (wantSequence) {
+        ensureSequenceSettings();
+        m_sequencePattern->setText(config.sequencePattern);
+        m_sequenceDigits->setValue(config.sequenceDigits);
+        m_sequenceStart->setValue(config.sequenceStart);
+        if (!config.sequenceFolder.isEmpty()) restoredOutput = config.sequenceFolder;
+    }
+    m_outputEdit->setText(restoredOutput);
     updateAudioOnlyControls();
     updateMarkedRangeCheckboxEnabled();
     updateSummary();

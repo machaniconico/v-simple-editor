@@ -138,6 +138,9 @@ private:
     QLineEdit *m_sequencePattern = nullptr;
     QSpinBox *m_sequenceDigits = nullptr;
     QSpinBox *m_sequenceStart = nullptr;
+    QString m_videoOutputBeforeSequence; // video file path, restored when leaving sequence mode
+    QString m_sequenceOutputBeforeVideo; // sequence folder, restored when re-entering sequence mode
+    ExportType m_lastExportType = ExportType::Video;
     QCheckBox *m_keepAlphaCheckbox = nullptr;
     QCheckBox *m_audioOnlyCheckbox = nullptr;
     QCheckBox *m_autoLoudness = nullptr;

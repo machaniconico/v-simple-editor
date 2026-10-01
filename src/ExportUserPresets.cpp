@@ -59,6 +59,15 @@ QJsonObject toJson(const ExportConfig &c)
     hdr.insert("maxFall", c.hdrSettings.maxFall);
     hdr.insert("previewToneMap", c.hdrSettings.previewToneMap);
     j.insert("hdrSettings", hdr);
+    const ExportConfig defaults;
+    if (c.subtitleMode != defaults.subtitleMode) j.insert("subtitleMode", static_cast<int>(c.subtitleMode));
+    if (c.imageSequence) j.insert("imageSequence", true);
+    if (!c.sequenceFolder.isEmpty()) j.insert("sequenceFolder", c.sequenceFolder);
+    if (c.sequencePattern != defaults.sequencePattern) j.insert("sequencePattern", c.sequencePattern);
+    if (c.sequenceDigits != defaults.sequenceDigits) j.insert("sequenceDigits", c.sequenceDigits);
+    if (c.sequenceStart != defaults.sequenceStart) j.insert("sequenceStart", c.sequenceStart);
+    if (c.autoLoudness) j.insert("autoLoudness", true);
+    if (c.targetLufs != defaults.targetLufs) j.insert("targetLufs", c.targetLufs);
     return j;
 }
 
@@ -94,6 +103,16 @@ ExportConfig fromJson(const QJsonObject &j)
     c.hdrSettings.maxCll = hdr.value("maxCll").toInt(c.hdrSettings.maxCll);
     c.hdrSettings.maxFall = hdr.value("maxFall").toInt(c.hdrSettings.maxFall);
     c.hdrSettings.previewToneMap = hdr.value("previewToneMap").toString(c.hdrSettings.previewToneMap);
+    const int subtitleMode = j.value("subtitleMode").toInt(static_cast<int>(c.subtitleMode));
+    if (subtitleMode >= static_cast<int>(subtitle::ExportMode::None) && subtitleMode <= static_cast<int>(subtitle::ExportMode::Both))
+        c.subtitleMode = static_cast<subtitle::ExportMode>(subtitleMode);
+    c.imageSequence = j.value("imageSequence").toBool(c.imageSequence);
+    c.sequenceFolder = j.value("sequenceFolder").toString(c.sequenceFolder);
+    c.sequencePattern = j.value("sequencePattern").toString(c.sequencePattern);
+    c.sequenceDigits = j.value("sequenceDigits").toInt(c.sequenceDigits);
+    c.sequenceStart = j.value("sequenceStart").toInt(c.sequenceStart);
+    c.autoLoudness = j.value("autoLoudness").toBool(c.autoLoudness);
+    c.targetLufs = j.value("targetLufs").toDouble(c.targetLufs);
     return c;
 }
 
@@ -158,7 +177,13 @@ bool resolve(const QString &name, ExportConfig *config, QString *error)
         return true;
     }
     for (const auto &p : load()) {
-        if (p.name == name) { *config = p.config; return true; }
+        if (p.name != name) continue;
+        *config = p.config;
+        // resolve() feeds headless callers (MCP export_video) that supply their own single output
+        // file. A saved sequence output would divert frames into the preset's folder instead.
+        config->imageSequence = false;
+        config->sequenceFolder.clear();
+        return true;
     }
     if (error) *error = QStringLiteral("プリセットが見つかりません: %1").arg(name);
     return false;

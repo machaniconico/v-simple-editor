@@ -63,6 +63,12 @@ CheckResults runChecks(bool withDecoys)
     const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
     const QByteArray oldEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
     QTemporaryDir temp;
+    if (!temp.isValid()) {
+        // Never fall back to the real preset directory; remaining gates stay FAIL.
+        std::fprintf(stderr, "export-presets%s: QTemporaryDir invalid, gates 2.. FAIL\n", withDecoys ? " decoy" : "");
+        results.av1Available = true; // keeps G5 a FAIL (gate stays false) instead of a reasonless SKIP
+        return results;
+    }
     qputenv("VEDITOR_EXPORT_PRESET_DIR", temp.path().toUtf8());
     const QString name = QStringLiteral("../テスト/A:B");
     bool saved = temp.isValid() && ExportUserPresets::save({name, config})
@@ -287,5 +293,205 @@ int runExportPresetsSelftest()
         decoy.av1Available ? (decoy.gates.at(4) ? "PASS" : "FAIL") : "SKIP",
         sameAvailability, decoy.decoysPresent);
     tally.gate(6, g6);
+
+    ExportConfig before;
+    before.subtitleMode = subtitle::ExportMode::Both;
+    before.imageSequence = true;
+    before.sequenceFolder = "C:/veditor-us712/frames";
+    before.sequencePattern = "shot_%04d.exr";
+    before.sequenceDigits = 4;
+    before.sequenceStart = 100;
+    before.autoLoudness = true;
+    before.targetLufs = -23.0;
+    const ExportConfig after = ExportUserPresets::fromJson(ExportUserPresets::toJson(before));
+    const QJsonObject defaultJson = ExportUserPresets::toJson(ExportConfig{});
+    const ExportConfig defaults;
+    const ExportConfig legacy = ExportUserPresets::fromJson(defaultJson);
+    const char *keys[] = {"subtitleMode", "imageSequence", "sequenceFolder", "sequencePattern",
+        "sequenceDigits", "sequenceStart", "autoLoudness", "targetLufs"};
+    int leakedKeys = 0;
+    for (const char *key : keys) {
+        if (!defaultJson.contains(QString::fromLatin1(key))) continue;
+        ++leakedKeys;
+        std::fprintf(stderr, "export-presets G7: default json contains %s\n", key);
+    }
+    const bool subtitleOk = after.subtitleMode == before.subtitleMode;
+    const bool sequenceOk = after.imageSequence == before.imageSequence;
+    const bool folderOk = after.sequenceFolder == before.sequenceFolder;
+    const bool patternOk = after.sequencePattern == before.sequencePattern;
+    const bool digitsOk = after.sequenceDigits == before.sequenceDigits;
+    const bool startOk = after.sequenceStart == before.sequenceStart;
+    const bool loudnessOk = after.autoLoudness == before.autoLoudness;
+    const bool lufsOk = after.targetLufs == before.targetLufs;
+    const bool legacyOk = legacy.subtitleMode == defaults.subtitleMode
+        && legacy.imageSequence == defaults.imageSequence && legacy.sequenceFolder == defaults.sequenceFolder
+        && legacy.sequencePattern == defaults.sequencePattern && legacy.sequenceDigits == defaults.sequenceDigits
+        && legacy.sequenceStart == defaults.sequenceStart && legacy.autoLoudness == defaults.autoLoudness
+        && legacy.targetLufs == defaults.targetLufs;
+    std::fprintf(stderr, "export-presets G7: subtitleMode %d->%d imageSequence %d->%d sequenceFolder %s->%s sequencePattern %s->%s\n",
+        static_cast<int>(before.subtitleMode), static_cast<int>(after.subtitleMode),
+        before.imageSequence, after.imageSequence,
+        qPrintable(before.sequenceFolder), qPrintable(after.sequenceFolder),
+        qPrintable(before.sequencePattern), qPrintable(after.sequencePattern));
+    std::fprintf(stderr, "export-presets G7: sequenceDigits %d->%d sequenceStart %d->%d autoLoudness %d->%d targetLufs %.1f->%.1f leakedKeys=%d legacyDefaults=%d\n",
+        before.sequenceDigits, after.sequenceDigits, before.sequenceStart, after.sequenceStart,
+        before.autoLoudness, after.autoLoudness, before.targetLufs, after.targetLufs, leakedKeys, legacyOk);
+    tally.gate(7, subtitleOk && sequenceOk && folderOk && patternOk && digitsOk && startOk
+        && loudnessOk && lufsOk && leakedKeys == 0 && legacyOk);
+    // G8: resolve() (MCP export_video) must not carry a saved sequence output; other fields stay.
+    // G9: selecting a saved sequence preset in the dialog must restore sequence type + folder.
+    {
+        const bool hadEnv8 = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray oldEnv8 = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        QTemporaryDir temp8;
+        if (!temp8.isValid()) {
+            std::fprintf(stderr, "export-presets G8/G9: QTemporaryDir invalid, FAIL without touching presets\n");
+            tally.gate(8, false);
+            tally.gate(9, false);
+            return tally.finish();
+        }
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", temp8.path().toUtf8());
+        ExportConfig seq = before;
+        seq.sequenceFolder = temp8.filePath("frames");
+        seq.sequencePattern = "shot_%04d.png";
+        ExportConfig vid;
+        vid.autoLoudness = true;
+        const bool saved8 = temp8.isValid() && ExportUserPresets::save({"seq-preset", seq})
+            && ExportUserPresets::save({"vid-preset", vid})
+            && ExportUserPresets::save({"seq-empty", [&] { ExportConfig e = seq; e.sequenceFolder.clear(); return e; }()});
+        ExportConfig resolved;
+        resolved.outputPath = temp8.filePath("requested.mp4");
+        const bool resolvedOk = ExportUserPresets::resolve("seq-preset", &resolved, nullptr);
+        const bool g8 = saved8 && resolvedOk && !resolved.imageSequence && resolved.sequenceFolder.isEmpty()
+            && resolved.autoLoudness && resolved.subtitleMode == seq.subtitleMode
+            && resolved.sequenceDigits == seq.sequenceDigits && resolved.sequenceStart == seq.sequenceStart;
+        std::fprintf(stderr, "export-presets G8: saved=%d resolved=%d imageSequence=%d sequenceFolder='%s' autoLoudness=%d subtitleMode=%d digits=%d start=%d\n",
+            saved8, resolvedOk, resolved.imageSequence, qPrintable(resolved.sequenceFolder),
+            resolved.autoLoudness, static_cast<int>(resolved.subtitleMode), resolved.sequenceDigits, resolved.sequenceStart);
+        tally.gate(8, g8);
+
+        bool g9 = false;
+        int exportType = -1;
+        QString restoredFolder;
+        QString restoredOutput;
+        {
+            ExportDialog dialog(ProjectConfig{});
+            auto *presetCombo = dialog.findChild<QComboBox *>("preset");
+            auto *typeCombo = dialog.findChild<QComboBox *>("exportType");
+            auto *output = dialog.findChild<QLineEdit *>("outputPath");
+            const int index = presetCombo ? presetCombo->findData("seq-preset") : -1;
+            const QString videoTarget = temp8.filePath("video/clip.mp4");
+            if (presetCombo && typeCombo && output && index >= 0) {
+                output->setText(videoTarget);
+                presetCombo->setCurrentIndex(index);
+                exportType = typeCombo->currentData().toInt();
+                restoredOutput = output->text();
+                restoredFolder = QFileInfo(restoredOutput).isDir() ? restoredOutput : QFileInfo(restoredOutput).absolutePath();
+                // ExportType::ImageSequence is the third item (data 2); the output field must hold the folder.
+                g9 = typeCombo->currentIndex() == 2 && QDir::cleanPath(restoredOutput) == QDir::cleanPath(seq.sequenceFolder);
+                auto *patternEdit = dialog.findChild<QLineEdit *>("sequencePattern");
+                auto *digitsSpin = dialog.findChild<QSpinBox *>("sequenceDigits");
+                auto *startSpin = dialog.findChild<QSpinBox *>("sequenceStart");
+                const bool patternShown = patternEdit && patternEdit->text() == seq.sequencePattern;
+                const bool digitsShown = digitsSpin && digitsSpin->value() == seq.sequenceDigits;
+                const bool startShown = startSpin && startSpin->value() == seq.sequenceStart;
+                const QString videoDir = QFileInfo(videoTarget).absolutePath();
+                const auto isFolderText = [](const QString &text) {
+                    const QFileInfo info(text);
+                    return !text.isEmpty() && info.suffix().isEmpty() && !info.isFile();
+                };
+                // (a) user path: the type combo, not the preset, leaves sequence mode -> earlier video file.
+                typeCombo->setCurrentIndex(0);
+                const bool backToFile = typeCombo->currentIndex() == 0 && output->text() == videoTarget;
+                // (b) edit the folder while in sequence mode, go Video -> Sequence again.
+                presetCombo->setCurrentIndex(0); // re-selecting the same item would not signal
+                presetCombo->setCurrentIndex(index);
+                output->setText(temp8.filePath("edited-frames"));
+                typeCombo->setCurrentIndex(0);
+                const bool editedBack = output->text() == videoTarget;
+                typeCombo->setCurrentIndex(2);
+                const QString editedFolder = temp8.filePath("edited-frames"); // the user's folder must survive the round trip
+                const bool reenter = QDir::cleanPath(output->text()) == QDir::cleanPath(editedFolder);
+                // A non-sequence preset leaving sequence mode also restores the file.
+                const int vidIndex = presetCombo->findData("vid-preset");
+                presetCombo->setCurrentIndex(vidIndex);
+                const bool presetBack = vidIndex >= 0 && typeCombo->currentIndex() == 0 && output->text() == videoTarget
+                    && !QFileInfo(output->text()).suffix().isEmpty();
+                // (c) sequence preset without a folder, fresh dialog: file name -> parent folder.
+                bool emptyOk = false, dottedOk = false, fallbackOk = false;
+                {
+                    ExportDialog third(ProjectConfig{});
+                    auto *pc3 = third.findChild<QComboBox *>("preset");
+                    auto *type3 = third.findChild<QComboBox *>("exportType");
+                    auto *out3 = third.findChild<QLineEdit *>("outputPath");
+                    const int emptyIndex = pc3 ? pc3->findData("seq-empty") : -1;
+                    if (pc3 && type3 && out3 && emptyIndex >= 0) {
+                        out3->setText(videoTarget);
+                        pc3->setCurrentIndex(emptyIndex);
+                        emptyOk = type3->currentIndex() == 2 && isFolderText(out3->text())
+                            && QDir::cleanPath(out3->text()) == QDir::cleanPath(videoDir);
+                    }
+                    // Existing directory with a dot in its name is a folder, not a video file.
+                    ExportDialog fourth(ProjectConfig{});
+                    auto *type4 = fourth.findChild<QComboBox *>("exportType");
+                    auto *out4 = fourth.findChild<QLineEdit *>("outputPath");
+                    const QString dotted = temp8.filePath("frames.v2");
+                    if (type4 && out4 && QDir().mkpath(dotted)) {
+                        out4->setText(dotted);
+                        type4->setCurrentIndex(2);
+                        dottedOk = QDir::cleanPath(out4->text()) == QDir::cleanPath(dotted);
+                        type4->setCurrentIndex(0);
+                        const QFileInfo back(out4->text());
+                        const bool dottedVideoOk = type4->currentIndex() == 0 && !back.isDir() && !back.suffix().isEmpty()
+                            && QDir::cleanPath(back.absolutePath()) == QDir::cleanPath(dotted);
+                        std::fprintf(stderr, "export-presets G9: dotted dir -> video path '%s' ok=%d\n", qPrintable(out4->text()), dottedVideoOk);
+                        dottedOk = dottedOk && dottedVideoOk;
+                    }
+                    // No remembered video path: the generated file lives in a directory that exists.
+                    ExportDialog fifth(ProjectConfig{});
+                    auto *pc5 = fifth.findChild<QComboBox *>("preset");
+                    auto *type5 = fifth.findChild<QComboBox *>("exportType");
+                    auto *out5 = fifth.findChild<QLineEdit *>("outputPath");
+                    if (pc5 && type5 && out5) {
+                        pc5->setCurrentIndex(pc5->findData("seq-preset"));
+                        type5->setCurrentIndex(0);
+                        const QFileInfo gen(out5->text());
+                        fallbackOk = type5->currentIndex() == 0 && !gen.suffix().isEmpty() && gen.absoluteDir().exists();
+                        std::fprintf(stderr, "export-presets G9: generated video path '%s'\n", qPrintable(out5->text()));
+                    }
+                }
+                std::fprintf(stderr, "export-presets G9: pattern=%d digits=%d start=%d (a)backToFile=%d (b)editedBack=%d reenter=%d presetBack=%d (c)emptyFolder=%d dotted=%d fallback=%d output='%s'\n",
+                    patternShown, digitsShown, startShown, backToFile, editedBack, reenter, presetBack, emptyOk, dottedOk, fallbackOk, qPrintable(output->text()));
+                g9 = g9 && patternShown && digitsShown && startShown && backToFile && editedBack && reenter && presetBack && emptyOk && dottedOk && fallbackOk;
+            }
+            // Sub-case: video user preset and built-in preset must keep type and the typed output.
+            ExportDialog second(ProjectConfig{});
+            auto *pc2 = second.findChild<QComboBox *>("preset");
+            auto *type2 = second.findChild<QComboBox *>("exportType");
+            auto *out2 = second.findChild<QLineEdit *>("outputPath");
+            if (pc2 && type2 && out2 && pc2->findData("vid-preset") >= 0) {
+                const QString typed = temp8.filePath("keep/out.mp4");
+                out2->setText(typed);
+                pc2->setCurrentIndex(pc2->findData("vid-preset"));
+                const bool userKeeps = type2->currentIndex() == 0 && QFileInfo(out2->text()).completeBaseName() == "out"
+                    && QFileInfo(out2->text()).absolutePath() == QFileInfo(typed).absolutePath();
+                out2->setText(typed);
+                pc2->setCurrentIndex(0);
+                const bool builtinKeeps = type2->currentIndex() == 0 && QFileInfo(out2->text()).completeBaseName() == "out";
+                std::fprintf(stderr, "export-presets G9: videoUserKeepsOutput=%d builtinKeepsOutput=%d output='%s'\n",
+                    userKeeps, builtinKeeps, qPrintable(out2->text()));
+                g9 = g9 && userKeeps && builtinKeeps;
+            } else {
+                g9 = false;
+            }
+        }
+        std::fprintf(stderr, "export-presets G9: exportTypeData=%d expectedFolder='%s' sequenceFolder='%s' outputField='%s' ok=%d\n",
+            exportType, qPrintable(seq.sequenceFolder), qPrintable(restoredFolder), qPrintable(restoredOutput), g9);
+        tally.gate(9, g9);
+        ExportUserPresets::remove("seq-preset");
+        ExportUserPresets::remove("vid-preset");
+        ExportUserPresets::remove("seq-empty");
+        if (hadEnv8) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv8); else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
     return tally.finish();
 }
