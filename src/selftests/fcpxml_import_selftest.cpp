@@ -257,5 +257,101 @@ int runFcpxmlImportSelftest()
         && invalidWarnings.contains(QStringLiteral("malformed"))
         && !allInvalid.error.isEmpty());
 
+    // G11 detects a gap being skipped with all of its connected children.
+    const auto gapChild = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"main\" duration=\"1s\"/>"
+        "<gap name=\"anchor-gap\" offset=\"10s\" duration=\"5s\">"
+        "<asset-clip ref=\"a\" name=\"gap-child\" lane=\"1\" offset=\"2s\" duration=\"1s\"/>"
+        "</gap>")), dir.path());
+    const int gapClipCount = gapChild.videoTracks.size() > 1 ? gapChild.videoTracks[1].size() : -1;
+    const double gapTimelineSec = gapClipCount > 0 ? gapChild.videoTracks[1][0].leadInSec : -1.0;
+    std::fprintf(stderr, "G11 clipCount=%d timelineSec=%.9f expectedTimelineSec=12 "
+        "error=%s warnings=%s\n", gapClipCount, gapTimelineSec,
+        gapChild.error.toUtf8().constData(), gapChild.warnings.join('|').toUtf8().constData());
+    gate(11, gapChild.error.isEmpty() && gapChild.videoTracks.size() == 2
+        && gapClipCount == 1 && near(gapTimelineSec, 12.0)
+        && gapChild.videoTracks[1][0].displayName == QStringLiteral("gap-child"));
+
+    // G12 catches rejection of a negative parent-relative offset and incorrect
+    // source trimming when the connected audio would begin before timeline 0.
+    const QString audioAsset = QStringLiteral(
+        "<asset id=\"j-audio\" src=\"j.wav\" hasVideo=\"0\" hasAudio=\"1\"/>");
+    const auto jCut = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"parent\" offset=\"10s\" start=\"5s\" duration=\"5s\">"
+        "<asset-clip ref=\"j-audio\" name=\"j-sound\" lane=\"1\" offset=\"2s\" start=\"1s\" duration=\"2s\"/>"
+        "</asset-clip>"), audioAsset), dir.path());
+    const auto trimmedJCut = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"early-parent\" offset=\"1s\" start=\"5s\" duration=\"5s\">"
+        "<asset-clip ref=\"j-audio\" name=\"trimmed-sound\" lane=\"1\" offset=\"2s\" start=\"1s\" duration=\"4s\"/>"
+        "</asset-clip>"), audioAsset), dir.path());
+    const bool jPresent = !jCut.audioTracks.isEmpty() && jCut.audioTracks[0].size() == 1;
+    const bool trimmedPresent = !trimmedJCut.audioTracks.isEmpty() && trimmedJCut.audioTracks[0].size() == 1;
+    const double jTimelineSec = jPresent ? jCut.audioTracks[0][0].leadInSec : -1.0;
+    const double trimmedTimelineSec = trimmedPresent ? trimmedJCut.audioTracks[0][0].leadInSec : -1.0;
+    const double trimmedSourceSec = trimmedPresent ? trimmedJCut.audioTracks[0][0].inPoint : -1.0;
+    const double trimmedDurationSec = trimmedPresent
+        ? trimmedJCut.audioTracks[0][0].outPoint - trimmedSourceSec : -1.0;
+    std::fprintf(stderr, "G12 jTimelineSec=%.9f jLocalSec=2 expectedTimelineSec=7 "
+        "trimmedTimelineSec=%.9f trimmedLocalSec=2 "
+        "trimmedSourceSec=%.9f expectedSourceSec=3 trimmedDurationSec=%.9f "
+        "warning=%s jError=%s trimmedError=%s\n", jTimelineSec, trimmedTimelineSec,
+        trimmedSourceSec, trimmedDurationSec, trimmedJCut.warnings.join('|').toUtf8().constData(),
+        jCut.error.toUtf8().constData(), trimmedJCut.error.toUtf8().constData());
+    gate(12, jCut.error.isEmpty() && trimmedJCut.error.isEmpty() && jPresent && trimmedPresent
+        && near(jTimelineSec, 7.0) && near(trimmedTimelineSec, 0.0)
+        && near(trimmedSourceSec, 3.0) && near(trimmedDurationSec, 2.0)
+        && trimmedJCut.warnings.join('|').contains(QStringLiteral("切り詰めました")));
+
+    // G13 detects descendants silently dropped when an invalid parent is skipped.
+    const QString descendants = QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"child-one\" lane=\"1\" duration=\"1s\">"
+        "<asset-clip ref=\"a\" name=\"child-two\" lane=\"1\" duration=\"1s\"/>"
+        "</asset-clip>");
+    const auto malformedParent = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"a\" name=\"bad-parent\" duration=\"1/0s\">")
+        + descendants + QStringLiteral("</asset-clip>"
+            "<asset-clip ref=\"a\" name=\"valid\" offset=\"4s\" duration=\"1s\"/>")), dir.path());
+    const auto invalidRangeParent = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"a\" name=\"zero-parent\" duration=\"0s\">")
+        + descendants + QStringLiteral("</asset-clip>"
+            "<asset-clip ref=\"a\" name=\"valid\" offset=\"4s\" duration=\"1s\"/>")), dir.path());
+    auto descendantWarnings = [](const fcpx::xml::ImportResult &r) {
+        int count = 0;
+        for (const auto &warning : r.warnings)
+            if (warning.contains(QStringLiteral("親クリップが不正"))) ++count;
+        return count;
+    };
+    const int malformedChildWarnings = descendantWarnings(malformedParent);
+    const int invalidRangeChildWarnings = descendantWarnings(invalidRangeParent);
+    const QString malformedText = malformedParent.warnings.join('|');
+    const QString invalidRangeText = invalidRangeParent.warnings.join('|');
+    std::fprintf(stderr, "G13 malformedDescendantWarnings=%d text=%s "
+        "rangeDescendantWarnings=%d rangeText=%s\n", malformedChildWarnings,
+        malformedText.toUtf8().constData(), invalidRangeChildWarnings,
+        invalidRangeText.toUtf8().constData());
+    gate(13, malformedParent.error.isEmpty() && invalidRangeParent.error.isEmpty()
+        && malformedChildWarnings == 2 && invalidRangeChildWarnings == 2
+        && malformedText.contains(QStringLiteral("child-one / a"))
+        && malformedText.contains(QStringLiteral("child-two / a"))
+        && invalidRangeText.contains(QStringLiteral("child-one / a"))
+        && invalidRangeText.contains(QStringLiteral("child-two / a")));
+
+    // G14 distinguishes an empty spine from a spine whose clips were rejected.
+    const auto noAssets = fcpx::xml::parseXml(document(QStringLiteral(
+        "<gap name=\"only-gap\" offset=\"2s\" duration=\"1s\"/>")), dir.path());
+    Timeline emptyTimeline;
+    const bool createdEmpty = noAssets.error.isEmpty()
+        && emptyTimeline.createSequence(noAssets.title, noAssets.videoTracks, noAssets.audioTracks);
+    const auto emptyState = emptyTimeline.currentState();
+    std::fprintf(stderr, "G14 error=%s warnings=%d warningText=%s created=%d "
+        "videoTracks=%d audioTracks=%d\n", noAssets.error.toUtf8().constData(),
+        int(noAssets.warnings.size()), noAssets.warnings.join('|').toUtf8().constData(),
+        int(createdEmpty), int(emptyState.videoTracks.size()), int(emptyState.audioTracks.size()));
+    gate(14, noAssets.error.isEmpty() && noAssets.warnings.size() == 1
+        && noAssets.warnings[0].contains(QStringLiteral("読み込めるクリップがありません"))
+        && noAssets.videoTracks.isEmpty() && noAssets.audioTracks.isEmpty()
+        && createdEmpty && emptyState.videoTracks.size() == 1 && emptyState.videoTracks[0].isEmpty()
+        && emptyState.audioTracks.size() == 1 && emptyState.audioTracks[0].isEmpty());
+
     return tally.finish();
 }
