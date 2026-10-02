@@ -120,6 +120,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/SpatialPathSelftest.cpp
     src/selftests/SmartRenderSelftest.cpp
     src/selftests/LoudnessExportWireSelftest.cpp
+    src/selftests/legacy_kf_selftest.cpp
     src/selftests/loudness_auto_selftest.cpp
     src/selftests/loudness_persist_selftest.cpp
     src/selftests/FrameExportSelftest.cpp

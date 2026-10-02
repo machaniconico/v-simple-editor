@@ -12256,6 +12256,28 @@ void MainWindow::pluginEffects()
     }
 }
 
+// Initial value for a "Edit Keyframes" dialog track: the clip's current static
+// value of the matching ColorCorrection field, or the existing track's value at
+// 0 s (the dialog's initial time). Exposed (non-static) for selftest legacy-kf G6.
+double editKeyframesInitialValue(const ColorCorrection &cc, const KeyframeManager &km,
+                                 const QString &prop)
+{
+    double value = 0.0;
+    if (prop == QLatin1String("grade.brightness")) value = cc.brightness;
+    else if (prop == QLatin1String("grade.contrast")) value = cc.contrast;
+    else if (prop == QLatin1String("grade.saturation")) value = cc.saturation;
+    else if (prop == QLatin1String("grade.exposure")) value = cc.exposure;
+    else if (prop == QLatin1String("grade.hue")) value = cc.hue;
+    else if (prop == QLatin1String("grade.temperature")) value = cc.temperature;
+    else if (prop == QLatin1String("grade.gamma")) value = cc.gamma;
+    else if (prop == QLatin1String("grade.highlights")) value = cc.highlights;
+    else if (prop == QLatin1String("grade.shadows")) value = cc.shadows;
+    const KeyframeTrack *existing = km.track(prop);
+    if (existing && existing->count() > 0)
+        return km.valueAt(prop, 0.0, value);
+    return value;
+}
+
 void MainWindow::editKeyframes()
 {
     if (!m_timeline->hasSelection()) {
@@ -12265,11 +12287,11 @@ void MainWindow::editKeyframes()
 
     // Let user choose which property to keyframe
     QStringList properties = {
-        "colorCorrection.brightness", "colorCorrection.contrast",
-        "colorCorrection.saturation", "colorCorrection.exposure",
-        "colorCorrection.hue", "colorCorrection.temperature",
-        "colorCorrection.gamma", "colorCorrection.highlights",
-        "colorCorrection.shadows"
+        "grade.brightness", "grade.contrast",
+        "grade.saturation", "grade.exposure",
+        "grade.hue", "grade.temperature",
+        "grade.gamma", "grade.highlights",
+        "grade.shadows"
     };
 
     bool ok;
@@ -12281,8 +12303,10 @@ void MainWindow::editKeyframes()
     auto km = m_timeline->clipKeyframes();
 
     // Get or create track for selected property
+    const double initialValue =
+        editKeyframesInitialValue(m_timeline->clipColorCorrection(), km, prop);
     KeyframeTrack track = km.hasTrack(prop) ?
-        *km.track(prop) : KeyframeTrack(prop, 0.0);
+        *km.track(prop) : KeyframeTrack(prop, initialValue);
 
     KeyframeDialog dialog(track, clipDur, this);
     if (dialog.exec() == QDialog::Accepted) {

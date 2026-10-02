@@ -327,6 +327,120 @@ void migrateGeneratedCaptionsToProjectLevel(ProjectData &data)
         });
 }
 
+// --- legacy "Edit Keyframes" dialog tracks -> canonical grade.* names ---
+//
+// The old dialog persisted inert `colorCorrection.<x>` tracks that the
+// evaluator never read. Rename them to `grade.<x>` on load. When a
+// `grade.<x>` track already exists it wins and the legacy track is dropped
+// with a warning (never silently merged).
+// Returns true when a legacy track was found (renamed or dropped).
+static bool migrateLegacyColorCorrectionKeyframesInManager(KeyframeManager &km)
+{
+    static const char *const kNames[] = {
+        "brightness", "contrast", "saturation", "exposure", "hue",
+        "temperature", "gamma", "highlights", "shadows"};
+    bool changed = false;
+    for (const char *name : kNames) {
+        const QString legacy = QStringLiteral("colorCorrection.") + QLatin1String(name);
+        const QString canonical = QStringLiteral("grade.") + QLatin1String(name);
+        if (!km.hasTrack(legacy))
+            continue;
+        changed = true;
+        if (km.hasTrack(canonical)) {
+            km.removeTrack(legacy);
+            qWarning("migrateLegacyColorCorrectionKeyframes: both %s and %s exist; "
+                     "keeping %s and dropping %s",
+                     qPrintable(legacy), qPrintable(canonical),
+                     qPrintable(canonical), qPrintable(legacy));
+        } else {
+            km.renameTrack(legacy, canonical);
+        }
+    }
+    return changed;
+}
+
+static void migrateLegacyColorCorrectionKeyframesInClip(ClipInfo &clip)
+{
+    migrateLegacyColorCorrectionKeyframesInManager(clip.keyframes);
+    if (clip.renderInPlaceOriginal)
+        migrateLegacyColorCorrectionKeyframesInClip(*clip.renderInPlaceOriginal);
+}
+
+// Clip JSON as stored inside the nested sequence store (a base64 blob in
+// clipParentEntries that is never expanded into ClipInfo here). The object is
+// rewritten only when a legacy track is present, so other JSON stays
+// byte-identical.
+static bool migrateLegacyColorCorrectionKeyframesInClipJson(QJsonObject &clip)
+{
+    bool changed = false;
+    if (clip.value(QStringLiteral("keyframes")).isObject()) {
+        KeyframeManager km;
+        km.fromJson(clip.value(QStringLiteral("keyframes")).toObject());
+        if (migrateLegacyColorCorrectionKeyframesInManager(km)) {
+            clip[QStringLiteral("keyframes")] = km.toJson();
+            changed = true;
+        }
+    }
+    if (clip.value(QStringLiteral("renderInPlaceOriginal")).isObject()) {
+        QJsonObject original = clip.value(QStringLiteral("renderInPlaceOriginal")).toObject();
+        if (migrateLegacyColorCorrectionKeyframesInClipJson(original)) {
+            clip[QStringLiteral("renderInPlaceOriginal")] = original;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static void migrateLegacyColorCorrectionKeyframesInSequenceStores(ProjectData &data)
+{
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (ClipParentEntry &entry : data.clipParentEntries) {
+        if (entry.clipId != storeKey)
+            continue;
+        QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+        QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+        bool storeChanged = false;
+        for (int si = 0; si < sequences.size(); ++si) {
+            QJsonObject sequence = sequences.at(si).toObject();
+            bool sequenceChanged = false;
+            for (const QString &trackKey : {QStringLiteral("videoTracks"), QStringLiteral("audioTracks")}) {
+                QJsonArray tracks = sequence.value(trackKey).toArray();
+                for (int ti = 0; ti < tracks.size(); ++ti) {
+                    QJsonArray clips = tracks.at(ti).toArray();
+                    for (int ci = 0; ci < clips.size(); ++ci) {
+                        QJsonObject clip = clips.at(ci).toObject();
+                        if (migrateLegacyColorCorrectionKeyframesInClipJson(clip)) {
+                            clips.replace(ci, clip);
+                            tracks.replace(ti, clips);
+                            sequence[trackKey] = tracks;
+                            sequenceChanged = true;
+                        }
+                    }
+                }
+            }
+            if (sequenceChanged) {
+                sequences.replace(si, sequence);
+                storeChanged = true;
+            }
+        }
+        if (storeChanged) {
+            store[QStringLiteral("sequences")] = sequences;
+            entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+        }
+    }
+}
+
+// Main tracks (+ renderInPlaceOriginal) and the nested sequence store. Must run
+// after clipParentEntries (including the root "sequences" store) is populated.
+static void migrateLegacyColorCorrectionKeyframes(ProjectData &data)
+{
+    for (ProjectTrackClips *tracks : {&data.videoTracks, &data.audioTracks})
+        for (QVector<ClipInfo> &track : *tracks)
+            for (ClipInfo &clip : track)
+                migrateLegacyColorCorrectionKeyframesInClip(clip);
+    migrateLegacyColorCorrectionKeyframesInSequenceStores(data);
+}
+
 // --- v1 -> v2 migration: clip pan offsets unit convention ---
 //
 // In format v1 the per-clip videoDx/videoDy were persisted in *pixels*
@@ -1104,6 +1218,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1707,6 +1822,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};

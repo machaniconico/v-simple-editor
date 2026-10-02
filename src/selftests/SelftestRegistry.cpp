@@ -159,6 +159,7 @@ int runKeyframeLoopSelftest();
 int runKeywordBinsSelftest();
 int runLayerStyleSelftest();
 int runLayerStyleUiSelftest();
+int runLegacyKfSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
 int runLinkedTrimSelftest();
@@ -626,6 +627,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
     { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
       "RenderQueue in-process export fps rational derivation (6 gates)" },
+    { "legacy-kf", nullptr, runLegacyKfSelftest, true,
+      "Legacy colorCorrection.* keyframe tracks migrate to grade.* on project load + dialog initial values + nested sequences (8 gates)" },
     { "loudness-auto", nullptr, runLoudnessAutoSelftest, true,
       "Automatic export loudness normalization (5 gates)" },
     { "loudness-persist", nullptr, runLoudnessPersistSelftest, true,
