@@ -353,5 +353,52 @@ int runFcpxmlImportSelftest()
         && createdEmpty && emptyState.videoTracks.size() == 1 && emptyState.videoTracks[0].isEmpty()
         && emptyState.audioTracks.size() == 1 && emptyState.audioTracks[0].isEmpty());
 
+    // G15 detects an imported source length collapsing to the selected out point.
+    const auto assetWithoutDuration = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" start=\"0s\" duration=\"4s\"/>"),
+        QString(), QString()), dir.path());
+    const auto tenSecondAsset = fcpx::xml::parseXml(QStringLiteral(
+        "<fcpxml><resources><asset id=\"a\" src=\"offline.mov\" duration=\"10s\"/>"
+        "</resources><project><sequence><spine>"
+        "<asset-clip ref=\"a\" start=\"0s\" duration=\"4s\"/>"
+        "</spine></sequence></project></fcpxml>"), dir.path());
+    const bool hasTenSecondClip = tenSecondAsset.error.isEmpty()
+        && tenSecondAsset.videoTracks.size() == 1 && tenSecondAsset.videoTracks[0].size() == 1;
+    const double sourceDurationSec = hasTenSecondClip ? tenSecondAsset.videoTracks[0][0].duration : -1.0;
+    const double sourceOutSec = hasTenSecondClip ? tenSecondAsset.videoTracks[0][0].outPoint : -1.0;
+    const double localDurationSec = hasTenSecondClip ? tenSecondAsset.videoTracks[0][0].effectiveDuration() : -1.0;
+    std::fprintf(stderr, "G15 sourceDurationSec=%.9f sourceOutSec=%.9f localDurationSec=%.9f error=%s\n",
+        sourceDurationSec, sourceOutSec, localDurationSec, tenSecondAsset.error.toUtf8().constData());
+    gate(15, hasTenSecondClip && near(sourceDurationSec, 10.0)
+        && near(sourceOutSec, 4.0) && near(localDurationSec, 4.0));
+
+    // G16 contrasts the same selection without asset duration: legacy fallback.
+    const bool hasFallbackClip = assetWithoutDuration.error.isEmpty()
+        && assetWithoutDuration.videoTracks.size() == 1 && assetWithoutDuration.videoTracks[0].size() == 1;
+    const double fallbackDurationSec = hasFallbackClip ? assetWithoutDuration.videoTracks[0][0].duration : -1.0;
+    const double fallbackOutSec = hasFallbackClip ? assetWithoutDuration.videoTracks[0][0].outPoint : -1.0;
+    std::fprintf(stderr, "G16 sourceDurationSec=%.9f sourceOutSec=%.9f error=%s\n",
+        fallbackDurationSec, fallbackOutSec, assetWithoutDuration.error.toUtf8().constData());
+    gate(16, hasFallbackClip && near(fallbackDurationSec, fallbackOutSec)
+        && near(fallbackOutSec, 4.0));
+
+    // G17 detects a declared asset length shorter than its selected source out.
+    const auto shortAsset = fcpx::xml::parseXml(QStringLiteral(
+        "<fcpxml><resources><asset id=\"a\" src=\"offline.mov\" duration=\"2s\"/>"
+        "</resources><project><sequence><spine>"
+        "<asset-clip ref=\"a\" start=\"1s\" duration=\"3s\"/>"
+        "</spine></sequence></project></fcpxml>"), dir.path());
+    const bool hasShortAssetClip = shortAsset.error.isEmpty()
+        && shortAsset.videoTracks.size() == 1 && shortAsset.videoTracks[0].size() == 1;
+    const double shortSourceDurationSec = hasShortAssetClip ? shortAsset.videoTracks[0][0].duration : -1.0;
+    const double shortSourceOutSec = hasShortAssetClip ? shortAsset.videoTracks[0][0].outPoint : -1.0;
+    const double shortLocalSec = hasShortAssetClip ? shortAsset.videoTracks[0][0].effectiveDuration() : -1.0;
+    std::fprintf(stderr, "G17 declaredSourceSec=2 sourceDurationSec=%.9f "
+        "sourceOutSec=%.9f localSec=%.9f timelineSec=0 error=%s\n",
+        shortSourceDurationSec, shortSourceOutSec, shortLocalSec,
+        shortAsset.error.toUtf8().constData());
+    gate(17, hasShortAssetClip && near(shortSourceDurationSec, 4.0)
+        && near(shortSourceOutSec, 4.0) && near(shortLocalSec, 3.0));
+
     return tally.finish();
 }

@@ -1,4 +1,5 @@
 #include "EdlImport.h"
+#include "libavcore/Probe.h"
 
 #include <QDir>
 #include <QFile>
@@ -104,16 +105,16 @@ void resolveClips(ImportResult &result, const QString &directory)
     QSet<QString> resolved, missing;
     auto events = result.document.events;
     std::stable_sort(events.begin(), events.end(), [](const EdlEvent &a, const EdlEvent &b) { return a.recInFrames < b.recInFrames; });
-    double videoEnd = 0.0, audioEnd = 0.0;
+    double videoEndTimelineSec = 0.0, audioEndTimelineSec = 0.0;
     for (const auto &event : events) {
         // Zero-duration C events are the outgoing reel of a CMX dissolve pair.
         if (event.recOutFrames == event.recInFrames || event.srcOutFrames == event.srcInFrames) continue;
         const bool audio = event.trackType == QStringLiteral("A");
         auto &track = audio ? result.audioTracks[0] : result.videoTracks[0];
-        double &end = audio ? audioEnd : videoEnd;
+        double &endTimelineSec = audio ? audioEndTimelineSec : videoEndTimelineSec;
         const double fps = result.document.frameRate;
-        const double start = event.recInFrames / fps;
-        if (start + 1e-8 < end) {
+        const double startTimelineSec = event.recInFrames / fps;
+        if (startTimelineSec + 1e-8 < endTimelineSec) {
             result.warnings.append(QStringLiteral("イベント %1: 重複するレコード範囲を読み飛ばしました。").arg(event.number)); continue;
         }
         QString path;
@@ -130,7 +131,8 @@ void resolveClips(ImportResult &result, const QString &directory)
             if (matches.size() == 1) { path = matches.first(); break; }
         }
         const QString name = event.clipName.isEmpty() ? event.reel : event.clipName;
-        if (path.isEmpty()) {
+        const bool sourceOnline = !path.isEmpty();
+        if (!sourceOnline) {
             path = dir.absoluteFilePath(name);
             if (!missing.contains(path)) {
                 missing.insert(path);
@@ -141,11 +143,17 @@ void resolveClips(ImportResult &result, const QString &directory)
         clip.filePath = path; // Ordinary missing media path: existing relink APIs can repair it.
         clip.displayName = name;
         clip.inPoint = event.srcInFrames / fps;
-        clip.outPoint = clip.duration = event.srcOutFrames / fps;
+        clip.outPoint = event.srcOutFrames / fps;
+        clip.duration = clip.outPoint;
+        if (sourceOnline) {
+            const auto durationUs = libavcore::probeDurationMicroseconds(path.toUtf8().toStdString());
+            if (durationUs && *durationUs > 0)
+                clip.duration = qMax(clip.outPoint, double(*durationUs) / 1000000.0);
+        }
         clip.speed = double(event.srcOutFrames - event.srcInFrames) / double(event.recOutFrames - event.recInFrames);
-        clip.leadInSec = qMax(0.0, start - end);
+        clip.leadInSec = qMax(0.0, startTimelineSec - endTimelineSec);
         if (event.transition == QLatin1Char('D') && !track.isEmpty()
-            && qAbs(start - end) < 1e-8) {
+            && qAbs(startTimelineSec - endTimelineSec) < 1e-8) {
             clip.leadIn.type = TransitionType::CrossDissolve;
             clip.leadIn.duration = qMin(event.transitionFrames / fps, (event.recOutFrames - event.recInFrames) / fps);
             clip.leadIn.alignment = TransitionAlignment::Start;
@@ -157,7 +165,7 @@ void resolveClips(ImportResult &result, const QString &directory)
                 outgoing.outPoint + clip.leadIn.duration * outgoing.speed);
         }
         track.append(clip);
-        end = event.recOutFrames / fps;
+        endTimelineSec = event.recOutFrames / fps;
     }
     result.resolvedFiles = resolved.size(); result.unresolvedFiles = missing.size();
     if (result.videoTracks[0].isEmpty() && result.audioTracks[0].isEmpty())

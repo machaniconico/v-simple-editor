@@ -55,7 +55,7 @@ bool lessTime(Time a, Time b)
         std::swap(a.n, a.d); std::swap(b.n, b.d); reverse = !reverse;
     }
 }
-struct Asset { QString path, name, format; Time start; bool audioOnly = false; };
+struct Asset { QString path, name, format; Time start, duration; bool audioOnly = false; };
 struct Entry { QString ref, name; int lane = 0, parentIndex = -1; Time offset, duration, start; };
 }
 ImportResult parseXml(const QString &xml, const QString &directory)
@@ -201,7 +201,8 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             asset.format = a.value("format").toString();
             asset.audioOnly = a.value("hasVideo") == QLatin1String("0")
                 || (!a.hasAttribute("hasVideo") && a.value("hasAudio") == QLatin1String("1"));
-            if (!readTime(a, QStringLiteral("start"), asset.start)) break;
+            if (!readTime(a, QStringLiteral("start"), asset.start)
+                || !readTime(a, QStringLiteral("duration"), asset.duration)) break;
             const QString id = a.value("id").toString();
             if (id.isEmpty() || assets.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
             while (reader.readNextStartElement()) {
@@ -324,7 +325,11 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                 if (QFileInfo(path).isFile()) found.insert(path);
                 else if (!missing.contains(path)) { missing.insert(path); result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path)); }
                 ClipInfo c; c.filePath = path; c.displayName = e.name.isEmpty() ? asset.name : e.name;
-                c.inPoint = start.seconds(); c.outPoint = c.duration = out.seconds(); c.leadInSec = gap.seconds();
+                c.inPoint = start.seconds();
+                c.outPoint = out.seconds();
+                c.duration = asset.duration.n > 0
+                    ? qMax(c.outPoint, asset.duration.seconds()) : c.outPoint;
+                c.leadInSec = gap.seconds();
                 track.append(c); end = nextEnd;
             }
             if (!track.isEmpty()) tracks.append(track);
