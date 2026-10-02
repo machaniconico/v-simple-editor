@@ -229,6 +229,7 @@ int runSnsCoverSelftest();
 int runSnsFitSelftest();
 int runSocialSelftest();
 int runSpatialPathSelftest();
+int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
 int runStereoPanSelftest();
 int runSubMovtextSelftest();
@@ -719,6 +720,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Motion preset library: built-in ids, generated motion keyframes, deterministic replacement (6 gates)" },
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
+    { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (3 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "noise-print", "VEDITOR_NOISE_PRINT_SELFTEST", runNoisePrintSelftest, false,

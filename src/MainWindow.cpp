@@ -8857,6 +8857,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
             QImage frame;
             int sourceFrameIndex = 0;
+            double fxSourceSeconds = clip.inPoint;
             auto trIt = m_timeRemapClipEntries.constFind(clipId);
             if (trIt != m_timeRemapClipEntries.cend() || clip.hasTimeRemap()) {
                 timeremap::TimeRemapCurve curve = (trIt != m_timeRemapClipEntries.cend())
@@ -8874,6 +8875,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                         sourceTime = qMax(mappedClip.inPoint,
                                           sourceTime - 1.0 / curve.sourceFps);
                     }
+                    fxSourceSeconds = sourceTime;
                     sourceFrameIndex = qMax(
                         0, static_cast<int>(std::llround(
                                sourceTime * curve.sourceFps)));
@@ -8894,17 +8896,43 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 } else {
                     // Keep the pre-US-004 path byte-identical while reverse
                     // is OFF, including its existing time-remap sampling.
-                    sourceFrameIndex = qMax(
-                        0, static_cast<int>(std::llround(
-                               (clip.inPoint
-                                + curve.srcTimeAt(localSeconds))
-                               * curve.sourceFps)));
-                    frame = timeremap::resolveFrame(
-                        curve, localSeconds,
+                    // Same derivation + clamp as export's
+                    // sourceSecondForClipAtLocalTime (TimelineFrameRenderer.cpp):
+                    // a remap past the out point samples at the out point, for
+                    // the decoded frame and for the Echo/RollingShutter second.
+                    const double sourceOut = (clip.outPoint > 0.0)
+                        ? clip.outPoint : clip.duration;
+                    const double remappedLocal = qMax(
+                        0.0, curve.srcTimeAt(qMax(0.0, localSeconds)));
+                    const bool pastOut = sourceOut > clip.inPoint
+                        && clip.inPoint + remappedLocal > sourceOut;
+                    fxSourceSeconds = (sourceOut <= clip.inPoint)
+                        ? clip.inPoint
+                        : qBound(clip.inPoint,
+                                 clip.inPoint + remappedLocal, sourceOut);
+                    const auto decodeByIndex =
                         [this, clip, curve](int srcFrameIndex) {
                             return decodeClipFrameByIndex(
                                 clip, srcFrameIndex, curve.sourceFps);
-                        });
+                        };
+                    if (pastOut) {
+                        sourceFrameIndex = qMax(
+                            0, static_cast<int>(std::llround(
+                                   fxSourceSeconds * curve.sourceFps)));
+                        timeremap::TimeRemapCurve clampedCurve = curve;
+                        clampedCurve.keys.clear();
+                        clampedCurve.addKey(0.0, sourceOut - clip.inPoint);
+                        frame = timeremap::resolveFrame(
+                            clampedCurve, 0.0, decodeByIndex);
+                    } else {
+                        sourceFrameIndex = qMax(
+                            0, static_cast<int>(std::llround(
+                                   (clip.inPoint
+                                    + curve.srcTimeAt(localSeconds))
+                                   * curve.sourceFps)));
+                        frame = timeremap::resolveFrame(
+                            curve, localSeconds, decodeByIndex);
+                    }
                 }
             } else if (clip.reversed) {
                 double sourceTime = clip.sourceSecondAtLocalTime(localSeconds);
@@ -8912,6 +8940,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     sourceTime = qMax(clip.inPoint,
                                       sourceTime - 1.0 / fps);
                 }
+                fxSourceSeconds = sourceTime;
                 sourceFrameIndex = qMax(
                     0, static_cast<int>(std::llround(sourceTime * fps)));
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
@@ -8924,6 +8953,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     clip.inPoint
                         + localSeconds * qMax(clip.speed, 0.0001),
                     clipOut);
+                fxSourceSeconds = sourceTime;
                 sourceFrameIndex = qMax(
                     0, static_cast<int>(std::llround(sourceTime * fps)));
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
@@ -8932,6 +8962,32 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             if (frame.isNull())
                 continue;
             frame = applyStoredRotoData(clipId, frame, sourceFrameIndex);
+
+            // US-708: run the same native FX stage as export (VFX footage
+            // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
+            // pins). Same condition, order and arguments as the V1 base layer
+            // and overlay layers in tlrender::renderFrameAt
+            // (src/TimelineFrameRenderer.cpp: applyClipFxStackWithEchoFromSource
+            // when hasActiveEcho / hasActiveRollingShutter, otherwise
+            // applyClipFxStackFromSource; local = clip-local seconds, source =
+            // clip source seconds). Keep the two sites in sync.
+            if (tlrender::hasActiveEcho(clip, localSeconds)
+                || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
+                const tlrender::EchoFrameProvider echoProvider =
+                    [this, clip](double sampleSourceSec, double sampleLocalSec) -> QImage {
+                        const QImage sampleRaw =
+                            decodeClipFrameAtSourceTime(clip, sampleSourceSec);
+                        if (sampleRaw.isNull())
+                            return QImage();
+                        return tlrender::prepareClipSourceForEcho(
+                            sampleRaw, clip, sampleLocalSec);
+                    };
+                frame = tlrender::applyClipFxStackWithEchoFromSource(
+                    frame, clip, localSeconds, fxSourceSeconds, echoProvider);
+            } else {
+                frame = tlrender::applyClipFxStackFromSource(
+                    frame, clip, localSeconds);
+            }
 
             // US-3D-11: alpha-over a rendered 3D extruded-text layer when this
             // clip carries one. localSeconds is the clip-local time in seconds.

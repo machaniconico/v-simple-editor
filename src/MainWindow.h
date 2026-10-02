@@ -252,6 +252,7 @@ class MainWindow : public QMainWindow
     friend class mcp::McpEditorTools;
     friend int runMcpSelftest();
     friend int runExportCfgSelftest();
+    friend int runSpecialCompositeSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
