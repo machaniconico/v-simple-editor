@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QJsonObject>
 
+#include <algorithm>
 #include <cmath>
 #include <limits>
 
@@ -50,6 +51,11 @@ ExportPresetDefaults presetDefaults(const QString &preset)
 
 // Batch built-ins always resolve as built-ins (case-insensitive); a same-named user
 // preset is neither offered nor consulted for loudness. Single source for both sites.
+static bool samePresetName(const QString &a, const QString &b)
+{
+    return a.trimmed().compare(b.trimmed(), Qt::CaseSensitive) == 0;
+}
+
 static bool isBatchBuiltinName(const QString &name)
 {
     const QString n = name.trimmed();
@@ -58,12 +64,16 @@ static bool isBatchBuiltinName(const QString &name)
         || n.compare(QStringLiteral("4K"), Qt::CaseInsensitive) == 0;
 }
 
+// Saved names are stored untrimmed, but the batch dialog trims the selected text. Names are
+// therefore compared trimmed everywhere (choices de-duplication and loudness lookup).
 QStringList presetChoices()
 {
     QStringList names{QStringLiteral("1080p"), QStringLiteral("720p"), QStringLiteral("4K")};
     for (const auto &p : ExportUserPresets::load()) {
-        if (!p.name.isEmpty() && !isBatchBuiltinName(p.name) && !names.contains(p.name))
-            names << p.name;
+        if (p.name.trimmed().isEmpty() || isBatchBuiltinName(p.name)) continue;
+        const bool dup = std::any_of(names.begin(), names.end(), [&](const QString &n) {
+            return samePresetName(n, p.name); });
+        if (!dup) names << p.name;
     }
     return names;
 }
@@ -91,11 +101,17 @@ static void captureLoudness(ExportTask &task)
     task.loudnessResolved = true;
     task.autoLoudness = false;
     if (isBatchBuiltinName(task.preset)) return;
-    for (const auto &p : ExportDialog::presets())
-        if (p.name == task.preset) return;
+    // Same rule as presetChoices(): look the saved user preset up by name directly, so a user
+    // preset sharing a name with an ExportDialog built-in still resolves.
     ExportConfig presetConfig;
-    if (!ExportUserPresets::resolve(task.preset, &presetConfig) || !presetConfig.autoLoudness)
-        return;
+    bool found = false;
+    for (const auto &p : ExportUserPresets::load()) {
+        if (!samePresetName(p.name, task.preset)) continue;
+        presetConfig = p.config;
+        found = true;
+        break;
+    }
+    if (!found || !presetConfig.autoLoudness) return;
     QJsonObject loudness;
     presetConfig.appendLoudnessSettings(loudness);
     task.autoLoudness = true;

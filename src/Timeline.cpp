@@ -3614,6 +3614,7 @@ void TimelineTrack::dropEvent(QDropEvent *event)
 
 Timeline::Timeline(QWidget *parent) : QWidget(parent)
 {
+    setObjectName(QStringLiteral("mainTimeline"));
     m_undoManager = new UndoManager(this);
     // Coalesce sequenceChanged storm: drag/scrub events used to emit on
     // every mouse-move (~30 Hz), each driving AudioMixer::seekTo +

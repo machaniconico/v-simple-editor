@@ -21,6 +21,8 @@
 #include <QVariant>
 #include <QVector>
 
+#include "SelftestGate.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -203,24 +205,12 @@ bool runQueueContractGate(QString *detail)
 
 int runBatchExportE2ESelftest()
 {
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
     auto check = [&](int gate, const char *name, bool ok,
                      const QString &detail = QString()) {
-        if (ok) {
-            ++passed;
-            qInfo().noquote() << QStringLiteral(
-                "[batchexport-e2e] PASS G%1 %2")
-                .arg(gate).arg(QString::fromLatin1(name));
-        } else {
-            ++failed;
-            qCritical().noquote() << QStringLiteral(
-                "[batchexport-e2e] FAIL G%1 %2%3")
-                .arg(gate)
-                .arg(QString::fromLatin1(name))
-                .arg(detail.isEmpty() ? QString()
-                                      : QStringLiteral(": ") + detail);
-        }
+        const std::string why = (QString::fromLatin1(name)
+            + (detail.isEmpty() ? QString() : QStringLiteral(": ") + detail)).toStdString();
+        tally.gate(gate, ok, why.c_str());
     };
 
     if (!QApplication::instance()) {
@@ -699,8 +689,69 @@ int runBatchExportE2ESelftest()
         else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     }
 
-    qInfo().noquote() << QStringLiteral(
-        "[batchexport-e2e] summary: %1 PASS, %2 FAIL")
-        .arg(passed).arg(failed);
-    return failed == 0 ? 0 : failed;
+    // G12: a user preset sharing its name with an ExportDialog built-in (first entry) and
+    // auto loudness ON is offered by presetChoices() AND resolves into the job. Every offered
+    // user-preset name with loudness ON resolves the same way (enumeration == resolution).
+    {
+        QTemporaryDir presetDir;
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray oldEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+        const auto dialogPresets = ExportDialog::presets();
+        const QString shadowName = dialogPresets.isEmpty() ? QString() : dialogPresets.first().name;
+        ExportUserPreset shadowUser, plainUser, paddedUser;
+        shadowUser.name = shadowName;
+        paddedUser.name = QStringLiteral("  g12-padded ");
+        paddedUser.config.autoLoudness = true;
+        paddedUser.config.targetLufs = -16.0;
+        plainUser.name = QStringLiteral("g12-plain");
+        shadowUser.config.autoLoudness = plainUser.config.autoLoudness = true;
+        shadowUser.config.targetLufs = plainUser.config.targetLufs = -16.0;
+        const bool saved = presetDir.isValid() && !shadowName.isEmpty()
+            && ExportUserPresets::save(shadowUser) && ExportUserPresets::save(plainUser)
+            && ExportUserPresets::save(paddedUser);
+        const QStringList choices = batchexport::presetChoices();
+        const bool offered = choices.contains(shadowName) && choices.contains(paddedUser.name);
+        bool allResolve = true;
+        QStringList perName;
+        for (const QString &name : choices) {
+            const bool builtin = name == QStringLiteral("1080p") || name == QStringLiteral("720p")
+                || name == QStringLiteral("4K");
+            batchexport::ExportTask t;
+            t.projectPath = QStringLiteral("g12.veditor");
+            t.outputPath = QStringLiteral("g12.mp4");
+            t.preset = name;
+            t.source = batchexport::TaskSource::File;
+            // Re-resolution path (loudnessResolved == false) and the addTask path.
+            const RenderJob reJob = batchexport::Queue::buildRenderJob(t);
+            batchexport::Queue q;
+            q.addTask(t);
+            const bool hasTask = q.tasks().size() == 1;
+            const bool qTaskOn = hasTask && q.tasks().first().autoLoudness;
+            const double qTaskLufs = hasTask ? q.tasks().first().targetLufs : 0.0;
+            const QJsonObject qCfg = hasTask
+                ? batchexport::Queue::buildRenderJob(q.tasks().first()).exportConfig : QJsonObject();
+            const bool qJobOn = qCfg.value("autoLoudness").toBool(false);
+            const double qJobLufs = qCfg.value("targetLufs").toDouble(0.0);
+            const bool reOn = reJob.exportConfig.value("autoLoudness").toBool(false);
+            const double reLufs = reJob.exportConfig.value("targetLufs").toDouble(0.0);
+            const bool queued = qTaskOn && qJobOn && std::fabs(qJobLufs + 16.0) <= 1e-9
+                && std::fabs(qTaskLufs + 16.0) <= 1e-9;
+            const bool reResolved = reOn && std::fabs(reLufs + 16.0) <= 1e-9;
+            perName << QStringLiteral("%1:builtin=%2 queuedJob(auto=%3,lufs=%4) reresolvedJob(auto=%5,lufs=%6)")
+                .arg(name).arg(builtin).arg(qJobOn).arg(qJobLufs).arg(reOn).arg(reLufs);
+            if (builtin) allResolve = allResolve && !qJobOn && !reOn && !qTaskOn;
+            else allResolve = allResolve && queued && reResolved;
+        }
+        qInfo().noquote() << QStringLiteral(
+            "[batchexport-e2e] G12 values: saved=%1 shadowName=%2 offered=%3 allResolve=%4 "
+            "perName=%5")
+            .arg(saved).arg(shadowName).arg(offered).arg(allResolve).arg(perName.join('|'));
+        check(12, "user preset named like a dialog built-in resolves loudness",
+              saved && offered && allResolve, QString());
+        if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
+        else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
+
+    return tally.finish("batchexport-e2e");
 }

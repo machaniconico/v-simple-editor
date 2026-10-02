@@ -442,7 +442,7 @@ int runCamtrackUiSelftest()
         const bool clipOk = temporary.isValid()
             && writeClip(clipPath, {320, 240}, false, 24, 48);
         MainWindow window;
-        auto* timeline = window.findChild<Timeline*>();
+        auto* timeline = window.findChild<Timeline*>("mainTimeline");
         bool selected = false;
         QString error;
         if (clipOk && timeline) {
@@ -473,7 +473,7 @@ int runCamtrackUiSelftest()
         const bool invoked = selected
             && QMetaObject::invokeMethod(&window, "openPlanarTrackerDialog");
         modalGuard.stop();
-        auto* d = window.findChild<PlanarTrackerDialog*>();
+        auto* d = window.findChild<PlanarTrackerDialog*>("planarTrackerDialog");
         const QString text = d ? summaryOf(*d) : QStringLiteral("<dialog missing>");
         const int start = d ? d->findChild<QSpinBox*>("featureStart")->value() : -1;
         const int end = d ? d->findChild<QSpinBox*>("featureEnd")->value() : -1;
