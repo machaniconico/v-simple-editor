@@ -40,7 +40,9 @@
 
 #include <QtGlobal>
 #include <QByteArray>
+#include <QFile>
 #include <QHash>
+#include <QMutex>
 #include <QPainter>
 #include <QRectF>
 #include <QVector>
@@ -67,9 +69,15 @@ std::atomic<bool> bypass{false};
 std::atomic<quint64> skipped{0};
 void setBypass(bool value) { bypass = value; skipped = 0; }
 quint64 skipCount() { return skipped; }
+// Same predicate without bumping skipCount(), for read-only queries such as
+// tlrender::parentLayerAt that must not perturb the render-path counter.
+bool disabledQuiet(const ClipInfo &clip)
+{
+    return !bypass && !clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath);
+}
 bool disabled(const ClipInfo &clip)
 {
-    if (!bypass && !clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath)) {
+    if (disabledQuiet(clip)) {
         ++skipped;
         return true;
     }
@@ -1737,43 +1745,18 @@ QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
         tightened, clip.vfxIntensity);
 }
 
-QImage renderFrameFromTracks(const Timeline *timeline,
-                             const QVector<RenderTrackSnapshot> &tracks,
-                             const QVector<EnhancedTextOverlay> &generatedCaptions,
-                             qint64 usec,
-                             QSize outSize,
-                             int sequenceDepth,
-                             const QVector<TimelineSequence> &sequenceSnapshot,
-                             QVector<QString> &sequenceStack,
-                             const QVector<Light3DState> &projectLights,
-                             const QVector3D &projectLightViewPosition,
-                             bool applyTimelineGlobals,
-                             bool applyProjectLighting,
-                             bool sampleFromLeftBoundary)
+// ── Per-track clip selection shared by renderFrameFromTracks and
+// tlrender::parentLayerAt (US-804). Extracted verbatim from the former
+// inline blocks of renderFrameFromTracks; evaluation order and comparisons
+// are unchanged so export stays byte-identical.
+
+// Overlap-transition intervals per track ({} when no clip has a transition).
+QVector<QVector<OverlapInterval>> overlapIntervalsForTracks(
+    const Timeline *timeline,
+    const QVector<RenderTrackSnapshot> &tracks,
+    bool applyTimelineGlobals,
+    bool *hasTransitionsOut)
 {
-    if (outSize.isEmpty())
-        return QImage();
-    if (sequenceDepth > kMaxNestedSequenceDepth)
-        return transparentFrame(outSize);
-
-    // ── Gather every video track's clip list ────────────────────────────────
-    // m_videoTracks[0] is V1 (alias m_videoTrack); each subsequent index is an
-    // overlay track (V2, V3, ...). Per Timeline::computePlaybackSequence
-    // (src/Timeline.cpp:4871-4875) every visible track contributes its full
-    // clip intervals with NO mutual subtraction — the compositor stacks them.
-    // PlaybackTypes.h defines the canonical V1-wins model: higher-index tracks
-    // are painted first as the back layers, and V1 is painted last/frontmost.
-    if (tracks.isEmpty())
-        return QImage();
-
-    const qint64 sampledUsec = sampleFromLeftBoundary
-        ? qMax<qint64>(0, usec - 1)
-        : usec;
-    const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
-    const Camera3DState projectCamera = applyTimelineGlobals && timeline
-        ? timeline->projectCameraAt(targetSec) : Camera3DState{};
-    QVector<ActiveAdjustmentClip> activeAdjustments;
-
     // Preserve the ClipInfo path exactly unless this sample is inside a real
     // borrowed overlap. In particular, nested/source-speed mapping outside
     // that window must not inherit playback's flattened interval mapping.
@@ -1821,8 +1804,20 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             intervals.append(ivs);
         }
     }
-    QVector<int> overlapA(tracks.size(), -1);
-    QVector<int> overlapB(tracks.size(), -1);
+    *hasTransitionsOut = hasTransitions;
+    return intervals;
+}
+
+// Per track: the (outgoing, incoming) interval pair whose borrowed overlap
+// window contains targetSec, or -1/-1.
+void overlapPairsAt(const QVector<RenderTrackSnapshot> &tracks,
+                    const QVector<QVector<OverlapInterval>> &intervals,
+                    double targetSec,
+                    QVector<int> &overlapA,
+                    QVector<int> &overlapB)
+{
+    overlapA = QVector<int>(tracks.size(), -1);
+    overlapB = QVector<int>(tracks.size(), -1);
     for (int t = 0; t < intervals.size() && t < tracks.size(); ++t) {
         if (tracks[t].hidden) continue;
         const auto &ivs = intervals[t];
@@ -1846,24 +1841,201 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             }
         }
     }
-    auto selectClip = [&](int t, bool clamp, double *start) {
-        if (overlapA[t] >= 0) {
-            const auto &a = intervals[t][overlapA[t]];
-            const auto &selected = clipenabletest::disabled(tracks[t].clips[a.clipIdx])
-                ? intervals[t][overlapB[t]] : a;
-            *start = selected.timelineStart;
-            return selected.clipIdx;
+}
+
+// Same-track choice: inside a borrowed overlap the outgoing clip wins unless
+// it is disabled; otherwise the first clip whose [start, end) holds
+// targetSec. countDisabled=false keeps clipenabletest::skipCount() untouched.
+const OverlapInterval &selectedOverlapInterval(
+    const QVector<RenderTrackSnapshot> &tracks,
+    const QVector<QVector<OverlapInterval>> &intervals,
+    const QVector<int> &overlapA, const QVector<int> &overlapB,
+    int t, bool countDisabled)
+{
+    const auto &a = intervals[t][overlapA[t]];
+    const ClipInfo &aClip = tracks[t].clips[a.clipIdx];
+    const bool aDisabled = countDisabled ? clipenabletest::disabled(aClip)
+                                         : clipenabletest::disabledQuiet(aClip);
+    return aDisabled ? intervals[t][overlapB[t]] : a;
+}
+
+int selectClipOnTrack(const QVector<RenderTrackSnapshot> &tracks,
+                      const QVector<QVector<OverlapInterval>> &intervals,
+                      const QVector<int> &overlapA, const QVector<int> &overlapB,
+                      int t, double targetSec, bool clamp, double *start,
+                      bool countDisabled)
+{
+    if (overlapA[t] >= 0) {
+        const auto &selected = selectedOverlapInterval(
+            tracks, intervals, overlapA, overlapB, t, countDisabled);
+        *start = selected.timelineStart;
+        return selected.clipIdx;
+    }
+    return activeClipOnTrack(tracks[t].clips, targetSec, clamp, start);
+}
+
+double sourceSecondOnTrack(const QVector<RenderTrackSnapshot> &tracks,
+                           const QVector<QVector<OverlapInterval>> &intervals,
+                           const QVector<int> &overlapA, const QVector<int> &overlapB,
+                           int t, const ClipInfo &c, double local, bool reverse,
+                           bool countDisabled)
+{
+    if (overlapA[t] >= 0) {
+        const auto &selected = selectedOverlapInterval(
+            tracks, intervals, overlapA, overlapB, t, countDisabled);
+        return overlapSourceSecond(selected, c, local, reverse);
+    }
+    return sourceSecondForClipAtLocalTime(c, local, reverse);
+}
+
+std::atomic<quint64> g_parentLayerAtCalls{0};
+std::atomic<bool> g_layerTimeObservation{false};
+QMutex g_layerTimeObservationMutex;
+QVector<detail::ObservedLayerTime> g_observedLayerTimes;
+
+// renderFrameFromTracks returns an empty frame BEFORE collecting any upper
+// layer when V1 is visible but has no clip at targetSec (V1 track empty with
+// no active upper shape clip, or no V1 clip selected). Same expressions as
+// the "Resolve + decode the V1 base layer" block there; keep both in sync.
+// (A V1 runtime decode failure also returns early there; that is dynamic and
+// not mirrored, like ParentLayerHit::decodable.)
+bool upperLayersReachedByRenderer(
+    const QVector<RenderTrackSnapshot> &tracks,
+    const QVector<QVector<OverlapInterval>> &intervals,
+    const QVector<int> &overlapA, const QVector<int> &overlapB,
+    double targetSec)
+{
+    if (tracks.isEmpty())
+        return false;
+    const RenderTrackSnapshot &v1 = tracks.first();
+    if (v1.hidden)
+        return true;
+    if (v1.clips.isEmpty()) {
+        bool activeUpperShape = false;
+        for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
+            double ignoredStart = 0.0;
+            const int idx = activeClipOnTrack(
+                tracks[t].clips, targetSec, /*clampToFirst=*/false,
+                &ignoredStart);
+            activeUpperShape = idx >= 0
+                && !tracks[t].clips[idx].shapes.isEmpty();
         }
-        return activeClipOnTrack(tracks[t].clips, targetSec, clamp, start);
+        return activeUpperShape;
+    }
+    double v1Start = 0.0;
+    return selectClipOnTrack(tracks, intervals, overlapA, overlapB, 0,
+                             targetSec, /*clampToFirst=*/true, &v1Start,
+                             /*countDisabled=*/false) >= 0;
+}
+
+void observeLayerTime(int trackIdx, int clipIdx, double localSec, double sourceSec)
+{
+    if (!g_layerTimeObservation.load(std::memory_order_relaxed))
+        return;
+    QMutexLocker lock(&g_layerTimeObservationMutex);
+    g_observedLayerTimes.append(
+        detail::ObservedLayerTime{trackIdx, clipIdx, localSec, sourceSec});
+}
+
+// Core of tlrender::parentLayerAt over an already-built track snapshot.
+// Mirrors the overlay-layer admission in renderFrameFromTracks: V1 (track 0)
+// is the base layer and never a parent (the parent resolver rejects index 0),
+// hidden tracks, unselected clips, disabled clips and adjustment clips never
+// become layers.
+std::optional<ParentLayerHit> parentLayerAtInTracks(
+    const QVector<RenderTrackSnapshot> &tracks,
+    const QVector<QVector<OverlapInterval>> &intervals,
+    const QVector<int> &overlapA, const QVector<int> &overlapB,
+    double targetSec, int trackIdx, int clipIdx,
+    const QVector<TimelineSequence> &sequenceSnapshot,
+    bool sampleFromLeftBoundary)
+{
+    // Test-only count; default OFF costs one relaxed load + branch.
+    if (g_layerTimeObservation.load(std::memory_order_relaxed))
+        g_parentLayerAtCalls.fetch_add(1, std::memory_order_relaxed);
+    if (trackIdx <= 0 || trackIdx >= tracks.size())
+        return std::nullopt;
+    if (!upperLayersReachedByRenderer(tracks, intervals, overlapA, overlapB,
+                                      targetSec))
+        return std::nullopt;
+    const RenderTrackSnapshot &trk = tracks[trackIdx];
+    if (trk.hidden || clipIdx < 0 || clipIdx >= trk.clips.size())
+        return std::nullopt;
+    double start = 0.0;
+    const int idx = selectClipOnTrack(tracks, intervals, overlapA, overlapB,
+                                      trackIdx, targetSec, /*clamp=*/false,
+                                      &start, /*countDisabled=*/false);
+    if (idx != clipIdx)
+        return std::nullopt;
+    const ClipInfo &c = trk.clips[idx];
+    if (clipenabletest::disabledQuiet(c) || c.isAdjustment)
+        return std::nullopt;
+    ParentLayerHit hit;
+    hit.timelineSec = targetSec;
+    hit.clipLocalSeconds = targetSec - start;
+    const bool reverse = sampleFromLeftBoundary
+        || clipParticipatesInReverseComposition(c, sequenceSnapshot);
+    hit.sourceSeconds = sourceSecondOnTrack(
+        tracks, intervals, overlapA, overlapB, trackIdx, c,
+        hit.clipLocalSeconds, reverse, /*countDisabled=*/false);
+    hit.decodable = clipgeom::isNullObjectFilePath(c.filePath)
+        || !c.sequenceRefId.isEmpty()
+        || QFile::exists(c.filePath);
+    return hit;
+}
+
+QImage renderFrameFromTracks(const Timeline *timeline,
+                             const QVector<RenderTrackSnapshot> &tracks,
+                             const QVector<EnhancedTextOverlay> &generatedCaptions,
+                             qint64 usec,
+                             QSize outSize,
+                             int sequenceDepth,
+                             const QVector<TimelineSequence> &sequenceSnapshot,
+                             QVector<QString> &sequenceStack,
+                             const QVector<Light3DState> &projectLights,
+                             const QVector3D &projectLightViewPosition,
+                             bool applyTimelineGlobals,
+                             bool applyProjectLighting,
+                             bool sampleFromLeftBoundary)
+{
+    if (outSize.isEmpty())
+        return QImage();
+    if (sequenceDepth > kMaxNestedSequenceDepth)
+        return transparentFrame(outSize);
+
+    // ── Gather every video track's clip list ────────────────────────────────
+    // m_videoTracks[0] is V1 (alias m_videoTrack); each subsequent index is an
+    // overlay track (V2, V3, ...). Per Timeline::computePlaybackSequence
+    // (src/Timeline.cpp:4871-4875) every visible track contributes its full
+    // clip intervals with NO mutual subtraction — the compositor stacks them.
+    // PlaybackTypes.h defines the canonical V1-wins model: higher-index tracks
+    // are painted first as the back layers, and V1 is painted last/frontmost.
+    if (tracks.isEmpty())
+        return QImage();
+
+    const qint64 sampledUsec = sampleFromLeftBoundary
+        ? qMax<qint64>(0, usec - 1)
+        : usec;
+    const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
+    const Camera3DState projectCamera = applyTimelineGlobals && timeline
+        ? timeline->projectCameraAt(targetSec) : Camera3DState{};
+    QVector<ActiveAdjustmentClip> activeAdjustments;
+
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, applyTimelineGlobals, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, targetSec, overlapA, overlapB);
+    auto selectClip = [&](int t, bool clamp, double *start) {
+        return selectClipOnTrack(tracks, intervals, overlapA, overlapB,
+                                 t, targetSec, clamp, start,
+                                 /*countDisabled=*/true);
     };
     auto sourceAt = [&](int t, const ClipInfo &c, double local, bool reverse) {
-        if (overlapA[t] >= 0) {
-            const auto &a = intervals[t][overlapA[t]];
-            const auto &selected = clipenabletest::disabled(tracks[t].clips[a.clipIdx])
-                ? intervals[t][overlapB[t]] : a;
-            return overlapSourceSecond(selected, c, local, reverse);
-        }
-        return sourceSecondForClipAtLocalTime(c, local, reverse);
+        return sourceSecondOnTrack(tracks, intervals, overlapA, overlapB,
+                                   t, c, local, reverse,
+                                   /*countDisabled=*/true);
     };
 
     // The preview applies transitions to its primary playback entry only,
@@ -1930,6 +2102,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     };
 
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
+    // The early returns below (V1 empty without an active upper shape, no V1
+    // clip selected) are mirrored by upperLayersReachedByRenderer for
+    // tlrender::parentLayerAt; change both together.
     // Single-track byte-identity with S2: V1 alone with a default transform
     // must produce the SAME pixels S2 returned (decode native -> scale to
     // outSize, NO QPainter / format conversion). The overlay path below only
@@ -2111,6 +2286,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         CompositeLayer layer;
         QString clipId;
         int trackIndex = 0;
+        int clipIndex = -1;
         QImage image;      // already transformed to outSize
         QImage sourceRgb;  // canvas/fitted source before placement
         clipgeom::ClipTransform transform;
@@ -2141,6 +2317,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.clipId =
             renderScopedClipId(0, v1Idx, sequenceDepth, sequenceStack);
         baseLayer.trackIndex = 0;
+        baseLayer.clipIndex = v1Idx;
         baseLayer.image = base;
         baseLayer.sourceRgb = v1LayerSource;
         baseLayer.transform = v1Transform;
@@ -2177,6 +2354,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool reverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
         const double srcSec = sourceAt(t, c, localSec, reverseComposition);
+        observeLayerTime(t, idx, localSec, srcSec);
         const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
         const clipgeom::ClipTransform cTransform = cHasKeyframes
             ? clipanim::effectiveTransformAt(c, localSec)
@@ -2196,6 +2374,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.clipId =
                 renderScopedClipId(t, idx, sequenceDepth, sequenceStack);
             renderLayer.trackIndex = t;
+            renderLayer.clipIndex = idx;
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
@@ -2265,6 +2444,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.clipId =
             renderScopedClipId(t, idx, sequenceDepth, sequenceStack);
         renderLayer.trackIndex = t;
+        renderLayer.clipIndex = idx;
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
@@ -2354,6 +2534,16 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                     if (it != parentEntries.cend() && !it.value().isEmpty()) {
                         const int parentIdx = indexByClipId.value(it.value(), -1);
                         if (parentIdx <= 0 || parentIdx == idx) {
+                            stack.removeLast();
+                            return false;
+                        }
+                        // US-804: the parent layer's admission goes through the
+                        // shared gate (same selection as the layer loop above).
+                        if (!parentLayerAtInTracks(
+                                tracks, intervals, overlapA, overlapB, targetSec,
+                                renderLayers[parentIdx].trackIndex,
+                                renderLayers[parentIdx].clipIndex,
+                                sequenceSnapshot, sampleFromLeftBoundary)) {
                             stack.removeLast();
                             return false;
                         }
@@ -2990,7 +3180,51 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
         : averaged;
 }
 
+std::optional<ParentLayerHit> parentLayerAt(const Timeline *timeline, qint64 usec,
+                                            int trackIdx, int clipIdx)
+{
+    if (!timeline)
+        return std::nullopt;
+    // Same inputs renderFrameAt's top-level pass uses: timeline tracks,
+    // timeline overlap intervals, no left-boundary sampling.
+    const QVector<RenderTrackSnapshot> tracks = snapshotsFromTimeline(timeline);
+    const double targetSec = static_cast<double>(usec) / 1'000'000.0;
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, /*applyTimelineGlobals=*/true, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, targetSec, overlapA, overlapB);
+    return parentLayerAtInTracks(tracks, intervals, overlapA, overlapB,
+                                 targetSec, trackIdx, clipIdx,
+                                 timeline->sequences(),
+                                 /*sampleFromLeftBoundary=*/false);
+}
+
 namespace detail {
+
+void resetParentLayerAtCallCountForTest()
+{
+    g_parentLayerAtCalls.store(0, std::memory_order_relaxed);
+}
+
+quint64 parentLayerAtCallCountForTest()
+{
+    return g_parentLayerAtCalls.load(std::memory_order_relaxed);
+}
+
+void setLayerTimeObservationForTest(bool enabled)
+{
+    QMutexLocker lock(&g_layerTimeObservationMutex);
+    g_observedLayerTimes.clear();
+    g_layerTimeObservation.store(enabled, std::memory_order_relaxed);
+}
+
+QVector<ObservedLayerTime> observedLayerTimesForTest()
+{
+    QMutexLocker lock(&g_layerTimeObservationMutex);
+    return g_observedLayerTimes;
+}
 
 QImage decodeClipFrameNativeForTest(const QString &filePath, double sourceSec,
                                    bool usePreviousSourceFrame, double sourceInSec)

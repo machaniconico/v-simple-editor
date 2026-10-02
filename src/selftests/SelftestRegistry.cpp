@@ -191,6 +191,7 @@ int runNestSequenceSelftest();
 int runObsSelftest();
 int runOffsetWheelSelftest();
 int runOnionSkinSelftest();
+int runParentGateSelftest();
 int runParitySelftest();
 int runPlanarSelftest();
 #if __has_include("PlanarTrackerPreset.h")
@@ -938,6 +939,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
+    { "parent-gate", "VEDITOR_PARENT_GATE_SELFTEST", runParentGateSelftest, true, "tlrender::parentLayerAt shared parent-layer gate vs renderFrameAt: times, offline parent, overlap pick, Start trail, outside interval, per-layer call count, V1 empty/ended boundary (7 gates)" },
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,

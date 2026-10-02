@@ -475,6 +475,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/sns_fit_selftest.cpp
     src/selftests/clip_enable_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
+    src/selftests/parent_gate_selftest.cpp
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp
     src/selftests/auto_proxy_policy_selftests.cpp

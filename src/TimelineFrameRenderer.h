@@ -11,6 +11,7 @@
 #include <QVector3D>
 #include <QtGlobal>
 #include <functional>
+#include <optional>
 
 class Timeline;
 struct ClipInfo;
@@ -134,7 +135,51 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
                      double frameDurationUs);
 
+// US-804 PARENT-GATE-SSOT: "is video clip (trackIdx, clipIdx) composited as a
+// layer (and so usable as a parent) at timeline time usec", with the times the
+// renderer uses for that layer. The renderer's parent resolver calls the same
+// gate. Semantics follow renderFrameAt's layer admission exactly: track 0 (V1)
+// is the base layer and is never a parent; no hit when renderFrameAt returns
+// an empty frame because visible V1 has no clip at usec (V1 empty without an
+// active upper shape clip, or past V1's end); hidden tracks, disabled clips and
+// adjustment clips yield no hit; on a borrowed overlap (transition) the
+// outgoing clip wins unless disabled, and TransitionAlignment::Start's trail
+// past the nominal end counts as the outgoing clip's time.
+//   timelineSec      = usec / 1e6 (timeline seconds)
+//   clipLocalSeconds = timelineSec - layer start (clip-local seconds)
+//   sourceSeconds    = source-media seconds (clamped to the borrowed
+//                      interval's clipOut inside an overlap, otherwise the
+//                      clip's time-remap / inPoint + local * speed mapping)
+//   decodable        = static check only: null object, sequence reference or
+//                      the file exists. A runtime decode failure (file present
+//                      but unreadable) still drops the layer in renderFrameAt
+//                      and is NOT reported here (known limitation).
+struct ParentLayerHit {
+    double timelineSec = 0.0;
+    double clipLocalSeconds = 0.0;
+    double sourceSeconds = 0.0;
+    bool decodable = false;
+};
+std::optional<ParentLayerHit> parentLayerAt(const Timeline *timeline, qint64 usec,
+                                            int trackIdx, int clipIdx);
+
 namespace detail {
+// US-804 test seams (parent-gate selftest), all behind one switch that is
+// OFF by default (setLayerTimeObservationForTest). While ON: the call
+// counter counts every parentLayerAt evaluation, including the renderer's
+// own parent resolver, and (track, clip, local, source) is recorded for each
+// upper-track layer renderFrameAt admits. While OFF neither is updated.
+struct ObservedLayerTime {
+    int trackIdx = -1;
+    int clipIdx = -1;
+    double localSec = 0.0;
+    double sourceSec = 0.0;
+};
+void resetParentLayerAtCallCountForTest();
+quint64 parentLayerAtCallCountForTest();
+void setLayerTimeObservationForTest(bool enabled);
+QVector<ObservedLayerTime> observedLayerTimesForTest();
+
 // Internal single-sample renderer. Public renderFrameAt overloads must route
 // through this directly when motion blur is disabled.
 QImage renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize);
