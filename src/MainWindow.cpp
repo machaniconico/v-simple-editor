@@ -45,6 +45,7 @@ double exporter_loudnessGainDb();
 #include "mcp/McpToolRegistry.h"
 #include "GLPreview.h"
 #include "EqualizerPanel.h"
+#include "DeEsserPanel.h"
 #include "CompressorPanel.h"
 #include "ReverbPanel.h"
 #include "NoiseReductionPanel.h"
@@ -3185,6 +3186,17 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+    // De-esser dock: one catch-all for audio track count changes (import /
+    // addClip auto-track, BGM, paste, undo / redo, project load, removal).
+    // Reseeds only when the track set changed, never on plain value edits.
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged,
+            this, &MainWindow::syncDeEsserPanelTracks);
+    connect(m_timeline, &Timeline::audioSequenceChanged,
+            this, &MainWindow::syncDeEsserPanelTracks);
+    connect(m_timeline, &Timeline::trackIndicesRemapped,
+            this, &MainWindow::syncDeEsserPanelTracks);
+    connect(m_timeline, &Timeline::trackStateRestored,
+            this, &MainWindow::syncDeEsserPanelTracks);
     m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
     m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
@@ -5613,95 +5625,7 @@ void MainWindow::setupMenuBar()
 
     auto *deesserAction = audioMenu->addAction("ディエッサー...");
     deesserAction->setObjectName("action_audio_deesser");
-    connect(deesserAction, &QAction::triggered, this, [this]() {
-        auto *mixer = m_player ? m_player->audioMixer() : nullptr;
-        if (!mixer || !m_timeline) return;
-        // A local modal dialog needs no persistent MainWindow members or moc changes.
-        QDialog dialog(this);
-        dialog.setWindowTitle(tr("ディエッサー"));
-        auto *form = new QFormLayout(&dialog);
-        auto *target = new QComboBox(&dialog);
-        target->addItem(tr("マスター"), AudioMixer::kMasterTrackId);
-        for (int i = 0; i < m_timeline->audioTrackCount(); ++i)
-            target->addItem(QStringLiteral("A%1").arg(i + 1), i);
-        form->addRow(tr("対象"), target);
-        auto *enabled = new QCheckBox(tr("有効"), &dialog);
-        form->addRow(enabled);
-        const auto spin = [&](const QString &label, double low, double high,
-                              double step, const QString &suffix) {
-            auto *box = new QDoubleSpinBox(&dialog);
-            box->setRange(low, high);
-            box->setSingleStep(step);
-            box->setSuffix(suffix);
-            form->addRow(label, box);
-            return box;
-        };
-        auto *frequency = spin(tr("周波数"), 1000.0, 16000.0, 100.0, tr(" Hz"));
-        auto *threshold = spin(tr("しきい値"), -60.0, 0.0, 1.0, tr(" dB"));
-        auto *ratio = spin(tr("レシオ"), 1.0, 20.0, 0.5, QStringLiteral(":1"));
-        auto *range = spin(tr("レンジ（最大減衰量）"), 0.0, 24.0, 1.0, tr(" dB"));
-        auto *listen = new QCheckBox(tr("リッスン（検出帯域のみ）"), &dialog);
-        form->addRow(listen);
-        const auto readWidgets = [&]() {
-            trackfx::DeEsserSettings s;
-            s.enabled = enabled->isChecked();
-            s.frequencyHz = frequency->value();
-            s.thresholdDb = threshold->value();
-            s.ratio = ratio->value();
-            s.rangeDb = range->value();
-            s.listen = listen->isChecked();
-            return s;
-        };
-        const auto storedFor = [&](int id) {
-            return (id == AudioMixer::kMasterTrackId
-                ? mixer->masterChain() : mixer->trackChain(id)).deesser;
-        };
-        const auto sameSettings = [](const trackfx::DeEsserSettings &a,
-                                     const trackfx::DeEsserSettings &b) {
-            return a.enabled == b.enabled && a.listen == b.listen
-                && a.frequencyHz == b.frequencyHz && a.thresholdDb == b.thresholdDb
-                && a.ratio == b.ratio && a.rangeDb == b.rangeDb;
-        };
-        // Switching 対象 must not discard edits: stage the values of the target being
-        // left, then show the staged (or stored) values of the newly selected one.
-        QHash<int, trackfx::DeEsserSettings> staged;
-        int stagedId = target->currentData().toInt();
-        const auto load = [&](int id) {
-            const auto settings = staged.contains(id) ? staged.value(id) : storedFor(id);
-            enabled->setChecked(settings.enabled);
-            frequency->setValue(settings.frequencyHz);
-            threshold->setValue(settings.thresholdDb);
-            ratio->setValue(settings.ratio);
-            range->setValue(settings.rangeDb);
-            listen->setChecked(settings.listen);
-        };
-        connect(target, &QComboBox::currentIndexChanged, &dialog, [&]() {
-            staged.insert(stagedId, readWidgets());
-            stagedId = target->currentData().toInt();
-            load(stagedId);
-        });
-        load(stagedId);
-        auto *buttons = new QDialogButtonBox(&dialog);
-        buttons->addButton(tr("適用"), QDialogButtonBox::AcceptRole);
-        buttons->addButton(tr("キャンセル"), QDialogButtonBox::RejectRole);
-        form->addRow(buttons);
-        connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-        if (dialog.exec() != QDialog::Accepted) return;
-        staged.insert(stagedId, readWidgets());
-        for (auto it = staged.cbegin(); it != staged.cend(); ++it) {
-            const int id = it.key();
-            if (sameSettings(it.value(), storedFor(id))) continue;
-            if (id == AudioMixer::kMasterTrackId) {
-                mixer->setMasterDeEsser(it.value());
-            } else {
-                auto chain = mixer->trackChain(id);
-                chain.deesser = it.value();
-                mixer->setTrackChain(id, chain);
-            }
-            setWindowModified(true);
-        }
-    });
+    connect(deesserAction, &QAction::triggered, this, &MainWindow::openDeEsserPanel);
     m_menuHelpEntries.append({deesserAction,
         QStringLiteral("歯擦音の帯域だけを動的に抑えます。リッスンで検出帯域を確認できます。")});
 
@@ -9856,6 +9780,7 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     }
     if (m_audioBusPanel) m_audioBusPanel->refresh();
     rebuildAudioMeters();
+    reseedDeEsserPanel();
 }
 
 void MainWindow::syncTrackMatteEntriesFromTimeline()
@@ -9886,6 +9811,7 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
         }
         if (m_audioBusPanel) m_audioBusPanel->refresh();
         rebuildAudioMeters();
+        reseedDeEsserPanel();
         return;
     }
     QVector<AdjustmentLayer> layers;
@@ -10007,6 +9933,7 @@ void MainWindow::applyAudioState(const ProjectData &data)
     }
     if (m_audioMetersDock)
         m_audioMetersDock->setVisible(data.audioMetersDockVisible);
+    reseedDeEsserPanel();
 }
 
 void MainWindow::newProject()
@@ -19970,6 +19897,72 @@ void MainWindow::openEqualizerPanel()
     }
     m_equalizerDock->setVisible(true);
     m_equalizerDock->raise();
+}
+
+void MainWindow::openDeEsserPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("ディエッサー"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_deesserDock) {
+        m_deesserDock = new QDockWidget(tr("ディエッサー"), this);
+        m_deesserDock->setObjectName("DeEsserDock");
+        auto *panel = new DeEsserPanel(m_deesserDock);
+        m_deesserDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_deesserDock);
+
+        // Live-apply like the EQ / compressor / reverb / NR docks.
+        connect(panel, &DeEsserPanel::settingsChanged,
+                this, [this](int trackId, trackfx::DeEsserSettings settings) {
+            auto *mx = m_player ? m_player->audioMixer() : nullptr;
+            if (!mx) return;
+            if (trackId == AudioMixer::kMasterTrackId) {
+                mx->setMasterDeEsser(settings);
+            } else {
+                auto chain = mx->trackChain(trackId);
+                chain.deesser = settings;
+                mx->setTrackChain(trackId, chain);
+            }
+            setWindowModified(true);
+        });
+    }
+
+    reseedDeEsserPanel();
+    m_deesserDock->setVisible(true);
+    m_deesserDock->raise();
+}
+
+// Mixer is the source of truth: re-seed the track list and every stored value
+// without emitting, so a stale panel can never overwrite new mixer state.
+// Called on show and after project load / new / undo restore / track changes.
+void MainWindow::reseedDeEsserPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    auto *panel = m_deesserDock
+        ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr;
+    if (!mixer || !panel) return;
+    QStringList names;
+    QList<int> ids;
+    const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
+    audiofxui::buildAudioTrackList(trackCount, names, ids);
+    panel->setTracks(names, ids);
+    for (int id : ids)
+        panel->setSettings(id, (id == AudioMixer::kMasterTrackId
+            ? mixer->masterChain() : mixer->trackChain(id)).deesser);
+}
+
+void MainWindow::syncDeEsserPanelTracks()
+{
+    auto *panel = m_deesserDock
+        ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr;
+    if (!panel || !m_timeline) return;
+    // Targets are the master plus A1..An, so the count identifies the id set.
+    if (panel->targetCount() != m_timeline->audioTrackCount() + 1)
+        reseedDeEsserPanel();
 }
 
 void MainWindow::openCompressorPanel()

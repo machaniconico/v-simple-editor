@@ -1,9 +1,19 @@
 #include "../AudioTrackFx.h"
 #include "../AudioMixer.h"
+#include "../DeEsserPanel.h"
 #include "../MainWindow.h"
 #include "../ProjectFile.h"
+#include "../Timeline.h"
+#include "../VideoPlayer.h"
+#include "SelftestGate.h"
 
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDockWidget>
+#include <QDoubleSpinBox>
 #include <QFile>
+#include <QSignalSpy>
+#include <QTest>
 #include <QTemporaryDir>
 #include <algorithm>
 #include <cmath>
@@ -61,11 +71,8 @@ void process(trackfx::Processor &processor, std::vector<float> &samples, int blo
 
 int runDeEsserSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int number, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", number);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int number, bool ok) { tally.gate(number, ok); };
 
     // G1: default off skips the new DSP entirely, including sub-PCM16 floats.
     auto precise = tone();
@@ -220,6 +227,183 @@ int runDeEsserSelftest()
         }
     }
     gate(5, persisted);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+
+    // G6: the dock panel applies live. Real MainWindow::openDeEsserPanel wiring:
+    // settingsChanged -> AudioMixer chain, per-target edits survive switching.
+    {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        if (window.m_timeline && window.m_timeline->audioTrackCount() < 1)
+            window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+        const int audioTracks = window.m_timeline ? window.m_timeline->audioTrackCount() : 0;
+        if (mixer && audioTracks >= 1) window.openDeEsserPanel();
+        auto *panel = window.m_deesserDock
+            ? window.m_deesserDock->findChild<DeEsserPanel *>("DeEsserPanel") : nullptr;
+        auto *target = panel ? panel->findChild<QComboBox *>("deesser_target") : nullptr;
+        auto *enabledBox = panel ? panel->findChild<QCheckBox *>("deesser_enabled") : nullptr;
+        auto *thresholdBox = panel ? panel->findChild<QDoubleSpinBox *>("deesser_threshold") : nullptr;
+        const bool built = mixer && panel && target && enabledBox && thresholdBox
+            && window.m_deesserDock->objectName() == QStringLiteral("DeEsserDock");
+        std::fprintf(stderr, "deesser G6: built=%d audioTracks=%d\n", built, audioTracks);
+        bool live = false;
+        if (built) {
+            const trackfx::DeEsserSettings defaults;
+            const int a1 = target->findData(0);
+            const int master = target->findData(AudioMixer::kMasterTrackId);
+            target->setCurrentIndex(a1);
+            QSignalSpy spy(panel, &DeEsserPanel::settingsChanged);
+            enabledBox->setChecked(true);
+            thresholdBox->setValue(-40.0);
+            const auto applied = mixer->trackChain(0).deesser;
+            const bool immediate = spy.count() == 2 && applied.enabled
+                && applied.thresholdDb == -40.0 && applied.ratio == defaults.ratio;
+            const int emittedBeforeSwitch = spy.count();
+            target->setCurrentIndex(master);
+            const bool masterShownDefault = !enabledBox->isChecked()
+                && thresholdBox->value() == defaults.thresholdDb;
+            target->setCurrentIndex(a1);
+            const bool restored = enabledBox->isChecked() && thresholdBox->value() == -40.0;
+            const auto a1After = mixer->trackChain(0).deesser;
+            const auto masterAfter = mixer->masterChain().deesser;
+            const bool masterDefault = !masterAfter.enabled
+                && masterAfter.thresholdDb == defaults.thresholdDb
+                && masterAfter.ratio == defaults.ratio;
+            const bool noSwitchEmit = spy.count() == emittedBeforeSwitch;
+            std::fprintf(stderr,
+                "deesser G6: emitted=%d immediate=%d a1.enabled=%d a1.threshold=%.1f "
+                "masterShownDefault=%d restored=%d a1After.threshold=%.1f "
+                "master.enabled=%d master.threshold=%.1f noSwitchEmit=%d "
+                "applied.ratio=%.1f a1After.enabled=%d master.ratio=%.1f masterDefault=%d\n",
+                emittedBeforeSwitch, immediate, applied.enabled, applied.thresholdDb,
+                masterShownDefault, restored, a1After.thresholdDb,
+                masterAfter.enabled, masterAfter.thresholdDb, noSwitchEmit,
+                applied.ratio, a1After.enabled, masterAfter.ratio, masterDefault);
+            live = immediate && masterShownDefault && restored && masterDefault
+                && noSwitchEmit && a1After.enabled && a1After.thresholdDb == -40.0;
+        }
+        gate(6, live);
+    }
+
+    // G7: the process-call counter survives resetFeedback (seek) and keeps growing.
+    {
+        auto seekChain = chain;
+        trackfx::Processor seeker(seekChain, kRate, 2);
+        auto first = dry;
+        process(seeker, first);
+        const uint64_t afterFirst = seeker.deEsserProcessCallsForTest();
+        seeker.resetFeedback();
+        auto second = dry;
+        process(seeker, second);
+        const uint64_t afterSecond = seeker.deEsserProcessCallsForTest();
+        seeker.resetFeedback();
+        const uint64_t afterSeek = seeker.deEsserProcessCallsForTest();
+        std::fprintf(stderr, "deesser G7: afterFirst=%llu afterSecond=%llu afterSeek=%llu\n",
+                     static_cast<unsigned long long>(afterFirst),
+                     static_cast<unsigned long long>(afterSecond),
+                     static_cast<unsigned long long>(afterSeek));
+        gate(7, afterFirst == static_cast<uint64_t>(kFrames)
+            && afterSecond == 2u * static_cast<uint64_t>(kFrames)
+            && afterSeek == afterSecond);
+    }
+
+    // G8: an open dock follows project load / new and track add / remove, and a
+    // stale panel never overwrites the new mixer state on the next edit.
+    {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        if (window.m_timeline && window.m_timeline->audioTrackCount() < 1)
+            window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+        if (mixer) window.openDeEsserPanel();
+        auto *panel = window.m_deesserDock
+            ? window.m_deesserDock->findChild<DeEsserPanel *>("DeEsserPanel") : nullptr;
+        auto *target = panel ? panel->findChild<QComboBox *>("deesser_target") : nullptr;
+        auto *enabledBox = panel ? panel->findChild<QCheckBox *>("deesser_enabled") : nullptr;
+        auto *thresholdBox = panel ? panel->findChild<QDoubleSpinBox *>("deesser_threshold") : nullptr;
+        bool ok = false;
+        if (mixer && panel && target && enabledBox && thresholdBox) {
+            target->setCurrentIndex(target->findData(0));
+            enabledBox->setChecked(true);
+            const bool enabledBefore = mixer->trackChain(0).deesser.enabled;
+            // Project load / new: de-esser disabled state arrives via applyAudioState.
+            window.applyAudioState(ProjectData{});
+            const bool mixerOff = !mixer->trackChain(0).deesser.enabled;
+            const bool panelOff = !enabledBox->isChecked();
+            QSignalSpy spy(panel, &DeEsserPanel::settingsChanged);
+            thresholdBox->setValue(-33.0);
+            const auto after = mixer->trackChain(0).deesser;
+            const bool noOverwrite = spy.count() == 1 && !after.enabled
+                && after.thresholdDb == -33.0;
+            // Track add / remove: target list follows, removed target falls back.
+            const int comboBefore = target->count();
+            window.addAudioTrack();
+            const int comboAdded = target->count();
+            target->setCurrentIndex(target->findData(1));
+            const int selectedBeforeRemove = panel->currentTrackId();
+            QString err;
+            const bool removed = window.m_timeline->removeTrack(true, 1, &err);
+            const int comboRemoved = target->count();
+            const int selectedAfterRemove = panel->currentTrackId();
+            const bool selectedValid = target->findData(selectedAfterRemove) >= 0;
+            // Timeline::addClip with an audio-only clip auto-creates A2 (the only track
+            // is occupied) without any remap signal; the dock must follow.
+            const int tracksBeforeImport = window.m_timeline->audioTrackCount();
+            const int comboBeforeImport = target->count();
+            QTemporaryDir importDir;
+            const QString wavPath = importDir.filePath(QStringLiteral("g8.wav"));
+            bool wavOk = importDir.isValid();
+            if (wavOk) {
+                QFile wav(wavPath);
+                wavOk = wav.open(QIODevice::WriteOnly);
+                if (wavOk) {
+                    const int dataBytes = 48000 * 2;
+                    QByteArray header("RIFF", 4);
+                    const auto le32 = [&](quint32 v) {
+                        for (int i = 0; i < 4; ++i) header.append(char((v >> (8 * i)) & 0xff));
+                    };
+                    const auto le16 = [&](quint16 v) {
+                        header.append(char(v & 0xff)); header.append(char(v >> 8));
+                    };
+                    le32(36 + dataBytes); header.append("WAVEfmt ", 8);
+                    le32(16); le16(1); le16(1); le32(48000); le32(96000); le16(2); le16(16);
+                    header.append("data", 4); le32(dataBytes);
+                    wav.write(header);
+                    wav.write(QByteArray(dataBytes, '\0'));
+                }
+            }
+            // Occupy every existing audio track so addClip must create a new one.
+            ClipInfo filler;
+            filler.filePath = wavPath;
+            filler.duration = filler.outPoint = 1.0;
+            filler.speed = 1.0;
+            QVector<QVector<ClipInfo>> occupied;
+            for (int t = 0; t < tracksBeforeImport; ++t) occupied.append(QVector<ClipInfo>{filler});
+            window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{}, occupied,
+                0.0, -1.0, -1.0, 100);
+            window.m_timeline->importMedia(wavPath);
+            const bool grew = QTest::qWaitFor([&]() {
+                return target->count() == comboBeforeImport + 1; }, 3000);
+            const int tracksAfterImport = window.m_timeline->audioTrackCount();
+            std::fprintf(stderr,
+                "deesser G8 addClip: wavOk=%d tracksBefore=%d tracksAfter=%d comboBefore=%d "
+                "comboAfter=%d grew=%d\n", wavOk, tracksBeforeImport, tracksAfterImport,
+                comboBeforeImport, target->count(), grew);
+            std::fprintf(stderr,
+                "deesser G8: enabledBefore=%d mixerOff=%d panelOff=%d spy=%d after.enabled=%d "
+                "after.threshold=%.1f comboBefore=%d comboAdded=%d selectedBeforeRemove=%d "
+                "removed=%d comboRemoved=%d selectedAfterRemove=%d selectedValid=%d\n",
+                enabledBefore, mixerOff, panelOff, static_cast<int>(spy.count()),
+                after.enabled, after.thresholdDb, comboBefore, comboAdded,
+                selectedBeforeRemove, removed, comboRemoved, selectedAfterRemove, selectedValid);
+            ok = enabledBefore && mixerOff && panelOff && noOverwrite
+                && comboBefore == 2 && comboAdded == 3 && selectedBeforeRemove == 1
+                && removed && comboRemoved == 2 && selectedValid
+                && wavOk && grew && tracksAfterImport == tracksBeforeImport + 1;
+        } else {
+            std::fprintf(stderr, "deesser G8: dock not built\n");
+        }
+        gate(8, ok);
+    }
+    return tally.finish("deesser");
 }

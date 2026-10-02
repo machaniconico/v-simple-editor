@@ -690,6 +690,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MeshEditTool.h
     src/EqualizerPanel.cpp
     src/EqualizerPanel.h
+    src/DeEsserPanel.cpp
+    src/DeEsserPanel.h
     src/CompressorPanel.cpp
     src/CompressorPanel.h
     src/ReverbPanel.cpp

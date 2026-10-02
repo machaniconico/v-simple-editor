@@ -253,6 +253,7 @@ class MainWindow : public QMainWindow
     friend int runMcpSelftest();
     friend int runExportCfgSelftest();
     friend int runSpecialCompositeSelftest();
+    friend int runDeEsserSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -456,6 +457,9 @@ private slots:
     // Consolidation slots — wire panels and dialogs implemented in
     // earlier sprint stories into the menu bar.
     void openEqualizerPanel();
+    void openDeEsserPanel();
+    void reseedDeEsserPanel();
+    void syncDeEsserPanelTracks();
     void openCompressorPanel();
     void openReverbPanel();
     void openNoiseReductionPanel();
@@ -1115,6 +1119,7 @@ private:
     // re-used on subsequent menu invocations so toggling the action
     // shows/hides the same dock.
     QDockWidget *m_equalizerDock = nullptr;
+    QDockWidget *m_deesserDock = nullptr;
     QDockWidget *m_compressorDock = nullptr;
     QDockWidget *m_reverbDock = nullptr;
     QDockWidget *m_noiseReductionDock = nullptr;

@@ -56,7 +56,6 @@ public:
     void setSettings(const DeEsserSettings &settings, int sampleRate);
     void processFrame(double &left, double &right);
     void reset();
-    void setBypassForTest(bool bypass) { m_bypassForTest = bypass; }
     uint64_t processCallsForTest() const { return m_processCalls; }
 private:
     DeEsserSettings m_settings;
@@ -64,7 +63,6 @@ private:
     std::array<double, 4> m_history{};
     double m_env = 0.0;
     double m_attack = 0.0, m_release = 0.0;
-    bool m_bypassForTest = false;
     uint64_t m_processCalls = 0;
 };
 

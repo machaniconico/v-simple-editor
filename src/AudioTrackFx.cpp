@@ -123,12 +123,11 @@ void DeEsserProcessor::reset()
 {
     m_history.fill(0.0);
     m_env = 0.0;
-    m_processCalls = 0;
 }
 
 void DeEsserProcessor::processFrame(double &left, double &right)
 {
-    if (m_bypassForTest || !m_settings.enabled) return;
+    if (!m_settings.enabled) return;
     ++m_processCalls;
     double band[2];
     const double input[2] = {left, right};
