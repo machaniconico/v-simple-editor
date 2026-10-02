@@ -21,6 +21,7 @@
 #include <QStringList>
 #include <QCoreApplication>
 #include <QDebug>
+#include <QRegularExpression>
 #include "../AutoColor.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -136,6 +137,7 @@ int runFreezeFrameSelftest();
 int runFrameIoSelftest();
 int runRollingShutterSelftest();
 int runFxGrainEchoSelftest();
+int runGateCountProbeSelftest();
 int runGateTallySelftest();
 int runGradeKeyframeSelftest();
 int runGradeKeyframeExtSelftest();
@@ -618,9 +620,11 @@ void disarmWatchdog()
 const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-free (needsQApplication=false) -------------------------
     { "gate-tally", nullptr, runGateTallySelftest, false,
-      "PASS / FAIL / SKIP tally and forced missing encoder (4 gates)" },
+      "PASS / FAIL / SKIP tally, gate-count dispatch, and missing encoder (13 gates)" },
+    { "gate-count-probe", "VEDITOR_GATE_COUNT_PROBE_SELFTEST", runGateCountProbeSelftest, false,
+      "内部用 (2 gates)" },
     { "proxy",             nullptr,                               runProxySelftestV2,            false,
-      "ProxyManager regression gate (libavcore + QSettings struct defaults, 6 gates)" },
+      "ProxyManager regression gate (libavcore + QSettings struct defaults) (6 gates)" },
     { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false,
       "HDR10 3-way routing (in-process 8-bit / in-process HDR / subprocess fallback)" },
     { "renderqueue-aces",  "VEDITOR_RENDERQUEUE_ACES_SELFTEST",   runRenderQueueAcesDecisionSelftest, false,
@@ -662,7 +666,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "project-preset",    "VEDITOR_PROJECT_PRESET_SELFTEST",     runProjectPresetSelftest,      false,
       "Tracker preset state persistence in ProjectFile save/load cycle (10 gates)" },
     { "grade-lgg-serialization", "VEDITOR_GRADE_LGG_SERIALIZATION_SELFTEST", runGradeLggSerializationSelftest, false,
-      "ColorCorrection LGG 9-field project serialization round-trip/default-omit/backward-compat gates" },
+      "ColorCorrection LGG 9-field project serialization round-trip/default-omit/backward-compat checks" },
     { "color-warper", "VEDITOR_COLOR_WARPER_SELFTEST", runColorWarperSelftest, false,
       "Hue/saturation mesh CPU math and persistence (6 gates)" },
     { "offset-wheel", "VEDITOR_OFFSET_WHEEL_SELFTEST", runOffsetWheelSelftest, true,
@@ -670,7 +674,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "grade-log-wheel", "VEDITOR_GRADE_LOG_WHEEL_SELFTEST", runGradeLogWheelSelftest, false,
       "ColorCorrection Log Shadow/Midtone/Highlight CPU math and project serialization (5 gates)" },
     { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,
-      "AIHighlight config defaults / Highlight struct helpers (singleton-free, 6 gates)" },
+      "AIHighlight config defaults / Highlight struct helpers (singleton-free) (6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (9 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
@@ -738,33 +742,33 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "ae-fx-blur",        "VEDITOR_AE_FX_BLUR_SELFTEST",         runAeFxBlurSelftest,           false,
-      "AE-FX-1 Blur Family: Gaussian, directional, radial implementation gates (G1-G6)" },
+      "AE-FX-1 Blur Family: Gaussian, directional, radial implementation (6 gates)" },
     { "ae-fx-color",       "VEDITOR_AE_FX_COLOR_SELFTEST",        runAeFxColorSelftest,          false,
-      "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation gates (G1-G6)" },
+      "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation (6 gates)" },
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
-      "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast gates (G1-G6)" },
+      "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (6 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,
       "Lens distortion identity, geometry and preset round-trip (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
-      "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch gates (G1-G6)" },
+      "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch (6 gates)" },
     { "ae-fx-distort2",    "VEDITOR_AE_FX_DISTORT2_SELFTEST",     runAeFxDistort2Selftest,       false,
-      "AE-FX-7 Distort/Transform Family: bulge, twirl, mirror, polar, motion tile, corner pin gates (G1-G7)" },
+      "AE-FX-7 Distort/Transform Family: bulge, twirl, mirror, polar, motion tile, corner pin (7 gates)" },
     { "ae-fx-generate",    "VEDITOR_AE_FX_GENERATE_SELFTEST",     runAeFxGenerateSelftest,       false,
-      "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone gates (G1-G6)" },
+      "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone (6 gates)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
-      "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
+      "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize (7 gates)" },
     { "puppet-pin", "VEDITOR_PUPPET_PIN_SELFTEST", runPuppetPinSelftest, true,
-      "正規化パペットピン・描画・保存・Undo・クリップ変換込みの配置 (G1-G6)" },
+      "正規化パペットピン・描画・保存・Undo・クリップ変換込みの配置 (6 gates)" },
     { "mesh-warp", "VEDITOR_MESH_WARP_SELFTEST", runMeshWarpSelftest, true,
       "正規化メッシュワープ・描画・保存・Undo・グリッド編集・4隅ピン (G1-G7)" },
     { "surface-tool", "VEDITOR_SURFACE_TOOL_SELFTEST", runSurfaceToolSelftest, true,
-      "サーフェスツールの画面座標とソース UV をフィット・クリップ変換込みで往復・ドラッグ量・解像度変更・scale 0・影響円・余白クリック (G1-G10)" },
+      "サーフェスツールの画面座標とソース UV をフィット・クリップ変換込みで往復・ドラッグ量・解像度変更・scale 0・影響円・余白クリック (10 gates)" },
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
-      "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing gates (G1-G16)" },
+      "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing (16 gates)" },
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
       "Flip CPU parity, involution, preset round-trip and solid insertion/undo (G1-G5)" },
     { "effect-mask", "VEDITOR_EFFECT_MASK_SELFTEST", runEffectMaskSelftest, true,
@@ -774,7 +778,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "effect-library", "VEDITOR_EFFECT_LIBRARY_SELFTEST", runEffectLibrarySelftest, false,
       "Effect Library: dynamic registry catalog, search/category indexes, favorites, preset round-trip, apply/preview parity, safe thumbnails, shader/plugin parameter routing, VFX registration and image application (13 gates)" },
     { "vfx-footage", "VEDITOR_VFX_FOOTAGE_SELFTEST", runVfxFootageSelftest, true,
-      "VFX footage: missing-directory safety, extension/category scan, EffectLibrary integration, black-level, Screen, intensity, determinism, ClipInfo/upper-track placement, non-black representative thumbnail (11 gates; valid-media decode explicitly SKIP when absent)" },
+      "VFX footage: missing-directory safety, extension/category scan, EffectLibrary integration, black-level, Screen, intensity, determinism, ClipInfo/upper-track placement, non-black representative thumbnail (11 gates); valid-media decode explicitly SKIP when absent" },
     { "dolby-vision",      "VEDITOR_DOLBY_VISION_SELFTEST",       runDolbyVisionSelftest,        false,
       "DolbyVision: PQ ST.2084 math + metadata + DV XML generation" },
     { "dv-timeline",       "VEDITOR_DV_TIMELINE_SELFTEST",         runDvTimelineSelftest,         false,
@@ -786,15 +790,15 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "object-removal",    "VEDITOR_OBJECT_REMOVAL_SELFTEST",     runObjectRemovalSelftest,      false,
       "ObjectRemoval: temporal trust, background alignment, bounds, dilation, cache, composite (14 gates)" },
     { "bundle-adjust", "VEDITOR_BUNDLE_ADJUST_SELFTEST", runBundleAdjustSelftest, false,
-      "可変サイズ線形ソルバ、多フレーム追跡、姿勢連結、Schurバンドル調整・密版同値性・規模上限 (G1-G9)" },
+      "可変サイズ線形ソルバ、多フレーム追跡、姿勢連結、Schurバンドル調整・密版同値性・規模上限 (9 gates)" },
     { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
       "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
-      "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (G1-G6)" },
+      "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (6 gates)" },
     { "camtrack-solve", "VEDITOR_CAMTRACK_SOLVE_SELFTEST", runCamtrackSolveSelftest, true,
-      "Camera tracking solve: noise-free nonplanar 64 points / 10 frames, substantial parallax; limits, rejection, undo, trim/speed/reverse, BA outliers/noise and backend parity (G1-G7)" },
+      "Camera tracking solve: noise-free nonplanar 64 points / 10 frames, substantial parallax; limits, rejection, undo, trim/speed/reverse, BA outliers/noise and backend parity (7 gates)" },
     { "camtrack-ui", "VEDITOR_CAMTRACK_UI_SELFTEST", runCamtrackUiSelftest, true,
-      "KLT tracking UI, bounded decoding, planar compatibility and BA limits (10 gates)" },
+      "KLT tracking UI, bounded decoding, planar compatibility and BA limits (11 gates)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
       "Planar camera solver: SVD, continuity, confidence, camera keyframes and single-slot undo (8 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
@@ -812,9 +816,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
-      "Text3D preview camera persistence and proxy policy gates" },
+      "Text3D preview camera persistence and proxy policy checks" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,
-      "TranscriptHighlighter offline deterministic scorer (headless, 8 gates)" },
+      "TranscriptHighlighter offline deterministic scorer (headless) (8 gates)" },
     { "pptx-export",      "VEDITOR_PPTX_EXPORT_SELFTEST",        runPptxExportSelftest,         false,
       "PptxExport: OOXML part tree + store-ZIP/CRC32 + slide XML well-formed + escaping" },
     { "asc-cdl-export",   "VEDITOR_ASC_CDL_EXPORT_SELFTEST",     runAscCdlExportSelftest,       false,
@@ -862,9 +866,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
-      "snsfit::containGeom/containInAspectCanvas pure geometry" },
+      "snsfit::containGeom/containInAspectCanvas pure geometry (15 gates)" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
-      "snsfit::coverGeom/coverInAspectCanvas pure geometry" },
+      "snsfit::coverGeom/coverInAspectCanvas pure geometry (12 gates)" },
     { "composite-frame-cache", "VEDITOR_COMPOSITE_FRAME_CACHE_SELFTEST", runCompositeFrameCacheSelftest, false,
       "CompositeFrameCache: LRU eviction + key hashing + hit/miss accounting" },
     { "playback-quality-policy", "VEDITOR_PLAYBACK_QUALITY_POLICY_SELFTEST", runPlaybackQualityPolicySelftest, false,
@@ -884,7 +888,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hdr-overlay-policy", "VEDITOR_HDR_OVERLAY_POLICY_SELFTEST", runHdrOverlayPolicySelftest, false,
       "Stage4 overlay RGBA64 デコード述語: VEDITOR_HDR_OVERLAY flag×isHdr 真理値表 + env トグル + 混在→8bit ルート確認 (8 gates)" },
     { "preview16-policy", "VEDITOR_PREVIEW16_POLICY_SELFTEST", runPreview16PolicySelftest, false,
-      "preview16 policy predicate gates" },
+      "preview16 policy predicate checks" },
     { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
       "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
@@ -898,7 +902,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "layer-style",        "VEDITOR_LAYER_STYLE_SELFTEST",        runLayerStyleSelftest,          false,
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,
-      "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and Timeline setter/getter gates (V1 legacy + track-aware)" },
+      "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and Timeline setter/getter checks (V1 legacy + track-aware)" },
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     { "whisper-guide",      nullptr,                                runWhisperGuideSelftest,       false,
@@ -929,7 +933,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
-      "Export PCM fixture: deterministic WAV data, track gain and flat EQ (G1-G5; VEDITOR_AUDIO_FIXTURE_OUT required)" },
+      "Export PCM fixture: deterministic WAV data, track gain and flat EQ (5 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
@@ -937,13 +941,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
-      "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates, byte-identical no-keyframe guard)" },
+      "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates); byte-identical no-keyframe guard" },
     { "motion-blur-p2", "VEDITOR_MOTION_BLUR_P2_SELFTEST", runMotionBlurP2Selftest, true,
       "Motion blur P2 activation: env force OR per-clip opt-in + ProjectFile true-only persistence (5 gates)" },
     { "motion-blur-parity", "VEDITOR_MOTION_BLUR_PARITY_SELFTEST", runMotionBlurParitySelftest, true,
       "Export SSOT motion blur OFF-path parity + premultiplied temporal averaging helper (3 gates)" },
     { "effect-keyframe-parity", "VEDITOR_EFFECT_KEYFRAME_PARITY_SELFTEST", runEffectKeyframeParitySelftest, true,
-      "Render-time per-clip effect parameter keyframe evaluation parity (4 gates, byte-identical no-keyframe guard)" },
+      "Render-time per-clip effect parameter keyframe evaluation parity (4 gates); byte-identical no-keyframe guard" },
     { "effect-timing", "VEDITOR_EFFECT_TIMING_SELFTEST", runEffectTimingSelftest, true,
       "Clip-local VideoEffect active range filtering + ProjectFile JSON round-trip (4 gates)" },
     { "mediapool-drag", "VEDITOR_MEDIAPOOL_DRAG_SELFTEST", runMediaPoolDragSelftest, true,
@@ -953,9 +957,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "grade-wheel-wiring", "VEDITOR_GRADE_WHEEL_WIRING_SELFTEST", runGradeWheelWiringSelftest, true,
       "LGG wheels + WB -> per-clip ColorCorrection wiring: value mapping, restore, render reflection" },
     { "grade-keyframe-ext", "VEDITOR_GRADE_KEYFRAME_EXT_SELFTEST", runGradeKeyframeExtSelftest, true,
-      "HSL secondary and color warper keyframes: interpolation, static identity, and project roundtrip" },
+      "HSL secondary and color warper keyframes: interpolation, static identity, and project roundtrip (5 gates)" },
     { "grade-keyframe", "VEDITOR_GRADE_KEYFRAME_SELFTEST", runGradeKeyframeSelftest, true,
-      "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip" },
+      "ColorCorrection grade.* keyframes: render evaluation, byte identity, undo, and roundtrip (12 gates)" },
     { "graph-editor", "VEDITOR_GRAPH_EDITOR_SELFTEST", runGraphEditorSelftest, true,
       "GraphEditor edit/undo, per-track Loop Out UI, ProjectFile persistence, and ClipAnim evaluation parity" },
     { "seq-from-clip", "VEDITOR_SEQ_FROM_CLIP_SELFTEST", runSeqFromClipSelftest, true,
@@ -983,15 +987,15 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
       "Track matte SSOT pixel-match across 4 matte types (luma/alpha/chroma/inv)" },
     { "gpu-composite-parity", "VEDITOR_GPU_COMPOSITE_PARITY_SELFTEST", runGpuCompositeParitySelftest, true,
-      "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, 7 gates, graceful GL skip)" },
+      "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, graceful GL skip) (7 gates)" },
     { "gpu-composite-parity-16-matte", "VEDITOR_GPU_COMPOSITE_PARITY_16_MATTE_SELFTEST", runGpuCompositeParity16MatteSelftest, true,
       "GPU RGBA16 track-matte (composite16Matte) vs CPU 16-bit matte oracle, all 4 matte types + premul + precision proof, graceful GL skip" },
     { "gpu-idt-parity", "VEDITOR_GPU_IDT_PARITY_SELFTEST", runGpuIdtParitySelftest, true,
-      "GpuIdt: per-fragment IDT (eotf->mat3->oetf) vs aces:: CPU oracle (9 gates incl Linear transfer, graceful GL skip)" },
+      "GpuIdt: per-fragment IDT (eotf->mat3->oetf) vs aces:: CPU oracle (9 gates); includes Linear transfer, graceful GL skip" },
     { "gpu-idt-matte-parity", "VEDITOR_GPU_IDT_MATTE_PARITY_SELFTEST", runGpuIdtMatteParitySelftest, true,
       "GpuIdtMatte: per-fragment IDT matte path vs IDT-then-compositeReference16Matte oracle" },
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
-      "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates incl 16-bit precision proof, graceful GL skip)" },
+      "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates); includes 16-bit precision proof, graceful GL skip" },
     { "matte16-parity", "VEDITOR_MATTE16_PARITY_SELFTEST", runMatte16ParitySelftest, true,
       "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (8 gates)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
@@ -1015,9 +1019,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "whisper-transcribe", "VEDITOR_WHISPER_TRANSCRIBE_SELFTEST", runWhisperTranscribeSelftest,  true,
       "Whisper transcription service scaffold smoke" },
     { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, true,
-      "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary gates" },
+      "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary checks" },
     { "caption-overlay-builder", "VEDITOR_CAPTION_OVERLAY_BUILDER_SELFTEST", runCaptionOverlayBuilderSelftest, true,
-      "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary gates" },
+      "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary checks" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
       "Transcript highlighter scaffold smoke" },
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
@@ -1131,9 +1135,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,
       "OAuth + Upload pipeline を localhost mock HTTP server で exercise する 10 gate e2e selftest" },
     { "oauth-refresh-e2e", "VEDITOR_OAUTH_REFRESH_E2E_SELFTEST", runOAuthRefreshE2eSelftest,    true,
-      "OAuth refresh_token auto-trigger e2e (YT 5 + Vimeo 5 gates via mock server). needs QApplication." },
+      "OAuth refresh_token auto-trigger e2e via mock server (10 gates). needs QApplication." },
     { "platform-mock-e2e", "VEDITOR_PLATFORM_MOCK_SELFTEST",      runPlatformMockE2eSelftest,    true,
-      "Instagram Graph API + X Media Upload を localhost mock 経由で e2e exercise (13 gates: server + 5 IG + 7 X). QApplication 必要。" },
+      "Instagram Graph API + X Media Upload を localhost mock 経由で e2e exercise (13 gates): server + 5 IG + 7 X. QApplication 必要。" },
     { "watchdog", "VEDITOR_WATCHDOG_SELFTEST", runWatchdogSelftest, false,
       "Selftest watchdog: timeout exit 124, armed/disabled lines, MCP port-exhaustion warning, per-entry re-arm in sweep (5 gates)" },
     { "watchdog-probe", nullptr, runWatchdogProbeSelftest, false,
@@ -1141,6 +1145,79 @@ const ArgvSelftestEntry kArgvSelftests[] = {
 };
 
 const std::size_t kArgvSelftestsCount = sizeof(kArgvSelftests) / sizeof(kArgvSelftests[0]);
+
+namespace {
+
+struct EntryTally {
+    bool active = false;
+    bool reported = false;
+    int passed = 0;
+    int failed = 0;
+    int skipped = 0;
+};
+
+enum class GateCountStatus { Verified, Mismatch, Unverified, NoDeclaration };
+
+std::mutex g_entryTallyMutex;
+EntryTally g_entryTally;
+GateCountStatus g_lastGateCountStatus = GateCountStatus::Unverified;
+
+} // namespace
+
+void reportTally(int passed, int failed, int skipped)
+{
+    std::lock_guard<std::mutex> lock(g_entryTallyMutex);
+    if (!g_entryTally.active) return;
+    g_entryTally.reported = true;
+    g_entryTally.passed += passed;
+    g_entryTally.failed += failed;
+    g_entryTally.skipped += skipped;
+}
+
+static int runEntryChecked(const ArgvSelftestEntry &e)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_entryTallyMutex);
+        g_entryTally = EntryTally{};
+        g_entryTally.active = true;
+    }
+    const int rc = e.fn();
+    EntryTally tally;
+    {
+        std::lock_guard<std::mutex> lock(g_entryTallyMutex);
+        tally = g_entryTally;
+        g_entryTally.active = false;
+    }
+
+    if (!tally.reported) {
+        g_lastGateCountStatus = GateCountStatus::Unverified;
+        std::cerr << "gate-count: unverified (no GateTally) (selftest="
+                  << e.name << ")\n";
+        return rc;
+    }
+
+    const int ran = tally.passed + tally.failed + tally.skipped;
+    static const QRegularExpression declaration(QStringLiteral("\\(([0-9]+) gates\\)"));
+    const QRegularExpressionMatch match = declaration.match(QString::fromUtf8(
+        e.description ? e.description : ""));
+    bool validNumber = false;
+    const int declared = match.hasMatch() ? match.captured(1).toInt(&validNumber) : 0;
+    if (!validNumber) {
+        g_lastGateCountStatus = GateCountStatus::NoDeclaration;
+        std::cerr << "gate-count: ran " << ran << ", no declaration (selftest="
+                  << e.name << ")\n";
+        return rc;
+    }
+    if (declared != ran) {
+        g_lastGateCountStatus = GateCountStatus::Mismatch;
+        std::cerr << "FAIL gate-count: declared " << declared << ", ran " << ran
+                  << " (selftest=" << e.name << ")\n";
+        return rc + 1;
+    }
+    g_lastGateCountStatus = GateCountStatus::Verified;
+    std::cerr << "gate-count: declared " << declared << ", ran " << ran << '\n';
+    return rc;
+}
 
 // ---------------------------------------------------------------------------
 // dispatchPreQApplication: handle --selftest=list / --selftest=help /
@@ -1199,7 +1276,7 @@ std::optional<int> dispatchPreQApplication(int argc, char* argv[])
                 writeLogLine("INFO",
                     QString("argv-switch: --selftest=%1").arg(QString::fromLatin1(e.name)));
                 armWatchdog(e.name);
-                const int rc = e.fn();
+                const int rc = runEntryChecked(e);
                 disarmWatchdog();
                 return rc;
             }
@@ -1309,13 +1386,23 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
         writeLogLine("INFO", "argv-switch: --selftest=all (full sweep)");
         int passed = 0;
         int failed = 0;
+        int verified = 0;
+        int mismatch = 0;
+        int unverified = 0;
+        int noDeclaration = 0;
         for (const ArgvSelftestEntry* entry : sweep) {
             const auto& e = *entry;
             writeLogLine("INFO",
                 QString("[--selftest=all] running --selftest=%1").arg(QString::fromLatin1(e.name)));
             armWatchdog(e.name);
-            const int rc = e.fn();
+            const int rc = runEntryChecked(e);
             disarmWatchdog();
+            switch (g_lastGateCountStatus) {
+            case GateCountStatus::Verified: ++verified; break;
+            case GateCountStatus::Mismatch: ++mismatch; break;
+            case GateCountStatus::Unverified: ++unverified; break;
+            case GateCountStatus::NoDeclaration: ++noDeclaration; break;
+            }
             if (rc == 0) {
                 ++passed;
                 writeLogLine("INFO",
@@ -1329,6 +1416,9 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
         }
         writeLogLine("INFO",
             QString("[--selftest=all] summary: %1 PASS, %2 FAIL").arg(passed).arg(failed));
+        std::cerr << "gate-count summary: verified " << verified
+                  << ", mismatch " << mismatch << ", unverified " << unverified
+                  << ", no-declaration " << noDeclaration << '\n';
         return failed == 0 ? 0 : failed;
     }
 
@@ -1340,7 +1430,7 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
         if (args.contains(sw)) {
             writeLogLine("INFO", QString("argv-switch: %1").arg(sw));
             armWatchdog(e.name);
-            const int rc = e.fn();
+            const int rc = runEntryChecked(e);
             disarmWatchdog();
             return rc;
         }
@@ -1356,7 +1446,7 @@ std::optional<int> dispatchPostQApplication(const QStringList& args)
             writeLogLine("INFO",
                 QString("running %1").arg(QString::fromLatin1(e.envVar)));
             armWatchdog(e.name);
-            const int rc = e.fn();
+            const int rc = runEntryChecked(e);
             disarmWatchdog();
             return rc;
         }

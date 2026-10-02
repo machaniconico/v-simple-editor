@@ -161,9 +161,10 @@ int runExportMetaSelftest()
     // seam here, so this gate cannot replace its ordering assertion. The
     // helper checks above verify the generated arguments; the render below
     // verifies the in-process output path only.
-    // A copyable single-clip timeline with smart rendering enabled must be
-    // encoded when tags are present. The encoder counter distinguishes this
-    // path from concatCopy, and the output container proves the tag survived.
+    // ClipInfo does not persist the source signature used by canStreamCopy.
+    // The test seam lets timelinePassThrough use its probed signature so G1
+    // checks an eligible source. Metadata must then prevent concatCopy and
+    // reach the encoder and output container.
     const QByteArray oldSmart = qgetenv("VEDITOR_SMART_RENDER");
     const bool hadSmart = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
     const QByteArray oldSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");

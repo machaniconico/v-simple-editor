@@ -35,6 +35,10 @@ struct ArgvSelftestEntry {
 extern const ArgvSelftestEntry kArgvSelftests[];
 extern const std::size_t kArgvSelftestsCount;
 
+// GateTally::finish() reports each completed tally to the active table entry.
+// Multiple finishes in one entry are added before its declared count is checked.
+void reportTally(int passed, int failed, int skipped);
+
 bool requireSelftest(bool condition, const QString &message, QString *error);
 
 // US-700: per-entry watchdog. armWatchdog() starts a std::thread that waits

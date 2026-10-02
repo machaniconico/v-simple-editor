@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../CodecDetector.h"
+#include "SelftestRegistry.h"
 
 #include <QByteArray>
 #include <QString>
@@ -50,11 +51,14 @@ struct GateTally {
         std::cerr << '\n';
     }
 
-    int finish(const char *name = nullptr)
+    int finish(const char *name = nullptr, bool report = true)
     {
         if (name && *name) std::cerr << name << ' ';
         std::cerr << "summary: " << passed << " PASS, " << failed
                   << " FAIL, " << skipped << " SKIP\n";
+        // The tally selftest checks finish() with nested sample tallies. Those
+        // samples opt out so only its own G1..G13 count toward the entry.
+        if (report) selftests::reportTally(passed, failed, skipped);
         return failed;
     }
 
