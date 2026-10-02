@@ -1,9 +1,11 @@
 #include "../ExportDialog.h"
+#include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../libavcore/AudioExtract.h"
 #include "SelftestGate.h"
+#include <QComboBox>
 #include <QEventLoop>
 #include <QFile>
 #include <QImage>
@@ -242,5 +244,43 @@ int runLoudnessAutoSelftest()
     gate(5, queued && mapped && bothPrepared && queuedPrepared);
     if (normal.projectFilePath != source) QFile::remove(normal.projectFilePath);
     if (batch.projectFilePath != source) QFile::remove(batch.projectFilePath);
+
+    // G6: selecting a saved preset whose target is -14 / -23 / -16 LUFS puts the
+    // loudness preset combo on 配信 / 放送 / 自由入力 (typing in the spin box
+    // intentionally means 自由入力).
+    {
+        QTemporaryDir presetDir;
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray oldEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        bool saved = presetDir.isValid();
+        int idx[3] = {-1, -1, -1};
+        bool controls = false;
+        if (saved) {
+            qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+            const double targets[3] = {-14.0, -23.0, -16.0};
+            for (int i = 0; i < 3; ++i) {
+                ExportUserPreset preset;
+                preset.name = QStringLiteral("g6-%1").arg(i);
+                preset.config.autoLoudness = true;
+                preset.config.targetLufs = targets[i];
+                saved = saved && ExportUserPresets::save(preset);
+            }
+            ExportDialog g6Dialog(ProjectConfig{});
+            auto *presetCombo = g6Dialog.findChild<QComboBox *>("preset");
+            auto *loudnessCombo = g6Dialog.findChild<QComboBox *>("loudnessPreset");
+            controls = presetCombo && loudnessCombo;
+            for (int i = 0; controls && i < 3; ++i) {
+                const int userIndex = presetCombo->findData(QStringLiteral("g6-%1").arg(i));
+                if (userIndex < 0) { controls = false; break; }
+                presetCombo->setCurrentIndex(userIndex);
+                idx[i] = loudnessCombo->currentIndex();
+            }
+            if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
+            else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+        }
+        std::fprintf(stderr, "[loudness-auto] G6 saved=%d controls=%d idx14=%d idx23=%d idx16=%d\n",
+            saved, controls, idx[0], idx[1], idx[2]);
+        gate(6, saved && controls && idx[0] == 0 && idx[1] == 1 && idx[2] == 2);
+    }
     return tally.finish("loudness-auto");
 }

@@ -3,6 +3,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QString>
+#include <QStringList>
 #include <QUuid>
 
 #include "RenderQueue.h"
@@ -36,6 +37,10 @@ struct ExportSettings {
 };
 
 ExportPresetDefaults presetDefaults(const QString &preset);
+
+// Preset names offered by the batch settings dialog: the three built-ins
+// (1080p / 720p / 4K, fixed order) followed by saved user preset names.
+QStringList presetChoices();
 
 struct ExportTask {
     QString   id;
@@ -79,6 +84,14 @@ struct ExportTask {
     // task is dispatched. Keeping it on the public task snapshot makes the
     // UI-facing contract and headless E2E assertions observable.
     QJsonObject exportConfig;
+
+    // Auto-loudness captured from the saved user preset when the task is queued
+    // (Queue::addTask), so deleting the preset afterwards cannot silently drop
+    // normalization at dispatch time. buildRenderJob resolves it itself only when
+    // a caller never went through addTask (loudnessResolved == false).
+    bool   loudnessResolved = false;
+    bool   autoLoudness = false;
+    double targetLufs = -14.0;
 
     // uuid of the delegated RenderQueue job (set when the task is dispatched).
     QString renderUuid;

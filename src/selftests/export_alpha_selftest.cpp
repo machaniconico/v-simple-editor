@@ -343,5 +343,47 @@ int runExportAlphaSelftest()
     policy &= !RenderQueue::alphaExportError(QJsonObject{{"videoCodec", "prores_ks"},
         {"proresProfile", 4.5}, {"keepAlpha", true}}).isEmpty();
     gate(6, policy);
+
+    // G7: unsupported-alpha codec + auto loudness whose measurement cannot run
+    // (no audio) must surface the alpha rejection, not be swallowed by loudness.
+    {
+        RenderJob job;
+        job.timeline = &timeline;
+        job.width = 128;
+        job.height = 64;
+        job.codec = QStringLiteral("h264");
+        job.exportConfig = exportcfg::toJobJson([] {
+            ExportConfig c;
+            c.videoCodec = QStringLiteral("libx264");
+            c.keepAlpha = true;
+            c.autoLoudness = true;
+            return c;
+        }());
+        const QString status = loudnessauto::prepareJob(job);
+        const QString expected = RenderQueue::alphaExportError(job.exportConfig);
+        auto rejectionOf = [](const RenderJob &candidate) {
+            RenderQueue queue;
+            QStringList messages;
+            QObject::connect(&queue, &RenderQueue::jobFailed,
+                [&](int, const QString &error) { messages << error; });
+            queue.addJob(candidate);
+            return messages;
+        };
+        const QStringList alphaOnly = rejectionOf(job);
+        RenderJob both = job;
+        both.exportConfig["loudnessAutoError"] = QStringLiteral("g7-loudness-failure");
+        const QStringList combined = rejectionOf(both);
+        const bool statusSkipped = status.contains(QStringLiteral("スキップ"));
+        const bool alphaShown = alphaOnly.size() == 1 && !expected.isEmpty()
+            && alphaOnly.first() == expected;
+        const bool bothShown = combined.size() == 1 && combined.first().startsWith(expected)
+            && combined.first().contains(QStringLiteral("g7-loudness-failure"));
+        std::fprintf(stderr, "export-alpha G7: ready=%d statusSkipped=%d expected=%s "
+            "alphaOnly=%s combined=%s alphaShown=%d bothShown=%d\n",
+            ready, statusSkipped, qPrintable(expected),
+            qPrintable(alphaOnly.join('|')), qPrintable(combined.join('|')),
+            alphaShown, bothShown);
+        gate(7, ready && statusSkipped && alphaShown && bothShown);
+    }
     return tally.finish();
 }

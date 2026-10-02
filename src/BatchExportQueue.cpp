@@ -1,6 +1,11 @@
 #include "BatchExportQueue.h"
 
+#include "ExportUserPresets.h"
+#include <QFile>
 #include <QJsonObject>
+
+#include <cmath>
+#include <limits>
 
 namespace batchexport {
 
@@ -43,6 +48,26 @@ ExportPresetDefaults presetDefaults(const QString &preset)
              QStringLiteral("aac"), 192 };
 }
 
+// Batch built-ins always resolve as built-ins (case-insensitive); a same-named user
+// preset is neither offered nor consulted for loudness. Single source for both sites.
+static bool isBatchBuiltinName(const QString &name)
+{
+    const QString n = name.trimmed();
+    return n.compare(QStringLiteral("1080p"), Qt::CaseInsensitive) == 0
+        || n.compare(QStringLiteral("720p"), Qt::CaseInsensitive) == 0
+        || n.compare(QStringLiteral("4K"), Qt::CaseInsensitive) == 0;
+}
+
+QStringList presetChoices()
+{
+    QStringList names{QStringLiteral("1080p"), QStringLiteral("720p"), QStringLiteral("4K")};
+    for (const auto &p : ExportUserPresets::load()) {
+        if (!p.name.isEmpty() && !isBatchBuiltinName(p.name) && !names.contains(p.name))
+            names << p.name;
+    }
+    return names;
+}
+
 Queue::Queue(QObject *parent)
     : QObject(parent)
 {
@@ -57,6 +82,24 @@ Queue::Queue(QObject *parent)
             this, &Queue::onJobProgress);
     connect(m_render, &RenderQueue::jobCompletedUuid,
             this, &Queue::onJobCompleted);
+}
+
+// Resolve the task's saved user preset into the auto-loudness fields. Built-in
+// preset names never resolve to a user preset.
+static void captureLoudness(ExportTask &task)
+{
+    task.loudnessResolved = true;
+    task.autoLoudness = false;
+    if (isBatchBuiltinName(task.preset)) return;
+    for (const auto &p : ExportDialog::presets())
+        if (p.name == task.preset) return;
+    ExportConfig presetConfig;
+    if (!ExportUserPresets::resolve(task.preset, &presetConfig) || !presetConfig.autoLoudness)
+        return;
+    QJsonObject loudness;
+    presetConfig.appendLoudnessSettings(loudness);
+    task.autoLoudness = true;
+    task.targetLufs = loudness.value("targetLufs").toDouble(-14.0);
 }
 
 QString Queue::addTask(const QString &projectPath,
@@ -101,6 +144,7 @@ QString Queue::addTask(const ExportTask &input)
     t.renderUuid.clear();
     t.exportConfig = QJsonObject();
     fillPresetDefaults(t);
+    captureLoudness(t);
     m_tasks.append(t);
     return t.id;
 }
@@ -138,6 +182,16 @@ RenderJob Queue::buildRenderJob(const ExportTask &input)
     cfg["videoBitrate"] = task.videoBitrateKbps;
     cfg["audioCodec"]   = task.audioCodec;
     cfg["audioBitrate"] = task.audioBitrateKbps;
+    // Intentional exception to rule 17b (exportcfg::toJobJson): a saved user preset
+    // with auto loudness adds ONLY these two keys. Mapping the whole ExportConfig
+    // would also pull HDR / subtitle / metadata / sequence settings into queued
+    // jobs, a behaviour change beyond US-711.
+    if (!task.loudnessResolved)
+        captureLoudness(task);
+    if (task.autoLoudness) {
+        cfg["autoLoudness"] = true;
+        cfg["targetLufs"]   = task.targetLufs;
+    }
     job.exportConfig     = cfg;
     return job;
 }
@@ -216,6 +270,30 @@ void Queue::processNext()
             task.progress = 0;
 
             RenderJob job = buildRenderJob(task);
+            if (job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false)) {
+                // Same measure -> gain -> AAC swap as the normal export path. Without a
+                // live timeline there is nothing to measure: reject rather than 0 dB.
+                if (!job.timeline) {
+                    job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                        "自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません");
+                } else {
+                    loudnessauto::prepareJob(job);
+                    // measureAutoLoudness only records "skipped, 0 dB" for silent /
+                    // audio-less / unmeasurable audio; never export that unnormalized.
+                    const double measured = job.exportConfig.value(QStringLiteral("measuredLufs"))
+                        .toDouble(std::numeric_limits<double>::quiet_NaN());
+                    if (!std::isfinite(measured) || measured <= -70.0)
+                        job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                            "自動ラウドネス: 無音・音声なし・測定失敗のため正規化できません");
+                }
+            }
+            if (!job.exportConfig.value(QStringLiteral("loudnessAutoError")).toString().isEmpty()
+                && job.projectFilePath != task.projectPath) {
+                // Rejected: prepareJob's temporary AAC mix would never be used or cleaned.
+                job.exportConfig[QStringLiteral("loudnessTempFile")] = job.projectFilePath;
+                QFile::remove(job.projectFilePath);
+                job.projectFilePath = task.projectPath;
+            }
             task.exportConfig = job.exportConfig;
 
             task.renderUuid = job.uuid;
