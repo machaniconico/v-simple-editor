@@ -25,12 +25,14 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Keyword collections (auto-generated virtual bins from clip tags, media-pool asset context menu "Edit Keywords…") and SmartBin creation/editing with name/tag/name-query/type conditions (media-pool bin-tree context menu "Create Smart Bin…")
 - Clip enable/disable toggle (excludes a clip from preview and export, MCP `set_clip_enabled`)
 - Clip grouping across tracks (linked select / move / trim / delete, MCP `group_clips` / `ungroup_clips`)
+- Linked clips (AV pairs / clip groups) now trim together on edge drag; Alt+drag trims only the grabbed clip (behaviour change in Wave 8; trim-menu operations such as ripple / roll / slip / slide keep applying to linked partners on other tracks, and are rolled back if a partner fails)
 - Align (6 directions) and distribute (horizontal / vertical) selected clips (Composition menu)
 - Keyframe copy & paste across parameters and clips (Graph Editor, playhead-relative shift)
 - Timeline hover skimming (off by default)
 - New sequence from a selected clip (media-pool asset context menu "New Sequence from This Clip"; video (+audio) clips are placed at V1 (+A1) head, audio-only clips at A1 head)
 - Unused-media removal (media-pool bin-tree context menu "Remove Unused Media…") now also checks LUT / image-overlay / particle-config references, not only the existing provider list; the existing "Unused" filter shares the same check (defect fix: previously narrower)
 - CMX3600 EDL / FCPXML import into a new sequence (MCP `import_edl` / `import_fcpxml`)
+  - Wave 8: FCPXML connected clips (anchored child asset-clips) are placed into lanes (lane 0 first, then by |lane|, up to 2 video and 2 audio tracks); audio-only assets go to audio tracks
 - Undo / redo (unlimited history)
 - Snap to grid & playhead
 - Timeline zoom
@@ -85,7 +87,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - De-esser (dynamic sibilance suppression) added to the track FX chain, off by default
 - Channel-strip audio mixer dock (faders + meters, hidden by default; defect fix: fader/normalize track gain now reaches export even without track FX)
 - Manual loudness-normalization gain and normalizer amount are now saved in the project (defect fix: previously reset on reopen)
-- Automatic loudness normalization on export (off by default; -14 LUFS streaming / -23 LUFS broadcast presets or custom target; not available in the batch export queue). The saved manual gain above is now actually applied at export time (defect fix: a Windows file-handle issue in the post-process step used to prevent the replacement from taking effect)
+- Automatic loudness normalization on export (off by default; -14 LUFS streaming / -23 LUFS broadcast presets or custom target; also applied in the batch export queue through saved user presets (Wave 8). Not applied to MCP `export_video`, RenderInPlace or manual additions in the render-queue dialog). The saved manual gain above is now actually applied at export time (defect fix: a Windows file-handle issue in the post-process step used to prevent the replacement from taking effect)
 
 ### AI & Automation
 - Silence detection
@@ -267,11 +269,13 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `group_clips` | 別々のトラックのクリップをグループ化する。`clips`（`{kind, trackIndex, clipIndex}` の配列、2 件以上）を指定する。応答は `{ok, linkGroup, undoRecorded}` | あり |
 | `ungroup_clips` | 指定クリップのグループを解除する。`clips`（配列、1 件以上） | あり |
 | `import_edl` | `filePath` の CMX3600 EDL をプロジェクトの FPS で新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
-| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip を最大 2 トラック（lane）までの新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
+| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane 0 を必ず採用し、残りは lane 番号の絶対値が小さい順に、映像・音声とも最大 2 トラックまで（超えた lane は警告）。音声専用 asset-clip は音声トラックに置く。transition / 複合クリップ / ref-clip / マルチカムは読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
 
-`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込み・自動ラウドネス正規化は書き出しダイアログのみの機能で、`export_video` の引数には含まれません。
+`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込み・自動ラウドネス正規化は書き出しダイアログ（および Wave 8 からはバッチ書き出しキューの保存済みユーザープリセット経由）の機能で、`export_video` の引数には含まれず、MCP 経由の書き出しには適用されません。
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G177。ツール数は 52）。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G177。ツール数は 52）。Wave 8 では MCP ツールの追加はありません（ツール数 52 / ゲート G1..G177 のまま）。
+
+ゲートを持つ selftest（`GateTally` を使うもの）は、最後に `N PASS, M FAIL, K SKIP` の 3 語書式のサマリ行を標準エラー出力へ出します。`SKIP` は環境依存で検証できなかったゲート（エンコーダ無し、Debug ビルドなど）で、未検証を意味します（終了コードは FAIL の数なので、SKIP だけなら 0 になります）。`VEDITOR_SELFTEST_TIMEOUT_SEC`（秒、既定 900、0 で無効）を超えると `summary: TIMEOUT after <N>s (selftest=<name>)` を出して終了コード 124 で打ち切られます。`--selftest=all` の対象は `VEDITOR_ALL_SELFTEST_FILTER`（カンマ区切り）で絞れ、未知または空の項目は終了コード 2 になります。MCP サーバの待受ポートは `VEDITOR_MCP_PORT` で指定でき、使い切ると警告が出ます。
 
 ---
 
@@ -409,7 +413,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Testing
 
 Selftests are wired into the executable itself, dispatched via a single
-`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 182 entries). Four entry
+`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 259 entries; `--selftest=help` prints 260 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
 points cover the routing matrix:
 
 ```bash
@@ -489,7 +493,7 @@ byte-equivalent and the selftest dispatch coherent:
 | `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
 | `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
 | `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
-| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (182 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (259 entries × 5 fields: name / envVar / fn / needsQApp / description) |
 
 Architecture rationale: preview ≠ export was historically the #1 NLE
 parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
@@ -599,10 +603,11 @@ v-simple-editor/
 - [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
 - [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
-- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 182-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 259-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
 - [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
 - [x] Wave 7 (24 stories, US-600..623): clip enable/disable, loudness-gain project persistence, keyword bins, sequence-from-clip, unused-media removal scope extension, clip grouping, align/distribute, keyframe copy/paste, timeline hover skim, per-effect mask, offset wheel, puppet pin, VP9 alpha export, image-sequence export, export metadata, mov_text subtitle embedding, EDL/FCPXML import, de-esser, audio mixer dock (track-gain export fix), automatic loudness normalization on export, multi-frame camera tracking with keyframe application, bundle adjustment Schur-complement solver
+- [x] Wave 8 (US-700..718): per-entry selftest watchdog and PASS / FAIL / SKIP gate tally, shared export job mapping, audio export byte-compare fixture, linked edge-drag trim (Alt = one side), align/distribute through the rendered transform, surface / mesh / puppet pin tools through the clip transform, special-composite preview parity, legacy keyframe dialog `grade.*` migration and hue / gamma / highlights / shadows keyframes, FCPXML connected clips and audio lanes, batch export queue auto loudness, user preset round-trip, camera-tracking backend tag and UI polish, de-esser dock (live-apply). No MCP tools added (52 tools, G1..G177)
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
