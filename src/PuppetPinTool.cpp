@@ -7,6 +7,7 @@
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <algorithm>
+#include <cmath>
 
 PuppetPinTool::PuppetPinTool(Timeline *timeline, int trackIndex, int clipIndex, QObject *parent)
     : SurfaceTool(nullptr, parent), m_timeline(timeline),
@@ -40,22 +41,21 @@ QVector<WarpPin> PuppetPinTool::currentPins() const
 
 QPointF PuppetPinTool::toWidget(const QPointF &uv) const
 {
-    return m_viewRect.topLeft() + QPointF(uv.x() * m_viewRect.width(), uv.y() * m_viewRect.height());
+    return SurfaceTool::toWidget(uv, m_viewRect);
 }
 
 QPointF PuppetPinTool::toUv(const QPoint &pos) const
 {
-    return QPointF(std::clamp((pos.x() - m_viewRect.left()) / m_viewRect.width(), 0.0, 1.0),
-                   std::clamp((pos.y() - m_viewRect.top()) / m_viewRect.height(), 0.0, 1.0));
+    const QPointF uv = widgetToUv(pos, m_viewRect);
+    return QPointF(std::clamp(uv.x(), 0.0, 1.0), std::clamp(uv.y(), 0.0, 1.0));
 }
 
 int PuppetPinTool::hitTestCorner(const QPoint &pos, const QRectF &rect) const
 {
-    if (!isEnabled() || rect.isEmpty()) return -1;
+    if (!isEnabled() || rect.isEmpty() || !clipMapValid()) return -1;
     const auto pins = currentPins();
     for (int i = pins.size() - 1; i >= 0; --i) {
-        const auto uv = pins[i].deformedPos;
-        const QPointF d = rect.topLeft() + QPointF(uv.x() * rect.width(), uv.y() * rect.height()) - pos;
+        const QPointF d = SurfaceTool::toWidget(pins[i].deformedPos, rect) - pos;
         if (d.x() * d.x() + d.y() * d.y() <= 64.0) return i;
     }
     return -1;
@@ -65,13 +65,14 @@ void PuppetPinTool::paintOverlay(QPainter &painter, const QRectF &rect)
 {
     m_viewRect = rect;
     if (!isEnabled() || rect.isEmpty()) return;
+    syncClipTransform(*m_timeline, m_trackIndex, m_clipIndex);
+    if (!clipMapValid()) return;
     painter.save();
     const auto pins = currentPins();
     for (const auto &pin : pins) {
         painter.setPen(QPen(QColor(255, 200, 50, 150), 1));
         painter.setBrush(Qt::NoBrush);
-        const double radius = pin.radius * qMin(rect.width(), rect.height());
-        painter.drawEllipse(toWidget(pin.originalPos), radius, radius);
+        painter.drawPolygon(sourceCircleToWidget(pin.originalPos, pin.radius, rect));
         painter.drawLine(toWidget(pin.originalPos), toWidget(pin.deformedPos));
         painter.setBrush(QColor(255, 190, 30));
         painter.drawEllipse(toWidget(pin.deformedPos), 6.0, 6.0);
@@ -84,7 +85,8 @@ void PuppetPinTool::paintOverlay(QPainter &painter, const QRectF &rect)
 
 bool PuppetPinTool::handleMousePress(const QPoint &pos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
-    if (!isEnabled() || m_handle >= 0 || m_viewRect.isEmpty() || !m_viewRect.contains(pos)) return false;
+    if (!isEnabled() || m_handle >= 0 || m_viewRect.isEmpty() || !m_viewRect.contains(pos)
+        || !clipMapValid()) return false;
     const int hit = hitTestCorner(pos, m_viewRect);
     auto pins = currentPins();
     if (button == Qt::RightButton) {
@@ -127,6 +129,10 @@ bool PuppetPinTool::handleMousePress(const QPoint &pos, Qt::MouseButton button, 
     m_before = pins;
     m_handle = hit;
     if (hit < 0) {
+        // Outside the clip's drawn area (e.g. a contain letterbox bar) there is
+        // no source pixel to pin.
+        const QPointF raw = widgetToUv(pos, m_viewRect);
+        if (raw.x() < 0.0 || raw.x() > 1.0 || raw.y() < 0.0 || raw.y() > 1.0) return false;
         WarpPin pin;
         pin.originalPos = pin.deformedPos = toUv(pos);
         pin.radius = 0.25;
@@ -148,8 +154,7 @@ bool PuppetPinTool::handleMouseMove(const QPoint &pos, Qt::KeyboardModifiers)
     // A restore/undo can replace the value while keeping the same clip identity.
     if (!puppetpin::equal(currentPins(), m_previewPins)) { m_handle = -1; return false; }
     auto pins = m_dragPins;
-    const QPointF p = pins[m_handle].deformedPos + QPointF(
-        (pos.x() - m_pressPos.x()) / m_viewRect.width(), (pos.y() - m_pressPos.y()) / m_viewRect.height());
+    const QPointF p = pins[m_handle].deformedPos + widgetDeltaToUv(QPointF(pos - m_pressPos), m_viewRect);
     pins[m_handle].deformedPos = QPointF(std::clamp(p.x(), 0.0, 1.0), std::clamp(p.y(), 0.0, 1.0));
     m_previewPins = pins;
     m_timeline->previewClipPuppetPins(m_trackIndex, m_clipIndex, pins);

@@ -6815,6 +6815,21 @@ void MainWindow::setupMenuBar()
         auto *tool = new PuppetPinTool(m_timeline, trackIdx, clipIdx, this);
         m_puppetPinTool = tool;
         tool->setViewRect(m_player->glPreview()->letterboxRect());
+        // US-707: the tool maps through the clip fit + placement the renderer applies
+        // after the warp; paintOverlay re-reads both (and the project canvas) at the
+        // playhead on every repaint.
+        tool->setCanvasProvider([this]() {
+            return QSize(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+        });
+        {
+            const ClipInfo &target = m_timeline->videoTracks()[trackIdx]->clips()[clipIdx];
+            const QSize toolCanvas(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+            const QSize sourceSize = target.filePath.isEmpty() ? QSize()
+                : probeVideoSourceInfo(target.filePath, qMax(1, m_projectConfig.fps)).frameSize;
+            tool->setClipTransform(SurfaceTool::renderedClipTransform(
+                    *m_timeline, trackIdx, clipIdx, currentPlayheadSeconds(), toolCanvas),
+                toolCanvas, sourceSize, target.fitContain, target.fitCover);
+        }
         connect(tool, &PuppetPinTool::previewChanged, this, [this]() {
             refreshSpecialClipPreview();
             if (m_player && m_player->glPreview()) m_player->glPreview()->update();
@@ -6861,6 +6876,21 @@ void MainWindow::setupMenuBar()
         auto *tool = new MeshEditTool(m_timeline, trackIdx, clipIdx, this);
         m_meshEditTool = tool;
         tool->setViewRect(m_player->glPreview()->letterboxRect());
+        // US-707: the tool maps through the clip fit + placement the renderer applies
+        // after the warp; paintOverlay re-reads both (and the project canvas) at the
+        // playhead on every repaint.
+        tool->setCanvasProvider([this]() {
+            return QSize(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+        });
+        {
+            const ClipInfo &target = m_timeline->videoTracks()[trackIdx]->clips()[clipIdx];
+            const QSize toolCanvas(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+            const QSize sourceSize = target.filePath.isEmpty() ? QSize()
+                : probeVideoSourceInfo(target.filePath, qMax(1, m_projectConfig.fps)).frameSize;
+            tool->setClipTransform(SurfaceTool::renderedClipTransform(
+                    *m_timeline, trackIdx, clipIdx, currentPlayheadSeconds(), toolCanvas),
+                toolCanvas, sourceSize, target.fitContain, target.fitCover);
+        }
         connect(tool, &MeshEditTool::previewChanged, this, [this]() {
             refreshSpecialClipPreview();
             if (m_player && m_player->glPreview()) m_player->glPreview()->update();

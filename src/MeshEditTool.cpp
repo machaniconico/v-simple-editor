@@ -41,12 +41,12 @@ MeshGrid MeshEditTool::currentGrid() const
 
 QPointF MeshEditTool::toWidget(const QPointF &uv) const
 {
-    return m_viewRect.topLeft() + QPointF(uv.x() * m_viewRect.width(), uv.y() * m_viewRect.height());
+    return SurfaceTool::toWidget(uv, m_viewRect);
 }
 
 int MeshEditTool::hitTest(const QPoint &pos) const
 {
-    if (!isEnabled() || m_viewRect.isEmpty()) return -1;
+    if (!isEnabled() || m_viewRect.isEmpty() || !clipMapValid()) return -1;
     const MeshGrid grid = currentGrid();
     for (int r = 0; r < grid.rows; ++r)
         for (int c = 0; c < grid.cols; ++c) {
@@ -60,6 +60,8 @@ void MeshEditTool::paintOverlay(QPainter &painter, const QRectF &rect)
 {
     setViewRect(rect);
     if (!isEnabled() || rect.isEmpty()) return;
+    syncClipTransform(*m_timeline, m_trackIndex, m_clipIndex);
+    if (!clipMapValid()) return;
     const MeshGrid grid = currentGrid();
     painter.save();
     painter.setPen(QPen(QColor(0, 200, 255, 220), 1));
@@ -94,8 +96,7 @@ bool MeshEditTool::handleMouseMove(const QPoint &pos, Qt::KeyboardModifiers)
     if (m_handle < 0 || !isEnabled() || m_viewRect.isEmpty()) return false;
     MeshGrid grid = m_dragGrid;
     grid.controlPoints[m_handle / grid.cols][m_handle % grid.cols] +=
-        QPointF((pos.x() - m_pressPos.x()) / m_viewRect.width(),
-                (pos.y() - m_pressPos.y()) / m_viewRect.height());
+        widgetDeltaToUv(QPointF(pos - m_pressPos), m_viewRect);
     m_previewGrid = grid;
     m_previewApplied = true;
     m_timeline->previewClipMeshWarp(m_trackIndex, m_clipIndex, grid);

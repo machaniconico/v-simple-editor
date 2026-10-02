@@ -235,6 +235,7 @@ int runSubMovtextSelftest();
 int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
 int runSubXlatSelftest();
+int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTextBasedEditSelftest();
 int runTextSpacingSelftest();
@@ -749,9 +750,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
       "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize gates (G1-G7)" },
     { "puppet-pin", "VEDITOR_PUPPET_PIN_SELFTEST", runPuppetPinSelftest, true,
-      "正規化パペットピン・描画・保存・Undo (G1-G5)" },
+      "正規化パペットピン・描画・保存・Undo・クリップ変換込みの配置 (G1-G6)" },
     { "mesh-warp", "VEDITOR_MESH_WARP_SELFTEST", runMeshWarpSelftest, true,
       "正規化メッシュワープ・描画・保存・Undo・グリッド編集・4隅ピン (G1-G7)" },
+    { "surface-tool", "VEDITOR_SURFACE_TOOL_SELFTEST", runSurfaceToolSelftest, true,
+      "サーフェスツールの画面座標とソース UV をフィット・クリップ変換込みで往復・ドラッグ量・解像度変更・scale 0・影響円・余白クリック (G1-G10)" },
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,

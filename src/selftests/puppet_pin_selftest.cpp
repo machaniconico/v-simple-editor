@@ -5,6 +5,7 @@
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
 #include "../libavcore/Encode.h"
+#include "SelftestGate.h"
 
 #include <QTemporaryDir>
 #include <cmath>
@@ -72,11 +73,8 @@ QImage gradient(QSize size)
 
 int runPuppetPinSelftest()
 {
-    int pass = 0, fail = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::cerr << (ok ? "PASS G" : "FAIL G") << n << '\n';
-        ok ? ++pass : ++fail;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     QTemporaryDir directory;
     const QSize size(320, 180);
     const QString path = directory.filePath(QStringLiteral("puppet.mp4"));
@@ -219,6 +217,59 @@ int runPuppetPinSelftest()
     timeline.undo();
     resetOk &= puppetpin::equal(pins, timeline.videoTracks()[0]->clips()[0].puppetPins);
     gate(5, resetOk);
-    std::cerr << "summary: " << pass << " PASS, " << fail << " FAIL\n";
-    return fail;
+
+    // G6 (US-707): on a clip placed with videoDx=+0.25 the pin lands where it
+    // was clicked. A single pin shifts its whole influence disk uniformly, so
+    // the changed region is that disk, centred on the pin's original position.
+    ClipInfo shifted = clip;
+    shifted.videoDx = 0.25;
+    restore(shifted);
+    const QImage shiftedPlain = render();
+    PuppetPinTool placing(&timeline, 0, 0);
+    placing.setViewRect(view);
+    placing.setClipTransform(SurfaceTool::renderedClipTransform(timeline, 0, 0, 0.0, size), size);
+    // Source centre: canvas x 160 + 0.25 * 320 = 240 -> screen 10 + 240 * 2.
+    const QPoint clickAt(490, 200);
+    const bool placed = placing.handleMousePress(clickAt, Qt::LeftButton, Qt::NoModifier)
+        && placing.handleMouseMove(clickAt + QPoint(20, 0), Qt::NoModifier)
+        && placing.handleMouseRelease(clickAt + QPoint(20, 0), Qt::LeftButton, Qt::NoModifier);
+    const auto placedPins = timeline.videoTracks()[0]->clips()[0].puppetPins;
+    const QImage shiftedWarp = render();
+    double maxDiff = 0.0;
+    QVector<double> diff;
+    const bool comparable = !shiftedPlain.isNull() && shiftedPlain.size() == shiftedWarp.size();
+    if (comparable) {
+        diff.resize(size.width() * size.height());
+        for (int y = 0; y < size.height(); ++y)
+            for (int x = 0; x < size.width(); ++x) {
+                const QColor a = shiftedPlain.pixelColor(x, y), b = shiftedWarp.pixelColor(x, y);
+                const double d = std::abs(a.red() - b.red()) + std::abs(a.green() - b.green())
+                    + std::abs(a.blue() - b.blue());
+                diff[y * size.width() + x] = d;
+                maxDiff = std::max(maxDiff, d);
+            }
+    }
+    double cx = 0.0, cy = 0.0;
+    int changed = 0;
+    for (int i = 0; i < diff.size(); ++i)
+        if (maxDiff > 0.0 && diff[i] >= 0.5 * maxDiff) {
+            cx += i % size.width() + 0.5;
+            cy += i / size.width() + 0.5;
+            ++changed;
+        }
+    const QPointF centroid = changed
+        ? QPointF(view.x() + cx / changed * view.width() / size.width(),
+                  view.y() + cy / changed * view.height() / size.height())
+        : QPointF(-1.0, -1.0);
+    const double offset = std::hypot(centroid.x() - clickAt.x(), centroid.y() - clickAt.y());
+    std::cerr << "puppet-pin G6 placed=" << placed << " pins=" << placedPins.size();
+    if (placedPins.size() == 1)
+        std::cerr << " originalUv=(" << placedPins[0].originalPos.x() << ","
+                  << placedPins[0].originalPos.y() << ") deformedUv=("
+                  << placedPins[0].deformedPos.x() << "," << placedPins[0].deformedPos.y() << ")";
+    std::cerr << " maxDiff=" << maxDiff << " changedPx=" << changed << " centroid=("
+              << centroid.x() << "," << centroid.y() << ") click=(" << clickAt.x() << ","
+              << clickAt.y() << ") offset=" << offset << "px\n";
+    gate(6, fixture && placed && placedPins.size() == 1 && changed > 0 && offset <= 3.0);
+    return tally.finish("puppet-pin");
 }
