@@ -8,6 +8,7 @@
 #include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 #include <QColor>
+#include <QFile>
 #include <QImage>
 #include <QPair>
 #include <QRectF>
@@ -843,6 +844,172 @@ int runAlignDistributeSelftest()
             ok = values && noKeys && oneUndo && ok;
         }
         gate(7, ok);
+    }
+    // G8-G11 (US-805): the alignment's parent gate is tlrender::parentLayerAt,
+    // so it matches the renderer in the three forms where a separate interval
+    // check used to disagree. Tracks: V1 Null base (0..3 s), V2 parent(s), V3
+    // child (scale 0.3, top half), V4 plain clip (scale 0.3, bottom half).
+    // Only the child and the plain clip are selected. After Left, the rendered
+    // left edge of both must be the canvas left edge (0 px, +-1).
+    const auto parentedLeft = [&](int n, const char *label, const QVector<ClipInfo> &parents,
+                                  int parentClip, double childDx, double playhead) {
+        ClipInfo child = mediaClip(media, 0.3, childDx, -0.25);
+        ClipInfo plain = mediaClip(media, 0.3, -0.15, 0.25);
+        Timeline tl;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{makeNullObject()}, parents, {child},
+                                                         {plain}},
+                              QVector<QVector<ClipInfo>>{}, playhead, -1.0, -1.0, 100);
+        tl.setProjectOutputConfig(kRenderW, kRenderH, true);
+        tl.setLinkedSelectionEnabled(false);
+        tl.clearSelection();
+        tl.videoTracks()[2]->toggleClipSelection(0);
+        tl.videoTracks()[3]->toggleClipSelection(0);
+        tl.setClipParent(trackMatteClipKey(2, 0), trackMatteClipKey(1, parentClip));
+        finishSetup(tl);
+        const qint64 usec = qint64(playhead * 1000000.0);
+        const auto hit = tlrender::parentLayerAt(&tl, usec, 1, parentClip);
+        const QPair<int, int> before = opaqueColumns(renderAt(tl, playhead), 0, kRenderH / 2);
+        const bool arranged = tl.selectedArrangementTargets().size() == 2
+            && tl.arrangeSelectedLayers(Arrangement::Left);
+        const QImage frame = renderAt(tl, playhead);
+        const QPair<int, int> childSpan = opaqueColumns(frame, 0, kRenderH / 2);
+        const QPair<int, int> plainSpan = opaqueColumns(frame, kRenderH / 2, kRenderH);
+        const int widthBefore = before.second - before.first;
+        const int widthAfter = childSpan.second - childSpan.first;
+        std::fprintf(stderr, "[align-distribute] G%d %s timelineSec=%.6f parentHit=%d "
+                     "parentLocalSec=%.6f parentSourceSec=%.6f decodable=%d arranged=%d "
+                     "childLeftBefore=%d childLeft=%d plainLeft=%d expectedLeft=0 "
+                     "childWidthBefore=%d childWidth=%d\n",
+                     n, label, playhead, hit ? 1 : 0, hit ? hit->clipLocalSeconds : -1.0,
+                     hit ? hit->sourceSeconds : -1.0, hit && hit->decodable ? 1 : 0, arranged,
+                     before.first, childSpan.first, plainSpan.first, widthBefore, widthAfter);
+        return arranged && childSpan.first >= 0 && plainSpan.first >= 0
+            && childSpan.first <= 1 && plainSpan.first <= 1
+            && std::abs(widthAfter - widthBefore) <= 1 && before.first > 10;
+    };
+    const auto crossDissolve = [](ClipInfo &out, ClipInfo &in, TransitionAlignment alignment) {
+        out.trailOut.type = in.leadIn.type = TransitionType::CrossDissolve;
+        out.trailOut.duration = in.leadIn.duration = 1.0;
+        out.trailOut.alignment = in.leadIn.alignment = alignment;
+    };
+    if (!haveMedia) {
+        for (int n = 8; n <= 11; ++n)
+            tally.skip(n, "synthetic media could not be encoded");
+    } else {
+        // G8 (a): an offline parent (regular clip, file missing, videoDx=+0.2)
+        // is dropped by the renderer, so the child renders raw and must be
+        // aligned raw (a +80 px parent shift would clip it at the left edge).
+        {
+            const QString offline = dir.path() + QStringLiteral("/offline-parent.mp4");
+            ClipInfo parent = mediaClip(offline, 1.0, 0.2, 0.0);
+            const bool missing = !QFile::exists(offline);
+            gate(8, missing && parentedLeft(8, "offline-parent", {parent}, 0, 0.1, 1.0));
+        }
+        // G9 (b): V2 A [0,2) and B [2,4) with a 1 s Center cross dissolve, so
+        // they overlap on [1.5, 2.5). At 2.2 s the renderer draws A (outgoing
+        // wins); B (videoDx=+0.2, the child's parent) is not a layer, so the
+        // child renders raw although 2.2 s is inside B's nominal interval.
+        {
+            ClipInfo a = makeNullObject(0.0);
+            ClipInfo b = makeNullObject(0.2);
+            a.duration = 3.0;  a.inPoint = 0.0; a.outPoint = 2.0;
+            b.duration = 3.0;  b.inPoint = 1.0; b.outPoint = 3.0;
+            crossDissolve(a, b, TransitionAlignment::Center);
+            gate(9, parentedLeft(9, "overlap-B-not-drawn", {a, b}, 1, 0.1, 2.2));
+        }
+        // G10 (c): US-706 r6 repro. Null parent V2 clip 0 (inPoint 1, outPoint 3,
+        // duration 4, videoDx=+0.2) with a 1 s Start cross dissolve into clip 1:
+        // at 2.5 s (past its nominal end 2.0) the renderer still draws it and
+        // composes the child. r6 measured an 80 px gap here. Second case: the
+        // parent's x is keyed 0 s 0.0 -> 3 s 0.3 (clip-local), so the parent
+        // transform must be evaluated at clip-local 2.5 s (0.25), not the
+        // nominal-end clamp 2.0 s (0.2, a 20 px error).
+        {
+            ClipInfo a = makeNullObject(0.2);
+            ClipInfo b = makeNullObject(0.0);
+            a.duration = 4.0;  a.inPoint = 1.0; a.outPoint = 3.0;
+            b.duration = 4.0;  b.inPoint = 1.0; b.outPoint = 3.0;
+            crossDissolve(a, b, TransitionAlignment::Start);
+            bool ok10 = parentedLeft(10, "start-trail-r6", {a, b}, 0, 0.0, 2.5);
+            ClipInfo keyedA = a;
+            KeyframeTrack track(QStringLiteral("motion.position.x"), 0.0);
+            track.addKeyframe(0.0, 0.0);
+            track.addKeyframe(3.0, 0.3);
+            keyedA.keyframes.addTrack(track);
+            std::fprintf(stderr, "[align-distribute] G10 keyed parent dx at localSec 2.5=%.6f "
+                         "(nominal-end clamp 2.0=%.6f)\n",
+                         clipanim::effectiveTransformAt(keyedA, 2.5).videoDx,
+                         clipanim::effectiveTransformAt(keyedA, 2.0).videoDx);
+            ok10 = parentedLeft(10, "start-trail-keyed", {keyedA, b}, 0, 0.0, 2.5) && ok10;
+            gate(10, ok10);
+        }
+        // G11 (US-805 r1): the selected child itself has position keys and sits
+        // in a borrowed transition interval. V3 child A (media, clip-local x keys
+        // 0 s -0.3 -> 3 s +0.3, nominal [0, 2)) has a 1 s Start cross dissolve
+        // into a Null B, so at 2.5 s the renderer draws A at clip-local 2.5 s
+        // (x 0.2), not at the nominal-end clamp 2.0 s (x 0.1, 40 px off). The
+        // alignment key must be written at clip-local 2.5 s. Cases: unparented,
+        // and parented to a V2 Null (videoDx +0.1).
+        {
+            bool ok11 = true;
+            for (const bool withParent : {false, true}) {
+                ClipInfo child = mediaClip(media, 0.3, 0.0, -0.25);
+                child.duration = 3.0;  child.inPoint = 0.0; child.outPoint = 2.0;
+                KeyframeTrack keys(QStringLiteral("motion.position.x"), 0.0);
+                keys.addKeyframe(0.0, -0.3);
+                keys.addKeyframe(3.0, 0.3);
+                child.keyframes.addTrack(keys);
+                ClipInfo b = makeNullObject(0.0);
+                b.duration = 3.0;  b.inPoint = 0.0; b.outPoint = 1.0;
+                crossDissolve(child, b, TransitionAlignment::Start);
+                ClipInfo plain = mediaClip(media, 0.3, -0.15, 0.25);
+                const double playhead = 2.5;
+                Timeline tl;
+                tl.restoreFromProject(QVector<QVector<ClipInfo>>{{makeNullObject()},
+                                                                 {makeNullObject(0.1)},
+                                                                 {child, b}, {plain}},
+                                      QVector<QVector<ClipInfo>>{}, playhead, -1.0, -1.0, 100);
+                tl.setProjectOutputConfig(kRenderW, kRenderH, true);
+                tl.setLinkedSelectionEnabled(false);
+                tl.clearSelection();
+                tl.videoTracks()[2]->toggleClipSelection(0);
+                tl.videoTracks()[3]->toggleClipSelection(0);
+                if (withParent)
+                    tl.setClipParent(trackMatteClipKey(2, 0), trackMatteClipKey(1, 0));
+                finishSetup(tl);
+                const auto childHit = tlrender::parentLayerAt(&tl, qint64(playhead * 1000000.0),
+                                                              2, 0);
+                const double clampedLocalSec = 2.0;   // nominal end of child A
+                const QPair<int, int> before = opaqueColumns(renderAt(tl, playhead), 0,
+                                                             kRenderH / 2);
+                const bool arranged = tl.selectedArrangementTargets().size() == 2
+                    && tl.arrangeSelectedLayers(Arrangement::Left);
+                const QImage frame = renderAt(tl, playhead);
+                const QPair<int, int> childSpan = opaqueColumns(frame, 0, kRenderH / 2);
+                const QPair<int, int> plainSpan = opaqueColumns(frame, kRenderH / 2, kRenderH);
+                const KeyframeTrack *written = positionX(tl.videoTracks()[2]->clips()[0]);
+                const double keyAtRender = written ? keyAt(written, 2.5) : std::nan("");
+                const double keyAtClamp = written ? keyAt(written, clampedLocalSec) : std::nan("");
+                const int widthBefore = before.second - before.first;
+                const int widthAfter = childSpan.second - childSpan.first;
+                std::fprintf(stderr, "[align-distribute] G11 %s timelineSec=%.6f childHit=%d "
+                             "childRenderLocalSec=%.6f childClampedLocalSec=%.6f "
+                             "childSourceSec=%.6f arranged=%d childLeftBefore=%d childLeft=%d "
+                             "plainLeft=%d expectedLeft=0 childWidthBefore=%d childWidth=%d "
+                             "keyAt2.5=%.6f keyAt2.0=%.6f\n",
+                             withParent ? "parented" : "unparented", playhead,
+                             childHit ? 1 : 0, childHit ? childHit->clipLocalSeconds : -1.0,
+                             clampedLocalSec, childHit ? childHit->sourceSeconds : -1.0,
+                             arranged, before.first, childSpan.first, plainSpan.first,
+                             widthBefore, widthAfter, keyAtRender, keyAtClamp);
+                ok11 = arranged && childHit && std::abs(childHit->clipLocalSeconds - 2.5) < 1e-9
+                    && childSpan.first >= 0 && childSpan.first <= 1
+                    && plainSpan.first >= 0 && plainSpan.first <= 1
+                    && std::abs(widthAfter - widthBefore) <= 1 && before.first > 10
+                    && std::isfinite(keyAtRender) && std::isnan(keyAtClamp) && ok11;
+            }
+            gate(11, ok11);
+        }
     }
     return tally.finish("[align-distribute]");
 }

@@ -1,5 +1,6 @@
 #include "RenderInPlace.h"
 #include "Timeline.h"
+#include "TimelineFrameRenderer.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
 #include "AudioClipEditor.h"
@@ -5479,39 +5480,45 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
             cursor += clips[i].leadInSec + clips[i].effectiveDuration();
         return cursor + clips[clipIdx].leadInSec;
     };
-    const auto localSecondsAt = [&](int trackIdx, int clipIdx) {
+    const auto clampedLocalSecondsAt = [&](int trackIdx, int clipIdx) {
         const auto &clip = m_videoTracks[trackIdx]->clips()[clipIdx];
         return qBound(0.0, m_playheadPos - clipStart(trackIdx, clipIdx),
                       clip.effectiveDuration());
     };
-    const auto activeParentLayer = [&](const QString &key, int *trackIdx, int *clipIdx) {
+    // US-805: the parent is active exactly when the renderer composites it as a
+    // layer (tlrender::parentLayerAt: base track, hidden track, disabled /
+    // adjustment clip, overlap selection and transition trail included) and its
+    // media is statically decodable; otherwise the child renders raw. The
+    // parent's transform is evaluated at the clip-local seconds the gate returns.
+    const qint64 playheadUsec = qRound64(m_playheadPos * 1'000'000.0);
+    // US-805: clip-local seconds the renderer evaluates a selected clip at
+    // (unclamped; inside a borrowed transition interval it runs past the
+    // nominal end / before the nominal start). Falls back to the clamped
+    // nominal time where the gate has no hit (V1, outside the clip's layer).
+    const auto renderLocalSecondsAt = [&](int trackIdx, int clipIdx) {
+        const auto hit = tlrender::parentLayerAt(this, playheadUsec, trackIdx, clipIdx);
+        return hit ? hit->clipLocalSeconds : clampedLocalSecondsAt(trackIdx, clipIdx);
+    };
+    const auto activeParentLayer = [&](const QString &key, int *trackIdx, int *clipIdx,
+                                       double *localSec) {
         const QStringList parts = key.split(QLatin1Char(':'));
         if (parts.size() != 2) return false;
         bool okTrack = false, okClip = false;
         const int t = parts[0].toInt(&okTrack), c = parts[1].toInt(&okClip);
-        // Track 0 is the renderer's base layer, which cannot act as a parent.
-        if (!okTrack || !okClip || t <= 0 || t >= m_videoTracks.size()) return false;
-        const auto *track = m_videoTracks[t];
-        if (track->isHidden() || c < 0 || c >= track->clipCount()) return false;
-        const double start = clipStart(t, c);
-        const double end = start + track->clips()[c].effectiveDuration();
-        if (m_playheadPos < start || m_playheadPos >= end) return false;
-        // The renderer builds no parent layer for a hidden regular clip
-        // (clipenabletest::disabled) or an adjustment clip, so its child renders raw.
-        const ClipInfo &parentClip = track->clips()[c];
-        if (parentClip.isAdjustment
-            || (!parentClip.visible && !clipgeom::isNullObjectFilePath(parentClip.filePath)))
-            return false;
+        if (!okTrack || !okClip) return false;
+        const auto hit = tlrender::parentLayerAt(this, playheadUsec, t, c);
+        if (!hit || !hit->decodable) return false;
         *trackIdx = t;
         *clipIdx = c;
+        *localSec = hit->clipLocalSeconds;
         return true;
     };
     // 0 = no parent, 1 = parented (*parentWorld set), -1 = broken chain (renders raw).
     std::function<int(int, int, int, QVector<QString> &, clipgeom::ClipTransform *)> resolveParent;
-    const auto resolveWorld = [&](int trackIdx, int clipIdx, int depth, QVector<QString> &stack,
-                                  clipgeom::ClipTransform *world) {
+    const auto resolveWorld = [&](int trackIdx, int clipIdx, double localSec, int depth,
+                                  QVector<QString> &stack, clipgeom::ClipTransform *world) {
         const auto &clip = m_videoTracks[trackIdx]->clips()[clipIdx];
-        *world = clipanim::effectiveTransformAt(clip, localSecondsAt(trackIdx, clipIdx));
+        *world = clipanim::effectiveTransformAt(clip, localSec);
         if (depth > 8) return true;
         clipgeom::ClipTransform parentWorld;
         const int parented = resolveParent(trackIdx, clipIdx, depth, stack, &parentWorld);
@@ -5526,17 +5533,19 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
         const QString parentKey = m_clipParentEntries.value(key);
         if (parentKey.isEmpty()) return 0;
         int parentTrack = -1, parentClip = -1;
-        if (!activeParentLayer(parentKey, &parentTrack, &parentClip)
+        double parentLocalSec = 0.0;
+        if (!activeParentLayer(parentKey, &parentTrack, &parentClip, &parentLocalSec)
             || parentKey == key || stack.contains(key) || stack.contains(parentKey))
             return -1;
         stack.append(key);
-        const bool ok = resolveWorld(parentTrack, parentClip, depth + 1, stack, parentWorld);
+        const bool ok = resolveWorld(parentTrack, parentClip, parentLocalSec, depth + 1, stack,
+                                     parentWorld);
         stack.removeLast();
         return ok ? 1 : -1;
     };
     struct Item {
         GroupClipTarget target; double start = 0.0; double length = 0.0;
-        double localSec = 0.0; ClipInfo original; double goal = 0.0;
+        double renderLocalSec = 0.0; ClipInfo original; double goal = 0.0;
         bool wrote = false;
     };
     const auto clipOf = [&](const Item &item) {
@@ -5545,7 +5554,7 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
     // Bounds as renderFrameAt draws the clip at the playhead (the rendering SSOT,
     // including its center pivot, scale and rotation) under the current parent chain.
     const auto boundsOf = [&](const Item &item, const ClipInfo &clip) {
-        clipgeom::ClipTransform transform = clipanim::effectiveTransformAt(clip, item.localSec);
+        clipgeom::ClipTransform transform = clipanim::effectiveTransformAt(clip, item.renderLocalSec);
         clipgeom::ClipTransform parentWorld;
         QVector<QString> stack;
         if (resolveParent(item.target.trackIndex, item.target.clipIndex, 0, stack,
@@ -5568,7 +5577,7 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
     for (const auto &target : selectedArrangementTargets()) {
         Item item;
         item.target = target;
-        item.localSec = localSecondsAt(target.trackIndex, target.clipIndex);
+        item.renderLocalSec = renderLocalSecondsAt(target.trackIndex, target.clipIndex);
         item.original = clipOf(item);
         const QRectF bounds = boundsOf(item, item.original);
         item.start = horizontal ? bounds.left() : bounds.top();
@@ -5697,7 +5706,7 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
         auto *track = m_videoTracks[item.target.trackIndex];
         const ClipInfo base = clipOf(item);
         // Re-evaluate against the current (possibly just moved) parent chain.
-        const clipgeom::ClipTransform local = clipanim::effectiveTransformAt(base, item.localSec);
+        const clipgeom::ClipTransform local = clipanim::effectiveTransformAt(base, item.renderLocalSec);
         clipgeom::ClipTransform parentWorld;
         QVector<QString> stack;
         const bool parented = resolveParent(item.target.trackIndex, item.target.clipIndex, 0,
@@ -5717,13 +5726,13 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
         const auto candidate = [&](double s) {
             ClipInfo clip = base;
             if (s == 0.0) return clip;   // ux/uy are non-finite under a zero-scale parent
-            moveAxis(clip, item.localSec, true, local.videoDx, s * ux);
-            moveAxis(clip, item.localSec, false, local.videoDy, s * uy);
+            moveAxis(clip, item.renderLocalSec, true, local.videoDx, s * ux);
+            moveAxis(clip, item.renderLocalSec, false, local.videoDy, s * uy);
             return clip;
         };
         const auto residual = [&](double s) {
             clipgeom::ClipTransform transform =
-                clipanim::effectiveTransformAt(candidate(s), item.localSec);
+                clipanim::effectiveTransformAt(candidate(s), item.renderLocalSec);
             if (parented) transform = clipgeom::composeParented(transform, parentWorld, canvas);
             return edgeOf(clipgeom::resolveTransform(transform, canvas)
                               .mapRect(QRectF(QPointF(0, 0), QSizeF(canvas)))) - item.goal;

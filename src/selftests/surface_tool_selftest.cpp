@@ -5,15 +5,23 @@
 #include "../PuppetPinTool.h"
 #include "../SurfaceTool.h"
 #include "../Timeline.h"
+#include "../TimelineFrameRenderer.h"
+#include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../WarpDistortion.h"
+#include "../clipanim/ClipAnim.h"
+#include "../libavcore/Encode.h"
 #include "../playback/SnsFit.h"
 #include "SelftestGate.h"
 
+#include <QFile>
 #include <QImage>
 #include <QPainter>
+#include <QTemporaryDir>
+#include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <optional>
 #include <string>
 
 namespace {
@@ -129,6 +137,69 @@ double meshDragDisplacement(const clipgeom::ClipTransform &t, bool *pressed)
         : 0.0;
     tool.cancelDrag();
     return moved;
+}
+
+// US-805 parent-gate cases: opaque synthetic media through FrameEncoder.
+bool writeOpaqueClip(const QString &path)
+{
+    libavcore::EncodeRequest req;
+    req.width = 40;
+    req.height = 24;
+    req.fps = 10;
+    req.fpsNum = 10;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req)) return false;
+    for (int i = 0; i < 30; ++i) {
+        QImage frame(req.width, req.height, QImage::Format_RGB888);
+        frame.fill(QColor(200, (i * 7) & 255, 60));
+        if (!encoder.pushFrame(frame, i)) return false;
+    }
+    return !encoder.finalize();
+}
+
+// Bounds [left, right) x [top, bottom) of non-transparent pixels; null if none.
+QRectF opaqueBounds(const QImage &frame)
+{
+    const QImage image = frame.convertToFormat(QImage::Format_ARGB32);
+    int minX = -1, maxX = -1, minY = -1, maxY = -1;
+    for (int y = 0; y < image.height(); ++y) {
+        const auto *row = reinterpret_cast<const QRgb *>(image.constScanLine(y));
+        for (int x = 0; x < image.width(); ++x) {
+            if (qAlpha(row[x]) == 0) continue;
+            if (minX < 0 || x < minX) minX = x;
+            maxX = qMax(maxX, x);
+            if (minY < 0) minY = y;
+            maxY = y;
+        }
+    }
+    if (minX < 0) return {};
+    return QRectF(QPointF(minX, minY), QPointF(maxX + 1, maxY + 1));
+}
+
+ClipInfo nullParent(double dx, double inPoint, double outPoint, double duration)
+{
+    ClipInfo clip;
+    clip.filePath = clipgeom::nullObjectFilePath();
+    clip.duration = duration;
+    clip.inPoint = inPoint;
+    clip.outPoint = outPoint;
+    clip.videoDx = dx;
+    clip.opacity = 0.0;
+    clip.visible = false;
+    return clip;
+}
+
+void crossDissolve(ClipInfo &out, ClipInfo &in, TransitionAlignment alignment)
+{
+    out.trailOut.type = in.leadIn.type = TransitionType::CrossDissolve;
+    out.trailOut.duration = in.leadIn.duration = 1.0;
+    out.trailOut.alignment = in.leadIn.alignment = alignment;
 }
 } // namespace
 
@@ -361,6 +432,167 @@ int runSurfaceToolSelftest()
         std::cerr << '\n';
         tally.gate(10, !barAccepted && pinsAfterBar == 0 && pictureAccepted && pins.size() == 1
                            && std::abs(pins[0].originalPos.x() - 0.5) < 1e-9);
+    }
+
+    // G11 / G12 (US-805): renderedClipTransform's parent gate is
+    // tlrender::parentLayerAt, so in the three forms where a separate interval
+    // check used to disagree the tool placement (static call, and MeshEditTool /
+    // PuppetPinTool after a repaint re-reads it at the playhead) equals what
+    // renderFrameAt draws. Tracks: V1 Null base, V2 parent(s), V3 child (media,
+    // scale 0.3, videoDx 0.1). Canvas 400x200, view == canvas (1 px = 1 px).
+    // `expectedParentLocal` < 0 means the renderer draws the child raw.
+    QTemporaryDir mediaDir;
+    const QString media = mediaDir.path() + QStringLiteral("/surface-parent.mp4");
+    const bool haveMedia = mediaDir.isValid() && writeOpaqueClip(media);
+    const QSize renderCanvas(400, 200);
+    const QRectF renderView(QPointF(0, 0), QSizeF(renderCanvas));
+    // `childKeys` (G13): the child gets these x keys and a nominal [0, 2) with
+    // a 1 s Start cross dissolve into a Null, so it is drawn past its end.
+    // Empty `parents`: the child has no parent link.
+    const auto parentCase = [&](const char *label, const QVector<ClipInfo> &parents,
+                                int parentClip, double timelineSec, double expectedParentLocal,
+                                const KeyframeTrack *childKeys = nullptr) {
+        ClipInfo base = nullParent(0.0, 0.0, 4.0, 4.0);
+        ClipInfo child;
+        child.filePath = media;
+        child.duration = child.outPoint = 3.0;
+        child.videoScale = 0.3;
+        child.videoDx = 0.1;
+        QVector<ClipInfo> childTrack{child};
+        if (childKeys) {
+            childTrack[0].outPoint = 2.0;
+            childTrack[0].keyframes.addTrack(*childKeys);
+            childTrack.append(nullParent(0.0, 0.0, 1.0, 3.0));
+            crossDissolve(childTrack[0], childTrack[1], TransitionAlignment::Start);
+        }
+        Timeline tl;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{base}, parents, childTrack},
+                              QVector<QVector<ClipInfo>>{}, timelineSec, -1.0, -1.0, 100);
+        tl.setProjectOutputConfig(renderCanvas.width(), renderCanvas.height(), true);
+        if (!parents.isEmpty())
+            tl.setClipParent(trackMatteClipKey(2, 0), trackMatteClipKey(1, parentClip));
+        const auto hit = parents.isEmpty() ? std::optional<tlrender::ParentLayerHit>{}
+            : tlrender::parentLayerAt(&tl, qRound64(timelineSec * 1e6), 1, parentClip);
+        const auto childHit = tlrender::parentLayerAt(&tl, qRound64(timelineSec * 1e6), 2, 0);
+        // Expected placement, built from the clips directly: child at its own
+        // clip-local time (starts at 0), parent at the renderer's clip-local time.
+        const clipgeom::ClipTransform childRaw = clipanim::effectiveTransformAt(
+            tl.videoTracks()[2]->clips()[0], timelineSec);
+        const clipgeom::ClipTransform expected = expectedParentLocal < 0.0 ? childRaw
+            : clipgeom::composeParented(childRaw, clipanim::effectiveTransformAt(
+                  tl.videoTracks()[1]->clips()[parentClip], expectedParentLocal), renderCanvas);
+        const clipgeom::ClipTransform got =
+            SurfaceTool::renderedClipTransform(tl, 2, 0, timelineSec, renderCanvas);
+        const bool sameTransform = std::abs(got.videoScale - expected.videoScale) < 1e-9
+            && std::abs(got.videoDx - expected.videoDx) < 1e-9
+            && std::abs(got.videoDy - expected.videoDy) < 1e-9
+            && std::abs(got.rotationDeg - expected.rotationDeg) < 1e-9;
+        const QRectF toolRect = clipgeom::resolveTransform(got, renderCanvas)
+            .mapRect(renderView);
+        const QRectF drawn = opaqueBounds(tlrender::renderFrameAt(
+            &tl, qRound64(timelineSec * 1e6), renderCanvas));
+        // The tools' own placement after a repaint (syncClipTransform at the playhead).
+        const auto toolBounds = [&](SurfaceTool &tool) {
+            tool.setCanvasProvider([&]() { return renderCanvas; });
+            tool.setClipTransform(clipgeom::ClipTransform{}, renderCanvas);
+            QImage surface(renderCanvas, QImage::Format_ARGB32_Premultiplied);
+            surface.fill(Qt::transparent);
+            {
+                QPainter painter(&surface);
+                tool.paintOverlay(painter, renderView);
+            }
+            return QRectF(tool.toWidget(QPointF(0, 0), renderView),
+                          tool.toWidget(QPointF(1, 1), renderView)).normalized();
+        };
+        MeshEditTool mesh(&tl, 2, 0);
+        PuppetPinTool puppet(&tl, 2, 0);
+        const QRectF meshRect = toolBounds(mesh);
+        const QRectF puppetRect = toolBounds(puppet);
+        const auto edgeErr = [&](const QRectF &r) {
+            if (drawn.isNull() || r.isNull()) return 1e9;
+            return std::max({std::abs(r.left() - drawn.left()), std::abs(r.right() - drawn.right()),
+                             std::abs(r.top() - drawn.top()), std::abs(r.bottom() - drawn.bottom())});
+        };
+        const double staticErr = edgeErr(toolRect), meshErr = edgeErr(meshRect),
+                     puppetErr = edgeErr(puppetRect);
+        const auto rectText = [](const QRectF &r) {
+            return "[" + std::to_string(r.left()) + "," + std::to_string(r.top()) + " "
+                + std::to_string(r.right()) + "," + std::to_string(r.bottom()) + "]";
+        };
+        std::cerr << "surface-tool " << label << " timelineSec=" << timelineSec
+                  << " parentHit=" << (hit ? 1 : 0)
+                  << " parentLocalSec=" << (hit ? hit->clipLocalSeconds : -1.0)
+                  << " parentSourceSec=" << (hit ? hit->sourceSeconds : -1.0)
+                  << " decodable=" << (hit && hit->decodable ? 1 : 0)
+                  << " expectedParentLocalSec=" << expectedParentLocal
+                  << " childRenderLocalSec=" << (childHit ? childHit->clipLocalSeconds : -1.0)
+                  << " childClampedLocalSec="
+                  << qBound(0.0, timelineSec, tl.videoTracks()[2]->clips()[0].effectiveDuration())
+                  << " gotDx=" << got.videoDx << " expectedDx=" << expected.videoDx
+                  << " sameTransform=" << sameTransform << " drawn=" << rectText(drawn)
+                  << " static=" << rectText(toolRect) << " mesh=" << rectText(meshRect)
+                  << " puppet=" << rectText(puppetRect) << " errPx(static/mesh/puppet)="
+                  << staticErr << "/" << meshErr << "/" << puppetErr << '\n';
+        return sameTransform && staticErr <= 1.5 && meshErr <= 1.5 && puppetErr <= 1.5;
+    };
+    if (!haveMedia) {
+        tally.skip(11, "synthetic media could not be encoded");
+        tally.skip(12, "synthetic media could not be encoded");
+        tally.skip(13, "synthetic media could not be encoded");
+    } else {
+        // G11 (a): offline parent (regular clip, file missing, videoDx=+0.2).
+        // The renderer drops it, so the child is drawn raw.
+        bool ok11 = true;
+        {
+            ClipInfo offline;
+            offline.filePath = mediaDir.path() + QStringLiteral("/offline-parent.mp4");
+            offline.duration = offline.outPoint = 3.0;
+            offline.videoDx = 0.2;
+            ok11 = !QFile::exists(offline.filePath)
+                && parentCase("G11a offline-parent", {offline}, 0, 1.0, -1.0) && ok11;
+        }
+        // G11 (b): V2 A [0,2) (dx -0.2) and B [2,4) (dx +0.2) overlap on
+        // [1.5, 2.5) through a 1 s Center cross dissolve. At 2.2 s the renderer
+        // draws A only: a child of B is drawn raw (although 2.2 s is in B's
+        // nominal interval), a child of A is composed with A at clip-local 2.2 s
+        // (although 2.2 s is past A's nominal end).
+        {
+            ClipInfo a = nullParent(-0.2, 0.0, 2.0, 3.0);
+            ClipInfo b = nullParent(0.2, 1.0, 3.0, 3.0);
+            crossDissolve(a, b, TransitionAlignment::Center);
+            ok11 = parentCase("G11b overlap child-of-B", {a, b}, 1, 2.2, -1.0) && ok11;
+            ok11 = parentCase("G11b overlap child-of-A", {a, b}, 0, 2.2, 2.2) && ok11;
+        }
+        tally.gate(11, ok11);
+        // G12 (c): TransitionAlignment::Start trail (US-706 r6 layout): the
+        // parent (inPoint 1, outPoint 3, dx +0.2) is still drawn at 2.5 s, past
+        // its nominal end 2.0 s. Keyed variant: x 0 s 0.0 -> 3 s 0.3, so the
+        // parent must be evaluated at clip-local 2.5 s, not clamped to 2.0 s.
+        {
+            ClipInfo a = nullParent(0.2, 1.0, 3.0, 4.0);
+            ClipInfo b = nullParent(0.0, 1.0, 3.0, 4.0);
+            crossDissolve(a, b, TransitionAlignment::Start);
+            bool ok12 = parentCase("G12 start-trail", {a, b}, 0, 2.5, 2.5);
+            KeyframeTrack track(QStringLiteral("motion.position.x"), 0.0);
+            track.addKeyframe(0.0, 0.0);
+            track.addKeyframe(3.0, 0.3);
+            a.keyframes.addTrack(track);
+            ok12 = parentCase("G12 start-trail-keyed", {a, b}, 0, 2.5, 2.5) && ok12;
+            tally.gate(12, ok12);
+        }
+        // G13 (US-805 r1): the tool's own clip has x keys (clip-local 0 s -0.3
+        // -> 3 s +0.3) and is in its Start trail at 2.5 s. The renderer draws
+        // it at clip-local 2.5 s (x 0.2), not the nominal-end clamp 2.0 s (x 0.1,
+        // 40 px off). Unparented, and parented to a V2 Null (dx +0.1).
+        {
+            KeyframeTrack keys(QStringLiteral("motion.position.x"), 0.0);
+            keys.addKeyframe(0.0, -0.3);
+            keys.addKeyframe(3.0, 0.3);
+            bool ok13 = parentCase("G13 keyed-child-trail unparented", {}, 0, 2.5, -1.0, &keys);
+            ok13 = parentCase("G13 keyed-child-trail parented",
+                              {nullParent(0.1, 0.0, 3.0, 3.0)}, 0, 2.5, 2.5, &keys) && ok13;
+            tally.gate(13, ok13);
+        }
     }
 
     return tally.finish("surface-tool");

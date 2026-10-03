@@ -1,6 +1,7 @@
 #include "SurfaceTool.h"
 #include "GLPreview.h"
 #include "Timeline.h"
+#include "TimelineFrameRenderer.h"
 #include "TrackMatteKey.h"
 #include "playback/SnsFit.h"
 #include "clipanim/ClipAnim.h"
@@ -164,32 +165,33 @@ clipgeom::ClipTransform SurfaceTool::renderedClipTransform(const Timeline &timel
             start += qMax(0.0, clips[i].leadInSec) + clips[i].effectiveDuration();
         return start + qMax(0.0, clips[c].leadInSec);
     };
-    const auto rawAt = [&](int t, int c) {
-        const ClipInfo &clip = tracks[t]->clips()[c];
-        return clipanim::effectiveTransformAt(
-            clip, qBound(0.0, timelineSec - clipStart(t, c), clip.effectiveDuration()));
+    const auto clampedLocalAt = [&](int t, int c) {
+        return qBound(0.0, timelineSec - clipStart(t, c), tracks[t]->clips()[c].effectiveDuration());
     };
     const QHash<QString, QString> parents = veditor::parentingEnabledFromEnv()
         ? timeline.clipParentEntries() : QHash<QString, QString>{};
-    // Same guards as the renderer's parent resolve: the parent must be a
-    // non-base layer drawn at timelineSec, else the child renders raw.
-    const auto activeParent = [&](const QString &key, int *t, int *c) {
+    // US-805: the parent is active exactly when the renderer composites it as a
+    // layer (tlrender::parentLayerAt, incl. overlap selection and transition
+    // trail) and its media is statically decodable, else the child renders raw.
+    // The parent's transform uses the clip-local seconds the gate returns.
+    const qint64 usec = qRound64(timelineSec * 1'000'000.0);
+    const auto activeParent = [&](const QString &key, int *t, int *c, double *localSec) {
         const QStringList parts = key.split(QLatin1Char(':'));
         bool okTrack = false, okClip = false;
         *t = parts.size() == 2 ? parts[0].toInt(&okTrack) : -1;
         *c = parts.size() == 2 ? parts[1].toInt(&okClip) : -1;
-        if (!okTrack || !okClip || *t <= 0 || *t >= tracks.size() || !tracks[*t]
-            || tracks[*t]->isHidden() || *c < 0 || *c >= tracks[*t]->clips().size())
+        if (!okTrack || !okClip)
             return false;
-        const ClipInfo &clip = tracks[*t]->clips()[*c];
-        const double start = clipStart(*t, *c);
-        return timelineSec >= start && timelineSec < start + clip.effectiveDuration()
-            && !clip.isAdjustment
-            && (clip.visible || clipgeom::isNullObjectFilePath(clip.filePath));
+        const auto hit = tlrender::parentLayerAt(&timeline, usec, *t, *c);
+        if (!hit || !hit->decodable)
+            return false;
+        *localSec = hit->clipLocalSeconds;
+        return true;
     };
-    std::function<bool(int, int, int, QStringList &, clipgeom::ClipTransform *)> world =
-        [&](int t, int c, int depth, QStringList &stack, clipgeom::ClipTransform *out) {
-            *out = rawAt(t, c);
+    std::function<bool(int, int, double, int, QStringList &, clipgeom::ClipTransform *)> world =
+        [&](int t, int c, double localSec, int depth, QStringList &stack,
+            clipgeom::ClipTransform *out) {
+            *out = clipanim::effectiveTransformAt(tracks[t]->clips()[c], localSec);
             if (depth > 8)
                 return true;
             const QString key = trackMatteClipKey(t, c);
@@ -197,12 +199,14 @@ clipgeom::ClipTransform SurfaceTool::renderedClipTransform(const Timeline &timel
             if (parentKey.isEmpty())
                 return true;
             int parentTrack = -1, parentClip = -1;
+            double parentLocalSec = 0.0;
             if (parentKey == key || stack.contains(parentKey)
-                || !activeParent(parentKey, &parentTrack, &parentClip))
+                || !activeParent(parentKey, &parentTrack, &parentClip, &parentLocalSec))
                 return false;
             stack.append(key);
             clipgeom::ClipTransform parentWorld;
-            const bool ok = world(parentTrack, parentClip, depth + 1, stack, &parentWorld);
+            const bool ok = world(parentTrack, parentClip, parentLocalSec, depth + 1, stack,
+                                  &parentWorld);
             stack.removeLast();
             if (ok)
                 *out = clipgeom::composeParented(*out, parentWorld, canvas);
@@ -210,8 +214,14 @@ clipgeom::ClipTransform SurfaceTool::renderedClipTransform(const Timeline &timel
         };
     clipgeom::ClipTransform result;
     QStringList stack;
-    if (!world(trackIdx, clipIdx, 0, stack, &result))
-        result = rawAt(trackIdx, clipIdx);
+    // The clip itself at the clip-local seconds the renderer uses (unclamped
+    // inside a borrowed transition interval); the clamped nominal time where
+    // the gate has no hit (V1, outside the clip's layer).
+    const auto selfHit = tlrender::parentLayerAt(&timeline, usec, trackIdx, clipIdx);
+    const double renderLocalSec = selfHit ? selfHit->clipLocalSeconds
+                                          : clampedLocalAt(trackIdx, clipIdx);
+    if (!world(trackIdx, clipIdx, renderLocalSec, 0, stack, &result))
+        result = clipanim::effectiveTransformAt(tracks[trackIdx]->clips()[clipIdx], renderLocalSec);
     return result;
 }
 
