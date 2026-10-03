@@ -88,6 +88,16 @@ namespace exportcfg {
 QJsonObject toJobJson(const ExportConfig &config);
 }
 
+namespace exportaudio {
+// ffmpeg codec/bitrate arguments for the AAC intermediate; kbps <= 0 falls back to 192.
+QStringList aacAudioArgs(int kbps);
+// selftest hooks: when set, a mix that ffmpeg wrote successfully is reported as failed, so
+// the failure cleanup runs on a real output file. The second records whether the output
+// existed at that moment (otherwise a "no leftover" check proves nothing).
+extern bool failAfterWriteForTest;
+extern bool outputExistedBeforeCleanupForTest;
+}
+
 class ExportDialog : public QDialog
 {
     Q_OBJECT
@@ -96,6 +106,8 @@ public:
     explicit ExportDialog(const ProjectConfig &project, QWidget *parent = nullptr);
 
     ExportConfig config() const { return m_config; }
+    // selftest: the config the dialog would accept right now (config() is set only on accept).
+    ExportConfig currentConfigForTest() const { return currentSettings(); }
     void setSourceIsHdr(bool hdr);
     void setMarkedRangeAvailable(bool hasRange);
 
@@ -126,6 +138,7 @@ private:
     void updateAudioOnlyControls(bool exportTypeChanged = false);
     void updateRateControlControls();
     void updateMarkedRangeCheckboxEnabled();
+    void updateLoudnessControlsEnabled();
     void regenerateChapters();
     QString defaultExtension() const;
 

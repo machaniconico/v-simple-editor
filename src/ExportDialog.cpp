@@ -322,10 +322,7 @@ void ExportDialog::setupUI()
     m_targetLufs->setEnabled(false);
     codecForm->addRow(tr("ラウドネスのプリセット:"), m_loudnessPreset);
     codecForm->addRow(tr("目標ラウドネス:"), m_targetLufs);
-    connect(m_autoLoudness, &QCheckBox::toggled, this, [this](bool on) {
-        m_loudnessPreset->setEnabled(on);
-        m_targetLufs->setEnabled(on);
-    });
+    connect(m_autoLoudness, &QCheckBox::toggled, this, [this]() { updateLoudnessControlsEnabled(); });
     connect(m_loudnessPreset, &QComboBox::currentIndexChanged, this, [this](int index) {
         if (index < 2) {
             const QSignalBlocker blocker(m_targetLufs);
@@ -725,6 +722,17 @@ void ExportDialog::ensureSequenceSettings()
     });
 }
 
+// Loudness normalization is not applied to image sequences (config() ignores it too).
+void ExportDialog::updateLoudnessControlsEnabled()
+{
+    if (!m_autoLoudness || !m_loudnessPreset || !m_targetLufs || !m_exportTypeCombo) return;
+    const bool sequence = static_cast<ExportType>(m_exportTypeCombo->currentData().toInt())
+        == ExportType::ImageSequence;
+    m_autoLoudness->setEnabled(!sequence);
+    m_loudnessPreset->setEnabled(!sequence && m_autoLoudness->isChecked());
+    m_targetLufs->setEnabled(!sequence && m_autoLoudness->isChecked());
+}
+
 void ExportDialog::onExportTypeChanged(int index)
 {
     const auto type = static_cast<ExportType>(m_exportTypeCombo->itemData(index).toInt());
@@ -740,6 +748,7 @@ void ExportDialog::onExportTypeChanged(int index)
     if (m_audioBitrateSpin) m_audioBitrateSpin->setEnabled(isVideo);
     if (m_hwEncoderCombo) m_hwEncoderCombo->setEnabled(isVideo);
     updateMarkedRangeCheckboxEnabled();
+    updateLoudnessControlsEnabled();
     updateAudioOnlyControls(true);
 
     // The output field is a file for video and a folder for sequences; convert on the transition itself.

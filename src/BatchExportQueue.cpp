@@ -319,7 +319,8 @@ void Queue::processNext()
                 RenderQueue::addTempFile(job.exportConfig, mixPath);
                 QString mixError;
                 const QString mixed = renderinplace::prepareAudioMix(
-                    job.timeline, mixPath, job.timeline->totalDuration(), &mixError);
+                    job.timeline, mixPath, job.timeline->totalDuration(), &mixError,
+                    task.audioBitrateKbps);
                 if (mixed == mixPath && QFileInfo::exists(mixPath)) {
                     job.projectFilePath = mixPath;
                 } else {

@@ -429,6 +429,16 @@ static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const 
     report.exec();
 }
 
+bool exportaudio::failAfterWriteForTest = false;
+bool exportaudio::outputExistedBeforeCleanupForTest = false;
+
+QStringList exportaudio::aacAudioArgs(int kbps)
+{
+    if (kbps <= 0) kbps = 192;
+    return {QStringLiteral("-c:a"), QStringLiteral("aac"),
+            QStringLiteral("-b:a"), QString::number(kbps) + QStringLiteral("k")};
+}
+
 namespace {
 // US-601: AudioMixer has no public amount getter. Keep its project value
 // alongside the mixer; all MainWindow amount writes pass through this helper.
@@ -978,7 +988,8 @@ bool runFfmpegForAudioMix(const QStringList &args, QString *error)
 
 QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                                          const QString &forcedOutputPath = {},
-                                         double forcedDurationSeconds = 0.0)
+                                         double forcedDurationSeconds = 0.0,
+                                         int audioKbps = 192)
 {
     if (!timeline)
         return {};
@@ -1026,8 +1037,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
     if (pcmIntermediate) {
         outputArgs << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le");
     } else {
-        outputArgs << QStringLiteral("-c:a") << QStringLiteral("aac")
-                   << QStringLiteral("-b:a") << QStringLiteral("192k")
+        outputArgs << exportaudio::aacAudioArgs(audioKbps)
                    << QStringLiteral("-movflags") << QStringLiteral("+faststart");
     }
     outputArgs << outputPath;
@@ -1035,7 +1045,7 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
     // Default path retains precisely the original single-pass arguments.
     // Enabled master EQ is applied once to the final amix output, including
     // every track's clip/track gain and pan, using the playback EQ processor.
-    const auto finishMix = [&](QStringList mixArgs) -> QString {
+    const auto finishMixUncleaned = [&](QStringList mixArgs) -> QString {
         if (!useMasterEq) {
             mixArgs << outputArgs;
             return runFfmpegForAudioMix(mixArgs, error) ? outputPath : QString();
@@ -1072,6 +1082,19 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                                QStringLiteral("-vn")};
         encodeArgs << outputArgs;
         return runFfmpegForAudioMix(encodeArgs, error) ? outputPath : QString();
+    };
+    // Whoever creates the intermediate removes it again when the mix fails: ffmpeg may have
+    // written part of outputPath, and the caller only gets an empty path back.
+    const auto finishMix = [&](QStringList mixArgs) -> QString {
+        QString result = finishMixUncleaned(mixArgs);
+        if (exportaudio::failAfterWriteForTest && !result.isEmpty()) {
+            exportaudio::outputExistedBeforeCleanupForTest = QFile::exists(outputPath);
+            if (error) *error = QStringLiteral("test: forced failure after write");
+            result.clear();
+        }
+        if (result.isEmpty())
+            QFile::remove(outputPath);
+        return result;
     };
 
     QStringList args;
@@ -2924,10 +2947,10 @@ int renderinplace::prepareAudioMixCallCountForTest()
 }
 
 QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
-                                      double durationSeconds, QString *error)
+                                      double durationSeconds, QString *error, int audioKbps)
 {
     ++prepareAudioMixCalls;
-    return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
+    return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds, audioKbps);
 }
 
 namespace {
@@ -2977,9 +3000,8 @@ QString loudnessauto::prepareJob(RenderJob &job)
         // The existing queue muxes compressed audio by stream copy. Use the
         // same AAC intermediate as the ordinary timeline mix after measuring PCM.
         const QString muxPath = nextExportAudioMixPath();
-        const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
-            QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("aac"),
-            QStringLiteral("-b:a"), QStringLiteral("192k"), muxPath};
+        QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix, QStringLiteral("-vn")};
+        args << exportaudio::aacAudioArgs(job.exportConfig.value("audioBitrate").toInt()) << muxPath;
         RenderQueue::addTempFile(job.exportConfig, muxPath);
         if (runFfmpegForAudioMix(args, &error)) job.projectFilePath = muxPath;
         else {
@@ -10804,11 +10826,13 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
         m_renderQueue = new RenderQueue(this);
     QString mixError;
     const QString preparedAudioMixPath = config.imageSequence
-        ? QString() : (config.autoLoudness ? QString() : prepareExportAudioMix(&mixError));
+        ? QString() : (config.autoLoudness ? QString()
+            : prepareTimelineAudioMixForExport(m_timeline, &mixError, {}, 0.0, config.audioBitrate));
     if (mixError.isEmpty()) mixError = m_exportAudioMixErrorForTest;
     // Register before judging the result so an intermediate left by a failed mix is
     // removed together with whatever buildExportRenderJob (prepareJob) already queued.
-    RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
+    if (!preparedAudioMixPath.isEmpty())
+        RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
     if (!mixError.isEmpty()) {
         m_renderQueue->removeTempFiles(&job);
         if (error) *error = mixError;

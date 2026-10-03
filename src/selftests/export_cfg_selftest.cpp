@@ -3,12 +3,25 @@
 #include "../Exporter.h"
 #include "../MainWindow.h"
 #include "../RenderQueue.h"
+#include "../Timeline.h"
+#include "../RenderInPlace.h"
+#include "../libavcore/AudioExtract.h"
+#include <QStandardPaths>
+extern "C" {
+#include <libavformat/avformat.h>
+}
 #include "SelftestGate.h"
+#include <QCheckBox>
+#include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QFile>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QSet>
 #include <QStringList>
 #include <QTemporaryDir>
 #include <cstdio>
+#include <vector>
 
 double exporter_loudnessGainDb();
 
@@ -275,5 +288,172 @@ int runExportCfgSelftest()
         offNormal.exportConfig.contains("tempFiles"), offMobile.exportConfig.contains("tempFiles"));
     tally.gate(6, offDelta == 0 && !traces(offNormal) && !traces(offMobile)
         && !offNormal.exportConfig.contains("tempFiles") && !offMobile.exportConfig.contains("tempFiles"));
+    // G7: the AAC intermediate's -b:a comes from the configured kbps (pure function, no
+    // ffmpeg). Detects a regression back to the hard-coded 192k (128 would still say 192k).
+    const QStringList args128 = exportaudio::aacAudioArgs(128);
+    const QStringList args192 = exportaudio::aacAudioArgs(ExportConfig().audioBitrate);
+    const QStringList argsBad = exportaudio::aacAudioArgs(0);
+    const auto bitrateOf = [](const QStringList &args) {
+        const int at = args.indexOf(QStringLiteral("-b:a"));
+        return at >= 0 && at + 1 < args.size() ? args.at(at + 1) : QString();
+    };
+    std::fprintf(stderr, "export-cfg G7 args128=[%s] args192=[%s] args0=[%s] default=%d\n",
+        qPrintable(args128.join(' ')), qPrintable(args192.join(' ')), qPrintable(argsBad.join(' ')),
+        ExportConfig().audioBitrate);
+    tally.gate(7, bitrateOf(args128) == QStringLiteral("128k") && bitrateOf(args192) == QStringLiteral("192k")
+        && bitrateOf(argsBad) == QStringLiteral("192k") && args128.contains(QStringLiteral("aac")));
+
+    // G8: the muxPath prepareJob converts to is registered in exportConfig["tempFiles"] and
+    // RenderQueue::removeTempFiles deletes it. No ffmpeg (no intermediate created) -> SKIP.
+    {
+        QTemporaryDir g8Dir;
+        const QString tone = g8Dir.filePath(QStringLiteral("tone.wav"));
+        // Noise, so the AAC encoder actually spends the configured bitrate (G11).
+        std::vector<float> samples(48000 * 2 * 2);
+        unsigned noiseState = 12345u;
+        for (float &sample : samples) {
+            noiseState = noiseState * 1664525u + 1013904223u;
+            sample = (static_cast<float>(noiseState >> 8) / 8388608.0f - 1.0f) * 0.3f;
+        }
+        QString wavError;
+        const bool wavOk = g8Dir.isValid()
+            && libavcore::writeWavFloatInterleaved(tone, samples, 48000, 2, &wavError);
+        MainWindow g8Window;
+        ClipInfo audioClip;
+        audioClip.filePath = tone;
+        audioClip.duration = audioClip.outPoint = 2.0;
+        ClipInfo pictureClip;
+        pictureClip.filePath = g8Dir.filePath(QStringLiteral("picture.mp4"));
+        pictureClip.duration = pictureClip.outPoint = 2.0;
+        g8Window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{pictureClip}},
+            QVector<QVector<ClipInfo>>{{audioClip}}, 0, -1, -1, 10);
+        ExportConfig g8Config = config;
+        g8Config.outputPath = g8Dir.filePath(QStringLiteral("g8.mp4"));
+        g8Config.autoLoudness = true;
+        g8Config.audioBitrate = 128;
+        RenderJob g8 = g8Window.buildExportRenderJob(g8Config, MainWindow::ExportEntry::Normal);
+        QStringList created;
+        for (const QJsonValue &value : g8.exportConfig.value("tempFiles").toArray())
+            created << value.toString();
+        bool createdExists = !created.isEmpty();
+        for (const QString &path : created) createdExists = createdExists && QFile::exists(path);
+        const bool muxIsProject = !g8.projectFilePath.isEmpty() && created.contains(g8.projectFilePath);
+        const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        if (ffmpeg.isEmpty()) {
+            std::fprintf(stderr, "export-cfg G8 ffmpeg=none wavOk=%d created=%lld\n",
+                wavOk, static_cast<long long>(created.size()));
+            tally.skip(8, "ffmpeg.exe unavailable");
+        } else {
+            RenderQueue queue;
+            queue.removeTempFiles(&g8);
+            bool leftover = false;
+            for (const QString &path : created) leftover = leftover || QFile::exists(path);
+            std::fprintf(stderr, "export-cfg G8 created=%lld createdExists=%d muxIsProject=%d "
+                "leftover=%d tempFilesKey=%d\n", static_cast<long long>(created.size()),
+                createdExists, muxIsProject, leftover, g8.exportConfig.contains("tempFiles"));
+            tally.gate(8, wavOk && createdExists && muxIsProject && !leftover
+                && !g8.exportConfig.contains("tempFiles"));
+        }
+
+        // G12: a mix that fails after ffmpeg wrote the output leaves no file behind and returns
+        // an empty path. The hook turns a successful write into a failure so the output really
+        // exists when the cleanup runs (existedBefore). Without the cleanup in
+        // prepareTimelineAudioMixForExport the file survives and this gate fails.
+        if (ffmpeg.isEmpty()) {
+            tally.skip(12, "ffmpeg.exe unavailable");
+        } else {
+            const QString failOut = g8Dir.filePath(QStringLiteral("fail-mix.m4a"));
+            QString failError;
+            exportaudio::outputExistedBeforeCleanupForTest = false;
+            exportaudio::failAfterWriteForTest = true;
+            const QString failed = renderinplace::prepareAudioMix(g8Window.m_timeline, failOut, 2.0, &failError);
+            exportaudio::failAfterWriteForTest = false;
+            const bool existedBefore = exportaudio::outputExistedBeforeCleanupForTest;
+            const bool leftover = QFile::exists(failOut);
+            const QString okMix = renderinplace::prepareAudioMix(g8Window.m_timeline, failOut, 2.0, &failError);
+            const bool okKept = okMix == failOut && QFile::exists(failOut);
+            std::fprintf(stderr, "export-cfg G12 returned=[%s] existedBefore=%d leftover=%d "
+                "successKept=%d error=[%s]\n", qPrintable(failed), existedBefore, leftover,
+                okKept, qPrintable(failError));
+            tally.gate(12, failed.isEmpty() && existedBefore && !leftover && okKept);
+        }
+
+        // G11: the batch queue hands task.audioBitrateKbps to renderinplace::prepareAudioMix
+        // (BatchExportQueue.cpp). Detects the batch AAC intermediate falling back to the
+        // default 192k: the 128 kbps intermediate must probe near 128000 and below the
+        // default-built one. No ffmpeg -> SKIP.
+        if (ffmpeg.isEmpty()) {
+            tally.skip(11, "ffmpeg.exe unavailable");
+        } else {
+            const auto probeBitRate = [](const QString &path) -> long long {
+                AVFormatContext *format = nullptr;
+                if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                    return -1;
+                long long rate = -1;
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned i = 0; i < format->nb_streams; ++i)
+                        if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                            rate = format->streams[i]->codecpar->bit_rate;
+                }
+                avformat_close_input(&format);
+                return rate;
+            };
+            const QString mix128 = g8Dir.filePath(QStringLiteral("batch128.m4a"));
+            const QString mixDefault = g8Dir.filePath(QStringLiteral("batchdefault.m4a"));
+            QString error128, errorDefault;
+            const QString made128 = renderinplace::prepareAudioMix(
+                g8Window.m_timeline, mix128, 2.0, &error128, 128);
+            const QString madeDefault = renderinplace::prepareAudioMix(
+                g8Window.m_timeline, mixDefault, 2.0, &errorDefault);
+            const long long rate128 = made128 == mix128 ? probeBitRate(mix128) : -1;
+            const long long rateDefault = madeDefault == mixDefault ? probeBitRate(mixDefault) : -1;
+            std::fprintf(stderr, "export-cfg G11 made128=%d madeDefault=%d rate128=%lld rateDefault=%lld "
+                "err128=[%s] errDefault=[%s]\n", made128 == mix128, madeDefault == mixDefault,
+                rate128, rateDefault, qPrintable(error128), qPrintable(errorDefault));
+            tally.gate(11, rate128 > 115000 && rate128 < 141000 && rateDefault > 170000
+                && rate128 < rateDefault);
+        }
+    }
+
+    // G9 / G10: choosing the image-sequence format disables the auto-loudness checkbox and
+    // its sub-controls (restored on returning to video); config() keeps ignoring it there.
+    // Detects removing updateLoudnessControlsEnabled's call from the format-change handler.
+    {
+        ExportDialog dialog(ProjectConfig{});
+        auto *type = dialog.findChild<QComboBox *>("exportType");
+        auto *toggle = dialog.findChild<QCheckBox *>("autoLoudness");
+        auto *preset = dialog.findChild<QComboBox *>("loudnessPreset");
+        auto *target = dialog.findChild<QDoubleSpinBox *>("targetLufs");
+        const int videoIndex = type ? type->findData(static_cast<int>(ExportType::Video)) : -1;
+        const int sequenceIndex = type ? type->findData(static_cast<int>(ExportType::ImageSequence)) : -1;
+        const bool found = type && toggle && preset && target && videoIndex >= 0 && sequenceIndex >= 0;
+        bool videoState[3] = {false, false, false}, sequenceState[3] = {true, true, true};
+        bool backState[3] = {false, false, false};
+        bool sequenceAuto = true, videoAuto = false;
+        if (found) {
+            type->setCurrentIndex(videoIndex);
+            toggle->setChecked(true);
+            const auto read = [&](bool *out) {
+                out[0] = toggle->isEnabled(); out[1] = preset->isEnabled(); out[2] = target->isEnabled();
+            };
+            read(videoState);
+            videoAuto = dialog.currentConfigForTest().autoLoudness;
+            type->setCurrentIndex(sequenceIndex);
+            read(sequenceState);
+            sequenceAuto = dialog.currentConfigForTest().autoLoudness;
+            type->setCurrentIndex(videoIndex);
+            read(backState);
+        }
+        std::fprintf(stderr, "export-cfg G9 found=%d video[box=%d preset=%d target=%d] "
+            "sequence[box=%d preset=%d target=%d] back[box=%d preset=%d target=%d]\n", found,
+            videoState[0], videoState[1], videoState[2], sequenceState[0], sequenceState[1],
+            sequenceState[2], backState[0], backState[1], backState[2]);
+        tally.gate(9, found && videoState[0] && videoState[1] && videoState[2]
+            && !sequenceState[0] && !sequenceState[1] && !sequenceState[2]
+            && backState[0] && backState[1] && backState[2]);
+        std::fprintf(stderr, "export-cfg G10 checked=%d videoAutoLoudness=%d sequenceAutoLoudness=%d\n",
+            found && toggle->isChecked(), videoAuto, sequenceAuto);
+        tally.gate(10, found && toggle->isChecked() && videoAuto && !sequenceAuto);
+    }
     return tally.finish("export-cfg");
 }

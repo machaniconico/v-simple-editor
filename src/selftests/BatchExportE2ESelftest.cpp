@@ -29,6 +29,10 @@
 
 #include "SelftestGate.h"
 
+extern "C" {
+#include <libavformat/avformat.h>
+}
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -883,6 +887,7 @@ int runBatchExportE2ESelftest()
             double mixSec = std::numeric_limits<double>::quiet_NaN();
             double mixRmsDb = std::numeric_limits<double>::quiet_NaN();
             QJsonObject cfg;
+            long long bitRate = -1;
         };
         const QString offOut = work.filePath("g13-off.mp4");
         const QString onOut = work.filePath("g14-on.mp4");
@@ -890,12 +895,54 @@ int runBatchExportE2ESelftest()
         batchexport::ExportTask nullTask = makeTask(QStringLiteral("720p"),
             work.filePath("g17-null.mp4"), nullptr);
         nullTask.projectPath = work.filePath("g17-other-project.veditor");
+        // G22: noise audio (a tone would not make the AAC encoder spend its bitrate) on its own
+        // timeline, queued twice: 128 kbps and the 192 default.
+        const QString noisePath = work.filePath("g22-noise.wav");
+        bool noiseOk = false;
+        if (fixture) {
+            std::vector<float> noise(48000 * 4 * 2);
+            unsigned noiseState = 12345u;
+            for (float &v : noise) {
+                noiseState = noiseState * 1664525u + 1013904223u;
+                v = (static_cast<float>(noiseState >> 8) / 8388608.0f - 1.0f) * 0.3f;
+            }
+            noiseOk = libavcore::writeWavFloatInterleaved(noisePath, noise, 48000, 2, &werr);
+        }
+        Timeline tl22;
+        {
+            ClipInfo noiseClip;
+            noiseClip.filePath = noisePath;
+            noiseClip.duration = noiseClip.outPoint = 4.0;
+            tl22.restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+                QVector<QVector<ClipInfo>>{{noiseClip}}, 0, -1, -1, 10);
+        }
+        const auto probeBitRate = [](const QString &path) -> long long {
+            AVFormatContext *format = nullptr;
+            if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                return -1;
+            long long rate = -1;
+            if (avformat_find_stream_info(format, nullptr) >= 0) {
+                for (unsigned i = 0; i < format->nb_streams; ++i)
+                    if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                        rate = format->streams[i]->codecpar->bit_rate;
+            }
+            avformat_close_input(&format);
+            return rate;
+        };
         batchexport::Queue q;
-        QString offId, onId, failId, nullId;
+        QString offId, onId, failId, nullId, lowId, defId;
         if (fixture) {
             offId = q.addTask(makeTask(QStringLiteral("720p"), offOut, &tl));
             onId = q.addTask(makeTask(QStringLiteral("g14-loud"), onOut, &tl));
             failId = q.addTask(makeTask(QStringLiteral("720p"), failOut, &tl));
+            if (noiseOk) {
+                batchexport::ExportTask low = makeTask(QStringLiteral("720p"),
+                    work.filePath("g22-128.mp4"), &tl22);
+                low.audioBitrateKbps = 128;
+                lowId = q.addTask(low);
+                defId = q.addTask(makeTask(QStringLiteral("720p"),
+                    work.filePath("g22-192.mp4"), &tl22));
+            }
         }
         nullId = q.addTask(nullTask);
         QHash<QString, Dispatch> dispatched;
@@ -922,6 +969,8 @@ int runBatchExportE2ESelftest()
             d.tempsExisted = !d.temps.isEmpty();
             for (const QString &temp : std::as_const(d.temps))
                 d.tempsExisted = d.tempsExisted && QFileInfo::exists(temp);
+            if ((id == lowId || id == defId) && d.pathExisted)
+                d.bitRate = probeBitRate(d.path);
             if (id == offId && d.pathExisted)
                 decode(d.path, QStringLiteral("g13-mix"), &d.mixSec, &d.mixRmsDb);
             dispatched.insert(id, d);
@@ -1008,6 +1057,22 @@ int runBatchExportE2ESelftest()
                 static_cast<int>(failState), qPrintable(finalTasks.value(failId).message),
                 qPrintable(failD.temps.join('|')), failD.tempsExisted, anyExists(failD.temps));
             check(16, "tempFiles removed after a failed task", g16);
+        }
+
+        if (ffmpeg.isEmpty()) {
+            tally.skip(22, "ffmpeg.exe not found on PATH (timeline audio mix needs it)");
+        } else {
+            const Dispatch low = dispatched.value(lowId);
+            const Dispatch def = dispatched.value(defId);
+            std::fprintf(stderr,
+                "[batchexport-e2e] G22 values: noiseOk=%d lowSeen=%d defSeen=%d lowMixCalls=%d "
+                "defMixCalls=%d lowRate=%lld defRate=%lld lowPath=%s\n",
+                noiseOk, low.seen, def.seen, low.mixCalls, def.mixCalls, low.bitRate,
+                def.bitRate, qPrintable(low.path));
+            check(22, "batch task audioBitrateKbps=128 reaches the AAC mix intermediate",
+                fixture && noiseOk && finished && low.seen && def.seen && low.mixCalls == 1
+                && def.mixCalls == 1 && low.bitRate > 115000 && low.bitRate < 141000
+                && def.bitRate > 170000 && low.bitRate < def.bitRate);
         }
 
         const bool g17 = finished && nullD.seen && nullD.mixCalls == 0
