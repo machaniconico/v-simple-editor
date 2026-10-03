@@ -2914,9 +2914,19 @@ void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
     }
 }
 
+namespace {
+std::atomic<int> prepareAudioMixCalls{0};
+}
+
+int renderinplace::prepareAudioMixCallCountForTest()
+{
+    return prepareAudioMixCalls.load();
+}
+
 QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &outputPath,
                                       double durationSeconds, QString *error)
 {
+    ++prepareAudioMixCalls;
     return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
 }
 
@@ -2963,6 +2973,7 @@ QString loudnessauto::prepareJob(RenderJob &job)
         const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
             QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("aac"),
             QStringLiteral("-b:a"), QStringLiteral("192k"), muxPath};
+        RenderQueue::addTempFile(job.exportConfig, muxPath);
         if (runFfmpegForAudioMix(args, &error)) job.projectFilePath = muxPath;
         else {
             message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
@@ -10832,6 +10843,7 @@ void MainWindow::exportVideo()
     // RenderQueue falls back to the V1 clip's source file for audio when this
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
     if (!preparedAudioMixPath.isEmpty()) job.projectFilePath = preparedAudioMixPath;
+    RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
     const double loudnessGainDb = job.loudnessGainDb;
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");

@@ -84,6 +84,9 @@ struct ExportTask {
     // task is dispatched. Keeping it on the public task snapshot makes the
     // UI-facing contract and headless E2E assertions observable.
     QJsonObject exportConfig;
+    // RenderJob::projectFilePath at dispatch (the audio-mux source): the timeline
+    // mix intermediate for a live-timeline task, otherwise projectPath.
+    QString dispatchedProjectFilePath;
 
     // Auto-loudness captured from the saved user preset when the task is queued
     // (Queue::addTask), so deleting the preset afterwards cannot silently drop

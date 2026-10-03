@@ -1,5 +1,7 @@
+#include "../AudioMixer.h"
 #include "../BatchExportDialog.h"
 #include "../BatchExportQueue.h"
+#include "../RenderInPlace.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../Timeline.h"
@@ -14,7 +16,11 @@
 #include <QSignalSpy>
 #include <QTest>
 #include <QHash>
+#include <QJsonArray>
+#include <QJsonDocument>
 #include <QMetaObject>
+#include <QProcess>
+#include <QStandardPaths>
 #include <QSet>
 #include <QTemporaryDir>
 #include <QTimer>
@@ -25,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <vector>
 
@@ -456,9 +463,10 @@ int runBatchExportE2ESelftest()
         if (fixture) {
             loudId = g8Queue.addTask(makeTask(QStringLiteral("g8-loud"), loudOut, &g8Timeline));
             {
-                // Queue an AAC source at -30 LUFS first (made by the queue itself); the plain
-                // task muxes it by stream copy, so its output carries measurable audio
-                // the plain preset must leave far from -16.
+                // Queue an AAC source at -30 LUFS first (made by the queue itself). Since
+                // US-802 the plain task (live timeline, loudness OFF) muxes the timeline's
+                // own AAC mix instead of projectPath; either way its output carries
+                // measurable audio the plain preset must leave far from -16.
                 quietId = g8Queue.addTask(makeTask(QStringLiteral("g8-quiet"), quietOut, &g8Timeline));
                 batchexport::ExportTask plainSource =
                     makeTask(QStringLiteral("g8-plain"), plainOut, &g8Timeline);
@@ -604,8 +612,10 @@ int runBatchExportE2ESelftest()
         const bool noAudioFailed = noAudioTask.state == batchexport::TaskState::Failed
             && noAudioTask.message.contains(QStringLiteral("ラウドネス"));
         const bool noOutputs = !QFileInfo::exists(silentOut) && !QFileInfo::exists(noAudioOut);
-        const QString silentTemp = silentTask.exportConfig.value("loudnessTempFile").toString();
-        const QString noAudioTemp = noAudioTask.exportConfig.value("loudnessTempFile").toString();
+        const QString silentTemp =
+            silentTask.exportConfig.value("tempFiles").toArray().at(0).toString();
+        const QString noAudioTemp =
+            noAudioTask.exportConfig.value("tempFiles").toArray().at(0).toString();
         // The silent task reached the AAC step (a temp file was created, then deleted);
         // the audio-less task never created one.
         const bool tempsGone = !silentTemp.isEmpty() && !QFileInfo::exists(silentTemp)
@@ -751,6 +761,464 @@ int runBatchExportE2ESelftest()
               saved && offered && allResolve, QString());
         if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
         else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
+
+    // G13-G17 (US-802): a live-timeline task with loudness OFF muxes the timeline's AAC
+    // mix (two audio tracks, A1 gain -6 dB, fades) instead of the V1 clip's source audio;
+    // loudness ON keeps prepareJob's mix; temporaries listed in exportConfig["tempFiles"]
+    // are gone after success and failure; a task without a live timeline is unchanged.
+    {
+        QTemporaryDir presetDir;
+        QTemporaryDir work;
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray oldEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+        ExportUserPreset loud;
+        loud.name = QStringLiteral("g14-loud");
+        loud.config.autoLoudness = true;
+        loud.config.targetLufs = -16.0;
+        const bool saved = presetDir.isValid() && work.isValid()
+            && ExportUserPresets::save(loud);
+
+        const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        auto writeTone = [](const QString &path, double hz, double amp, QString *err) {
+            std::vector<float> samples(48000 * 4 * 2);
+            for (int i = 0; i < 48000 * 4; ++i)
+                samples[2 * i] = samples[2 * i + 1] = static_cast<float>(
+                    amp * std::sin(2.0 * 3.141592653589793 * hz * i / 48000.0));
+            return libavcore::writeWavFloatInterleaved(path, samples, 48000, 2, err);
+        };
+        // Decoded mono PCM length (seconds) and RMS (dBFS) of a file's first audio stream.
+        auto decode = [&](const QString &media, const QString &tag, double *sec, double *rmsDb) {
+            *sec = *rmsDb = std::numeric_limits<double>::quiet_NaN();
+            const QString wavPath = work.filePath(tag + QStringLiteral("-decoded.wav"));
+            std::vector<double> pcm;
+            int rate = 0;
+            QString err;
+            if (!libavcore::extractAudioToWav(media, wavPath, 48000, &err)
+                || !libavcore::readPcm16WavToMono(wavPath, pcm, rate, &err)
+                || rate <= 0 || pcm.empty()) {
+                std::fprintf(stderr, "[batchexport-e2e] decode %s failed: %s\n",
+                             qPrintable(media), qPrintable(err));
+                return;
+            }
+            double sum = 0.0;
+            for (double v : pcm) sum += v * v;
+            *sec = static_cast<double>(pcm.size()) / rate;
+            *rmsDb = 20.0 * std::log10(std::max(1e-12, std::sqrt(sum / pcm.size())));
+        };
+
+        const QString video = work.filePath("g13-video.mp4");
+        const QString v1Tone = work.filePath("g13-v1tone.wav");
+        const QString v1Path = work.filePath("g13-v1.mp4");
+        const QString a1Path = work.filePath("g13-a1.wav");
+        const QString a2Path = work.filePath("g13-a2.wav");
+        QString werr;
+        bool fixture = false;
+        if (saved && !ffmpeg.isEmpty()
+            && writeG8Video(video) && writeTone(v1Tone, 440.0, 0.05, &werr)
+            && writeTone(a1Path, 1000.0, 0.4, &werr) && writeTone(a2Path, 300.0, 0.3, &werr)) {
+            QProcess mux;
+            mux.start(ffmpeg, {QStringLiteral("-y"), QStringLiteral("-i"), video,
+                               QStringLiteral("-i"), v1Tone, QStringLiteral("-map"),
+                               QStringLiteral("0:v"), QStringLiteral("-map"), QStringLiteral("1:a"),
+                               QStringLiteral("-c:v"), QStringLiteral("copy"),
+                               QStringLiteral("-c:a"), QStringLiteral("aac"),
+                               QStringLiteral("-shortest"), v1Path});
+            fixture = mux.waitForFinished(60000) && mux.exitStatus() == QProcess::NormalExit
+                && mux.exitCode() == 0 && QFileInfo::exists(v1Path);
+            if (!fixture)
+                werr = QString::fromUtf8(mux.readAllStandardError()).right(400);
+        }
+        double v1Sec = 0.0, v1RmsDb = 0.0;
+        if (fixture)
+            decode(v1Path, QStringLiteral("g13-v1"), &v1Sec, &v1RmsDb);
+
+        AudioMixer mixer;
+        Timeline tl;
+        ClipInfo picture;
+        picture.filePath = v1Path;
+        picture.duration = picture.outPoint = 4.0;
+        ClipInfo a1;
+        a1.filePath = a1Path;
+        a1.duration = a1.outPoint = 4.0;
+        a1.trailOut.type = TransitionType::FadeOut;
+        a1.trailOut.duration = 0.5;
+        ClipInfo a2;
+        a2.filePath = a2Path;
+        a2.duration = a2.outPoint = 4.0;
+        a2.leadIn.type = TransitionType::FadeIn;
+        a2.leadIn.duration = 1.0;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+            QVector<QVector<ClipInfo>>{{a1}, {a2}}, 0, -1, -1, 10);
+        tl.setAudioMixer(&mixer);
+        mixer.setTrackGain(0, 0.5); // A1 -6 dB
+        const double timelineSec = tl.totalDuration();
+        const double fps = 10.0;
+
+        auto makeTask = [&](const QString &preset, const QString &out, Timeline *timeline) {
+            batchexport::ExportTask t;
+            t.projectPath = QStringLiteral("g13.veditor");
+            t.outputPath = out;
+            t.preset = preset;
+            t.timeline = timeline;
+            t.source = timeline ? batchexport::TaskSource::CurrentProject
+                                : batchexport::TaskSource::File;
+            t.width = t.height = 64;
+            t.fps = fps;
+            t.codec = QStringLiteral("mpeg4");
+            t.videoCodec = QStringLiteral("mpeg4");
+            t.videoBitrateKbps = 200;
+            t.audioCodec = QStringLiteral("aac");
+            t.audioBitrateKbps = 192;
+            return t;
+        };
+        struct Dispatch {
+            bool seen = false;
+            int mixCalls = -1;
+            QString path;
+            bool pathExisted = false;
+            QStringList temps;
+            bool tempsExisted = false;
+            double mixSec = std::numeric_limits<double>::quiet_NaN();
+            double mixRmsDb = std::numeric_limits<double>::quiet_NaN();
+            QJsonObject cfg;
+        };
+        const QString offOut = work.filePath("g13-off.mp4");
+        const QString onOut = work.filePath("g14-on.mp4");
+        const QString failOut = work.filePath("no-such-dir/g16-fail.mp4");
+        batchexport::ExportTask nullTask = makeTask(QStringLiteral("720p"),
+            work.filePath("g17-null.mp4"), nullptr);
+        nullTask.projectPath = work.filePath("g17-other-project.veditor");
+        batchexport::Queue q;
+        QString offId, onId, failId, nullId;
+        if (fixture) {
+            offId = q.addTask(makeTask(QStringLiteral("720p"), offOut, &tl));
+            onId = q.addTask(makeTask(QStringLiteral("g14-loud"), onOut, &tl));
+            failId = q.addTask(makeTask(QStringLiteral("720p"), failOut, &tl));
+        }
+        nullId = q.addTask(nullTask);
+        QHash<QString, Dispatch> dispatched;
+        int lastCalls = renderinplace::prepareAudioMixCallCountForTest();
+        // processNext emits Running after building the job and before RenderQueue
+        // takes it, so the dispatch-time intermediates can be inspected here.
+        QObject::connect(&q, &batchexport::Queue::taskStateChanged, &q,
+                         [&](const QString &id, batchexport::TaskState state) {
+            if (state != batchexport::TaskState::Running)
+                return;
+            const int calls = renderinplace::prepareAudioMixCallCountForTest();
+            Dispatch d;
+            d.seen = true;
+            d.mixCalls = calls - lastCalls;
+            lastCalls = calls;
+            for (const auto &t : q.tasks()) {
+                if (t.id != id) continue;
+                d.path = t.dispatchedProjectFilePath;
+                d.cfg = t.exportConfig;
+            }
+            d.pathExisted = QFileInfo::exists(d.path);
+            for (const QJsonValue &v : d.cfg.value("tempFiles").toArray())
+                d.temps << v.toString();
+            d.tempsExisted = !d.temps.isEmpty();
+            for (const QString &temp : std::as_const(d.temps))
+                d.tempsExisted = d.tempsExisted && QFileInfo::exists(temp);
+            if (id == offId && d.pathExisted)
+                decode(d.path, QStringLiteral("g13-mix"), &d.mixSec, &d.mixRmsDb);
+            dispatched.insert(id, d);
+        });
+        QSignalSpy done(&q, &batchexport::Queue::queueFinished);
+        q.start();
+        const bool finished = done.wait(240000) || !done.isEmpty();
+        QHash<QString, batchexport::ExportTask> finalTasks;
+        for (const auto &t : q.tasks())
+            finalTasks.insert(t.id, t);
+        auto anyExists = [](const QStringList &paths) {
+            for (const QString &p : paths)
+                if (QFileInfo::exists(p)) return true;
+            return false;
+        };
+        const Dispatch off = dispatched.value(offId);
+        const Dispatch on = dispatched.value(onId);
+        const Dispatch failD = dispatched.value(failId);
+        const Dispatch nullD = dispatched.value(nullId);
+        const batchexport::TaskState offState = finalTasks.value(offId).state;
+        const batchexport::TaskState onState = finalTasks.value(onId).state;
+        const batchexport::TaskState failState = finalTasks.value(failId).state;
+
+        if (ffmpeg.isEmpty()) {
+            for (int g = 13; g <= 16; ++g)
+                tally.skip(g, "ffmpeg.exe not found on PATH (timeline audio mix needs it)");
+        } else {
+            double outSec = std::numeric_limits<double>::quiet_NaN();
+            double outRmsDb = std::numeric_limits<double>::quiet_NaN();
+            if (offState == batchexport::TaskState::Done)
+                decode(offOut, QStringLiteral("g13-out"), &outSec, &outRmsDb);
+            const bool g13 = fixture && finished && off.seen && off.mixCalls == 1
+                && QFileInfo(off.path).suffix() == QStringLiteral("m4a")
+                && off.pathExisted && off.path != v1Path
+                && std::fabs(off.mixSec - timelineSec) <= 1.0 / fps
+                && std::fabs(off.mixRmsDb - v1RmsDb) >= 1.0
+                && offState == batchexport::TaskState::Done
+                && std::fabs(outRmsDb - off.mixRmsDb) <= 1.0;
+            std::fprintf(stderr,
+                "[batchexport-e2e] G13 values: fixture=%d finished=%d seen=%d mixCalls=%d "
+                "path=%s existed=%d v1=%s timelineSec=%.4f mixSec=%.4f v1Sec=%.4f "
+                "mixRmsDb=%.3f v1RmsDb=%.3f offState=%d outSec=%.4f outRmsDb=%.3f err=%s\n",
+                fixture, finished, off.seen, off.mixCalls, qPrintable(off.path),
+                off.pathExisted, qPrintable(v1Path), timelineSec, off.mixSec, v1Sec,
+                off.mixRmsDb, v1RmsDb, static_cast<int>(offState), outSec, outRmsDb,
+                qPrintable(werr));
+            check(13, "loudness-OFF live-timeline task muxes the timeline AAC mix", g13, werr);
+
+            const bool g14 = fixture && on.seen && on.mixCalls == 0
+                && !on.path.isEmpty() && on.temps.contains(on.path) && on.pathExisted
+                && QFileInfo(on.path).suffix().compare(QStringLiteral("wav"),
+                                                       Qt::CaseInsensitive) != 0
+                && on.cfg.contains("loudnessGainDb");
+            std::fprintf(stderr,
+                "[batchexport-e2e] G14 values: seen=%d mixCalls=%d path=%s existed=%d "
+                "temps=%s loudnessGainDb=%s onState=%d\n",
+                on.seen, on.mixCalls, qPrintable(on.path), on.pathExisted,
+                qPrintable(on.temps.join('|')),
+                on.cfg.contains("loudnessGainDb")
+                    ? qPrintable(QString::number(on.cfg.value("loudnessGainDb").toDouble()))
+                    : "absent",
+                static_cast<int>(onState));
+            check(14, "loudness-ON task keeps prepareJob's AAC mix", g14);
+
+            const bool g15 = fixture && finished
+                && offState == batchexport::TaskState::Done
+                && onState == batchexport::TaskState::Done
+                && off.tempsExisted && on.tempsExisted
+                && !anyExists(off.temps) && !anyExists(on.temps);
+            std::fprintf(stderr,
+                "[batchexport-e2e] G15 values: offState=%d onState=%d offTemps=%s "
+                "existedAtDispatch=%d existNow=%d onTemps=%s existedAtDispatch=%d existNow=%d\n",
+                static_cast<int>(offState), static_cast<int>(onState),
+                qPrintable(off.temps.join('|')), off.tempsExisted, anyExists(off.temps),
+                qPrintable(on.temps.join('|')), on.tempsExisted, anyExists(on.temps));
+            check(15, "tempFiles removed after successful tasks", g15);
+
+            const bool g16 = fixture && finished
+                && failState == batchexport::TaskState::Failed
+                && failD.tempsExisted && !anyExists(failD.temps);
+            std::fprintf(stderr,
+                "[batchexport-e2e] G16 values: failState=%d message=%s temps=%s "
+                "existedAtDispatch=%d existNow=%d\n",
+                static_cast<int>(failState), qPrintable(finalTasks.value(failId).message),
+                qPrintable(failD.temps.join('|')), failD.tempsExisted, anyExists(failD.temps));
+            check(16, "tempFiles removed after a failed task", g16);
+        }
+
+        const bool g17 = finished && nullD.seen && nullD.mixCalls == 0
+            && nullD.path == nullTask.projectPath && nullD.temps.isEmpty();
+        std::fprintf(stderr,
+            "[batchexport-e2e] G17 values: finished=%d seen=%d mixCalls=%d path=%s "
+            "projectPath=%s temps=%s\n",
+            finished, nullD.seen, nullD.mixCalls, qPrintable(nullD.path),
+            qPrintable(nullTask.projectPath), qPrintable(nullD.temps.join('|')));
+        check(17, "task without a live timeline keeps projectPath audio", g17);
+        if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
+        else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
+
+    // G18-G21 (US-802 r1/r2): RenderQueue consumes each tempFiles path exactly once.
+    // G18: clearAll() during a render while the temp file is held open (Windows refuses
+    // the delete) still leaves nothing behind once the worker's completion runs.
+    // G19: a path reused after its job completed is not deleted again by removeJob /
+    // clearAll of that finished job.
+    {
+        QTemporaryDir work;
+        const QString video = work.filePath("g18-video.mp4");
+        const bool fixture = work.isValid() && writeG8Video(video);
+        Timeline tl;
+        ClipInfo picture;
+        picture.filePath = video;
+        picture.duration = picture.outPoint = 4.0;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        auto makeJob = [&](const QString &out, const QString &temp) {
+            batchexport::ExportTask t;
+            t.projectPath = QStringLiteral("g18.veditor");
+            t.outputPath = out;
+            t.preset = QStringLiteral("720p");
+            t.timeline = &tl;
+            t.width = t.height = 64;
+            t.fps = 10.0;
+            t.codec = QStringLiteral("mpeg4");
+            t.videoCodec = QStringLiteral("mpeg4");
+            t.videoBitrateKbps = 200;
+            t.audioCodec = QStringLiteral("aac");
+            t.audioBitrateKbps = 192;
+            RenderJob job = batchexport::Queue::buildRenderJob(t);
+            RenderQueue::addTempFile(job.exportConfig, temp);
+            return job;
+        };
+        auto writeFile = [](const QString &path, const QByteArray &bytes) {
+            QFile f(path);
+            return f.open(QIODevice::WriteOnly) && f.write(bytes) == bytes.size();
+        };
+        auto readFile = [](const QString &path) {
+            QFile f(path);
+            return f.open(QIODevice::ReadOnly) ? f.readAll() : QByteArray();
+        };
+
+        // G18
+        const QString busyTemp = work.filePath("g18-busy.m4a");
+        bool startedRendering = false, existsAfterClear = false, goneAtEnd = false;
+        bool lockedOpen = false;
+        if (fixture && writeFile(busyTemp, QByteArrayLiteral("g18"))) {
+            RenderQueue rq;
+            rq.addJob(makeJob(work.filePath("g18-out.mp4"), busyTemp));
+            rq.start();
+            const RenderJob *current = rq.currentJob();
+            startedRendering = current && current->status == RenderJobStatus::Rendering;
+            QFile holder(busyTemp);
+            lockedOpen = holder.open(QIODevice::ReadOnly);
+            rq.clearAll(); // no event processing in between: the job is still in flight
+            existsAfterClear = QFileInfo::exists(busyTemp);
+            holder.close();
+            goneAtEnd = QTest::qWaitFor([&]() { return !QFileInfo::exists(busyTemp); }, 30000);
+        }
+        std::fprintf(stderr,
+            "[batchexport-e2e] G18 values: fixture=%d startedRendering=%d lockedOpen=%d "
+            "existsAfterClearAll=%d goneAfterWorkerEnd=%d temp=%s\n",
+            fixture, startedRendering, lockedOpen, existsAfterClear, goneAtEnd,
+            qPrintable(busyTemp));
+        if (fixture && lockedOpen && !existsAfterClear)
+            tally.skip(18, "open file did not block deletion here; busy-delete path not exercised");
+        else
+            check(18, "temp file busy at clearAll is removed after the worker ends",
+                  fixture && startedRendering && lockedOpen && existsAfterClear && goneAtEnd);
+
+        // G19
+        const QString tempA = work.filePath("g19-a.m4a");
+        const QString tempB = work.filePath("g19-b.m4a");
+        bool bothDone = false, consumed = false, keptAfterRemove = false, keptAfterClear = false;
+        QString uuidA;
+        if (fixture && writeFile(tempA, "a") && writeFile(tempB, "b")) {
+            RenderQueue rq;
+            RenderJob jobA = makeJob(work.filePath("g19-a.mp4"), tempA);
+            RenderJob jobB = makeJob(work.filePath("g19-b.mp4"), tempB);
+            uuidA = jobA.uuid;
+            int completedOk = 0;
+            QObject::connect(&rq, &RenderQueue::jobCompletedUuid, &rq,
+                             [&](QString, bool success, QString) { completedOk += success ? 1 : 0; });
+            QSignalSpy finishedSpy(&rq, &RenderQueue::queueFinished);
+            rq.addJob(jobA);
+            rq.addJob(jobB);
+            rq.start();
+            bothDone = (finishedSpy.wait(120000) || !finishedSpy.isEmpty()) && completedOk == 2;
+            consumed = !QFileInfo::exists(tempA) && !QFileInfo::exists(tempB);
+            // Unrelated files now occupy the consumed paths.
+            writeFile(tempA, QByteArrayLiteral("unrelated-a"));
+            writeFile(tempB, QByteArrayLiteral("unrelated-b"));
+            rq.removeJob(uuidA);
+            keptAfterRemove = readFile(tempA) == QByteArrayLiteral("unrelated-a");
+            rq.clearAll();
+            keptAfterClear = readFile(tempB) == QByteArrayLiteral("unrelated-b")
+                && keptAfterRemove && QFileInfo::exists(tempA);
+        }
+        std::fprintf(stderr,
+            "[batchexport-e2e] G19 values: fixture=%d bothDone=%d consumedAtJobEnd=%d "
+            "keptAfterRemoveJob=%d keptAfterClearAll=%d tempA=%s tempB=%s\n",
+            fixture, bothDone, consumed, keptAfterRemove, keptAfterClear,
+            qPrintable(tempA), qPrintable(tempB));
+        check(19, "a consumed temp path is never deleted twice",
+              fixture && bothDone && consumed && keptAfterRemove && keptAfterClear);
+
+        // G20: cancelCurrent() marks the in-flight job Cancelled at once; clearCompleted()
+        // then discards it while the temp file is still open. The path must stay pending
+        // and be removed when the worker's completion runs.
+        const QString cancelTemp = work.filePath("g20-cancel.m4a");
+        bool g20Started = false, g20Locked = false, g20Cancelled = false;
+        bool g20Discarded = false, g20ExistsAfterClear = false, g20Gone = false;
+        if (fixture && writeFile(cancelTemp, QByteArrayLiteral("g20"))) {
+            RenderQueue rq;
+            rq.addJob(makeJob(work.filePath("g20-out.mp4"), cancelTemp));
+            rq.start();
+            const RenderJob *current = rq.currentJob();
+            g20Started = current && current->status == RenderJobStatus::Rendering;
+            QFile holder(cancelTemp);
+            g20Locked = holder.open(QIODevice::ReadOnly);
+            rq.cancelCurrent();
+            g20Cancelled = !rq.jobs().isEmpty()
+                && rq.jobs().first().status == RenderJobStatus::Cancelled;
+            rq.clearCompleted(); // still no event processing: the worker is in flight
+            g20Discarded = rq.jobs().isEmpty();
+            g20ExistsAfterClear = QFileInfo::exists(cancelTemp);
+            holder.close();
+            g20Gone = QTest::qWaitFor([&]() { return !QFileInfo::exists(cancelTemp); }, 30000);
+        }
+        std::fprintf(stderr,
+            "[batchexport-e2e] G20 values: fixture=%d startedRendering=%d lockedOpen=%d "
+            "cancelledBeforeWorkerEnd=%d discardedByClearCompleted=%d existsAfterClearCompleted=%d "
+            "goneAfterWorkerEnd=%d temp=%s\n",
+            fixture, g20Started, g20Locked, g20Cancelled, g20Discarded, g20ExistsAfterClear,
+            g20Gone, qPrintable(cancelTemp));
+        if (fixture && g20Locked && !g20ExistsAfterClear)
+            tally.skip(20, "open file did not block deletion here; busy-delete path not exercised");
+        else
+            check(20, "cancel + clearCompleted leaves no temp file after the worker ends",
+                  fixture && g20Started && g20Locked && g20Cancelled && g20Discarded
+                      && g20ExistsAfterClear && g20Gone);
+
+        // G21: tempFiles is a trust boundary. saveQueue does not persist it; a loaded
+        // queue JSON naming a user file never gets that file deleted (also not on
+        // destruction), while loadQueue still cleans the jobs it replaces. A path that
+        // was never registered through addTempFile is ignored even if a job carries it.
+        const QString userFile = work.filePath("g21-user-media.mp4");
+        const QString strayFile = work.filePath("g21-unregistered.m4a");
+        const QString replacedTemp = work.filePath("g21-replaced.m4a");
+        const QString savedJson = work.filePath("g21-saved.json");
+        const QString loadJson = work.filePath("g21-load.json");
+        bool savedClean = false, replacedGone = false, loadedStripped = false;
+        bool strayKept = false, userKept = false, wrote = false;
+        if (fixture) {
+            wrote = writeFile(userFile, QByteArrayLiteral("user-media"))
+                && writeFile(strayFile, QByteArrayLiteral("stray"))
+                && writeFile(replacedTemp, QByteArrayLiteral("replaced"));
+            QJsonObject loadedJob;
+            loadedJob["id"] = 1;
+            loadedJob["uuid"] = QStringLiteral("g21-loaded");
+            loadedJob["name"] = QStringLiteral("g21");
+            loadedJob["projectFilePath"] = QStringLiteral("g21.veditor");
+            loadedJob["outputPath"] = work.filePath("g21-out.mp4");
+            QJsonObject loadedCfg;
+            loadedCfg["tempFiles"] = QJsonArray{userFile};
+            loadedJob["exportConfig"] = loadedCfg;
+            loadedJob["status"] = 0;
+            QJsonObject root;
+            root["nextId"] = 2;
+            root["jobs"] = QJsonArray{loadedJob};
+            wrote = wrote && writeFile(loadJson, QJsonDocument(root).toJson());
+            {
+                RenderQueue rq;
+                rq.addJob(makeJob(work.filePath("g21-pending.mp4"), replacedTemp));
+                QJsonObject strayCfg;
+                strayCfg["tempFiles"] = QJsonArray{strayFile};
+                const int strayId = rq.addJob(QStringLiteral("g21-stray"),
+                    QStringLiteral("g21.veditor"), work.filePath("g21-stray.mp4"), strayCfg);
+                rq.removeJob(strayId);
+                strayKept = readFile(strayFile) == QByteArrayLiteral("stray");
+                savedClean = rq.saveQueue(savedJson)
+                    && !readFile(savedJson).contains("tempFiles");
+                const bool loaded = rq.loadQueue(loadJson);
+                replacedGone = loaded && !QFileInfo::exists(replacedTemp);
+                loadedStripped = loaded && rq.jobs().size() == 1
+                    && !rq.jobs().first().exportConfig.contains("tempFiles");
+            } // destructor discards the loaded job
+            userKept = readFile(userFile) == QByteArrayLiteral("user-media");
+        }
+        std::fprintf(stderr,
+            "[batchexport-e2e] G21 values: fixture=%d wrote=%d savedWithoutTempFiles=%d "
+            "unregisteredKept=%d replacedJobTempGone=%d loadedStripped=%d "
+            "userFileKeptAfterDestroy=%d user=%s\n",
+            fixture, wrote, savedClean, strayKept, replacedGone, loadedStripped, userKept,
+            qPrintable(userFile));
+        check(21, "tempFiles never persisted, loaded or deleted without ownership",
+              fixture && wrote && savedClean && strayKept && replacedGone
+                  && loadedStripped && userKept);
     }
 
     return tally.finish("batchexport-e2e");

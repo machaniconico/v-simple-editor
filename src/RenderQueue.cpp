@@ -40,6 +40,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QMutexLocker>
+#include <QSet>
 #include <QStandardPaths>
 #include <cmath>  // std::round for the HDR10 master-display luminance scaling
 #include <cstddef>
@@ -539,6 +540,9 @@ RenderQueue::~RenderQueue()
         delete m_renderThread;
         m_renderThread = nullptr;
     }
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
+    removeTempFiles(nullptr);
 }
 
 // AC: production export 経路の ACES パイプラインを設定する。UI スレッドから
@@ -562,6 +566,65 @@ bool RenderQueue::isProjectFilePath(const QString &path)
     return suffix == QLatin1String("veditor")
         || suffix == QLatin1String("vsep")
         || suffix == QLatin1String("json");
+}
+
+namespace {
+// Paths registered through addTempFile in this process: the only ones removeTempFiles
+// may delete (a stray tempFiles entry from elsewhere is ignored).
+QMutex ownedTempFilesMutex;
+QSet<QString> ownedTempFiles;
+}
+
+void RenderQueue::addTempFile(QJsonObject &config, const QString &path)
+{
+    if (path.isEmpty())
+        return;
+    {
+        QMutexLocker locker(&ownedTempFilesMutex);
+        ownedTempFiles.insert(path);
+    }
+    QJsonArray files = config.value(QStringLiteral("tempFiles")).toArray();
+    files.append(path);
+    config[QStringLiteral("tempFiles")] = files;
+}
+
+void RenderQueue::removeTempFiles(RenderJob *job)
+{
+    if (job) {
+        const QJsonArray files = job->exportConfig.value(QStringLiteral("tempFiles")).toArray();
+        QMutexLocker locker(&ownedTempFilesMutex);
+        for (const QJsonValue &file : files) {
+            const QString path = file.toString();
+            if (path.isEmpty() || m_pendingTempFiles.contains(path))
+                continue;
+            if (ownedTempFiles.contains(path))
+                m_pendingTempFiles.append(path);
+            else
+                qWarning().noquote() << "[render-queue] ignoring unregistered temp file" << path;
+        }
+        job->exportConfig.remove(QStringLiteral("tempFiles"));
+    }
+    QStringList stillPending;
+    for (const QString &path : std::as_const(m_pendingTempFiles)) {
+        if (QFile::exists(path) && !QFile::remove(path)) {
+            qWarning().noquote() << "[render-queue] temp file busy, retrying at next job end" << path;
+            stillPending.append(path);
+        } else {
+            QMutexLocker locker(&ownedTempFilesMutex);
+            ownedTempFiles.remove(path);
+        }
+    }
+    m_pendingTempFiles = stillPending;
+}
+
+void RenderQueue::discardJob(int idx)
+{
+    removeTempFiles(&m_jobs[idx]);
+    m_jobs.removeAt(idx);
+    if (m_currentJobIndex > idx)
+        m_currentJobIndex--;
+    else if (m_currentJobIndex == idx)
+        m_currentJobIndex = -1;
 }
 
 namespace {
@@ -712,6 +775,7 @@ void RenderQueue::addJob(const RenderJob &job)
         rejection = rejection.isEmpty() ? loudnessError
                                         : rejection + QLatin1Char('\n') + loudnessError;
     if (!rejection.isEmpty()) {
+        removeTempFiles(&copy);
         emit jobFailed(copy.id, rejection);
         emit jobCompletedUuid(copy.uuid, false, rejection);
         return;
@@ -731,14 +795,7 @@ void RenderQueue::removeJob(int id)
     if (m_jobs[idx].status == RenderJobStatus::Rendering)
         return;
 
-    m_jobs.removeAt(idx);
-
-    // Adjust current index if needed
-    if (m_currentJobIndex > idx)
-        m_currentJobIndex--;
-    else if (m_currentJobIndex == idx)
-        m_currentJobIndex = -1;
-
+    discardJob(idx);
     emit jobsChanged();
 }
 
@@ -750,12 +807,7 @@ void RenderQueue::removeJob(const QString &uuid)
     if (m_jobs[idx].status == RenderJobStatus::Rendering)
         return;
 
-    m_jobs.removeAt(idx);
-    if (m_currentJobIndex > idx)
-        m_currentJobIndex--;
-    else if (m_currentJobIndex == idx)
-        m_currentJobIndex = -1;
-
+    discardJob(idx);
     emit jobsChanged();
 }
 
@@ -782,9 +834,8 @@ void RenderQueue::clearCompleted()
         if (m_jobs[i].status == RenderJobStatus::Completed ||
             m_jobs[i].status == RenderJobStatus::Failed ||
             m_jobs[i].status == RenderJobStatus::Cancelled) {
-            m_jobs.removeAt(i);
-            if (m_currentJobIndex > i)
-                m_currentJobIndex--;
+            // A job cancelled mid-render is Cancelled before its worker ends.
+            discardJob(i);
         }
     }
     emit jobsChanged();
@@ -798,7 +849,8 @@ void RenderQueue::clearAll()
     if (hadRunningJob)
         cancelCurrent();
 
-    m_jobs.clear();
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
     m_currentJobIndex = -1;
     emit jobsChanged();
 }
@@ -992,6 +1044,7 @@ bool RenderQueue::saveQueue(const QString &filePath) const
             exportConfig.remove("rateControl");
         if (exportConfig.value("crf").toInt(-1) == -1)
             exportConfig.remove("crf");
+        exportConfig.remove(QStringLiteral("tempFiles")); // process-local, never persisted
         obj["exportConfig"] = exportConfig;
         obj["loudnessGainDb"] = job.loudnessGainDb;
         obj["status"] = static_cast<int>(job.status);
@@ -1035,7 +1088,8 @@ bool RenderQueue::loadQueue(const QString &filePath)
     QJsonObject root = doc.object();
     m_nextId = root["nextId"].toInt(1);
 
-    m_jobs.clear();
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
     QJsonArray jobsArray = root["jobs"].toArray();
     for (const QJsonValue &val : jobsArray) {
         QJsonObject obj = val.toObject();
@@ -1054,6 +1108,8 @@ bool RenderQueue::loadQueue(const QString &filePath)
         job.endUs = static_cast<qint64>(obj["endUs"].toDouble(0));
         job.passes = obj["passes"].toInt(1);
         job.exportConfig = obj["exportConfig"].toObject();
+        // Trust boundary: temp files belong to the process that created them.
+        job.exportConfig.remove(QStringLiteral("tempFiles"));
         job.loudnessGainDb = configuredLoudnessGainDb(
             job.exportConfig,
             obj.value(QStringLiteral("loudnessGainDb")).toDouble(0.0));
@@ -2288,11 +2344,16 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
         m_renderThread = nullptr;
     }
 
-    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
+    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size()) {
+        removeTempFiles(nullptr); // worker has stopped: retry paths it held open
         return;
+    }
 
     RenderJob &job = m_jobs[m_currentJobIndex];
     job.endTime = QDateTime::currentDateTime();
+    // Single job-end cleanup for every jobCompletedUuid below (cancel / failure /
+    // success), done before the emits because a slot may enqueue and reallocate m_jobs.
+    removeTempFiles(&job);
 
     if (job.status == RenderJobStatus::Cancelled || m_cancelRequested) {
         job.status = RenderJobStatus::Cancelled;

@@ -1,7 +1,12 @@
 #include "BatchExportQueue.h"
 
 #include "ExportUserPresets.h"
+#include "RenderInPlace.h"
+#include "Timeline.h"
+#include <QDebug>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonObject>
 
 #include <algorithm>
@@ -159,6 +164,7 @@ QString Queue::addTask(const ExportTask &input)
     t.message.clear();
     t.renderUuid.clear();
     t.exportConfig = QJsonObject();
+    t.dispatchedProjectFilePath.clear();
     fillPresetDefaults(t);
     captureLoudness(t);
     m_tasks.append(t);
@@ -302,15 +308,33 @@ void Queue::processNext()
                         job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
                             "自動ラウドネス: 無音・音声なし・測定失敗のため正規化できません");
                 }
+            } else if (job.timeline && job.timeline->totalDuration() > 0.0
+                       && !job.timeline->computeAudioPlaybackSequence().isEmpty()) {
+                // Same AAC timeline-mix intermediate as the normal export: the queue
+                // muxes audio by stream copy, so this must not be a .wav. Built from
+                // the timeline as it is now (task dispatch), like the video frames.
+                const QString mixPath = QDir::tempPath()
+                    + QStringLiteral("/v-simple-editor-audio-mix/batch_mix_%1.m4a").arg(job.uuid);
+                QDir().mkpath(QFileInfo(mixPath).absolutePath());
+                RenderQueue::addTempFile(job.exportConfig, mixPath);
+                QString mixError;
+                const QString mixed = renderinplace::prepareAudioMix(
+                    job.timeline, mixPath, job.timeline->totalDuration(), &mixError);
+                if (mixed == mixPath && QFileInfo::exists(mixPath)) {
+                    job.projectFilePath = mixPath;
+                } else {
+                    // Fall back to the previous audio source, but keep the reason.
+                    job.exportConfig[QStringLiteral("audioMixWarning")] = QStringLiteral(
+                        "タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: %1")
+                        .arg(mixError);
+                    qWarning().noquote() << job.exportConfig.value(
+                        QStringLiteral("audioMixWarning")).toString();
+                }
             }
-            if (!job.exportConfig.value(QStringLiteral("loudnessAutoError")).toString().isEmpty()
-                && job.projectFilePath != task.projectPath) {
-                // Rejected: prepareJob's temporary AAC mix would never be used or cleaned.
-                job.exportConfig[QStringLiteral("loudnessTempFile")] = job.projectFilePath;
-                QFile::remove(job.projectFilePath);
-                job.projectFilePath = task.projectPath;
-            }
+            // A rejected job (loudnessAutoError) is never rendered; RenderQueue::addJob
+            // deletes its exportConfig["tempFiles"] when it emits the failure.
             task.exportConfig = job.exportConfig;
+            task.dispatchedProjectFilePath = job.projectFilePath;
 
             task.renderUuid = job.uuid;
 
@@ -350,7 +374,11 @@ void Queue::onJobCompleted(QString uuid, bool success, QString error)
     if (success) {
         task.progress = 100;
         task.state    = TaskState::Done;
-        task.message  = QStringLiteral("Export complete");
+        const QString audioMixWarning =
+            task.exportConfig.value(QStringLiteral("audioMixWarning")).toString();
+        task.message  = audioMixWarning.isEmpty()
+            ? QStringLiteral("Export complete")
+            : QStringLiteral("Export complete (%1)").arg(audioMixWarning);
         emit taskProgress(task.id, 100);
         emit taskStateChanged(task.id, TaskState::Done);
     } else {

@@ -141,6 +141,11 @@ public:
     // プロジェクト JSON (.veditor / .vsep / .json) を音声ソースとして開かないための判定。
     static bool isProjectFilePath(const QString &path);
 
+    // Export temporaries (audio-mix intermediates) live in exportConfig["tempFiles"]
+    // (string array). Creators only append; the queue consumes them once per job end
+    // (jobCompletedUuid: success / failure / cancel / rejection) or job removal.
+    static void addTempFile(QJsonObject &config, const QString &path);
+
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
                                    const QString &outputPath,
@@ -269,6 +274,15 @@ private:
     aces::AcesPipeline m_acesPipeline;
 
     double m_loudnessGainDb = 0.0;
+
+    // The single temp-file cleanup: moves job->exportConfig["tempFiles"] (if job) into
+    // m_pendingTempFiles, clears the key so a path is consumed once, then deletes every
+    // pending path. Paths whose delete fails (still open by a worker) stay pending and
+    // are retried at the next call (any job end, finishCurrentJob, destructor).
+    void removeTempFiles(RenderJob *job);
+    // Every removal of a job from m_jobs goes through here (removeTempFiles first).
+    void discardJob(int idx);
+    QStringList m_pendingTempFiles;
 };
 
 // MainWindow export submission seam, shared by normal and batch/mobile export.

@@ -10,6 +10,8 @@ namespace renderinplace {
 // Uses the same audio filter/mix implementation as normal export.
 QString prepareAudioMix(Timeline *timeline, const QString &outputPath,
                         double durationSeconds, QString *error);
+// Number of prepareAudioMix calls since process start (selftests compare deltas).
+int prepareAudioMixCallCountForTest();
 struct Options {
     QString codec = QStringLiteral("h264");
     double handlesSec = 0.0;
