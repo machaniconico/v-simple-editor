@@ -1,14 +1,17 @@
 #include "../ExportDialog.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
+#include "../MainWindow.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../libavcore/AudioExtract.h"
 #include "SelftestGate.h"
 #include <QComboBox>
+#include <QDir>
 #include <QEventLoop>
 #include <QFile>
 #include <QImage>
+#include <QJsonArray>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <algorithm>
@@ -206,11 +209,9 @@ int runLoudnessAutoSelftest()
         && normalMapped.value("targetLufs").toDouble() == -14.0
         && batchMapped.value("targetLufs").toDouble() == -23.0;
     // The removed text check counted prepareJob calls inside two private UI
-    // handlers; calling those handlers would open dialogs. G2/G4 instead run
-    // prepareJob on both target profiles and render their audio. The
-    // handlers still call prepareJob themselves (outside the shared job
-    // builder that export-cfg G3 covers), so a dropped call in one handler
-    // is not detected by any gate.
+    // handlers. G2/G4 run prepareJob on both target profiles and render their
+    // audio; prepareJob itself now runs inside MainWindow::buildExportRenderJob,
+    // whose normal / mobile entries export-cfg G4-G6 cover.
     const double normalMeasured = normal.exportConfig.value("measuredLufs").toDouble(
         std::numeric_limits<double>::quiet_NaN());
     const double batchMeasured = batch.exportConfig.value("measuredLufs").toDouble(
@@ -281,6 +282,43 @@ int runLoudnessAutoSelftest()
         std::fprintf(stderr, "[loudness-auto] G6 saved=%d controls=%d idx14=%d idx23=%d idx16=%d\n",
             saved, controls, idx[0], idx[1], idx[2]);
         gate(6, saved && controls && idx[0] == 0 && idx[1] == 1 && idx[2] == 2);
+    }
+
+    // G7: when exportVideo's audio step (MainWindow::finalizeExportJobAudio) fails after
+    // buildExportRenderJob -> prepareJob already created intermediates, it must return
+    // false and leave none behind. Detects removing that cleanup call (the temp file
+    // would survive). The failure is forced via m_exportAudioMixErrorForTest; ffmpeg or
+    // fixture unavailable (no intermediate created) -> SKIP, never FAIL.
+    {
+        MainWindow window;
+        window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+            QVector<QVector<ClipInfo>>{{audio}}, 0, -1, -1, 10);
+        ExportConfig g7Config = settings;
+        g7Config.outputPath = temporary.filePath("g7.mp4");
+        g7Config.autoLoudness = true;
+        RenderJob g7 = window.buildExportRenderJob(g7Config, MainWindow::ExportEntry::Normal);
+        QStringList created;
+        for (const QJsonValue &value : g7.exportConfig.value("tempFiles").toArray())
+            created << value.toString();
+        bool createdExists = !created.isEmpty();
+        for (const QString &path : created) createdExists = createdExists && QFile::exists(path);
+        if (!fixture || !createdExists) {
+            std::fprintf(stderr, "[loudness-auto] G7 fixture=%d created=%lld createdExists=%d\n",
+                fixture, static_cast<long long>(created.size()), createdExists);
+            tally.skip(7, "ffmpeg.exe or audio fixture unavailable: prepareJob created no temp file");
+        } else {
+            window.m_exportAudioMixErrorForTest = QStringLiteral("forced mix failure");
+            QString mixError;
+            const bool finalized = window.finalizeExportJobAudio(g7, g7Config, &mixError);
+            bool leftover = false;
+            for (const QString &path : created) leftover = leftover || QFile::exists(path);
+            std::fprintf(stderr, "[loudness-auto] G7 created=%lld createdExists=%d finalized=%d "
+                "error=%s leftover=%d tempFilesKey=%d\n",
+                static_cast<long long>(created.size()), createdExists, finalized,
+                qPrintable(mixError), leftover, g7.exportConfig.contains("tempFiles"));
+            tally.gate(7, !finalized && mixError == QStringLiteral("forced mix failure")
+                && !leftover && !g7.exportConfig.contains("tempFiles"));
+        }
     }
     return tally.finish("loudness-auto");
 }

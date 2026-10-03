@@ -145,6 +145,9 @@ public:
     // (string array). Creators only append; the queue consumes them once per job end
     // (jobCompletedUuid: success / failure / cancel / rejection) or job removal.
     static void addTempFile(QJsonObject &config, const QString &path);
+    // Consumes job->exportConfig["tempFiles"] and deletes them (see the private notes
+    // below); public so a caller that abandons a prepared job before addJob can clean up.
+    void removeTempFiles(RenderJob *job);
 
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
@@ -275,11 +278,11 @@ private:
 
     double m_loudnessGainDb = 0.0;
 
-    // The single temp-file cleanup: moves job->exportConfig["tempFiles"] (if job) into
-    // m_pendingTempFiles, clears the key so a path is consumed once, then deletes every
-    // pending path. Paths whose delete fails (still open by a worker) stay pending and
-    // are retried at the next call (any job end, finishCurrentJob, destructor).
-    void removeTempFiles(RenderJob *job);
+    // removeTempFiles (public above) is the single temp-file cleanup: it moves
+    // job->exportConfig["tempFiles"] (if job) into m_pendingTempFiles, clears the key so
+    // a path is consumed once, then deletes every pending path. Paths whose delete fails
+    // (still open by a worker) stay pending and are retried at the next call (any job
+    // end, finishCurrentJob, destructor).
     // Every removal of a job from m_jobs goes through here (removeTempFiles first).
     void discardJob(int idx);
     QStringList m_pendingTempFiles;
@@ -288,4 +291,6 @@ private:
 // MainWindow export submission seam, shared by normal and batch/mobile export.
 namespace loudnessauto {
 QString prepareJob(RenderJob &job);
+// Number of prepareJob calls that ran with autoLoudness ON (selftest counter).
+int prepareJobCallCountForTest();
 }

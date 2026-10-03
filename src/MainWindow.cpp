@@ -2930,9 +2930,16 @@ QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &output
     return prepareTimelineAudioMixForExport(timeline, error, outputPath, durationSeconds);
 }
 
+namespace {
+std::atomic<int> s_prepareJobCalls{0};
+}
+
+int loudnessauto::prepareJobCallCountForTest() { return s_prepareJobCalls.load(); }
+
 QString loudnessauto::prepareJob(RenderJob &job)
 {
     if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    ++s_prepareJobCalls;
     job.exportConfig.remove("loudnessAutoError");
     QString error;
     QString mix;
@@ -10755,7 +10762,8 @@ bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)
     return runFfmpegForAudioMix(args, error);
 }
 
-RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEntry entry)
+RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEntry entry,
+                                           double *projectLoudnessGainDb)
 {
     RenderJob job;
     job.name = QFileInfo(config.outputPath).fileName();
@@ -10782,7 +10790,37 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
     job.loudnessGainDb = exporter_loudnessGainDb();
     job.exportConfig["loudnessGainDb"] = job.loudnessGainDb;
     RenderQueue::appendSubtitleTrack(job.exportConfig, m_subtitleSegments, m_subtitleStyle, this);
+    // prepareJob overwrites job.loudnessGainDb with the measured value. Callers hand the
+    // pre-measurement project gain to RenderQueue::setLoudnessGainDb (its fallback), so
+    // report it before preparing. Its status text stays in exportConfig["loudnessAutoStatus"].
+    if (projectLoudnessGainDb) *projectLoudnessGainDb = job.loudnessGainDb;
+    loudnessauto::prepareJob(job);
     return job;
+}
+
+bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error)
+{
+    if (!m_renderQueue)
+        m_renderQueue = new RenderQueue(this);
+    QString mixError;
+    const QString preparedAudioMixPath = config.imageSequence
+        ? QString() : (config.autoLoudness ? QString() : prepareExportAudioMix(&mixError));
+    if (mixError.isEmpty()) mixError = m_exportAudioMixErrorForTest;
+    // Register before judging the result so an intermediate left by a failed mix is
+    // removed together with whatever buildExportRenderJob (prepareJob) already queued.
+    RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
+    if (!mixError.isEmpty()) {
+        m_renderQueue->removeTempFiles(&job);
+        if (error) *error = mixError;
+        return false;
+    }
+    // projectFilePath doubles as RenderQueue's audio-mux source. When a saved
+    // project path exists use it; the in-memory timeline seam below carries
+    // the actual edit graph (LUT/mask/tracking are NOT serialized), and
+    // RenderQueue falls back to the V1 clip's source file for audio when this
+    // is a .veditor / empty path (RenderQueue.cpp:551-563).
+    if (!preparedAudioMixPath.isEmpty()) job.projectFilePath = preparedAudioMixPath;
+    return true;
 }
 
 void MainWindow::exportVideo()
@@ -10828,23 +10866,14 @@ void MainWindow::exportVideo()
     if (!m_renderQueue)
         m_renderQueue = new RenderQueue(this);
 
-    RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal);
+    double projectLoudnessGainDb = 0.0;
+    RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal, &projectLoudnessGainDb);
     QString audioMixError;
-    const QString preparedAudioMixPath = exportCfg.imageSequence
-        ? QString() : (exportCfg.autoLoudness ? QString() : prepareExportAudioMix(&audioMixError));
-    if (!audioMixError.isEmpty()) {
+    if (!finalizeExportJobAudio(job, exportCfg, &audioMixError)) {
         QMessageBox::warning(this, QStringLiteral("Export"),
                              audioMixError);
         return;
     }
-    // projectFilePath doubles as RenderQueue's audio-mux source. When a saved
-    // project path exists use it; the in-memory timeline seam below carries
-    // the actual edit graph (LUT/mask/tracking are NOT serialized), and
-    // RenderQueue falls back to the V1 clip's source file for audio when this
-    // is a .veditor / empty path (RenderQueue.cpp:551-563).
-    if (!preparedAudioMixPath.isEmpty()) job.projectFilePath = preparedAudioMixPath;
-    RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
-    const double loudnessGainDb = job.loudnessGainDb;
     const bool isHdrExport =
         exportCfg.hdr10 || exportCfg.hdrSettings.mode != QStringLiteral("sdr");
 
@@ -10923,9 +10952,9 @@ void MainWindow::exportVideo()
     // legacy Exporter には openColorManagement / load で既に push 済み。
     // RenderQueue は 8bit 経路でのみ適用し、enabled=false 時はビット同一。
     m_renderQueue->setAcesPipeline(m_acesPipeline);
-    m_renderQueue->setLoudnessGainDb(loudnessGainDb);
+    m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
     statusBar()->showMessage("Exporting: " + exportCfg.outputPath);
-    const QString loudnessStatus = loudnessauto::prepareJob(job);
+    const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
     if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
     m_renderQueue->addJob(job);
     m_renderQueue->start();
@@ -17067,7 +17096,9 @@ void MainWindow::onMobileExport()
                     if (!m_renderQueue)
                         m_renderQueue = new RenderQueue(this);
 
-                    RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch);
+                    double projectLoudnessGainDb = 0.0;
+                    RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,
+                                                         &projectLoudnessGainDb);
 
                     auto *progress = new QProgressDialog(
                         QStringLiteral("モバイル向けエクスポート中..."),
@@ -17105,10 +17136,10 @@ void MainWindow::onMobileExport()
                     // AC: production export 経路に ACES SSOT を push (start()
                     // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
                     m_renderQueue->setAcesPipeline(m_acesPipeline);
-                    m_renderQueue->setLoudnessGainDb(job.loudnessGainDb);
+                    m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
                     statusBar()->showMessage(
                         QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
-                    const QString loudnessStatus = loudnessauto::prepareJob(job);
+                    const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
                     if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
                     m_renderQueue->addJob(job);
                     m_renderQueue->start();

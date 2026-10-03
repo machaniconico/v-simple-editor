@@ -252,6 +252,7 @@ class MainWindow : public QMainWindow
     friend class mcp::McpEditorTools;
     friend int runMcpSelftest();
     friend int runExportCfgSelftest();
+    friend int runLoudnessAutoSelftest();
     friend int runSpecialCompositeSelftest();
     friend int runDeEsserSelftest();
 
@@ -688,7 +689,11 @@ protected:
 
 private:
     enum class ExportEntry { Normal, MobileBatch };
-    RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry);
+    // Also runs loudnessauto::prepareJob (the single normal / mobile call site). When
+    // projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
+    // measurement (what RenderQueue::setLoudnessGainDb must keep receiving).
+    RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry,
+                                   double *projectLoudnessGainDb = nullptr);
     noiseprint::NoisePrint m_noisePrint;
     QPointer<TimelineTrack> m_noisePrintMenuTrack;
     int m_noisePrintMenuClip = -1;
@@ -744,6 +749,11 @@ private:
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
     // GUI の exportVideo と MCP の export_video が同じ経路で使う。
     QString prepareExportAudioMix(QString *error);
+    // exportVideo's step between buildExportRenderJob and addJob: makes the OFF-side audio
+    // mix and attaches it to the job. On failure it removes every temp file the job holds
+    // (including those prepareJob made) and returns false with *error set.
+    bool finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error);
+    QString m_exportAudioMixErrorForTest; // selftest: non-empty forces a mix failure
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
