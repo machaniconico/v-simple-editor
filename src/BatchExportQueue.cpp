@@ -322,7 +322,7 @@ void Queue::processNext()
                     job.timeline, mixPath, job.timeline->totalDuration(), &mixError,
                     task.audioBitrateKbps);
                 if (mixed == mixPath && QFileInfo::exists(mixPath)) {
-                    job.projectFilePath = mixPath;
+                    RenderQueue::setIntermediateProjectFile(job, mixPath);
                 } else {
                     // Fall back to the previous audio source, but keep the reason.
                     job.exportConfig[QStringLiteral("audioMixWarning")] = QStringLiteral(

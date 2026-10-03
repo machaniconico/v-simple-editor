@@ -145,6 +145,10 @@ public:
     // (string array). Creators only append; the queue consumes them once per job end
     // (jobCompletedUuid: success / failure / cancel / rejection) or job removal.
     static void addTempFile(QJsonObject &config, const QString &path);
+    // Points job.projectFilePath at an audio intermediate (a temp file). The previous
+    // path is kept once in exportConfig["sourceProjectFilePath"] so saveQueue can
+    // persist it instead of the temp path. Every such replacement goes through here.
+    static void setIntermediateProjectFile(RenderJob &job, const QString &path);
     // Consumes job->exportConfig["tempFiles"] and deletes them (see the private notes
     // below); public so a caller that abandons a prepared job before addJob can clean up.
     void removeTempFiles(RenderJob *job);

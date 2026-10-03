@@ -1284,6 +1284,53 @@ int runBatchExportE2ESelftest()
         check(21, "tempFiles never persisted, loaded or deleted without ownership",
               fixture && wrote && savedClean && strayKept && replacedGone
                   && loadedStripped && userKept);
+
+        // G23: a job whose projectFilePath was swapped for the batch-OFF audio mix
+        // (temp file) is saved with the project path it replaced, and the temp path
+        // appears nowhere in the saved JSON. Detects: temp path persisted (old form).
+        const QString g23Mix = work.filePath("g23-batch_mix.m4a");
+        const QString g23Json = work.filePath("g23-saved.json");
+        QString g23Saved;
+        bool g23Wrote = false;
+        if (fixture) {
+            RenderQueue rq;
+            RenderJob job = makeJob(work.filePath("g23-out.mp4"), QString());
+            RenderQueue::addTempFile(job.exportConfig, g23Mix);
+            RenderQueue::setIntermediateProjectFile(job, g23Mix);
+            rq.addJob(job);
+            g23Wrote = rq.saveQueue(g23Json);
+            const QJsonArray jobs = QJsonDocument::fromJson(readFile(g23Json))
+                                        .object().value("jobs").toArray();
+            if (!jobs.isEmpty())
+                g23Saved = jobs.first().toObject().value("projectFilePath").toString();
+        }
+        const bool g23NoTemp = !readFile(g23Json).contains("g23-batch_mix");
+        // Legacy caller: temp input set directly, no recorded source. The path is kept
+        // as is (previous behavior) rather than silently saved empty.
+        const QString g23LegacyJson = work.filePath("g23-legacy.json");
+        QString g23LegacySaved;
+        if (fixture) {
+            RenderQueue rq;
+            RenderJob job = makeJob(work.filePath("g23-legacy-out.mp4"), QString());
+            RenderQueue::addTempFile(job.exportConfig, g23Mix);
+            job.projectFilePath = g23Mix;
+            rq.addJob(job);
+            rq.saveQueue(g23LegacyJson);
+            const QJsonArray jobs = QJsonDocument::fromJson(readFile(g23LegacyJson))
+                                        .object().value("jobs").toArray();
+            if (!jobs.isEmpty())
+                g23LegacySaved = jobs.first().toObject().value("projectFilePath").toString();
+        }
+        const bool g23LegacyKept = g23LegacySaved == g23Mix;
+        std::fprintf(stderr,
+            "[batchexport-e2e] G23 values: fixture=%d wrote=%d savedProjectFilePath=%s "
+            "isOriginal=%d tempAbsentFromJson=%d legacySaved=%s legacyKept=%d\n",
+            fixture, g23Wrote, qPrintable(g23Saved),
+            g23Saved == QStringLiteral("g18.veditor"), g23NoTemp,
+            qPrintable(g23LegacySaved), g23LegacyKept);
+        check(23, "saveQueue persists the replaced project path, never the audio temp path",
+              fixture && g23Wrote && g23Saved == QStringLiteral("g18.veditor") && g23NoTemp
+                  && g23LegacyKept);
     }
 
     return tally.finish("batchexport-e2e");

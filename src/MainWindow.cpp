@@ -3003,7 +3003,7 @@ QString loudnessauto::prepareJob(RenderJob &job)
         QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix, QStringLiteral("-vn")};
         args << exportaudio::aacAudioArgs(job.exportConfig.value("audioBitrate").toInt()) << muxPath;
         RenderQueue::addTempFile(job.exportConfig, muxPath);
-        if (runFfmpegForAudioMix(args, &error)) job.projectFilePath = muxPath;
+        if (runFfmpegForAudioMix(args, &error)) RenderQueue::setIntermediateProjectFile(job, muxPath);
         else {
             message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
             job.exportConfig["loudnessAutoStatus"] = message;
@@ -10844,7 +10844,7 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
     // the actual edit graph (LUT/mask/tracking are NOT serialized), and
     // RenderQueue falls back to the V1 clip's source file for audio when this
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
-    if (!preparedAudioMixPath.isEmpty()) job.projectFilePath = preparedAudioMixPath;
+    if (!preparedAudioMixPath.isEmpty()) RenderQueue::setIntermediateProjectFile(job, preparedAudioMixPath);
     return true;
 }
 

@@ -575,6 +575,14 @@ QMutex ownedTempFilesMutex;
 QSet<QString> ownedTempFiles;
 }
 
+void RenderQueue::setIntermediateProjectFile(RenderJob &job, const QString &path)
+{
+    const QString key = QStringLiteral("sourceProjectFilePath");
+    if (!job.exportConfig.contains(key))
+        job.exportConfig[key] = job.projectFilePath;
+    job.projectFilePath = path;
+}
+
 void RenderQueue::addTempFile(QJsonObject &config, const QString &path)
 {
     if (path.isEmpty())
@@ -1027,7 +1035,20 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["id"] = job.id;                 // legacy int id
         obj["uuid"] = job.uuid;             // spec QString uuid
         obj["name"] = job.name;
-        obj["projectFilePath"] = job.projectFilePath;
+        // An audio intermediate is process-local: persist the project path it replaced.
+        // Without a recorded source (callers outside setIntermediateProjectFile) keep the
+        // previous behavior of saving the path as is, and say so.
+        const QString sourceKey = QStringLiteral("sourceProjectFilePath");
+        if (job.exportConfig.contains(sourceKey)) {
+            obj["projectFilePath"] = job.exportConfig.value(sourceKey).toString();
+        } else {
+            if (job.exportConfig.value(QStringLiteral("tempFiles")).toArray()
+                    .contains(job.projectFilePath))
+                qWarning().noquote() << "RenderQueue::saveQueue: job" << job.uuid
+                                     << "uses a temporary input with no recorded source:"
+                                     << job.projectFilePath;
+            obj["projectFilePath"] = job.projectFilePath;
+        }
         obj["outputPath"] = job.outputPath;
         obj["preset"] = job.preset;
         obj["width"] = job.width;
@@ -1045,6 +1066,7 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         if (exportConfig.value("crf").toInt(-1) == -1)
             exportConfig.remove("crf");
         exportConfig.remove(QStringLiteral("tempFiles")); // process-local, never persisted
+        exportConfig.remove(sourceKey); // folded into projectFilePath above
         obj["exportConfig"] = exportConfig;
         obj["loudnessGainDb"] = job.loudnessGainDb;
         obj["status"] = static_cast<int>(job.status);
