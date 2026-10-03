@@ -33,6 +33,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Unused-media removal (media-pool bin-tree context menu "Remove Unused Media…") now also checks LUT / image-overlay / particle-config references, not only the existing provider list; the existing "Unused" filter shares the same check (defect fix: previously narrower)
 - CMX3600 EDL / FCPXML import into a new sequence (MCP `import_edl` / `import_fcpxml`)
   - Wave 8: FCPXML connected clips (anchored child asset-clips) are placed into lanes (lane 0 first, then by |lane|, up to 2 video and 2 audio tracks); audio-only assets go to audio tracks
+  - Wave 9: FCPXML connected clips inside a `<gap>` are imported (anchored on the gap), J-cut connected clips that start before their parent are imported (the part before 0 s is trimmed with the warning 「接続クリップをタイムライン 0 で切り詰めました: <name> / <ref>」; a clip that lies entirely before 0 s is not imported and is skipped with 「クリップの値が不正です (接続位置): <name> / <ref>」), each descendant of a parent whose time range is invalid (duration 0, or an invalid offset / start) is skipped with its own warning, and a spine with no asset-clips yields an empty sequence plus a warning instead of an error. FCPXML clips keep the source length only when the `<asset>` declares a `duration` and its `start` is 0 (an asset with a non-zero `start` may allow the right edge to extend `start` seconds less than the source end; to be confirmed in Wave 10) (otherwise the used range is the limit, as before), and EDL clips only when the media file is found and the probed length is positive; the right edge of an imported EDL clip can be extended only when the probed length is longer than its used range (otherwise the previous value is kept); for an EDL dissolve of positive length, the outgoing clip can always be extended by the dissolve handle (dissolve length x speed) regardless of the media; growth beyond the handle up to the source length is possible only when the file is found and the probed length is positive and longer than the handle-inclusive length.
 - Undo / redo (unlimited history)
 - Snap to grid & playhead
 - Timeline zoom
@@ -88,6 +89,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Channel-strip audio mixer dock (faders + meters, hidden by default; defect fix: fader/normalize track gain now reaches export even without track FX)
 - Manual loudness-normalization gain and normalizer amount are now saved in the project (defect fix: previously reset on reopen)
 - Automatic loudness normalization on export (off by default; -14 LUFS streaming / -23 LUFS broadcast presets or custom target; also applied in the batch export queue through saved user presets (Wave 8). Not applied to MCP `export_video`, RenderInPlace or manual additions in the render-queue dialog). The saved manual gain above is now actually applied at export time (defect fix: a Windows file-handle issue in the post-process step used to prevent the replacement from taking effect)
+- Wave 9: the batch export queue now exports the timeline audio mix (multi-track, track FX, gain, fades) for tasks of the current project when auto loudness is off and the timeline has audible audio (the source-file audio is kept when the timeline length is 0 or it has no clip with audio; if every track is muted the mix is silent); the export dialog's audio bitrate is honored on the AAC re-encode path; image-sequence export disables the auto-loudness checkbox; the EQ / compressor / reverb / noise-reduction docks follow project load and track add / remove like the de-esser dock
 
 ### AI & Automation
 - Silence detection
@@ -269,7 +271,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `group_clips` | 別々のトラックのクリップをグループ化する。`clips`（`{kind, trackIndex, clipIndex}` の配列、2 件以上）を指定する。応答は `{ok, linkGroup, undoRecorded}` | あり |
 | `ungroup_clips` | 指定クリップのグループを解除する。`clips`（配列、1 件以上） | あり |
 | `import_edl` | `filePath` の CMX3600 EDL をプロジェクトの FPS で新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
-| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane 0 を必ず採用し、残りは lane 番号の絶対値が小さい順に、映像・音声とも最大 2 トラックまで（超えた lane は警告）。音声専用 asset-clip は音声トラックに置く。transition / 複合クリップ / ref-clip / マルチカムは読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
+| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane 0 を必ず採用し、残りは lane 番号の絶対値が小さい順に、映像・音声とも最大 2 トラックまで（超えた lane は警告）。音声専用 asset-clip は音声トラックに置く。gap の子の接続クリップと親より前に始まる接続クリップ（J カット。0 秒より前に全体が出るものは「クリップの値が不正です (接続位置): …」で読み飛ばし、一部だけ出るものは「接続クリップをタイムライン 0 で切り詰めました: …」の警告で切り詰める）も取り込み、接続クリップを持つ親の時刻範囲が不正（duration が 0、または offset / start の計算が不正）な場合は、その親とその接続クリップを警告付きで読み飛ばす。asset-clip が 0 本の spine は空のシーケンス + 警告。取り込んだクリップが素材の全長を保持するのは、FCPXML では <asset> に duration があり start が 0 の場合だけ（無ければ使用範囲まで）。transition / 複合クリップ / ref-clip / マルチカムは読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
 
 `export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込み・自動ラウドネス正規化は書き出しダイアログ（および Wave 8 からはバッチ書き出しキューの保存済みユーザープリセット経由）の機能で、`export_video` の引数には含まれず、MCP 経由の書き出しには適用されません。
 
@@ -413,7 +415,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Testing
 
 Selftests are wired into the executable itself, dispatched via a single
-`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 259 entries; `--selftest=help` prints 260 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
+`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 261 entries; `--selftest=help` prints 262 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
 points cover the routing matrix:
 
 ```bash
@@ -451,6 +453,15 @@ Run with --selftest=list to see available selftests.
 $ echo $?
 2
 ```
+
+Since Wave 9 (US-800) every selftest that uses `GateTally` is cross-checked against the
+`(N gates)` figure in its registry description: a mismatch prints
+`FAIL gate-count: declared N, ran M (selftest=<name>)` and exits non-zero, and the
+`--selftest=all` sweep ends with a `gate-count summary: verified V, mismatch W, unverified U,
+no-declaration D` line. New in Wave 9: `--selftest=parent-gate` (7 gates; the shared
+`tlrender::parentLayerAt` rule) and `gate-count-probe` (internal helper for the gate-tally
+selftest, 2 gates, not meant to be run on its own). Gate counts for other selftests are in
+the registry descriptions (`grep -oE '\([0-9]+ gates\)' src/selftests/SelftestRegistry.cpp`).
 
 Adding a new selftest = one line in `kArgvSelftests[]`: argv-switch name +
 `VEDITOR_<NAME>_SELFTEST` env var + function pointer + QApplication-required
@@ -493,7 +504,7 @@ byte-equivalent and the selftest dispatch coherent:
 | `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
 | `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
 | `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
-| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (259 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (261 entries × 5 fields: name / envVar / fn / needsQApp / description) |
 
 Architecture rationale: preview ≠ export was historically the #1 NLE
 parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
@@ -603,15 +614,32 @@ v-simple-editor/
 - [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
 - [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
-- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 259-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 261-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
 - [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
 - [x] Wave 7 (24 stories, US-600..623): clip enable/disable, loudness-gain project persistence, keyword bins, sequence-from-clip, unused-media removal scope extension, clip grouping, align/distribute, keyframe copy/paste, timeline hover skim, per-effect mask, offset wheel, puppet pin, VP9 alpha export, image-sequence export, export metadata, mov_text subtitle embedding, EDL/FCPXML import, de-esser, audio mixer dock (track-gain export fix), automatic loudness normalization on export, multi-frame camera tracking with keyframe application, bundle adjustment Schur-complement solver
 - [x] Wave 8 (US-700..718): per-entry selftest watchdog and PASS / FAIL / SKIP gate tally, shared export job mapping, audio export byte-compare fixture, linked edge-drag trim (Alt = one side), align/distribute through the rendered transform, surface / mesh / puppet pin tools through the clip transform, special-composite preview parity, legacy keyframe dialog `grade.*` migration and hue / gamma / highlights / shadows keyframes, FCPXML connected clips and audio lanes, batch export queue auto loudness, user preset round-trip, camera-tracking backend tag and UI polish, de-esser dock (live-apply). No MCP tools added (52 tools, G1..G177)
+- [x] Wave 9 (US-800..810): selftest gate-count auto cross-check, auto loudness prepared inside the shared export job builder, batch export queue exports the timeline audio mix, export audio bitrate honored on AAC intermediates and temp-file cleanup unified in `RenderQueue`, shared parent-layer rule (`parentLayerAt`) for the renderer / align-distribute / surface tools, EQ / compressor / reverb / noise-reduction docks follow project changes, FCPXML gap children / J-cuts / empty spines, imported clips keep the source length only under the conditions above (FCPXML: `<asset>` has a `duration`; EDL: media found and probed length longer than the used range), saved queues keep the project path instead of a temporary audio file. No MCP tools added
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
+
+### Wave 9 で据え置いた制限事項
+
+- ロトスコープ (roto) 付きクリップは書き出しに反映されません (プレビューのみ。Wave 10 候補)。
+- 自動ラウドネスは MCP `export_video` / RenderInPlace / レンダーキューダイアログの手動追加では効きません。
+- Echo / ローリングシャッターの特殊合成は、ソースフレームの取得関数がプレビュー (decodeClipFrameAtSourceTime) と書き出し (renderClipSourceFrame) で別実装です (現状の結果は一致)。
+- EQ / コンプレッサー / リバーブ / ノイズリダクション / ディエッサー Dock の操作は undo に積まれません。
+- 自動ラウドネスの測定 (prepareJob) は GUI スレッドで同期実行されるため、長い素材では書き出し開始時に画面が止まることがあります。
+- バッチ書き出しの音声: 現在のプロジェクト以外のファイルを指すタスク (task.timeline が null) は、自動ラウドネスが OFF のときだけ従来どおり元ファイルの音声で書き出されます。自動ラウドネスが ON のときは測定できないため、Queue::processNext がエラー「自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません」を記録し、RenderQueue がジョブを拒否します (書き出されません)。バッチ設定ダイアログには、組み込み名 (1080p / 720p / 4K) と同名のユーザープリセットは出ません (組み込みが優先)。ミックスはタスク実行時のタイムラインから作られるため、キュー投入後の編集が反映されます (映像と同じ)。タイムラインの長さが 0 より大きく音声の再生シーケンスが空でないときだけミックスを作ります (長さ 0、または音声トラックが無い / 音声を持つクリップが無いときは従来どおり元ファイルの音声で、警告は出ません。全トラックがミュートでも音声を持つクリップがあれば、ミュート分を除いた無音のミックスで書き出され、警告は出ません。通常書き出しと同じ)。ミックスの作成に失敗したときは元ファイル音声で書き出し、書き出しが成功した場合だけタスクのメッセージが「Export complete (タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: <原因>)」になります (書き出しが失敗した場合はエラーメッセージが優先され、警告は残りません)。
+- 書き出し設定の音声ビットレートは音声を再エンコードする経路にだけ効きます。素材の音声をそのままコピーする経路では元のビットレートのままです。
+- 親付きクリップ: VideoPlayer プレビューの親合成は、オフライン親 / 重なり / 借用区間の 3 形態で整列結果とずれることがあります。親素材は存在するがデコードできない場合、整列は親ありとして計算し、描画は親を省きます。V1 上のキーフレーム付きクリップがトランジションの借用区間にあるときは、整列 / サーフェスツール (メッシュワープ / パペットピンの共通の編集ツール) はクランプした時刻で評価します。
+- FCPXML / EDL: 接続クリップを持つ親クリップの時刻範囲が不正 (duration が 0、または offset / start の計算が不正) な場合、その親は「lane N の時刻範囲が不正なクリップを読み飛ばしました: <名前> / <ref>」で、その接続クリップは「親クリップが不正なため接続クリップを読み飛ばしました: <名前> / <ref>」で、警告付きで読み飛ばされます (従来は取り込まれることがありました)。子を持たない spine の gap は警告を出さなくなりました。J カットが 0 秒より前に一部だけ出る分は切り詰めて警告「接続クリップをタイムライン 0 で切り詰めました: <名前> / <ref>」を出し、全体が 0 秒より前に出るクリップは取り込まれず「クリップの値が不正です (接続位置): <名前> / <ref>」で読み飛ばされます。EDL の dissolve は、長さが正のものなら素材の有無に関係なく、少なくともディゾルブ長 × 速度ぶんのハンドルが確保されて trail が常に正になるため (0 フレームのディゾルブはハンドルが 0 になり得て、trail は正になりません)、取り込み直後のトランジション区間の描画が変わります (送り側クリップは、そのハンドル分だけは常に右端を伸ばせます。ハンドルを超えて素材長まで伸びるのは、素材が見つかり probe が正の値でハンドル込みの長さより長いときだけです)。EDL はソース開始タイムコードを差し引きません (既存の制限)。
+- 自動ラウドネスの測定用 WAV は RenderQueue の一時ファイル管理を通らず直接削除されるため、削除に失敗しても再試行されず、ファイルが残ることがあります (既存。W10-LOUDWAV)。
+- RenderInPlace と MCP のレンダー経路の一部は、一時ファイルを保存用のプロジェクトパスとして扱う処理が新しい保護を通っていません。MCP 経由でメインのレンダーキューに載ったジョブを保存すると、掃除で消える一時パスが保存されることがあります (既存。W10-SAVEDTEMP。現在の画面にはキューの保存操作が無く、`RenderQueue::saveQueue` を呼ぶ API 経由でのみ起こり得ます)。また MCP `export_video` と RenderInPlace の音声ミックスの一時ファイルはキューが削除しないため、残ることがあります。
+- FCPXML の `<asset>` の `start` が 0 でない素材では、右端を伸ばせる範囲が素材末尾より `start` ぶん短くなることがあります (`asset.duration` を `start` 込みの outPoint と比べているため。Wave 10 で確認予定)。
+- mixer-dock selftest は起動直後にまれにハングすることがあります (既存、約 1.7%)。
 
 ---
 
