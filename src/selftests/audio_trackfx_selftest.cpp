@@ -13,6 +13,12 @@
 #include <QSignalBlocker>
 #include <QSlider>
 #include "../RenderInPlace.h"
+#include "../UndoManager.h"
+#include "../VideoPlayer.h"
+#include "SelftestGate.h"
+#include <QAbstractSlider>
+#include <QDockWidget>
+#include <functional>
 #include "../libavcore/AudioExtract.h"
 #include <QFile>
 #include <QTemporaryDir>
@@ -116,11 +122,8 @@ bool sameChain(const trackfx::Chain &a, const trackfx::Chain &b)
 
 int runAudioTrackFxSelftest()
 {
-    int pass = 0, fail = 0;
-    auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++pass : ++fail;
-    };
+    selftest::GateTally tally;
+    auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     trackfx::Chain chain;
     chain.eqEnabled = chain.compEnabled = chain.reverbEnabled = chain.nrEnabled = true;
     chain.eq.lowMid = {100.0, -12.0, 1.0, true};
@@ -469,14 +472,14 @@ int runAudioTrackFxSelftest()
         const QSignalBlocker blocker(&eqPanel);
         eqPanel.setTracks(panelNames, panelIds);
     }
-    auto *eqCombo = eqPanel.findChild<QComboBox *>();
+    auto *eqCombo = eqPanel.findChild<QComboBox *>(QStringLiteral("eq_track"));
     idsOk = idsOk && eqCombo && eqCombo->itemData(0).toInt() == AudioMixer::kMasterTrackId
         && eqCombo->itemData(1).toInt() == 0 && eqCombo->itemData(2).toInt() == 1;
     if (eqCombo) {
         eqCombo->setCurrentIndex(1);
         eqCombo->setCurrentIndex(0);
         idsOk = idsOk && eqWrites == 0;
-        auto *gain = eqPanel.findChild<QSlider *>();
+        auto *gain = eqPanel.findChild<QSlider *>(QStringLiteral("eq_low_gain"));
         if (gain) gain->setValue(-12);
         idsOk = idsOk && eqWrites == 1 && lastEqId == AudioMixer::kMasterTrackId;
         eqCombo->setCurrentIndex(1);
@@ -788,6 +791,164 @@ int runAudioTrackFxSelftest()
         && dryPcm == originalOne && dryMaster == masterDry && identical(exact, preciseBypass);
     resetMixer->clearTrackFx(); // idempotent on an FX-free project
     gate(19, resetOk && resetMixer->trackChain(0).isDefault());
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
-    return fail;
+
+    // G20-G23: an open EQ / compressor / reverb / NR dock follows a project load
+    // (the mixer is the source of truth) and its reseed writes nothing back.
+    struct DockCase {
+        int gateNumber;
+        const char *name;
+        const char *comboName;
+        const char *valueName;   // control whose value must follow the project
+        const char *touchName;   // another control, moved after the reseed
+        int touchValue;
+        std::function<void(MainWindow &)> open;
+        std::function<QDockWidget *(MainWindow &)> dock;
+        std::function<void(trackfx::Chain &)> arrange;
+        std::function<double(AudioMixer &)> mixerValue;
+        std::function<int(MainWindow &)> emitCount;
+        double projectValue;
+        double dockPerValue;     // dock control value = projectValue * dockPerValue
+    };
+    const std::vector<DockCase> dockCases = {
+        {20, "eq", "eq_track", "eq_lowmid_gain", "eq_high_gain", 3,
+         [](MainWindow &w) { w.openEqualizerPanel(); },
+         [](MainWindow &w) { return w.m_equalizerDock; },
+         [](trackfx::Chain &c) { c.eqEnabled = true; c.eq.lowMid = {250.0, -9.0, 1.0, true}; },
+         [](AudioMixer &m) { return m.eqForTrack(0).lowMid.gainDb; },
+         [](MainWindow &w) { return qobject_cast<EqualizerPanel *>(w.m_equalizerDock->widget())
+                                 ->changedEmitCountForTest(); },
+         -9.0, 1.0},
+        {21, "compressor", "compressor_track", "compressor_threshold", "compressor_makeup", 30,
+         [](MainWindow &w) { w.openCompressorPanel(); },
+         [](MainWindow &w) { return w.m_compressorDock; },
+         [](trackfx::Chain &c) { c.compEnabled = true; c.comp.enabled = true;
+                                 c.comp.thresholdDb = -30.0; c.comp.ratio = 6.0; },
+         [](AudioMixer &m) { return m.compressorForTrack(0).thresholdDb; },
+         [](MainWindow &w) { return qobject_cast<CompressorPanel *>(w.m_compressorDock->widget())
+                                 ->changedEmitCountForTest(); },
+         -30.0, 1.0},
+        {22, "reverb", "reverb_track", "reverb_mix", "reverb_width", 70,
+         [](MainWindow &w) { w.openReverbPanel(); },
+         [](MainWindow &w) { return w.m_reverbDock; },
+         [](trackfx::Chain &c) { c.reverbEnabled = true; c.reverb.enabled = true;
+                                 c.reverb.mixRatio = 0.4; c.reverb.decaySeconds = 2.0; },
+         [](AudioMixer &m) { return m.reverbForTrack(0).mixRatio; },
+         [](MainWindow &w) { return qobject_cast<ReverbPanel *>(w.m_reverbDock->widget())
+                                 ->changedEmitCountForTest(); },
+         0.4, 100.0},
+        {23, "nr", "nr_track", "nr_reduction", "nr_attack", 100,
+         [](MainWindow &w) { w.openNoiseReductionPanel(); },
+         [](MainWindow &w) { return w.m_noiseReductionDock; },
+         [](trackfx::Chain &c) { c.nrEnabled = true; c.nr.enabled = true;
+                                 c.nr.reductionDb = 24.0; c.nr.thresholdDb = -30.0; },
+         [](AudioMixer &m) { return m.noiseReductionForTrack(0).reductionDb; },
+         [](MainWindow &w) { return qobject_cast<NoiseReductionPanel *>(w.m_noiseReductionDock->widget())
+                                 ->changedEmitCountForTest(); },
+         24.0, 1.0},
+    };
+    for (const auto &dc : dockCases) {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        if (window.m_timeline && window.m_timeline->audioTrackCount() < 1)
+            window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+        bool ok = false;
+        if (mixer && window.m_timeline) {
+            dc.open(window);
+            QDockWidget *dock = dc.dock(window);
+            QWidget *panel = dock ? dock->widget() : nullptr;
+            auto *combo = panel ? panel->findChild<QComboBox *>(dc.comboName) : nullptr;
+            auto *value = panel ? panel->findChild<QAbstractSlider *>(dc.valueName) : nullptr;
+            auto *touch = panel ? panel->findChild<QAbstractSlider *>(dc.touchName) : nullptr;
+            if (combo && value && touch && combo->findData(0) >= 0) {
+                combo->setCurrentIndex(combo->findData(0)); // edit A1 (engine id 0)
+                const int undoBefore = window.m_timeline->undoManager()->currentIndex();
+                const int emitBefore = dc.emitCount(window);
+                trackfx::Chain chain;
+                dc.arrange(chain);
+                ProjectData project;
+                project.trackFx.insert(0, chain);
+                window.applyAudioState(project); // project load: mixer -> dock
+                const double dockValue = value->value() / dc.dockPerValue;
+                const double mixerValue = dc.mixerValue(*mixer);
+                const int emitReseed = dc.emitCount(window) - emitBefore;
+                const int undoAfterReseed = window.m_timeline->undoManager()->currentIndex();
+                // Outside a reseed one control change emits exactly once and must
+                // not write the stale (default) value of the loaded control back.
+                touch->setValue(dc.touchValue);
+                const int emitTouch = dc.emitCount(window) - emitBefore - emitReseed;
+                const double mixerAfterTouch = dc.mixerValue(*mixer);
+                std::fprintf(stderr,
+                    "audio-trackfx G%d %s: dock=%g mixer=%g project=%g emitsDuringReseed=%d "
+                    "emitsOnTouch=%d mixerAfterTouch=%g undoIdx=%d->%d\n",
+                    dc.gateNumber, dc.name, dockValue, mixerValue, dc.projectValue, emitReseed,
+                    emitTouch, mixerAfterTouch, undoBefore, undoAfterReseed);
+                const auto same = [](double a, double b) { return std::abs(a - b) < 1e-9; };
+                ok = same(dockValue, dc.projectValue) && same(mixerValue, dc.projectValue)
+                    && emitReseed == 0 && emitTouch == 1
+                    && same(mixerAfterTouch, dc.projectValue)
+                    && undoAfterReseed == undoBefore;
+            } else {
+                std::fprintf(stderr, "audio-trackfx G%d %s: dock controls not found "
+                    "(combo=%d value=%d touch=%d)\n", dc.gateNumber, dc.name,
+                    combo != nullptr, value != nullptr, touch != nullptr);
+            }
+        }
+        gate(dc.gateNumber, ok);
+    }
+
+    // G24: suppression entered by a caller survives a reseed (the panels save the
+    // state on entry and restore it on exit instead of forcing it off).
+    {
+        const QStringList names{QStringLiteral("M"), QStringLiteral("A1")};
+        const QList<int> ids{AudioMixer::kMasterTrackId, 0};
+        bool outerKept = true, outerClear = true;
+        int eqEmits = 0;
+        {
+            EqualizerPanel eq;
+            auto *gain = eq.findChild<QAbstractSlider *>("eq_low_gain");
+            const int eqBase = eq.changedEmitCountForTest(); // the constructor refreshes labels once
+            eq.m_suppressSignals = true;
+            if (gain) gain->blockSignals(true);
+            eq.setTracks(names, ids);
+            eq.setEqSettings(AudioMixer::kMasterTrackId, AudioMixer::EqSettings{});
+            const bool kept = eq.m_suppressSignals && gain && gain->signalsBlocked();
+            std::fprintf(stderr, "audio-trackfx G24 eq: outer suppress kept=%d (suppress=%d blocked=%d)\n",
+                kept, eq.m_suppressSignals, gain && gain->signalsBlocked());
+            outerKept = outerKept && kept;
+            eq.m_suppressSignals = false;
+            if (gain) gain->blockSignals(false);
+            eq.setTracks(names, ids);
+            eq.setEqSettings(AudioMixer::kMasterTrackId, AudioMixer::EqSettings{});
+            const bool clear = !eq.m_suppressSignals && gain && !gain->signalsBlocked();
+            outerClear = outerClear && clear;
+            eqEmits = eq.changedEmitCountForTest() - eqBase;
+        }
+        const auto checkPanel = [&](const char *name, auto &panel, auto settings) {
+            auto *combo = panel.template findChild<QComboBox *>(QStringLiteral("%1_track").arg(QLatin1String(name)));
+            audiofxui::setTrackComboItems(combo, {QStringLiteral("A1")}, {0});
+            const int base = panel.changedEmitCountForTest(); // constructor refresh
+            panel.m_suppressEmit = true;
+            panel.loadSettings(0, settings);
+            panel.setTrackList({1});
+            const bool kept = panel.m_suppressEmit;
+            panel.m_suppressEmit = false;
+            panel.loadSettings(0, settings);
+            const bool clear = !panel.m_suppressEmit;
+            std::fprintf(stderr, "audio-trackfx G24 %s: outer suppress kept=%d, cleared stays clear=%d, emits=%d\n",
+                name, kept, clear, panel.changedEmitCountForTest() - base);
+            outerKept = outerKept && kept;
+            outerClear = outerClear && clear && panel.changedEmitCountForTest() == base;
+        };
+        CompressorPanel comp;
+        ReverbPanel reverb;
+        NoiseReductionPanel nr;
+        checkPanel("compressor", comp, AudioMixer::CompressorSettings{});
+        checkPanel("reverb", reverb, AudioMixer::ReverbSettings{});
+        checkPanel("nr", nr, AudioMixer::NoiseReductionSettings{});
+        std::fprintf(stderr, "audio-trackfx G24: kept=%d clear=%d eqEmits=%d\n",
+            outerKept, outerClear, eqEmits);
+        gate(24, outerKept && outerClear && eqEmits == 0);
+    }
+    return tally.finish("audio-trackfx");
 }

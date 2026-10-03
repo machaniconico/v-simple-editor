@@ -21,6 +21,7 @@ class QLabel;
 // Plate / Cathedral / Off).
 class ReverbPanel : public QWidget {
     Q_OBJECT
+    friend int runAudioTrackFxSelftest(); // selftest reads/sets the suppress state
 public:
     explicit ReverbPanel(QWidget *parent = nullptr);
 
@@ -38,6 +39,9 @@ public:
 
     int currentTrackId() const;
 
+    // Number of *Changed emissions so far (selftests prove reseeds stay silent).
+    int changedEmitCountForTest() const { return m_emitCount; }
+
 signals:
     void reverbChanged(int trackId, AudioMixer::ReverbSettings r);
 
@@ -54,6 +58,7 @@ private:
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
+    int m_emitCount = 0;
 
     QComboBox *m_trackCombo = nullptr;
     QCheckBox *m_enable = nullptr;

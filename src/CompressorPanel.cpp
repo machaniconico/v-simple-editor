@@ -1,5 +1,7 @@
 #include "CompressorPanel.h"
 
+#include <QScopedValueRollback>
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDial>
@@ -59,7 +61,7 @@ void CompressorPanel::setMixer(AudioMixer *mixer) {
 
 void CompressorPanel::setTrackList(const QList<int> &trackIds) {
     const int prevId = currentTrackId();
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->clear();
     m_trackCombo->addItem(tr("Master"), 0);
     for (int id : trackIds) {
@@ -70,17 +72,15 @@ void CompressorPanel::setTrackList(const QList<int> &trackIds) {
     int idx = m_trackCombo->findData(prevId);
     if (idx < 0) idx = 0;
     m_trackCombo->setCurrentIndex(idx);
-    m_suppressEmit = false;
 }
 
 void CompressorPanel::loadSettings(int trackId,
                                    const AudioMixer::CompressorSettings &c) {
     int idx = m_trackCombo->findData(trackId);
     if (idx < 0) idx = 0;
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->setCurrentIndex(idx);
     applySettingsToControls(c);
-    m_suppressEmit = false;
 }
 
 int CompressorPanel::currentTrackId() const {
@@ -139,6 +139,14 @@ void CompressorPanel::buildUi() {
     addColumn(5, tr("Make-up"),   m_makeup,    m_makeupLabel,
               kMakeupMin, kMakeupMax, 0);
     root->addLayout(grid);
+    m_trackCombo->setObjectName(QStringLiteral("compressor_track"));
+    m_enable->setObjectName(QStringLiteral("compressor_enable"));
+    m_threshold->setObjectName(QStringLiteral("compressor_threshold"));
+    m_ratio->setObjectName(QStringLiteral("compressor_ratio"));
+    m_attack->setObjectName(QStringLiteral("compressor_attack"));
+    m_release->setObjectName(QStringLiteral("compressor_release"));
+    m_knee->setObjectName(QStringLiteral("compressor_knee"));
+    m_makeup->setObjectName(QStringLiteral("compressor_makeup"));
 
     // GR meter.
     auto *meterRow = new QHBoxLayout();
@@ -229,21 +237,21 @@ void CompressorPanel::onTrackChanged(int /*idx*/) {
     // so the dials reflect what is actually running.
     if (m_mixer) {
         const auto c = m_mixer->compressorForTrack(currentTrackId());
-        m_suppressEmit = true;
+        QScopedValueRollback<bool> suppress(m_suppressEmit, true);
         applySettingsToControls(c);
-        m_suppressEmit = false;
     }
 }
 
 void CompressorPanel::onLimiterModeClicked() {
     // Brick-wall limiter shortcut: ratio=20, attack=0.5ms, makeup=0,
     // enable=on. Threshold/release/knee left as the user set them.
-    m_suppressEmit = true;
-    m_ratio->setValue(2000);    // 20.00:1
-    m_attack->setValue(5);      // 0.5 ms
-    m_makeup->setValue(0);
-    m_enable->setChecked(true);
-    m_suppressEmit = false;
+    {
+        QScopedValueRollback<bool> suppress(m_suppressEmit, true);
+        m_ratio->setValue(2000);    // 20.00:1
+        m_attack->setValue(5);      // 0.5 ms
+        m_makeup->setValue(0);
+        m_enable->setChecked(true);
+    }
     onAnyControlChanged();
 }
 
@@ -257,5 +265,6 @@ void CompressorPanel::onPollMeter() {
 
 void CompressorPanel::emitChange() {
     if (m_suppressEmit) return;
+    ++m_emitCount;
     emit compressorChanged(currentTrackId(), collectSettings());
 }

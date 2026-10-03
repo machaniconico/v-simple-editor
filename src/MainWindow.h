@@ -255,6 +255,7 @@ class MainWindow : public QMainWindow
     friend int runLoudnessAutoSelftest();
     friend int runSpecialCompositeSelftest();
     friend int runDeEsserSelftest();
+    friend int runAudioTrackFxSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -459,8 +460,8 @@ private slots:
     // earlier sprint stories into the menu bar.
     void openEqualizerPanel();
     void openDeEsserPanel();
-    void reseedDeEsserPanel();
-    void syncDeEsserPanelTracks();
+    void reseedAudioFxDocks();
+    void syncAudioFxDocks();
     void openCompressorPanel();
     void openReverbPanel();
     void openNoiseReductionPanel();

@@ -22,6 +22,7 @@ class QTimer;
 // meter. The GR meter polls AudioMixer::currentGainReductionDb at 30 Hz.
 class CompressorPanel : public QWidget {
     Q_OBJECT
+    friend int runAudioTrackFxSelftest(); // selftest reads/sets the suppress state
 public:
     explicit CompressorPanel(QWidget *parent = nullptr);
 
@@ -38,6 +39,9 @@ public:
     void loadSettings(int trackId, const AudioMixer::CompressorSettings &c);
 
     int currentTrackId() const;
+
+    // Number of *Changed emissions so far (selftests prove reseeds stay silent).
+    int changedEmitCountForTest() const { return m_emitCount; }
 
 signals:
     void compressorChanged(int trackId, AudioMixer::CompressorSettings c);
@@ -56,6 +60,7 @@ private:
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
+    int m_emitCount = 0;
 
     QComboBox *m_trackCombo = nullptr;
     QDial *m_threshold = nullptr;

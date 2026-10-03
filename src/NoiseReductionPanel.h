@@ -21,6 +21,7 @@ class QTimer;
 // real-time floor estimate readout.
 class NoiseReductionPanel : public QWidget {
     Q_OBJECT
+    friend int runAudioTrackFxSelftest(); // selftest reads/sets the suppress state
 public:
     explicit NoiseReductionPanel(QWidget *parent = nullptr);
 
@@ -39,6 +40,9 @@ public:
                       const AudioMixer::NoiseReductionSettings &nr);
 
     int currentTrackId() const;
+
+    // Number of *Changed emissions so far (selftests prove reseeds stay silent).
+    int changedEmitCountForTest() const { return m_emitCount; }
 
 signals:
     void noiseReductionChanged(int trackId,
@@ -60,6 +64,7 @@ private:
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
+    int m_emitCount = 0;
 
     QComboBox *m_trackCombo = nullptr;
     QCheckBox *m_enable = nullptr;

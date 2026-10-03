@@ -8,7 +8,9 @@
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QVBoxLayout>
+#include <QScopedValueRollback>
 #include <QSignalBlocker>
+#include <vector>
 
 #include <cmath>
 
@@ -54,6 +56,7 @@ EqualizerPanel::EqualizerPanel(QWidget *parent) : QWidget(parent) {
 }
 
 EqualizerPanel::BandWidgets EqualizerPanel::buildBand(const QString &title,
+                                                      const QString &key,
                                                       double freqDefault,
                                                       bool peaking) {
     BandWidgets w;
@@ -66,6 +69,7 @@ EqualizerPanel::BandWidgets EqualizerPanel::buildBand(const QString &title,
     w.gain->setValue(0);
     w.gain->setTickPosition(QSlider::TicksRight);
     w.gain->setTickInterval(6);
+    w.gain->setObjectName(QStringLiteral("eq_%1_gain").arg(key));
     w.gainLabel = new QLabel(QStringLiteral("0 dB"), w.box);
     w.gainLabel->setAlignment(Qt::AlignCenter);
 
@@ -74,6 +78,7 @@ EqualizerPanel::BandWidgets EqualizerPanel::buildBand(const QString &title,
     w.freq->setRange(kFreqDialMin, kFreqDialMax);
     w.freq->setValue(hzToDial(freqDefault));
     w.freq->setNotchesVisible(true);
+    w.freq->setObjectName(QStringLiteral("eq_%1_freq").arg(key));
     w.freqLabel = new QLabel(w.box);
     w.freqLabel->setAlignment(Qt::AlignCenter);
 
@@ -83,6 +88,7 @@ EqualizerPanel::BandWidgets EqualizerPanel::buildBand(const QString &title,
         w.q->setRange(kQDialMin, kQDialMax);
         w.q->setValue(qToDial(1.0));
         w.q->setNotchesVisible(true);
+        w.q->setObjectName(QStringLiteral("eq_%1_q").arg(key));
         w.qLabel = new QLabel(w.box);
         w.qLabel->setAlignment(Qt::AlignCenter);
     }
@@ -116,6 +122,7 @@ void EqualizerPanel::buildUi() {
     auto *top = new QHBoxLayout();
     top->addWidget(new QLabel(QStringLiteral("Track:"), this));
     m_trackCombo = new QComboBox(this);
+    m_trackCombo->setObjectName(QStringLiteral("eq_track"));
     m_trackCombo->addItem(QStringLiteral("Master"), QVariant(0));
     top->addWidget(m_trackCombo, /*stretch=*/1);
     connect(m_trackCombo,
@@ -125,10 +132,10 @@ void EqualizerPanel::buildUi() {
     root->addLayout(top);
 
     auto *bands = new QHBoxLayout();
-    m_low     = buildBand(QStringLiteral("Low (Shelf)"),     80.0,    /*peaking=*/false);
-    m_lowMid  = buildBand(QStringLiteral("Low-Mid"),         250.0,   /*peaking=*/true);
-    m_highMid = buildBand(QStringLiteral("High-Mid"),        3000.0,  /*peaking=*/true);
-    m_high    = buildBand(QStringLiteral("High (Shelf)"),    10000.0, /*peaking=*/false);
+    m_low     = buildBand(QStringLiteral("Low (Shelf)"),     QStringLiteral("low"),     80.0,    /*peaking=*/false);
+    m_lowMid  = buildBand(QStringLiteral("Low-Mid"),         QStringLiteral("lowmid"),  250.0,   /*peaking=*/true);
+    m_highMid = buildBand(QStringLiteral("High-Mid"),        QStringLiteral("highmid"), 3000.0,  /*peaking=*/true);
+    m_high    = buildBand(QStringLiteral("High (Shelf)"),    QStringLiteral("high"),    10000.0, /*peaking=*/false);
     bands->addWidget(m_low.box);
     bands->addWidget(m_lowMid.box);
     bands->addWidget(m_highMid.box);
@@ -154,6 +161,9 @@ void EqualizerPanel::setTracks(const QStringList &itemNames, const QList<int> &t
     if (m_trackCombo->count() > 0) {
         m_trackCombo->setCurrentIndex(0);
         m_currentTrackId = m_trackCombo->itemData(0).toInt();
+        // Reseeding never emits: the panel guards itself, not only its host.
+        QScopedValueRollback<bool> suppress(m_suppressSignals, true);
+        const auto blockers = blockBandSignals();
         applyBandToWidgets(m_low,
                            m_perTrackSettings[m_currentTrackId].low, false);
         applyBandToWidgets(m_lowMid,
@@ -162,6 +172,7 @@ void EqualizerPanel::setTracks(const QStringList &itemNames, const QList<int> &t
                            m_perTrackSettings[m_currentTrackId].highMid, true);
         applyBandToWidgets(m_high,
                            m_perTrackSettings[m_currentTrackId].high, false);
+        onAnyControlChanged();
     }
 }
 
@@ -169,15 +180,16 @@ void EqualizerPanel::setEqSettings(int trackId, const AudioMixer::EqSettings &eq
     m_perTrackSettings.insert(trackId, eq);
     if (trackId == m_currentTrackId) {
         // Apply without emitting eqChanged.
-        m_suppressSignals = true;
-        blockBandSignals(true);
-        applyBandToWidgets(m_low,     eq.low,     false);
-        applyBandToWidgets(m_lowMid,  eq.lowMid,  true);
-        applyBandToWidgets(m_highMid, eq.highMid, true);
-        applyBandToWidgets(m_high,    eq.high,    false);
-        blockBandSignals(false);
-        m_suppressSignals = false;
-        // Refresh labels (these depend on widget values, not signals).
+        QScopedValueRollback<bool> suppress(m_suppressSignals, true);
+        {
+            const auto blockers = blockBandSignals();
+            applyBandToWidgets(m_low,     eq.low,     false);
+            applyBandToWidgets(m_lowMid,  eq.lowMid,  true);
+            applyBandToWidgets(m_highMid, eq.highMid, true);
+            applyBandToWidgets(m_high,    eq.high,    false);
+        }
+        // Refresh labels (these depend on widget values, not signals); still
+        // suppressed so the refresh itself never reports a user edit.
         onAnyControlChanged();
     }
 }
@@ -220,18 +232,20 @@ void EqualizerPanel::onAnyControlChanged() {
 
     m_perTrackSettings.insert(m_currentTrackId, eq);
     if (!m_suppressSignals) {
+        ++m_emitCount;
         emit eqChanged(m_currentTrackId, eq);
     }
 }
 
-void EqualizerPanel::blockBandSignals(bool block) {
-    auto setBlocked = [block](QObject *o) {
-        if (o) o->blockSignals(block);
-    };
-    setBlocked(m_low.gain);     setBlocked(m_low.freq);     setBlocked(m_low.q);
-    setBlocked(m_lowMid.gain);  setBlocked(m_lowMid.freq);  setBlocked(m_lowMid.q);
-    setBlocked(m_highMid.gain); setBlocked(m_highMid.freq); setBlocked(m_highMid.q);
-    setBlocked(m_high.gain);    setBlocked(m_high.freq);    setBlocked(m_high.q);
+std::vector<QSignalBlocker> EqualizerPanel::blockBandSignals() {
+    // QSignalBlocker restores each control's previous blocked state on exit,
+    // so a caller that blocked a control first keeps its protection.
+    std::vector<QSignalBlocker> blockers;
+    for (const BandWidgets *w : {&m_low, &m_lowMid, &m_highMid, &m_high})
+        for (QObject *o : {static_cast<QObject *>(w->gain), static_cast<QObject *>(w->freq),
+                           static_cast<QObject *>(w->q)})
+            if (o) blockers.emplace_back(o);
+    return blockers;
 }
 
 void EqualizerPanel::applyBandToWidgets(const BandWidgets &w,

@@ -3226,17 +3226,18 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
-    // De-esser dock: one catch-all for audio track count changes (import /
-    // addClip auto-track, BGM, paste, undo / redo, project load, removal).
-    // Reseeds only when the track set changed, never on plain value edits.
+    // Audio FX docks (EQ / compressor / reverb / NR / de-esser): one catch-all
+    // for audio track count changes (import / addClip auto-track, BGM, paste,
+    // undo / redo, project load, removal). Reseeds only when the track set
+    // changed, never on plain value edits.
     connect(m_timeline->undoManager(), &UndoManager::stateChanged,
-            this, &MainWindow::syncDeEsserPanelTracks);
+            this, &MainWindow::syncAudioFxDocks);
     connect(m_timeline, &Timeline::audioSequenceChanged,
-            this, &MainWindow::syncDeEsserPanelTracks);
+            this, &MainWindow::syncAudioFxDocks);
     connect(m_timeline, &Timeline::trackIndicesRemapped,
-            this, &MainWindow::syncDeEsserPanelTracks);
+            this, &MainWindow::syncAudioFxDocks);
     connect(m_timeline, &Timeline::trackStateRestored,
-            this, &MainWindow::syncDeEsserPanelTracks);
+            this, &MainWindow::syncAudioFxDocks);
     m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
     m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
@@ -9820,7 +9821,7 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     }
     if (m_audioBusPanel) m_audioBusPanel->refresh();
     rebuildAudioMeters();
-    reseedDeEsserPanel();
+    reseedAudioFxDocks();
 }
 
 void MainWindow::syncTrackMatteEntriesFromTimeline()
@@ -9851,7 +9852,7 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
         }
         if (m_audioBusPanel) m_audioBusPanel->refresh();
         rebuildAudioMeters();
-        reseedDeEsserPanel();
+        reseedAudioFxDocks();
         return;
     }
     QVector<AdjustmentLayer> layers;
@@ -9973,7 +9974,7 @@ void MainWindow::applyAudioState(const ProjectData &data)
     }
     if (m_audioMetersDock)
         m_audioMetersDock->setVisible(data.audioMetersDockVisible);
-    reseedDeEsserPanel();
+    reseedAudioFxDocks();
 }
 
 void MainWindow::newProject()
@@ -19943,25 +19944,7 @@ void MainWindow::openEqualizerPanel()
         });
     }
 
-    // Re-seed track list and current per-track settings on every show
-    // so newly added audio tracks appear without restart.
-    if (auto *panel = qobject_cast<EqualizerPanel *>(m_equalizerDock->widget())) {
-        const QSignalBlocker seedBlocker(panel);
-        QStringList names;
-        QList<int> ids;
-        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        audiofxui::buildAudioTrackList(trackCount, names, ids);
-        panel->setTracks(names, ids);
-        if (auto *combo = panel->findChild<QComboBox *>()) {
-            const int masterIndex = combo->findData(AudioMixer::kMasterTrackId);
-            if (masterIndex >= 0)
-                combo->setItemData(masterIndex, tr(
-                    "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
-        }
-        for (int id : ids)
-            panel->setEqSettings(id, id == AudioMixer::kMasterTrackId
-                ? mixer->masterChain().eq : mixer->eqForTrack(id));
-    }
+    reseedAudioFxDocks();
     m_equalizerDock->setVisible(true);
     m_equalizerDock->raise();
 }
@@ -19998,38 +19981,101 @@ void MainWindow::openDeEsserPanel()
         });
     }
 
-    reseedDeEsserPanel();
+    reseedAudioFxDocks();
     m_deesserDock->setVisible(true);
     m_deesserDock->raise();
 }
 
-// Mixer is the source of truth: re-seed the track list and every stored value
-// without emitting, so a stale panel can never overwrite new mixer state.
-// Called on show and after project load / new / undo restore / track changes.
-void MainWindow::reseedDeEsserPanel()
+// Mixer is the source of truth: re-seed every open audio FX dock (track list and
+// every stored value) without emitting, so a stale panel can never overwrite new
+// mixer state. Called on show and after project load / new / undo restore /
+// track changes. Each panel suppresses its own *Changed signal while seeding.
+void MainWindow::reseedAudioFxDocks()
 {
     auto *mixer = m_player ? m_player->audioMixer() : nullptr;
-    auto *panel = m_deesserDock
-        ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr;
-    if (!mixer || !panel) return;
+    if (!mixer) return;
+    const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
     QStringList names;
     QList<int> ids;
-    const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-    audiofxui::buildAudioTrackList(trackCount, names, ids);
-    panel->setTracks(names, ids);
-    for (int id : ids)
-        panel->setSettings(id, (id == AudioMixer::kMasterTrackId
-            ? mixer->masterChain() : mixer->trackChain(id)).deesser);
+    if (m_equalizerDock) {
+        if (auto *panel = qobject_cast<EqualizerPanel *>(m_equalizerDock->widget())) {
+            const int selectedId = panel->currentTrackId();
+            audiofxui::buildAudioTrackList(trackCount, names, ids);
+            panel->setTracks(names, ids);
+            auto *combo = panel->findChild<QComboBox *>("eq_track");
+            if (combo) {
+                const int masterIndex = combo->findData(AudioMixer::kMasterTrackId);
+                if (masterIndex >= 0)
+                    combo->setItemData(masterIndex, tr(
+                        "すべてのトラックをミックスした後に掛かります (書き出しにも反映)"), Qt::ToolTipRole);
+            }
+            for (int id : ids)
+                panel->setEqSettings(id, id == AudioMixer::kMasterTrackId
+                    ? mixer->masterChain().eq : mixer->eqForTrack(id));
+            // Keep the user's track selection when it still exists.
+            if (combo) {
+                const int keep = combo->findData(selectedId);
+                if (keep >= 0 && keep != combo->currentIndex())
+                    combo->setCurrentIndex(keep);
+            }
+        }
+    }
+    if (m_deesserDock) {
+        if (auto *panel = qobject_cast<DeEsserPanel *>(m_deesserDock->widget())) {
+            audiofxui::buildAudioTrackList(trackCount, names, ids);
+            panel->setTracks(names, ids);
+            for (int id : ids)
+                panel->setSettings(id, (id == AudioMixer::kMasterTrackId
+                    ? mixer->masterChain() : mixer->trackChain(id)).deesser);
+        }
+    }
+    // Compressor / reverb / NR have no master row: engine ids 0..n-1 only.
+    audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
+    const auto reseedTrackPanel = [&](auto *panel, const char *comboName, auto settingsFor) {
+        if (!panel) return;
+        const int selectedId = panel->currentTrackId();
+        // Legacy panel builders reserve 0 for Master; install engine IDs here.
+        audiofxui::setTrackComboItems(panel->template findChild<QComboBox *>(comboName),
+                                      names, ids);
+        panel->setEnabled(!ids.isEmpty());
+        for (int id : ids)
+            panel->loadSettings(id, settingsFor(id));
+        if (!ids.isEmpty()) {
+            const int shown = ids.contains(selectedId) ? selectedId : ids.first();
+            panel->loadSettings(shown, settingsFor(shown));
+        }
+    };
+    if (m_compressorDock)
+        reseedTrackPanel(qobject_cast<CompressorPanel *>(m_compressorDock->widget()),
+            "compressor_track", [mixer](int id) { return mixer->compressorForTrack(id); });
+    if (m_reverbDock)
+        reseedTrackPanel(qobject_cast<ReverbPanel *>(m_reverbDock->widget()),
+            "reverb_track", [mixer](int id) { return mixer->reverbForTrack(id); });
+    if (m_noiseReductionDock)
+        reseedTrackPanel(qobject_cast<NoiseReductionPanel *>(m_noiseReductionDock->widget()),
+            "nr_track", [mixer](int id) { return mixer->noiseReductionForTrack(id); });
 }
 
-void MainWindow::syncDeEsserPanelTracks()
+void MainWindow::syncAudioFxDocks()
 {
-    auto *panel = m_deesserDock
-        ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr;
-    if (!panel || !m_timeline) return;
-    // Targets are the master plus A1..An, so the count identifies the id set.
-    if (panel->targetCount() != m_timeline->audioTrackCount() + 1)
-        reseedDeEsserPanel();
+    if (!m_timeline) return;
+    const int tracks = m_timeline->audioTrackCount();
+    // Master-bearing docks list the master plus A1..An; the others list A1..An.
+    const auto comboCount = [](QDockWidget *dock, const char *name) {
+        auto *combo = dock && dock->widget()
+            ? dock->widget()->findChild<QComboBox *>(name) : nullptr;
+        return combo ? combo->count() : -1;
+    };
+    bool stale = false;
+    if (m_equalizerDock) stale |= comboCount(m_equalizerDock, "eq_track") != tracks + 1;
+    if (m_compressorDock) stale |= comboCount(m_compressorDock, "compressor_track") != tracks;
+    if (m_reverbDock) stale |= comboCount(m_reverbDock, "reverb_track") != tracks;
+    if (m_noiseReductionDock) stale |= comboCount(m_noiseReductionDock, "nr_track") != tracks;
+    if (auto *panel = m_deesserDock
+            ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr)
+        stale |= panel->targetCount() != tracks + 1;
+    if (stale)
+        reseedAudioFxDocks();
 }
 
 void MainWindow::openCompressorPanel()
@@ -20056,19 +20102,7 @@ void MainWindow::openCompressorPanel()
         });
     }
 
-    if (auto *panel = qobject_cast<CompressorPanel *>(m_compressorDock->widget())) {
-        QStringList names;
-        QList<int> ids;
-        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        // Legacy panel builders reserve 0 for Master; install engine IDs here.
-        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
-        panel->setEnabled(!ids.isEmpty());
-        for (int id : ids)
-            panel->loadSettings(id, mixer->compressorForTrack(id));
-        if (!ids.isEmpty())
-            panel->loadSettings(ids.first(), mixer->compressorForTrack(ids.first()));
-    }
+    reseedAudioFxDocks();
     m_compressorDock->setVisible(true);
     m_compressorDock->raise();
 }
@@ -20097,19 +20131,7 @@ void MainWindow::openReverbPanel()
         });
     }
 
-    if (auto *panel = qobject_cast<ReverbPanel *>(m_reverbDock->widget())) {
-        QStringList names;
-        QList<int> ids;
-        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        // Legacy panel builders reserve 0 for Master; install engine IDs here.
-        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
-        panel->setEnabled(!ids.isEmpty());
-        for (int id : ids)
-            panel->loadSettings(id, mixer->reverbForTrack(id));
-        if (!ids.isEmpty())
-            panel->loadSettings(ids.first(), mixer->reverbForTrack(ids.first()));
-    }
+    reseedAudioFxDocks();
     m_reverbDock->setVisible(true);
     m_reverbDock->raise();
 }
@@ -20138,19 +20160,7 @@ void MainWindow::openNoiseReductionPanel()
         });
     }
 
-    if (auto *panel = qobject_cast<NoiseReductionPanel *>(m_noiseReductionDock->widget())) {
-        QStringList names;
-        QList<int> ids;
-        const int trackCount = m_timeline ? m_timeline->audioTrackCount() : 0;
-        audiofxui::buildAudioTrackList(trackCount, names, ids, /*includeMaster=*/false);
-        // Legacy panel builders reserve 0 for Master; install engine IDs here.
-        audiofxui::setTrackComboItems(panel->findChild<QComboBox *>(), names, ids);
-        panel->setEnabled(!ids.isEmpty());
-        for (int id : ids)
-            panel->loadSettings(id, mixer->noiseReductionForTrack(id));
-        if (!ids.isEmpty())
-            panel->loadSettings(ids.first(), mixer->noiseReductionForTrack(ids.first()));
-    }
+    reseedAudioFxDocks();
     m_noiseReductionDock->setVisible(true);
     m_noiseReductionDock->raise();
 }
