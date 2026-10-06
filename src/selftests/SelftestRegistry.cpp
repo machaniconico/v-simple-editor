@@ -26,6 +26,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../util/Logger.h"
+#include "../util/HangDump.h"
 
 // ---------------------------------------------------------------------------
 // Forward declarations for the selftest functions implemented in src/main.cpp.
@@ -572,6 +573,9 @@ void armWatchdog(const char* name)
     const std::string entryName = name ? name : "?";
     std::cerr << "[watchdog] armed " << sec << "s (" << entryName << ")" << std::endl;
 
+#ifdef _WIN32
+    hangdump::prepare();
+#endif
     auto state = std::make_shared<WatchdogState>();
     {
         std::lock_guard<std::mutex> lock(g_watchdogMutex);
@@ -586,6 +590,16 @@ void armWatchdog(const char* name)
         std::fflush(stdout);
         std::fprintf(stderr, "summary: TIMEOUT after %ds (selftest=%s)\n",
                      sec, entryName.c_str());
+        std::fflush(stderr);
+#ifdef _WIN32
+        const hangdump::Result dump = hangdump::writeHangArtifacts(entryName.c_str());
+        std::fprintf(stderr, "watchdog: dump %s %s stacks=%s elapsedMs=%lld\n",
+                     dump.dumpWritten ? "written to" : "failed at",
+                     dump.dumpPath, dump.stacksWritten ? "yes" : "no",
+                     dump.elapsedMs);
+#else
+        std::fprintf(stderr, "watchdog: stack dump unsupported on this platform\n");
+#endif
         std::fflush(stderr);
         std::_Exit(124);
     }).detach();
@@ -1141,7 +1155,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "platform-mock-e2e", "VEDITOR_PLATFORM_MOCK_SELFTEST",      runPlatformMockE2eSelftest,    true,
       "Instagram Graph API + X Media Upload を localhost mock 経由で e2e exercise (13 gates): server + 5 IG + 7 X. QApplication 必要。" },
     { "watchdog", "VEDITOR_WATCHDOG_SELFTEST", runWatchdogSelftest, false,
-      "Selftest watchdog: timeout exit 124, armed/disabled lines, MCP port-exhaustion warning, per-entry re-arm in sweep (5 gates)" },
+      "Selftest watchdog: timeout exit 124, hang dump, armed/disabled lines, MCP port-exhaustion warning, per-entry re-arm in sweep (7 gates)" },
     { "watchdog-probe", nullptr, runWatchdogProbeSelftest, false,
       "内部用 (--selftest=watchdog の子プロセス。VEDITOR_WATCHDOG_PROBE_MODE=hang|slow)" },
 };

@@ -1,5 +1,5 @@
 // src/selftests/watchdog_selftest.cpp
-// US-700 SELFTEST-WATCHDOG: --selftest=watchdog (G1..G5) and the internal
+// US-700 SELFTEST-WATCHDOG: --selftest=watchdog (G1..G7) and the internal
 // --selftest=watchdog-probe child entry.
 //
 // The watchdog itself lives in SelftestRegistry.cpp (selftests::armWatchdog /
@@ -7,27 +7,118 @@
 // executable so that std::_Exit(124) is observed from the outside.
 
 #include "SelftestRegistry.h"
+#include "SelftestGate.h"
 #include "../mcp/McpHttpServer.h"
 
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QHostAddress>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 #include <QTcpServer>
 #include <QTest>
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
+#ifdef Q_OS_WIN
+#define NOMINMAX
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
+
 namespace {
+
+std::mutex g_watchdogProbeMutex;
+std::mutex g_watchdogProbeReadyMutex;
+std::condition_variable g_watchdogProbeReadyCv;
+bool g_watchdogProbeReady = false;
+
+#ifdef _WIN32
+#define WATCHDOG_NOINLINE __declspec(noinline)
+#else
+#define WATCHDOG_NOINLINE __attribute__((noinline))
+#endif
+
+extern "C" WATCHDOG_NOINLINE void watchdogProbeHangWorker()
+{
+    std::lock_guard<std::mutex> held(g_watchdogProbeMutex);
+    {
+        std::lock_guard<std::mutex> ready(g_watchdogProbeReadyMutex);
+        g_watchdogProbeReady = true;
+    }
+    g_watchdogProbeReadyCv.notify_one();
+    for (;;)
+        std::this_thread::sleep_for(std::chrono::hours(1));
+}
+
+extern "C" WATCHDOG_NOINLINE void watchdogProbeHangMain()
+{
+    {
+        std::unique_lock<std::mutex> ready(g_watchdogProbeReadyMutex);
+        g_watchdogProbeReadyCv.wait(ready, [] { return g_watchdogProbeReady; });
+    }
+    std::lock_guard<std::mutex> blocked(g_watchdogProbeMutex);
+}
+
+QSet<QString> dumpFiles()
+{
+    const QDir dir(QStringLiteral(".omc/artifacts/hang-dumps"));
+    QSet<QString> files;
+    for (const QString& name : dir.entryList(QDir::Files))
+        files.insert(name);
+    return files;
+}
+
+bool isWslDirectExec()
+{
+#ifdef Q_OS_WIN
+    if (qEnvironmentVariableIsSet("WSL_INTEROP") ||
+        qEnvironmentVariableIsSet("VEDITOR_WSL_DIRECT_EXEC"))
+        return true;
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    DWORD parentPid = 0;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == GetCurrentProcessId()) {
+                parentPid = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    bool direct = false;
+    if (parentPid && Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == parentPid) {
+                direct = lstrcmpiW(entry.szExeFile, L"wsl.exe") == 0 ||
+                         lstrcmpiW(entry.szExeFile, L"wslhost.exe") == 0;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return direct;
+#else
+    return false;
+#endif
+}
 
 struct ChildRun {
     bool finished = false;
@@ -123,8 +214,8 @@ int runWatchdogProbeSelftest()
 {
     const QByteArray mode = qgetenv("VEDITOR_WATCHDOG_PROBE_MODE");
     if (mode == "hang") {
-        for (;;)
-            std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::thread(watchdogProbeHangWorker).detach();
+        watchdogProbeHangMain();
     }
     if (mode == "slow")
         std::this_thread::sleep_for(std::chrono::seconds(2));
@@ -140,12 +231,9 @@ int runWatchdogSelftest()
     if (!QCoreApplication::instance())
         localApp = std::make_unique<QCoreApplication>(s_argc, s_argv);
 
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
     auto gate = [&](const char* id, bool ok) {
-        if (ok) ++passed; else ++failed;
-        std::fprintf(stderr, "%s %s\n", ok ? "PASS" : "FAIL", id);
-        std::fflush(stderr);
+        tally.gate(std::atoi(id + 1), ok);
     };
     const QStringList probeArgs{ QStringLiteral("--selftest=watchdog-probe") };
 
@@ -281,7 +369,84 @@ int runWatchdogSelftest()
                    && armed == 3 && timeouts == 0);
     }
 
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL, 0 SKIP\n", passed, failed);
-    std::fflush(stderr);
-    return failed;
+    // G6 detects a timeout path that exits without producing its required
+    // minidump. The disabled and normal paths in G7 are its negative control.
+#ifdef Q_OS_WIN
+    if (isWslDirectExec()) {
+        tally.skip(6, "WSL direct exec cannot validate Windows child dump behavior");
+        tally.skip(7, "WSL direct exec cannot validate Windows child dump behavior");
+    } else {
+        QProcessEnvironment env = cleanChildEnvironment();
+        env.insert(QStringLiteral("VEDITOR_SELFTEST_TIMEOUT_SEC"), QStringLiteral("2"));
+        env.insert(QStringLiteral("VEDITOR_WATCHDOG_PROBE_MODE"), QStringLiteral("hang"));
+        const ChildRun r = runChild(env, probeArgs, 15000, true);
+        const QRegularExpression dumpLine(QStringLiteral(
+            R"(watchdog: dump written to (\S+\.dmp) stacks=(yes|no) elapsedMs=(\d+))"));
+        const QRegularExpressionMatch match = dumpLine.match(r.stdErr);
+        const QString dumpPath = match.captured(1);
+        const QFileInfo dumpInfo(QDir::current().filePath(dumpPath));
+        const bool timeoutLine = r.stdErr.contains(
+            QStringLiteral("summary: TIMEOUT after 2s (selftest=watchdog-probe)"));
+        const bool dumpExists = dumpInfo.isFile() && dumpInfo.size() > 0;
+        const bool stackReported = match.captured(2) == QStringLiteral("yes");
+        const qint64 dumpElapsedMs = match.hasMatch() ? match.captured(3).toLongLong() : -1;
+
+        QFile stackFile(dumpPath.left(dumpPath.size() - 4) + QStringLiteral(".txt"));
+        const bool textExists = stackFile.open(QIODevice::ReadOnly);
+        const QString stackText = textExists ? QString::fromUtf8(stackFile.readAll()) : QString();
+        const QStringList sections = stackText.split(
+            QRegularExpression(QStringLiteral(R"((?=thread \d+))")), Qt::SkipEmptyParts);
+        int threadCount = 0;
+        int mainTid = -1;
+        int workerTid = -1;
+        const QRegularExpression threadId(QStringLiteral(R"(^thread (\d+))"));
+        for (const QString& section : sections) {
+            const QRegularExpressionMatch idMatch = threadId.match(section);
+            if (!idMatch.hasMatch()) continue;
+            ++threadCount;
+            const int tid = idMatch.captured(1).toInt();
+            if (section.contains(QStringLiteral("watchdogProbeHangMain"))) mainTid = tid;
+            if (section.contains(QStringLiteral("watchdogProbeHangWorker"))) workerTid = tid;
+        }
+        std::fprintf(stderr,
+            "[watchdog] G6 terms: finished=%d exit124=%d timeoutLine=%d "
+            "dumpPath=%s dumpExists=%d dumpBytes=%lld dumpElapsedMs=%lld "
+            "txt=%d stackReported=%d threads=%d mainTid=%d workerTid=%d distinct=%d\n",
+            r.finished, r.exitCode == 124, timeoutLine,
+            dumpPath.toUtf8().constData(), dumpExists,
+            static_cast<long long>(dumpInfo.size()), static_cast<long long>(dumpElapsedMs),
+            textExists, stackReported, threadCount, mainTid, workerTid,
+            mainTid >= 0 && workerTid >= 0 && mainTid != workerTid);
+        gate("G6", r.finished && r.exitCode == 124 && timeoutLine &&
+                    match.hasMatch() && dumpExists && dumpElapsedMs >= 0 && dumpElapsedMs < 10000);
+
+        // G7 detects a regression where disabled or normally completed entries
+        // still leave dump artifacts. The hang child is deliberately killed.
+        const QSet<QString> before = dumpFiles();
+        env.insert(QStringLiteral("VEDITOR_SELFTEST_TIMEOUT_SEC"), QStringLiteral("0"));
+        const ChildRun disabled = runChild(env, probeArgs, 3000, true);
+        env.insert(QStringLiteral("VEDITOR_SELFTEST_TIMEOUT_SEC"), QStringLiteral("60"));
+        env.remove(QStringLiteral("VEDITOR_WATCHDOG_PROBE_MODE"));
+        const ChildRun normal = runChild(env,
+            QStringList{ QStringLiteral("--selftest=gate-count-probe") }, 30000, true);
+        const QSet<QString> added = dumpFiles() - before;
+        const bool disabledLine = disabled.stdErr.contains(QStringLiteral("[watchdog] disabled"));
+        const bool normalArmed = normal.stdErr.contains(QStringLiteral("[watchdog] armed"));
+        const bool normalExit = normal.finished && normal.exitCode == 0 &&
+                                normal.exitStatus == QProcess::NormalExit;
+        std::fprintf(stderr,
+            "[watchdog] G7 terms: disabledFinished=%d disabledExit=%d "
+            "disabledLine=%d normalArmed=%d normalFinished=%d normalExit=%d "
+            "normalExitCode=%d newDumpFiles=%d\n",
+            disabled.finished, disabled.exitCode, disabledLine, normalArmed, normal.finished,
+            normalExit, normal.exitCode, static_cast<int>(added.size()));
+        gate("G7", !disabled.finished && disabled.exitCode != 124 && disabledLine &&
+                    normalArmed && normalExit && added.isEmpty());
+    }
+#else
+    tally.skip(6, "Windows minidump requires Windows");
+    tally.skip(7, "Windows minidump requires Windows");
+#endif
+
+    return tally.finish();
 }

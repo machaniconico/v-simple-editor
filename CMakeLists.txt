@@ -191,6 +191,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
 
     src/main.cpp
     src/util/CrashHandler.cpp
+    src/util/HangDump.cpp
     src/util/Logger.cpp
     src/util/RcPause.h
     src/DynamicZoom.h
