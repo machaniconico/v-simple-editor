@@ -178,7 +178,12 @@ int runKeyframeCopySelftest()
     const int emptyBefore = emptyTimeline.undoManager()->currentIndex();
     auto emptyModel = [&]() { return emptyTimeline.videoTracks()[0]->clips()[0].keyframes; };
     bool g5 = emptyModel().tracks().isEmpty();
-    const auto *destinations = emptyPanel.findChild<QListWidget *>();
+    const auto *destinations = emptyPanel.findChild<QListWidget *>(QStringLiteral("GraphEditorTrackList"));
+    const auto destinationsByType = emptyPanel.findChildren<QListWidget *>();
+    std::fprintf(stderr, "[keyframe-copy] G5 found=%s typeOnlyFirst=%s lists=%lld\n",
+                 destinations ? qPrintable(destinations->objectName()) : "(null)",
+                 destinationsByType.isEmpty() ? "(none)" : qPrintable(destinationsByType.first()->objectName()),
+                 static_cast<long long>(destinationsByType.size()));
     g5 = g5 && destinations && destinations->currentItem()
         && destinations->currentItem()->data(Qt::UserRole).toString() == sourceProperty;
     QAction *pasteAction = nullptr;

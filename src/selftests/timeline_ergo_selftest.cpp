@@ -359,11 +359,27 @@ int runTimelineErgoSelftest()
         timeline.resize(1200, 400);
         timeline.show();
         QApplication::processEvents();
-        auto *scroll = timeline.findChild<QScrollArea *>();
+        auto *scroll = timeline.findChild<QScrollArea *>(QStringLiteral("timelineScrollArea"));
+        auto *headerScroll = timeline.findChild<QScrollArea *>(QStringLiteral("timelineHeaderScrollArea"));
         auto *track = timeline.videoTracks()[0];
+        // The found widget must be the production track scroll area: it hosts the
+        // track widgets (widget() is their ancestor) and is not the header scroll area.
+        const auto scrollAreas = timeline.findChildren<QScrollArea *>();
+        const QString typeOnlyFirst = scrollAreas.isEmpty() ? QString() : scrollAreas.first()->objectName();
+        const bool widgetHostsTrack = scroll && scroll->widget() && scroll->widget()->isAncestorOf(track);
+        const bool headerDistinct = headerScroll && headerScroll != scroll;
+        const bool headerNotHostingTrack =
+            !(headerScroll && headerScroll->widget() && headerScroll->widget()->isAncestorOf(track));
+        const bool scrollIsTrackArea = widgetHostsTrack && headerDistinct && headerNotHostingTrack;
+        std::fprintf(stderr, "[timeline-ergo] zoom-scroll found=%s header=%s typeOnlyFirst=%s areas=%lld trackArea=%d widgetHostsTrack=%d headerDistinct=%d headerNotHostingTrack=%d\n",
+                     scroll ? qPrintable(scroll->objectName()) : "(null)",
+                     headerScroll ? qPrintable(headerScroll->objectName()) : "(null)",
+                     qPrintable(typeOnlyFirst), static_cast<long long>(scrollAreas.size()),
+                     int(scrollIsTrackArea), int(widgetHostsTrack), int(headerDistinct),
+                     int(headerNotHostingTrack));
         timeline.setZoomLevel(1.0);
         timeline.zoomToFitSequence();
-        bool ok = scroll && track->pixelsPerSecond() > 1.0
+        bool ok = scrollIsTrackArea && track->pixelsPerSecond() > 1.0
             && timeline.totalDuration() * track->pixelsPerSecond() <= scroll->viewport()->width()
             && scroll->horizontalScrollBar()->value() == 0;
         track->setSelectedClip(1);

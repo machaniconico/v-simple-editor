@@ -506,14 +506,20 @@ int runTrackOpsSelftest()
             QTimer::singleShot(0, &window, [&]() {
                 auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget());
                 if (!dialog) return;
-                const auto combos = dialog->findChildren<QComboBox *>();
-                if (combos.size() == 2) {
-                    const int type = combos[0]->findData(int(TrackMatteType::AlphaMatte));
-                    const int source = combos[1]->findData(QStringLiteral("1:0"));
+                auto *typeCombo = dialog->findChild<QComboBox *>(QStringLiteral("trackMatteTypeCombo"));
+                auto *sourceCombo = dialog->findChild<QComboBox *>(QStringLiteral("trackMatteSourceCombo"));
+                const auto typeOnly = dialog->findChildren<QComboBox *>();
+                std::fprintf(stderr, "[track-ops] matte-dialog found=%s/%s typeOnlyFirst=%s\n",
+                             typeCombo ? qPrintable(typeCombo->objectName()) : "(null)",
+                             sourceCombo ? qPrintable(sourceCombo->objectName()) : "(null)",
+                             typeOnly.isEmpty() ? "(none)" : qPrintable(typeOnly.first()->objectName()));
+                if (typeCombo && sourceCombo && typeCombo != sourceCombo) {
+                    const int type = typeCombo->findData(int(TrackMatteType::AlphaMatte));
+                    const int source = sourceCombo->findData(QStringLiteral("1:0"));
                     configured = type >= 0 && source >= 0;
                     if (configured) {
-                        combos[0]->setCurrentIndex(type);
-                        combos[1]->setCurrentIndex(source);
+                        typeCombo->setCurrentIndex(type);
+                        sourceCombo->setCurrentIndex(source);
                     }
                 }
                 dialog->done(configured ? QDialog::Accepted : QDialog::Rejected);

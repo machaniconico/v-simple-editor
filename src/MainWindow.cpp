@@ -14700,7 +14700,9 @@ void MainWindow::configureTrackMatte()
     dialog.setWindowTitle(QStringLiteral("トラックマット設定"));
     auto *layout = new QFormLayout(&dialog);
     auto *typeCombo = new QComboBox(&dialog);
+    typeCombo->setObjectName(QStringLiteral("trackMatteTypeCombo"));
     auto *sourceCombo = new QComboBox(&dialog);
+    sourceCombo->setObjectName(QStringLiteral("trackMatteSourceCombo"));
 
     const QList<TrackMatteType> matteTypes = {
         TrackMatteType::None,
@@ -19872,7 +19874,7 @@ void MainWindow::onMeterRequestResetAllMeters()
 namespace audiofxui {
 void suppressEqualizerSelectionWrites(EqualizerPanel *panel)
 {
-    auto *combo = panel->findChild<QComboBox *>();
+    auto *combo = panel->findChild<QComboBox *>(QStringLiteral("eq_track"));
     if (!combo) return;
     // EqualizerPanel's selection slot calls setEqSettings, which emits
     // eqChanged after rounding dial values. Selection must never enable DSP.

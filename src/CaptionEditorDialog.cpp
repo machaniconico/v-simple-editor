@@ -92,6 +92,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // ===================== 左パネル =====================
     // クリップテーブル
     m_clipTable = new QTableWidget(this);
+    m_clipTable->setObjectName(QStringLiteral("captionClipTable"));
     m_clipTable->setColumnCount(kClipColumnCount);
     m_clipTable->setHorizontalHeaderLabels(
         {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});

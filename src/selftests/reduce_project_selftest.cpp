@@ -185,9 +185,20 @@ int runReduceProjectSelftest()
                     other->reject();
                 return;
             }
-            auto *buttons = dialog->findChild<QDialogButtonBox *>();
-            auto *list = dialog->findChild<QListWidget *>();
-            auto *label = dialog->findChild<QLabel *>();
+            auto *buttons = dialog->findChild<QDialogButtonBox *>(QStringLiteral("ReduceProjectButtons"));
+            auto *list = dialog->findChild<QListWidget *>(QStringLiteral("ReduceProjectList"));
+            auto *label = dialog->findChild<QLabel *>(QStringLiteral("ReduceProjectMessage"));
+            const auto firstName = [](const auto &found) {
+                return found.isEmpty() ? QString() : found.first()->objectName();
+            };
+            std::fprintf(stderr,
+                "[reduce-project] confirm-dialog found=%s/%s/%s typeOnlyFirst=%s/%s/%s\n",
+                buttons ? qPrintable(buttons->objectName()) : "(null)",
+                list ? qPrintable(list->objectName()) : "(null)",
+                label ? qPrintable(label->objectName()) : "(null)",
+                qPrintable(firstName(dialog->findChildren<QDialogButtonBox *>())),
+                qPrintable(firstName(dialog->findChildren<QListWidget *>())),
+                qPrintable(firstName(dialog->findChildren<QLabel *>())));
             QPushButton *yes = nullptr, *no = nullptr;
             if (buttons) {
                 for (auto *button : buttons->buttons()) {

@@ -4,7 +4,7 @@
 #include "../VideoPlayer.h"
 #include <QApplication>
 #include <QEventLoop>
-#include <QElapsedTimer>
+#include <QTest>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QTimer>
@@ -35,19 +35,29 @@ int runTimelineSkimSelftest()
         &player, &VideoPlayer::positionChanged, &player,
         [&](double seconds) { if (qAbs(seconds - 0.25) < 0.000001) seekConfirmed = true; });
     player.seek(250);
-    auto *stack = player.findChild<QStackedWidget *>();
+    auto *stack = player.findChild<QStackedWidget *>(QStringLiteral("videoDisplayStack"));
+    const auto stacksByType = player.findChildren<QStackedWidget *>();
+    // The software display (m_videoDisplay, a QLabel) is stack index 0; the surface
+    // read below must be that production member, not any other stacked widget.
     auto *playheadSurface = stack ? qobject_cast<QLabel *>(stack->currentWidget()) : nullptr;
-    QElapsedTimer seekDeadline;
-    seekDeadline.start();
-    while ((!seekConfirmed || !playheadSurface || playheadSurface->pixmap().isNull())
-           && seekDeadline.elapsed() < 30000) {
-        QApplication::processEvents(QEventLoop::AllEvents, 25);
-    }
+    const bool stackCountIsTwo = stack && stack->count() == 2;
+    const bool widget0IsLabel = stack && qobject_cast<QLabel *>(stack->widget(0));
+    const bool widget0ParentIsStack = stack && stack->widget(0) && stack->widget(0)->parentWidget() == stack;
+    const bool stackHostsVideoDisplay = stackCountIsTwo && widget0IsLabel && widget0ParentIsStack;
+    std::fprintf(stderr, "[timeline-skim] G3 found=%s typeOnlyFirst=%s stacks=%lld count=%d widget0IsLabel=%d widget0ParentIsStack=%d hostsVideoDisplay=%d\n",
+                 stack ? qPrintable(stack->objectName()) : "(null)",
+                 stacksByType.isEmpty() ? "(none)" : qPrintable(stacksByType.first()->objectName()),
+                 static_cast<long long>(stacksByType.size()), stack ? stack->count() : -1,
+                 int(widget0IsLabel), int(widget0ParentIsStack), int(stackHostsVideoDisplay));
+    if (!stackHostsVideoDisplay) playheadSurface = nullptr;
+    const bool ready = stackHostsVideoDisplay && QTest::qWaitFor([&] {
+        return seekConfirmed && playheadSurface && !playheadSurface->pixmap().isNull();
+    }, 30000);
     QObject::disconnect(seekConnection);
     QImage playheadImage = playheadSurface ? playheadSurface->pixmap().toImage() : QImage();
     if (!seekConfirmed || playheadImage.isNull()) {
-        std::fprintf(stderr, "[timeline-skim] prerequisite failed: seekConfirmed=%d playheadImageNonNull=%d\n",
-                     int(seekConfirmed), int(!playheadImage.isNull()));
+        std::fprintf(stderr, "[timeline-skim] prerequisite failed: seekConfirmed=%d playheadImageNonNull=%d hostsVideoDisplay=%d ready=%d\n",
+                     int(seekConfirmed), int(!playheadImage.isNull()), int(stackHostsVideoDisplay), int(ready));
         gate(3, false);
         std::fprintf(stderr, "[timeline-skim] summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;

@@ -612,13 +612,16 @@ void MediaPoolDock::onRemoveUnused()
     auto *message = new QLabel(tr("未使用素材 %1 件をメディアプールから削除しますか？\n"
         "この操作は元に戻せません。ディスク上のファイルは削除されないので、必要になれば再度読み込めます")
         .arg(unused.size()), &dialog);
+    message->setObjectName(QStringLiteral("ReduceProjectMessage"));
     message->setWordWrap(true);
     layout->addWidget(message);
     auto *list = new QListWidget(&dialog);
+    list->setObjectName(QStringLiteral("ReduceProjectList"));
     for (const auto &asset : unused)
         list->addItem(QFileInfo(asset.filePath).fileName() + QStringLiteral("\n") + asset.filePath);
     layout->addWidget(list);
     auto *buttons = new QDialogButtonBox(&dialog);
+    buttons->setObjectName(QStringLiteral("ReduceProjectButtons"));
     auto *yes = buttons->addButton(tr("はい"), QDialogButtonBox::AcceptRole);
     auto *no = buttons->addButton(tr("いいえ"), QDialogButtonBox::RejectRole);
     yes->setAutoDefault(false);

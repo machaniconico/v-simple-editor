@@ -3743,6 +3743,7 @@ void Timeline::setupUI()
     m_headerLayout->addWidget(magnetArea);
 
     m_scrollArea = new QScrollArea(contentArea);
+    m_scrollArea->setObjectName(QStringLiteral("timelineScrollArea"));
     m_scrollArea->setWidgetResizable(true);
     m_scrollArea->setStyleSheet("background-color: #2a2a2a;");
     // Horizontal scrollbar removed — its role overlaps with the player's seek
@@ -3998,6 +3999,7 @@ void Timeline::setupUI()
     // pinned at the top while the clip rows slide upward — the lock /
     // mute icons drift away from the clips they label.
     auto *headerScrollArea = new QScrollArea(contentArea);
+    headerScrollArea->setObjectName(QStringLiteral("timelineHeaderScrollArea"));
     headerScrollArea->setWidgetResizable(true);
     headerScrollArea->setFrameShape(QFrame::NoFrame);
     headerScrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);

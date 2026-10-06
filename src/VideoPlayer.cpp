@@ -1524,6 +1524,7 @@ void VideoPlayer::setupUI()
     auto *layout = new QVBoxLayout(this);
 
     auto *displayStack = new QStackedWidget(this);
+    displayStack->setObjectName(QStringLiteral("videoDisplayStack"));
 
     m_videoDisplay = new QLabel(this);
     m_videoDisplay->setAlignment(Qt::AlignCenter);

@@ -490,8 +490,13 @@ int runAudioTrackFxSelftest()
     CompressorPanel compPanel;
     ReverbPanel reverbPanel;
     NoiseReductionPanel nrPanel;
-    const auto checkPanel = [&](auto &panel) {
-        auto *combo = panel.template findChild<QComboBox *>();
+    const auto checkPanel = [&](auto &panel, const char *comboName) {
+        auto *combo = panel.template findChild<QComboBox *>(QString::fromLatin1(comboName));
+        const auto combosByType = panel.template findChildren<QComboBox *>();
+        std::fprintf(stderr, "[audio-trackfx] G14 track-combo found=%s typeOnlyFirst=%s combos=%lld\n",
+                     combo ? qPrintable(combo->objectName()) : "(null)",
+                     combosByType.isEmpty() ? "(none)" : qPrintable(combosByType.first()->objectName()),
+                     static_cast<long long>(combosByType.size()));
         audiofxui::setTrackComboItems(combo, panelNames, panelIds);
         if (!combo || combo->count() != 2 || combo->findData(AudioMixer::kMasterTrackId) >= 0)
             return false;
@@ -503,7 +508,8 @@ int runAudioTrackFxSelftest()
         audiofxui::setTrackComboItems(combo, {}, {});
         return combo->count() == 0;
     };
-    idsOk = checkPanel(compPanel) && checkPanel(reverbPanel) && checkPanel(nrPanel) && idsOk;
+    idsOk = checkPanel(compPanel, "compressor_track") && checkPanel(reverbPanel, "reverb_track")
+        && checkPanel(nrPanel, "nr_track") && idsOk;
     AudioMixer::EqSettings masterEq;
     masterEq.lowMid = {100.0, -12.0, 1.0, true};
     std::vector<int16_t> trackOne(input.size()), trackTwo(input.size());
