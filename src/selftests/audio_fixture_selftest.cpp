@@ -1,6 +1,7 @@
 // US-704: persistent PCM fixture for the real timeline export audio mixer.
 // Run from the repository root and compare data chunks across baseline/HEAD.
 #include "../AudioMixer.h"
+#include "../AudioTrackFx.h"
 #include "../RenderInPlace.h"
 #include "../Timeline.h"
 #include "SelftestGate.h"
@@ -18,10 +19,14 @@
 #include <cstdio>
 #include <limits>
 
+#ifndef M_PI
+#  define M_PI 3.14159265358979323846
+#endif
+
 namespace {
 
-constexpr int kFixtureCount = 4;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d"};
+constexpr int kFixtureCount = 6;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f"};
 
 quint16 readLe16(const char *p)
 {
@@ -38,7 +43,8 @@ quint32 readLe32(const char *p)
 
 // RIFF chunks may include metadata before or after PCM and need word padding.
 // Only the data payload is part of the byte comparison.
-bool readPcmData(const QString &path, QByteArray *pcm, QString *error)
+bool readPcmData(const QString &path, QByteArray *pcm, QString *error,
+                 int *channels = nullptr, int *sampleRate = nullptr)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
@@ -64,6 +70,8 @@ bool readPcmData(const QString &path, QByteArray *pcm, QString *error)
         if (QByteArrayView(chunk, 4) == QByteArrayView("fmt ", 4) && length >= 16) {
             pcm16 = readLe16(wav.constData() + payload) == 1
                 && readLe16(wav.constData() + payload + 14) == 16;
+            if (channels) *channels = readLe16(wav.constData() + payload + 2);
+            if (sampleRate) *sampleRate = int(readLe32(wav.constData() + payload + 4));
         } else if (QByteArrayView(chunk, 4) == QByteArrayView("data", 4)) {
             *pcm = wav.mid(payload, length);
             foundData = true;
@@ -101,7 +109,55 @@ ClipInfo humClip(double in, double out)
     return clip;
 }
 
-bool generate(int variant, const QString &path, QByteArray *pcm, QString *error)
+// Variant e: 200 Hz low shelf -12 dB (50 Hz sits inside the shelf).
+// Variant f: 1 kHz peaking -12 dB (50 Hz is outside the band: frequency control).
+trackfx::Chain eqVariantChain(int variant)
+{
+    trackfx::Chain chain;
+    chain.eqEnabled = true;
+    if (variant == 4) chain.eq.low = trackfx::EqBand{200.0, -12.0, 0.7};
+    if (variant == 5) chain.eq.lowMid = trackfx::EqBand{1000.0, -12.0, 1.0};
+    return chain;
+}
+
+// RMS over the steady window [0.1 s, 0.4 s) of interleaved PCM16.
+double windowRms(const QByteArray &pcm, int channels, int sampleRate)
+{
+    if (channels <= 0 || sampleRate <= 0) return 0.0;
+    const qsizetype begin = qsizetype(0.1 * sampleRate) * channels * 2;
+    const qsizetype end = qMin(pcm.size(), qsizetype(0.4 * sampleRate) * channels * 2);
+    if (end <= begin) return 0.0;
+    return rms(pcm.mid(begin, end - begin));
+}
+
+// Expected attenuation: the same Chain run through trackfx::Processor on a pure
+// 50 Hz sine, measured over the same steady window (no hand-computed values).
+double expectedRatio(int variant, int channels, int sampleRate)
+{
+    if (channels <= 0 || sampleRate <= 0) return 0.0;
+    const int frames = sampleRate / 2;
+    QVector<float> in(frames * channels);
+    for (int i = 0; i < frames; ++i)
+        for (int c = 0; c < channels; ++c)
+            in[i * channels + c] = float(0.5 * std::sin(2.0 * M_PI * 50.0 * i / sampleRate));
+    QVector<float> out = in;
+    trackfx::Processor processor(eqVariantChain(variant), sampleRate, channels);
+    processor.process(out.data(), frames);
+    const auto toPcm = [&](const QVector<float> &v) {
+        QByteArray bytes(v.size() * 2, 0);
+        for (qsizetype i = 0; i < v.size(); ++i) {
+            const qint16 q = qint16(std::lround(qBound(-1.0f, v[i], 1.0f) * 32767.0f));
+            bytes[2 * i] = char(q & 0xff);
+            bytes[2 * i + 1] = char((q >> 8) & 0xff);
+        }
+        return bytes;
+    };
+    const double inRms = windowRms(toPcm(in), channels, sampleRate);
+    return inRms > 0.0 ? windowRms(toPcm(out), channels, sampleRate) / inRms : 0.0;
+}
+
+bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
+              int *channels = nullptr, int *sampleRate = nullptr)
 {
     AudioMixer mixer;
     Timeline timeline;
@@ -118,6 +174,8 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error)
         chain.eqEnabled = true; // four default 0 dB EQ bands
         mixer.setTrackChain(0, chain);
     }
+    if (variant == 4 || variant == 5)
+        mixer.setTrackChain(0, eqVariantChain(variant));
     double audioDuration = 0.0;
     for (const TimelineTrack *track : timeline.audioTracks()) {
         double trackDuration = 0.0;
@@ -134,7 +192,7 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error)
         if (error->isEmpty()) *error = QStringLiteral("export returned no WAV: %1").arg(path);
         return false;
     }
-    return readPcmData(path, pcm, error);
+    return readPcmData(path, pcm, error, channels, sampleRate);
 }
 
 qsizetype differentBytes(const QByteArray &a, const QByteArray &b)
@@ -155,7 +213,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 5; ++gate)
+        for (int gate = 1; gate <= 7; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -163,13 +221,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 5; ++gate)
+        for (int gate = 2; gate <= 7; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 5; ++gate)
+        for (int gate = 2; gate <= 7; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -189,18 +247,20 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 5; ++gate)
+        for (int gate = 2; gate <= 7; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
     QByteArray pcm[kFixtureCount];
     bool generated[kFixtureCount] = {};
+    int channels[kFixtureCount] = {};
+    int sampleRates[kFixtureCount] = {};
     QJsonObject manifest;
     for (int i = 0; i < kFixtureCount; ++i) {
         const QString name = QString::fromLatin1(kNames[i]);
         const QString path = out.filePath(name + QStringLiteral(".wav"));
         QString error;
-        generated[i] = generate(i, path, &pcm[i], &error);
+        generated[i] = generate(i, path, &pcm[i], &error, &channels[i], &sampleRates[i]);
         const double level = rms(pcm[i]);
         std::fprintf(stderr, "G1 %s path=%s dataBytes=%lld rms=%.12g error=%s\n",
                      kNames[i], path.toUtf8().constData(), static_cast<long long>(pcm[i].size()),
@@ -221,7 +281,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "four PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "six PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -265,5 +325,27 @@ int runAudioFixtureSelftest()
                  static_cast<long long>(pcm[1].size()), static_cast<long long>(abDifferent));
     tally.gate(5, generated[0] && generated[1] && abDifferent > 0,
                "negative control must detect PCM differences");
+
+    // G6/G7: band coefficients must act at the right frequency. Expected ratios
+    // come from the same Chain run through trackfx::Processor, each with a
+    // sanity band so a mutation moving expectation and measurement together fails.
+    const auto bandGate = [&](int gate, int variant, double tolerance, double lo, double hi,
+                              const char *what) {
+        const double aWin = windowRms(pcm[0], channels[0], sampleRates[0]);
+        const double vWin = windowRms(pcm[variant], channels[variant], sampleRates[variant]);
+        const double measured = aWin > 0.0 ? vWin / aWin : 0.0;
+        const double expected = expectedRatio(variant, channels[variant], sampleRates[variant]);
+        const double error = expected > 0.0 ? std::abs(measured / expected - 1.0)
+                                            : std::numeric_limits<double>::infinity();
+        const bool sane = expected >= lo && expected <= hi;
+        std::fprintf(stderr, "G%d %s aWinRms=%.12g winRms=%.12g measuredRatio=%.12g "
+                             "expectedRatio=%.12g relativeError=%.12g sanity=[%g,%g] sane=%d\n",
+                     gate, kNames[variant], aWin, vWin, measured, expected, error, lo, hi, sane);
+        tally.gate(gate, generated[0] && generated[variant] && sane && error <= tolerance, what);
+    };
+    bandGate(6, 4, 0.02, 0.15, 0.5,
+             "200 Hz low shelf -12 dB must attenuate 50 Hz (catches low-band coefficient regressions)");
+    bandGate(7, 5, 0.01, 0.97, 10.0,
+             "1 kHz peaking -12 dB must leave 50 Hz unchanged (catches out-of-band EQ leakage)");
     return tally.finish();
 }
