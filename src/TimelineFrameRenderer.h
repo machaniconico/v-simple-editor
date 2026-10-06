@@ -200,6 +200,9 @@ QVector<QImage> applyLightingToLayerImages(
 // the evaluated light list is empty/disabled; the helper remains a strict
 // no-op in that case. This proves the no-light byte-identity gate exercises
 // the wired export path rather than only a detached helper call.
+// Observation is OFF by default and toggled explicitly (not latched from an
+// environment variable, which made the result depend on sweep order).
+void setLightingSelftestObservation(bool enabled);
 void resetLightingSelftestObservation();
 bool lightingSelftestSeamWasCalled();
 

@@ -209,12 +209,7 @@ namespace {
 
 std::atomic_bool g_lightingSelftestSeamCalled{false};
 
-bool lightingSelftestObservationEnabled()
-{
-    static const bool enabled =
-        qEnvironmentVariableIntValue("VEDITOR_LIGHT3D_SELFTEST") != 0;
-    return enabled;
-}
+std::atomic_bool g_lightingSelftestObservation{false};
 
 } // namespace
 
@@ -226,7 +221,7 @@ QVector<QImage> applyLightingToLayerImages(
     const QVector<Light3DState> &lights,
     const QVector3D &viewPos)
 {
-    if (lightingSelftestObservationEnabled())
+    if (g_lightingSelftestObservation.load(std::memory_order_relaxed))
         g_lightingSelftestSeamCalled.store(true, std::memory_order_release);
     QVector<QImage> result = layerImages;
     if (canvasSize.isEmpty() || !light3d::hasActiveLights(lights))
@@ -245,6 +240,11 @@ QVector<QImage> applyLightingToLayerImages(
             QSizeF(canvasSize), viewPos, layers[i].material);
     }
     return result;
+}
+
+void setLightingSelftestObservation(bool enabled)
+{
+    g_lightingSelftestObservation.store(enabled, std::memory_order_relaxed);
 }
 
 void resetLightingSelftestObservation()
