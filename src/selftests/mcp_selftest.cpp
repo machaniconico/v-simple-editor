@@ -21,6 +21,8 @@
 #include <QFileInfo>
 #include <QList>
 #include <QTemporaryFile>
+#include <QStandardPaths>
+#include <QTest>
 #include <QTemporaryDir>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -43,6 +45,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "../clipanim/ClipAnim.h"
 #include "../mcp/McpEditorTools.h"
@@ -60,6 +63,7 @@
 #include "../ExportUserPresets.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "../UndoManager.h"
 
@@ -6083,6 +6087,171 @@ int runMcpSelftest()
         fail("G172 group_clips", QStringLiteral("Timeline was not available"));
         fail("G173 ungroup_clips", QStringLiteral("Timeline was not available"));
     }
+    // US-900 G178-G180: the MCP export_video mix (ducking_mix_*.m4a) is registered in the
+    // job's tempFiles and removed by RenderQueue at job end. The job is read synchronously
+    // from RenderQueue::jobsChanged (connected before the call) because removeTempFiles
+    // drops the key at job end.
+    {
+        const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        const QString videoAsset = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        const bool g178Ready = timelineReady && queue && QFileInfo(videoAsset).isFile()
+            && exportRootReady;
+        if (!g178Ready) {
+            const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4")
+                .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
+                .arg(exportRootReady);
+            for (int n = 178; n <= 180; ++n)
+                tally.gate(n, false, why.toUtf8().constData());
+        } else if (ffmpegExe.isEmpty()) {
+            for (int n = 178; n <= 180; ++n)
+                tally.skip(n, "ffmpeg.exe unavailable");
+        } else {
+            const QString tonePath = exportRoot.filePath(QStringLiteral("us900-tone.wav"));
+            std::vector<float> toneSamples(48000 * 2, 0.1f);
+            QString toneError;
+            const bool toneOk = libavcore::writeWavFloatInterleaved(tonePath, toneSamples, 48000, 2, &toneError);
+            // A separate audio file makes the passthrough shortcut inapplicable, so a mix is built.
+            ClipInfo videoClip;
+            videoClip.filePath = videoAsset;
+            videoClip.displayName = QStringLiteral("us900-video");
+            videoClip.duration = videoClip.outPoint = 1.0;
+            ClipInfo audioClip;
+            audioClip.filePath = tonePath;
+            audioClip.displayName = QStringLiteral("us900-audio");
+            audioClip.duration = audioClip.outPoint = 1.0;
+            TimelineTrack *videoTrack = projectTimeline->videoTracks().first();
+            TimelineTrack *audioTrack = projectTimeline->audioTracks().first();
+            const QVector<ClipInfo> savedVideoClips = videoTrack->clips();
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> savedAudioClips;
+            for (TimelineTrack *track : projectTimeline->audioTracks()) {
+                savedAudioClips.append(qMakePair(track, track->clips()));
+                track->setClips(QVector<ClipInfo>{});
+            }
+            videoTrack->setClips(QVector<ClipInfo>{videoClip});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            queue->clear();
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            const QString mixDirPath = QDir::tempPath() + QStringLiteral("/v-simple-editor-audio-mix");
+
+            // G178 / G179: one successful export_video call.
+            RenderJob capturedJob;
+            bool captured = false;
+            bool mixExistedAtAdd = false;
+            QString mixPath;
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                if (captured) return;
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                capturedJob = jobs.first();
+                captured = true;
+                const QJsonArray files = capturedJob.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+                for (const QJsonValue &file : files) {
+                    const QString name = QFileInfo(file.toString()).fileName();
+                    if (name.startsWith(QStringLiteral("ducking_mix_")) && name.endsWith(QStringLiteral(".m4a")))
+                        mixPath = file.toString();
+                }
+                mixExistedAtAdd = !mixPath.isEmpty() && QFile::exists(mixPath);
+            });
+            const QJsonObject okResponse = callProjectInfoTool(1780, QStringLiteral("export_video"),
+                QJsonObject{{QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us900-ok.mp4"))}});
+            const QString okJobId = toolPayload(okResponse).value(QStringLiteral("jobId")).toString();
+            const bool okIsError = toolResult(okResponse).value(QStringLiteral("isError")).toBool(true);
+            const bool addedJob = QTest::qWaitFor([&]() { return captured; }, 60000);
+            const auto jobTerminal = [&]() {
+                for (const RenderJob &job : queue->jobs()) {
+                    if (job.uuid != okJobId) continue;
+                    return job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed
+                        || job.status == RenderJobStatus::Cancelled;
+                }
+                return false;
+            };
+            const bool terminal = addedJob && QTest::qWaitFor(jobTerminal, 120000);
+            QObject::disconnect(connection);
+            const bool mixGoneAtEnd = !mixPath.isEmpty() && !QFile::exists(mixPath);
+            const bool g178 = toneOk && !okIsError && !okJobId.isEmpty() && captured
+                && capturedJob.uuid == okJobId && mixExistedAtAdd && terminal && mixGoneAtEnd;
+            std::fprintf(stderr, "mcp G178 toneOk=%d isError=%d jobId=[%s] addedJob=%d captured=%d capturedUuid=[%s] mixPath=[%s] "
+                "existedAtAdd=%d terminal=%d existsAtEnd=%d\n", toneOk, okIsError, qPrintable(okJobId),
+                addedJob, captured, qPrintable(capturedJob.uuid), qPrintable(mixPath), mixExistedAtAdd, terminal,
+                !mixPath.isEmpty() && QFile::exists(mixPath));
+            tally.gate(178, g178, "the export_video audio mix was not registered in tempFiles or survived the job end");
+
+            const QJsonArray capturedTemp = capturedJob.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+            const bool tempHasMix = capturedTemp.contains(mixPath) && !mixPath.isEmpty();
+            const bool hasSourceKey = capturedJob.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+            const QString sourceProject = capturedJob.exportConfig.value(QStringLiteral("sourceProjectFilePath")).toString();
+            const QString queuePath = exportRoot.filePath(QStringLiteral("us900-queue.json"));
+            bool saved = false;
+            QByteArray savedBytes;
+            {
+                RenderQueue saveProbe;
+                saveProbe.addJob(capturedJob);
+                saved = saveProbe.saveQueue(queuePath);
+            }
+            {
+                QFile savedFile(queuePath);
+                if (savedFile.open(QIODevice::ReadOnly)) savedBytes = savedFile.readAll();
+            }
+            const QString mixName = QFileInfo(mixPath).fileName();
+            const bool savedHasMix = !mixName.isEmpty() && savedBytes.contains(mixName.toUtf8());
+            std::fprintf(stderr, "mcp G179 tempFilesHasMix=%d hasSourceKey=%d sourceProjectFilePath=[%s] "
+                "projectFilePathAtAdd=[%s] saved=%d savedBytes=%lld savedHasMixName=%d mixName=[%s]\n",
+                tempHasMix, hasSourceKey, qPrintable(sourceProject), qPrintable(capturedJob.projectFilePath),
+                saved, static_cast<long long>(savedBytes.size()), savedHasMix, qPrintable(mixName));
+            tally.gate(179, tempHasMix && hasSourceKey && sourceProject.isEmpty()
+                && capturedJob.projectFilePath == mixPath && saved && !savedBytes.isEmpty() && !savedHasMix,
+                "the MCP mix was not tracked as a temp intermediate or leaked into the saved queue");
+            queue->clear();
+
+            // G180: regression guard for the existing failure cleanup in finishMix (not a
+            // negative control for the US-900 change): a mix that fails after ffmpeg wrote
+            // the file leaves no ducking_mix_* file behind and the job reports failed.
+            const auto mixFiles = [&]() {
+                QSet<QString> names;
+                for (const QString &name : QDir(mixDirPath).entryList(QStringList{QStringLiteral("ducking_mix_*")},
+                                                                      QDir::Files))
+                    names.insert(name);
+                return names;
+            };
+            const QSet<QString> mixBefore = mixFiles();
+            exportaudio::failAfterWriteForTest = true;
+            exportaudio::outputExistedBeforeCleanupForTest = false;
+            const QJsonObject failResponse = callProjectInfoTool(1781, QStringLiteral("export_video"),
+                QJsonObject{{QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us900-fail.mp4"))}});
+            const QString failJobId = toolPayload(failResponse).value(QStringLiteral("jobId")).toString();
+            QString failStatus, failError;
+            int pollId = 1782;
+            const bool failed = QTest::qWaitFor([&]() {
+                const QJsonObject status = toolPayload(callProjectInfoTool(pollId++,
+                    QStringLiteral("get_export_status"), QJsonObject{{QStringLiteral("jobId"), failJobId}}));
+                failStatus = status.value(QStringLiteral("status")).toString();
+                failError = status.value(QStringLiteral("error")).toString();
+                return failStatus == QStringLiteral("failed");
+            }, 60000);
+            exportaudio::failAfterWriteForTest = false;
+            const bool existedBeforeCleanup = exportaudio::outputExistedBeforeCleanupForTest;
+            exportaudio::outputExistedBeforeCleanupForTest = false;
+            QSet<QString> leftover = mixFiles();
+            leftover.subtract(mixBefore);
+            std::fprintf(stderr, "mcp G180 jobId=[%s] status=[%s] error=[%s] existedBeforeCleanup=%d "
+                "newMixFiles=%lld jobsInQueue=%lld\n", qPrintable(failJobId), qPrintable(failStatus),
+                qPrintable(failError), existedBeforeCleanup, static_cast<long long>(leftover.size()),
+                static_cast<long long>(queue->jobs().size()));
+            tally.gate(180, !failJobId.isEmpty() && failed && existedBeforeCleanup && leftover.isEmpty()
+                && queue->jobs().isEmpty(),
+                "a failed export_video mix left a ducking_mix file or reached the queue");
+
+            queue->clear();
+            projectInfoWindow.m_mcpTools = previousTools;
+            videoTrack->setClips(savedVideoClips);
+            for (auto &entry : savedAudioClips)
+                entry.first->setClips(entry.second);
+        }
+    }
+
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end";
     return tally.finish("mcp");

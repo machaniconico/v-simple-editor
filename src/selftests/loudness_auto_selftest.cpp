@@ -12,6 +12,7 @@
 #include <QFile>
 #include <QImage>
 #include <QJsonArray>
+#include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimer>
 #include <algorithm>
@@ -300,24 +301,84 @@ int runLoudnessAutoSelftest()
         QStringList created;
         for (const QJsonValue &value : g7.exportConfig.value("tempFiles").toArray())
             created << value.toString();
-        bool createdExists = !created.isEmpty();
-        for (const QString &path : created) createdExists = createdExists && QFile::exists(path);
-        if (!fixture || !createdExists) {
-            std::fprintf(stderr, "[loudness-auto] G7 fixture=%d created=%lld createdExists=%d\n",
-                fixture, static_cast<long long>(created.size()), createdExists);
-            tally.skip(7, "ffmpeg.exe or audio fixture unavailable: prepareJob created no temp file");
+        // The measurement WAV is registered but already removed by prepareJob; the AAC mux
+        // file is the intermediate that must exist here.
+        QStringList wavPaths;
+        QStringList otherPaths;
+        for (const QString &path : created)
+            (path.endsWith(QStringLiteral(".m4a.wav")) ? wavPaths : otherPaths) << path;
+        bool otherExists = !otherPaths.isEmpty();
+        for (const QString &path : otherPaths) otherExists = otherExists && QFile::exists(path);
+        const bool wavRegistered = wavPaths.size() == 1;
+        const bool wavGone = wavRegistered && !QFile::exists(wavPaths.first());
+        const bool createdExists = otherExists && wavRegistered && wavGone;
+        const bool g7EnvMissing = !fixture || QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+        if (g7EnvMissing || !createdExists) {
+            std::fprintf(stderr, "[loudness-auto] G7 fixture=%d created=%lld otherCount=%lld "
+                "otherExists=%d wavRegistered=%d wavGone=%d createdExists=%d envMissing=%d\n",
+                fixture, static_cast<long long>(created.size()),
+                static_cast<long long>(otherPaths.size()), otherExists, wavRegistered, wavGone,
+                createdExists, g7EnvMissing);
+            if (g7EnvMissing) {
+                tally.skip(7, "ffmpeg.exe or audio fixture unavailable");
+            } else {
+                tally.gate(7, false, "prepareJob temp registration invalid: WAV not registered/removed or mux missing");
+                RenderQueue q;
+                q.removeTempFiles(&g7);
+            }
         } else {
             window.m_exportAudioMixErrorForTest = QStringLiteral("forced mix failure");
             QString mixError;
             const bool finalized = window.finalizeExportJobAudio(g7, g7Config, &mixError);
             bool leftover = false;
             for (const QString &path : created) leftover = leftover || QFile::exists(path);
-            std::fprintf(stderr, "[loudness-auto] G7 created=%lld createdExists=%d finalized=%d "
+            std::fprintf(stderr, "[loudness-auto] G7 created=%lld otherCount=%lld otherExists=%d "
+                "wavRegistered=%d wavGone=%d createdExists=%d finalized=%d "
                 "error=%s leftover=%d tempFilesKey=%d\n",
-                static_cast<long long>(created.size()), createdExists, finalized,
+                static_cast<long long>(created.size()), static_cast<long long>(otherPaths.size()),
+                otherExists, wavRegistered, wavGone, createdExists, finalized,
                 qPrintable(mixError), leftover, g7.exportConfig.contains("tempFiles"));
             tally.gate(7, !finalized && mixError == QStringLiteral("forced mix failure")
                 && !leftover && !g7.exportConfig.contains("tempFiles"));
+        }
+    }
+    // G8: prepareJob registers both intermediates, the PCM measurement WAV (<mix>.m4a.wav,
+    // which it also removes itself) and the AAC mux file, in exportConfig["tempFiles"].
+    // Detects dropping the WAV registration: removeTempFiles could then not retry a
+    // failed remove. No fixture / no mix created (no ffmpeg) -> SKIP.
+    {
+        RenderJob g8 = normal;
+        g8.exportConfig.remove("tempFiles");
+        g8.exportConfig.remove("sourceProjectFilePath");
+        g8.projectFilePath.clear();
+        g8.outputPath = temporary.filePath("g8.mp4");
+        settings.targetLufs = -14.0;
+        settings.appendLoudnessSettings(g8.exportConfig);
+        const bool g8Ffmpeg = !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+        const QString g8Status = fixture ? loudnessauto::prepareJob(g8) : QString();
+        QString wavPath, muxPath;
+        for (const QJsonValue &value : g8.exportConfig.value("tempFiles").toArray()) {
+            const QString path = value.toString();
+            if (path.endsWith(QStringLiteral(".m4a.wav"))) wavPath = path;
+            else if (path.endsWith(QStringLiteral(".m4a"))) muxPath = path;
+        }
+        if (!fixture || !g8Ffmpeg) {
+            tally.skip(8, "ffmpeg.exe or audio fixture unavailable");
+        } else if (muxPath.isEmpty() || !QFile::exists(muxPath)) {
+            std::fprintf(stderr, "[loudness-auto] G8 status=[%s] muxPath=[%s]\n",
+                qPrintable(g8Status), qPrintable(muxPath));
+            tally.gate(8, false, "prepareJob created no mux file although ffmpeg and the fixture exist");
+        } else {
+            const bool wavRegistered = !wavPath.isEmpty();
+            const bool wavGone = wavRegistered && !QFile::exists(wavPath);
+            const bool muxIsProject = g8.projectFilePath == muxPath;
+            std::fprintf(stderr, "[loudness-auto] G8 wavPath=[%s] wavRegistered=%d wavExists=%d "
+                "muxPath=[%s] muxExists=%d muxIsProject=%d\n", qPrintable(wavPath), wavRegistered,
+                wavRegistered && QFile::exists(wavPath), qPrintable(muxPath), QFile::exists(muxPath),
+                muxIsProject);
+            tally.gate(8, wavRegistered && wavGone && muxIsProject);
+            RenderQueue g8Queue;
+            g8Queue.removeTempFiles(&g8);
         }
     }
     return tally.finish("loudness-auto");

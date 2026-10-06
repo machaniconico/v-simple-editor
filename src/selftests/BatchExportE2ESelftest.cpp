@@ -883,7 +883,9 @@ int runBatchExportE2ESelftest()
             QString path;
             bool pathExisted = false;
             QStringList temps;
-            bool tempsExisted = false;
+            bool tempsExisted = false;   // every non-WAV temp existed at dispatch (and there was one)
+            int wavTemps = 0;            // loudness measurement WAVs registered in tempFiles
+            bool wavsGone = true;        // ... and already removed by prepareJob
             double mixSec = std::numeric_limits<double>::quiet_NaN();
             double mixRmsDb = std::numeric_limits<double>::quiet_NaN();
             QJsonObject cfg;
@@ -966,9 +968,18 @@ int runBatchExportE2ESelftest()
             d.pathExisted = QFileInfo::exists(d.path);
             for (const QJsonValue &v : d.cfg.value("tempFiles").toArray())
                 d.temps << v.toString();
-            d.tempsExisted = !d.temps.isEmpty();
-            for (const QString &temp : std::as_const(d.temps))
-                d.tempsExisted = d.tempsExisted && QFileInfo::exists(temp);
+            int otherTemps = 0;
+            d.tempsExisted = true;
+            for (const QString &temp : std::as_const(d.temps)) {
+                if (temp.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)) {
+                    ++d.wavTemps;
+                    d.wavsGone = d.wavsGone && !QFileInfo::exists(temp);
+                } else {
+                    ++otherTemps;
+                    d.tempsExisted = d.tempsExisted && QFileInfo::exists(temp);
+                }
+            }
+            d.tempsExisted = d.tempsExisted && otherTemps > 0;
             if ((id == lowId || id == defId) && d.pathExisted)
                 d.bitRate = probeBitRate(d.path);
             if (id == offId && d.pathExisted)
@@ -1039,13 +1050,16 @@ int runBatchExportE2ESelftest()
                 && offState == batchexport::TaskState::Done
                 && onState == batchexport::TaskState::Done
                 && off.tempsExisted && on.tempsExisted
+                && on.wavTemps == 1 && on.wavsGone   // loudness measurement WAV: registered + removed
                 && !anyExists(off.temps) && !anyExists(on.temps);
             std::fprintf(stderr,
-                "[batchexport-e2e] G15 values: offState=%d onState=%d offTemps=%s "
-                "existedAtDispatch=%d existNow=%d onTemps=%s existedAtDispatch=%d existNow=%d\n",
-                static_cast<int>(offState), static_cast<int>(onState),
+                "[batchexport-e2e] G15 values: fixture=%d finished=%d offState=%d onState=%d offTemps=%s "
+                "existedAtDispatch=%d existNow=%d onTemps=%s existedAtDispatch=%d existNow=%d "
+                "offWav=%d/%d onWav=%d/%d\n",
+                fixture, finished, static_cast<int>(offState), static_cast<int>(onState),
                 qPrintable(off.temps.join('|')), off.tempsExisted, anyExists(off.temps),
-                qPrintable(on.temps.join('|')), on.tempsExisted, anyExists(on.temps));
+                qPrintable(on.temps.join('|')), on.tempsExisted, anyExists(on.temps),
+                off.wavTemps, off.wavsGone, on.wavTemps, on.wavsGone);
             check(15, "tempFiles removed after successful tasks", g15);
 
             const bool g16 = fixture && finished

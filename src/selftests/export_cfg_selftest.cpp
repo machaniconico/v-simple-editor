@@ -335,8 +335,22 @@ int runExportCfgSelftest()
         QStringList created;
         for (const QJsonValue &value : g8.exportConfig.value("tempFiles").toArray())
             created << value.toString();
-        bool createdExists = !created.isEmpty();
-        for (const QString &path : created) createdExists = createdExists && QFile::exists(path);
+        // prepareJob registers its measurement WAV (<mix>.m4a.wav) and deletes it right away:
+        // every other temp file must exist, the WAV must be registered and already gone.
+        int wavRegistered = 0;
+        bool wavGone = true;
+        bool otherExists = false;
+        int otherCount = 0;
+        for (const QString &path : created) {
+            if (path.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)) {
+                ++wavRegistered;
+                wavGone = wavGone && !QFile::exists(path);
+            } else {
+                if (++otherCount == 1) otherExists = true;
+                otherExists = otherExists && QFile::exists(path);
+            }
+        }
+        const bool createdExists = otherExists && wavRegistered == 1 && wavGone;
         const bool muxIsProject = !g8.projectFilePath.isEmpty() && created.contains(g8.projectFilePath);
         const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
         if (ffmpeg.isEmpty()) {
@@ -348,9 +362,10 @@ int runExportCfgSelftest()
             queue.removeTempFiles(&g8);
             bool leftover = false;
             for (const QString &path : created) leftover = leftover || QFile::exists(path);
-            std::fprintf(stderr, "export-cfg G8 created=%lld createdExists=%d muxIsProject=%d "
-                "leftover=%d tempFilesKey=%d\n", static_cast<long long>(created.size()),
-                createdExists, muxIsProject, leftover, g8.exportConfig.contains("tempFiles"));
+            std::fprintf(stderr, "export-cfg G8 created=%lld otherExists=%d otherCount=%d wavRegistered=%d wavGone=%d "
+                "createdExists=%d muxIsProject=%d leftover=%d tempFilesKey=%d\n",
+                static_cast<long long>(created.size()), otherExists, otherCount, wavRegistered,
+                wavGone, createdExists, muxIsProject, leftover, g8.exportConfig.contains("tempFiles"));
             tally.gate(8, wavOk && createdExists && muxIsProject && !leftover
                 && !g8.exportConfig.contains("tempFiles"));
         }

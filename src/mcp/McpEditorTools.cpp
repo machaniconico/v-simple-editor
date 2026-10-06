@@ -2812,8 +2812,11 @@ void McpEditorTools::registerWriteTools()
                     observation.error = audioMixError;
                     return;
                 }
-                if (!audioMixPath.isEmpty())
-                    job.projectFilePath = audioMixPath;
+                if (!audioMixPath.isEmpty()) {
+                    // The mix is a per-job intermediate: let RenderQueue delete it at job end.
+                    RenderQueue::addTempFile(job.exportConfig, audioMixPath);
+                    RenderQueue::setIntermediateProjectFile(job, audioMixPath);
+                }
                 queueGuard->addJob(job);
                 queueGuard->start();
             });

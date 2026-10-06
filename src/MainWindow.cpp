@@ -2972,6 +2972,8 @@ QString loudnessauto::prepareJob(RenderJob &job)
         mix = prepareTimelineAudioMixForExport(job.timeline, &error,
             nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration());
     }
+    // The measurement WAV is removed below; registering it makes removeTempFiles retry if that fails.
+    if (!mix.isEmpty()) RenderQueue::addTempFile(job.exportConfig, mix);
     QString measurementPath = mix;
     QTemporaryDir rangeTemporary;
     if (!mix.isEmpty() && job.timeline) {
