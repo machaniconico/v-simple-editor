@@ -514,6 +514,7 @@ int runRenderQueueFpsRationalSelftest()
 RenderQueue::RenderQueue(QObject *parent)
     : QObject(parent)
 {
+    setObjectName(QStringLiteral("mainRenderQueue"));
 }
 
 RenderQueue::~RenderQueue()

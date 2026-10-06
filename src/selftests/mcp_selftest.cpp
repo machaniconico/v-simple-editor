@@ -50,6 +50,7 @@
 #include "../mcp/McpProtocol.h"
 #include "../mcp/McpStdioBridge.h"
 #include "../mcp/McpToolRegistry.h"
+#include "SelftestGate.h"
 #include "../AiChatDock.h"
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
@@ -183,15 +184,29 @@ int rawHttpStatus(quint16 port, const QByteArray& request)
 int runMcpSelftest()
 {
     qInfo().noquote() << "[mcp] selftest start";
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
+    // Gate names start with "G<n> "; anything else is an explicit G0 FAIL.
+    auto gateNumber = [](const char* name) {
+        const QString text = QString::fromUtf8(name);
+        if (!text.startsWith(QLatin1Char('G'))) return 0;
+        int end = 1;
+        while (end < text.size() && text.at(end).isDigit()) ++end;
+        if (end == 1 || end >= text.size() || text.at(end) != QLatin1Char(' ')) return 0;
+        return text.mid(1, end - 1).toInt();
+    };
     auto pass = [&](const char* name) {
-        ++passed;
-        qInfo().noquote() << "[mcp] PASS" << name;
+        const int n = gateNumber(name);
+        if (n > 0) {
+            qInfo().noquote() << "[mcp] PASS" << name;
+            tally.gate(n, true);
+        } else {
+            qWarning().noquote() << "[mcp] FAIL" << name << ": unparsable gate name";
+            tally.gate(0, false, QByteArray(QByteArrayLiteral("unparsable gate name: ") + name).constData());
+        }
     };
     auto fail = [&](const char* name, const QString& message) {
-        ++failed;
         qWarning().noquote() << "[mcp] FAIL" << name << ":" << message;
+        tally.gate(gateNumber(name), false, message.toUtf8().constData());
     };
     auto toolResult = [](const QJsonObject& response) {
         return response.value(QStringLiteral("result")).toObject();
@@ -1319,7 +1334,7 @@ int runMcpSelftest()
         : fail("G82 save_project/open_project roundtrip",
                QStringLiteral("save/open did not preserve the project path and response contract"));
 
-    Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>();
+    Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     const QJsonObject missingImport = callProjectInfoTool(
         43, QStringLiteral("import_media"), QJsonObject{
             {QStringLiteral("filePath"),
@@ -3811,8 +3826,8 @@ int runMcpSelftest()
                 {QStringLiteral("rateControl"), QStringLiteral("crf")},
                 {QStringLiteral("crf"), 20}});
         const QString qualityId = toolPayload(qualityResponse).value(QStringLiteral("jobId")).toString();
-        g161 &= !qualityId.isEmpty()
-            && !toolResult(qualityResponse).value(QStringLiteral("isError")).toBool(true);
+        const bool qualityIsError = toolResult(qualityResponse).value(QStringLiteral("isError")).toBool(true);
+        g161 &= !qualityId.isEmpty() && !qualityIsError;
         const QList<QJsonObject> invalidArguments{
             {{QStringLiteral("rateControl"), QStringLiteral("invalid")}},
             {{QStringLiteral("rateControl"), 1}},
@@ -3823,15 +3838,21 @@ int runMcpSelftest()
             {{QStringLiteral("videoCodec"), QStringLiteral("libsvtav1")}, {QStringLiteral("crf"), 64}}
         };
         int requestId = 1611;
+        QStringList invalidDetail;
         for (auto args : invalidArguments) {
+            const QString argsText = QString::fromUtf8(QJsonDocument(args).toJson(QJsonDocument::Compact));
             args.insert(QStringLiteral("outputPath"), qualityPath);
             const auto response = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
-            g161 &= toolResult(response).value(QStringLiteral("isError")).toBool(false)
-                && toolPayload(response).isEmpty();
+            const bool invErr = toolResult(response).value(QStringLiteral("isError")).toBool(false);
+            const bool invPayloadEmpty = toolPayload(response).isEmpty();
+            const bool rejected = invErr && invPayloadEmpty;
+            invalidDetail << QStringLiteral("%1:%2:isError=%3(want 1):payloadEmpty=%4(want 1)")
+                                 .arg(requestId - 1).arg(argsText).arg(invErr).arg(invPayloadEmpty);
+            g161 &= rejected;
         }
-        auto* queue = projectInfoWindow.findChild<RenderQueue*>();
+        auto* queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
         QHash<QString, QJsonObject> captured;
-        if (queue) {
+        if (queue && queue->parent() == &projectInfoWindow) {
             const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged,
                 queue, [&]() {
                     const auto jobs = queue->jobs();
@@ -3848,14 +3869,25 @@ int runMcpSelftest()
             projectInfoWindow.m_mcpTools = previousTools;
             QObject::disconnect(connection);
         }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        const QString qualityRate = captured.value(qualityId).value(QStringLiteral("rateControl")).toString();
+        const int qualityCrf = captured.value(qualityId).value(QStringLiteral("crf")).toInt(-1);
+        const QString exportRate = captured.value(exportJobId).value(QStringLiteral("rateControl")).toString(QStringLiteral("bitrate"));
+        const int exportCrf = captured.value(exportJobId).value(QStringLiteral("crf")).toInt(-1);
         g161 &= captured.contains(qualityId) && captured.contains(exportJobId)
-            && captured.value(qualityId).value(QStringLiteral("rateControl")).toString() == QStringLiteral("crf")
-            && captured.value(qualityId).value(QStringLiteral("crf")).toInt(-1) == 20
-            && captured.value(exportJobId).value(QStringLiteral("rateControl")).toString(QStringLiteral("bitrate")) == QStringLiteral("bitrate")
-            && captured.value(exportJobId).value(QStringLiteral("crf")).toInt(-1) == -1;
+            && qualityRate == QStringLiteral("crf") && qualityCrf == 20
+            && exportRate == QStringLiteral("bitrate") && exportCrf == -1;
         g161 ? pass("G161 export_video rate control validation and queue wiring")
              : fail("G161 export_video rate control validation and queue wiring",
-                    QStringLiteral("CRF validation, queued settings, or bitrate default did not match"));
+                    QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3 exportRootReady=%11 timelineReady=%12 "
+                                   "qualityId.empty=%13 qualityIsError=%14(want 0) invalid=[%4] "
+                                   "containsQuality=%5 containsExport=%6 quality.rateControl=%7(want crf) "
+                                   "quality.crf=%8(want 20) export.rateControl=%9(want bitrate) export.crf=%10(want -1)")
+                        .arg(queueFound).arg(parentOk).arg(captured.size()).arg(invalidDetail.join(QLatin1Char(' ')))
+                        .arg(captured.contains(qualityId)).arg(captured.contains(exportJobId))
+                        .arg(qualityRate).arg(qualityCrf).arg(exportRate).arg(exportCrf)
+                        .arg(exportRootReady).arg(timelineReady).arg(qualityId.isEmpty()).arg(qualityIsError));
     }
 
     // US-503: capture queued jobs without launching an encoder (same observation as G161).
@@ -3869,11 +3901,16 @@ int runMcpSelftest()
         userConfig.videoCodec = "libx265"; userConfig.videoBitrate = 17000;
         userConfig.rateControl = ExportConfig::RateControl::Crf; userConfig.crf = 18;
         const QString userName = QStringLiteral("MCP/ユーザー:プリセット");
-        bool g164 = presetDir.isValid() && ExportUserPresets::save({userName, userConfig});
+        const bool presetDirValid = presetDir.isValid();
+        const bool presetSaved = presetDirValid && ExportUserPresets::save({userName, userConfig});
+        bool g164 = presetSaved;
         const auto missing = callProjectInfoTool(1640, QStringLiteral("export_video"), QJsonObject{
             {"outputPath", exportRoot.filePath("missing.mp4")}, {"preset", "US503-missing"}});
-        g164 &= toolResult(missing).value("isError").toBool(false) && toolPayload(missing).isEmpty()
-            && QJsonDocument(missing).toJson().contains(QStringLiteral("プリセットが見つかりません: US503-missing").toUtf8());
+        const bool missingIsError = toolResult(missing).value("isError").toBool(false);
+        const bool missingPayloadEmpty = toolPayload(missing).isEmpty();
+        const bool missingMessage = QJsonDocument(missing).toJson().contains(
+            QStringLiteral("プリセットが見つかりません: US503-missing").toUtf8());
+        g164 &= missingIsError && missingPayloadEmpty && missingMessage;
         const QString builtinName = QStringLiteral("YouTube (1440p H.264)");
         const auto builtin = callProjectInfoTool(1630, QStringLiteral("export_video"), QJsonObject{
             {"outputPath", exportRoot.filePath("preset-builtin.mp4")}, {"preset", builtinName},
@@ -3883,8 +3920,8 @@ int runMcpSelftest()
         const QString builtinId = toolPayload(builtin).value("jobId").toString();
         const QString userId = toolPayload(user).value("jobId").toString();
         QHash<QString, QJsonObject> captured;
-        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
-        if (queue) {
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
             const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
                 const auto jobs = queue->jobs();
                 if (jobs.isEmpty()) return;
@@ -3898,6 +3935,8 @@ int runMcpSelftest()
             QObject::disconnect(connection);
         }
         const auto b = captured.value(builtinId);
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
         const bool g163 = exportRootReady && timelineReady && !builtinId.isEmpty()
             && captured.contains(builtinId) && toolPayload(builtin).value("preset").toString() == builtinName
             && b.value("width").toInt() == qMax(2, projectInfoWindow.m_projectConfig.width)
@@ -3912,9 +3951,32 @@ int runMcpSelftest()
             && u.value("videoBitrate").toInt() == 17000 && u.value("audioBitrate").toInt() == 256
             && u.value("rateControl").toString() == "crf" && u.value("crf").toInt() == 18;
         g163 ? pass("G163 built-in export preset and explicit overrides")
-             : fail("G163 built-in export preset and explicit overrides", QStringLiteral("queued preset config mismatch"));
+             : fail("G163 built-in export preset and explicit overrides",
+                    QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3 exportRootReady=%4 timelineReady=%5 "
+                                   "builtinId.empty=%6 contains=%7 preset=%8(want %9) width=%10(want %11) height=%12(want %13) "
+                                   "videoCodec=%14(want libx264) videoBitrate=%15(want 16000) rateControl=%16(want crf) crf=%17(want 20)")
+                        .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                        .arg(builtinId.isEmpty()).arg(captured.contains(builtinId))
+                        .arg(toolPayload(builtin).value("preset").toString(), builtinName)
+                        .arg(b.value("width").toInt()).arg(qMax(2, projectInfoWindow.m_projectConfig.width))
+                        .arg(b.value("height").toInt()).arg(qMax(2, projectInfoWindow.m_projectConfig.height))
+                        .arg(b.value("videoCodec").toString(), QString::number(b.value("videoBitrate").toInt()))
+                        .arg(b.value("rateControl").toString()).arg(b.value("crf").toInt()));
         g164 ? pass("G164 user export preset and missing preset rejection")
-             : fail("G164 user export preset and missing preset rejection", QStringLiteral("user preset resolution or unexpected job"));
+             : fail("G164 user export preset and missing preset rejection",
+                    QStringLiteral("queueFound=%1 parentOk=%2 presetDirValid=%3 presetSaved=%4 missingIsError=%5(want 1) "
+                                   "missingPayloadEmpty=%6(want 1) missingMessage=%7(want 1) captured.size=%8(want 2) "
+                                   "userId.empty=%9 contains=%10 preset=%11(want %12) width=%13(want 1280) height=%14(want 720) "
+                                   "fps=%15(want 24) videoCodec=%16(want libx265) videoBitrate=%17(want 17000) "
+                                   "audioBitrate=%18(want 256) rateControl=%19(want crf) crf=%20(want 18)")
+                        .arg(queueFound).arg(parentOk).arg(presetDirValid).arg(presetSaved).arg(missingIsError)
+                        .arg(missingPayloadEmpty).arg(missingMessage).arg(captured.size())
+                        .arg(userId.isEmpty()).arg(captured.contains(userId))
+                        .arg(toolPayload(user).value("preset").toString(), userName)
+                        .arg(u.value("width").toInt()).arg(u.value("height").toInt()).arg(u.value("fps").toInt())
+                        .arg(u.value("videoCodec").toString()).arg(u.value("videoBitrate").toInt())
+                        .arg(u.value("audioBitrate").toInt()).arg(u.value("rateControl").toString())
+                        .arg(u.value("crf").toInt()));
         if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", previousDir);
         else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
     }
@@ -3927,7 +3989,8 @@ int runMcpSelftest()
             {"videoCodec", "prores"}, {"proresProfile", 4}};
         const auto response = callProjectInfoTool(1650, QStringLiteral("export_video"), valid);
         const QString id = toolPayload(response).value("jobId").toString();
-        ok &= !id.isEmpty() && !toolResult(response).value("isError").toBool(true);
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        ok &= !id.isEmpty() && !validIsError;
         const QList<QJsonObject> invalid{
             {{"videoCodec", "h264"}}, {{"proresProfile", 2}},
             {{"keepAlpha", "true"}}, {{"keepAlpha", 1}},
@@ -3936,17 +3999,24 @@ int runMcpSelftest()
             {{"audioOnly", true}}
         };
         int requestId = 1651;
+        QStringList invalidDetail;
         for (const auto &overrides : invalid) {
             auto args = valid;
-            for (auto it = overrides.begin(); it != overrides.end(); ++it)
+            QStringList keys;
+            for (auto it = overrides.begin(); it != overrides.end(); ++it) {
                 args.insert(it.key(), it.value());
+                keys << QStringLiteral("%1=%2").arg(it.key(), it.value().toVariant().toString());
+            }
             const auto rejected = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
-            ok &= toolResult(rejected).value("isError").toBool(false)
-                && toolPayload(rejected).isEmpty();
+            const bool invIsError = toolResult(rejected).value("isError").toBool(false);
+            const bool invPayloadEmpty = toolPayload(rejected).isEmpty();
+            invalidDetail << QStringLiteral("%1:isError=%2,payloadEmpty=%3")
+                                 .arg(keys.join(QLatin1Char(','))).arg(invIsError).arg(invPayloadEmpty);
+            ok &= invIsError && invPayloadEmpty;
         }
         QHash<QString, QJsonObject> captured;
-        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
-        if (queue) {
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
             const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
                 const auto jobs = queue->jobs();
                 if (jobs.isEmpty()) return;
@@ -3959,11 +4029,20 @@ int runMcpSelftest()
             projectInfoWindow.m_mcpTools = previousTools;
             QObject::disconnect(connection);
         }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
         ok &= captured.size() == 1 && captured.contains(id)
             && captured.value(id).value("keepAlpha").toBool(false)
             && captured.value(id).value("proresProfile").toInt(-1) == 4;
         ok ? pass("G165 alpha export validation and queue wiring")
-           : fail("G165 alpha export validation and queue wiring", QStringLiteral("alpha validation or queued settings mismatch"));
+           : fail("G165 alpha export validation and queue wiring",
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) invalid=[%8] contains=%9 "
+                                 "keepAlpha=%10(want 1) proresProfile=%11(want 4)")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(invalidDetail.join(QLatin1Char(' ')))
+                      .arg(captured.contains(id)).arg(captured.value(id).value("keepAlpha").toBool(false))
+                      .arg(captured.value(id).value("proresProfile").toInt(-1)));
     }
 
     // US-612 G174: the real MCP handler shares the alpha export policy.
@@ -3973,15 +4052,18 @@ int runMcpSelftest()
             {"keepAlpha", true}, {"videoCodec", "libvpx-vp9"}, {"audioCodec", "libopus"}};
         const auto response = callProjectInfoTool(1740, QStringLiteral("export_video"), valid);
         const QString id = toolPayload(response).value("jobId").toString();
-        ok &= !id.isEmpty() && !toolResult(response).value("isError").toBool(true);
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        ok &= !id.isEmpty() && !validIsError;
         auto invalid = valid;
         invalid.insert("videoCodec", "libx264");
         invalid.insert("outputPath", exportRoot.filePath("alpha-h264.mp4"));
         const auto rejected = callProjectInfoTool(1741, QStringLiteral("export_video"), invalid);
-        ok &= toolResult(rejected).value("isError").toBool(false) && toolPayload(rejected).isEmpty();
+        const bool h264IsError = toolResult(rejected).value("isError").toBool(false);
+        const bool h264PayloadEmpty = toolPayload(rejected).isEmpty();
+        ok &= h264IsError && h264PayloadEmpty;
         QHash<QString, QJsonObject> captured;
-        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
-        if (queue) {
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
             const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
                 const auto jobs = queue->jobs();
                 if (jobs.isEmpty()) return;
@@ -3994,12 +4076,20 @@ int runMcpSelftest()
             projectInfoWindow.m_mcpTools = previousTools;
             QObject::disconnect(connection);
         }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
         ok &= captured.size() == 1 && captured.contains(id)
             && captured.value(id).value("keepAlpha").toBool(false)
             && captured.value(id).value("videoCodec").toString() == QStringLiteral("libvpx-vp9");
         ok ? pass("G174 VP9 alpha acceptance and H.264 rejection")
            : fail("G174 VP9 alpha acceptance and H.264 rejection",
-                  QStringLiteral("alpha validation or queued settings mismatch"));
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) h264IsError=%8(want 1) h264PayloadEmpty=%9(want 1) contains=%10 "
+                                 "keepAlpha=%11(want 1) videoCodec=%12(want libvpx-vp9)")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(h264IsError).arg(h264PayloadEmpty)
+                      .arg(captured.contains(id)).arg(captured.value(id).value("keepAlpha").toBool(false))
+                      .arg(captured.value(id).value("videoCodec").toString()));
     }
 
     // US-614 G175: validate nested arguments and capture the actual queued job.
@@ -4009,21 +4099,29 @@ int runMcpSelftest()
         QJsonObject args{{"outputPath", exportRoot.filePath("metadata.mp4")}, {"metadata", metadata}};
         const auto response = callProjectInfoTool(1750, QStringLiteral("export_video"), args);
         const QString id = toolPayload(response).value("jobId").toString();
-        bool ok = exportRootReady && timelineReady && !id.isEmpty()
-            && !toolResult(response).value("isError").toBool(true);
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        bool ok = exportRootReady && timelineReady && !id.isEmpty() && !validIsError;
+        QStringList invalidDetail;
         for (const QJsonValue &invalid : {QJsonValue("invalid"), QJsonValue(QJsonObject{{"unknown", "x"}}),
                 QJsonValue(QJsonObject{{"title", 42}})}) {
             args.insert("metadata", invalid);
-            ok &= toolResult(callProjectInfoTool(1751, QStringLiteral("export_video"), args))
+            const bool rejected = toolResult(callProjectInfoTool(1751, QStringLiteral("export_video"), args))
                 .value("isError").toBool(false);
+            invalidDetail << QStringLiteral("metadata=%1:rejected=%2")
+                .arg(invalid.isObject()
+                         ? QString::fromUtf8(QJsonDocument(invalid.toObject()).toJson(QJsonDocument::Compact))
+                         : invalid.toVariant().toString())
+                .arg(rejected);
+            ok &= rejected;
         }
         args.insert("metadata", metadata);
         args.insert("unknownMetadata", "x");
-        ok &= toolResult(callProjectInfoTool(1752, QStringLiteral("export_video"), args))
+        const bool unknownRejected = toolResult(callProjectInfoTool(1752, QStringLiteral("export_video"), args))
             .value("isError").toBool(false);
+        ok &= unknownRejected;
         QHash<QString, QJsonObject> captured;
-        auto *queue = projectInfoWindow.findChild<RenderQueue*>();
-        if (queue) {
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
             const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
                 const auto jobs = queue->jobs();
                 if (jobs.isEmpty()) return;
@@ -4036,11 +4134,22 @@ int runMcpSelftest()
             projectInfoWindow.m_mcpTools = previousTools;
             QObject::disconnect(connection);
         }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
         ok &= captured.size() == 1 && captured.contains(id);
-        for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it)
+        QStringList metadataDetail;
+        for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
             ok &= captured.value(id).value(it.key()) == it.value();
+            metadataDetail << QStringLiteral("%1=%2(want %3)").arg(it.key(),
+                captured.value(id).value(it.key()).toString(), it.value().toString());
+        }
         ok ? pass("G175 export metadata")
-           : fail("G175 export metadata", QStringLiteral("metadata validation or queued settings mismatch"));
+           : fail("G175 export metadata",
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) invalid=[%8] unknownMetadataRejected=%9(want 1) contains=%10 %11")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(invalidDetail.join(QLatin1Char(' ')))
+                      .arg(unknownRejected).arg(captured.contains(id)).arg(metadataDetail.join(QLatin1Char(' '))));
     }
 
     // US-616 G176: exercise the registered import tool and restore the fixture.
@@ -4176,16 +4285,21 @@ int runMcpSelftest()
             });
         const QJsonObject addCaptionPayload = toolPayload(addCaptionResponse);
         CaptionEditorDialog *captionDialog =
-            projectInfoWindow.findChild<CaptionEditorDialog*>();
-        const bool g59 = noCaptionEditorBefore
-            && !toolResult(addCaptionResponse).value(QStringLiteral("isError"))
-                   .toBool(false)
-            && addCaptionPayload.value(QStringLiteral("ok")).toBool(false)
-            && addCaptionPayload.value(QStringLiteral("captionCount")).toInt(-1) == 1
-            && captionDialog != nullptr && !captionDialog->isVisible();
+            projectInfoWindow.findChild<CaptionEditorDialog*>(QStringLiteral("captionEditorDialog"));
+        const bool addCaptionIsError = toolResult(addCaptionResponse).value(QStringLiteral("isError"))
+                                           .toBool(false);
+        const bool addCaptionOk = addCaptionPayload.value(QStringLiteral("ok")).toBool(false);
+        const int addCaptionCount = addCaptionPayload.value(QStringLiteral("captionCount")).toInt(-1);
+        const bool captionDialogFound = captionDialog != nullptr;
+        const bool captionDialogVisible = captionDialog && captionDialog->isVisible();
+        const bool g59 = noCaptionEditorBefore && !addCaptionIsError && addCaptionOk
+            && addCaptionCount == 1 && captionDialogFound && !captionDialogVisible;
         g59 ? pass("G59 add_caption without open editor")
             : fail("G59 add_caption without open editor",
-                   QStringLiteral("add_caption did not create a hidden caption editor"));
+                   QStringLiteral("noCaptionEditorBefore=%1 isError=%2(want 0) ok=%3(want 1) "
+                                  "captionCount=%4(want 1) dialogFound=%5 visible=%6(want 0)")
+                       .arg(noCaptionEditorBefore).arg(addCaptionIsError).arg(addCaptionOk)
+                       .arg(addCaptionCount).arg(captionDialogFound).arg(captionDialogVisible));
 
         ClipInfo captionHost;
         captionHost.filePath = QStringLiteral("caption-host");
@@ -5200,16 +5314,23 @@ int runMcpSelftest()
                 && assistantButton->text() == QStringLiteral("LLM に指示を出す")
                 && assistantButton->parentWidget() == projectInfoWindow.statusBar()
                 && !assistantButton->isHidden();
-            bool assistantOpened = false;
+            bool toggleFound = false, toggleChecked = false, serverFound = false, serverRunning = false;
+            bool chatActionFound = false, chatActionChecked = false, dockFound = false, dockShown = false;
             if (buttonPresent) {
                 assistantButton->click();
-                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
-                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
-                assistantOpened = mcpToggle && mcpToggle->isChecked()
-                    && server && server->isRunning()
-                    && aiChatAction && aiChatAction->isChecked()
-                    && dock && !dock->isHidden();
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>(QStringLiteral("AiChatDock"));
+                toggleFound = mcpToggle != nullptr;
+                toggleChecked = mcpToggle && mcpToggle->isChecked();
+                serverFound = server != nullptr;
+                serverRunning = server && server->isRunning();
+                chatActionFound = aiChatAction != nullptr;
+                chatActionChecked = aiChatAction && aiChatAction->isChecked();
+                dockFound = dock != nullptr;
+                dockShown = dock && !dock->isHidden();
             }
+            const bool assistantOpened = toggleFound && toggleChecked && serverFound && serverRunning
+                && chatActionFound && chatActionChecked && dockFound && dockShown;
             if (aiChatAction)
                 aiChatAction->setChecked(false);
             if (mcpToggle && mcpToggle->isChecked())
@@ -5217,7 +5338,11 @@ int runMcpSelftest()
             const bool g109 = buttonPresent && assistantOpened;
             g109 ? pass("G109 status bar LLM button starts the MCP server and opens the AI chat")
                  : fail("G109 status bar LLM button starts the MCP server and opens the AI chat",
-                        QStringLiteral("present=%1 opened=%2").arg(buttonPresent).arg(assistantOpened));
+                        QStringLiteral("present=%1 opened=%2 toggleFound=%3 toggleChecked=%4 serverFound=%5 "
+                                       "serverRunning=%6 chatActionFound=%7 chatActionChecked=%8 dockFound=%9 dockShown=%10")
+                            .arg(buttonPresent).arg(assistantOpened).arg(toggleFound).arg(toggleChecked)
+                            .arg(serverFound).arg(serverRunning).arg(chatActionFound).arg(chatActionChecked)
+                            .arg(dockFound).arg(dockShown));
 
             QAction *toggle = actionByText(QStringLiteral("「LLM に指示を出す」ボタンを表示"));
             bool toggleWorks = toggle && toggle->isCheckable() && toggle->isChecked()
@@ -5238,39 +5363,65 @@ int runMcpSelftest()
             {
                 if (aiChatAction)
                     aiChatAction->setChecked(true);
-                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>(QStringLiteral("AiChatDock"));
                 auto *connectionLabel = dock
                     ? dock->findChild<QLabel *>(QStringLiteral("AiChatConnectionStatus")) : nullptr;
                 auto *connectButton = dock
                     ? dock->findChild<QPushButton *>(QStringLiteral("AiChatConnectButton")) : nullptr;
-                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                const bool dockFound111 = dock != nullptr;
+                const bool labelFound = connectionLabel != nullptr;
+                const bool buttonFound = connectButton != nullptr;
+                const bool serverFound111 = server != nullptr;
+                const bool serverRunningStopped = server && server->isRunning();
+                const QString labelTextStopped = connectionLabel ? connectionLabel->text() : QString();
+                const QString buttonTextStopped = connectButton ? connectButton->text() : QString();
                 const bool stoppedShown = connectionLabel && connectButton
-                    && !(server && server->isRunning())
-                    && connectionLabel->text().contains(QStringLiteral("停止中"))
-                    && connectionLabel->text().contains(QStringLiteral("CLI"))
-                    && connectButton->text() == QStringLiteral("接続");
+                    && !serverRunningStopped
+                    && labelTextStopped.contains(QStringLiteral("停止中"))
+                    && labelTextStopped.contains(QStringLiteral("CLI"))
+                    && buttonTextStopped == QStringLiteral("接続");
                 bool connected = false;
                 bool disconnected = false;
+                bool mcpToggleConnected = false, mcpToggleDisconnected = false;
+                bool serverRunningConnected = false, serverRunningDisconnected = false;
+                QString labelTextConnected, buttonTextConnected, labelTextDisconnected, buttonTextDisconnected;
                 if (stoppedShown) {
                     connectButton->click();
-                    server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
-                    connected = server && server->isRunning()
-                        && connectionLabel->text().contains(QString::number(server->port()))
-                        && connectButton->text() == QStringLiteral("切断")
-                        && mcpToggle && mcpToggle->isChecked();
+                    server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                    serverRunningConnected = server && server->isRunning();
+                    labelTextConnected = connectionLabel->text();
+                    buttonTextConnected = connectButton->text();
+                    mcpToggleConnected = mcpToggle && mcpToggle->isChecked();
+                    connected = serverRunningConnected
+                        && labelTextConnected.contains(QString::number(server->port()))
+                        && buttonTextConnected == QStringLiteral("切断")
+                        && mcpToggleConnected;
                     connectButton->click();
-                    disconnected = !(server && server->isRunning())
-                        && connectionLabel->text().contains(QStringLiteral("停止中"))
-                        && connectButton->text() == QStringLiteral("接続")
-                        && mcpToggle && !mcpToggle->isChecked();
+                    serverRunningDisconnected = server && server->isRunning();
+                    labelTextDisconnected = connectionLabel->text();
+                    buttonTextDisconnected = connectButton->text();
+                    mcpToggleDisconnected = mcpToggle && mcpToggle->isChecked();
+                    disconnected = !serverRunningDisconnected
+                        && labelTextDisconnected.contains(QStringLiteral("停止中"))
+                        && buttonTextDisconnected == QStringLiteral("接続")
+                        && mcpToggle && !mcpToggleDisconnected;
                 }
                 if (aiChatAction)
                     aiChatAction->setChecked(false);
                 const bool g111 = stoppedShown && connected && disconnected;
                 g111 ? pass("G111 AI chat dock shows the connection state and its button starts/stops the server")
                      : fail("G111 AI chat dock shows the connection state and its button starts/stops the server",
-                            QStringLiteral("stoppedShown=%1 connected=%2 disconnected=%3")
-                                .arg(stoppedShown).arg(connected).arg(disconnected));
+                            QStringLiteral("stoppedShown=%1 connected=%2 disconnected=%3 dockFound=%4 labelFound=%5 "
+                                           "buttonFound=%6 serverFound=%7 serverRunning(stopped/connected/disconnected)=%8/%9/%10 "
+                                           "label(stopped/connected/disconnected)=[%11]/[%12]/[%13] "
+                                           "button(stopped/connected/disconnected)=[%14]/[%15]/[%16] mcpToggleFound=%17 mcpToggle(connected/disconnected)=%18(want 1)/%19(want 0)")
+                                .arg(stoppedShown).arg(connected).arg(disconnected)
+                                .arg(dockFound111).arg(labelFound).arg(buttonFound).arg(serverFound111)
+                                .arg(serverRunningStopped).arg(serverRunningConnected).arg(serverRunningDisconnected)
+                                .arg(labelTextStopped, labelTextConnected, labelTextDisconnected)
+                                .arg(buttonTextStopped, buttonTextConnected, buttonTextDisconnected)
+                                .arg(mcpToggle != nullptr).arg(mcpToggleConnected).arg(mcpToggleDisconnected));
             }
 
             // G112: codex exec の引数は stdio ブリッジを -c で渡し、cmd.exe 経由でも安全 (" を含まない)。
@@ -5933,9 +6084,6 @@ int runMcpSelftest()
         fail("G173 ungroup_clips", QStringLiteral("Timeline was not available"));
     }
     server.stop();
-    qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
-                                << " failed=" << failed;
-    qInfo().noquote().nospace() << "summary: " << passed << " PASS, "
-                                << failed << " FAIL";
-    return failed;
+    qInfo().noquote().nospace() << "[mcp] selftest end";
+    return tally.finish("mcp");
 }

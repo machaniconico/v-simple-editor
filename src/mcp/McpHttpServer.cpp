@@ -186,6 +186,7 @@ McpHttpServer::McpHttpServer(McpToolRegistry* registry, QObject* parent)
     connect(m_idleTimer, &QTimer::timeout,
             this, &McpHttpServer::onIdleTimeout);
     m_idleTimer->start();
+    setObjectName(QStringLiteral("mcpHttpServer"));
 }
 
 McpHttpServer::~McpHttpServer()
