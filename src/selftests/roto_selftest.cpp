@@ -1,4 +1,5 @@
-// --selftest=roto: carrier remapping, undo, persistence, and queue restoration.
+// --selftest=roto: carrier remapping, undo, persistence, queue restoration,
+// roto::applyEntryToFrame and the MainWindow single writer (storeRotoEntry).
 #include "SelftestGate.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -8,7 +9,12 @@
 #include "../SubtitleTrackRenderer.h"
 #include "../libavcore/Encode.h"
 #include "../AcesColor.h"
+#include "../MainWindow.h"
+#include "../RotoApply.h"
+#include "../libavcore/FrameGrab.h"
+#include <cmath>
 #include <atomic>
+#include <functional>
 #include <QDateTime>
 #include <QMutex>
 #include <QJsonDocument>
@@ -150,6 +156,115 @@ bool samePayload(const RotoClipEntry &a, const RotoClipEntry &b)
         && a.brushMask.size() == b.brushMask.size();
 }
 
+
+RotoPoint corner(double x, double y)
+{
+    RotoPoint p;
+    p.position = p.handleIn = p.handleOut = QPointF(x, y);
+    return p;
+}
+
+RotoPath rectPath(double x0, double y0, double x1, double y1, double feather = 0.0)
+{
+    RotoPath path;
+    path.points = {corner(x0, y0), corner(x1, y0), corner(x1, y1), corner(x0, y1)};
+    path.closed = true;
+    path.feather = feather;
+    return path;
+}
+
+// Pixel statistics of a roto result against its input. "Inside" pixels must be
+// byte-identical (ARGB), "outside" pixels must be alpha 0 with RGB 0.
+struct MaskStats {
+    int insidePixels = 0;
+    int insideDiff = 0;
+    int insideMaxDiff = 0;
+    int outsidePixels = 0;
+    int outsideBad = 0;
+    int edgePixels = 0;
+    int edgeAlphaMin = 255;
+    int edgeAlphaMax = 0;
+};
+
+template <typename InsideFn, typename OutsideFn>
+MaskStats maskStats(const QImage &input, const QImage &output, InsideFn inside, OutsideFn outside)
+{
+    MaskStats stats;
+    if (input.isNull() || output.size() != input.size()) return stats;
+    for (int y = 0; y < input.height(); ++y) {
+        for (int x = 0; x < input.width(); ++x) {
+            const QRgb in = input.pixel(x, y);
+            const QRgb out = output.pixel(x, y);
+            const int alpha = qAlpha(out);
+            if (alpha > 0 && alpha < 255) {
+                ++stats.edgePixels;
+                stats.edgeAlphaMin = qMin(stats.edgeAlphaMin, alpha);
+                stats.edgeAlphaMax = qMax(stats.edgeAlphaMax, alpha);
+            }
+            if (inside(x, y)) {
+                ++stats.insidePixels;
+                const int diff = qMax(qMax(qAbs(qRed(in) - qRed(out)), qAbs(qGreen(in) - qGreen(out))),
+                                      qMax(qAbs(qBlue(in) - qBlue(out)), qAbs(qAlpha(in) - alpha)));
+                if (diff > 0) ++stats.insideDiff;
+                stats.insideMaxDiff = qMax(stats.insideMaxDiff, diff);
+            } else if (outside(x, y)) {
+                ++stats.outsidePixels;
+                if (alpha != 0 || qRed(out) != 0 || qGreen(out) != 0 || qBlue(out) != 0)
+                    ++stats.outsideBad;
+            }
+        }
+    }
+    return stats;
+}
+
+bool inRect(int x, int y, int x0, int y0, int x1, int y1)
+{
+    return x >= x0 && x < x1 && y >= y0 && y < y1;
+}
+
+void printStats(const char *label, const MaskStats &s)
+{
+    std::cerr << label << " inside=" << s.insidePixels << " insideDiff=" << s.insideDiff
+              << " insideMaxDiff=" << s.insideMaxDiff << " outside=" << s.outsidePixels
+              << " outsideBad=" << s.outsideBad << " edge=" << s.edgePixels
+              << " edgeAlpha=" << (s.edgePixels ? s.edgeAlphaMin : 0) << ".."
+              << s.edgeAlphaMax << '\n';
+}
+
+bool cleanMask(const MaskStats &s)
+{
+    return s.insidePixels > 0 && s.insideDiff == 0 && s.outsidePixels > 0 && s.outsideBad == 0;
+}
+
+// MainWindow fixture for G9-G12 (seedWindow): V1 [100, 101 (1 s gap)],
+// V2 [1, 2 (1 s gap)], V3 [3], V4 [matte/parent source at 10 s]. Roto markers
+// 1/2/3/4 sit on V2:0 / V2:1 / V3:0 / V1:1; the matte on the same key carries a
+// marker-specific type so a roto/matte pairing shift is visible.
+TrackMatteType matteTypeForMarker(int marker)
+{
+    switch (marker) {
+    case 1: return TrackMatteType::AlphaMatte;
+    case 2: return TrackMatteType::AlphaInvertedMatte;
+    case 3: return TrackMatteType::LumaMatte;
+    case 4: return TrackMatteType::LumaInvertedMatte;
+    default: return TrackMatteType::None;
+    }
+}
+
+QString layoutSignature(const Timeline *tl)
+{
+    QStringList parts;
+    for (const auto *track : tl->videoTracks()) {
+        QStringList clips;
+        for (const ClipInfo &c : track->clips())
+            clips.append(QStringLiteral("%1@%2+%3/%4-%5").arg(c.displayName)
+                .arg(c.leadInSec, 0, 'f', 3).arg(c.effectiveDuration(), 0, 'f', 3)
+                .arg(c.inPoint, 0, 'f', 3).arg(c.outPoint, 0, 'f', 3));
+        parts.append(QLatin1Char('[') + clips.join(QLatin1Char(',')) + QLatin1Char(']'));
+    }
+    return parts.join(QLatin1Char(' '));
+}
+
 } // namespace
 
 int runRotoSelftest()
@@ -159,13 +274,13 @@ int runRotoSelftest()
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
     QString unavailable;
     if (!media.isValid() || !selftest::requireEncoder(QStringLiteral("mpeg4"), &unavailable)) {
-        for (int gate = 1; gate <= 6; ++gate)
+        for (int gate = 1; gate <= 12; ++gate)
             gates.skip(gate, media.isValid() ? "mpeg4 fixture encoder unavailable"
                                              : "temporary directory unavailable");
         return gates.finish("roto");
     }
     if (!writeSyntheticClip(gSyntheticClipPath)) {
-        for (int gate = 1; gate <= 6; ++gate)
+        for (int gate = 1; gate <= 12; ++gate)
             gates.gate(gate, false, "mpeg4 fixture creation failed");
         return gates.finish("roto");
     }
@@ -549,5 +664,320 @@ int runRotoSelftest()
               << " markers=" << newEntries.value(QStringLiteral("1:0")).path.points.size()
               << '/' << newEntries.value(QStringLiteral("1:1")).path.points.size() << '\n';
     gates.gate(6, g6, "clipMoved failed to reorder the roto carrier");
+
+    // G7 detects an inverted or shifted roto mask (interior must be kept) and
+    // keyframes losing priority over the single path.
+    const QImage source = libavcore::grabFrameAt(gSyntheticClipPath, 0.5);
+    RotoClipEntry hard;
+    hard.path = rectPath(16, 16, 48, 48);
+    const QImage hardOut = roto::applyEntryToFrame(hard, source, 5);
+    const MaskStats hardStats = maskStats(source, hardOut,
+        [](int x, int y) { return inRect(x, y, 18, 18, 46, 46); },
+        [](int x, int y) { return !inRect(x, y, 14, 14, 50, 50); });
+    RotoClipEntry soft;
+    soft.path = rectPath(16, 16, 48, 48, 3.0);
+    const QImage softOut = roto::applyEntryToFrame(soft, source, 5);
+    // Three box-blur passes of radius 3 reach 9 px past the edge.
+    const MaskStats softStats = maskStats(source, softOut,
+        [](int x, int y) { return inRect(x, y, 26, 26, 38, 38); },
+        [](int x, int y) { return !inRect(x, y, 6, 6, 58, 58); });
+    RotoClipEntry keyed;
+    keyed.path = rectPath(16, 16, 48, 48);
+    RotoKeyframe keyedFrame;
+    keyedFrame.frameNumber = 0;
+    keyedFrame.path = rectPath(0, 0, 24, 64);
+    keyed.keyframes.append(keyedFrame);
+    const QImage keyedOut = roto::applyEntryToFrame(keyed, source, 5);
+    const MaskStats keyedStats = maskStats(source, keyedOut,
+        [](int x, int y) { return inRect(x, y, 2, 2, 22, 62); },
+        [](int x, int y) { return inRect(x, y, 26, 18, 46, 46); });
+    printStats("G7 path feather=0", hardStats);
+    printStats("G7 path feather=3", softStats);
+    printStats("G7 keyframes>path", keyedStats);
+    std::cerr << "G7 source=" << source.width() << 'x' << source.height()
+              << " format=" << int(hardOut.format()) << '\n';
+    const bool g7 = source.size() == QSize(64, 64)
+        && cleanMask(hardStats) && hardStats.edgePixels == 0
+        && cleanMask(softStats) && softStats.edgePixels > 0
+        && cleanMask(keyedStats);
+    gates.gate(7, g7, "roto interior not kept, exterior not cleared, or keyframes lost priority");
+
+    // G8 detects a dropped brush max-combine, an altered pass-through for
+    // empty entries / null frames, and a preview that bypasses
+    // roto::sourceFrameIndexFor (its call counter stays flat).
+    QImage brush(64, 64, QImage::Format_Grayscale8);
+    brush.fill(0);
+    for (int y = 8; y < 24; ++y)
+        for (int x = 8; x < 24; ++x)
+            brush.scanLine(y)[x] = 255;
+    RotoClipEntry brushOnly;
+    brushOnly.brushMask = brush;
+    const MaskStats brushStats = maskStats(source, roto::applyEntryToFrame(brushOnly, source, 5),
+        [](int x, int y) { return inRect(x, y, 8, 8, 24, 24); },
+        [](int x, int y) { return !inRect(x, y, 6, 6, 26, 26); });
+    RotoClipEntry pathBrush;
+    pathBrush.path = rectPath(32, 32, 56, 56);
+    pathBrush.brushMask = brush;
+    const MaskStats unionStats = maskStats(source, roto::applyEntryToFrame(pathBrush, source, 5),
+        [](int x, int y) { return inRect(x, y, 8, 8, 24, 24) || inRect(x, y, 34, 34, 54, 54); },
+        [](int x, int y) { return !inRect(x, y, 6, 6, 26, 26) && !inRect(x, y, 30, 30, 58, 58); });
+    printStats("G8 brush-only", brushStats);
+    printStats("G8 path+brush", unionStats);
+    const bool emptySame = roto::applyEntryToFrame(RotoClipEntry{}, source, 5) == source;
+    const bool nullSame = roto::applyEntryToFrame(hard, QImage(), 5).isNull();
+    struct IndexCase { double sec; double fps; int expected; };
+    const IndexCase indexCases[] = {
+        {1.0, 30.0, 30}, {2.0, 29.97, 60}, {-0.4, 30.0, 0}, {0.25, 10.0, 3}, {0.0, 24.0, 0}};
+    bool indexOk = true;
+    for (const auto &c : indexCases) {
+        const int actual = roto::sourceFrameIndexFor(c.sec, c.fps);
+        const int viaLlround = qMax(0, static_cast<int>(std::llround(c.sec * c.fps)));
+        std::cerr << "G8 sourceFrameIndexFor(" << c.sec << ',' << c.fps << ")=" << actual
+                  << " llround=" << viaLlround << " expected=" << c.expected << '\n';
+        indexOk = indexOk && actual == viaLlround && actual == c.expected;
+    }
+    MainWindow window;
+    Timeline *wtl = window.m_timeline;
+    window.m_projectConfig.width = 64;
+    window.m_projectConfig.height = 64;
+    window.m_projectConfig.fps = 10;
+    ClipInfo remapped = clip(70);
+    remapped.timeRemapCurve.sourceFps = 10.0;
+    remapped.timeRemapCurve.addKey(0.0, 0.0);
+    remapped.timeRemapCurve.addKey(1.0, 1.0);
+    wtl->restoreFromProject(QVector<QVector<ClipInfo>>{{remapped}},
+                            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    wtl->setRotoEntries({});
+    const quint64 remapBefore = roto::sourceFrameIndexForCallCount();
+    const QImage remapPreview = window.buildSpecialClipComposite(0.5);
+    const quint64 remapCalls = roto::sourceFrameIndexForCallCount() - remapBefore;
+    wtl->restoreFromProject(QVector<QVector<ClipInfo>>{{clip(71)}},
+                            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    QHash<QString, RotoClipEntry> plainRoto;
+    plainRoto.insert(QStringLiteral("0:0"), hard);
+    wtl->setRotoEntries(plainRoto);
+    const quint64 plainBefore = roto::sourceFrameIndexForCallCount();
+    const QImage plainPreview = window.buildSpecialClipComposite(0.5);
+    const quint64 plainCalls = roto::sourceFrameIndexForCallCount() - plainBefore;
+    wtl->setRotoEntries({});
+    std::cerr << "G8 emptySame=" << emptySame << " nullSame=" << nullSame
+              << " indexOk=" << indexOk << " remapPreviewCalls=" << remapCalls
+              << " remapPreviewNull=" << remapPreview.isNull()
+              << " plainRotoPreviewCalls=" << plainCalls
+              << " plainPreviewNull=" << plainPreview.isNull() << '\n';
+    const bool g8 = cleanMask(brushStats) && cleanMask(unionStats) && emptySame && nullSame
+        && indexOk && remapCalls > 0 && !remapPreview.isNull()
+        && plainCalls > 0 && !plainPreview.isNull();
+    gates.gate(8, g8, "brush max-combine, pass-through or shared source frame index failed");
+
+    const auto seedWindow = [](MainWindow &window) {
+        Timeline *tl = window.m_timeline;
+        ClipInfo gappedV1 = clip(101);
+        gappedV1.leadInSec = 1.0;
+        ClipInfo gappedV2 = clip(2);
+        gappedV2.leadInSec = 1.0;
+        ClipInfo source = clip(4);
+        source.leadInSec = 10.0;
+        const QVector<QVector<ClipInfo>> video{
+            {clip(100), gappedV1}, {clip(1), gappedV2}, {clip(3)}, {source}};
+        const QVector<QVector<ClipInfo>> audio{{}};
+        tl->clearSelection();
+        tl->restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+        QHash<QString, RotoClipEntry> rotos;
+        rotos.insert(QStringLiteral("1:0"), entry(1));
+        rotos.insert(QStringLiteral("1:1"), entry(2, true));
+        rotos.insert(QStringLiteral("2:0"), entry(3));
+        rotos.insert(QStringLiteral("0:1"), entry(4));
+        tl->setRotoEntries(rotos);
+        window.m_trackMatteClipEntries.clear();
+        QHash<QString, TimelineTrackMatteEntry> carrier;
+        QHash<QString, QString> parents;
+        for (auto it = rotos.cbegin(); it != rotos.cend(); ++it) {
+            TrackMatteClipEntry m;
+            m.clipId = it.key();
+            m.matteType = matteTypeForMarker(it.value().path.points.size());
+            m.matteSourceClipId = QStringLiteral("3:0");
+            window.m_trackMatteClipEntries.insert(it.key(), m);
+            TimelineTrackMatteEntry c;
+            c.matteType = m.matteType;
+            c.matteSourceClipId = m.matteSourceClipId;
+            carrier.insert(it.key(), c);
+            parents.insert(it.key(), QStringLiteral("3:0"));
+        }
+        tl->setTrackMatteEntries(carrier);
+        tl->setClipParentEntries(parents);
+        tl->undoManager()->clear();
+        tl->undoManager()->saveState(tl->currentState(), QStringLiteral("基準"));
+    };
+
+    // G9 detects a writer that bypasses the carrier, keeps a stale value
+    // clipId, or skips the single undo step.
+    seedWindow(window);
+    UndoManager *um = wtl->undoManager();
+    const quint64 serialBefore = um->saveSerial();
+    RotoClipEntry stored = entry(6);
+    stored.clipId = QStringLiteral("9:9");
+    window.storeRotoEntry(QStringLiteral("0:0"), stored);
+    const quint64 serialAfter = um->saveSerial();
+    const auto afterStore = wtl->rotoEntries();
+    wtl->undo();
+    const auto afterStoreUndo = wtl->rotoEntries();
+    wtl->redo();
+    const auto afterStoreRedo = wtl->rotoEntries();
+    ProjectData populated;
+    window.populateProjectData(populated);
+    const auto populatedEntries = restoreEntries(populated.rotoClipEntries);
+    bool populatedSame = populatedEntries.size() == afterStoreRedo.size()
+        && populated.rotoClipEntries.size() == afterStoreRedo.size();
+    for (auto it = afterStoreRedo.cbegin(); it != afterStoreRedo.cend(); ++it)
+        populatedSame = populatedSame && samePayload(populatedEntries.value(it.key()), it.value());
+    const QSet<QString> seeded{QStringLiteral("0:1"), QStringLiteral("1:0"),
+                               QStringLiteral("1:1"), QStringLiteral("2:0")};
+    QSet<QString> withStored = seeded;
+    withStored.insert(QStringLiteral("0:0"));
+    std::cerr << "G9 store=" << show(keys(afterStore)).toStdString()
+              << " clipId=" << afterStore.value(QStringLiteral("0:0")).clipId.toStdString()
+              << " saveSerial=" << serialBefore << "->" << serialAfter
+              << " undo=" << show(keys(afterStoreUndo)).toStdString()
+              << " redo=" << show(keys(afterStoreRedo)).toStdString()
+              << " redoPoints=" << afterStoreRedo.value(QStringLiteral("0:0")).path.points.size()
+              << " populated=" << show(keys(populatedEntries)).toStdString()
+              << " populatedSame=" << populatedSame << '\n';
+    const bool g9 = keys(afterStore) == withStored
+        && afterStore.value(QStringLiteral("0:0")).clipId == QStringLiteral("0:0")
+        && afterStore.value(QStringLiteral("0:0")).path.points.size() == 6
+        && serialAfter == serialBefore + 1
+        && keys(afterStoreUndo) == seeded
+        && keys(afterStoreRedo) == withStored
+        && afterStoreRedo.value(QStringLiteral("0:0")).path.points.size() == 6
+        && invariant(afterStore) && invariant(afterStoreRedo) && populatedSame;
+    gates.gate(9, g9, "storeRotoEntry carrier, clipId, undo serial or populateProjectData mismatch");
+
+    // G10 detects roto keys drifting from the MainWindow matte keys on the GUI
+    // edit paths (each path remaps twice: inside Timeline and in MainWindow).
+    // The text-based range ripple compares against parents (matte does not
+    // follow that path, an existing defect).
+    struct EditPath { const char *name; std::function<void()> run; bool parentPeer; };
+    const auto select = [&](int track, int clipIndex) {
+        wtl->clearSelection();
+        QString error;
+        wtl->selectClipByIndex(false, track, clipIndex, &error);
+    };
+    const QVector<EditPath> editPaths{
+        // MainWindow::deleteClip only runs with a V1 (primary track) selection.
+        {"deleteClip", [&] { select(1, 0); wtl->videoTracks()[0]->toggleClipSelection(0);
+                             window.deleteClip(); }, false},
+        {"splitClip", [&] { wtl->setPlayheadPosition(1.0); select(1, 0); window.splitClip(); }, false},
+        {"rippleDelete", [&] { select(1, 0); window.rippleDelete(); }, false},
+        // Timeline::pasteClip copies from / inserts into V1 (the audio track is
+        // empty, so the insert lands at V1:0 and shifts the V1:1 roto).
+        {"pasteClip", [&] { select(0, 0); window.copyClip(); wtl->setPlayheadPosition(0.0);
+                            window.pasteClip(); }, false},
+        {"moveClipHeadToPlayhead", [&] { wtl->setPlayheadPosition(6.0); select(1, 0);
+                                         window.m_moveClipHeadAction->trigger(); }, false},
+        {"duplicate", [&] { select(1, 0); window.m_duplicateAction->trigger(); }, false},
+        {"nudge-1", [&] { select(1, 1); window.m_nudgeLeftAction->trigger(); }, false},
+        {"nudge+1", [&] { select(1, 1); window.m_nudgeRightAction->trigger(); }, false},
+        {"nudge-10", [&] { select(1, 1); window.m_nudgeLeft10Action->trigger(); }, false},
+        {"nudge+10", [&] { select(1, 0); window.m_nudgeRight10Action->trigger(); }, false},
+        {"closeAllGaps", [&] { window.m_closeAllGapsAction->trigger(); }, false},
+        {"bladeAll", [&] { wtl->setPlayheadPosition(1.0); window.m_bladeAllAction->trigger(); }, false},
+        {"lift", [&] { select(1, 0); window.m_liftAction->trigger(); }, false},
+        {"textRangeRipple", [&] { select(1, 0); wtl->rippleDeleteTimeRangeActive(0.0, 2.0); }, true},
+    };
+    bool g10 = true;
+    for (const auto &path : editPaths) {
+        seedWindow(window);
+        const QString layoutBefore = layoutSignature(wtl);
+        path.run();
+        const QString layoutAfter = layoutSignature(wtl);
+        const auto rotos = wtl->rotoEntries();
+        const QSet<QString> rotoKeys = keys(rotos);
+        const QSet<QString> peerKeys = path.parentPeer
+            ? keys(wtl->clipParentEntries()) : keys(window.m_trackMatteClipEntries);
+        QStringList pairing;
+        bool paired = true;
+        if (!path.parentPeer) {
+            for (auto it = rotos.cbegin(); it != rotos.cend(); ++it) {
+                const int marker = it.value().path.points.size();
+                const TrackMatteType matte = window.m_trackMatteClipEntries.value(it.key()).matteType;
+                if (matte != matteTypeForMarker(marker)) {
+                    paired = false;
+                    pairing.append(QStringLiteral("%1:marker%2/matte%3").arg(it.key())
+                                       .arg(marker).arg(int(matte)));
+                }
+            }
+        }
+        const bool changed = layoutBefore != layoutAfter;
+        const bool one = changed && rotoKeys == peerKeys && invariant(rotos) && paired
+            && rotoKeys.size() >= 2;
+        std::cerr << "G10 " << path.name << " roto=" << show(rotoKeys).toStdString()
+                  << " peer(" << (path.parentPeer ? "parent" : "matte") << ")="
+                  << show(peerKeys).toStdString()
+                  << " rotoOnly=" << show(rotoKeys - peerKeys).toStdString()
+                  << " peerOnly=" << show(peerKeys - rotoKeys).toStdString()
+                  << " marker1At=" << whereMarker(rotos, 1).toStdString()
+                  << " marker2At=" << whereMarker(rotos, 2).toStdString()
+                  << " marker3At=" << whereMarker(rotos, 3).toStdString()
+                  << " marker4At=" << whereMarker(rotos, 4).toStdString()
+                  << " pairingMismatch=" << pairing.join(QLatin1Char(',')).toStdString()
+                  << " clipIdOk=" << invariant(rotos) << " changed=" << changed
+                  << " layout=" << layoutAfter.toStdString() << '\n';
+        g10 = g10 && one;
+    }
+    gates.gate(10, g10, "roto keys drifted from matte/parent keys on a MainWindow edit path");
+
+    // G11 detects a project load that sets roto after the undo baseline (an
+    // edit + undo would then wipe the loaded roto).
+    seedWindow(window);
+    ProjectData project;
+    window.populateProjectData(project);
+    wtl->setRotoEntries({});
+    window.applyLoadedProjectData(project, QString());
+    const auto afterLoad = wtl->rotoEntries();
+    const bool canUndoAfterLoad = wtl->undoManager()->canUndo();
+    wtl->undo();
+    const auto afterLoadUndo = wtl->rotoEntries();
+    window.storeRotoEntry(QStringLiteral("0:0"), entry(7));
+    const auto afterLoadEdit = wtl->rotoEntries();
+    wtl->undo();
+    const auto afterLoadEditUndo = wtl->rotoEntries();
+    std::cerr << "G11 projectRoto=" << project.rotoClipEntries.size()
+              << " load=" << show(keys(afterLoad)).toStdString()
+              << " canUndoAfterLoad=" << canUndoAfterLoad
+              << " undo=" << show(keys(afterLoadUndo)).toStdString()
+              << " edit=" << show(keys(afterLoadEdit)).toStdString()
+              << " editUndo=" << show(keys(afterLoadEditUndo)).toStdString()
+              << " marker2At=" << whereMarker(afterLoadEditUndo, 2).toStdString() << '\n';
+    QSet<QString> loadEdited = seeded;
+    loadEdited.insert(QStringLiteral("0:0"));
+    const bool g11 = project.rotoClipEntries.size() == 4 && keys(afterLoad) == seeded
+        && keys(afterLoadUndo) == seeded && keys(afterLoadEdit) == loadEdited
+        && keys(afterLoadEditUndo) == seeded
+        && whereMarker(afterLoadEditUndo, 2) == QStringLiteral("1:1")
+        && invariant(afterLoadEditUndo);
+    gates.gate(11, g11, "loaded roto missing from the post-load undo baseline");
+
+    // G12 detects an empty dialog result that leaves the entry in the carrier
+    // or removes it outside the undo history.
+    seedWindow(window);
+    const quint64 clearSerialBefore = um->saveSerial();
+    window.storeRotoEntry(QStringLiteral("1:1"), RotoClipEntry{});
+    const quint64 clearSerialAfter = um->saveSerial();
+    const auto afterClear = wtl->rotoEntries();
+    wtl->undo();
+    const auto afterClearUndo = wtl->rotoEntries();
+    const RotoClipEntry restored = afterClearUndo.value(QStringLiteral("1:1"));
+    std::cerr << "G12 clear=" << show(keys(afterClear)).toStdString()
+              << " saveSerial=" << clearSerialBefore << "->" << clearSerialAfter
+              << " undo=" << show(keys(afterClearUndo)).toStdString()
+              << " points=" << restored.path.points.size()
+              << " mask=" << restored.brushMask.width() << 'x' << restored.brushMask.height() << '\n';
+    const bool g12 = keys(afterClear) == QSet<QString>{QStringLiteral("0:1"), QStringLiteral("1:0"),
+                                                       QStringLiteral("2:0")}
+        && clearSerialAfter == clearSerialBefore + 1
+        && keys(afterClearUndo) == seeded && restored.clipId == QStringLiteral("1:1")
+        && restored.path.points.size() == 2 && restored.brushMask.size() == QSize(3, 2);
+    gates.gate(12, g12, "empty roto entry not removed from the carrier or not undoable");
     return gates.finish("roto");
 }

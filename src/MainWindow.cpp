@@ -357,6 +357,7 @@ double exporter_loudnessGainDb();
 #include "NodePropertiesPanel.h"
 #include "LayerNodeBridge.h"
 #include "RotoToolsDialog.h"
+#include "RotoApply.h"
 #include "TimeRemapDialog.h"
 #include "FavoritesEditDialog.h"
 #include "Text3DExtrusionDialog.h"
@@ -1361,11 +1362,6 @@ void setVfxPanelState(VfxControlsPanel *panel, const ProjectVfxState &state)
 double clipSourceOutPoint(const ClipInfo &clip)
 {
     return (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
-}
-
-double clipEffectiveSourceFps(const VideoSourceInfo &info, double fallback)
-{
-    return (info.fps > 0.0) ? info.fps : qMax(1.0, fallback);
 }
 
 bool timelineHasClipTimeRemap(const Timeline *timeline)
@@ -2397,29 +2393,6 @@ playback::AutoProxyClip probeAutoProxyClipMetadata(const QString &filePath)
 QImage decodeFrameAtSecondsFromFile(const QString &filePath, double sourceTimeSeconds)
 {
     return libavcore::grabFrameAt(filePath, sourceTimeSeconds);
-}
-
-QImage combineMasksMax(const QImage &a, const QImage &b)
-{
-    if (a.isNull())
-        return b.convertToFormat(QImage::Format_Grayscale8);
-    if (b.isNull())
-        return a.convertToFormat(QImage::Format_Grayscale8);
-
-    QImage base = a.convertToFormat(QImage::Format_Grayscale8);
-    QImage overlay = b.convertToFormat(QImage::Format_Grayscale8);
-    if (overlay.size() != base.size()) {
-        overlay = overlay.scaled(base.size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
-                         .convertToFormat(QImage::Format_Grayscale8);
-    }
-
-    for (int y = 0; y < base.height(); ++y) {
-        uchar *baseLine = base.scanLine(y);
-        const uchar *overlayLine = overlay.constScanLine(y);
-        for (int x = 0; x < base.width(); ++x)
-            baseLine[x] = std::max(baseLine[x], overlayLine[x]);
-    }
-    return base;
 }
 
 QImage renderCompositeImage(const QImage &source, const CompositeLayer &layer, const QSize &canvasSize)
@@ -8740,27 +8713,13 @@ QImage MainWindow::applyStoredRotoData(const QString &clipId,
                                        const QImage &frame,
                                        int sourceFrameIndex) const
 {
-    const auto it = m_rotoClipEntries.constFind(clipId);
-    if (it == m_rotoClipEntries.cend() || frame.isNull())
+    if (!m_timeline || frame.isNull())
         return frame;
-
-    const RotoClipEntry &entry = it.value();
-    QImage mask;
-    if (!entry.keyframes.isEmpty()) {
-        Rotoscope roto;
-        for (const auto &keyframe : entry.keyframes)
-            roto.addKeyframe(keyframe.frameNumber, keyframe.path);
-        mask = roto.renderMask(sourceFrameIndex, frame.size());
-    } else if (!entry.path.points.isEmpty()) {
-        Rotoscope roto;
-        roto.addKeyframe(sourceFrameIndex, entry.path);
-        mask = roto.renderMask(sourceFrameIndex, frame.size());
-    }
-    if (!entry.brushMask.isNull())
-        mask = combineMasksMax(mask, entry.brushMask);
-    if (mask.isNull())
+    const auto entries = m_timeline->rotoEntries();
+    const auto it = entries.constFind(clipId);
+    if (it == entries.cend())
         return frame;
-    return Rotoscope::applyToFrame(frame, mask);
+    return roto::applyEntryToFrame(it.value(), frame, sourceFrameIndex);
 }
 
 QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
@@ -8785,6 +8744,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         QImage image;
     };
 
+    const auto rotoEntries = m_timeline->rotoEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
@@ -8808,7 +8768,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
             const QString clipId = brushClipId(trackIdx, clipIdx);
             hasActiveSpecialData = hasActiveSpecialData
-                || m_rotoClipEntries.contains(clipId)
+                || rotoEntries.contains(clipId)
                 || m_timeRemapClipEntries.contains(clipId)
                 || clip.hasTimeRemap()
                 || m_trackMatteClipEntries.contains(clipId)
@@ -8819,7 +8779,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
                 m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
-            const double fps = clipEffectiveSourceFps(info, m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
+            const double fps = roto::clipEffectiveSourceFps(info.fps, m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0);
             const double localSeconds = qBound(0.0, timelineSeconds - clipStart, clip.effectiveDuration());
 
             QImage frame;
@@ -8843,9 +8803,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                                           sourceTime - 1.0 / curve.sourceFps);
                     }
                     fxSourceSeconds = sourceTime;
-                    sourceFrameIndex = qMax(
-                        0, static_cast<int>(std::llround(
-                               sourceTime * curve.sourceFps)));
+                    sourceFrameIndex = roto::sourceFrameIndexFor(
+                        sourceTime, curve.sourceFps);
 
                     // resolveFrame consumes clip-relative source seconds. Pin
                     // a one-key sampling curve to the already-composed source
@@ -8883,20 +8842,17 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                                 clip, srcFrameIndex, curve.sourceFps);
                         };
                     if (pastOut) {
-                        sourceFrameIndex = qMax(
-                            0, static_cast<int>(std::llround(
-                                   fxSourceSeconds * curve.sourceFps)));
+                        sourceFrameIndex = roto::sourceFrameIndexFor(
+                            fxSourceSeconds, curve.sourceFps);
                         timeremap::TimeRemapCurve clampedCurve = curve;
                         clampedCurve.keys.clear();
                         clampedCurve.addKey(0.0, sourceOut - clip.inPoint);
                         frame = timeremap::resolveFrame(
                             clampedCurve, 0.0, decodeByIndex);
                     } else {
-                        sourceFrameIndex = qMax(
-                            0, static_cast<int>(std::llround(
-                                   (clip.inPoint
-                                    + curve.srcTimeAt(localSeconds))
-                                   * curve.sourceFps)));
+                        sourceFrameIndex = roto::sourceFrameIndexFor(
+                            clip.inPoint + curve.srcTimeAt(localSeconds),
+                            curve.sourceFps);
                         frame = timeremap::resolveFrame(
                             curve, localSeconds, decodeByIndex);
                     }
@@ -8908,8 +8864,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                                       sourceTime - 1.0 / fps);
                 }
                 fxSourceSeconds = sourceTime;
-                sourceFrameIndex = qMax(
-                    0, static_cast<int>(std::llround(sourceTime * fps)));
+                sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             } else {
                 // Preserve the legacy special-compositor mapping exactly for
@@ -8921,8 +8876,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                         + localSeconds * qMax(clip.speed, 0.0001),
                     clipOut);
                 fxSourceSeconds = sourceTime;
-                sourceFrameIndex = qMax(
-                    0, static_cast<int>(std::llround(sourceTime * fps)));
+                sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
                 frame = decodeClipFrameAtSourceTime(clip, sourceTime);
             }
 
@@ -9137,7 +9091,7 @@ void MainWindow::refreshSpecialClipPreview()
     const double playheadSeconds = m_timeline->playheadPosition();
     const bool anyLightingEnabled = light3d::hasActiveLights(
         light3d::statesAt(m_projectLights, playheadSeconds));
-    if (m_rotoClipEntries.isEmpty() && m_timeRemapClipEntries.isEmpty()
+    if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
         && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled
@@ -9178,7 +9132,8 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.zoomLevel = 10; // TODO: expose zoom level getter
     data.brushAnimations = m_brushAnimationEntries;
     data.rotoClipEntries.clear();
-    for (auto it = m_rotoClipEntries.cbegin(); it != m_rotoClipEntries.cend(); ++it)
+    const auto rotoEntries = m_timeline->rotoEntries();
+    for (auto it = rotoEntries.cbegin(); it != rotoEntries.cend(); ++it)
         data.rotoClipEntries.append(it.value());
     std::sort(data.rotoClipEntries.begin(), data.rotoClipEntries.end(),
               [](const RotoClipEntry &a, const RotoClipEntry &b) { return a.clipId < b.clipId; });
@@ -9440,10 +9395,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
 
     m_projectConfig = data.config;
     setBrushAnimationEntries(data.brushAnimations);
-    m_rotoClipEntries.clear();
-    for (const auto &entry : data.rotoClipEntries) {
-        if (!entry.clipId.isEmpty())
-            m_rotoClipEntries.insert(entry.clipId, entry);
+    // roto は restoreFromProject より前に carrier へ入れる (setClips は carrier を
+    // 消さない)。読込後の undo 基線 (undoManager()->clear() + saveState) に入る。
+    if (m_timeline) {
+        QHash<QString, RotoClipEntry> rotoEntries;
+        for (const auto &entry : data.rotoClipEntries) {
+            if (!entry.clipId.isEmpty())
+                rotoEntries.insert(entry.clipId, entry);
+        }
+        m_timeline->setRotoEntries(rotoEntries);
     }
     m_timeRemapClipEntries.clear();
     for (const auto &entry : data.timeRemapClipEntries) {
@@ -12999,7 +12959,7 @@ void MainWindow::openDeflicker()
     // never become the contract for generated frames.
     const VideoSourceInfo sourceInfo = probeVideoSourceInfo(
         clip.filePath, fallbackFps);
-    const double fps = clipEffectiveSourceFps(sourceInfo, fallbackFps);
+    const double fps = roto::clipEffectiveSourceFps(sourceInfo.fps, fallbackFps);
     const double sourceOut = clipSourceOutPoint(clip);
     const int sourceFrameBase = qMax(
         0, static_cast<int>(std::llround(clip.inPoint * fps)));
@@ -14517,9 +14477,9 @@ void MainWindow::openRotoToolsDialog()
     const double fallbackFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
     const VideoSourceInfo info = probeVideoSourceInfo(
         ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
-    const double fps = clipEffectiveSourceFps(info, fallbackFps);
+    const double fps = roto::clipEffectiveSourceFps(info.fps, fallbackFps);
     const double sourceTime = clipSourceTimeAtPlayheadSeconds(trackIdx, clipIdx, clip);
-    const int sourceFrameIndex = qMax(0, static_cast<int>(std::llround(sourceTime * fps)));
+    const int sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
 
     QImage currentFrame = decodeClipFrameAtSourceTime(clip, sourceTime);
     if (currentFrame.isNull()) {
@@ -14547,8 +14507,9 @@ void MainWindow::openRotoToolsDialog()
     dialog.setFrameSequence(frames, sourceFrameIndex);
 
     const QString clipId = brushClipId(trackIdx, clipIdx);
-    if (m_rotoClipEntries.contains(clipId)) {
-        const RotoClipEntry &entry = m_rotoClipEntries.value(clipId);
+    const auto storedRoto = m_timeline->rotoEntries();
+    if (storedRoto.contains(clipId)) {
+        const RotoClipEntry entry = storedRoto.value(clipId);
         if (!entry.keyframes.isEmpty()) {
             Rotoscope roto;
             for (const auto &keyframe : entry.keyframes)
@@ -14562,7 +14523,7 @@ void MainWindow::openRotoToolsDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
-    RotoClipEntry entry = m_rotoClipEntries.value(clipId);
+    RotoClipEntry entry = storedRoto.value(clipId);
     entry.clipId = clipId;
     entry.path = dialog.rotoPath();
 
@@ -14594,14 +14555,26 @@ void MainWindow::openRotoToolsDialog()
     if (!brushMask.isNull())
         entry.brushMask = brushMask.convertToFormat(QImage::Format_Grayscale8);
 
-    if (entry.path.points.isEmpty() && entry.keyframes.isEmpty() && entry.brushMask.isNull()) {
-        m_rotoClipEntries.remove(clipId);
-    } else {
-        m_rotoClipEntries.insert(clipId, entry);
-    }
+    storeRotoEntry(clipId, entry);
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("ロトデータを %1 に保存しました").arg(clip.displayName), 4000);
+}
+
+void MainWindow::storeRotoEntry(const QString &clipId, const RotoClipEntry &entry)
+{
+    if (!m_timeline || clipId.isEmpty())
+        return;
+    auto entries = m_timeline->rotoEntries();
+    if (entry.path.points.isEmpty() && entry.keyframes.isEmpty() && entry.brushMask.isNull()) {
+        entries.remove(clipId);
+    } else {
+        RotoClipEntry stored = entry;
+        stored.clipId = clipId;
+        entries.insert(clipId, stored);
+    }
+    m_timeline->setRotoEntries(entries);
+    m_timeline->saveUndoState(QStringLiteral("ロト"));
 }
 
 void MainWindow::openTimeRemapDialog()
@@ -14624,7 +14597,7 @@ void MainWindow::openTimeRemapDialog()
     const double fallbackFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
     const VideoSourceInfo info = probeVideoSourceInfo(
         ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
-    const double fps = clipEffectiveSourceFps(info, fallbackFps);
+    const double fps = roto::clipEffectiveSourceFps(info.fps, fallbackFps);
     const int frameCount = (info.frameCount > 0)
         ? info.frameCount
         : qMax(1, static_cast<int>(std::llround((clipSourceOutPoint(clip) - clip.inPoint) * fps)));
@@ -18037,7 +18010,7 @@ void MainWindow::openObjectRemoval()
         ? m_projectConfig.fps : 30.0;
     const VideoSourceInfo sourceInfo = probeVideoSourceInfo(
         ProxyManager::instance().getProxyPath(clip.filePath), fallbackFps);
-    const double fps = clipEffectiveSourceFps(sourceInfo, fallbackFps);
+    const double fps = roto::clipEffectiveSourceFps(sourceInfo.fps, fallbackFps);
     const double sourceOut = clipSourceOutPoint(clip);
     const int sourceFrameBase = qMax(0, static_cast<int>(std::llround(clip.inPoint * fps)));
     int frameCount = qMax(1, static_cast<int>(std::ceil(
@@ -18051,8 +18024,9 @@ void MainWindow::openObjectRemoval()
     const int defaultFrame = qBound(0, static_cast<int>(std::llround(
         qMax(0.0, currentSource - clip.inPoint) * fps)), frameCount - 1);
     const QString clipId = brushClipId(trackIdx, clipIdx);
-    const auto rotoIt = m_rotoClipEntries.constFind(clipId);
-    const bool hasRotoMask = rotoIt != m_rotoClipEntries.cend()
+    const auto rotoEntries = m_timeline->rotoEntries();
+    const auto rotoIt = rotoEntries.constFind(clipId);
+    const bool hasRotoMask = rotoIt != rotoEntries.cend()
         && (!rotoIt.value().path.points.isEmpty()
             || !rotoIt.value().keyframes.isEmpty()
             || !rotoIt.value().brushMask.isNull());

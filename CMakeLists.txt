@@ -242,6 +242,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/clipanim/ClipAnim.cpp
     src/TrackMatteKey.h
     src/RotoClipEntry.h
+    src/RotoApply.h
+    src/RotoApply.cpp
     src/TrackMatteKey.cpp
     src/CodecDetector.cpp
     src/UndoTrace.h

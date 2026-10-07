@@ -256,6 +256,7 @@ class MainWindow : public QMainWindow
     friend int runSpecialCompositeSelftest();
     friend int runDeEsserSelftest();
     friend int runAudioTrackFxSelftest();
+    friend int runRotoSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -811,6 +812,9 @@ private:
 
     QImage buildSpecialClipComposite(double timelineSeconds) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
+    // roto carrier (Timeline::rotoEntries) の唯一の書き手。空 entry なら削除し、
+    // 1 回の saveUndoState で 1 undo にする。
+    void storeRotoEntry(const QString &clipId, const RotoClipEntry &entry);
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
     void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
@@ -861,7 +865,6 @@ private:
     quint64 m_mediaRelinkObservedSaveSerial = 0;
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
-    QHash<QString, RotoClipEntry> m_rotoClipEntries;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
     QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
