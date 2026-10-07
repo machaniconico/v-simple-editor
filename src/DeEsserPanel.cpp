@@ -35,6 +35,8 @@ DeEsserPanel::DeEsserPanel(QWidget *parent) : QWidget(parent)
         box->setSuffix(suffix);
         form->addRow(label, box);
         connect(box, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &DeEsserPanel::onAnyControlChanged);
+        // Typing / stepping is one gesture, finished by Enter or focus loss.
+        connect(box, &QDoubleSpinBox::editingFinished, this, &DeEsserPanel::finishGesture);
         return box;
     };
     m_frequency = spin("deesser_frequency", tr("周波数"), 1000.0, 16000.0, 100.0, tr(" Hz"));
@@ -47,6 +49,7 @@ DeEsserPanel::DeEsserPanel(QWidget *parent) : QWidget(parent)
     form->addRow(m_listen);
 
     connect(m_enabled, &QCheckBox::toggled, this, &DeEsserPanel::onAnyControlChanged);
+    connect(m_enabled, &QCheckBox::toggled, this, &DeEsserPanel::finishGesture);
     connect(m_listen, &QCheckBox::toggled, this, &DeEsserPanel::onAnyControlChanged);
     connect(m_target, &QComboBox::currentIndexChanged, this, &DeEsserPanel::onTargetChanged);
     showSettings(trackfx::DeEsserSettings{});
@@ -127,5 +130,13 @@ void DeEsserPanel::onAnyControlChanged()
     if (m_suppressSignals || m_currentTrackId == kNoTrack) return;
     const auto settings = currentSettings();
     m_perTrackSettings.insert(m_currentTrackId, settings);
+    if (sender() != m_listen) m_gestureDirty = true;
     emit settingsChanged(m_currentTrackId, settings);
+}
+
+void DeEsserPanel::finishGesture()
+{
+    if (!m_gestureDirty || m_suppressSignals || m_currentTrackId == kNoTrack) return;
+    m_gestureDirty = false;
+    emit gestureFinished(m_currentTrackId);
 }

@@ -430,6 +430,9 @@ private:
     // avoid recomputing inside readData.
     void processTrackFxLocked(int trackIdx, const int16_t *src, int16_t *output, int samples);
     void processMasterEqLocked(int32_t *samples, int frames);
+    // The one writer of the master EQ / DeEsser: updates m_masterFxChain and the
+    // m_masterEqFilter processor together. Caller holds m_controlMutex.
+    void applyMasterChainLocked(const trackfx::Chain &chain);
     trackfx::Chain m_masterFxChain;
     MasterEqFilter m_masterEqFilter;
     bool m_masterEqBypassForTest = false;

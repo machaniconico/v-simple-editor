@@ -33,10 +33,15 @@ public:
 
 signals:
     void settingsChanged(int trackId, trackfx::DeEsserSettings settings);
+    // One finished user edit (spin box editingFinished, enable checkbox) that
+    // emitted settingsChanged; the host records it as one undo step. The
+    // listen monitor is not undo state and never marks a gesture.
+    void gestureFinished(int trackId);
 
 private slots:
     void onTargetChanged();
     void onAnyControlChanged();
+    void finishGesture();
 
 private:
     void showSettings(const trackfx::DeEsserSettings &settings);
@@ -53,4 +58,5 @@ private:
     QHash<int, trackfx::DeEsserSettings> m_perTrackSettings;
     int m_currentTrackId = INT_MIN; // no target yet
     bool m_suppressSignals = false;
+    bool m_gestureDirty = false; // edited since the last gestureFinished
 };

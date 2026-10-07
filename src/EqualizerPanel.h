@@ -47,6 +47,9 @@ public:
 
 signals:
     void eqChanged(int trackId, AudioMixer::EqSettings eq);
+    // One finished user gesture (drag release, wheel / keyboard step) that
+    // emitted eqChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onTrackSelectionChanged(int index);
@@ -69,6 +72,7 @@ private:
                           double freqDefault,
                           bool peaking); // false = shelf, no Q control
     void emitChange();
+    void finishGesture();
     std::vector<QSignalBlocker> blockBandSignals();
     void applyBandToWidgets(const BandWidgets &w,
                             const AudioMixer::EqBand &band,
@@ -97,4 +101,5 @@ private:
     int m_currentTrackId = 0;
     bool m_suppressSignals = false;
     int m_emitCount = 0;
+    bool m_gestureDirty = false; // eqChanged emitted since the last gestureFinished
 };

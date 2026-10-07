@@ -2513,8 +2513,7 @@ void AudioMixer::clearTrackFx()
     m_trackFxChains.clear();
     m_trackFxProcessors.clear();
     m_masterFxChain = trackfx::Chain{};
-    m_masterEqFilter.setEq(EqSettings{});
-    m_masterEqFilter.setDeEsser(trackfx::DeEsserSettings{});
+    applyMasterChainLocked(trackfx::Chain{});
     m_masterEqFilter.reset();
     m_trackEq.clear();
     m_trackEqCoefs.clear();
@@ -2564,9 +2563,10 @@ trackfx::Chain AudioMixer::masterChain() const
 void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
 {
     QMutexLocker lock(&m_controlMutex);
-    m_masterFxChain.eq = eq;
-    m_masterFxChain.eqEnabled = enabled;
-    m_masterEqFilter.setEq(enabled ? eq : EqSettings{});
+    trackfx::Chain chain = m_masterFxChain;
+    chain.eq = eq;
+    chain.eqEnabled = enabled;
+    applyMasterChainLocked(chain);
 }
 
 void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
@@ -2575,8 +2575,18 @@ void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
     chain.deesser = settings;
     const auto restored = trackfx::Chain::fromJson(chain.toJson()).deesser;
     QMutexLocker lock(&m_controlMutex);
-    m_masterFxChain.deesser = restored;
-    m_masterEqFilter.setDeEsser(restored);
+    trackfx::Chain master = m_masterFxChain;
+    master.deesser = restored;
+    applyMasterChainLocked(master);
+}
+
+void AudioMixer::applyMasterChainLocked(const trackfx::Chain &chain)
+{
+    m_masterFxChain.eq = chain.eq;
+    m_masterFxChain.eqEnabled = chain.eqEnabled;
+    m_masterFxChain.deesser = chain.deesser;
+    m_masterEqFilter.setEq(chain.eqEnabled ? chain.eq : EqSettings{});
+    m_masterEqFilter.setDeEsser(chain.deesser);
 }
 
 void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
@@ -3925,7 +3935,10 @@ QJsonObject AudioMixer::collectTrackState() const
     QJsonObject chains;
     for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it)
         chains.insert(QString::number(it.key()), it.value().toJson());
-    return QJsonObject{{"states", states}, {"chains", chains}};
+    // Master EQ / DeEsser (the only master stages the docks edit) ride along so
+    // undo restores them; applyTrackState applies the key only when present.
+    return QJsonObject{{"states", states}, {"chains", chains},
+                       {"masterChain", m_masterFxChain.toJson()}};
 }
 
 void AudioMixer::applyTrackState(const QJsonObject &snapshot)
@@ -3962,8 +3975,17 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
             computeEqBand(chain.eq.highMid, 2, kSampleRateHz),
             computeEqBand(chain.eq.high, 3, kSampleRateHz)});
     }
-    // Publish one complete snapshot to the audio callback. Master FX remain intact.
+    const bool hasMaster = snapshot.contains("masterChain");
+    const auto master = trackfx::Chain::fromJson(snapshot.value("masterChain").toObject());
+    // Publish one complete snapshot to the audio callback. The master EQ /
+    // DeEsser change only when the snapshot carries them (chain + processor).
     QMutexLocker lock(&m_controlMutex);
+    if (hasMaster) {
+        // The DeEsser listen monitor is not undo state: keep the live toggle.
+        auto restoredMaster = master;
+        restoredMaster.deesser.listen = m_masterFxChain.deesser.listen;
+        applyMasterChainLocked(restoredMaster);
+    }
     m_trackStates = std::move(restoredStates);
     m_trackFxChains = std::move(restoredChains);
     m_trackEqCoefs = std::move(restoredCoefs);

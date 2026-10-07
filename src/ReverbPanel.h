@@ -44,6 +44,9 @@ public:
 
 signals:
     void reverbChanged(int trackId, AudioMixer::ReverbSettings r);
+    // One finished user gesture (drag release, wheel / keyboard step, checkbox,
+    // button) that emitted reverbChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onAnyControlChanged();
@@ -55,10 +58,12 @@ private:
     AudioMixer::ReverbSettings collectSettings() const;
     void applySettingsToControls(const AudioMixer::ReverbSettings &r);
     void emitChange();
+    void finishGesture();
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
     int m_emitCount = 0;
+    bool m_gestureDirty = false; // changed since the last gestureFinished
 
     QComboBox *m_trackCombo = nullptr;
     QCheckBox *m_enable = nullptr;

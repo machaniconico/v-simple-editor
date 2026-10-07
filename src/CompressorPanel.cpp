@@ -180,8 +180,19 @@ void CompressorPanel::buildUi() {
             this, &CompressorPanel::onLimiterModeClicked);
     connect(m_trackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &CompressorPanel::onTrackChanged);
+    // Undo gestures (after the change slots above): a drag ends on release;
+    // wheel / keyboard steps, the checkbox and the limiter button are complete.
+    for (QDial *d : {m_threshold, m_ratio, m_attack, m_release, m_knee, m_makeup}) {
+        connect(d, &QDial::valueChanged, this, [this, d] {
+            if (!d->isSliderDown()) finishGesture();
+        });
+        connect(d, &QDial::sliderReleased, this, &CompressorPanel::finishGesture);
+    }
+    connect(m_enable, &QCheckBox::toggled, this, &CompressorPanel::finishGesture);
+    connect(m_limiterMode, &QPushButton::clicked, this, &CompressorPanel::finishGesture);
 
     onAnyControlChanged(); // refresh labels (no emit due to initial state)
+    m_gestureDirty = false;
 }
 
 AudioMixer::CompressorSettings CompressorPanel::collectSettings() const {
@@ -266,5 +277,12 @@ void CompressorPanel::onPollMeter() {
 void CompressorPanel::emitChange() {
     if (m_suppressEmit) return;
     ++m_emitCount;
+    m_gestureDirty = true;
     emit compressorChanged(currentTrackId(), collectSettings());
+}
+
+void CompressorPanel::finishGesture() {
+    if (!m_gestureDirty || m_suppressEmit) return;
+    m_gestureDirty = false;
+    emit gestureFinished(currentTrackId());
 }

@@ -113,6 +113,17 @@ EqualizerPanel::BandWidgets EqualizerPanel::buildBand(const QString &title,
     if (peaking) {
         connect(w.q, &QDial::valueChanged, this, &EqualizerPanel::onAnyControlChanged);
     }
+    // Undo gestures: a drag ends on release; wheel / keyboard steps are complete
+    // on their own (N wheel notches = N gestures).
+    for (QAbstractSlider *control : {static_cast<QAbstractSlider *>(w.gain),
+                                     static_cast<QAbstractSlider *>(w.freq),
+                                     static_cast<QAbstractSlider *>(w.q)}) {
+        if (!control) continue;
+        connect(control, &QAbstractSlider::valueChanged, this, [this, control] {
+            if (!control->isSliderDown()) finishGesture();
+        });
+        connect(control, &QAbstractSlider::sliderReleased, this, &EqualizerPanel::finishGesture);
+    }
     return w;
 }
 
@@ -144,6 +155,7 @@ void EqualizerPanel::buildUi() {
 
     // Initialize labels by reading the default state.
     onAnyControlChanged();
+    m_gestureDirty = false; // the label refresh above is not a user gesture
     // Seed master settings cache so currentSettings() returns sensible defaults.
     m_perTrackSettings.insert(0, AudioMixer::EqSettings{});
     m_currentTrackId = 0;
@@ -233,8 +245,15 @@ void EqualizerPanel::onAnyControlChanged() {
     m_perTrackSettings.insert(m_currentTrackId, eq);
     if (!m_suppressSignals) {
         ++m_emitCount;
+        m_gestureDirty = true;
         emit eqChanged(m_currentTrackId, eq);
     }
+}
+
+void EqualizerPanel::finishGesture() {
+    if (!m_gestureDirty || m_suppressSignals) return;
+    m_gestureDirty = false;
+    emit gestureFinished(m_currentTrackId);
 }
 
 std::vector<QSignalBlocker> EqualizerPanel::blockBandSignals() {

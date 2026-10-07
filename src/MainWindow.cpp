@@ -9680,8 +9680,10 @@ void MainWindow::captureMediaRelinkSidecarsAtCurrentUndoIndex()
         return;
     if (m_mediaRelinkSidecarHistory.size() <= index)
         m_mediaRelinkSidecarHistory.resize(index + 1);
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
     m_mediaRelinkSidecarHistory[index] = {
-        m_projectOverlays, m_particleClipConfigs
+        m_projectOverlays, m_particleClipConfigs,
+        mixer ? audiofxui::undoState(mixer) : QJsonObject{}
     };
 }
 
@@ -9707,14 +9709,20 @@ void MainWindow::handleMediaRelinkHistoryChanged()
             m_mediaRelinkSidecarHistory.resize(index);
         }
         m_mediaRelinkSidecarHistory.resize(index + 1);
+        auto *mixer = m_player ? m_player->audioMixer() : nullptr;
         m_mediaRelinkSidecarHistory[index] = {
-            m_projectOverlays, m_particleClipConfigs
+            m_projectOverlays, m_particleClipConfigs,
+            mixer ? audiofxui::undoState(mixer) : QJsonObject{}
         };
     } else if (index < m_mediaRelinkSidecarHistory.size()) {
         const MediaRelinkSidecarState &state =
             m_mediaRelinkSidecarHistory.at(index);
         m_projectOverlays = state.overlays;
         m_particleClipConfigs = state.particleClipConfigs;
+        // Undo / redo / history jump: the Timeline carrier reaches the mixer only
+        // across track-structure changes, so the dock-edited FX follow here.
+        if (index != m_mediaRelinkObservedUndoIndex)
+            restoreAudioFxUndoState(QJsonObject(state.audioFx));
     }
 
     m_mediaRelinkObservedSaveSerial = saveSerial;
@@ -9937,6 +9945,12 @@ void MainWindow::applyAudioState(const ProjectData &data)
     if (m_audioMetersDock)
         m_audioMetersDock->setVisible(data.audioMetersDockVisible);
     reseedAudioFxDocks();
+    // The load's undo entry was recorded before these FX: refresh it so undoing
+    // back to it restores the loaded FX, and dock gestures compare against them.
+    auto *fxMixer = m_player ? m_player->audioMixer() : nullptr;
+    const int undoIndex = m_timeline ? m_timeline->undoManager()->currentIndex() : -1;
+    if (fxMixer && undoIndex >= 0 && undoIndex < m_mediaRelinkSidecarHistory.size())
+        m_mediaRelinkSidecarHistory[undoIndex].audioFx = audiofxui::undoState(fxMixer);
 }
 
 void MainWindow::newProject()
@@ -19893,7 +19907,68 @@ void setTrackComboItems(QComboBox *combo, const QStringList &names,
     const int previousIndex = combo->findData(previousId);
     combo->setCurrentIndex(previousIndex >= 0 ? previousIndex : (ids.isEmpty() ? -1 : 0));
 }
+
+QJsonObject undoState(AudioMixer *mixer)
+{
+    // listen only monitors the detection band; it is not undo state.
+    const auto withoutListen = [](trackfx::Chain chain) {
+        chain.deesser.listen = false;
+        return chain.toJson();
+    };
+    QJsonObject chains;
+    const QJsonObject live = mixer->collectTrackState().value("chains").toObject();
+    for (auto it = live.begin(); it != live.end(); ++it) {
+        // A default chain equals a missing key (restore treats both alike).
+        const QJsonObject json = withoutListen(trackfx::Chain::fromJson(it.value().toObject()));
+        if (!json.isEmpty()) chains.insert(it.key(), json);
+    }
+    return QJsonObject{{"chains", chains}, {"masterChain", withoutListen(mixer->masterChain())}};
+}
 } // namespace audiofxui
+
+// The one undo hook of the five audio FX docks. Each panel emits
+// gestureFinished once per finished gesture, after its *Changed signal has
+// reached the mixer (saveUndoState is commit-after). A gesture that ends on the
+// values of the current undo entry (drag and return) records nothing.
+template <typename Panel>
+void MainWindow::connectAudioFxDockUndo(Panel *panel, const QString &tag)
+{
+    connect(panel, &Panel::gestureFinished, this, [this, tag](int /*trackId*/) {
+        auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+        if (!mixer || !m_timeline) return;
+        const int index = m_timeline->undoManager()->currentIndex();
+        if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()
+            && m_mediaRelinkSidecarHistory[index].audioFx == audiofxui::undoState(mixer))
+            return;
+        m_timeline->saveUndoState(tag);
+    });
+}
+
+// Rewrites only the stages that differ from the history entry, so untouched
+// tracks keep their DSP state; the DeEsser listen monitor stays as it is.
+void MainWindow::restoreAudioFxUndoState(const QJsonObject &audioFx)
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer || audioFx.isEmpty()) return;
+    const QJsonObject live = audiofxui::undoState(mixer);
+    const QJsonObject chains = audioFx.value("chains").toObject();
+    const QJsonObject liveChains = live.value("chains").toObject();
+    QStringList ids = chains.keys() + liveChains.keys();
+    ids.removeDuplicates();
+    for (const QString &id : ids) {
+        if (chains.value(id) == liveChains.value(id)) continue;
+        auto chain = trackfx::Chain::fromJson(chains.value(id).toObject());
+        chain.deesser.listen = mixer->trackChain(id.toInt()).deesser.listen;
+        mixer->setTrackChain(id.toInt(), chain);
+    }
+    if (audioFx.value("masterChain") != live.value("masterChain")) {
+        auto master = trackfx::Chain::fromJson(audioFx.value("masterChain").toObject());
+        master.deesser.listen = mixer->masterChain().deesser.listen;
+        mixer->setMasterEq(master.eq, master.eqEnabled);
+        mixer->setMasterDeEsser(master.deesser);
+    }
+    reseedAudioFxDocks();
+}
 
 void MainWindow::openEqualizerPanel()
 {
@@ -19921,6 +19996,7 @@ void MainWindow::openEqualizerPanel()
                     mx->setEqForTrack(trackId, eq);
             }
         });
+        connectAudioFxDockUndo(panel, tr("EQ を変更"));
     }
 
     reseedAudioFxDocks();
@@ -19958,6 +20034,7 @@ void MainWindow::openDeEsserPanel()
             }
             setWindowModified(true);
         });
+        connectAudioFxDockUndo(panel, tr("ディエッサーを変更"));
     }
 
     reseedAudioFxDocks();
@@ -20079,6 +20156,7 @@ void MainWindow::openCompressorPanel()
             if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
                 mx->setCompressorForTrack(trackId, c);
         });
+        connectAudioFxDockUndo(panel, tr("コンプレッサーを変更"));
     }
 
     reseedAudioFxDocks();
@@ -20108,6 +20186,7 @@ void MainWindow::openReverbPanel()
             if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
                 mx->setReverbForTrack(trackId, r);
         });
+        connectAudioFxDockUndo(panel, tr("リバーブを変更"));
     }
 
     reseedAudioFxDocks();
@@ -20137,6 +20216,7 @@ void MainWindow::openNoiseReductionPanel()
             if (auto *mx = m_player ? m_player->audioMixer() : nullptr)
                 mx->setNoiseReductionForTrack(trackId, nr);
         });
+        connectAudioFxDockUndo(panel, tr("ノイズリダクションを変更"));
     }
 
     reseedAudioFxDocks();

@@ -47,6 +47,9 @@ public:
 signals:
     void noiseReductionChanged(int trackId,
                                AudioMixer::NoiseReductionSettings nr);
+    // One finished user gesture (drag release, wheel / keyboard step, checkbox,
+    // button) that emitted noiseReductionChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onAnyControlChanged();
@@ -61,10 +64,12 @@ private:
         const AudioMixer::NoiseReductionSettings &nr);
     void updateFloorReadoutEnabled();
     void emitChange();
+    void finishGesture();
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
     int m_emitCount = 0;
+    bool m_gestureDirty = false; // changed since the last gestureFinished
 
     QComboBox *m_trackCombo = nullptr;
     QCheckBox *m_enable = nullptr;

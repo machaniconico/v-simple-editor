@@ -163,6 +163,16 @@ void NoiseReductionPanel::buildUi() {
             this, &NoiseReductionPanel::onAutoFloorToggled);
     connect(m_trackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &NoiseReductionPanel::onTrackChanged);
+    // Undo gestures (after the change slots above): a drag ends on release;
+    // wheel / keyboard steps and the checkboxes are complete on their own.
+    for (QDial *d : {m_threshold, m_reduction, m_attack, m_release, m_manualFloor}) {
+        connect(d, &QDial::valueChanged, this, [this, d] {
+            if (!d->isSliderDown()) finishGesture();
+        });
+        connect(d, &QDial::sliderReleased, this, &NoiseReductionPanel::finishGesture);
+    }
+    connect(m_enable, &QCheckBox::toggled, this, &NoiseReductionPanel::finishGesture);
+    connect(m_autoFloor, &QCheckBox::toggled, this, &NoiseReductionPanel::finishGesture);
 
     // Floor estimate readout poll — only meaningful when the audio
     // engine is running and the track has the NR stage enabled. Always
@@ -174,6 +184,7 @@ void NoiseReductionPanel::buildUi() {
     m_pollTimer->start();
 
     onAnyControlChanged();        // refresh labels (no emit due to initial state)
+    m_gestureDirty = false;
     updateFloorReadoutEnabled();  // initial enable/disable for manual-floor dial
 }
 
@@ -253,5 +264,12 @@ void NoiseReductionPanel::onPollFloorReadout() {
 void NoiseReductionPanel::emitChange() {
     if (m_suppressEmit) return;
     ++m_emitCount;
+    m_gestureDirty = true;
     emit noiseReductionChanged(currentTrackId(), collectSettings());
+}
+
+void NoiseReductionPanel::finishGesture() {
+    if (!m_gestureDirty || m_suppressEmit) return;
+    m_gestureDirty = false;
+    emit gestureFinished(currentTrackId());
 }

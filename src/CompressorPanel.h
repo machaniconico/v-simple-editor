@@ -45,6 +45,9 @@ public:
 
 signals:
     void compressorChanged(int trackId, AudioMixer::CompressorSettings c);
+    // One finished user gesture (drag release, wheel / keyboard step, checkbox,
+    // button) that emitted compressorChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onAnyControlChanged();
@@ -57,10 +60,12 @@ private:
     AudioMixer::CompressorSettings collectSettings() const;
     void applySettingsToControls(const AudioMixer::CompressorSettings &c);
     void emitChange();
+    void finishGesture();
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
     int m_emitCount = 0;
+    bool m_gestureDirty = false; // changed since the last gestureFinished
 
     QComboBox *m_trackCombo = nullptr;
     QDial *m_threshold = nullptr;

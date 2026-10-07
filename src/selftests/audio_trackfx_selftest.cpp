@@ -9,7 +9,11 @@
 #include "../CompressorPanel.h"
 #include "../ReverbPanel.h"
 #include "../NoiseReductionPanel.h"
+#include "../DeEsserPanel.h"
+#include <QCheckBox>
 #include <QComboBox>
+#include <QDoubleSpinBox>
+#include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
 #include "../RenderInPlace.h"
@@ -24,6 +28,7 @@
 #include <QTemporaryDir>
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -955,6 +960,490 @@ int runAudioTrackFxSelftest()
         std::fprintf(stderr, "audio-trackfx G24: kept=%d clear=%d eqEmits=%d\n",
             outerKept, outerClear, eqEmits);
         gate(24, outerKept && outerClear && eqEmits == 0);
+    }
+    // G25-G36 (US-911): audio FX dock gestures are undo steps. One window: A1
+    // carries the edited track FX, A2 a clip for G35's unrelated edit.
+    // Master test signal on the int32 bus: 100 Hz + 1 kHz + 6 kHz (de-esser band).
+    std::vector<int32_t> busSignal(2 * kFrames);
+    for (int f = 0; f < kFrames; ++f) {
+        const double t = static_cast<double>(f) / kRate;
+        const auto sample = static_cast<int32_t>(8000 * (std::sin(2 * kPi * 100 * t)
+            + std::sin(2 * kPi * 1000 * t) + std::sin(2 * kPi * 6000 * t)));
+        busSignal[2 * f] = busSignal[2 * f + 1] = sample;
+    }
+    // The master stage's output for busSignal from a cleared filter history.
+    const auto masterPcm = [&](AudioMixer *m) {
+        m->setMasterEqBypassForTest(false); // resets the filter history
+        auto pcm = busSignal;
+        for (int f = 0; f < kFrames; f += 257)
+            m->processMasterEqForTest(pcm.data() + 2 * f, std::min(257, kFrames - f));
+        return pcm;
+    };
+    const auto rmsDiff = [](const std::vector<int32_t> &a, const std::vector<int32_t> &b) {
+        double sum = 0;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i)
+            sum += (static_cast<double>(a[i]) - b[i]) * (static_cast<double>(a[i]) - b[i]);
+        return a.empty() ? 0.0 : std::sqrt(sum / a.size());
+    };
+    {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        Timeline *timeline = window.m_timeline;
+        if (timeline)
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}, QVector<ClipInfo>{audioClip}},
+                0.0, -1.0, -1.0, 100);
+        if (mixer && timeline) {
+            window.openEqualizerPanel();
+            window.openCompressorPanel();
+            window.openReverbPanel();
+            window.openNoiseReductionPanel();
+            window.openDeEsserPanel();
+        }
+        const auto panelOf = [](QDockWidget *dock) { return dock ? dock->widget() : nullptr; };
+        QWidget *eqPanel = panelOf(window.m_equalizerDock);
+        QWidget *compPanel = panelOf(window.m_compressorDock);
+        QWidget *reverbPanel = panelOf(window.m_reverbDock);
+        QWidget *nrPanel = panelOf(window.m_noiseReductionDock);
+        QWidget *dePanel = panelOf(window.m_deesserDock);
+        const auto serial = [&]() -> quint64 {
+            return timeline ? timeline->undoManager()->saveSerial() : 0;
+        };
+        const auto same = [](double a, double b) { return std::abs(a - b) < 1e-9; };
+        const auto select = [](QWidget *panel, const char *comboName, int id) {
+            auto *combo = panel ? panel->findChild<QComboBox *>(comboName) : nullptr;
+            const int index = combo ? combo->findData(id) : -1;
+            if (index >= 0) combo->setCurrentIndex(index);
+            return index >= 0;
+        };
+        // A mouse drag: press, valueChanged per value, release.
+        const auto drag = [](QAbstractSlider *slider, const std::vector<int> &values) {
+            slider->setSliderDown(true);
+            for (int v : values) slider->setValue(v);
+            slider->setSliderDown(false);
+        };
+
+        // G25-G28: one 5-step slider / dial drag = exactly one save; undo / redo
+        // move the mixer back to the previous snapshot and forward again, and
+        // the reseeded dock shows the mixer value.
+        struct SliderCase {
+            int gateNumber;
+            const char *name;
+            QWidget *panel;
+            const char *comboName;
+            const char *controlName;
+            std::function<double()> mixerValue;
+            double dockPerValue; // control value = mixer value * dockPerValue
+        };
+        const std::vector<SliderCase> sliderCases = {
+            {25, "eq", eqPanel, "eq_track", "eq_lowmid_gain",
+             [&] { return mixer->eqForTrack(0).lowMid.gainDb; }, 1.0},
+            {26, "compressor", compPanel, "compressor_track", "compressor_threshold",
+             [&] { return mixer->compressorForTrack(0).thresholdDb; }, 1.0},
+            {27, "reverb", reverbPanel, "reverb_track", "reverb_mix",
+             [&] { return mixer->reverbForTrack(0).mixRatio; }, 100.0},
+            {28, "nr", nrPanel, "nr_track", "nr_reduction",
+             [&] { return mixer->noiseReductionForTrack(0).reductionDb; }, 1.0},
+        };
+        for (const auto &sc : sliderCases) {
+            bool ok = false;
+            auto *control = sc.panel ? sc.panel->findChild<QAbstractSlider *>(sc.controlName) : nullptr;
+            if (mixer && control && select(sc.panel, sc.comboName, 0)) {
+                const int start = control->value();
+                const int step = start + 5 <= control->maximum() ? 1 : -1;
+                std::vector<int> values;
+                for (int k = 1; k <= 5; ++k) values.push_back(start + k * step);
+                int changes = 0;
+                const auto counter = QObject::connect(control, &QAbstractSlider::valueChanged,
+                                                      [&changes] { ++changes; });
+                const double before = sc.mixerValue();
+                const quint64 serialBefore = serial();
+                drag(control, values);
+                QObject::disconnect(counter);
+                const quint64 saves = serial() - serialBefore;
+                const double after = sc.mixerValue();
+                timeline->undo();
+                const double undone = sc.mixerValue();
+                const double dockUndone = control->value() / sc.dockPerValue;
+                timeline->redo();
+                const double redone = sc.mixerValue();
+                const double dockRedone = control->value() / sc.dockPerValue;
+                std::fprintf(stderr,
+                    "audio-trackfx G%d %s: valueChanged=%d saves=%llu before=%g after=%g "
+                    "undo mixer=%g dock=%g redo mixer=%g dock=%g\n",
+                    sc.gateNumber, sc.name, changes, static_cast<unsigned long long>(saves),
+                    before, after, undone, dockUndone, redone, dockRedone);
+                ok = changes == 5 && saves == 1 && !same(before, after)
+                    && same(undone, before) && same(dockUndone, undone)
+                    && same(redone, after) && same(dockRedone, redone);
+            } else {
+                std::fprintf(stderr, "audio-trackfx G%d %s: dock control not found\n",
+                             sc.gateNumber, sc.name);
+            }
+            gate(sc.gateNumber, ok);
+        }
+
+        // G29-G31: the de-esser has spin boxes and checkboxes only.
+        auto *deThreshold = dePanel ? dePanel->findChild<QDoubleSpinBox *>("deesser_threshold") : nullptr;
+        auto *deEnabled = dePanel ? dePanel->findChild<QCheckBox *>("deesser_enabled") : nullptr;
+        auto *deListen = dePanel ? dePanel->findChild<QCheckBox *>("deesser_listen") : nullptr;
+        const bool deReady = mixer && deThreshold && deEnabled && deListen
+            && select(dePanel, "deesser_target", 0);
+        const auto deChain = [&] { return trackfx::Chain(mixer->trackChain(0)).deesser; };
+        {
+            // G29: typed value + editingFinished = one save; undo / redo + reseed.
+            bool ok = false;
+            if (deReady) {
+                const double before = deChain().thresholdDb;
+                const quint64 serialBefore = serial();
+                deThreshold->setValue(before - 6.0);
+                emit deThreshold->editingFinished();
+                const quint64 saves = serial() - serialBefore;
+                const double after = deChain().thresholdDb;
+                timeline->undo();
+                const double undone = deChain().thresholdDb;
+                const double dockUndone = deThreshold->value();
+                timeline->redo();
+                const double redone = deChain().thresholdDb;
+                const double dockRedone = deThreshold->value();
+                std::fprintf(stderr,
+                    "audio-trackfx G29 deesser spin: saves=%llu before=%g after=%g undo mixer=%g "
+                    "dock=%g redo mixer=%g dock=%g\n", static_cast<unsigned long long>(saves),
+                    before, after, undone, dockUndone, redone, dockRedone);
+                ok = saves == 1 && same(after, before - 6.0) && same(undone, before)
+                    && same(dockUndone, undone) && same(redone, after) && same(dockRedone, redone);
+            }
+            gate(29, ok);
+        }
+        {
+            // G30: valueChanged bursts while typing save nothing until editingFinished.
+            bool ok = false;
+            if (deReady) {
+                const double base = deThreshold->value();
+                const quint64 serialBefore = serial();
+                for (int k = 1; k <= 5; ++k)
+                    deThreshold->setValue(base - k);
+                const quint64 typingSaves = serial() - serialBefore;
+                const double live = deChain().thresholdDb;
+                emit deThreshold->editingFinished();
+                const quint64 finishSaves = serial() - serialBefore - typingSaves;
+                std::fprintf(stderr,
+                    "audio-trackfx G30 deesser typing: saves while typing=%llu mixer live=%g "
+                    "(expected %g) saves on editingFinished=%llu\n",
+                    static_cast<unsigned long long>(typingSaves), live, base - 5,
+                    static_cast<unsigned long long>(finishSaves));
+                ok = typingSaves == 0 && same(live, base - 5) && finishSaves == 1;
+            }
+            gate(30, ok);
+        }
+        {
+            // G31: the enable checkbox is one save; the listen monitor is none.
+            bool ok = false;
+            if (deReady) {
+                const bool enabledBefore = deChain().enabled;
+                quint64 serialBefore = serial();
+                deEnabled->setChecked(!enabledBefore);
+                const quint64 enableSaves = serial() - serialBefore;
+                const bool enabledAfter = deChain().enabled;
+                serialBefore = serial();
+                deListen->setChecked(!deListen->isChecked());
+                const quint64 listenSaves = serial() - serialBefore;
+                const bool listenLive = deChain().listen;
+                deListen->setChecked(!deListen->isChecked());
+                const quint64 listenBackSaves = serial() - serialBefore;
+                std::fprintf(stderr,
+                    "audio-trackfx G31 checkbox: enable %d->%d saves=%llu; listen live=%d "
+                    "saves=%llu (toggle back total %llu)\n", enabledBefore, enabledAfter,
+                    static_cast<unsigned long long>(enableSaves), listenLive,
+                    static_cast<unsigned long long>(listenSaves),
+                    static_cast<unsigned long long>(listenBackSaves));
+                ok = enableSaves == 1 && enabledAfter != enabledBefore
+                    && listenSaves == 0 && listenLive && listenBackSaves == 0;
+            }
+            gate(31, ok);
+        }
+        {
+            // G32: a reverb preset moves several dials but is one gesture.
+            bool ok = false;
+            auto *preset = reverbPanel ? reverbPanel->findChild<QPushButton *>("reverb_preset_cathedral") : nullptr;
+            if (mixer && preset && select(reverbPanel, "reverb_track", 0)) {
+                const char *dialNames[] = {"reverb_mix", "reverb_decay", "reverb_preDelay",
+                                           "reverb_damping", "reverb_width"};
+                std::vector<int> before;
+                for (const char *name : dialNames) {
+                    auto *dial = reverbPanel->findChild<QAbstractSlider *>(name);
+                    before.push_back(dial ? dial->value() : INT_MIN);
+                }
+                const quint64 serialBefore = serial();
+                preset->click();
+                const quint64 saves = serial() - serialBefore;
+                int moved = 0;
+                for (size_t i = 0; i < before.size(); ++i) {
+                    auto *dial = reverbPanel->findChild<QAbstractSlider *>(dialNames[i]);
+                    moved += dial && dial->value() != before[i];
+                }
+                const double mix = mixer->reverbForTrack(0).mixRatio;
+                std::fprintf(stderr, "audio-trackfx G32 reverb preset: dials moved=%d saves=%llu mix=%g\n",
+                             moved, static_cast<unsigned long long>(saves), mix);
+                ok = moved >= 3 && saves == 1 && same(mix, 0.40);
+            }
+            gate(32, ok);
+        }
+        {
+            // G33: switching the edited track in every dock saves nothing.
+            bool ok = false;
+            if (mixer) {
+                const quint64 serialBefore = serial();
+                bool switched = true;
+                for (int id : {1, 0}) {
+                    switched = select(eqPanel, "eq_track", id) && switched;
+                    switched = select(compPanel, "compressor_track", id) && switched;
+                    switched = select(reverbPanel, "reverb_track", id) && switched;
+                    switched = select(nrPanel, "nr_track", id) && switched;
+                    switched = select(dePanel, "deesser_target", id) && switched;
+                }
+                switched = select(eqPanel, "eq_track", AudioMixer::kMasterTrackId) && switched;
+                switched = select(dePanel, "deesser_target", AudioMixer::kMasterTrackId) && switched;
+                switched = select(eqPanel, "eq_track", 0) && select(dePanel, "deesser_target", 0) && switched;
+                const quint64 saves = serial() - serialBefore;
+                std::fprintf(stderr, "audio-trackfx G33 track combo: switched=%d saves=%llu\n",
+                             switched, static_cast<unsigned long long>(saves));
+                ok = switched && saves == 0;
+            }
+            gate(33, ok);
+        }
+        {
+            // G34 (negative control): a press-release without a value change, a
+            // drag that returns to its start (the panel reports a gesture, the
+            // snapshot comparison drops it) and a project-load reseed save nothing.
+            bool ok = false;
+            auto *gain = eqPanel ? eqPanel->findChild<QAbstractSlider *>("eq_lowmid_gain") : nullptr;
+            auto *eq = qobject_cast<EqualizerPanel *>(eqPanel);
+            if (mixer && gain && eq && select(eqPanel, "eq_track", 0)) {
+                int gestures = 0;
+                const auto counter = QObject::connect(eq, &EqualizerPanel::gestureFinished,
+                                                      [&gestures] { ++gestures; });
+                quint64 serialBefore = serial();
+                gain->setSliderDown(true);
+                gain->setSliderDown(false);
+                const quint64 pressSaves = serial() - serialBefore;
+                const int pressGestures = gestures;
+                const int start = gain->value();
+                const int away = start + 1 <= gain->maximum() ? start + 1 : start - 1;
+                serialBefore = serial();
+                drag(gain, {away, start});
+                const quint64 returnSaves = serial() - serialBefore;
+                const int returnGestures = gestures - pressGestures;
+                QObject::disconnect(counter);
+                // Drag and return after an undo on an untouched track: the undo
+                // leaves a default chain under the track key where the history
+                // entry has none; both mean the same state, so nothing is saved
+                // and the redo stays available.
+                auto *compDial = compPanel ? compPanel->findChild<QAbstractSlider *>("compressor_threshold") : nullptr;
+                quint64 compSaves = 0, compReturnSaves = 0;
+                bool compRedo = false;
+                QByteArray compChainJson;
+                const bool compReady = compDial && select(compPanel, "compressor_track", 1)
+                    && !mixer->collectTrackState().value("chains").toObject().contains("1");
+                if (compReady) {
+                    const int compStart = compDial->value();
+                    const int compAway = compStart + 1 <= compDial->maximum() ? compStart + 1 : compStart - 1;
+                    serialBefore = serial();
+                    drag(compDial, {compAway});
+                    compSaves = serial() - serialBefore;
+                    timeline->undo();
+                    serialBefore = serial();
+                    drag(compDial, {compAway, compDial->value()});
+                    compReturnSaves = serial() - serialBefore;
+                    compRedo = timeline->canRedo();
+                    compChainJson = QJsonDocument(mixer->collectTrackState().value("chains").toObject()
+                        .value("1").toObject()).toJson(QJsonDocument::Compact);
+                    select(compPanel, "compressor_track", 0);
+                }
+                std::fprintf(stderr,
+                    "audio-trackfx G34 untouched track 1: ready=%d compressor gesture saves=%llu; "
+                    "after undo drag-and-return saves=%llu canRedo=%d live chain[1]=%s\n",
+                    compReady, static_cast<unsigned long long>(compSaves),
+                    static_cast<unsigned long long>(compReturnSaves), compRedo,
+                    compChainJson.constData());
+                trackfx::Chain loaded;
+                loaded.compEnabled = loaded.comp.enabled = true;
+                loaded.comp.thresholdDb = -33.0;
+                ProjectData project;
+                project.trackFx.insert(0, loaded);
+                serialBefore = serial();
+                window.applyAudioState(project);
+                const quint64 reseedSaves = serial() - serialBefore;
+                const double reseeded = mixer->compressorForTrack(0).thresholdDb;
+                std::fprintf(stderr,
+                    "audio-trackfx G34: press-release gestures=%d saves=%llu; drag-and-return "
+                    "gestures=%d saves=%llu; applyAudioState reseed saves=%llu (mixer threshold %g)\n",
+                    pressGestures, static_cast<unsigned long long>(pressSaves), returnGestures,
+                    static_cast<unsigned long long>(returnSaves),
+                    static_cast<unsigned long long>(reseedSaves), reseeded);
+                ok = pressGestures == 0 && pressSaves == 0 && returnGestures == 1
+                    && returnSaves == 0 && reseedSaves == 0 && same(reseeded, -33.0)
+                    && compReady && compSaves == 1 && compReturnSaves == 0 && compRedo;
+            }
+            gate(34, ok);
+        }
+        {
+            // G35: master EQ / de-esser gestures undo and redo both the chain
+            // values and the master stage's output; an unrelated clip edit's
+            // undo also returns the master to its snapshot.
+            bool ok = false;
+            auto *gain = eqPanel ? eqPanel->findChild<QAbstractSlider *>("eq_lowmid_gain") : nullptr;
+            if (mixer && gain && deReady && select(eqPanel, "eq_track", AudioMixer::kMasterTrackId)
+                && select(dePanel, "deesser_target", AudioMixer::kMasterTrackId)) {
+                const auto master = [&] { return mixer->masterChain(); };
+                const double gain0 = master().eq.lowMid.gainDb;
+                const bool de0 = master().deesser.enabled;
+                const auto pcm0 = masterPcm(mixer);
+                quint64 serialBefore = serial();
+                drag(gain, {-2, -4, -6, -8, -10});
+                const quint64 eqSaves = serial() - serialBefore;
+                const double gain1 = master().eq.lowMid.gainDb;
+                const auto pcm1 = masterPcm(mixer);
+                serialBefore = serial();
+                deEnabled->setChecked(!de0);
+                const quint64 deSaves = serial() - serialBefore;
+                const bool de2 = master().deesser.enabled;
+                const auto pcm2 = masterPcm(mixer);
+                timeline->undo();
+                const bool deUndo = master().deesser.enabled;
+                const auto pcmUndoDe = masterPcm(mixer);
+                timeline->undo();
+                const double gainUndo = master().eq.lowMid.gainDb;
+                const auto pcmUndoEq = masterPcm(mixer);
+                timeline->redo();
+                const double gainRedo = master().eq.lowMid.gainDb;
+                const auto pcmRedoEq = masterPcm(mixer);
+                timeline->redo();
+                const bool deRedo = master().deesser.enabled;
+                const auto pcmRedoDe = masterPcm(mixer);
+                // Unrelated clip edit, then a master write that records no undo.
+                QString editError;
+                serialBefore = serial();
+                const bool deleted = timeline->deleteClipByIndex(true, 1, 0, false, &editError);
+                const quint64 editSaves = serial() - serialBefore;
+                mixer->setMasterEq(AudioMixer::EqSettings{}, false);
+                mixer->setMasterDeEsser(trackfx::DeEsserSettings{});
+                const auto pcmDrift = masterPcm(mixer);
+                timeline->undo();
+                const double gainBack = master().eq.lowMid.gainDb;
+                const bool deBack = master().deesser.enabled;
+                const auto pcmBack = masterPcm(mixer);
+                std::fprintf(stderr,
+                    "audio-trackfx G35 master: eq gain %g -> %g (saves=%llu, pcm rms diff %.1f), "
+                    "deesser %d -> %d (saves=%llu, pcm rms diff %.1f)\n", gain0, gain1,
+                    static_cast<unsigned long long>(eqSaves), rmsDiff(pcm0, pcm1), de0, de2,
+                    static_cast<unsigned long long>(deSaves), rmsDiff(pcm1, pcm2));
+                std::fprintf(stderr,
+                    "audio-trackfx G35 master: undo deesser=%d pcm==before=%d (rms %.1f); undo eq "
+                    "gain=%g pcm==before=%d (rms %.1f); redo eq gain=%g pcm==after=%d (rms %.1f); "
+                    "redo deesser=%d pcm==after=%d (rms %.1f)\n", deUndo, pcmUndoDe == pcm1,
+                    rmsDiff(pcmUndoDe, pcm1), gainUndo, pcmUndoEq == pcm0, rmsDiff(pcmUndoEq, pcm0),
+                    gainRedo, pcmRedoEq == pcm1, rmsDiff(pcmRedoEq, pcm1), deRedo,
+                    pcmRedoDe == pcm2, rmsDiff(pcmRedoDe, pcm2));
+                std::fprintf(stderr,
+                    "audio-trackfx G35 unrelated clip delete: ok=%d saves=%llu error=%s; drift pcm "
+                    "rms %.1f; after its undo gain=%g deesser=%d pcm==snapshot=%d (rms %.1f)\n",
+                    deleted, static_cast<unsigned long long>(editSaves),
+                    editError.toUtf8().constData(), rmsDiff(pcmDrift, pcm2), gainBack, deBack,
+                    pcmBack == pcm2, rmsDiff(pcmBack, pcm2));
+                ok = eqSaves == 1 && same(gain1, -10.0) && pcm1 != pcm0
+                    && deSaves == 1 && de2 != de0 && pcm2 != pcm1
+                    && deUndo == de0 && pcmUndoDe == pcm1
+                    && same(gainUndo, gain0) && pcmUndoEq == pcm0
+                    && same(gainRedo, gain1) && pcmRedoEq == pcm1
+                    && deRedo == de2 && pcmRedoDe == pcm2
+                    && deleted && editSaves == 1 && pcmDrift != pcm2
+                    && same(gainBack, gain1) && deBack == de2 && pcmBack == pcm2;
+            }
+            gate(35, ok);
+        }
+    }
+    {
+        // G36 (negative control): applyTrackState leaves the master alone without
+        // "masterChain", and with a different one moves chain and processor.
+        auto m = std::make_unique<AudioMixer>();
+        AudioMixer::EqSettings eqA;
+        eqA.lowMid = {250.0, -10.0, 1.0, true};
+        trackfx::DeEsserSettings deA;
+        deA.enabled = true;
+        m->setMasterEq(eqA, true);
+        m->setMasterDeEsser(deA);
+        const QJsonObject snapshotA = m->collectTrackState();
+        const auto pcmA = masterPcm(m.get());
+        AudioMixer::EqSettings eqB;
+        eqB.lowMid = {250.0, 6.0, 1.0, true};
+        m->setMasterEq(eqB, true);
+        m->setMasterDeEsser(trackfx::DeEsserSettings{});
+        const auto pcmB = masterPcm(m.get());
+        QJsonObject withoutMaster = snapshotA;
+        withoutMaster.remove(QStringLiteral("masterChain"));
+        m->applyTrackState(withoutMaster);
+        const auto kept = m->masterChain();
+        const auto pcmKept = masterPcm(m.get());
+        m->applyTrackState(snapshotA);
+        const auto restored = m->masterChain();
+        const auto pcmRestored = masterPcm(m.get());
+        std::fprintf(stderr,
+            "audio-trackfx G36: snapshot has masterChain=%d; A vs B pcm rms %.1f; without key: "
+            "gain=%g deesser=%d pcm==B=%d (rms %.1f); with A: gain=%g deesser=%d pcm==A=%d (rms %.1f)\n",
+            snapshotA.contains(QStringLiteral("masterChain")), rmsDiff(pcmA, pcmB),
+            kept.eq.lowMid.gainDb, kept.deesser.enabled, pcmKept == pcmB, rmsDiff(pcmKept, pcmB),
+            restored.eq.lowMid.gainDb, restored.deesser.enabled, pcmRestored == pcmA,
+            rmsDiff(pcmRestored, pcmA));
+        // The de-esser listen monitor is not undo state: a snapshot moves the
+        // master EQ (chain and processor) but keeps the live listen toggle, in
+        // both directions. With the de-esser on, listen changes the output.
+        AudioMixer::EqSettings eqLive, eqSnap;
+        eqLive.highMid = {6000.0, 6.0, 1.0, true};
+        eqSnap.highMid = {6000.0, -9.0, 1.0, true};
+        const auto configure = [](AudioMixer *mx, const AudioMixer::EqSettings &eq, bool listen) {
+            trackfx::DeEsserSettings de;
+            de.enabled = true;
+            de.listen = listen;
+            mx->setMasterEq(eq, true);
+            mx->setMasterDeEsser(de);
+        };
+        // Snapshots and reference outputs (eqSnap) for listen off / on.
+        auto ref = std::make_unique<AudioMixer>();
+        QJsonObject listenSnapshot[2];
+        std::vector<int32_t> refPcm[2];
+        for (int listen : {0, 1}) {
+            configure(ref.get(), eqSnap, listen);
+            listenSnapshot[listen] = ref->collectTrackState();
+            refPcm[listen] = masterPcm(ref.get());
+        }
+        bool listenOk = refPcm[0] != refPcm[1];
+        for (int live : {1, 0}) {
+            configure(m.get(), eqLive, live);
+            const auto pcmLive = masterPcm(m.get());
+            const QJsonObject &snapshot = listenSnapshot[!live];
+            m->applyTrackState(snapshot);
+            const auto after = m->masterChain();
+            const auto pcmAfter = masterPcm(m.get());
+            std::fprintf(stderr,
+                "audio-trackfx G36 listen: live listen=%d eq highMid %g; snapshot listen=%d eq "
+                "highMid %g -> chain highMid=%g listen=%d; pcm vs live rms %.1f, pcm==ref(listen=%d)=%d "
+                "(rms %.1f), pcm vs ref(listen=%d) rms %.1f; ref listen on vs off rms %.1f\n",
+                live, eqLive.highMid.gainDb,
+                snapshot.value("masterChain").toObject().value("deesser").toObject()
+                    .value("listen").toBool(false),
+                eqSnap.highMid.gainDb, after.eq.highMid.gainDb, after.deesser.listen,
+                rmsDiff(pcmAfter, pcmLive), live, pcmAfter == refPcm[live],
+                rmsDiff(pcmAfter, refPcm[live]), !live, rmsDiff(pcmAfter, refPcm[!live]),
+                rmsDiff(refPcm[0], refPcm[1]));
+            listenOk = listenOk && after.eq.highMid.gainDb == eqSnap.highMid.gainDb
+                && after.deesser.listen == (live == 1) && pcmAfter != pcmLive
+                && pcmAfter == refPcm[live] && pcmAfter != refPcm[!live];
+        }
+        gate(36, snapshotA.contains(QStringLiteral("masterChain")) && pcmA != pcmB
+            && kept.eq.lowMid.gainDb == 6.0 && !kept.deesser.enabled && pcmKept == pcmB
+            && restored.eq.lowMid.gainDb == -10.0 && restored.deesser.enabled
+            && pcmRestored == pcmA && listenOk);
     }
     return tally.finish("audio-trackfx");
 }

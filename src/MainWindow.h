@@ -768,6 +768,11 @@ private:
     bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
     void captureMediaRelinkSidecarsAtCurrentUndoIndex();
     void handleMediaRelinkHistoryChanged();
+    // Audio FX dock undo (US-911): the one gesture -> saveUndoState hook of the
+    // five docks, and the restore of a history entry's dock-edited FX.
+    template <typename Panel>
+    void connectAudioFxDockUndo(Panel *panel, const QString &tag);
+    void restoreAudioFxUndoState(const QJsonObject &audioFx);
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
     void syncTrackMatteEntriesFromTimeline();
@@ -860,6 +865,7 @@ private:
     struct MediaRelinkSidecarState {
         QVector<OverlayItem> overlays;
         QHash<QString, ParticleEmitterConfig> particleClipConfigs;
+        QJsonObject audioFx; // audiofxui::undoState of the mixer at this entry
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
@@ -1272,6 +1278,9 @@ void buildAudioTrackList(int audioTrackCount, QStringList &names,
                         QList<int> &ids, bool includeMaster = true);
 void setTrackComboItems(QComboBox *combo, const QStringList &names,
                        const QList<int> &ids);
+// Undo-relevant FX of the mixer: per-track chains + master EQ / DeEsser
+// ("chains" / "masterChain"), with the DeEsser listen monitor cleared.
+QJsonObject undoState(AudioMixer *mixer);
 }
 namespace audiofxexport {
 void setMasterEqBypassForTest(bool bypass);
