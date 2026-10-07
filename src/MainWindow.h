@@ -749,12 +749,13 @@ private:
     // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
     // GUI の exportVideo と MCP の export_video が同じ経路で使う。
-    QString prepareExportAudioMix(QString *error);
+    QString prepareExportAudioMix(QString *error, int audioKbps = 192);
     // exportVideo's step between buildExportRenderJob and addJob: makes the OFF-side audio
     // mix and attaches it to the job. On failure it removes every temp file the job holds
     // (including those prepareJob made) and returns false with *error set.
     bool finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error);
     QString m_exportAudioMixErrorForTest; // selftest: non-empty forces a mix failure
+    int exportAudioMixCallCountForTest = 0; // selftest: prepareExportAudioMix calls
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);

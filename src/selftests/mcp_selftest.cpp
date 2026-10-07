@@ -61,6 +61,7 @@
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../ExportUserPresets.h"
+#include "../LoudnessMaster.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/AudioExtract.h"
@@ -6245,6 +6246,413 @@ int runMcpSelftest()
                 "a failed export_video mix left a ducking_mix file or reached the queue");
 
             queue->clear();
+            projectInfoWindow.m_mcpTools = previousTools;
+            videoTrack->setClips(savedVideoClips);
+            for (auto &entry : savedAudioClips)
+                entry.first->setClips(entry.second);
+        }
+    }
+
+    // US-909 G181-G187: export_video autoLoudness / targetLufs (explicit > preset > false),
+    // the prepareJob / prepareExportAudioMix exclusion, and audioBitrate reaching the mix.
+    {
+        // G181: the export_video descriptor as of the base (before US-909), pinned verbatim.
+        // The expected entry is that string plus two properties and one description sentence.
+        static const char kBaseExportVideoDescriptor[] = R"US909({"description":"audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。","inputSchema":{"additionalProperties":false,"properties":{"audioBitrate":{"description":"kbps。既定 192","minimum":1,"type":"integer"},"audioCodec":{"description":"ffmpeg の音声エンコーダ名。既定 aac","type":"string"},"audioOnly":{"default":false,"type":"boolean"},"crf":{"description":"品質。-1 は既定、H.264/H.265 は 0..51、AV1 は 0..63","maximum":63,"minimum":-1,"type":"integer"},"fps":{"exclusiveMinimum":0,"type":"number"},"height":{"minimum":2,"type":"integer"},"keepAlpha":{"default":false,"description":"ProRes 4444 / 4444 XQ または VP9 でアルファチャンネルを保持","type":"boolean"},"metadata":{"additionalProperties":false,"properties":{"author":{"type":"string"},"comment":{"type":"string"},"copyright":{"type":"string"},"title":{"type":"string"}},"type":"object"},"outputPath":{"type":"string"},"preset":{"type":"string"},"proresProfile":{"default":1,"description":"ProRes プロファイル。省略時は既存の既定値 1","maximum":5,"minimum":0,"type":"integer"},"rateControl":{"enum":["bitrate","crf"],"type":"string"},"videoBitrate":{"description":"kbps","minimum":1,"type":"integer"},"videoCodec":{"type":"string"},"width":{"minimum":2,"type":"integer"}},"required":["outputPath"],"type":"object"},"name":"export_video","outputSchema":{"oneOf":[{"required":["jobId","status","progress","outputPath","width","height","fps","videoCodec","videoBitrate"]},{"not":{"required":["jobId"]},"required":["outputPath"]}],"properties":{"audioBitrate":{"type":"integer"},"audioCodec":{"type":"string"},"fps":{"type":"number"},"height":{"type":"integer"},"jobId":{"type":"string"},"ok":{"type":"boolean"},"outputPath":{"type":"string"},"preset":{"type":"string"},"progress":{"type":"integer"},"status":{"enum":["queued"],"type":"string"},"videoBitrate":{"type":"integer"},"videoCodec":{"type":"string"},"warnings":{"items":{"type":"string"},"type":"array"},"width":{"type":"integer"}},"required":["ok"],"type":"object"}})US909";
+        const QJsonObject baseDescriptor = QJsonDocument::fromJson(QByteArray(kBaseExportVideoDescriptor)).object();
+        QJsonObject currentDescriptor;
+        for (const QJsonValue &value : projectInfoToolDescriptors)
+            if (value.toObject().value(QStringLiteral("name")).toString() == QStringLiteral("export_video"))
+                currentDescriptor = value.toObject();
+        QJsonObject expectedDescriptor = baseDescriptor;
+        const QString addedSentence = QStringLiteral("autoLoudness / targetLufs を省略すると、preset 指定時はそのプリセットの自動ラウドネス設定に従う (audioOnly=true では行わない)。");
+        expectedDescriptor.insert(QStringLiteral("description"),
+            baseDescriptor.value(QStringLiteral("description")).toString() + addedSentence);
+        QJsonObject expectedSchema = baseDescriptor.value(QStringLiteral("inputSchema")).toObject();
+        QJsonObject expectedProps = expectedSchema.value(QStringLiteral("properties")).toObject();
+        expectedProps.insert(QStringLiteral("autoLoudness"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("boolean")},
+            {QStringLiteral("description"), QStringLiteral("音声を自動ラウドネス正規化する。省略時は preset の設定に従い、preset が無ければ OFF。audioOnly=true では自動ラウドネスを行わず、true の指定はエラー")}});
+        expectedProps.insert(QStringLiteral("targetLufs"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), -70},
+            {QStringLiteral("maximum"), -1},
+            {QStringLiteral("description"), QStringLiteral("自動ラウドネスの目標 LUFS。省略時は preset の値、無ければ -14")}});
+        expectedSchema.insert(QStringLiteral("properties"), expectedProps);
+        expectedDescriptor.insert(QStringLiteral("inputSchema"), expectedSchema);
+        QStringList diffKeys;
+        for (const QString &key : expectedDescriptor.keys())
+            if (expectedDescriptor.value(key) != currentDescriptor.value(key)) diffKeys << key;
+        for (const QString &key : currentDescriptor.keys())
+            if (!expectedDescriptor.contains(key)) diffKeys << key;
+        const QJsonObject currentSchema = currentDescriptor.value(QStringLiteral("inputSchema")).toObject();
+        QStringList propDiff;
+        const QJsonObject currentProps = currentSchema.value(QStringLiteral("properties")).toObject();
+        for (const QString &key : expectedProps.keys())
+            if (expectedProps.value(key) != currentProps.value(key)) propDiff << key;
+        for (const QString &key : currentProps.keys())
+            if (!expectedProps.contains(key)) propDiff << key;
+        const QJsonArray requiredNow = currentSchema.value(QStringLiteral("required")).toArray();
+        const bool descriptorBaseSane = !baseDescriptor.isEmpty()
+            && baseDescriptor.value(QStringLiteral("name")).toString() == QStringLiteral("export_video")
+            && !baseDescriptor.value(QStringLiteral("inputSchema")).toObject().value(QStringLiteral("properties"))
+                   .toObject().contains(QStringLiteral("autoLoudness"));
+        std::fprintf(stderr, "mcp G181 baseSane=%d equal=%d diffKeys=[%s] propDiff=[%s] required=%s outputSchemaSame=%d\n",
+            descriptorBaseSane, expectedDescriptor == currentDescriptor, qPrintable(diffKeys.join(QLatin1Char(','))),
+            qPrintable(propDiff.join(QLatin1Char(','))),
+            QJsonDocument(requiredNow).toJson(QJsonDocument::Compact).constData(),
+            baseDescriptor.value(QStringLiteral("outputSchema")) == currentDescriptor.value(QStringLiteral("outputSchema")));
+        tally.gate(181, descriptorBaseSane && expectedDescriptor == currentDescriptor
+            && requiredNow == QJsonArray{QStringLiteral("outputPath")}
+            && baseDescriptor.value(QStringLiteral("outputSchema")) == currentDescriptor.value(QStringLiteral("outputSchema")),
+            "the export_video descriptor differs from the pinned base plus the two US-909 properties and sentence");
+
+        const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        const QString videoAsset = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        QTemporaryDir presetDir;
+        const bool g182Ready = timelineReady && queue && QFileInfo(videoAsset).isFile()
+            && exportRootReady && presetDir.isValid();
+        if (!g182Ready) {
+            const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4 presetDir=%5")
+                .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
+                .arg(exportRootReady).arg(presetDir.isValid());
+            for (int n = 182; n <= 187; ++n)
+                tally.gate(n, false, why.toUtf8().constData());
+        } else if (ffmpegExe.isEmpty()) {
+            for (int n = 182; n <= 187; ++n)
+                tally.skip(n, "ffmpeg.exe unavailable");
+        } else {
+            const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
+            std::vector<float> toneSamples(48000 * 2 * 4);
+            for (size_t i = 0; i < toneSamples.size(); ++i)
+                toneSamples[i] = 0.1f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 440.0 * static_cast<double>(i / 2) / 48000.0));
+            QString toneError;
+            const bool toneOk = libavcore::writeWavFloatInterleaved(tonePath, toneSamples, 48000, 2, &toneError);
+            ClipInfo videoClip;
+            videoClip.filePath = videoAsset;
+            videoClip.displayName = QStringLiteral("us909-video");
+            videoClip.duration = videoClip.outPoint = 1.0;
+            ClipInfo audioClip;
+            audioClip.filePath = tonePath;
+            audioClip.displayName = QStringLiteral("us909-audio");
+            audioClip.duration = audioClip.outPoint = 4.0;
+            TimelineTrack *videoTrack = projectTimeline->videoTracks().first();
+            TimelineTrack *audioTrack = projectTimeline->audioTracks().first();
+            const QVector<ClipInfo> savedVideoClips = videoTrack->clips();
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> savedAudioClips;
+            for (TimelineTrack *track : projectTimeline->audioTracks()) {
+                savedAudioClips.append(qMakePair(track, track->clips()));
+                track->setClips(QVector<ClipInfo>{});
+            }
+            videoTrack->setClips(QVector<ClipInfo>{videoClip});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            queue->clear();
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+
+            const bool hadPresetEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+            const QByteArray oldPresetEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+            qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+            ExportUserPreset onPreset;
+            onPreset.name = QStringLiteral("us909-on");
+            onPreset.config.autoLoudness = true;
+            onPreset.config.targetLufs = -16.0;
+            ExportUserPreset offPreset;
+            offPreset.name = QStringLiteral("us909-off");
+            offPreset.config.autoLoudness = false;
+            offPreset.config.targetLufs = -16.0;
+            QString presetError;
+            const bool presetsSaved = ExportUserPresets::save(onPreset, &presetError)
+                && ExportUserPresets::save(offPreset, &presetError);
+
+            struct Run {
+                bool isError = true;
+                QString errorText;
+                QString jobId;
+                bool captured = false;
+                RenderJob job;
+                QJsonArray tempFiles;
+                bool mixInTemp = false;
+                qint64 mixBytes = -1;
+                qint64 mixDurationUs = -1;
+                qint64 mixStreamBitRate = -1;
+                bool mixIsAac = false;
+                int measureDelta = -1;
+                int mixDelta = -1;
+                bool terminal = false;
+                RenderJobStatus finalStatus = RenderJobStatus::Pending;
+                qsizetype queueAfter = -1;
+            };
+            // Audio stream bit_rate from the container headers (not size / duration).
+            const auto probeStreamBitRate = [](const QString &path) -> qint64 {
+                AVFormatContext *format = nullptr;
+                if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                    return -1;
+                qint64 rate = -1;
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned i = 0; i < format->nb_streams; ++i)
+                        if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                            rate = format->streams[i]->codecpar->bit_rate;
+                }
+                avformat_close_input(&format);
+                return rate;
+            };
+            // Codec of the first audio stream (the .m4a extension names the container, not the codec).
+            const auto firstAudioIsAac = [](const QString &path) -> bool {
+                AVFormatContext *format = nullptr;
+                if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                    return false;
+                bool aac = false;
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned i = 0; i < format->nb_streams; ++i) {
+                        if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                            aac = format->streams[i]->codecpar->codec_id == AV_CODEC_ID_AAC;
+                            break;
+                        }
+                    }
+                }
+                avformat_close_input(&format);
+                return aac;
+            };
+            int callId = 1900;
+            // jobsChanged is connected before the call: the job's tempFiles and mix are gone at job end.
+            auto runExport = [&](QJsonObject args, bool expectJob = true) {
+                Run run;
+                queue->clear();
+                if (!args.contains(QStringLiteral("outputPath")))
+                    args.insert(QStringLiteral("outputPath"),
+                                exportRoot.filePath(QStringLiteral("us909-%1.mp4").arg(callId)));
+                if (!args.contains(QStringLiteral("audioOnly"))) {
+                    args.insert(QStringLiteral("width"), 320);
+                    args.insert(QStringLiteral("height"), 180);
+                    args.insert(QStringLiteral("fps"), 10);
+                }
+                const int queueBefore = queue->jobs().size();
+                const int measureBefore = RenderQueue::autoLoudnessMeasurementCountForTest();
+                const int mixBefore = projectInfoWindow.exportAudioMixCallCountForTest;
+                const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                    if (run.captured) return;
+                    const auto jobs = queue->jobs();
+                    if (jobs.isEmpty()) return;
+                    run.job = jobs.first();
+                    run.captured = true;
+                    run.tempFiles = run.job.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+                    run.mixInTemp = !run.job.projectFilePath.isEmpty()
+                        && run.tempFiles.contains(run.job.projectFilePath);
+                    const QFileInfo mixInfo(run.job.projectFilePath);
+                    if (mixInfo.isFile()) {
+                        run.mixBytes = mixInfo.size();
+                        const auto duration = libavcore::probeDurationMicroseconds(
+                            run.job.projectFilePath.toStdString());
+                        if (duration) run.mixDurationUs = *duration;
+                        run.mixStreamBitRate = probeStreamBitRate(run.job.projectFilePath);
+                        run.mixIsAac = firstAudioIsAac(run.job.projectFilePath);
+                    }
+                });
+                const QJsonObject response = callProjectInfoTool(callId++, QStringLiteral("export_video"), args);
+                run.isError = toolResult(response).value(QStringLiteral("isError")).toBool(true);
+                run.jobId = toolPayload(response).value(QStringLiteral("jobId")).toString();
+                if (run.isError) {
+                    const QJsonArray content = toolResult(response).value(QStringLiteral("content")).toArray();
+                    run.errorText = content.isEmpty() ? QString()
+                        : content.first().toObject().value(QStringLiteral("text")).toString();
+                }
+                if (expectJob && !run.isError) {
+                    (void)QTest::qWaitFor([&]() { return run.captured; }, 60000);
+                    run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
+                    run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                    run.terminal = run.captured && QTest::qWaitFor([&]() {
+                        for (const RenderJob &job : queue->jobs()) {
+                            if (job.uuid != run.jobId) continue;
+                            run.finalStatus = job.status;
+                            return job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed
+                                || job.status == RenderJobStatus::Cancelled;
+                        }
+                        return false;
+                    }, 120000);
+                } else {
+                    // Returns as soon as a (wrongly) deferred job step is observed; the deferral is QTimer::singleShot(0).
+                    (void)QTest::qWaitFor([&]() {
+                        return queue->jobs().size() != queueBefore
+                            || RenderQueue::autoLoudnessMeasurementCountForTest() != measureBefore
+                            || projectInfoWindow.exportAudioMixCallCountForTest != mixBefore;
+                    }, 1000);
+                    run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
+                    run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                }
+                QObject::disconnect(connection);
+                run.queueAfter = queue->jobs().size();
+                return run;
+            };
+            const auto lufsOf = [](const Run &run, const char *key) {
+                return run.job.exportConfig.value(QLatin1String(key)).toDouble(std::numeric_limits<double>::quiet_NaN());
+            };
+            const auto autoOf = [](const Run &run) {
+                return run.job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false);
+            };
+            const auto describe = [&](const char *tag, const Run &run) {
+                std::fprintf(stderr, "mcp %s isError=%d err=[%s] captured=%d measureDelta=%d mixDelta=%d "
+                    "hasAutoKey=%d autoLoudness=%d targetLufs=%g measuredLufs=%g mixInTemp=%d "
+                    "mixIsAac=%d projectFilePath=[%s] terminal=%d status=%d\n", tag, run.isError, qPrintable(run.errorText),
+                    run.captured, run.measureDelta, run.mixDelta,
+                    run.job.exportConfig.contains(QStringLiteral("autoLoudness")), autoOf(run),
+                    lufsOf(run, "targetLufs"), lufsOf(run, "measuredLufs"), run.mixInTemp,
+                    run.mixIsAac, qPrintable(run.job.projectFilePath), run.terminal, static_cast<int>(run.finalStatus));
+            };
+            const auto finiteSane = [](double lufs) { return std::isfinite(lufs) && lufs > -30.0 && lufs < -18.0; };
+
+            // G182: explicit autoLoudness=true goes through prepareJob, not prepareExportAudioMix.
+            const Run explicitOn = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
+                                                         {QStringLiteral("targetLufs"), -14}});
+            describe("G182", explicitOn);
+
+            // G182 sub-case: autoLoudness resolved true on a timeline whose audio playback sequence is empty.
+            // prepareJob makes no mix there; without the MCP-side silent mix RenderQueue falls back to the
+            // V1 source audio (e2e_clip.mp4 has an audible AAC stream) that the user removed.
+            audioTrack->setClips(QVector<ClipInfo>{});
+            const QString silentOut = exportRoot.filePath(QStringLiteral("us909-emptyaudio.mp4"));
+            const Run emptyAudio = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
+                {QStringLiteral("outputPath"), silentOut}});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            describe("G182-empty", emptyAudio);
+            const double silentLufs = emptyAudio.terminal ? loudness::measureIntegratedLufs(silentOut)
+                                                          : std::numeric_limits<double>::quiet_NaN();
+            const double sourceLufs = loudness::measureIntegratedLufs(videoAsset);
+            const bool silentOk = !emptyAudio.isError && emptyAudio.captured
+                && emptyAudio.mixInTemp && emptyAudio.job.projectFilePath != videoAsset
+                && emptyAudio.mixDelta == 1
+                && emptyAudio.terminal && emptyAudio.finalStatus == RenderJobStatus::Completed
+                && std::isfinite(sourceLufs) && sourceLufs > -40.0
+                && std::isfinite(silentLufs) && silentLufs <= -70.0;
+            std::fprintf(stderr, "mcp G182-empty silentOk=%d outputLufs=%g sourceV1Lufs=%g mixDelta=%d measureDelta=%d "
+                "projectFilePathIsV1=%d\n", silentOk, silentLufs, sourceLufs, emptyAudio.mixDelta,
+                emptyAudio.measureDelta, emptyAudio.job.projectFilePath == videoAsset);
+            tally.gate(182, toneOk && presetsSaved && !explicitOn.isError && explicitOn.captured
+                && explicitOn.measureDelta == 1 && finiteSane(lufsOf(explicitOn, "measuredLufs"))
+                && explicitOn.mixInTemp && explicitOn.mixIsAac && explicitOn.mixDelta == 0
+                && explicitOn.terminal && explicitOn.finalStatus == RenderJobStatus::Completed
+                && silentOk,
+                "autoLoudness=true did not measure once via prepareJob (or also called prepareExportAudioMix), "
+                "or an empty audio sequence brought back the V1 source audio");
+
+            // G183 / G184: omitted + no preset is the base path; omitted + ON preset is the US-909 change.
+            const Run omitted = runExport(QJsonObject{});
+            describe("G183", omitted);
+            const bool g183Ext = QFileInfo(omitted.job.projectFilePath).suffix().toLower() == QStringLiteral("m4a")
+                || omitted.mixInTemp;
+            tally.gate(183, !omitted.isError && omitted.captured
+                && !omitted.job.exportConfig.contains(QStringLiteral("autoLoudness"))
+                && !omitted.job.exportConfig.contains(QStringLiteral("targetLufs"))
+                && omitted.measureDelta == 0 && omitted.mixDelta == 1 && omitted.mixInTemp && g183Ext
+                && omitted.terminal && omitted.finalStatus == RenderJobStatus::Completed,
+                "omitted autoLoudness without a preset left the base export path (key, measurement or mix call count changed)");
+            const Run presetOn = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")}});
+            describe("G184", presetOn);
+            tally.gate(184, !presetOn.isError && presetOn.captured && presetOn.measureDelta == 1
+                && presetOn.mixDelta == 0 && autoOf(presetOn)
+                && lufsOf(presetOn, "targetLufs") == -16.0 && finiteSane(lufsOf(presetOn, "measuredLufs"))
+                && presetOn.mixInTemp && presetOn.terminal && presetOn.finalStatus == RenderJobStatus::Completed,
+                "an ON preset with autoLoudness omitted was not measured (behavior change not applied)");
+
+            // G185: resolution rule explicit > preset > false.
+            const Run caseA = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")},
+                                                    {QStringLiteral("autoLoudness"), false}});
+            describe("G185a", caseA);
+            const Run caseB = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-off")},
+                                                    {QStringLiteral("autoLoudness"), true}});
+            describe("G185b", caseB);
+            const Run caseC = runExport(QJsonObject{{QStringLiteral("targetLufs"), -20}});
+            describe("G185c", caseC);
+            const Run caseD = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")},
+                                                    {QStringLiteral("targetLufs"), -20}});
+            describe("G185d", caseD);
+            const bool a = !caseA.isError && caseA.captured && caseA.measureDelta == 0 && caseA.mixDelta == 1
+                && !autoOf(caseA)
+                && caseA.job.exportConfig.contains(QStringLiteral("autoLoudness"))
+                && caseA.job.exportConfig.value(QStringLiteral("autoLoudness")).isBool();
+            const bool b = !caseB.isError && caseB.captured && caseB.measureDelta == 1 && caseB.mixDelta == 0
+                && autoOf(caseB) && lufsOf(caseB, "targetLufs") == -16.0;
+            const bool c = !caseC.isError && caseC.captured && caseC.measureDelta == 0 && caseC.mixDelta == 1
+                && !autoOf(caseC) && lufsOf(caseC, "targetLufs") == -20.0;
+            const bool d = !caseD.isError && caseD.captured && caseD.measureDelta == 1 && caseD.mixDelta == 0
+                && autoOf(caseD) && lufsOf(caseD, "targetLufs") == -20.0;
+            std::fprintf(stderr, "mcp G185 a=%d b=%d c=%d d=%d\n", a, b, c, d);
+            tally.gate(185, a && b && c && d,
+                "the explicit > preset > false resolution of autoLoudness / targetLufs was violated");
+
+            // G186: invalid values are rejected without queuing; audioOnly + preset-derived true is ignored.
+            const QString audioOnlyPath = exportRoot.filePath(QStringLiteral("us909-audio.m4a"));
+            const QList<QJsonObject> invalidArgs{
+                QJsonObject{{QStringLiteral("targetLufs"), 0}},
+                QJsonObject{{QStringLiteral("targetLufs"), -80}},
+                QJsonObject{{QStringLiteral("autoLoudness"), QStringLiteral("yes")}},
+                QJsonObject{{QStringLiteral("audioOnly"), true}, {QStringLiteral("autoLoudness"), true},
+                            {QStringLiteral("outputPath"), audioOnlyPath}}};
+            bool invalidOk = true;
+            for (int i = 0; i < invalidArgs.size(); ++i) {
+                const Run run = runExport(invalidArgs.at(i), false);
+                std::fprintf(stderr, "mcp G186 invalid#%d isError=%d err=[%s] queueAfter=%lld measureDelta=%d mixDelta=%d\n",
+                    i, run.isError, qPrintable(run.errorText), static_cast<long long>(run.queueAfter),
+                    run.measureDelta, run.mixDelta);
+                invalidOk = invalidOk && run.isError && !run.errorText.isEmpty() && run.queueAfter == 0
+                    && run.measureDelta == 0 && run.mixDelta == 0;
+            }
+            // audioOnly + ON preset + omitted: decision 7 (Wave 10 exception) - MCP audioOnly never measures (base measured once).
+            const Run audioOnlyPreset = runExport(QJsonObject{{QStringLiteral("audioOnly"), true},
+                {QStringLiteral("preset"), QStringLiteral("us909-on")}, {QStringLiteral("outputPath"), audioOnlyPath}}, false);
+            const bool audioOnlyPresetFile = QFileInfo(audioOnlyPath).isFile();
+            std::fprintf(stderr, "mcp G186 audioOnly+ON preset isError=%d err=[%s] jobId=[%s] queueAfter=%lld measureDelta=%d outputExists=%d (decision 7: not measured; base measured)\n",
+                audioOnlyPreset.isError, qPrintable(audioOnlyPreset.errorText), qPrintable(audioOnlyPreset.jobId),
+                static_cast<long long>(audioOnlyPreset.queueAfter), audioOnlyPreset.measureDelta, audioOnlyPresetFile);
+            // Explicit autoLoudness=false overrides the preset: not measured.
+            const QString audioOnlyOffPath = exportRoot.filePath(QStringLiteral("us909-audio-off.m4a"));
+            const Run audioOnlyOff = runExport(QJsonObject{{QStringLiteral("audioOnly"), true},
+                {QStringLiteral("preset"), QStringLiteral("us909-on")}, {QStringLiteral("autoLoudness"), false},
+                {QStringLiteral("outputPath"), audioOnlyOffPath}}, false);
+            std::fprintf(stderr, "mcp G186 audioOnly+ON preset+autoLoudness=false isError=%d err=[%s] jobId=[%s] queueAfter=%lld measureDelta=%d outputExists=%d\n",
+                audioOnlyOff.isError, qPrintable(audioOnlyOff.errorText), qPrintable(audioOnlyOff.jobId),
+                static_cast<long long>(audioOnlyOff.queueAfter), audioOnlyOff.measureDelta, QFileInfo(audioOnlyOffPath).isFile());
+            tally.gate(186, invalidOk && !audioOnlyPreset.isError && audioOnlyPreset.jobId.isEmpty()
+                && audioOnlyPreset.queueAfter == 0 && audioOnlyPreset.measureDelta == 0 && audioOnlyPresetFile
+                && !audioOnlyOff.isError && audioOnlyOff.jobId.isEmpty() && audioOnlyOff.queueAfter == 0
+                && audioOnlyOff.measureDelta == 0 && QFileInfo(audioOnlyOffPath).isFile(),
+                "an invalid autoLoudness / targetLufs queued a job, or MCP audioOnly + ON preset measured (decision 7: not measured; base measured) / audioOnly + explicit false measured");
+
+            // G187: audioBitrate reaches the mix. The audio stream bit_rate is read from the m4a headers.
+            // Noise (a tone would not make the AAC encoder spend its bitrate), on the audio track for these two runs only.
+            const QString noisePath = exportRoot.filePath(QStringLiteral("us909-noise.wav"));
+            std::vector<float> noiseSamples(48000 * 2 * 4);
+            unsigned noiseState = 12345u;
+            for (float &v : noiseSamples) {
+                noiseState = noiseState * 1664525u + 1013904223u;
+                v = (static_cast<float>(noiseState >> 8) / 8388608.0f - 1.0f) * 0.3f;
+            }
+            QString noiseError;
+            const bool noiseOk = libavcore::writeWavFloatInterleaved(noisePath, noiseSamples, 48000, 2, &noiseError);
+            ClipInfo noiseClip = audioClip;
+            noiseClip.filePath = noisePath;
+            noiseClip.displayName = QStringLiteral("us909-noise");
+            audioTrack->setClips(QVector<ClipInfo>{noiseClip});
+            const Run bitrate96 = runExport(QJsonObject{{QStringLiteral("audioBitrate"), 96}});
+            const Run bitrate192 = runExport(QJsonObject{{QStringLiteral("audioBitrate"), 192}});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            const double rate96 = static_cast<double>(bitrate96.mixStreamBitRate) / 1000.0;
+            const double rate192 = static_cast<double>(bitrate192.mixStreamBitRate) / 1000.0;
+            std::fprintf(stderr, "mcp G187 noiseOk=%d 96: isError=%d mixInTemp=%d bit_rate=%lld bytes=%lld durationUs=%lld | 192: isError=%d mixInTemp=%d bit_rate=%lld bytes=%lld durationUs=%lld\n",
+                noiseOk, bitrate96.isError, bitrate96.mixInTemp, static_cast<long long>(bitrate96.mixStreamBitRate),
+                static_cast<long long>(bitrate96.mixBytes), static_cast<long long>(bitrate96.mixDurationUs),
+                bitrate192.isError, bitrate192.mixInTemp, static_cast<long long>(bitrate192.mixStreamBitRate),
+                static_cast<long long>(bitrate192.mixBytes), static_cast<long long>(bitrate192.mixDurationUs));
+            tally.gate(187, noiseOk && !bitrate96.isError && bitrate96.mixInTemp && rate96 > 81.6 && rate96 < 110.4
+                && !bitrate192.isError && bitrate192.mixInTemp && rate192 > 163.2 && rate192 < 220.8
+                && rate192 > 1.4 * rate96,
+                "the MCP audioBitrate did not set the mix AAC stream bit_rate (about 96 / 192 kbps)");
+
+            queue->clear();
+            if (hadPresetEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldPresetEnv);
+            else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
             projectInfoWindow.m_mcpTools = previousTools;
             videoTrack->setClips(savedVideoClips);
             for (auto &entry : savedAudioClips)

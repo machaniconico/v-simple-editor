@@ -10719,9 +10719,10 @@ bool MainWindow::timelineRequiresExportAudioMix(Timeline *timeline)
     return timelineNeedsAudioMixForExport(timeline);
 }
 
-QString MainWindow::prepareExportAudioMix(QString *error)
+QString MainWindow::prepareExportAudioMix(QString *error, int audioKbps)
 {
-    return prepareTimelineAudioMixForExport(m_timeline, error);
+    ++exportAudioMixCallCountForTest;
+    return prepareTimelineAudioMixForExport(m_timeline, error, {}, 0.0, audioKbps);
 }
 
 bool MainWindow::exportAudioOnly(const ExportConfig &config, QString *error)

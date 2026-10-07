@@ -2459,7 +2459,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("export_video"),
-        QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。"),
+        QStringLiteral("audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。autoLoudness / targetLufs を省略すると、preset 指定時はそのプリセットの自動ラウドネス設定に従う (audioOnly=true では行わない)。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("metadata"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("object")},
@@ -2528,6 +2528,16 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("type"), QStringLiteral("integer")},
                 {QStringLiteral("minimum"), 1},
                 {QStringLiteral("description"), QStringLiteral("kbps。既定 192")}
+            }},
+            {QStringLiteral("autoLoudness"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("boolean")},
+                {QStringLiteral("description"), QStringLiteral("音声を自動ラウドネス正規化する。省略時は preset の設定に従い、preset が無ければ OFF。audioOnly=true では自動ラウドネスを行わず、true の指定はエラー")}
+            }},
+            {QStringLiteral("targetLufs"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("number")},
+                {QStringLiteral("minimum"), -70},
+                {QStringLiteral("maximum"), -1},
+                {QStringLiteral("description"), QStringLiteral("自動ラウドネスの目標 LUFS。省略時は preset の値、無ければ -14")}
             }}
         }, {QStringLiteral("outputPath")}),
         guardedWrite(QStringLiteral("export_video"),
@@ -2547,7 +2557,9 @@ void McpEditorTools::registerWriteTools()
                                          QStringLiteral("rateControl"),
                                          QStringLiteral("crf"),
                                          QStringLiteral("audioCodec"),
-                                         QStringLiteral("audioBitrate")}, err))
+                                         QStringLiteral("audioBitrate"),
+                                         QStringLiteral("autoLoudness"),
+                                         QStringLiteral("targetLufs")}, err))
                 return {};
 
             if (args.contains("metadata") && !args.value("metadata").isObject())
@@ -2610,9 +2622,29 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("音声のみの書き出しではアルファを保持できません")), QJsonObject();
             if (args.contains(QStringLiteral("audioOnly")) && !args.value(QStringLiteral("audioOnly")).isBool())
                 return setError(err, QStringLiteral("audioOnly は真偽値で指定してください")), QJsonObject();
-            if (args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly)) {
+            const bool hasExplicitAutoLoudness = args.contains(QStringLiteral("autoLoudness"));
+            if (hasExplicitAutoLoudness && !args.value(QStringLiteral("autoLoudness")).isBool())
+                return setError(err, QStringLiteral("autoLoudness は真偽値で指定してください")), QJsonObject();
+            const bool explicitAutoLoudness = args.value(QStringLiteral("autoLoudness")).toBool(false);
+            const bool hasExplicitTargetLufs = args.contains(QStringLiteral("targetLufs"));
+            double explicitTargetLufs = 0.0;
+            if (hasExplicitTargetLufs) {
+                const QJsonValue value = args.value(QStringLiteral("targetLufs"));
+                explicitTargetLufs = value.toDouble(0.0);
+                if (!value.isDouble() || !std::isfinite(explicitTargetLufs)
+                    || explicitTargetLufs < -70.0 || explicitTargetLufs > -1.0)
+                    return setError(err, QStringLiteral("targetLufs は -70 から -1 の数値で指定してください")), QJsonObject();
+            }
+            const bool audioOnlyRequested = args.value(QStringLiteral("audioOnly")).toBool(baseConfig.audioOnly);
+            if (audioOnlyRequested && hasExplicitAutoLoudness && explicitAutoLoudness)
+                return setError(err, QStringLiteral("音声のみの書き出しでは autoLoudness=true を指定できません")), QJsonObject();
+            if (audioOnlyRequested) {
                 ExportConfig config = baseConfig;
                 config.audioOnly = true;
+                // MCP の audioOnly は自動ラウドネスを行わない (Wave 10 利用者判断 7 の例外。基点は preset の ON を尊重して測定していた)。
+                // 明示 true は上で拒否済み。GUI の exportAudioOnly は変えない。
+                config.autoLoudness = false;
+                if (hasExplicitTargetLufs) config.targetLufs = explicitTargetLufs;
                 config.outputPath = outputPath;
                 config.container = outputInfo.suffix().toLower();
                 config.audioCodec = ExportConfig::audioCodecForContainer(config.container);
@@ -2760,6 +2792,20 @@ void McpEditorTools::registerWriteTools()
                 merged.insert(QStringLiteral("hdrMaxFall"), baseConfig.hdrSettings.maxFall);
                 job.exportConfig = merged;
             }
+            // autoLoudness: 明示 > preset (merged に入った値) > false。targetLufs: 明示 > preset > 既定。
+            const bool resolvedAutoLoudness = hasExplicitAutoLoudness
+                ? explicitAutoLoudness
+                : job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false);
+            if (resolvedAutoLoudness)
+                job.exportConfig.insert(QStringLiteral("autoLoudness"), true);
+            else if (hasExplicitAutoLoudness)
+                job.exportConfig.insert(QStringLiteral("autoLoudness"), false);
+            else
+                job.exportConfig.remove(QStringLiteral("autoLoudness"));
+            if (hasExplicitTargetLufs)
+                job.exportConfig.insert(QStringLiteral("targetLufs"), explicitTargetLufs);
+            else if (resolvedAutoLoudness && !job.exportConfig.contains(QStringLiteral("targetLufs")))
+                job.exportConfig.insert(QStringLiteral("targetLufs"), baseConfig.targetLufs);
             for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
                 if (it.value().toString().isEmpty()) job.exportConfig.remove(it.key());
                 else job.exportConfig.insert(it.key(), it.value());
@@ -2801,21 +2847,59 @@ void McpEditorTools::registerWriteTools()
             const QPointer<RenderQueue> queueGuard(queue);
             const QPointer<MainWindow> windowGuard(m_window);
             const QString jobId = job.uuid;
-            QTimer::singleShot(0, m_window, [this, queueGuard, windowGuard, job, jobId]() mutable {
+            QTimer::singleShot(0, m_window, [this, queueGuard, windowGuard, job, jobId, audioBitrate]() mutable {
                 if (!queueGuard || !windowGuard || windowGuard->m_mcpTools != this)
                     return;
-                QString audioMixError;
-                const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError);
-                if (!audioMixError.isEmpty()) {
-                    ExportJobObservation& observation = m_exportJobObservations[jobId];
-                    observation.status = QStringLiteral("failed");
-                    observation.error = audioMixError;
-                    return;
-                }
-                if (!audioMixPath.isEmpty()) {
-                    // The mix is a per-job intermediate: let RenderQueue delete it at job end.
-                    RenderQueue::addTempFile(job.exportConfig, audioMixPath);
-                    RenderQueue::setIntermediateProjectFile(job, audioMixPath);
+                if (job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false)) {
+                    // Same exclusion as the GUI: auto loudness builds its own AAC intermediate,
+                    // so the ordinary mix is not made. A failure of the AAC conversion sets
+                    // loudnessAutoError and addJob rejects the job. A failure of the PCM mix only
+                    // adds a warning to loudnessAutoStatus, so promote it to an error here (MCP only)
+                    // to keep the "failed" observation the ordinary mix path gave.
+                    loudnessauto::prepareJob(job);
+                    if (job.timeline && job.timeline->totalDuration() > 0.0
+                        && !job.timeline->computeAudioPlaybackSequence().isEmpty()
+                        && !job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"))
+                        && job.exportConfig.value(QStringLiteral("loudnessAutoError")).toString().isEmpty()) {
+                        const QString status = job.exportConfig.value(QStringLiteral("loudnessAutoStatus")).toString();
+                        job.exportConfig[QStringLiteral("loudnessAutoError")] = status.isEmpty()
+                            ? QStringLiteral("音声ミックスの作成に失敗しました") : status;
+                    }
+                    // Empty audio playback sequence: prepareJob makes no mix, and RenderQueue would fall
+                    // back to the V1 source audio the user removed. Make the silent track the ordinary
+                    // path makes (the only case where both prepareJob and the ordinary mix run).
+                    if (job.timeline && job.timeline->totalDuration() > 0.0
+                        && job.timeline->computeAudioPlaybackSequence().isEmpty()
+                        && !job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"))
+                        && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray()
+                               .contains(job.projectFilePath)) {
+                        QString audioMixError;
+                        const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError, audioBitrate);
+                        if (!audioMixError.isEmpty()) {
+                            ExportJobObservation& observation = m_exportJobObservations[jobId];
+                            observation.status = QStringLiteral("failed");
+                            observation.error = audioMixError;
+                            return;
+                        }
+                        if (!audioMixPath.isEmpty()) {
+                            RenderQueue::addTempFile(job.exportConfig, audioMixPath);
+                            RenderQueue::setIntermediateProjectFile(job, audioMixPath);
+                        }
+                    }
+                } else {
+                    QString audioMixError;
+                    const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError, audioBitrate);
+                    if (!audioMixError.isEmpty()) {
+                        ExportJobObservation& observation = m_exportJobObservations[jobId];
+                        observation.status = QStringLiteral("failed");
+                        observation.error = audioMixError;
+                        return;
+                    }
+                    if (!audioMixPath.isEmpty()) {
+                        // The mix is a per-job intermediate: let RenderQueue delete it at job end.
+                        RenderQueue::addTempFile(job.exportConfig, audioMixPath);
+                        RenderQueue::setIntermediateProjectFile(job, audioMixPath);
+                    }
                 }
                 queueGuard->addJob(job);
                 queueGuard->start();
