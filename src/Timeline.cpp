@@ -49,6 +49,7 @@
 #include <QJsonDocument>
 #include <QJsonValue>
 #include <QMessageBox>
+#include <QMutexLocker>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QPushButton>
@@ -4521,6 +4522,14 @@ void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
             mattes.insert(key, entry);
         }
         m_trackMatteEntries = mattes;
+        const auto rotoBefore = rotoEntries();
+        QHash<QString, RotoClipEntry> rotos;
+        rotos.reserve(rotoBefore.size());
+        for (auto it = rotoBefore.cbegin(); it != rotoBefore.cend(); ++it) {
+            const QString key = remapKey(it.key());
+            if (!key.isEmpty()) rotos.insert(key, it.value());
+        }
+        commitRotoEntries(std::move(rotos), true);
         QHash<QString, QString> parents;
         for (auto it = m_clipParentEntries.cbegin(); it != m_clipParentEntries.cend(); ++it) {
             const QString child = remapKey(it.key()), parent = remapKey(it.value());
@@ -11379,7 +11388,8 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
     //   clips in [to..from-1] (if from>to) shift to [to+1..from]  (up by 1)
     connect(track, &TimelineTrack::clipMoved, this,
         [this, track](int fromIdx, int toIdx) {
-            if (m_trackMatteEntries.isEmpty() && m_clipParentEntries.isEmpty()) return;
+            if (m_trackMatteEntries.isEmpty() && m_clipParentEntries.isEmpty()
+                && rotoEntries().isEmpty()) return;
             const int t = m_videoTracks.indexOf(track);
             if (t < 0) return;   // audio track — no video clip sidecars
             // Build old→new index map for track t only.
@@ -11407,6 +11417,14 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
                     rebuilt.insert(newKey, e);
                 }
                 m_trackMatteEntries = rebuilt;
+            }
+            const auto rotoBefore = rotoEntries();
+            if (!rotoBefore.isEmpty()) {
+                QHash<QString, RotoClipEntry> rebuilt;
+                rebuilt.reserve(rotoBefore.size());
+                for (auto it = rotoBefore.cbegin(); it != rotoBefore.cend(); ++it)
+                    rebuilt.insert(oldToNew.value(it.key(), it.key()), it.value());
+                commitRotoEntries(std::move(rebuilt), true);
             }
             if (!m_clipParentEntries.isEmpty()) {
                 QHash<QString, QString> rebuilt;
@@ -13035,6 +13053,66 @@ void Timeline::clearClipParent(const QString& childKey)
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::commitRotoEntries(QHash<QString, RotoClipEntry> next, bool clearMemo)
+{
+    QMutexLocker lock(&m_rotoMutex);
+    for (auto it = next.begin(); it != next.end(); ++it)
+        it.value().clipId = it.key();
+    m_rotoEntries = std::move(next);
+    if (clearMemo) {
+        m_rotoRemapMemoAfter.clear();
+        m_rotoRemapMemoValid = false;
+    }
+}
+
+void Timeline::setRotoEntries(const QHash<QString, RotoClipEntry> &entries)
+{
+    commitRotoEntries(entries, true);
+}
+
+QHash<QString, RotoClipEntry> Timeline::rotoEntries() const
+{
+    QMutexLocker lock(&m_rotoMutex);
+    return m_rotoEntries;
+}
+
+void Timeline::remapRotoEntriesAfterMutation(const TrackClipSnapshot &before)
+{
+    if (rotoEntries().isEmpty()) return;
+    const TrackClipSnapshot after = snapshotTrackClips(this);
+    {
+        QMutexLocker lock(&m_rotoMutex);
+        if (m_rotoRemapMemoValid && after.size() == m_rotoRemapMemoAfter.size()) {
+            bool same = true;
+            for (int track = 0; same && track < after.size(); ++track) {
+                if (after[track].size() != m_rotoRemapMemoAfter[track].size()) {
+                    same = false;
+                    break;
+                }
+                for (int clip = 0; clip < after[track].size(); ++clip) {
+                    if (!after[track][clip].sameAs(m_rotoRemapMemoAfter[track][clip])) {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+            if (same) return;
+        }
+    }
+    const auto entries = rotoEntries();
+    const auto oldToNew = alignedClipKeyMap(this, before);
+    QHash<QString, RotoClipEntry> rebuilt;
+    rebuilt.reserve(entries.size());
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
+        const auto key = oldToNew.constFind(it.key());
+        if (key != oldToNew.cend()) rebuilt.insert(key.value(), it.value());
+    }
+    commitRotoEntries(std::move(rebuilt), false);
+    QMutexLocker lock(&m_rotoMutex);
+    m_rotoRemapMemoAfter = after;
+    m_rotoRemapMemoValid = true;
+}
+
 TimelineState Timeline::currentState() const
 {
     TimelineState state;
@@ -13079,6 +13157,7 @@ TimelineState Timeline::currentState() const
     state.playheadPos = m_playheadPos;
     state.clipParentEntries = clipParentEntries();
     state.trackMatteEntries = m_trackMatteEntries;
+    state.rotoEntries = rotoEntries();
     state.trackStructureRevision = m_trackStructureRevision;
 
     if (m_audioMixer) {
@@ -13134,6 +13213,7 @@ void Timeline::restoreState(const TimelineState &state)
     }
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
     m_trackMatteEntries = state.trackMatteEntries;
+    commitRotoEntries(state.rotoEntries, true);
     setClipParentEntries(state.clipParentEntries);
     rebuildTimelineBreadcrumbBar(this);
 

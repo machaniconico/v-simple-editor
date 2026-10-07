@@ -218,6 +218,7 @@ int runRightclickPausePrefSelftest();
 int runReverseClipSelftest();
 int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
+int runRotoSelftest();
 int runSeqFromClipSelftest();
 int runSequenceDockSelftest();
 int runSfmTwoViewSelftest();
@@ -998,6 +999,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Timeline selection, blade, gaps, duplicate, nudge, marquee, zoom, timecode, playhead moves, labels and linked selection (12 gates)" },
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
+    { "roto", "VEDITOR_ROTO_SELFTEST", runRotoSelftest, true,
+      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (6 gates)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,

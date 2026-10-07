@@ -1405,6 +1405,16 @@ void RenderQueue::startRenderPipe(int jobIndex)
         return;
     }
 
+    // The file-backed carrier selftest observes the Timeline actually used by
+    // the queue. Keep this opt-in so ordinary exports do no extra copying.
+    if (property("captureResolvedRotoClipIdsForTest").toBool()) {
+        QJsonObject ids;
+        const auto entries = tl->rotoEntries();
+        for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+            ids.insert(it.key(), it.value().clipId);
+        setProperty("resolvedRotoClipIdsForTest", QVariant::fromValue(ids));
+    }
+
     const QJsonObject &cfg = jobCopy.exportConfig;
     const std::optional<TimecodeBurnInRenderer> timecodeRenderer =
         timecodeBurnInForRender(cfg, tl);
@@ -2523,6 +2533,13 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         matteEntries.insert(canonicalKey(entry.clipId), e);
     }
     tl->setTrackMatteEntries(matteEntries);
+    QHash<QString, RotoClipEntry> rotoEntries;
+    rotoEntries.reserve(data.rotoClipEntries.size());
+    for (const RotoClipEntry &entry : data.rotoClipEntries) {
+        if (!entry.clipId.isEmpty())
+            rotoEntries.insert(canonicalKey(entry.clipId), entry);
+    }
+    tl->setRotoEntries(rotoEntries);
     QHash<QString, QString> parentEntries;
     parentEntries.reserve(data.clipParentEntries.size());
     for (const ClipParentEntry &entry : data.clipParentEntries) {

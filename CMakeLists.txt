@@ -86,6 +86,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-1: selftest registry (table + dispatch helpers).
     src/selftests/SelftestRegistry.h
     src/selftests/SelftestRegistry.cpp
+    src/selftests/roto_selftest.cpp
     src/selftests/audio_fixture_selftest.cpp
     src/selftests/render_fixture_selftest.cpp
 
@@ -240,6 +241,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/clipanim/ClipAnim.h
     src/clipanim/ClipAnim.cpp
     src/TrackMatteKey.h
+    src/RotoClipEntry.h
     src/TrackMatteKey.cpp
     src/CodecDetector.cpp
     src/UndoTrace.h

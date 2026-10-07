@@ -45,6 +45,7 @@ struct TimelineState {
     quint64 trackStructureRevision = 0;
     QHash<QString, QString> clipParentEntries;
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
+    QHash<QString, RotoClipEntry> rotoEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを
     // 9:16 にリサイズする)適用後の Ctrl+Z が、クリップの fit だけでなく**元の
     // プロジェクトサイズも**復元できるよう捕捉する。これが無いと undo は fit を戻すが

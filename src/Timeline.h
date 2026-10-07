@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QVector>
 #include <QHash>
+#include <QMutex>
 #include <QMenu>
 #include <QElapsedTimer>
 #include <QColor>
@@ -33,6 +34,7 @@
 #include "PlaybackTypes.h"
 #include "Overlay.h"
 #include "TrackMatteKey.h"
+#include "RotoClipEntry.h"
 #include "SnapEngine.h"
 #include "MarkerData.h"
 #include "SpeedRampData.h"
@@ -1312,6 +1314,9 @@ public:
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const {
         return m_trackMatteEntries;
     }
+    void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
+    QHash<QString, RotoClipEntry> rotoEntries() const;
+    void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
 signals:
     void skimPreviewRequested(const QImage &image);
     void skimPreviewCleared();
@@ -1378,6 +1383,7 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    void commitRotoEntries(QHash<QString, RotoClipEntry> next, bool clearMemo);
     ClipInfo copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups);
     double m_nudgeFrameRate = 30.0;
     bool m_nudgeBatchActive = false;
@@ -1442,6 +1448,10 @@ private:
     // TM-8: track-matte wiring carried by the Timeline (see
     // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
     QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
+    mutable QMutex m_rotoMutex;
+    QHash<QString, RotoClipEntry> m_rotoEntries;
+    TrackClipSnapshot m_rotoRemapMemoAfter;
+    bool m_rotoRemapMemoValid = false;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;

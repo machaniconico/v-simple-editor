@@ -14,7 +14,7 @@
 #include "MaskSystem.h"
 #include "PlanarTracker.h"
 #include "ParticleSystem.h"
-#include "Rotoscope.h"
+#include "RotoClipEntry.h"
 #include "TimeRemap.h"
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
@@ -125,13 +125,6 @@ struct ClipNodeGraph {
     QString clipId;
     QJsonObject graph;
     QString compositingMode = QStringLiteral("layer");
-};
-
-struct RotoClipEntry {
-    QString clipId;
-    RotoPath path;
-    QVector<RotoKeyframe> keyframes;
-    QImage brushMask;
 };
 
 struct TimeRemapClipEntry {
