@@ -1,6 +1,11 @@
 #include "RotoApply.h"
 
 #include "Rotoscope.h"
+#include <QDateTime>
+#include <QFileInfo>
+#include <QHash>
+#include <QMutex>
+#include <QMutexLocker>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -14,6 +19,7 @@ namespace {
 std::atomic<quint64> gSourceFrameIndexForCalls{0};
 std::atomic<quint64> gRenderApplyCalls{0};
 std::atomic<int> gLastRenderSourceFrameIndex{-1};
+std::atomic<quint64> gProbeVideoStreamFpsOpens{0};
 } // namespace
 
 QImage applyEntryToFrame(const RotoClipEntry &entry, const QImage &frame,
@@ -60,12 +66,36 @@ int lastRenderSourceFrameIndex()
     return gLastRenderSourceFrameIndex.load(std::memory_order_relaxed);
 }
 
+quint64 probeVideoStreamFpsOpenCount()
+{
+    return gProbeVideoStreamFpsOpens.load(std::memory_order_relaxed);
+}
+
 double probeVideoStreamFps(const QString &filePath)
 {
     double fps = 0.0;
+    if (filePath.isEmpty() || filePath.startsWith(QStringLiteral("veditor://")))
+        return fps;
+
+    // Process-wide cache (the renderer probes every roto frame, possibly on
+    // export worker threads). A missing file or a failed open is not cached,
+    // so relinked media is probed again.
+    static QMutex cacheMutex;
+    static QHash<QString, double> cache;
+    const QFileInfo info(filePath);
+    QString cacheKey;
+    if (info.exists()) {
+        cacheKey = info.absoluteFilePath() + QLatin1Char('|') + QString::number(info.size())
+            + QLatin1Char('|') + QString::number(info.lastModified().toMSecsSinceEpoch());
+        QMutexLocker locker(&cacheMutex);
+        const auto it = cache.constFind(cacheKey);
+        if (it != cache.constEnd())
+            return it.value();
+    }
+
+    gProbeVideoStreamFpsOpens.fetch_add(1, std::memory_order_relaxed);
     AVFormatContext *format = nullptr;
-    if (filePath.isEmpty() || filePath.startsWith(QStringLiteral("veditor://"))
-        || avformat_open_input(&format, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+    if (avformat_open_input(&format, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
         return fps;
     if (avformat_find_stream_info(format, nullptr) >= 0) {
         for (unsigned i = 0; i < format->nb_streams; ++i) {
@@ -79,6 +109,10 @@ double probeVideoStreamFps(const QString &filePath)
         }
     }
     avformat_close_input(&format);
+    if (!cacheKey.isEmpty()) {
+        QMutexLocker locker(&cacheMutex);
+        cache.insert(cacheKey, fps);
+    }
     return fps;
 }
 

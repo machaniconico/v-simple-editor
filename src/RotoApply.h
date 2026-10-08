@@ -26,12 +26,18 @@ QImage applyEntryForRender(const RotoClipEntry &entry, const QImage &frame,
 // Test counter: number of applyEntryForRender calls in this process.
 quint64 renderApplyCallCount();
 
+// Test counter: number of avformat_open_input calls made by
+// probeVideoStreamFps in this process (cache misses on a real file path).
+quint64 probeVideoStreamFpsOpenCount();
+
 // Test hook: sourceFrameIndex of the latest applyEntryForRender call.
 int lastRenderSourceFrameIndex();
 
 // First video stream's av_guess_frame_rate (the preview's probeVideoSourceInfo
 // rate); 0 when the file has none, cannot be opened or is generated
-// (veditor://). Feed it to clipEffectiveSourceFps for the fallback.
+// (veditor://). Cached per absolute path + size + mtime of an existing file
+// (thread-safe); failed opens are not cached. Feed it to
+// clipEffectiveSourceFps for the fallback.
 double probeVideoStreamFps(const QString &filePath);
 
 // Per-pixel max of two masks as Format_Grayscale8; b is scaled to a's size.

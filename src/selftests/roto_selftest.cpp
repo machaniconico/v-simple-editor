@@ -449,18 +449,19 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
+    constexpr int kRotoGateCount = 26;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
     QString unavailable;
     if (!media.isValid() || !selftest::requireEncoder(QStringLiteral("mpeg4"), &unavailable)) {
-        for (int gate = 1; gate <= 25; ++gate)
+        for (int gate = 1; gate <= kRotoGateCount; ++gate)
             gates.skip(gate, media.isValid() ? "mpeg4 fixture encoder unavailable"
                                              : "temporary directory unavailable");
         return gates.finish("roto");
     }
     if (!writeSyntheticClip(gSyntheticClipPath)) {
-        for (int gate = 1; gate <= 25; ++gate)
+        for (int gate = 1; gate <= kRotoGateCount; ++gate)
             gates.gate(gate, false, "mpeg4 fixture creation failed");
         return gates.finish("roto");
     }
@@ -1898,6 +1899,60 @@ int runRotoSelftest()
                   << " g22Predicate=" << predicate << " staleDetected=" << stale
                   << " | noSource ignored=" << ignored << " untouched=" << untouched << '\n';
         gates.gate(25, stale && untouched, "negative control did not discriminate");
+    }
+
+    // ── G26 (US-913): the renderer's roto fps probe is cached. G26 detects
+    // roto::probeVideoStreamFps reopening the media on every rendered roto frame
+    // (open-count delta == frames instead of <= 1) or a cached fps that differs
+    // from a real probe. Control: changing the file's mtime re-keys the cache, so
+    // the next probe really opens (open delta 1) and gives the uncached value.
+    {
+        const QString fpsClipPath = media.filePath(QStringLiteral("roto-g26-fps.mp4"));
+        const bool fpsReady = writeSyntheticClip(fpsClipPath, QColor(40, 160, 90));
+        ClipInfo fpsClip = clip(260);
+        fpsClip.filePath = fpsClipPath;
+        Timeline fpsTimeline;
+        fpsTimeline.restoreFromProject(oneTrack({fpsClip}), QVector<QVector<ClipInfo>>{},
+                                       0.0, -1.0, -1.0, 100);
+        fpsTimeline.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+        const quint64 opensBefore = roto::probeVideoStreamFpsOpenCount();
+        const quint64 appliesBefore = roto::renderApplyCallCount();
+        int frames = 0;
+        double lastSec = 0.0;
+        for (int i = 0; i < 6; ++i) {
+            lastSec = 0.12 + 0.2 * i;
+            if (!renderAt(&fpsTimeline, lastSec).isNull())
+                ++frames;
+        }
+        const quint64 openDelta = roto::probeVideoStreamFpsOpenCount() - opensBefore;
+        const quint64 applyDelta = roto::renderApplyCallCount() - appliesBefore;
+        const int lastIndex = roto::lastRenderSourceFrameIndex();
+        const quint64 opensBeforeCached = roto::probeVideoStreamFpsOpenCount();
+        const double cachedFps = roto::probeVideoStreamFps(fpsClipPath);
+        const quint64 cachedOpens = roto::probeVideoStreamFpsOpenCount() - opensBeforeCached;
+
+        QFile touch(fpsClipPath);
+        const QDateTime mtime = QFileInfo(fpsClipPath).lastModified();
+        const bool touched = touch.open(QIODevice::ReadWrite | QIODevice::ExistingOnly)
+            && touch.setFileTime(mtime.addSecs(-60), QFileDevice::FileModificationTime);
+        touch.close();
+        const quint64 opensBeforeUncached = roto::probeVideoStreamFpsOpenCount();
+        const double uncachedFps = roto::probeVideoStreamFps(fpsClipPath);
+        const quint64 uncachedOpens = roto::probeVideoStreamFpsOpenCount() - opensBeforeUncached;
+        const long long expectedLastIndex = std::llround(lastSec * uncachedFps);
+
+        std::cerr << "G26 frames=" << frames << " openDelta=" << openDelta
+                  << " renderApplyDelta=" << applyDelta << " cachedFps=" << cachedFps
+                  << " cachedProbeOpens=" << cachedOpens << " uncachedFps=" << uncachedFps
+                  << " uncachedProbeOpens=" << uncachedOpens << " touched=" << touched
+                  << " lastSourceFrameIndex=" << lastIndex << " expected=" << expectedLastIndex
+                  << " (timelineSec=localSec=sourceSec=" << lastSec << ") fpsReady=" << fpsReady
+                  << '\n';
+        gates.gate(26, fpsReady && frames >= 5 && openDelta <= 1
+                       && applyDelta == quint64(frames) && cachedOpens == 0
+                       && touched && uncachedOpens == 1 && std::abs(uncachedFps - 10.0) < 0.01
+                       && cachedFps == uncachedFps && lastIndex == expectedLastIndex,
+                   "roto fps probe reopened the media per frame or the cached fps differs from a real probe");
     }
     return gates.finish("roto");
 }
