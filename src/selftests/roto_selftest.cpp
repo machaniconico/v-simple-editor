@@ -29,6 +29,9 @@
 #include <QFileInfo>
 #include <QSet>
 #include <QSignalSpy>
+#include <QCoreApplication>
+#include <QDropEvent>
+#include <QMimeData>
 #include <iostream>
 
 namespace {
@@ -348,6 +351,100 @@ bool writeTone(const QString &path)
     return out.status() == QDataStream::Ok && file.flush();
 }
 
+// G22-G25 (US-915) fixture: V1 [100], V2 [10 @0 s, 11 @3 s, 12 @6 s],
+// V3 [20 @0 s, 21 @6 s], every clip 2 s. Dropping V2:1 on V3 at 3 s lands at
+// V3 index 1. Roto markers 1..5 sit on V2:0 / V2:1 / V2:2 / V3:0 / V3:1,
+// parents are V3:0 -> V2:2 and V2:1 -> V3:1, Timeline-side mattes sit on
+// V2:1 / V3:1. linked: V2:1 keeps linkGroup 12 and its audio partner is on A1.
+void seedCrossDrop(Timeline &tl, bool linked)
+{
+    auto at = [](int id, double leadInSec) {
+        ClipInfo c = clip(id);
+        c.leadInSec = leadInSec;
+        return c;
+    };
+    ClipInfo moved = at(11, 1.0);
+    if (!linked) moved.linkGroup = 0;
+    const QVector<QVector<ClipInfo>> video{
+        {clip(100)}, {at(10, 0.0), moved, at(12, 1.0)}, {at(20, 0.0), at(21, 4.0)}};
+    QVector<QVector<ClipInfo>> audio{{}};
+    if (linked) audio[0].append(at(11, 3.0));
+    tl.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+    QHash<QString, RotoClipEntry> rotos;
+    const QStringList rotoKeys{QStringLiteral("1:0"), QStringLiteral("1:1"),
+                               QStringLiteral("1:2"), QStringLiteral("2:0"),
+                               QStringLiteral("2:1")};
+    for (int i = 0; i < rotoKeys.size(); ++i)
+        rotos.insert(rotoKeys[i], entry(i + 1, i == 1));
+    tl.setRotoEntries(rotos);
+    QHash<QString, QString> parents;
+    parents.insert(QStringLiteral("2:0"), QStringLiteral("1:2"));
+    parents.insert(QStringLiteral("1:1"), QStringLiteral("2:1"));
+    tl.setClipParentEntries(parents);
+    QHash<QString, TimelineTrackMatteEntry> mattes;
+    TimelineTrackMatteEntry m;
+    m.matteType = TrackMatteType::AlphaMatte;
+    m.matteSourceClipId = QStringLiteral("0:0");
+    mattes.insert(QStringLiteral("1:1"), m);
+    mattes.insert(QStringLiteral("2:1"), m);
+    tl.setTrackMatteEntries(mattes);
+}
+
+// "key=marker" sorted, so a key that kept the wrong payload is visible.
+QString rotoLayout(const QHash<QString, RotoClipEntry> &entries)
+{
+    QStringList out;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        out.append(it.key() + QLatin1Char('=') + QString::number(it.value().path.points.size()));
+    out.sort();
+    return out.join(QLatin1Char(','));
+}
+
+QString parentLayout(const QHash<QString, QString> &entries)
+{
+    QStringList out;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        out.append(it.key() + QLatin1Char('>') + it.value());
+    out.sort();
+    return out.join(QLatin1Char(','));
+}
+
+// Sends a synthetic QDropEvent ("srcIdx:0" payload) to dest at dropTimelineSec.
+// Qt 6 resolves QDropEvent::source() only through an active QDrag, so the
+// source track is supplied through TimelineTrack's selftest seam.
+bool driveCrossDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest,
+                    double dropTimelineSec, bool useSeam, bool *qtSourceNull)
+{
+    QMimeData mime;
+    mime.setData(QStringLiteral("application/x-vse-clip"),
+                 QByteArray::number(srcIdx) + QByteArray(":0"));
+    const QPointF pos(dropTimelineSec * dest->pixelsPerSecond(), 4.0);
+    const double clipDurSec = srcIdx < src->clipCount()
+        ? src->clips()[srcIdx].effectiveDuration() : -1.0;
+    const auto plan = dest->planDrop(dropTimelineSec, clipDurSec);
+    QDropEvent event(pos, Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
+    event.ignore();
+    if (qtSourceNull) *qtSourceNull = event.source() == nullptr;
+    TimelineTrack::setSelftestDropSource(useSeam ? src : nullptr);
+    // QApplication::notify does not deliver a Drop outside an active QDrag, so
+    // dispatch through the virtual QObject::event (QWidget::event -> dropEvent).
+    static_cast<QObject *>(dest)->event(&event);
+    TimelineTrack::setSelftestDropSource(nullptr);
+    std::cerr << "  drop srcIdx=" << srcIdx << " timelineSec=" << dropTimelineSec
+              << " x=" << pos.x() << " pps=" << dest->pixelsPerSecond()
+              << " clipDurSec=" << clipDurSec << " planValid=" << plan.valid
+              << " insertIdx=" << plan.insertIdx << " seam=" << useSeam
+              << " accepted=" << event.isAccepted() << '\n';
+    return event.isAccepted();
+}
+
+bool droppedIntoV3(const Timeline &tl)
+{
+    const auto v2 = tl.videoTracks()[1]->clips();
+    const auto v3 = tl.videoTracks()[2]->clips();
+    return v2.size() == 2 && v3.size() == 3 && v3[1].displayName == QStringLiteral("11");
+}
+
 } // namespace
 
 int runRotoSelftest()
@@ -357,13 +454,13 @@ int runRotoSelftest()
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
     QString unavailable;
     if (!media.isValid() || !selftest::requireEncoder(QStringLiteral("mpeg4"), &unavailable)) {
-        for (int gate = 1; gate <= 21; ++gate)
+        for (int gate = 1; gate <= 25; ++gate)
             gates.skip(gate, media.isValid() ? "mpeg4 fixture encoder unavailable"
                                              : "temporary directory unavailable");
         return gates.finish("roto");
     }
     if (!writeSyntheticClip(gSyntheticClipPath)) {
-        for (int gate = 1; gate <= 21; ++gate)
+        for (int gate = 1; gate <= 25; ++gate)
             gates.gate(gate, false, "mpeg4 fixture creation failed");
         return gates.finish("roto");
     }
@@ -1665,6 +1762,142 @@ int runRotoSelftest()
             g21 = g21 && f;
         }
         gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose limitation mismatch");
+    }
+
+    // ── G22-G25 (US-915): cross-track drop through TimelineTrack::dropEvent.
+    // Map: 1:1 -> 2:1 (moved), 1:2 -> 1:1 (src shift), 2:1 -> 2:2 (dest shift),
+    // 1:0 / 2:0 fixed. The matte carrier is intentionally not remapped.
+    const QString crossRotoBefore = QStringLiteral("1:0=1,1:1=2,1:2=3,2:0=4,2:1=5");
+    const QString crossRotoAfter = QStringLiteral("1:0=1,1:1=3,2:0=4,2:1=2,2:2=5");
+    const QString crossParentBefore = QStringLiteral("1:1>2:1,2:0>1:2");
+    const QString crossParentAfter = QStringLiteral("2:0>1:1,2:1>2:2");
+    const QString crossMatte = QStringLiteral("1:1,2:1");
+    std::cerr << "G22 map V2:1(1:1)->V3:1(2:1) V2:2(1:2)->V2:1(1:1) V3:1(2:1)->V3:2(2:2)"
+                 " fixed V2:0(1:0) V3:0(2:0)\n";
+    auto crossMapped = [&](const Timeline &tl, const char *label) {
+        const auto rotos = tl.rotoEntries();
+        const QString roto = rotoLayout(rotos);
+        const QString parent = parentLayout(tl.clipParentEntries());
+        const QString matte = show(keys(tl.trackMatteEntries()));
+        const bool ok = droppedIntoV3(tl) && roto == crossRotoAfter && invariant(rotos)
+            && parent == crossParentAfter && matte == crossMatte;
+        std::cerr << label << " moved=" << droppedIntoV3(tl)
+                  << " roto=" << roto.toStdString() << " (expected " << crossRotoAfter.toStdString() << ")"
+                  << " clipIdOk=" << invariant(rotos)
+                  << " parent=" << parent.toStdString() << " (expected " << crossParentAfter.toStdString() << ")"
+                  << " matte=" << matte.toStdString() << " (unchanged " << crossMatte.toStdString() << ")"
+                  << " marker2At=" << whereMarker(rotos, 2).toStdString() << " -> " << ok << '\n';
+        return ok;
+    };
+
+    // G22 detects an unlinked cross-track drop that leaves roto / parent keys on
+    // the pre-drop indices (HEAD emitted no signal for linkGroup 0).
+    {
+        Timeline tl;
+        seedCrossDrop(tl, false);
+        const QString rotoPre = rotoLayout(tl.rotoEntries());
+        const QString parentPre = parentLayout(tl.clipParentEntries());
+        bool qtSourceNull = false;
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, tl.videoTracks()[2], 3.0,
+                                             true, &qtSourceNull);
+        std::cerr << "G22 before roto=" << rotoPre.toStdString()
+                  << " parent=" << parentPre.toStdString()
+                  << " linkGroup=" << tl.videoTracks()[2]->clips().value(1).linkGroup
+                  << " accepted=" << accepted << " qtSourceNull=" << qtSourceNull << '\n';
+        const bool mapped = crossMapped(tl, "G22 after");
+        gates.gate(22, rotoPre == crossRotoBefore && parentPre == crossParentBefore
+                           && accepted && mapped,
+                   "unlinked cross-track drop did not remap roto / parent keys");
+    }
+
+    // G23 detects the linked path re-aligning roto / parent after the audio
+    // partner move (handleCrossTrackLinkedDrop) and losing the explicit map.
+    {
+        Timeline tl;
+        seedCrossDrop(tl, true);
+        TimelineTrack *dest = tl.videoTracks()[2];
+        QString rotoAtSignal, parentAtSignal;
+        QObject::connect(dest, &TimelineTrack::clipMovedAcrossTracks, &tl,
+            [&](TimelineTrack *, int, int) {
+                rotoAtSignal = rotoLayout(tl.rotoEntries());
+                parentAtSignal = parentLayout(tl.clipParentEntries());
+            });
+        QSignalSpy linkedSpy(dest, &TimelineTrack::crossTrackDropped);
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, dest, 3.0, true, nullptr);
+        int partnerTrack = -1;
+        for (int t = 0; t < tl.audioTracks().size(); ++t)
+            for (const ClipInfo &c : tl.audioTracks()[t]->clips())
+                if (c.linkGroup == clip(11).linkGroup) partnerTrack = t;
+        const bool mapped = crossMapped(tl, "G23 after-partner");
+        const bool stable = rotoAtSignal == rotoLayout(tl.rotoEntries())
+            && parentAtSignal == parentLayout(tl.clipParentEntries());
+        std::cerr << "G23 accepted=" << accepted << " crossTrackDropped=" << linkedSpy.count()
+                  << " partnerAudioTrack=" << partnerTrack << " (expected 2, from 0)"
+                  << " rotoAtSignal=" << rotoAtSignal.toStdString()
+                  << " parentAtSignal=" << parentAtSignal.toStdString()
+                  << " stableAfterPartnerMove=" << stable << '\n';
+        gates.gate(23, accepted && linkedSpy.count() == 1 && partnerTrack == 2 && mapped && stable,
+                   "linked cross-track drop map differs or partner move changed roto / parent keys");
+    }
+
+    // G24 Step 0: a cross-track drop pushes no undo entry (TimelineTrack::
+    // mouseMoveEvent returns after drag->exec without interactionCompleted;
+    // modified -> onTrackModified does not save). The gate prints the save
+    // point and checks that the next save captures the remapped keys: undo
+    // returns to the pre-drop keys and redo re-applies the map.
+    {
+        Timeline tl;
+        seedCrossDrop(tl, false);
+        tl.undoManager()->clear();
+        tl.undoManager()->saveState(tl.currentState(), QStringLiteral("基準"));
+        const quint64 serialBefore = tl.undoManager()->saveSerial();
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, tl.videoTracks()[2], 3.0,
+                                             true, nullptr);
+        const quint64 serialAfter = tl.undoManager()->saveSerial();
+        const bool undoPoint = serialAfter != serialBefore;
+        if (!undoPoint) tl.saveUndoState(QStringLiteral("cross-track drop (selftest save)"));
+        tl.undo();
+        const QString rotoUndo = rotoLayout(tl.rotoEntries());
+        const QString parentUndo = parentLayout(tl.clipParentEntries());
+        const int v2Undo = tl.videoTracks()[1]->clipCount();
+        tl.redo();
+        const bool redoMapped = crossMapped(tl, "G24 redo");
+        const bool undoOk = rotoUndo == crossRotoBefore && parentUndo == crossParentBefore && v2Undo == 3;
+        std::cerr << "G24 undoPoint=" << (undoPoint ? tl.undoManager()->undoDescription().toStdString()
+                                                   : std::string("none"))
+                  << " saveSerial " << serialBefore << "->" << serialAfter
+                  << " accepted=" << accepted << " undo roto=" << rotoUndo.toStdString()
+                  << " parent=" << parentUndo.toStdString() << " v2Clips=" << v2Undo
+                  << " undoOk=" << undoOk << '\n';
+        gates.gate(24, accepted && undoOk && redoMapped,
+                   "drop undo / redo did not restore and re-apply the roto / parent keys");
+    }
+
+    // G25 negative controls: (a) without the new signal connection the same drop
+    // keeps the pre-drop keys, so the G22 predicate fails; (b) without a source
+    // the drop is ignored, so G22 really goes through dropEvent's source check.
+    // The production mutation (connection removed) is logged separately in
+    // .omc/state/ralph4-results/US-915-mutation.txt.
+    {
+        Timeline tl;
+        seedCrossDrop(tl, false);
+        QObject::disconnect(tl.videoTracks()[2], &TimelineTrack::clipMovedAcrossTracks, &tl, nullptr);
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, tl.videoTracks()[2], 3.0,
+                                             true, nullptr);
+        const QString roto = rotoLayout(tl.rotoEntries());
+        const bool predicate = crossMapped(tl, "G25 disconnected");
+        const bool stale = accepted && droppedIntoV3(tl) && roto == crossRotoBefore && !predicate;
+        Timeline noSource;
+        seedCrossDrop(noSource, false);
+        const bool ignored = !driveCrossDrop(noSource.videoTracks()[1], 1,
+                                             noSource.videoTracks()[2], 3.0, false, nullptr);
+        const bool untouched = ignored && noSource.videoTracks()[1]->clipCount() == 3
+            && rotoLayout(noSource.rotoEntries()) == crossRotoBefore;
+        std::cerr << "G25 disconnected accepted=" << accepted << " roto=" << roto.toStdString()
+                  << " marker2At=" << whereMarker(tl.rotoEntries(), 2).toStdString()
+                  << " g22Predicate=" << predicate << " staleDetected=" << stale
+                  << " | noSource ignored=" << ignored << " untouched=" << untouched << '\n';
+        gates.gate(25, stale && untouched, "negative control did not discriminate");
     }
     return gates.finish("roto");
 }

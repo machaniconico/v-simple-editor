@@ -611,6 +611,11 @@ public:
 
     void setTimeline(Timeline *t) { m_timeline = t; }
 
+    // Selftest seam: Qt 6 resolves QDropEvent::source() only through an active
+    // QDrag, so a synthetic drop has no source. dropEvent falls back to this
+    // track when source() is null. Production never sets it (nullptr).
+    static void setSelftestDropSource(TimelineTrack *src);
+
 signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
@@ -637,6 +642,9 @@ signals:
     void linkedTrimFinished();
     void linkedTrimCancelled();
     void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
+    // Emitted by dropEvent after every cross-track move (linked or not) and
+    // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
+    void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
     void effectDropped(const QString &entryId, int clipIndex);
 
 protected:
@@ -1577,6 +1585,13 @@ private:
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+    // Explicit index map for one clip moved between tracks by dropEvent:
+    // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
+    // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
+    // -1 for an audio track (not keyed). Applies to roto and clip-parent
+    // entries only; the matte carrier is overwritten by MainWindow's copy.
+    void remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
+                                          int destTrackIdx, int destIdx);
 
     // Snap line visual feedback
     int m_snapLineX = -1;

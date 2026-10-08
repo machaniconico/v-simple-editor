@@ -3489,6 +3489,13 @@ static int parseDropPayload(const QByteArray &payload, int &grabOffsetPx)
     return srcIdx;
 }
 
+static TimelineTrack *s_selftestDropSource = nullptr;
+
+void TimelineTrack::setSelftestDropSource(TimelineTrack *src)
+{
+    s_selftestDropSource = src;
+}
+
 void TimelineTrack::dragEnterEvent(QDragEnterEvent *event)
 {
     if (event->mimeData()->hasFormat("application/x-vse-clip")
@@ -3574,6 +3581,7 @@ void TimelineTrack::dropEvent(QDropEvent *event)
         return;
     }
     auto *src = qobject_cast<TimelineTrack *>(event->source());
+    if (!src) src = s_selftestDropSource;
     if (!src || src == this) {
         event->ignore();
         return;
@@ -3604,6 +3612,10 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
 
     event->acceptProposedAction();
+
+    // Every cross-track move changes clip keys on both tracks; Timeline remaps
+    // the carriers before any linked-partner move below.
+    emit clipMovedAcrossTracks(src, srcIdx, plan.insertIdx);
 
     // Notify Timeline to move linked partners (V↔A) to the corresponding track.
     // Pass the absolute drop time so Timeline can place the partner at the same position.
@@ -11369,6 +11381,11 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         applyLinkedTrimDelta(0.0);
         m_linkedTrimPartners.clear();
     });
+    connect(track, &TimelineTrack::clipMovedAcrossTracks, this,
+        [this, track](TimelineTrack *src, int srcIdx, int destIdx) {
+            remapCarriersAfterCrossTrackMove(m_videoTracks.indexOf(src), srcIdx,
+                                             m_videoTracks.indexOf(track), destIdx);
+        });
     connect(track, &TimelineTrack::crossTrackDropped, this,
         [this, track](int /*insertIdx*/, int linkGroup, double dropTime) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime);
@@ -11649,6 +11666,51 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
             return;  // Only one partner per linkGroup on the other track type
         }
+    }
+}
+
+void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
+                                                int destTrackIdx, int destIdx)
+{
+    if (srcTrackIdx < 0 && destTrackIdx < 0) return;   // audio -> audio: no keys
+    // Called after the move: the source track lost one clip, the destination
+    // gained one. An empty value drops the key (a video clip moved to audio).
+    QHash<QString, QString> oldToNew;
+    if (srcTrackIdx >= 0) {
+        const int oldCount = m_videoTracks[srcTrackIdx]->clipCount() + 1;
+        for (int i = srcIdx + 1; i < oldCount; ++i)
+            oldToNew.insert(trackMatteClipKey(srcTrackIdx, i),
+                            trackMatteClipKey(srcTrackIdx, i - 1));
+        oldToNew.insert(trackMatteClipKey(srcTrackIdx, srcIdx),
+                        destTrackIdx >= 0 ? trackMatteClipKey(destTrackIdx, destIdx)
+                                          : QString());
+    }
+    if (destTrackIdx >= 0) {
+        const int oldCount = m_videoTracks[destTrackIdx]->clipCount() - 1;
+        for (int i = destIdx; i < oldCount; ++i)
+            oldToNew.insert(trackMatteClipKey(destTrackIdx, i),
+                            trackMatteClipKey(destTrackIdx, i + 1));
+    }
+    const auto rotoBefore = rotoEntries();
+    if (!rotoBefore.isEmpty()) {
+        QHash<QString, RotoClipEntry> rebuilt;
+        rebuilt.reserve(rotoBefore.size());
+        for (auto it = rotoBefore.cbegin(); it != rotoBefore.cend(); ++it) {
+            const QString newKey = oldToNew.value(it.key(), it.key());
+            if (!newKey.isEmpty()) rebuilt.insert(newKey, it.value());
+        }
+        commitRotoEntries(std::move(rebuilt), true);
+    }
+    if (!m_clipParentEntries.isEmpty()) {
+        QHash<QString, QString> rebuilt;
+        rebuilt.reserve(m_clipParentEntries.size());
+        for (auto it = m_clipParentEntries.cbegin(); it != m_clipParentEntries.cend(); ++it) {
+            const QString newChild = oldToNew.value(it.key(), it.key());
+            const QString newParent = oldToNew.value(it.value(), it.value());
+            if (!newChild.isEmpty() && !newParent.isEmpty() && newChild != newParent)
+                rebuilt.insert(newChild, newParent);
+        }
+        m_clipParentEntries = rebuilt;
     }
 }
 
