@@ -5,6 +5,7 @@
 #include "../UndoManager.h"
 #include "../RenderInPlace.h"
 #include "../libavcore/AudioExtract.h"
+#include "SelftestGate.h"
 
 #include <QApplication>
 #include <QAction>
@@ -15,6 +16,7 @@
 #include <QSlider>
 #include <QTemporaryDir>
 #include <QTest>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -121,15 +123,23 @@ double pcmEnergy(const QByteArray &pcm)
     return sum / 35200.0;
 }
 bool near(double a, double b) { return std::abs(a - b) < 1e-9; }
+
+// G6 forwards every message to the handler main() installed, counting the
+// wildcard-disconnect warnings on the way so the gate proves they reached it.
+QtMessageHandler g_productionHandler = nullptr;
+std::atomic<int> g_wildcardWarnings{0};
+void countWildcardWarning(QtMsgType type, const QMessageLogContext &context, const QString &message)
+{
+    if (message.contains(QLatin1String("wildcard call disconnects from destroyed signal")))
+        ++g_wildcardWarnings;
+    g_productionHandler(type, context, message);
+}
 }
 
 int runMixerDockSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int n, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", n);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
 
     {
         auto mixer = std::make_unique<AudioMixer>();
@@ -300,6 +310,36 @@ int runMixerDockSelftest()
         gate(5, sourceOk && synchronized && hidden && noWrites && stateSame && undoSame
              && pcmEnergy(beforeDock) > 0.001 && pcmEnergy(actual) > 0.001 && pcmSame);
     }
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    {
+        // Qt reports a wildcard disconnect of a connected destroyed() signal
+        // (Timeline::remapTrackIndices: track->disconnect()) while it holds the
+        // sender's signal/slot pool mutex. The installed message handler must not
+        // take a pool mutex itself (QTextStream connects its device): with this
+        // many distinct sender addresses one of them shares the handler's pool
+        // slot, so such a handler hangs here (watchdog TIMEOUT) instead of passing.
+        constexpr int kSenders = 400;
+        QObject context;
+        std::vector<std::unique_ptr<QObject>> senders;
+        std::vector<QMetaObject::Connection> connections;
+        for (int i = 0; i < kSenders; ++i) {
+            senders.push_back(std::make_unique<QObject>());
+            connections.push_back(QObject::connect(senders.back().get(), &QObject::destroyed,
+                                                   &context, [] {}));
+        }
+        int connected = 0;
+        for (const auto &connection : connections) connected += bool(connection) ? 1 : 0;
+        g_productionHandler = qInstallMessageHandler(nullptr);
+        const bool handlerInstalled = g_productionHandler != nullptr;
+        if (handlerInstalled) qInstallMessageHandler(countWildcardWarning);
+        g_wildcardWarnings = 0;
+        for (const auto &sender : senders) sender->disconnect();
+        qInstallMessageHandler(g_productionHandler);
+        int stillConnected = 0;
+        for (const auto &connection : connections) stillConnected += QObject::disconnect(connection) ? 1 : 0;
+        std::fprintf(stderr, "mixer-dock handler-lock: senders=%d connected=%d handlerInstalled=%d warnings=%d stillConnected=%d\n",
+                     kSenders, connected, int(handlerInstalled), g_wildcardWarnings.load(), stillConnected);
+        gate(6, handlerInstalled && connected == kSenders && g_wildcardWarnings == kSenders
+             && stillConnected == 0);
+    }
+    return tally.finish("mixer-dock");
 }

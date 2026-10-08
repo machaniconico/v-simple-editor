@@ -1057,7 +1057,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "deesser", nullptr, runDeEsserSelftest, true,
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence, live dock, seek counter, dock follows project/track changes (8 gates)" },
     { "mixer-dock", nullptr, runMixerDockSelftest, true,
-      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity (5 gates)" },
+      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (6 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
