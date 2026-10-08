@@ -13,7 +13,8 @@ param(
 
     # Executable to loop; pass a copy outside build/ so the loop does not hold
     # the shared build directory while other lanes rebuild it.
-    [string]$ExePath = '',
+    [Parameter(Mandatory = $true)]
+    [string]$ExePath,
 
     [Parameter(Mandatory = $true)]
     [string]$OutDir,
@@ -31,10 +32,10 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-if ($ExePath -eq '') {
-    $ExePath = Join-Path $repoRoot 'build\Release\v-simple-editor.exe'
-}
 $ExePath = [System.IO.Path]::GetFullPath($ExePath)
+if ($ExePath.StartsWith((Join-Path $repoRoot 'build\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "ExePath is inside build\: $ExePath. Copy the exe outside build\ or use a separate build dir so the loop does not hold the shared build (common rule 25)."
+}
 if (-not (Test-Path -LiteralPath $ExePath -PathType Leaf)) {
     throw "Executable not found: $ExePath"
 }
