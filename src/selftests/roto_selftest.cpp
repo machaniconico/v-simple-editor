@@ -12,6 +12,10 @@
 #include "../MainWindow.h"
 #include "../RotoApply.h"
 #include "../libavcore/FrameGrab.h"
+#include "../TimelineFrameRenderer.h"
+#include "../SmartRender.h"
+#include "../RenderInPlace.h"
+#include "../VideoEffect.h"
 #include <cmath>
 #include <atomic>
 #include <functional>
@@ -19,7 +23,10 @@
 #include <QMutex>
 #include <QJsonDocument>
 #include <QTemporaryDir>
+#include <QDataStream>
+#include <QStandardPaths>
 #include <QFile>
+#include <QFileInfo>
 #include <QSet>
 #include <QSignalSpy>
 #include <iostream>
@@ -28,7 +35,7 @@ namespace {
 
 QString gSyntheticClipPath;
 
-bool writeSyntheticClip(const QString &path)
+bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80, 160))
 {
     libavcore::EncodeRequest request;
     request.width = 64;
@@ -44,7 +51,7 @@ bool writeSyntheticClip(const QString &path)
     libavcore::FrameEncoder encoder;
     if (encoder.open(request)) return false;
     QImage frame(64, 64, QImage::Format_RGB888);
-    frame.fill(QColor(32, 80, 160));
+    frame.fill(color);
     for (int i = 0; i < 20; ++i)
         if (!encoder.pushFrame(frame, i)) return false;
     return !encoder.finalize().has_value() && QFile::exists(path);
@@ -265,6 +272,82 @@ QString layoutSignature(const Timeline *tl)
     return parts.join(QLatin1Char(' '));
 }
 
+// G13-G21 (renderer roto). Per-pixel comparison in premultiplied ARGB over the
+// pixels selected by `region`: diffPixels counts channel differences > 2.
+struct RegionDiff {
+    int pixels = 0;
+    int diffPixels = 0;
+    int maxDiff = 255;
+};
+
+template <typename RegionFn>
+RegionDiff regionDiff(const QImage &a, const QImage &b, RegionFn region)
+{
+    RegionDiff d;
+    if (a.isNull() || b.isNull() || a.size() != b.size()) return d;
+    const QImage pa = a.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const QImage pb = b.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    d.maxDiff = 0;
+    for (int y = 0; y < pa.height(); ++y) {
+        const QRgb *la = reinterpret_cast<const QRgb *>(pa.constScanLine(y));
+        const QRgb *lb = reinterpret_cast<const QRgb *>(pb.constScanLine(y));
+        for (int x = 0; x < pa.width(); ++x) {
+            if (!region(x, y)) continue;
+            ++d.pixels;
+            const int diff = qMax(qMax(qAbs(qRed(la[x]) - qRed(lb[x])), qAbs(qGreen(la[x]) - qGreen(lb[x]))),
+                                  qMax(qAbs(qBlue(la[x]) - qBlue(lb[x])), qAbs(qAlpha(la[x]) - qAlpha(lb[x]))));
+            if (diff > 2) ++d.diffPixels;
+            d.maxDiff = qMax(d.maxDiff, diff);
+        }
+    }
+    return d;
+}
+
+std::string showDiff(const RegionDiff &d)
+{
+    return "pixels=" + std::to_string(d.pixels) + " diffPixels=" + std::to_string(d.diffPixels)
+        + " maxDiff=" + std::to_string(d.maxDiff);
+}
+
+// Mean BT.601 luma of the opaque-flattened pixels selected by `region`
+// (-1 when the image is null or the region is empty).
+template <typename RegionFn>
+double meanLuma(const QImage &image, RegionFn region)
+{
+    if (image.isNull()) return -1.0;
+    const QImage rgb = image.convertToFormat(QImage::Format_RGB32);
+    double sum = 0.0;
+    int count = 0;
+    for (int y = 0; y < rgb.height(); ++y) {
+        for (int x = 0; x < rgb.width(); ++x) {
+            if (!region(x, y)) continue;
+            const QRgb p = rgb.pixel(x, y);
+            sum += 0.299 * qRed(p) + 0.587 * qGreen(p) + 0.114 * qBlue(p);
+            ++count;
+        }
+    }
+    return count ? sum / count : -1.0;
+}
+
+bool writeTone(const QString &path)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return false;
+    QDataStream out(&file);
+    out.setByteOrder(QDataStream::LittleEndian);
+    constexpr quint32 frames = 8 * 48000;
+    out.writeRawData("RIFF", 4);
+    out << quint32(36 + frames * 2);
+    out.writeRawData("WAVEfmt ", 8);
+    out << quint32(16) << quint16(1) << quint16(1) << quint32(48000)
+        << quint32(96000) << quint16(2) << quint16(16);
+    out.writeRawData("data", 4);
+    out << quint32(frames * 2);
+    for (quint32 i = 0; i < frames; ++i)
+        out << qint16(std::lround(8192.0 * std::sin(6.283185307179586 * 440.0 * i / 48000.0)));
+    return out.status() == QDataStream::Ok && file.flush();
+}
+
 } // namespace
 
 int runRotoSelftest()
@@ -274,13 +357,13 @@ int runRotoSelftest()
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
     QString unavailable;
     if (!media.isValid() || !selftest::requireEncoder(QStringLiteral("mpeg4"), &unavailable)) {
-        for (int gate = 1; gate <= 12; ++gate)
+        for (int gate = 1; gate <= 21; ++gate)
             gates.skip(gate, media.isValid() ? "mpeg4 fixture encoder unavailable"
                                              : "temporary directory unavailable");
         return gates.finish("roto");
     }
     if (!writeSyntheticClip(gSyntheticClipPath)) {
-        for (int gate = 1; gate <= 12; ++gate)
+        for (int gate = 1; gate <= 21; ++gate)
             gates.gate(gate, false, "mpeg4 fixture creation failed");
         return gates.finish("roto");
     }
@@ -979,5 +1062,609 @@ int runRotoSelftest()
         && keys(afterClearUndo) == seeded && restored.clipId == QStringLiteral("1:1")
         && restored.path.points.size() == 2 && restored.brushMask.size() == QSize(3, 2);
     gates.gate(12, g12, "empty roto entry not removed from the carrier or not undoable");
+
+    // ── G13-G21 (US-908): roto in tlrender::renderFrameAt, Smart Render and
+    // RenderInPlace. outSize = the 64x64 fixture resolution, no proxy.
+    const QSize frameSize(64, 64);
+    const auto renderAt = [&](const Timeline *tl, double timelineSec) {
+        return tlrender::renderFrameAt(tl, qRound64(timelineSec * 1000000.0), frameSize);
+    };
+    const auto oneTrack = [](const QVector<ClipInfo> &clips) {
+        return QVector<QVector<ClipInfo>>{clips};
+    };
+    const auto rotoAt = [](const QString &key, const RotoClipEntry &value) {
+        QHash<QString, RotoClipEntry> entries;
+        entries.insert(key, value);
+        return entries;
+    };
+    RotoClipEntry hardRect;
+    hardRect.path = rectPath(16, 16, 48, 48);
+    const auto insideRect = [](int x, int y) { return inRect(x, y, 18, 18, 46, 46); };
+    const auto outsideRect = [](int x, int y) { return !inRect(x, y, 14, 14, 50, 50); };
+    const auto everyPixel = [](int, int) { return true; };
+    const QString redClipPath = media.filePath(QStringLiteral("roto-synthetic-red.mp4"));
+    const bool redReady = writeSyntheticClip(redClipPath, QColor(200, 60, 40));
+
+    // G13 detects a missing, inverted or shifted roto stage on the V1 layer
+    // of renderFrameAt (interior kept, exterior alpha 0 over an empty canvas).
+    Timeline v1Timeline;
+    v1Timeline.restoreFromProject(oneTrack({clip(130)}), QVector<QVector<ClipInfo>>{},
+                                  0.0, -1.0, -1.0, 100);
+    const QImage v1Plain = renderAt(&v1Timeline, 0.5);
+    v1Timeline.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+    const quint64 v1CallsBefore = roto::renderApplyCallCount();
+    const QImage v1Roto = renderAt(&v1Timeline, 0.5);
+    const quint64 v1Calls = roto::renderApplyCallCount() - v1CallsBefore;
+    const MaskStats v1Stats = maskStats(v1Plain, v1Roto, insideRect, outsideRect);
+    const QRgb v1PlainCorner = v1Plain.isNull() ? 0 : v1Plain.pixel(2, 2);
+    printStats("G13 V1 roto vs no-entry", v1Stats);
+    std::cerr << "G13 plainCorner=" << qRed(v1PlainCorner) << ',' << qGreen(v1PlainCorner) << ','
+              << qBlue(v1PlainCorner) << ',' << qAlpha(v1PlainCorner)
+              << " plainFormat=" << int(v1Plain.format()) << " rotoFormat=" << int(v1Roto.format())
+              << " renderApplyCalls=" << v1Calls << '\n';
+    gates.gate(13, cleanMask(v1Stats) && qAlpha(v1PlainCorner) == 255 && qBlue(v1PlainCorner) > 100
+                   && v1Roto.format() == v1Plain.format() && v1Calls > 0,
+               "V1 roto interior not kept or exterior not alpha 0 in renderFrameAt");
+
+    // G14 detects preview/export roto drift (shifted source frame index,
+    // double application, feather at another resolution): the special-
+    // composite preview and renderFrameAt agree within maxDiff <= 2 on a
+    // 24 fps timeline (fixture stream 10 fps) at keyframe boundary frames
+    // 4 / 5 / 6. In-binary controls: re-applying the entry to the export, and
+    // the export one frame later, must both exceed the threshold.
+    window.m_projectConfig.width = 64;
+    window.m_projectConfig.height = 64;
+    window.m_projectConfig.fps = 24;
+    wtl->setProjectOutputConfig(64, 64, true, 24.0);
+    window.m_trackMatteClipEntries.clear();
+    wtl->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+    wtl->setClipParentEntries(QHash<QString, QString>{});
+    wtl->restoreFromProject(oneTrack({clip(140)}), QVector<QVector<ClipInfo>>{},
+                            0.0, -1.0, -1.0, 100);
+    RotoClipEntry featherForm;
+    featherForm.path = rectPath(16, 16, 48, 48, 3.0);
+    RotoClipEntry keyedForm;
+    RotoKeyframe key4;
+    key4.frameNumber = 4;
+    key4.path = rectPath(6, 8, 30, 56, 3.0);
+    RotoKeyframe key5;
+    key5.frameNumber = 5;
+    key5.path = rectPath(34, 8, 58, 56, 3.0);
+    keyedForm.keyframes = {key4, key5};
+    RotoClipEntry brushForm;
+    brushForm.brushMask = QImage(64, 64, QImage::Format_Grayscale8);
+    for (int y = 0; y < 64; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            const int dist = qMax(qMax(20 - x, x - 43), qMax(20 - y, y - 43));
+            brushForm.brushMask.scanLine(y)[x] = uchar(qBound(0, 255 - 32 * qMax(0, dist), 255));
+        }
+    }
+    struct ParityForm { const char *name; RotoClipEntry entry; };
+    const QVector<ParityForm> parityForms{
+        {"path", featherForm}, {"keyframes", keyedForm}, {"brushMask", brushForm}};
+    bool g14 = true;
+    for (const auto &form : parityForms) {
+        wtl->setRotoEntries(rotoAt(QStringLiteral("0:0"), form.entry));
+        for (double timelineSec : {0.4, 0.5, 0.6}) {
+            const double localSec = timelineSec;   // clip starts at 0
+            const double sourceSec = 0.0 + localSec; // inPoint 0, speed 1
+            const int sourceFrameIndex = roto::sourceFrameIndexFor(sourceSec, 10.0);
+            const QImage preview = window.buildSpecialClipComposite(timelineSec);
+            const QImage exported = renderAt(wtl, timelineSec);
+            const RegionDiff parity = regionDiff(preview, exported, everyPixel);
+            const QImage doubled = roto::applyEntryToFrame(
+                form.entry, exported.convertToFormat(QImage::Format_ARGB32_Premultiplied),
+                sourceFrameIndex);
+            const RegionDiff doubledDiff = regionDiff(preview, doubled, everyPixel);
+            const RegionDiff shiftedDiff = regionDiff(preview, renderAt(wtl, timelineSec + 0.1), everyPixel);
+            int featherPixels = 0;
+            for (int y = 0; y < exported.height(); ++y)
+                for (int x = 0; x < exported.width(); ++x) {
+                    const int a = qAlpha(exported.pixel(x, y));
+                    if (a > 0 && a < 255) ++featherPixels;
+                }
+            const bool shiftMatters = std::string(form.name) == "keyframes" && sourceFrameIndex == 4;
+            const bool ok = parity.pixels == 64 * 64 && parity.maxDiff <= 2 && featherPixels > 0
+                && doubledDiff.maxDiff > 2 && (!shiftMatters || shiftedDiff.maxDiff > 2);
+            std::cerr << "G14 form=" << form.name << " timelineSec=" << timelineSec
+                      << " localSec=" << localSec << " sourceSec=" << sourceSec
+                      << " sourceFrameIndex=" << sourceFrameIndex
+                      << " fps stream=10 previewProject=" << window.m_projectConfig.fps
+                      << " rendererProject=" << wtl->projectFrameRate()
+                      << " parity " << showDiff(parity) << " featherPixels=" << featherPixels
+                      << " doubleApplied " << showDiff(doubledDiff)
+                      << " nextFrame " << showDiff(shiftedDiff)
+                      << (shiftMatters ? " (keyframe boundary)" : "") << " ok=" << ok << '\n';
+            g14 = g14 && ok;
+        }
+    }
+    // Reversed form: reverse decode keeps the frame before the source second,
+    // so preview and export both index the mask one source frame earlier
+    // (sourceSec - 1/fps). Local 1.4 / 1.5 / 1.6 -> index 5 / 4 / 3 around the
+    // 4|5 keyframe boundary. Control: the export 0.1 s earlier (index + 1, the
+    // unadjusted index) must differ at the boundary.
+    ClipInfo reversedClip = clip(141);
+    reversedClip.reversed = true;
+    wtl->restoreFromProject(oneTrack({reversedClip}), QVector<QVector<ClipInfo>>{},
+                            0.0, -1.0, -1.0, 100);
+    wtl->setRotoEntries(rotoAt(QStringLiteral("0:0"), keyedForm));
+    const QVector<QPair<double, int>> reversedTimes{{1.4, 5}, {1.5, 4}, {1.6, 3}};
+    for (const auto &[timelineSec, expectedIndex] : reversedTimes) {
+        const double localSec = timelineSec;   // clip starts at 0
+        const double sourceSec = reversedClip.sourceSecondAtLocalTime(localSec);
+        const bool runsBackward = reversedClip.sourceTimeRunsBackwardAtLocalTime(localSec);
+        const double previewSourceSec = runsBackward
+            ? qMax(reversedClip.inPoint, sourceSec - 1.0 / 10.0) : sourceSec;
+        const int previewIndex = roto::sourceFrameIndexFor(previewSourceSec, 10.0);
+        const QImage preview = window.buildSpecialClipComposite(timelineSec);
+        const QImage exported = renderAt(wtl, timelineSec);
+        const int rendererIndex = roto::lastRenderSourceFrameIndex();
+        const RegionDiff parity = regionDiff(preview, exported, everyPixel);
+        const RegionDiff shiftedDiff = regionDiff(preview, renderAt(wtl, timelineSec - 0.1), everyPixel);
+        const bool boundary = expectedIndex == 4;
+        const bool ok = parity.pixels == 64 * 64 && parity.maxDiff <= 2
+            && previewIndex == expectedIndex && rendererIndex == expectedIndex
+            && (!boundary || shiftedDiff.maxDiff > 2);
+        std::cerr << "G14 form=reversed timelineSec=" << timelineSec << " localSec=" << localSec
+                  << " sourceSec=" << sourceSec << " runsBackward=" << runsBackward
+                  << " preview sourceSec=" << previewSourceSec << " sourceFrameIndex=" << previewIndex
+                  << " renderer sourceFrameIndex=" << rendererIndex << " (expected " << expectedIndex << ")"
+                  << " fps stream=10 previewProject=" << window.m_projectConfig.fps
+                  << " rendererProject=" << wtl->projectFrameRate()
+                  << " parity " << showDiff(parity)
+                  << " unadjustedIndex(+1) " << showDiff(shiftedDiff)
+                  << (boundary ? " (keyframe boundary)" : "") << " ok=" << ok << '\n';
+        g14 = g14 && ok;
+    }
+    wtl->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    gates.gate(14, g14, "special-composite preview and renderFrameAt roto differ (maxDiff > 2) or a control did not separate");
+
+    // G15 detects a missing roto stage on upper-track layers: V1 hidden, V2
+    // (red, entry) over V3 (blue). Interior keeps V2, exterior shows V3.
+    ClipInfo redV2 = clip(151);
+    redV2.filePath = redClipPath;
+    Timeline upper;
+    upper.restoreFromProject(QVector<QVector<ClipInfo>>{{clip(150)}, {redV2}, {clip(152)}},
+                             QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    upper.videoTracks()[0]->setHidden(true);
+    const QImage upperPlain = renderAt(&upper, 0.5);
+    upper.videoTracks()[1]->setHidden(true);
+    const QImage upperV3Only = renderAt(&upper, 0.5);
+    upper.videoTracks()[1]->setHidden(false);
+    upper.setRotoEntries(rotoAt(QStringLiteral("1:0"), hardRect));
+    const quint64 upperCallsBefore = roto::renderApplyCallCount();
+    const QImage upperRoto = renderAt(&upper, 0.5);
+    const quint64 upperCalls = roto::renderApplyCallCount() - upperCallsBefore;
+    const RegionDiff upperInside = regionDiff(upperPlain, upperRoto, insideRect);
+    const RegionDiff upperOutside = regionDiff(upperV3Only, upperRoto, outsideRect);
+    const RegionDiff upperSanity = regionDiff(upperPlain, upperV3Only, outsideRect);
+    std::cerr << "G15 inside(roto vs no-entry) " << showDiff(upperInside)
+              << " outside(roto vs V3 only) " << showDiff(upperOutside)
+              << " sanity outside(no-entry vs V3 only) " << showDiff(upperSanity)
+              << " redReady=" << redReady << " renderApplyCalls=" << upperCalls << '\n';
+    gates.gate(15, redReady && upperInside.pixels > 0 && upperInside.maxDiff <= 2
+                   && upperOutside.pixels > 0 && upperOutside.maxDiff <= 2
+                   && upperSanity.diffPixels == upperSanity.pixels && upperCalls > 0,
+               "upper-layer roto interior not kept or exterior does not reveal the lower track");
+
+    // G16 detects roto leaking into nested-sequence layers (sequenceDepth > 0):
+    // the child's 0:1 key collides with a top-level key format. Control: the
+    // same clips flat on V1 with the same entry do change.
+    TimelineSequence child;
+    child.id = child.name = QStringLiteral("roto-child");
+    ClipInfo childFirst = clip(160);
+    childFirst.outPoint = 1.0;
+    ClipInfo childSecond = clip(161);
+    childSecond.outPoint = 1.0;
+    child.videoTracks = {{childFirst, childSecond}};
+    ClipInfo nestedRef = clip(162);
+    nestedRef.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+    nestedRef.sequenceRefId = child.id;
+    TimelineSequence mainSequence;
+    mainSequence.id = mainSequence.name = QStringLiteral("roto-main");
+    mainSequence.videoTracks = {{nestedRef}};
+    Timeline nestedTimeline;
+    nestedTimeline.setSequences({mainSequence, child}, mainSequence.id);
+    const QImage nestedPlain = renderAt(&nestedTimeline, 1.5);
+    nestedTimeline.setRotoEntries(rotoAt(QStringLiteral("0:1"), hardRect));
+    const quint64 nestedCallsBefore = roto::renderApplyCallCount();
+    const QImage nestedRoto = renderAt(&nestedTimeline, 1.5);
+    const quint64 nestedCalls = roto::renderApplyCallCount() - nestedCallsBefore;
+    Timeline flat;
+    flat.restoreFromProject(oneTrack({childFirst, childSecond}), QVector<QVector<ClipInfo>>{},
+                            0.0, -1.0, -1.0, 100);
+    const QImage flatPlain = renderAt(&flat, 1.5);
+    flat.setRotoEntries(rotoAt(QStringLiteral("0:1"), hardRect));
+    const QImage flatRoto = renderAt(&flat, 1.5);
+    const RegionDiff nestedDiff = regionDiff(nestedPlain, nestedRoto, everyPixel);
+    const RegionDiff flatDiff = regionDiff(flatPlain, flatRoto, outsideRect);
+    std::cerr << "G16 nested(entry vs none) " << showDiff(nestedDiff)
+              << " nestedRenderApplyCalls=" << nestedCalls
+              << " control flat outside " << showDiff(flatDiff) << '\n';
+    gates.gate(16, nestedDiff.pixels == 64 * 64 && nestedDiff.maxDiff == 0 && nestedCalls == 0
+                   && flatDiff.pixels > 0 && flatDiff.diffPixels == flatDiff.pixels,
+               "roto applied inside a nested sequence or flat control did not change");
+
+    // G17 detects roto applied to Echo samples: the current frame is masked
+    // but the 0.2 s echo sample is not, so the exterior carries the sample and
+    // export matches the preview (which also leaves samples unmasked). The
+    // control masks the samples too and must differ outside.
+    ClipInfo echoed = clip(170);
+    echoed.effects = {VideoEffect::createEcho(0.2, 1, 1.0, 0)};
+    wtl->restoreFromProject(oneTrack({echoed}), QVector<QVector<ClipInfo>>{},
+                            0.0, -1.0, -1.0, 100);
+    wtl->setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+    const QImage echoPreview = window.buildSpecialClipComposite(0.5);
+    const QImage echoExport = renderAt(wtl, 0.5);
+    const int echoIndex = roto::sourceFrameIndexFor(0.5, 10.0);
+    const QImage echoCurrent = roto::applyEntryToFrame(
+        hardRect, tlrender::detail::decodeClipFrameNativeForTest(gSyntheticClipPath, 0.5, false, 0.0),
+        echoIndex);
+    const tlrender::EchoFrameProvider maskedSamples = [&](double sampleSourceSec, double sampleLocalSec) {
+        const QImage raw = tlrender::detail::decodeClipFrameNativeForTest(
+            gSyntheticClipPath, sampleSourceSec, false, 0.0);
+        return tlrender::prepareClipSourceForEcho(
+            roto::applyEntryToFrame(hardRect, raw, roto::sourceFrameIndexFor(sampleSourceSec, 10.0)),
+            echoed, sampleLocalSec);
+    };
+    const QImage echoMaskedControl = tlrender::applyClipFxStackWithEchoFromSource(
+        echoCurrent, echoed, 0.5, 0.5, maskedSamples);
+    const RegionDiff echoParity = regionDiff(echoPreview, echoExport, everyPixel);
+    const RegionDiff echoControl = regionDiff(echoExport, echoMaskedControl, outsideRect);
+    int echoOutsideVisible = 0;
+    for (int y = 0; y < echoExport.height(); ++y)
+        for (int x = 0; x < echoExport.width(); ++x)
+            if (outsideRect(x, y) && qAlpha(echoExport.pixel(x, y)) > 0) ++echoOutsideVisible;
+    wtl->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    std::cerr << "G17 parity(preview vs export) " << showDiff(echoParity)
+              << " exteriorVisiblePixels=" << echoOutsideVisible
+              << " control(masked samples) outside " << showDiff(echoControl) << '\n';
+    gates.gate(17, echoParity.pixels == 64 * 64 && echoParity.maxDiff <= 2 && echoOutsideVisible > 0
+                   && echoControl.diffPixels > 0,
+               "Echo samples were roto'd or export differs from the preview");
+
+    // G18 detects a missing roto stage on the transition incoming clip: a
+    // CrossDissolve (blue -> red) over 1.0-2.0 s, entry on the incoming 0:1. One
+    // frame before / after the 1.5 s cut the exterior changes and the interior
+    // does not; 0.5 s (outgoing only) is untouched.
+    ClipInfo outgoing = clip(180);
+    outgoing.outPoint = 1.5;
+    ClipInfo incoming = clip(181);
+    incoming.filePath = redClipPath;
+    incoming.inPoint = 0.5;
+    outgoing.trailOut.type = incoming.leadIn.type = TransitionType::CrossDissolve;
+    outgoing.trailOut.duration = incoming.leadIn.duration = 1.0;
+    outgoing.trailOut.alignment = incoming.leadIn.alignment = TransitionAlignment::Center;
+    Timeline dissolve;
+    dissolve.restoreFromProject(oneTrack({outgoing, incoming}), QVector<QVector<ClipInfo>>{},
+                                0.0, -1.0, -1.0, 100);
+    bool g18 = true;
+    for (double timelineSec : {1.4, 1.6, 0.5}) {
+        dissolve.setRotoEntries(QHash<QString, RotoClipEntry>{});
+        const QImage plain = renderAt(&dissolve, timelineSec);
+        dissolve.setRotoEntries(rotoAt(QStringLiteral("0:1"), hardRect));
+        const QImage masked = renderAt(&dissolve, timelineSec);
+        const RegionDiff inside = regionDiff(plain, masked, insideRect);
+        const RegionDiff outside = regionDiff(plain, masked, outsideRect);
+        const bool overlap = timelineSec > 1.0;
+        const bool ok = inside.pixels > 0 && inside.maxDiff <= 2
+            && (overlap ? outside.diffPixels == outside.pixels : outside.maxDiff == 0);
+        std::cerr << "G18 timelineSec=" << timelineSec << (overlap ? " (overlap)" : " (outgoing only)")
+                  << " inside " << showDiff(inside) << " outside " << showDiff(outside)
+                  << " ok=" << ok << '\n';
+        g18 = g18 && ok;
+    }
+    gates.gate(18, g18 && redReady, "transition incoming roto missing or leaked outside the overlap");
+
+    // G19 detects a file-backed RenderQueue job that drops roto (resolveTimeline
+    // carrier): the decoded output's far exterior must go dark against the
+    // entry-less output, the interior must match it within the mpeg4 encoder
+    // tolerance (mean 8-bit luma difference <= 6). Also Smart Render pass-
+    // through: eligible without roto, rejected with a roto reason with it.
+    const auto innerRegion = [](int x, int y) { return inRect(x, y, 24, 24, 40, 40); };
+    const auto farOutside = [](int x, int y) { return !inRect(x, y, 8, 8, 56, 56); };
+    const auto exportProject = [&](bool withRoto, QString *outputPath) {
+        ProjectData project;
+        project.videoTracks = oneTrack({clip(190)});
+        if (withRoto) {
+            RotoClipEntry stored = hardRect;
+            stored.clipId = QStringLiteral("0:0");
+            project.rotoClipEntries = {stored};
+        }
+        const QString name = withRoto ? QStringLiteral("g19-roto") : QStringLiteral("g19-plain");
+        const QString projectPath = temporary.filePath(name + QStringLiteral(".veditor"));
+        *outputPath = temporary.filePath(name + QStringLiteral(".mp4"));
+        if (!ProjectFile::save(projectPath, project)) return false;
+        RenderJob renderJob;
+        renderJob.projectFilePath = projectPath;
+        renderJob.outputPath = *outputPath;
+        renderJob.width = 64;
+        renderJob.height = 64;
+        renderJob.codec = QStringLiteral("mpeg4");
+        renderJob.bitrateBps = 600000;
+        renderJob.endUs = 1000000;
+        renderJob.exportConfig.insert(QStringLiteral("fps"), 10);
+        RenderQueue renderQueue;
+        QSignalSpy done(&renderQueue, &RenderQueue::jobCompletedUuid);
+        renderQueue.addJob(renderJob);
+        renderQueue.start();
+        if (done.isEmpty()) done.wait(120000);
+        return !done.isEmpty() && done.first().value(1).toBool();
+    };
+    QString plainOutput, rotoOutput;
+    const bool plainExported = exportProject(false, &plainOutput);
+    const bool rotoExported = exportProject(true, &rotoOutput);
+    const QImage plainFrame = plainExported ? libavcore::grabFrameAt(plainOutput, 0.5) : QImage();
+    const QImage rotoFrame = rotoExported ? libavcore::grabFrameAt(rotoOutput, 0.5) : QImage();
+    const double plainInner = meanLuma(plainFrame, innerRegion);
+    const double rotoInner = meanLuma(rotoFrame, innerRegion);
+    const double plainOuter = meanLuma(plainFrame, farOutside);
+    const double rotoOuter = meanLuma(rotoFrame, farOutside);
+    Timeline smartTimeline;
+    ClipInfo smartClip = clip(191);
+    smartTimeline.restoreFromProject(oneTrack({smartClip}), QVector<QVector<ClipInfo>>{},
+                                     0.0, -1.0, -1.0, 100);
+    const QString smartOutput = temporary.filePath(QStringLiteral("g19-smart.mp4"));
+    const auto passThrough = [&]() {
+        return smartrender::timelinePassThrough(&smartTimeline, smartOutput, QStringLiteral("mpeg4"),
+            64, 64, 10.0, 0, 0, false, false, false, false, false, false, false);
+    };
+    // Same seam as export-meta: canStreamCopy reads the probed signature that
+    // timelinePassThrough stores in the predicate clip's displayName.
+    const QByteArray oldSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    const bool hadSeam = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+    qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+    const smartrender::PassThroughEligibility smartPlain = passThrough();
+    smartTimeline.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+    const smartrender::PassThroughEligibility smartRoto = passThrough();
+    if (hadSeam) qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", oldSeam);
+    else qunsetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    std::cerr << "G19 exported plain=" << plainExported << " roto=" << rotoExported
+              << " frame=" << rotoFrame.width() << 'x' << rotoFrame.height()
+              << " inner[24,40)^2 luma plain=" << plainInner << " roto=" << rotoInner
+              << " |delta|=" << std::abs(plainInner - rotoInner) << " (<= 6)"
+              << " farOutside(8px border) luma plain=" << plainOuter << " roto=" << rotoOuter
+              << " drop=" << (plainOuter - rotoOuter) << " (>= 30)"
+              << " smart plain eligible=" << smartPlain.eligible
+              << " reason='" << smartPlain.reason.toStdString() << "'"
+              << " smart roto eligible=" << smartRoto.eligible
+              << " reason='" << smartRoto.reason.toStdString() << "'\n";
+    gates.gate(19, plainExported && rotoExported && plainInner >= 0.0 && rotoInner >= 0.0
+                   && std::abs(plainInner - rotoInner) <= 6.0 && plainOuter - rotoOuter >= 30.0
+                   && smartPlain.eligible && !smartRoto.eligible
+                   && smartRoto.reason.contains(QStringLiteral("roto")),
+               "file-backed export ignored roto or Smart Render pass-through accepted a roto timeline");
+
+    // G20 detects the roto stage running (renderApplyCallCount moving) for a
+    // timeline without roto entries; V1 + V2 + dissolve + Echo exercise every
+    // insertion point. The positive control adds entries and must move it.
+    ClipInfo busyFirst = outgoing;
+    busyFirst.effects = {VideoEffect::createEcho(0.2, 1, 0.5, 0)};
+    ClipInfo busyUpper = clip(201);
+    busyUpper.filePath = redClipPath;
+    Timeline busy;
+    busy.restoreFromProject(QVector<QVector<ClipInfo>>{{busyFirst, incoming}, {busyUpper}},
+                            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    const auto busyCalls = [&]() {
+        const quint64 before = roto::renderApplyCallCount();
+        bool rendered = true;
+        for (double timelineSec : {0.5, 1.4, 1.6})
+            rendered = rendered && !renderAt(&busy, timelineSec).isNull();
+        return rendered ? roto::renderApplyCallCount() - before : quint64(~0ULL);
+    };
+    const quint64 busyNoEntry = busyCalls();
+    QHash<QString, RotoClipEntry> busyEntries;
+    busyEntries.insert(QStringLiteral("0:0"), hardRect);
+    busyEntries.insert(QStringLiteral("0:1"), hardRect);
+    busyEntries.insert(QStringLiteral("1:0"), hardRect);
+    busy.setRotoEntries(busyEntries);
+    const quint64 busyWithEntries = busyCalls();
+    std::cerr << "G20 renderApplyCalls noEntries=" << busyNoEntry
+              << " withEntries=" << busyWithEntries << '\n';
+    gates.gate(20, busyNoEntry == 0 && busyWithEntries > 0 && busyWithEntries != quint64(~0ULL),
+               "roto stage ran without entries or the counter did not move with entries");
+
+    // G21 detects a RenderInPlace bake that drops the roto (temporary key not
+    // shifted past the prefix black clip), applies it twice after the bake
+    // (entry left on the source key) or loses it on undo; (d) pins the known
+    // limitation that decompose does not restore the entry.
+    const QString ffmpegPath = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    QString proresUnavailable;
+    if (ffmpegPath.isEmpty()) {
+        gates.skip(21, "ffmpeg.exe not found (the linked-audio prefix case needs the export mix)");
+    } else if (!selftest::requireEncoder(QStringLiteral("prores_ks"), &proresUnavailable)) {
+        gates.skip(21, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+    } else {
+        const QString tonePath = temporary.filePath(QStringLiteral("g21-tone.wav"));
+        const bool toneReady = writeTone(tonePath);
+        struct BakeResult {
+            bool baked = false;
+            QString path;
+            QString error;
+            double inPoint = -1.0;
+            double inner = -1.0;
+            double outer = -1.0;
+            bool keyAfterBake = true;
+            bool undoClip = false;
+            bool undoKey = false;
+            bool redoClip = false;
+            bool redoKey = true;
+            bool decomposeClip = false;
+            bool decomposeKey = true;
+        };
+        const auto bake = [&](bool withRoto, double handles, bool linked) {
+            BakeResult r;
+            ClipInfo video = clip(210);
+            video.inPoint = 0.5;
+            video.outPoint = 1.5;
+            video.leadInSec = linked ? 1.0 : 0.0;
+            QVector<QVector<ClipInfo>> audio{{}};
+            if (linked) {
+                ClipInfo tone;
+                tone.filePath = tonePath;
+                tone.displayName = QStringLiteral("tone");
+                tone.duration = 8.0;
+                tone.outPoint = 1.0;
+                tone.leadInSec = 0.5; // starts 0.5 s before the video
+                tone.linkGroup = video.linkGroup;
+                audio = {{tone}};
+            }
+            Timeline tl;
+            tl.restoreFromProject(oneTrack({video}), audio, 0.0, -1.0, -1.0, 10);
+            if (withRoto) tl.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+            tl.undoManager()->clear();
+            tl.saveUndoState(QStringLiteral("roto 焼き込み前"));
+            renderinplace::Options options;
+            options.handlesSec = handles; // codec: the default h264 (RenderInPlace accepts h264 / prores)
+            options.outputDir = temporary.path();
+            options.outputSize = frameSize;
+            options.fps = 10.0;
+            r.baked = renderinplace::renderClipInPlace(tl, 0, 0, options, &r.path, &r.error);
+            if (!r.baked) return r;
+            const ClipInfo replaced = tl.videoTracks()[0]->clips()[0];
+            r.inPoint = replaced.inPoint;
+            const QImage frame = libavcore::grabFrameAt(r.path, replaced.inPoint + 0.5);
+            r.inner = meanLuma(frame, innerRegion);
+            r.outer = meanLuma(frame, farOutside);
+            const QString key = QStringLiteral("0:0");
+            r.keyAfterBake = tl.rotoEntries().contains(key);
+            tl.undo();
+            r.undoClip = tl.videoTracks()[0]->clips()[0].filePath == gSyntheticClipPath;
+            r.undoKey = tl.rotoEntries().contains(key);
+            tl.redo();
+            r.redoClip = tl.videoTracks()[0]->clips()[0].filePath == r.path;
+            r.redoKey = tl.rotoEntries().contains(key);
+            renderinplace::decomposeRenderInPlace(tl, 0, 0);
+            r.decomposeClip = tl.videoTracks()[0]->clips()[0].filePath == gSyntheticClipPath;
+            r.decomposeKey = tl.rotoEntries().contains(key);
+            return r;
+        };
+        const BakeResult control = bake(false, 0.0, false);
+        struct BakeCase { const char *name; double handles; bool linked; double expectedInPoint; };
+        bool g21 = toneReady && control.baked && control.inner >= 0.0 && control.outer >= 0.0;
+        std::cerr << "G21 control(no roto) baked=" << control.baked << " inner=" << control.inner
+                  << " outer=" << control.outer << " error=" << control.error.toStdString()
+                  << " toneReady=" << toneReady << '\n';
+        for (const BakeCase &c : {BakeCase{"handles0/prefixCount0", 0.0, false, 0.0},
+                                  BakeCase{"handles0.2+linkedAudio/prefixCount1", 0.2, true, 0.5}}) {
+            const BakeResult r = bake(true, c.handles, c.linked);
+            const bool a = r.baked && std::abs(r.inPoint - c.expectedInPoint) <= 1e-6
+                && std::abs(r.inner - control.inner) <= 6.0 && control.outer - r.outer >= 30.0;
+            const bool b = r.baked && !r.keyAfterBake;
+            const bool cUndo = r.baked && r.undoClip && r.undoKey && r.redoClip && !r.redoKey;
+            const bool d = r.baked && r.decomposeClip && !r.decomposeKey;
+            std::cerr << "G21 case=" << c.name << " baked=" << r.baked
+                      << " error=" << r.error.toStdString()
+                      << " replacementInPoint=" << r.inPoint << " (expected " << c.expectedInPoint << ")"
+                      << " (a) inner=" << r.inner << " vs control " << control.inner
+                      << " outer=" << r.outer << " vs control " << control.outer << " -> " << a
+                      << " (b) keyAfterBake=" << r.keyAfterBake << " -> " << b
+                      << " (c) undoClip=" << r.undoClip << " undoKey=" << r.undoKey
+                      << " redoClip=" << r.redoClip << " redoKey=" << r.redoKey << " -> " << cUndo
+                      << " (d) decomposeClip=" << r.decomposeClip << " decomposeKey=" << r.decomposeKey
+                      << " -> " << d << '\n';
+            g21 = g21 && a && b && cUndo && d;
+        }
+
+        renderinplace::Options bakeOptions;
+        bakeOptions.outputDir = temporary.path();
+        bakeOptions.outputSize = frameSize;
+        bakeOptions.fps = 10.0;
+        const auto alphaMismatch = [](const QImage &a, const QImage &b) {
+            if (a.isNull() || b.isNull() || a.size() != b.size()) return -1;
+            int mismatched = 0;
+            for (int y = 0; y < a.height(); ++y)
+                for (int x = 0; x < a.width(); ++x)
+                    if (qAbs(qAlpha(a.pixel(x, y)) - qAlpha(b.pixel(x, y))) > 16) ++mismatched;
+            return mismatched;
+        };
+
+        // (e) An opaque red V2 under the roto'd V1 clip shows through the
+        // exterior before the bake and must still show after it (alpha kept:
+        // ProRes 4444 .mov, not an opaque h264 file flattened onto black).
+        {
+            ClipInfo video = clip(211);
+            video.inPoint = 0.5;
+            video.outPoint = 1.5;
+            ClipInfo under = clip(212);
+            under.filePath = redClipPath;
+            Timeline tl;
+            tl.restoreFromProject(QVector<QVector<ClipInfo>>{{video}, {under}},
+                                  QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 10);
+            tl.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardRect));
+            const QImage before = renderAt(&tl, 0.5);
+            QString path, error;
+            const bool baked = renderinplace::renderClipInPlace(tl, 0, 0, bakeOptions, &path, &error);
+            const QImage after = baked ? renderAt(&tl, 0.5) : QImage();
+            const RegionDiff exterior = regionDiff(before, after, farOutside);
+            const RegionDiff interior = regionDiff(before, after, innerRegion);
+            const double beforeOuter = meanLuma(before, farOutside);
+            const double afterOuter = meanLuma(after, farOutside);
+            const double beforeInner = meanLuma(before, innerRegion);
+            const double afterInner = meanLuma(after, innerRegion);
+            const bool e = redReady && baked && path.endsWith(QStringLiteral(".mov"))
+                && beforeOuter >= 50.0 && exterior.pixels > 0 && exterior.maxDiff <= 2
+                && std::abs(afterOuter - beforeOuter) <= 2.0
+                && afterInner >= 0.0 && std::abs(afterInner - beforeInner) <= 6.0
+                && !tl.rotoEntries().contains(QStringLiteral("0:0"));
+            std::cerr << "G21 case=V2-under-roto baked=" << baked << " error=" << error.toStdString()
+                      << " output=" << QFileInfo(path).suffix().toStdString()
+                      << " (e) farOutside luma before=" << beforeOuter << " (V2 red, >= 50) after=" << afterOuter
+                      << " exterior " << showDiff(exterior) << " (maxDiff <= 2)"
+                      << " inner luma before=" << beforeInner << " after=" << afterInner
+                      << " interior " << showDiff(interior) << " (|luma delta| <= 6) -> " << e << '\n';
+            g21 = g21 && e;
+        }
+
+        // (f) Animated roto with handles over a synthetic time-remap curve
+        // (inPoint 0, handles 0.2 -> isolated inPoint < 0): the curve's
+        // sourceFps must be the stream rate (10), not the 30 Hz default, so the
+        // baked mask matches the source timeline around the 4|5 keyframe
+        // boundary (local 0.3 / 0.4 / 0.5 / 0.6 -> source frames 3 / 4 / 5 / 6).
+        {
+            RotoClipEntry hardKeyed;
+            RotoKeyframe left;
+            left.frameNumber = 4;
+            left.path = rectPath(6, 8, 30, 56);
+            RotoKeyframe right;
+            right.frameNumber = 5;
+            right.path = rectPath(34, 8, 58, 56);
+            hardKeyed.keyframes = {left, right};
+            ClipInfo video = clip(213);
+            video.inPoint = 0.0;
+            video.outPoint = 1.5;
+            Timeline tl;
+            tl.restoreFromProject(oneTrack({video}), QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 10);
+            tl.setRotoEntries(rotoAt(QStringLiteral("0:0"), hardKeyed));
+            const QVector<double> times{0.3, 0.4, 0.5, 0.6};
+            QVector<QImage> before;
+            for (double timelineSec : times) before.append(renderAt(&tl, timelineSec));
+            renderinplace::Options options = bakeOptions;
+            options.handlesSec = 0.2;
+            QString path, error;
+            const bool baked = renderinplace::renderClipInPlace(tl, 0, 0, options, &path, &error);
+            const double inPoint = baked ? tl.videoTracks()[0]->clips()[0].inPoint : -1.0;
+            const int boundarySanity = alphaMismatch(before[1], before[2]);
+            bool f = baked && std::abs(inPoint - 0.2) <= 1e-6 && boundarySanity > 0;
+            std::cerr << "G21 case=keyframes+handles0.2/syntheticCurve baked=" << baked
+                      << " error=" << error.toStdString() << " replacementInPoint=" << inPoint
+                      << " (expected 0.2) sanity source key4-vs-key5 alphaMismatch=" << boundarySanity
+                      << " (> 0)\n";
+            for (int i = 0; i < times.size(); ++i) {
+                const QImage after = baked ? renderAt(&tl, times[i]) : QImage();
+                const int mismatched = alphaMismatch(before[i], after);
+                const RegionDiff diff = regionDiff(before[i], after, everyPixel);
+                const bool ok = mismatched == 0;
+                std::cerr << "G21 (f) timelineSec=" << times[i] << " localSec=" << times[i]
+                          << " sourceSec=" << times[i]
+                          << " sourceFrameIndex=" << roto::sourceFrameIndexFor(times[i], 10.0)
+                          << " baked-vs-source alphaMismatch(>16)=" << mismatched << " (== 0) "
+                          << showDiff(diff) << " -> " << ok << '\n';
+                f = f && ok;
+            }
+            g21 = g21 && f;
+        }
+        gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose limitation mismatch");
+    }
     return gates.finish("roto");
 }

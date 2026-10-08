@@ -5,9 +5,15 @@
 #include <atomic>
 #include <cmath>
 
+extern "C" {
+#include <libavformat/avformat.h>
+}
+
 namespace roto {
 namespace {
 std::atomic<quint64> gSourceFrameIndexForCalls{0};
+std::atomic<quint64> gRenderApplyCalls{0};
+std::atomic<int> gLastRenderSourceFrameIndex{-1};
 } // namespace
 
 QImage applyEntryToFrame(const RotoClipEntry &entry, const QImage &frame,
@@ -32,6 +38,48 @@ QImage applyEntryToFrame(const RotoClipEntry &entry, const QImage &frame,
     if (mask.isNull())
         return frame;
     return Rotoscope::applyToFrame(frame, mask);
+}
+
+QImage applyEntryForRender(const RotoClipEntry &entry, const QImage &frame,
+                           int sourceFrameIndex)
+{
+    gRenderApplyCalls.fetch_add(1, std::memory_order_relaxed);
+    gLastRenderSourceFrameIndex.store(sourceFrameIndex, std::memory_order_relaxed);
+    const QImage applied = applyEntryToFrame(entry, frame, sourceFrameIndex);
+    return applied.format() == frame.format()
+        ? applied : applied.convertToFormat(frame.format());
+}
+
+quint64 renderApplyCallCount()
+{
+    return gRenderApplyCalls.load(std::memory_order_relaxed);
+}
+
+int lastRenderSourceFrameIndex()
+{
+    return gLastRenderSourceFrameIndex.load(std::memory_order_relaxed);
+}
+
+double probeVideoStreamFps(const QString &filePath)
+{
+    double fps = 0.0;
+    AVFormatContext *format = nullptr;
+    if (filePath.isEmpty() || filePath.startsWith(QStringLiteral("veditor://"))
+        || avformat_open_input(&format, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+        return fps;
+    if (avformat_find_stream_info(format, nullptr) >= 0) {
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            AVStream *stream = format->streams[i];
+            if (stream->codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            const AVRational rate = av_guess_frame_rate(format, stream, nullptr);
+            if (rate.num > 0 && rate.den > 0)
+                fps = av_q2d(rate);
+            break;
+        }
+    }
+    avformat_close_input(&format);
+    return fps;
 }
 
 QImage combineMasksMax(const QImage &a, const QImage &b)

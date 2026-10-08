@@ -17,6 +17,7 @@
 #include "LayerStyle.h"         // Per-clip layer style at the rendered-layer seam
 #include "clipanim/ClipAnim.h"  // S1 — motion/opacity keyframe evaluation
 #include "TrackMatteKey.h"      // RM-1.1 — single shared clip-key formula
+#include "RotoApply.h"          // US-908 — roto stage shared with the preview
 #include "VfxFootageLibrary.h"  // VFX-C source-side black level + intensity
 #include "ShapeLayer.h"         // SHAPE-CLIP generated source-frame SSOT
 #include <cstring>              // std::memcpy (decode row copy)
@@ -1735,6 +1736,17 @@ QImage renderClipSourceFrame(const Timeline *timeline,
         resolvedSampleFromLeft, clip.inPoint);
 }
 
+// Roto source frame rate, chosen like the special-composite preview
+// (MainWindow::buildSpecialClipComposite): a time-remap curve's own sourceFps,
+// otherwise the stream's av_guess_frame_rate (probeVideoSourceInfo), otherwise
+// the project fps through roto::clipEffectiveSourceFps.
+double rotoSourceFps(const ClipInfo &clip, double projectFps)
+{
+    if (clip.hasTimeRemap() && clip.timeRemapCurve.sourceFps > 0.0)
+        return clip.timeRemapCurve.sourceFps;
+    return roto::clipEffectiveSourceFps(roto::probeVideoStreamFps(clip.filePath), projectFps);
+}
+
 QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
 {
     if (!clip.isVfxFootage || native.isNull())
@@ -2037,6 +2049,31 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                                    t, c, local, reverse,
                                    /*countDisabled=*/true);
     };
+    // US-908: roto stage right after each top-level layer decode (V1, upper
+    // layers, transition incoming), before VFX/grade/FX/mask — the preview's
+    // position (MainWindow::buildSpecialClipComposite -> applyStoredRotoData).
+    // Echo samples and nested-sequence layers get none, as in the preview.
+    const QHash<QString, RotoClipEntry> rotoEntries =
+        (sequenceDepth == 0 && timeline) ? timeline->rotoEntries()
+                                         : QHash<QString, RotoClipEntry>();
+    // A reversed clip's source second is the right-hand boundary of the
+    // decoded frame (reverse decode keeps the last frame strictly before it);
+    // the preview indexes the mask one source frame earlier, in both its
+    // time-remap and plain reversed branches. Do the same here.
+    auto applyRoto = [&](int t, int clipIdx, const ClipInfo &c,
+                         const QImage &raw, double sourceSec,
+                         double localSec) -> QImage {
+        if (rotoEntries.isEmpty() || raw.isNull())
+            return raw;
+        const auto it = rotoEntries.constFind(renderClipId(t, clipIdx));
+        if (it == rotoEntries.cend())
+            return raw;
+        const double fps = rotoSourceFps(c, timeline->projectFrameRate());
+        if (c.reversed && c.sourceTimeRunsBackwardAtLocalTime(localSec))
+            sourceSec = qMax(c.inPoint, sourceSec - 1.0 / fps);
+        return roto::applyEntryForRender(
+            it.value(), raw, roto::sourceFrameIndexFor(sourceSec, fps));
+    };
 
     // The preview applies transitions to its primary playback entry only,
     // selected by (timelineStart, sourceTrack). Other tracks have already
@@ -2077,10 +2114,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool reverse = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
         const double source = overlapSourceSecond(b, c, local, reverse);
-        const QImage raw = renderClipSourceFrame(
-            timeline, c, source, local, outSize, sequenceDepth,
-            sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition, sampleFromLeftBoundary);
+        const QImage raw = applyRoto(primaryTrack, b.clipIdx, c,
+            renderClipSourceFrame(
+                timeline, c, source, local, outSize, sequenceDepth,
+                sequenceSnapshot, sequenceStack, projectLights,
+                projectLightViewPosition, sampleFromLeftBoundary),
+            source, local);
         if (raw.isNull()) return composed;
         const EchoFrameProvider provider = [&](double src, double loc) {
             return prepareClipSourceForEcho(renderClipSourceFrame(
@@ -2185,10 +2224,12 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             base.fill(Qt::transparent);
         } else {
 
-        const QImage v1NativeRaw = renderClipSourceFrame(
-            timeline, v1Clip, v1SourceSec, v1LocalSec, outSize, sequenceDepth,
-            sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition, sampleFromLeftBoundary);
+        const QImage v1NativeRaw = applyRoto(0, v1Idx, v1Clip,
+            renderClipSourceFrame(
+                timeline, v1Clip, v1SourceSec, v1LocalSec, outSize, sequenceDepth,
+                sequenceSnapshot, sequenceStack, projectLights,
+                projectLightViewPosition, sampleFromLeftBoundary),
+            v1SourceSec, v1LocalSec);
         if (v1NativeRaw.isNull())
             return QImage();
 
@@ -2393,11 +2434,13 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayers.append(renderLayer);
             continue;
         }
-        const QImage nativeRaw = renderClipSourceFrame(
-            timeline, c, srcSec, localSec, outSize, sequenceDepth,
-            sequenceSnapshot,
-            sequenceStack, projectLights, projectLightViewPosition,
-            sampleFromLeftBoundary);
+        const QImage nativeRaw = applyRoto(t, idx, c,
+            renderClipSourceFrame(
+                timeline, c, srcSec, localSec, outSize, sequenceDepth,
+                sequenceSnapshot,
+                sequenceStack, projectLights, projectLightViewPosition,
+                sampleFromLeftBoundary),
+            srcSec, localSec);
         if (nativeRaw.isNull())
             continue;
         // S4: grade each overlay clip in native resolution too (same per-clip
