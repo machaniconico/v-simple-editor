@@ -280,6 +280,7 @@ uniform float uExposure;     // -3.0 to 3.0
 
 // US-WIRE-2: Lift/Gamma/Gain color wheels (DaVinci Resolve style)
 // xyz = RGB channel scalar, w = Luma scalar applied across all channels
+uniform vec3 uOffset;
 uniform vec4 uLift;      // additive offset
 uniform vec4 uLggGamma;  // power-curve exponent denominator (renamed from uGamma to avoid collision with scalar uGamma at line ~117)
 uniform vec4 uGain;      // multiplicative scaling
@@ -566,6 +567,7 @@ vec3 hslToRgb(vec3 hsl) {
 vec3 applyLiftGammaGain(vec3 color) {
     // Stage 1 — Lift: additive offset, applied uniformly (not shadow-weighted)
     vec3 c1 = color + uLift.rgb + uLift.www;
+    if (uOffset != vec3(0.0)) c1 += uOffset;
 
     // Stage 2 — Gamma: power curve; denominator clamped >= 1e-3 for safety
     vec3 gammaTotal = max(uLggGamma.rgb * uLggGamma.w, vec3(1e-3));
@@ -916,7 +918,7 @@ R"(
 
         // US-WIRE-2: Lift/Gamma/Gain color wheels (DaVinci Resolve style)
         // Identity: vec4(0,0,0,0) / vec4(1,1,1,1) / vec4(1,1,1,1) = no-op
-        if (uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
+        if (uOffset != vec3(0.0) || uLift != vec4(0.0) || uLggGamma != vec4(1.0, 1.0, 1.0, 1.0) || uGain != vec4(1.0, 1.0, 1.0, 1.0))
             color = applyLiftGammaGain(color);
 
         if (logEnabled)
@@ -1564,6 +1566,7 @@ void GLPreview::createShaderProgram()
     m_locFxTime              = m_program->uniformLocation("uFxTime");
 
     // Lift/Gamma/Gain (vec4: xyz=RGB, w=Luma)
+    m_locOffset = m_program->uniformLocation("uOffset");
     m_locLift     = m_program->uniformLocation("uLift");
     m_locLggGamma = m_program->uniformLocation("uLggGamma");
     m_locGain     = m_program->uniformLocation("uGain");
@@ -1767,6 +1770,7 @@ void GLPreview::setDisplayAspectRatio(double aspectRatio)
 void GLPreview::setColorCorrection(const ColorCorrection &cc)
 {
     m_cc = cc;
+    m_offset = {{cc.offsetR, cc.offsetG, cc.offsetB}};
     m_logWheels = {{
         {cc.logShadowR, cc.logShadowG, cc.logShadowB},
         {cc.logMidR, cc.logMidG, cc.logMidB},
@@ -2455,6 +2459,8 @@ void GLPreview::paintGL()
     }
 
     // Lift/Gamma/Gain (US-WIRE-2: vec4: xyz=RGB, w=Luma)
+    m_program->setUniformValue(m_locOffset,
+        QVector3D(float(m_offset[0] * 0.5), float(m_offset[1] * 0.5), float(m_offset[2] * 0.5)));
     m_program->setUniformValue(m_locLift,
         QVector4D(static_cast<float>(effLgg[0][0]),
                   static_cast<float>(effLgg[0][1]),
@@ -3956,6 +3962,12 @@ void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
                   || std::abs(dyUv) > kIdEps
                   || std::abs(theta) > kIdEps
                   || std::abs(scl - 1.0) > kIdEps);
+    update();
+}
+
+void GLPreview::setOffset(const std::array<double,3> &values)
+{
+    m_offset = values;
     update();
 }
 

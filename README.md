@@ -12,7 +12,28 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Video import & decoding (MP4, MKV, MOV, WebM, FLV)
 - Multi-track timeline with drag & drop
 - Cut, split, trim at playhead
-- Copy / paste / ripple delete
+- Copy / paste / ripple delete / duplicate (Ctrl+D) / lift
+- Select all / select forward・backward from playhead / blade all tracks at playhead (Ctrl+Shift+K)
+- Frame nudge (Alt+←/→ = 1 frame, Alt+Shift+←/→ = 10 frames) / close all gaps (only gaps common to every unlocked track)
+- Track name & color (track header context menu, MCP `set_track_property`)
+- Track remove / reorder with full undo, including track-matte, parenting, adjustment-layer, mixer and bus references (track header context menu, Track menu, MCP `add_track` / `remove_track` / `move_track`)
+- Marquee (rubber-band) clip selection, zoom to sequence / selection, go to timecode (`Ctrl+Shift+J`)
+- Move clip head / tail to playhead, select clips by label, linked-selection toggle
+- Sequence list dock (switch / create / rename, MCP `get_sequences` / `set_active_sequence`)
+- Clip filmstrip thumbnails on the timeline (off by default) and media-pool thumbnails with hover skimming
+- Media pool ratings (favorite / rejected / 1-5 stars), filters (all / favorites / exclude rejected / unused), rename, show in Explorer
+- Keyword collections (auto-generated virtual bins from clip tags, media-pool asset context menu "Edit Keywords…") and SmartBin creation/editing with name/tag/name-query/type conditions (media-pool bin-tree context menu "Create Smart Bin…")
+- Clip enable/disable toggle (excludes a clip from preview and export, MCP `set_clip_enabled`)
+- Clip grouping across tracks (linked select / move / trim / delete, MCP `group_clips` / `ungroup_clips`)
+- Linked clips (AV pairs / clip groups) now trim together on edge drag; Alt+drag trims only the grabbed clip (behaviour change in Wave 8; trim-menu operations such as ripple / roll / slip / slide keep applying to linked partners on other tracks, and are rolled back if a partner fails)
+- Align (6 directions) and distribute (horizontal / vertical) selected clips (Composition menu)
+- Keyframe copy & paste across parameters and clips (Graph Editor, playhead-relative shift)
+- Timeline hover skimming (off by default)
+- New sequence from a selected clip (media-pool asset context menu "New Sequence from This Clip"; video (+audio) clips are placed at V1 (+A1) head, audio-only clips at A1 head)
+- Unused-media removal (media-pool bin-tree context menu "Remove Unused Media…") now also checks LUT / image-overlay / particle-config references, not only the existing provider list; the existing "Unused" filter shares the same check (defect fix: previously narrower)
+- CMX3600 EDL / FCPXML import into a new sequence (MCP `import_edl` / `import_fcpxml`)
+  - Wave 8: FCPXML connected clips (anchored child asset-clips) are placed into lanes (lane 0 first, then by |lane|, up to 2 video and 2 audio tracks); audio-only assets go to audio tracks
+  - Wave 9: FCPXML connected clips inside a `<gap>` are imported (anchored on the gap), J-cut connected clips that start before their parent are imported (the part before 0 s is trimmed with the warning 「接続クリップをタイムライン 0 で切り詰めました: <name> / <ref>」; a clip that lies entirely before 0 s is not imported and is skipped with 「クリップの値が不正です (接続位置): <name> / <ref>」), each descendant of a parent whose time range is invalid (duration 0, or an invalid offset / start) is skipped with its own warning, and a spine with no asset-clips yields an empty sequence plus a warning instead of an error. FCPXML clips keep the source length only when the `<asset>` declares a `duration` and its `start` is 0 (an asset with a non-zero `start` may allow the right edge to extend `start` seconds less than the source end; to be confirmed in Wave 10) (otherwise the used range is the limit, as before), and EDL clips only when the media file is found and the probed length is positive; the right edge of an imported EDL clip can be extended only when the probed length is longer than its used range (otherwise the previous value is kept); for an EDL dissolve of positive length, the outgoing clip can always be extended by the dissolve handle (dissolve length x speed) regardless of the media; growth beyond the handle up to the source length is possible only when the file is found and the probed length is positive and longer than the handle-inclusive length.
 - Undo / redo (unlimited history)
 - Snap to grid & playhead
 - Timeline zoom
@@ -35,9 +56,15 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Image overlay & Picture-in-Picture
 - 9 video effects (blur, sharpen, sepia, negative, etc.)
 - Color correction (10 parameters: brightness, contrast, saturation, hue, temperature, tint, gamma, highlights, shadows, exposure)
-- LUT import (.cube format + 4 built-in LUTs)
+- LUT import (.cube format + 4 built-in LUTs), applied from the Effects menu to the selected clip and honoured by export (defect fix: menu LUT used to affect preview only)
 - Log-range color wheels (Shadow / Midtone / Highlight) and still store with wipe compare
 - Color warper (12 x 3 hue / saturation mesh, CPU and GPU parity)
+- Camera Log → Rec.709 (S-Log3 / LogC3 / V-Log / Cineon, exposure offset, gamma 2.4 / linear / Rec.709 OETF output)
+- Luma key / color key (CPU-only, alpha survives through export; place last in the stack)
+- Broadcast safe (Rec.709 legal / full-range limiter) and Leave Color (keep one hue, desaturate the rest), both CPU-only so preview matches export
+- Offset color wheel (printer-light style, CPU/GPU parity, MCP `set_color_correction` `offsetR`/`offsetG`/`offsetB`)
+- Per-effect mask (Bezier path with 3+ points and feather; brush strokes are not supported and are discarded)
+- Flip / Flop, solid color layer insertion, and 5 parametric warps (wave / ripple / spherize / fisheye / pinch)
 - Effect stacking with keyframe animation (5 interpolation modes)
 - Plugin system (5 built-in: Glow, Emboss, Posterize, Edge Detect, Color Shift)
 - Effect preset library (8 built-in + custom save)
@@ -55,6 +82,14 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Explicit audio transitions (constant-power crossfade / fade in / fade out) with true clip overlap (Center / Start / End at cut)
 - Dialogue leveler (automatic speech loudness leveling to a target LUFS)
 - Music remix (beat-aware BGM re-timing to a target duration)
+- Per-track 4-band EQ / compressor / reverb / noise reduction as a shared DSP module, applied to export as well as playback (defect fix: projects using track FX now export the processed sound)
+- Master bus EQ (post-mix, off by default) and correct panel-to-engine track mapping (defect fix: A1's FX used to land on another track)
+- Track FX and master EQ are saved in the project and cleared when switching projects (defect fix: settings used to leak between projects)
+- De-esser (dynamic sibilance suppression) added to the track FX chain, off by default
+- Channel-strip audio mixer dock (faders + meters, hidden by default; defect fix: fader/normalize track gain now reaches export even without track FX)
+- Manual loudness-normalization gain and normalizer amount are now saved in the project (defect fix: previously reset on reopen)
+- Automatic loudness normalization on export (off by default; -14 LUFS streaming / -23 LUFS broadcast presets or custom target; also applied in the batch export queue through saved user presets (Wave 8). Applied to MCP `export_video` since Wave 10 through the optional `autoLoudness` / `targetLufs` arguments; when they are omitted the specified user preset's setting is followed, so an existing MCP call that uses an auto-loudness-ON user preset via `preset=` now produces normalized audio without adding any argument (Wave 10 behavior change; pass `autoLoudness=false` explicitly to keep the old output). Not applied to RenderInPlace or manual additions in the render-queue dialog). The saved manual gain above is now actually applied at export time (defect fix: a Windows file-handle issue in the post-process step used to prevent the replacement from taking effect)
+- Wave 9: the batch export queue now exports the timeline audio mix (multi-track, track FX, gain, fades) for tasks of the current project when auto loudness is off and the timeline has audible audio (the source-file audio is kept when the timeline length is 0 or it has no clip with audio; if every track is muted the mix is silent); the export dialog's audio bitrate is honored on the AAC re-encode path; image-sequence export disables the auto-loudness checkbox; the EQ / compressor / reverb / noise-reduction docks follow project load and track add / remove like the de-esser dock
 
 ### AI & Automation
 - Silence detection
@@ -72,13 +107,18 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Particle system (7 presets)
 - 3D camera (dolly, pan, orbit, zoom) with optional true perspective projection (look-at, roll, layer rotation)
 - 3D camera solve from planar tracks (homography decomposition, no external solver)
-- Expression engine (wiggle, noise, ease)
+- Two-view relative pose (normalized 8-point + RANSAC + essential decomposition) and linear triangulation (numeric core)
+- Multi-frame feature tracking (Planar Tracker dialog's "Feature Tracking (3D)" section): KLT tracking → two-view pose chaining → bundle adjustment solves camera position/look-at keyframes directly from the UI (Levenberg-Marquardt, Schur-complement solver by default, up to 60 frames x 800 points). Frame range is specified in 0-based source frames, and the default start/end auto-fill from the clip's trimmed in/out (clamped to the 60-frame window); applied keyframes correctly convert to timeline time honoring the clip's trim/speed/reverse; not applicable to speed-ramped or time-remapped clips
+- Mesh warp per clip with on-preview grid handles (Composition menu, off by default, CPU path so preview matches export)
+- Puppet pin: interactive mesh deformation via draggable pins on the preview (Composition menu, off by default, CPU path so preview matches export)
+- Expression engine (wiggle, noise, ease, `audioLevel()` from linked audio)
+- Convert audio to keyframes (RMS envelope → opacity / scale / rotation / position)
 - Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths modifiers
 - Auto-orient along motion path
 - Text animator (15 types)
 - Tracker link (motion track to effect)
 - Pre-compose / nesting
-- Rotoscope (path interpolation)
+- Rotoscope (path interpolation; since Wave 10 roto is reflected in every export path and in RenderInPlace, follows clip edits and is part of undo)
 - Warp & distortion (9 effects)
 
 ### Export & Workflow
@@ -89,6 +129,13 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Auto-save & crash recovery
 - Proxy editing (low-res preview, full-res export)
 - Render queue (batch export)
+- Rate control: bitrate or CRF quality mode (H.264 / H.265 / VP9 0..51, AV1 0..63 with software AV1 fallback)
+- Audio-only export (m4a / wav / mp3, PCM intermediate mix)
+- User export presets (save / delete current settings, resolved by name from MCP `export_video`; since Wave 10 a preset with auto loudness ON also normalizes the audio of `export_video` when `autoLoudness` is omitted, behavior change)
+- Alpha export on ProRes 4444 / 4444 XQ or VP9 (yuva420p) (`keepAlpha`, off by default; transparent areas stay transparent in the output)
+- Image-sequence export (PNG / TIFF, GUI export dialog only)
+- Export metadata embedding (title / author / copyright / comment, MCP `export_video` `metadata`)
+- Subtitle export mode: none / burn-in / mov_text embedded stream / both (MP4 / MOV only, GUI export dialog only)
 - Screen recorder (cross-platform)
 - Speed ramp (variable speed with easing)
 - Timeline markers & YouTube chapter export
@@ -174,14 +221,14 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | 名前 | 何をするか | Undo |
 |---|---|---|
 | `get_project_info` | プロジェクト情報を読み取る | なし |
-| `get_timeline` | タイムラインを読み取る。各クリップの `leadIn` / `trailOut` は `{type, durationSec, alignment, easing, softness, borderWidth, borderColor}`、`overlap` は隣接クリップとのトランジションで実際に重なる秒数 `{leadInSec, trailOutSec}` を返す | なし |
+| `get_timeline` | タイムラインを読み取る。各クリップの `leadIn` / `trailOut` は `{type, durationSec, alignment, easing, softness, borderWidth, borderColor}`、`overlap` は隣接クリップとのトランジションで実際に重なる秒数 `{leadInSec, trailOutSec}` を返す。各クリップに `colorCorrection`（28 項目の色補正値）と `lut`（`{filePath, intensity}`）、各トラックに `name` / `color`（`#rrggbb`、未設定は空文字）も返る（いずれも既存フィールドと `required` は不変） | なし |
 | `get_frame` | 指定時刻の合成フレームを PNG で返す（既定 640px 以下・1MB 以内） | なし |
 | `get_captions` | 字幕を読み取る | なし |
 | `get_export_status` | `export_video` ジョブの状態・進捗を返す | なし |
 | `compare_project` | `filePath` の保存済み `.veditor` と現在のタイムラインを構造比較し、`{ok, changes:[{type, path, before, after}], summary:{added, removed, moved, trimmed, changed}}` を返す（読み取り専用）。`type` は `Added` / `Removed` / `Moved` / `Trimmed` / `PropertyChanged` / `EffectsChanged` / `TransitionChanged` / `TrackFlagChanged`。数値の微小差（eps 以内）は同一とみなす | なし |
 | `list_commands` | メニュー直下のお気に入り登録可能なアクションを一覧する（サブメニュー内の項目は含まない）。ID は `<メニューキー>.<メニュー内の通し番号>`（例: `file.11`, `tools.41`）で、表示文言の変更では変わらないが、メニューの途中にアクションが追加されると後続の番号がずれる（位置依存）ため、実行前に `list_commands` で id を確認する。`query` 省略時は全件（約 230 件・JSON で約 60KB）を返すので通常は `query` で id / 表示名 / メニュー名を部分一致フィルタする。各項目に `risk`（safe / blocking / quit）と `enabled` を返す | なし |
 | `run_command` | `list_commands` のアクションを ID で実行する（`allowBlocking` は既定 false。応答の `undoRecorded` で Ctrl+Z / `undo` の対象になったか確認できる） | アクション依存（MCP 側では追加しない） |
-| `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する（`audioCodec` / `audioBitrate` 省略時は aac / 192 kbps） | なし |
+| `export_video` | タイムラインを動画へ非同期で書き出し、`jobId` を返す。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する（`audioCodec` / `audioBitrate` 省略時は aac / 192 kbps）。`rateControl`（`bitrate` / `crf`、既定 bitrate）と `crf`（-1 = 未指定、通常 0..51、AV1 は 0..63）で品質ベースのレート制御を選べる（CRF 指定時にハードウェア AV1 が使えない環境ではソフトウェア AV1 へフォールバック）。`audioOnly: true` は音声だけを `outputPath` の拡張子（m4a / wav / mp3）に合わせたコーデックで同期書き出しし、`jobId` の代わりに `{ok, outputPath, warnings}` を返す（映像系の引数は無視して `warnings` に列挙）。Wave 10 から `autoLoudness`（boolean）/ `targetLufs`（number、-70..-1）で自動ラウドネス正規化を指定でき、省略時は `preset` の設定に従う（下の説明を参照。挙動変更） | なし |
 | `import_media` | ダイアログなしで素材を指定トラックへ取り込む（`kind` 既定 `auto`: 映像があれば V/A の組、無いファイル（BGM・ナレーション）は音声トラックだけ。`video` / `audio` で片側だけ。開けないファイルはエラー） | あり |
 | `save_project` | プロジェクトを指定パスへ保存する（ダイアログなし。拡張子は GUI と同じ `.veditor` を推奨） | なし |
 | `open_project` | 指定パスのプロジェクトを読み込む（未保存確認なし） | なし |
@@ -202,18 +249,37 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `undo` | 直前の編集を元に戻す | なし |
 | `redo` | 元に戻した編集をやり直す | なし |
 | `set_track_locked` | 指定トラックの編集ロックを設定する。ロック中は `split_clip` / `delete_clip` / `move_clip` などのクリップ編集を拒否する | なし（ロック変更自体は Ctrl+Z 対象外） |
+| `set_track_property` | 指定トラック（`kind` / `trackIndex` 必須）の `name`（空文字で既定に戻す）/ `color`（`#RRGGBB`、空文字で解除）/ `muted` / `solo` / `hidden` を設定する。応答は `{ok, track:{index, name, color, locked, muted, solo, hidden}, undoRecorded}` | 名前・色はまとめて 1 回（`undoRecorded`）。muted / solo / hidden は Ctrl+Z 対象外 |
 | `set_clip_label` | クリップのラベルカラーを設定する（`none` / `red` / `orange` / `yellow` / `green` / `cyan` / `blue` / `purple` / `pink`）。`kind` / `trackIndex` 省略時は video / 0 | あり |
 | `set_project_option` | プロジェクト全体の設定を変更する。現在は `option=timecodeBurnIn` のみ受け付け、プレビューと以後の書き出しへ即時反映する | なし（Ctrl+Z 対象外） |
 | `dynamic_zoom` | 指定動画クリップへダイナミックズームを適用し、位置とスケールに開始・終了キーフレームを生成する。`preset`（zoomIn / zoomOut / panLeft / panRight / panUp / panDown）か `start` / `end`（cx / cy / w の正規化座標）のどちらか一方を指定する（両方指定はエラー）。枠は常にキャンバスのアスペクト比に固定され、`h` を指定しても無視して warning を返す | あり |
 | `match_frame` | 再生ヘッド位置（または `timeSec`）の動画クリップを、speed・逆再生・リマップを反映したソース時刻でソースモニターに開く | なし |
 | `replace_clip` | 指定クリップの素材を `filePath` のメディアへ置き換える。位置・inPoint・長さを可能な限り維持し、同じ linkGroup の音声も新素材に音声があれば置き換える。新素材が短い場合は warning を返す | あり |
-| `render_in_place` | 指定した映像クリップ（`trackIndex` / `clipIndex`、`kind` は `video` のみ）の効果・変形を新規メディアへ焼き込み、そのクリップを差し替える（`codec` は `h264` / `prores`、`handlesSec` 0..5 で前後の余白秒）。同じ linkGroup の音声クリップも同時に焼き込む。応答は `{ok, outputPath, replaced, linkedAudioReplaced}`。重ね合わせトランジション付き・クロマキー付きのクリップは拒否する | あり（映像・音声まとめて 1 回） |
-| `decompose_render_in_place` | `render_in_place` で差し替えたクリップ（`trackIndex` / `clipIndex`）を効果・変形つきの元のクリップに戻す（リンク音声も同時） | あり |
+| `render_in_place` | 指定した映像クリップ（`trackIndex` / `clipIndex`、`kind` は `video` のみ）の効果・変形を新規メディアへ焼き込み、そのクリップを差し替える（`codec` は `h264` / `prores`、`handlesSec` 0..5 で前後の余白秒）。同じ linkGroup の音声クリップも同時に焼き込む。応答は `{ok, outputPath, replaced, linkedAudioReplaced}`。重ね合わせトランジション付き・クロマキー付きのクリップは拒否する。Wave 10: roto を持つクリップは `codec` にかかわらずアルファ付き ProRes 4444 (.mov) で焼き込み、元クリップの roto は外れる（undo で戻る。`decompose_render_in_place` では戻らない） | あり（映像・音声まとめて 1 回） |
+| `decompose_render_in_place` | `render_in_place` で差し替えたクリップ（`trackIndex` / `clipIndex`）を効果・変形つきの元のクリップに戻す（リンク音声も同時）。Wave 10: render_in_place で外れた roto は分解では戻らない（undo では戻る） | あり |
+| `set_color_correction` | 映像クリップ（`clipIndex` 必須、`kind` / `trackIndex` 省略時は video / 0）の色補正を `values` で部分更新する（brightness / contrast / saturation / temperature / tint / highlights / shadows は -100..100、hue は -180..180、gamma は 0.1..3、exposure は -3..3、liftR/G/B と gainR/G/B は -2..2、gammaR/G/B は log2 で -6.64..4、logShadow/Mid/High の R/G/B は -1..1）。`reset: true` は既定値へ戻してから `values` を適用する。不正な項目があれば何も変えずにエラー。`hueSatWarp` は無視して `warning` を返す。応答は `{ok, colorCorrection, warning?}` | あり（1 回） |
+| `apply_lut` | 映像クリップに `.cube` などの LUT ファイル（`filePath`、存在しないとエラー）を `intensity`（0..1、既定 1）で適用する。`filePath` を空文字にすると解除。応答は `{ok, lut:{filePath, intensity}}` | あり（適用・解除それぞれ 1 回。同じ値の再設定は積まない） |
 | `relink_media` | 見つからないメディア / LUT のパスを `mapping`（`[{from, to}]`、1 件以上）で一括再リンクする。`to` が全て実在するファイルのときだけ変更し、リンクした映像・音声、パーティクル設定やオーバーレイの参照、ネストしたシーケンスまで 1 回の Undo で更新する。存在しないファイルを指定すると「ファイルが見つかりません」のエラーで何も変更しない。応答は `{"ok":true,"relinked":N}` | あり |
 | `music_remix` | 音声クリップ（`kind` は `audio` のみ）をビート境界のセグメントで再構成し、`targetSec`（0 より大きく 86400 以下）の尺へ自動調整する。継ぎ目にはコンスタントパワーのクロスフェードが付く。ビートが 2 個未満の素材は変更せずエラー。応答に `resultDuration` と `segmentCount` を返す | あり |
 | `dialogue_level` | 音声クリップ（`kind` は `audio` のみ）の短時間ラウドネスを解析し、会話音量を `targetLufs`（既定 -18）へ平準化する音量エンベロープを生成する。応答に `pointCount` / `measuredLufsMin` / `measuredLufsMax` を返す | あり |
+| `get_sequences` | プロジェクト内の全シーケンスを列挙する（`{ok, sequences:[{id, name, active}]}`）。引数なし | なし |
+| `set_active_sequence` | `id` のシーケンスへ切り替える。存在しない `id` はエラー | なし（Ctrl+Z 対象外） |
+| `add_track` | `kind`（`video` / `audio`）のトラックを末尾に追加する | あり（1 回） |
+| `remove_track` | `kind` / `trackIndex`（0 始まり）のトラックを削除する。載っているクリップも消え、トラックマット / 親子付け / 調整レイヤー / ミキサー / バス送りの参照も付け替わる。最後の 1 本とロック中は拒否 | あり（1 回で本数も中身も復元） |
+| `move_track` | `kind` / `trackIndex` のトラックを `newTrackIndex` へ移動する。範囲外はエラー | あり（1 回） |
+| `set_clip_enabled` | 映像・音声クリップの有効状態を `enabled` で切り替える。Null Object は対象外 | あり |
+| `group_clips` | 別々のトラックのクリップをグループ化する。`clips`（`{kind, trackIndex, clipIndex}` の配列、2 件以上）を指定する。応答は `{ok, linkGroup, undoRecorded}` | あり |
+| `ungroup_clips` | 指定クリップのグループを解除する。`clips`（配列、1 件以上） | あり |
+| `import_edl` | `filePath` の CMX3600 EDL をプロジェクトの FPS で新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
+| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane 0 を必ず採用し、残りは lane 番号の絶対値が小さい順に、映像・音声とも最大 2 トラックまで（超えた lane は警告）。音声専用 asset-clip は音声トラックに置く。gap の子の接続クリップと親より前に始まる接続クリップ（J カット。0 秒より前に全体が出るものは「クリップの値が不正です (接続位置): …」で読み飛ばし、一部だけ出るものは「接続クリップをタイムライン 0 で切り詰めました: …」の警告で切り詰める）も取り込み、接続クリップを持つ親の時刻範囲が不正（duration が 0、または offset / start の計算が不正）な場合は、その親とその接続クリップを警告付きで読み飛ばす。asset-clip が 0 本の spine は空のシーケンス + 警告。FCPXML では <asset> に duration があれば素材の全長を保持する（asset の start が 0 でなくても同じ。無ければ使用範囲まで）。transition / 複合クリップ / ref-clip / マルチカムは読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G155。ツール数は 39）。
+`export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込みは書き出しダイアログの機能で、`export_video` の引数には含まれず、MCP 経由の書き出しには適用されません。
+
+Wave 10 から `export_video` は自動ラウドネス正規化の任意引数 `autoLoudness`（boolean）と `targetLufs`（number、-70..-1、LUFS）を受け付けます（ツールの追加はなく、`outputSchema` / `required` も変わりません）。解決順は「明示した引数 > `preset` で指定したプリセットの値 > OFF（`targetLufs` は -14）」です。**挙動変更: `autoLoudness` を省略したときは指定プリセットの `autoLoudness` / `targetLufs` に従います。自動ラウドネスが ON のユーザープリセットを `preset=` で使っている既存の MCP 呼び出しは、引数を足さなくても書き出しの音量が正規化されるようになり、従来と出力音量が変わります。従来どおりにするには `autoLoudness=false` を明示してください。** 引数を省略し、プリセットも無い（または OFF のプリセット）ときは従来と同じです。`targetLufs` だけを指定して解決後の `autoLoudness` が OFF のときは、値の検証だけを行い正規化はしません。`autoLoudness=true` の明示と `audioOnly=true` の併用はエラーです。`audioOnly=true` は、ON のプリセットを指定して引数を省略した場合も自動ラウドネスを行いません（Wave 10 の挙動変更。従来はプリセットの ON に従って測定していました。GUI の音声のみ書き出しは変わりません）。測定は GUI スレッドで同期実行されるため、実行中は `get_export_status` の応答が止まります。測定に失敗した（無音・音声なしなど）場合は正規化をスキップして 0 dB のゲインで書き出しを続け、ジョブは完了します。ジョブが `failed` になるのは、音声ミックスを作れない・変換できないときだけです。`audioBitrate`（kbps、既定 192）は、192 以外のとき書き出し前に作る音声ミックス（AAC）のビットレートにも反映されます。なお RenderInPlace とレンダーキューダイアログからの手動追加には、自動ラウドネスは適用しません（設計）。
+
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます（実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G187。ツール数は 52）。Wave 8 では MCP ツールの追加はありません（ツール数 52 / ゲート G1..G177 のまま）。Wave 10 でも MCP ツールの追加はなく（ツール数 52）、`export_video` の任意引数 `autoLoudness` / `targetLufs` の追加と、selftest の拡張（G178..G187）だけです。
+
+ゲートを持つ selftest（`GateTally` を使うもの）は、最後に `N PASS, M FAIL, K SKIP` の 3 語書式のサマリ行を標準エラー出力へ出します。`SKIP` は環境依存で検証できなかったゲート（エンコーダ無し、Debug ビルドなど）で、未検証を意味します（終了コードは FAIL の数なので、SKIP だけなら 0 になります）。`VEDITOR_SELFTEST_TIMEOUT_SEC`（秒、既定 900、0 で無効）を超えると `summary: TIMEOUT after <N>s (selftest=<name>)` を出して終了コード 124 で打ち切られます。`--selftest=all` の対象は `VEDITOR_ALL_SELFTEST_FILTER`（カンマ区切り）で絞れ、未知または空の項目は終了コード 2 になります。MCP サーバの待受ポートは `VEDITOR_MCP_PORT` で指定でき、使い切ると警告が出ます。
 
 ---
 
@@ -325,6 +391,10 @@ cmake --build build
 | Export | `Ctrl+E` |
 | Undo / Redo | `Ctrl+Z` / `Ctrl+Shift+Z` |
 | Copy / Paste | `Ctrl+C` / `Ctrl+V` |
+| Duplicate / Select All | `Ctrl+D` / `Ctrl+A` |
+| Blade All Tracks at Playhead | `Ctrl+Shift+K` |
+| Go to Timecode | `Ctrl+Shift+J` |
+| Nudge 1 / 10 frames | `Alt+←/→` / `Alt+Shift+←/→` |
 | Split at Playhead | `S` |
 | Delete / Ripple Delete | `Del` / `Shift+Del` |
 | Toggle Snap | `N` |
@@ -347,7 +417,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Testing
 
 Selftests are wired into the executable itself, dispatched via a single
-`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 182 entries). Four entry
+`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 263 entries; `--selftest=help` prints 264 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
 points cover the routing matrix:
 
 ```bash
@@ -385,6 +455,15 @@ Run with --selftest=list to see available selftests.
 $ echo $?
 2
 ```
+
+Since Wave 9 (US-800) every selftest that uses `GateTally` is cross-checked against the
+`(N gates)` figure in its registry description: a mismatch prints
+`FAIL gate-count: declared N, ran M (selftest=<name>)` and exits non-zero, and the
+`--selftest=all` sweep ends with a `gate-count summary: verified V, mismatch W, unverified U,
+no-declaration D` line. New in Wave 9: `--selftest=parent-gate` (7 gates; the shared
+`tlrender::parentLayerAt` rule) and `gate-count-probe` (internal helper for the gate-tally
+selftest, 2 gates, not meant to be run on its own). Gate counts for other selftests are in
+the registry descriptions (`grep -oE '\([0-9]+ gates\)' src/selftests/SelftestRegistry.cpp`).
 
 Adding a new selftest = one line in `kArgvSelftests[]`: argv-switch name +
 `VEDITOR_<NAME>_SELFTEST` env var + function pointer + QApplication-required
@@ -427,7 +506,7 @@ byte-equivalent and the selftest dispatch coherent:
 | `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
 | `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
 | `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
-| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (182 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (263 entries × 5 fields: name / envVar / fn / needsQApp / description) |
 
 Architecture rationale: preview ≠ export was historically the #1 NLE
 parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
@@ -537,12 +616,42 @@ v-simple-editor/
 - [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
 - [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
-- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 182-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 263-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
+- [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
+- [x] Wave 7 (24 stories, US-600..623): clip enable/disable, loudness-gain project persistence, keyword bins, sequence-from-clip, unused-media removal scope extension, clip grouping, align/distribute, keyframe copy/paste, timeline hover skim, per-effect mask, offset wheel, puppet pin, VP9 alpha export, image-sequence export, export metadata, mov_text subtitle embedding, EDL/FCPXML import, de-esser, audio mixer dock (track-gain export fix), automatic loudness normalization on export, multi-frame camera tracking with keyframe application, bundle adjustment Schur-complement solver
+- [x] Wave 8 (US-700..718): per-entry selftest watchdog and PASS / FAIL / SKIP gate tally, shared export job mapping, audio export byte-compare fixture, linked edge-drag trim (Alt = one side), align/distribute through the rendered transform, surface / mesh / puppet pin tools through the clip transform, special-composite preview parity, legacy keyframe dialog `grade.*` migration and hue / gamma / highlights / shadows keyframes, FCPXML connected clips and audio lanes, batch export queue auto loudness, user preset round-trip, camera-tracking backend tag and UI polish, de-esser dock (live-apply). No MCP tools added (52 tools, G1..G177)
+- [x] Wave 9 (US-800..810): selftest gate-count auto cross-check, auto loudness prepared inside the shared export job builder, batch export queue exports the timeline audio mix, export audio bitrate honored on AAC intermediates and temp-file cleanup unified in `RenderQueue`, shared parent-layer rule (`parentLayerAt`) for the renderer / align-distribute / surface tools, EQ / compressor / reverb / noise-reduction docks follow project changes, FCPXML gap children / J-cuts / empty spines, imported clips keep the source length only under the conditions above (FCPXML: `<asset>` has a `duration`; EDL: media found and probed length longer than the used range), saved queues keep the project path instead of a temporary audio file. No MCP tools added
+- [x] Wave 10 (US-900..915): selftest hygiene (mcp moved to the gate tally, `objectName` lookups, light3d latch, non-flat audio EQ fixture, watchdog minidump + text stack), rotoscope data moved into `Timeline` / `ProjectFile` / undo and reflected in every export path and in RenderInPlace (existing roto projects export differently), roto follows clip edits and the main-clip cross-track drag, MCP `export_video` `autoLoudness` / `targetLufs` (omitted = follow the preset; behavior change for auto-loudness-ON user presets), VideoPlayer parent admission observed against `parentLayerAt` (`video-player-parent` selftest, divergences kept as limitations), audio dock gestures are undoable, the selftest hang root cause (self-deadlock in the Qt message handlers) fixed. No MCP tools added (52 tools, G1..G187)
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
+
+### Wave 10 で据え置いた制限事項
+
+Wave 10 で変わったこと (既存プロジェクトにも効くもの):
+
+- ロトスコープ (roto) が書き出しに反映されます (Wave 10)。**roto を設定した既存プロジェクトの書き出しは、Wave 9 までと変わります** (従来はプレビューだけで、書き出しには出ませんでした)。通常 / モバイル / バッチ (別プロジェクトのタスクや保存済みキューのようにファイル経由のジョブでも、ブラシマスク (brushMask) を含めて) / MCP `export_video` の書き出し、静止画書き出し、RenderInPlace に反映され、トランジションの incoming 側のクリップにも掛かります。入れ子シーケンスの中のクリップは対象外で、Echo のサンプルフレームには掛かりません。roto を持つタイムラインは Smart Render の素通し (再エンコードなしのコピー) の対象外になり、通常の再エンコードで書き出されます。プロキシを使っているときは、書き出しは元素材の解像度で roto を適用するため、プレビューと解像度が違って見えることがあります。roto の無いプロジェクトの書き出しは変わりません。
+- RenderInPlace (「効果を焼き込んで差し替え」) でも roto が焼き込まれます。roto を持つクリップを焼き込むときは、選んだコーデックにかかわらずアルファ付きの ProRes 4444 (MOV) で書き出されます (roto は範囲外のアルファを 0 にするため)。焼き込み後は元のクリップの roto が外れ、新しいクリップには roto が残りません (undo で元に戻ります。分解 (decompose) では roto は戻りません)。
+- roto はクリップ編集に追従し、undo の対象です。削除 / 分割 / 移動 / リップル / 範囲リップル (文字起こし編集) / ペースト / ドラッグ並べ替え / トラック増減 / nudge / 複製 / ギャップ詰め / 全トラック分割 / リフト、および主クリップのクロストラック drag で、roto は元のクリップに付いたまま動きます (クロストラック drag そのものは undo に積まれません。据え置いた制限事項を参照)。roto の編集 (ロトツール) は 1 操作 = 1 undo です (クリップ削除の undo で roto も戻ります)。従来は編集後に roto のキーがずれることがありました (欠陥修正)。
+- MCP `export_video` は `autoLoudness` / `targetLufs` を省略するとプリセットの設定に従います。自動ラウドネスが ON のユーザープリセットを `preset=` で使う既存の MCP 呼び出しは、引数を足さなくても音量が正規化されるようになります (挙動変更。従来どおりにするには `autoLoudness=false` を明示)。詳細は MCP の節の `export_video` の説明を参照。
+- 音声 Dock の操作が undo の対象になりました (ジェスチャ単位: スライダーやダイヤルのドラッグ 1 回 = 1 undo。マスターは EQ / ディエッサーが対象。wheel は 1 ノッチ 1 回、ディエッサーはスピンボックスの確定で 1 回)。ディエッサーの試聴 (listen) とレガシーのマスターコンプは対象外です。
+- selftest が稀にハングする原因は、アプリ自身の Qt メッセージハンドラが Qt のシグナル / スロットのロックを保持したまま自己デッドロックすることでした (トラックの削除、トラック追加 / 削除の undo で起こり得ました)。ログとクラッシュのハンドラを修正し、mixer-dock 0/300、mcp 0/100、track-ops 0/100 でハングは出なくなりました (到達)。selftest のタイムアウト時は `.omc/artifacts/hang-dumps/` に (Windows のみ) minidump (.dmp、必須) とテキストスタック (.txt、ベストエフォート) が書かれます。
+
+据え置いた制限事項:
+
+- 逆再生クリップをハンドル付き、またはタイムリマップ / 速度ランプ付きで RenderInPlace に焼き込むと、焼き込み結果 (映像と roto マスクの両方) が元のタイムラインより 1 ソースフレーム後ろになります (既存の制限。Wave 11 で修正)。
+- トラックマットは、主クリップのクロストラック drag と範囲リップル (文字起こし編集) では追従しません (roto / 親子付けは追従します)。クロストラック drag そのものは undo に積まれません (既存の挙動。次に保存される状態には移動後のキーが入るので、その後の undo / redo は整合します)。リンクされた音声トラックへのクロストラック drop では、リンク相手の映像クリップの roto / 親子付け / マットのキーが従来どおり外れることがあります。
+- 親付きクリップ: VideoPlayer プレビューの親合成は、オフライン親 / 重なり / 借用区間の 3 形態で整列結果とずれることがあります。親素材は存在するがデコードできない場合、整列は親ありとして計算し、描画は親を省きます。V1 上のキーフレーム付きクリップがトランジションの借用区間にあるときは、整列 / サーフェスツール (メッシュワープ / パペットピンの共通の編集ツール) はクランプした時刻で評価します。
+- (j) VideoPlayer のプレビューの親合成と書き出しの親判定 (`parentLayerAt`) は 2 形態で食い違います (`--selftest=video-player-parent` の G4 / G5 が現状を固定しています。Wave 11 で `parentLayerAt` に寄せます)。(1) 同じトラックのトランジションの重なり区間では、incoming (後ろ) のクリップを親にした子が、プレビューではその incoming クリップに追従し、書き出しでは outgoing (前) のクリップが親として選ばれるため子は親なしになります。(2) 無効化したクリップ (visible=false) を親にした子は、CPU のみのプレビュー (エフェクトダイアログのプレビューなどの一時停止中の表示) では無効な親に追従しますが、書き出しと通常の再生では追従しません (無効なクリップがあると再生が `tlrender::renderFrameAt` に回るため)。通常の親、V1 の親 (無視)、調整クリップの親 (無視)、Start 揃えの trail、オフライン親 (無視) は一致します。
+- 自動ラウドネスは RenderInPlace / レンダーキューダイアログの手動追加では適用しません (設計)。
+- Echo / ローリングシャッターの特殊合成は、ソースフレームの取得関数がプレビュー (decodeClipFrameAtSourceTime) と書き出し (renderClipSourceFrame) で別実装です (現状の結果は一致)。
+- 自動ラウドネスの測定 (prepareJob) は GUI スレッドで同期実行されるため、長い素材では書き出し開始時に画面が止まることがあります (MCP の `export_video` では `get_export_status` の応答も止まります)。
+- バッチ書き出しの音声: 現在のプロジェクト以外のファイルを指すタスク (task.timeline が null) は、自動ラウドネスが OFF のときだけ従来どおり元ファイルの音声で書き出されます。自動ラウドネスが ON のときは測定できないため、Queue::processNext がエラー「自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません」を記録し、RenderQueue がジョブを拒否します (書き出されません)。バッチ設定ダイアログには、組み込み名 (1080p / 720p / 4K) と同名のユーザープリセットは出ません (組み込みが優先)。ミックスはタスク実行時のタイムラインから作られるため、キュー投入後の編集が反映されます (映像と同じ)。タイムラインの長さが 0 より大きく音声の再生シーケンスが空でないときだけミックスを作ります (長さ 0、または音声トラックが無い / 音声を持つクリップが無いときは従来どおり元ファイルの音声で、警告は出ません。全トラックがミュートでも音声を持つクリップがあれば、ミュート分を除いた無音のミックスで書き出され、警告は出ません。通常書き出しと同じ)。ミックスの作成に失敗したときは元ファイル音声で書き出し、書き出しが成功した場合だけタスクのメッセージが「Export complete (タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: <原因>)」になります (書き出しが失敗した場合はエラーメッセージが優先され、警告は残りません)。
+- 書き出し設定の音声ビットレートは音声を再エンコードする経路にだけ効きます。素材の音声をそのままコピーする経路では元のビットレートのままです。
+- FCPXML / EDL: 接続クリップを持つ親クリップの時刻範囲が不正 (duration が 0、または offset / start の計算が不正) な場合、その親は「lane N の時刻範囲が不正なクリップを読み飛ばしました: <名前> / <ref>」で、その接続クリップは「親クリップが不正なため接続クリップを読み飛ばしました: <名前> / <ref>」で、警告付きで読み飛ばされます (従来は取り込まれることがありました)。子を持たない spine の gap は警告を出さなくなりました。J カットが 0 秒より前に一部だけ出る分は切り詰めて警告「接続クリップをタイムライン 0 で切り詰めました: <名前> / <ref>」を出し、全体が 0 秒より前に出るクリップは取り込まれず「クリップの値が不正です (接続位置): <名前> / <ref>」で読み飛ばされます。EDL の dissolve は、長さが正のものなら素材の有無に関係なく、少なくともディゾルブ長 × 速度ぶんのハンドルが確保されて trail が常に正になるため (0 フレームのディゾルブはハンドルが 0 になり得て、trail は正になりません)、取り込み直後のトランジション区間の描画が変わります (送り側クリップは、そのハンドル分だけは常に右端を伸ばせます。ハンドルを超えて素材長まで伸びるのは、素材が見つかり probe が正の値でハンドル込みの長さより長いときだけです)。EDL はソース開始タイムコードを差し引きません (既存の制限)。
+- FCPXML の `<asset>` の `start` が 0 でない素材でも、`<asset>` に `duration` があれば、右端を伸ばせる範囲は素材末尾までです (Wave 9 の「`start` が 0 の場合だけ」という記載は誤りでした)。取り込み時の combine が `asset.start` を引いたうえでファイル内の時刻で比較するためです (`FcpxmlImport.cpp` の取り込み処理)。
 
 ---
 

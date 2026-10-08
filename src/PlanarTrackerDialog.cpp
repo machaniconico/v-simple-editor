@@ -1,6 +1,14 @@
 #include "PlanarTrackerDialog.h"
 
 #include "PlanarTrackerPresetRegistry.h"
+#include "FeatureTracker.h"
+#include "libavcore/FrameGrab.h"
+#include <QDebug>
+#include <QPointer>
+#include <QThread>
+#include <cmath>
+#include <memory>
+#include <utility>
 
 #include <algorithm>
 
@@ -319,6 +327,7 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     m_progress->setVisible(false);
 
     m_summaryLabel = new QLabel(QStringLiteral("--"), this);
+    m_summaryLabel->setObjectName(QStringLiteral("planarSummary"));
     m_summaryLabel->setWordWrap(true);
 
     m_buttonBox = new QDialogButtonBox(
@@ -355,6 +364,47 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
             this, &PlanarTrackerDialog::onCameraSolveClicked);
     rightLayout->addWidget(m_progress);
     rightLayout->addWidget(m_summaryLabel);
+    auto* featureForm = new QFormLayout;
+    auto* limits = new QLabel(tr("特徴点トラッキング (3D) — 上限 %1 フレーム / %2 点")
+        .arg(sfm::kMaxBundleFrames).arg(sfm::kMaxBundlePoints), this);
+    limits->setObjectName(QStringLiteral("featureLimits"));
+    limits->setWordWrap(true);
+    rightLayout->addWidget(limits);
+    m_featureStart = new QSpinBox(this);
+    m_featureEnd = new QSpinBox(this);
+    m_featureMaxPoints = new QSpinBox(this);
+    m_featureStart->setObjectName(QStringLiteral("featureStart"));
+    m_featureEnd->setObjectName(QStringLiteral("featureEnd"));
+    m_featureMaxPoints->setObjectName(QStringLiteral("featureMaxPoints"));
+    m_featureMaxPoints->setRange(8, sfm::kMaxBundlePoints);
+    m_featureMaxPoints->setValue(sfm::kMaxBundlePoints);
+    featureForm->addRow(tr("開始フレーム (素材・0始まり):"), m_featureStart);
+    featureForm->addRow(tr("終了フレーム (含む):"), m_featureEnd);
+    featureForm->addRow(tr("最大特徴点数:"), m_featureMaxPoints);
+    rightLayout->addLayout(featureForm);
+    m_featureButton = new QPushButton(tr("特徴点を追跡"), this);
+    m_featureButton->setObjectName(QStringLiteral("featureTrackButton"));
+    m_featureButton->setEnabled(false);
+    m_featureProgress = new QProgressBar(this);
+    m_featureProgress->setVisible(false);
+    m_featureSummary = new QLabel(this);
+    m_featureSummary->setObjectName(QStringLiteral("featureSummary"));
+    m_featureSummary->setWordWrap(true);
+    rightLayout->addWidget(m_featureButton);
+    rightLayout->addWidget(m_featureProgress);
+    rightLayout->addWidget(m_featureSummary);
+    m_featureSolveButton = new QPushButton(tr("カメラを解析"), this);
+    m_featureSolveButton->setObjectName(QStringLiteral("featureSolveButton"));
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary = new QLabel(this);
+    m_featureSolveSummary->setObjectName(QStringLiteral("featureSolveSummary"));
+    m_featureSolveSummary->setWordWrap(true);
+    rightLayout->addWidget(m_featureSolveButton);
+    rightLayout->addWidget(m_featureSolveSummary);
+    connect(m_featureSolveButton, &QPushButton::clicked, this,
+            [this] { solveFeatureCamera(); });
+    connect(m_featureButton, &QPushButton::clicked,
+            this, &PlanarTrackerDialog::onFeatureTrackClicked);
     rightLayout->addStretch();
     rightLayout->addWidget(m_buttonBox);
 
@@ -396,6 +446,12 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     connect(m_dampingSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &PlanarTrackerDialog::onDampingChanged);
 
+    // The pending-load summary derives its expected frame count from the range.
+    connect(m_featureStart, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &PlanarTrackerDialog::rebuildSummary);
+    connect(m_featureEnd, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &PlanarTrackerDialog::rebuildSummary);
+
     connect(m_buttonBox, &QDialogButtonBox::accepted, this, &PlanarTrackerDialog::accept);
     connect(m_buttonBox, &QDialogButtonBox::rejected, this, &QDialog::reject);
 
@@ -412,19 +468,23 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setReferenceFrame(const QImage& frame)
 {
+    // A new reference means a new clip: drop the previous clip's frames too.
+    m_frames.clear();
     m_result.clear();
     m_reference = frame;
     m_cornerWidget->setReferenceImage(frame);
     onResetCorners();   // reset corners to new image bounds
+    rebuildSummary();
 }
 
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::setFrames(const QList<QImage>& frames)
 {
-    m_result.clear();
-    m_frames = frames;
+    m_planarFrameLoader = {};
     if (!frames.isEmpty() && m_reference.isNull())
         setReferenceFrame(frames.first());
+    m_result.clear();
+    m_frames = frames;
     rebuildSummary();
 }
 
@@ -787,6 +847,12 @@ void PlanarTrackerDialog::onResetCorners()
 // ---------------------------------------------------------------------------
 void PlanarTrackerDialog::onTrackClicked()
 {
+    if (m_planarFrameLoader) {
+        const auto frames = m_planarFrameLoader();
+        if (frames.isEmpty()) return;
+        setFrames(frames);
+        m_planarFrameLoader = {};
+    }
     if (m_frames.isEmpty()) {
         QMessageBox::information(this, tr("情報"),
                                  tr("フレームが投入されていません。"));
@@ -897,9 +963,313 @@ void PlanarTrackerDialog::rebuildSummary()
     if (tracked > 0)
         avgConf /= tracked;
 
-    const QString text = tr("投入: %1 / 追跡済: %2 / 平均信頼度: %3")
-                             .arg(total)
-                             .arg(tracked)
-                             .arg(avgConf, 0, 'f', 2);
+    QString text;
+    if (total == 0 && m_planarFrameLoader) {
+        // Frames load lazily on 追跡; report the count the loader is expected to
+        // supply instead of 0, from the dialog's own range and source length.
+        const int expected = std::min(
+            std::max(0, m_featureEnd->value() - m_featureStart->value() + 1),
+            std::max(0, m_featureFrameCount));
+        text = tr("投入: 読み込み待ち (期待 %1 フレーム) / 追跡済: %2 / 平均信頼度: %3")
+                   .arg(expected)
+                   .arg(tracked)
+                   .arg(avgConf, 0, 'f', 2);
+    } else {
+        text = tr("投入: %1 / 追跡済: %2 / 平均信頼度: %3")
+                   .arg(total)
+                   .arg(tracked)
+                   .arg(avgConf, 0, 'f', 2);
+    }
     m_summaryLabel->setText(text);
+}
+
+std::function<QImage(const QString&, double, const QSize&)>&
+PlanarTrackerDialog::featureGrabFunctionForTest()
+{
+    static std::function<QImage(const QString&, double, const QSize&)> grab =
+        [](const QString& path, double seconds, const QSize& maxSize) {
+            return libavcore::grabFrameAt(path, seconds, maxSize);
+        };
+    return grab;
+}
+
+std::function<void()>& PlanarTrackerDialog::featureOrphanCallbackHookForTest()
+{
+    static std::function<void()> hook;
+    return hook;
+}
+
+PlanarTrackerDialog::~PlanarTrackerDialog()
+{
+    if (!m_featureWorker) return;
+    QThread* worker = m_featureWorker;
+    worker->requestInterruption();
+    // Block the GUI thread for at most 5 seconds: decoding or KLT may not reach
+    // an interruption check sooner.
+    if (worker->wait(5000)) {
+        delete worker;
+        return;
+    }
+    qWarning().noquote() << QStringLiteral("特徴点解析スレッドの停止を待ちきれませんでした");
+    // Detach: the worker captures only copies and reports through its own
+    // context object (see onFeatureTrackClicked), never this dialog, so it can
+    // finish on its own and then delete itself.
+    connect(worker, &QThread::finished, worker, &QObject::deleteLater);
+    if (worker->isFinished()) worker->deleteLater(); // finished before the connect
+    // The application-exit wait was registered when the worker started (see
+    // onFeatureTrackClicked); it stays connected until the worker is deleted.
+}
+
+void PlanarTrackerDialog::setPlanarFrameLoader(std::function<QList<QImage>()> loader)
+{
+    m_frames.clear();
+    m_result.clear();
+    m_planarFrameLoader = std::move(loader);
+    rebuildSummary();
+}
+
+void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double fps, int frameCount)
+{
+    if (m_featureWorker) return;
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary->clear();
+    m_featureSolveResult = {};
+    m_featureIn = 0;
+    m_featureOut = fps > 0 ? frameCount / fps : 0;
+    m_featureSpeed = 1;
+    m_featureReversed = false;
+    m_featurePath = path;
+    m_featureFps = fps;
+    m_featureFrameCount = frameCount;
+    m_featureTracks = {};
+    m_featureAnalysisSize = {};
+    m_featureSummary->clear();
+    m_featureStartFrame = 0;
+    m_featureProgress->setVisible(false);
+    m_featureStart->setToolTip(tr("素材の先頭を0として、毎秒%1フレームで解析します。タイムラインの速度変更・トリムは適用しません。")
+        .arg(fps));
+    m_featureEnd->setToolTip(m_featureStart->toolTip());
+    m_featureStart->setRange(0, std::max(0, frameCount - 1));
+    m_featureEnd->setRange(0, std::max(0, frameCount - 1));
+    m_featureStart->setValue(0);
+    m_featureEnd->setValue(std::max(0, std::min(frameCount, sfm::kMaxBundleFrames) - 1));
+    m_featureButton->setEnabled(!path.isEmpty());
+    // MainWindow calls this after setPlanarFrameLoader, so the pending-load
+    // summary must be rebuilt against the new frame count.
+    rebuildSummary();
+}
+
+void PlanarTrackerDialog::onFeatureTrackClicked()
+{
+    if (m_featureWorker) return;
+    m_featureTracks = {};
+    m_featureSolveResult = {};
+    m_featureSolveButton->setEnabled(false);
+    m_featureSolveSummary->clear();
+    m_featureAnalysisSize = {};
+    const int first = m_featureStart->value(), last = m_featureEnd->value();
+    const int count = last - first + 1, maxPoints = m_featureMaxPoints->value();
+    QString error;
+    if (count < 2 || first < 0 || last >= m_featureFrameCount)
+        error = tr("範囲が不正です。最低2フレームを指定してください。");
+    else if (count > sfm::kMaxBundleFrames)
+        error = tr("メモリ使用量を制限するため、上限は%1フレームです。範囲を短くしてください。")
+            .arg(sfm::kMaxBundleFrames);
+    else if (maxPoints < 8)
+        error = tr("特徴点は最低8点必要です。");
+    else if (m_featurePath.isEmpty() || !std::isfinite(m_featureFps) || m_featureFps <= 0)
+        error = tr("動画素材またはフレームレートが不正です。");
+    if (!error.isEmpty()) {
+        m_featureSummary->setText(error);
+        emit featureTrackingFinished(false);
+        return;
+    }
+    m_featureStartFrame = first;
+    m_featureButton->setEnabled(false);
+    m_featureStart->setEnabled(false);
+    m_featureEnd->setEnabled(false);
+    m_featureMaxPoints->setEnabled(false);
+    m_featureProgress->setVisible(true);
+    m_featureProgress->setRange(0, count);
+    m_featureProgress->setValue(0);
+    m_featureSummary->setText(tr("解析用フレームを読み込み中…"));
+    struct Result { sfm::MultiViewTracks tracks; QSize size; QString error; int complete = 0; };
+    auto result = std::make_shared<Result>();
+    const QString path = m_featurePath;
+    const double fps = m_featureFps;
+    const auto grab = featureGrabFunctionForTest();
+    // Queued callbacks go to a per-run context object, not to this dialog. The
+    // dialog may be destroyed while the worker still runs (see the destructor);
+    // the context lives until the worker finishes, and each callback checks the
+    // QPointer before touching the dialog.
+    QObject* ctx = new QObject;
+    m_featureWorkerContext = ctx;
+    const QPointer<PlanarTrackerDialog> dialog(this);
+    const auto orphaned = [] {
+        if (const auto& hook = featureOrphanCallbackHookForTest()) hook();
+    };
+    m_featureWorker = QThread::create([ctx, dialog, orphaned, grab, result, path, fps, first, count, maxPoints] {
+        QVector<QImage> frames;
+        // Bounding both dimensions also bounds extreme-aspect-ratio memory use.
+        for (int i = 0; i < count; ++i) {
+            if (QThread::currentThread()->isInterruptionRequested()) return;
+            QImage frame = grab(path, double(first + i) / fps, QSize(1280, 1280));
+            if (frame.isNull()) { result->error = PlanarTrackerDialog::tr("フレームを取得できませんでした。"); return; }
+            const int shorter = std::min(frame.width(), frame.height());
+            if (shorter > 720)
+                frame = frame.scaled(qRound(frame.width() * 720.0 / shorter),
+                    qRound(frame.height() * 720.0 / shorter), Qt::KeepAspectRatio, Qt::SmoothTransformation);
+            frame = frame.convertToFormat(QImage::Format_Grayscale8);
+            if (i == 0) {
+                result->size = frame.size();
+                if (feattrack::detectShiTomasi(frame, maxPoints).size() < 8) {
+                    result->error = PlanarTrackerDialog::tr("特徴点が不足しています。最低8点が必要です。"); return;
+                }
+            } else if (frame.size() != result->size) {
+                result->error = PlanarTrackerDialog::tr("フレームの解像度が途中で変化しています。"); return;
+            }
+            frames.append(frame);
+            QMetaObject::invokeMethod(ctx, [dialog, orphaned, i] {
+                if (!dialog) { orphaned(); return; }
+                dialog->m_featureProgress->setValue(i + 1);
+            }, Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(ctx, [dialog, orphaned] {
+            if (!dialog) { orphaned(); return; }
+            dialog->m_featureProgress->setRange(0, 0);
+            dialog->m_featureSummary->setText(PlanarTrackerDialog::tr("特徴点を追跡中…"));
+        }, Qt::QueuedConnection);
+        const auto interrupted = [result] {
+            if (!QThread::currentThread()->isInterruptionRequested()) return false;
+            result->tracks = {};
+            result->error = PlanarTrackerDialog::tr("解析を中断しました。");
+            return true;
+        };
+        if (interrupted()) return;
+        result->tracks = sfm::trackAcrossFrames(frames, maxPoints);
+        if (interrupted()) return;
+        for (const auto& track : result->tracks.tracks)
+            if (track.observations.size() == count) ++result->complete;
+        if (result->complete < 8)
+            result->error = PlanarTrackerDialog::tr("最後まで追跡できた特徴点が不足しています。最低8点が必要です。");
+    });
+    connect(m_featureWorker, &QThread::finished, ctx, &QObject::deleteLater);
+    // Application exit: registered now, while the event loop still runs, because
+    // aboutToQuit is emitted before app.exec() returns and so before MainWindow
+    // (and this dialog) is destroyed. The handler interrupts the worker and waits
+    // at most 2 seconds. It never deletes the worker: destroying a running QThread
+    // aborts with "QThread: Destroyed while thread is still running", so a worker
+    // that is still running is intentionally leaked to the process exit.
+    // The worker is the context object, so the connection is dropped when the
+    // worker is deleted (by the finished handler below, by the destructor, or by
+    // its own deleteLater after detaching); the handler never sees a dead worker.
+    if (qApp) {
+        QThread* worker = m_featureWorker;
+        connect(qApp, &QCoreApplication::aboutToQuit, worker, [worker] {
+            worker->requestInterruption();
+            worker->wait(2000);
+        });
+    }
+    connect(m_featureWorker, &QThread::finished, this, [this, result] {
+        m_featureWorker->deleteLater();
+        m_featureWorker = nullptr;
+        m_featureWorkerContext = nullptr;
+        m_featureButton->setEnabled(true);
+        m_featureStart->setEnabled(true);
+        m_featureEnd->setEnabled(true);
+        m_featureMaxPoints->setEnabled(true);
+        m_featureProgress->setRange(0, 100);
+        m_featureProgress->setValue(100);
+        m_featureAnalysisSize = result->size;
+        const bool success = result->error.isEmpty() && result->tracks.frameCount >= 2;
+        if (success) {
+            setFeatureTrackingResult(result->tracks, result->size, m_featureStartFrame);
+            const int total = int(m_featureTracks.tracks.size());
+            m_featureSummary->setText(tr("追跡点数: %1 / %2、フレーム数: %3、脱落率: %4%")
+                .arg(result->complete).arg(total).arg(m_featureTracks.frameCount)
+                .arg(100.0 * (total - result->complete) / total, 0, 'f', 1));
+        } else m_featureSummary->setText(result->error);
+        emit featureTrackingFinished(success);
+    });
+    m_featureWorker->start();
+}
+
+void PlanarTrackerDialog::setFeatureClipTiming(double inPoint, double outPoint,
+                                               double speed, bool reversed, bool nonLinearTiming)
+{
+    m_featureNonLinearTiming = nonLinearTiming;
+    m_featureIn = inPoint;
+    m_featureOut = outPoint;
+    m_featureSpeed = speed;
+    m_featureReversed = reversed;
+    if (!std::isfinite(inPoint) || !std::isfinite(outPoint) || !std::isfinite(m_featureFps) || m_featureFps <= 0
+        || inPoint < 0 || outPoint <= inPoint) return;
+    const double first = std::ceil(inPoint * m_featureFps - 1e-9);
+    const double last = std::ceil(outPoint * m_featureFps - 1e-9) - 1;
+    m_featureStart->setValue(int(std::clamp(first, 0.0, double(m_featureStart->maximum()))));
+    m_featureEnd->setValue(int(std::clamp(std::min(last, first + sfm::kMaxBundleFrames - 1),
+                                        0.0, double(m_featureEnd->maximum()))));
+}
+
+void PlanarTrackerDialog::setFeatureTrackingResult(const sfm::MultiViewTracks& tracks,
+                                                   QSize size, int first)
+{
+    m_featureTracks = tracks;
+    m_featureAnalysisSize = size;
+    m_featureStartFrame = first;
+    m_featureSolveResult = {};
+    m_featureSolveSummary->clear();
+    m_featureSolveButton->setEnabled(tracks.frameCount >= 2 && tracks.tracks.size() >= 8);
+}
+
+bool PlanarTrackerDialog::solveFeatureCamera()
+{
+    if (m_featureWorker) return false;
+    m_featureSolveResult = sfm::sampleCameraTracks(m_featureTracks);
+    const double first = m_featureStartFrame / m_featureFps;
+    const double last = (double(m_featureStartFrame) + m_featureTracks.frameCount - 1) / m_featureFps;
+    QString error;
+    if (!std::isfinite(m_featureFps) || m_featureFps <= 0
+        || !std::isfinite(m_featureIn) || !std::isfinite(m_featureOut)
+        || m_featureIn < 0 || m_featureOut <= m_featureIn
+        || !std::isfinite(m_featureSpeed) || m_featureSpeed <= 0
+        || !std::isfinite(m_cameraStartSec) || first < m_featureIn - 1e-9
+        || last >= m_featureOut || m_featureTracks.frameCount < 2)
+        error = tr("解析範囲がクリップの使用区間外です。適用できません。");
+    else if (m_featureNonLinearTiming)
+        // The inverse mapping below is linear in inPoint / speed / reversed only, so a
+        // ramped clip would place every keyframe at a silently wrong time.
+        error = tr("速度ランプまたはタイムリマップのあるクリップには適用できません。");
+    else if (m_featureAnalysisSize.isEmpty() || m_cameraCanvas.isEmpty())
+        error = tr("解析画像のサイズが不正です。");
+    else {
+        const double focal = m_cameraFov * std::max(
+            double(m_featureAnalysisSize.width()) / m_cameraCanvas.width(),
+            double(m_featureAnalysisSize.height()) / m_cameraCanvas.height());
+        m_featureSolveResult = sfm::solveCameraTracks(m_featureTracks,
+            camsolve::makeIntrinsicsFromFocalPx(focal, m_featureAnalysisSize));
+        if (!m_featureSolveResult.bundle.valid) error = m_featureSolveResult.bundle.reason;
+    }
+    const auto& result = m_featureSolveResult;
+    m_featureSolveSummary->setText(tr("%1使用フレーム数: %2 / %3、使用点数: %4 / %5\nRMS 再投影誤差: %6 px")
+        .arg(result.thinned ? tr("間引きあり — ") : QString())
+        .arg(result.input.frameCount).arg(m_featureTracks.frameCount)
+        .arg(result.input.tracks.size()).arg(m_featureTracks.tracks.size())
+        .arg(std::isfinite(result.bundle.rms) ? QString::number(result.bundle.rms, 'g', 6) : tr("∞（算出不可）")));
+    if (!error.isEmpty()) {
+        m_featureSolveSummary->setText(m_featureSolveSummary->text() + "\n" + error
+            + tr("\n平面シーンでは既存の 3D カメラ解析を使ってください"));
+        return false;
+    }
+    // Invalid entries preserve unsolved sample times without inventing poses.
+    QVector<camsolve::Pose> timed(m_featureTracks.frameCount);
+    const auto poses = sfm::toCameraPoses(result.bundle);
+    for (int i = 0; i < poses.size(); ++i) {
+        const int frame = result.sourceFrames[i];
+        timed[m_featureReversed ? timed.size() - 1 - frame : frame] = poses[i];
+    }
+    const double start = m_cameraStartSec + (m_featureReversed
+        ? m_featureOut - last : first - m_featureIn) / m_featureSpeed;
+    emit cameraSolveApplied(timed, m_featureFps * m_featureSpeed, start);
+    return true;
 }

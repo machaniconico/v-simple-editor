@@ -8,8 +8,9 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QString>
-#include <QTextStream>
 #include <QVector>
+
+#include <cstdio>
 
 #ifdef Q_OS_WIN
 #include <windows.h>
@@ -44,8 +45,14 @@ static void qtMessageHandler(QtMsgType type, const QMessageLogContext &ctx, cons
     }
     writeLogLine(level, full);
 
-    // Also emit to stderr so console users see it.
-    QTextStream(stderr) << "[" << level << "] " << msg << "\n";
+    // Also emit to stderr so console users see it. No QTextStream here: Qt can
+    // call this handler while it holds a signal/slot pool mutex (the wildcard
+    // QObject::disconnect warning), and QTextStream(FILE *) connects a new QFile,
+    // which self-deadlocks when its pool mutex collides with the held one.
+    const QByteArray line = (QStringLiteral("[") + QLatin1String(level) + QStringLiteral("] ")
+                             + msg + QLatin1Char('\n')).toUtf8();
+    std::fwrite(line.constData(), 1, size_t(line.size()), stderr);
+    std::fflush(stderr);
 }
 
 #ifdef Q_OS_WIN

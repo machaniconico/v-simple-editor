@@ -35,7 +35,19 @@ struct ArgvSelftestEntry {
 extern const ArgvSelftestEntry kArgvSelftests[];
 extern const std::size_t kArgvSelftestsCount;
 
+// GateTally::finish() reports each completed tally to the active table entry.
+// Multiple finishes in one entry are added before its declared count is checked.
+void reportTally(int passed, int failed, int skipped);
+
 bool requireSelftest(bool condition, const QString &message, QString *error);
+
+// US-700: per-entry watchdog. armWatchdog() starts a std::thread that waits
+// VEDITOR_SELFTEST_TIMEOUT_SEC seconds (default 900, 0 = disabled); on expiry
+// it prints `summary: TIMEOUT after <N>s (selftest=<name>)` to stderr and
+// calls std::_Exit(124). disarmWatchdog() cancels the pending timer.
+// Usable before QApplication is constructed.
+void armWatchdog(const char* name);
+void disarmWatchdog();
 
 // Pre-QApplication argv parse: handles --selftest=list / --selftest=help /
 // QApp-free entries. Returns the selftest exit code if matched, std::nullopt

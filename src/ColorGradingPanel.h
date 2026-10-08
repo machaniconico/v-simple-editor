@@ -13,6 +13,7 @@
 #include "VideoEffect.h"
 #include "LutImporter.h"
 
+class QDoubleSpinBox;
 class ColorWheelWidget;
 class HueSatWarpWidget;
 class CurveEditor;
@@ -23,6 +24,7 @@ class QJsonObject;
 
 // Primary Lift/Gamma/Gain wheels plus Log Shadow/Midtone/Highlight wheels.
 struct ColorWheels {
+    QVector3D offset = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D lift   = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D gamma  = QVector3D(1.0f, 1.0f, 1.0f);
     QVector3D gain   = QVector3D(0.0f, 0.0f, 0.0f);
@@ -34,7 +36,7 @@ struct ColorWheels {
     double gainLuma  = 0.0;
 
     bool operator==(const ColorWheels &o) const {
-        return lift == o.lift && gamma == o.gamma && gain == o.gain
+        return offset == o.offset && lift == o.lift && gamma == o.gamma && gain == o.gain
             && logShadow == o.logShadow && logMid == o.logMid && logHigh == o.logHigh
             && liftLuma == o.liftLuma && gammaLuma == o.gammaLuma && gainLuma == o.gainLuma;
     }
@@ -250,6 +252,8 @@ private:
     ColorWheels m_wheels;
 
     // Color wheels (graphical)
+    ColorWheelWidget *m_offsetWheel = nullptr;
+    QDoubleSpinBox *m_offsetValues[3] = {nullptr, nullptr, nullptr};
     ColorWheelWidget *m_liftWheel;
     ColorWheelWidget *m_gammaWheel;
     ColorWheelWidget *m_gainWheel;

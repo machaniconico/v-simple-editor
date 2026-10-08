@@ -1,4 +1,5 @@
 #include "../FeatureTracker.h"
+#include "SelftestGate.h"
 
 #include <chrono>
 #include <cmath>
@@ -79,11 +80,8 @@ int accurate(const QVector<QPointF>& original, const QVector<feattrack::Track>& 
 
 int runFeatureTrackerSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto gate = [&](int number, bool ok) {
-        std::cerr << (ok ? "PASS G" : "FAIL G") << number << '\n';
-        if (ok) ++passed; else ++failed;
-    };
+    selftest::GateTally tally;
+    const auto gate = [&](int n, bool ok) { tally.gate(n, ok); };
     const QImage image = texture(640, 480, 200);
     const auto points = feattrack::detectShiTomasi(image, 500, 0.01, 8);
     QImage flat(image.size(), QImage::Format_Grayscale8);
@@ -155,9 +153,7 @@ int runFeatureTrackerSelftest()
     std::cerr << (ms > 2000 ? "WARN " : "") << "G6 1080p, " << hdPoints.size() << " points: " << ms << " ms\n";
     gate(6, hdPoints.size() == 500);
 #else
-    std::cerr << "SKIP G6 (Debug)\n";
-    gate(6, true);
+    tally.skip(6, "Debug build");
 #endif
-    std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
-    return failed;
+    return tally.finish();
 }

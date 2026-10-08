@@ -1,4 +1,5 @@
 #include "ProjectFile.h"
+#include "ClipGeometry.h"
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
@@ -326,6 +327,120 @@ void migrateGeneratedCaptionsToProjectLevel(ProjectData &data)
         });
 }
 
+// --- legacy "Edit Keyframes" dialog tracks -> canonical grade.* names ---
+//
+// The old dialog persisted inert `colorCorrection.<x>` tracks that the
+// evaluator never read. Rename them to `grade.<x>` on load. When a
+// `grade.<x>` track already exists it wins and the legacy track is dropped
+// with a warning (never silently merged).
+// Returns true when a legacy track was found (renamed or dropped).
+static bool migrateLegacyColorCorrectionKeyframesInManager(KeyframeManager &km)
+{
+    static const char *const kNames[] = {
+        "brightness", "contrast", "saturation", "exposure", "hue",
+        "temperature", "gamma", "highlights", "shadows"};
+    bool changed = false;
+    for (const char *name : kNames) {
+        const QString legacy = QStringLiteral("colorCorrection.") + QLatin1String(name);
+        const QString canonical = QStringLiteral("grade.") + QLatin1String(name);
+        if (!km.hasTrack(legacy))
+            continue;
+        changed = true;
+        if (km.hasTrack(canonical)) {
+            km.removeTrack(legacy);
+            qWarning("migrateLegacyColorCorrectionKeyframes: both %s and %s exist; "
+                     "keeping %s and dropping %s",
+                     qPrintable(legacy), qPrintable(canonical),
+                     qPrintable(canonical), qPrintable(legacy));
+        } else {
+            km.renameTrack(legacy, canonical);
+        }
+    }
+    return changed;
+}
+
+static void migrateLegacyColorCorrectionKeyframesInClip(ClipInfo &clip)
+{
+    migrateLegacyColorCorrectionKeyframesInManager(clip.keyframes);
+    if (clip.renderInPlaceOriginal)
+        migrateLegacyColorCorrectionKeyframesInClip(*clip.renderInPlaceOriginal);
+}
+
+// Clip JSON as stored inside the nested sequence store (a base64 blob in
+// clipParentEntries that is never expanded into ClipInfo here). The object is
+// rewritten only when a legacy track is present, so other JSON stays
+// byte-identical.
+static bool migrateLegacyColorCorrectionKeyframesInClipJson(QJsonObject &clip)
+{
+    bool changed = false;
+    if (clip.value(QStringLiteral("keyframes")).isObject()) {
+        KeyframeManager km;
+        km.fromJson(clip.value(QStringLiteral("keyframes")).toObject());
+        if (migrateLegacyColorCorrectionKeyframesInManager(km)) {
+            clip[QStringLiteral("keyframes")] = km.toJson();
+            changed = true;
+        }
+    }
+    if (clip.value(QStringLiteral("renderInPlaceOriginal")).isObject()) {
+        QJsonObject original = clip.value(QStringLiteral("renderInPlaceOriginal")).toObject();
+        if (migrateLegacyColorCorrectionKeyframesInClipJson(original)) {
+            clip[QStringLiteral("renderInPlaceOriginal")] = original;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+static void migrateLegacyColorCorrectionKeyframesInSequenceStores(ProjectData &data)
+{
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (ClipParentEntry &entry : data.clipParentEntries) {
+        if (entry.clipId != storeKey)
+            continue;
+        QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+        QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+        bool storeChanged = false;
+        for (int si = 0; si < sequences.size(); ++si) {
+            QJsonObject sequence = sequences.at(si).toObject();
+            bool sequenceChanged = false;
+            for (const QString &trackKey : {QStringLiteral("videoTracks"), QStringLiteral("audioTracks")}) {
+                QJsonArray tracks = sequence.value(trackKey).toArray();
+                for (int ti = 0; ti < tracks.size(); ++ti) {
+                    QJsonArray clips = tracks.at(ti).toArray();
+                    for (int ci = 0; ci < clips.size(); ++ci) {
+                        QJsonObject clip = clips.at(ci).toObject();
+                        if (migrateLegacyColorCorrectionKeyframesInClipJson(clip)) {
+                            clips.replace(ci, clip);
+                            tracks.replace(ti, clips);
+                            sequence[trackKey] = tracks;
+                            sequenceChanged = true;
+                        }
+                    }
+                }
+            }
+            if (sequenceChanged) {
+                sequences.replace(si, sequence);
+                storeChanged = true;
+            }
+        }
+        if (storeChanged) {
+            store[QStringLiteral("sequences")] = sequences;
+            entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+        }
+    }
+}
+
+// Main tracks (+ renderInPlaceOriginal) and the nested sequence store. Must run
+// after clipParentEntries (including the root "sequences" store) is populated.
+static void migrateLegacyColorCorrectionKeyframes(ProjectData &data)
+{
+    for (ProjectTrackClips *tracks : {&data.videoTracks, &data.audioTracks})
+        for (QVector<ClipInfo> &track : *tracks)
+            for (ClipInfo &clip : track)
+                migrateLegacyColorCorrectionKeyframesInClip(clip);
+    migrateLegacyColorCorrectionKeyframesInSequenceStores(data);
+}
+
 // --- v1 -> v2 migration: clip pan offsets unit convention ---
 //
 // In format v1 the per-clip videoDx/videoDy were persisted in *pixels*
@@ -629,6 +744,17 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        // Chain owns de-esser serialization/default omission for tracks and master.
+        QJsonArray fxArray;
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
+            QJsonObject chain = it.value().toJson();
+            if (it.key() < 0 || chain.isEmpty()) continue;
+            chain["track"] = it.key();
+            fxArray.append(chain);
+        }
+        if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        const QJsonObject masterFx = data.masterFx.toJson();
+        if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
     }
 
@@ -949,8 +1075,19 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    // Both project readers restore de-esser settings through the shared Chain codec.
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
+        for (const auto &value : am["trackFx"].toArray()) {
+            const QJsonObject object = value.toObject();
+            const int track = object["track"].toInt(-1);
+            if (track < 0) continue;
+            const auto chain = trackfx::Chain::fromJson(object);
+            if (!chain.isDefault()) data.trackFx.insert(track, chain);
+        }
+        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1081,6 +1218,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1240,6 +1378,17 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         am["trackEq"] = teArr;
         am["compressor"] = compressorToJson(data.masterCompressor);
         am["autoDuck"] = autoDuckToJson(data.autoDuck);
+        // Chain owns de-esser serialization/default omission for tracks and master.
+        QJsonArray fxArray;
+        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
+            QJsonObject chain = it.value().toJson();
+            if (it.key() < 0 || chain.isEmpty()) continue;
+            chain["track"] = it.key();
+            fxArray.append(chain);
+        }
+        if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        const QJsonObject masterFx = data.masterFx.toJson();
+        if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
     }
 
@@ -1530,8 +1679,19 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
+    // Both project readers restore de-esser settings through the shared Chain codec.
+    data.trackFx.clear();
+    data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
+        for (const auto &value : am["trackFx"].toArray()) {
+            const QJsonObject object = value.toObject();
+            const int track = object["track"].toInt(-1);
+            if (track < 0) continue;
+            const auto chain = trackfx::Chain::fromJson(object);
+            if (!chain.isDefault()) data.trackFx.insert(track, chain);
+        }
+        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1662,6 +1822,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1822,6 +1983,8 @@ ProjectConfig ProjectFile::configFromJson(const QJsonObject &obj)
 QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
 {
     QJsonObject obj;
+    if (!clip.visible && !clipgeom::isNullObjectFilePath(clip.filePath))
+        obj["visible"] = false;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
     if (!clip.shapes.isEmpty()) {
@@ -1894,6 +2057,13 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["colorCorrection"] = colorCorrectionToJson(clip.colorCorrection);
     if (clip.colorCurves.hasCurves())
         obj["colorCurves"] = clipCurvesToJson(clip.colorCurves);
+    if (!clip.puppetPins.isEmpty()) {
+        QJsonArray pins;
+        for (const auto &pin : clip.puppetPins) pins.append(pin.toJson());
+        obj["puppetPins"] = pins;
+    }
+    if (clip.hasMeshWarp())
+        obj["meshWarp"] = clip.meshWarp.toJson();
     if (!clip.hslSecondary.isDefault())
         obj["hslSecondary"] = hslSecondaryToJson(clip.hslSecondary);
     if (!clip.colorMeta.isDefault())
@@ -1942,6 +2112,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
 {
     ClipInfo clip;
     clip.filePath = obj["filePath"].toString();
+    clip.visible = !clipgeom::isNullObjectFilePath(clip.filePath)
+        && obj.value("visible").toBool(true);
     clip.displayName = obj["displayName"].toString();
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())
@@ -2009,6 +2181,18 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.colorCorrection = colorCorrectionFromJson(obj["colorCorrection"].toObject());
     if (obj.contains("colorCurves"))
         clip.colorCurves = clipCurvesFromJson(obj["colorCurves"].toObject());
+    for (const auto &value : obj["puppetPins"].toArray()) {
+        const WarpPin pin = WarpPin::fromJson(value.toObject());
+        const auto validUv = [](const QPointF &p) {
+            return p.x() >= 0.0 && p.x() <= 1.0 && p.y() >= 0.0 && p.y() <= 1.0;
+        };
+        if (validUv(pin.originalPos) && validUv(pin.deformedPos)
+            && pin.radius > 0.0 && pin.radius <= 2.0
+            && pin.stiffness >= 0.0 && pin.stiffness <= 1.0)
+            clip.puppetPins.append(pin);
+    }
+    if (obj.contains("meshWarp"))
+        clip.meshWarp = MeshGrid::fromJson(obj["meshWarp"].toObject());
     if (obj.contains("hslSecondary"))
         clip.hslSecondary = hslSecondaryFromJson(obj["hslSecondary"].toObject());
     clip.colorMeta = obj.contains("colorMeta")
@@ -2067,6 +2251,9 @@ QJsonObject ProjectFile::colorCorrectionToJson(const ColorCorrection &cc)
         if (value != 0.0)
             obj[key] = value;
     };
+    addIfNonZero(QStringLiteral("offsetR"), cc.offsetR);
+    addIfNonZero(QStringLiteral("offsetG"), cc.offsetG);
+    addIfNonZero(QStringLiteral("offsetB"), cc.offsetB);
     addIfNonZero(QStringLiteral("liftR"), cc.liftR);
     addIfNonZero(QStringLiteral("liftG"), cc.liftG);
     addIfNonZero(QStringLiteral("liftB"), cc.liftB);
@@ -2110,6 +2297,9 @@ ColorCorrection ProjectFile::colorCorrectionFromJson(const QJsonObject &obj)
     cc.highlights = obj["highlights"].toDouble();
     cc.shadows = obj["shadows"].toDouble();
     cc.exposure = obj["exposure"].toDouble();
+    cc.offsetR = obj["offsetR"].toDouble(0.0);
+    cc.offsetG = obj["offsetG"].toDouble(0.0);
+    cc.offsetB = obj["offsetB"].toDouble(0.0);
     cc.liftR = obj["liftR"].toDouble(0.0);
     cc.liftG = obj["liftG"].toDouble(0.0);
     cc.liftB = obj["liftB"].toDouble(0.0);
@@ -2152,6 +2342,7 @@ QJsonObject ProjectFile::effectToJson(const VideoEffect &e)
     obj["param1"] = e.param1;
     obj["param2"] = e.param2;
     obj["param3"] = e.param3;
+    if (!e.mask.isDefault()) obj["mask"] = e.mask.toJson();
     obj["keyColor"] = e.keyColor.name();
     if (e.startSec != -1.0)
         obj["startSec"] = e.startSec;
@@ -2171,6 +2362,7 @@ VideoEffect ProjectFile::effectFromJson(const QJsonObject &obj)
     e.keyColor = QColor(obj["keyColor"].toString("#00ff00"));
     e.startSec = obj["startSec"].toDouble(-1.0);
     e.endSec = obj["endSec"].toDouble(-1.0);
+    e.mask.fromJson(obj["mask"].toObject());
     return e;
 }
 
@@ -2308,6 +2500,10 @@ QJsonObject ProjectFile::trackFlagsToJson(const ProjectData &data)
                 item.insert(QStringLiteral("solo"), solo);
                 item.insert(QStringLiteral("hidden"), hidden);
             }
+            const QString name = candidate.value(QStringLiteral("name")).toString();
+            const QColor color(candidate.value(QStringLiteral("color")).toString());
+            if (!name.isEmpty()) item.insert(QStringLiteral("name"), name);
+            if (color.isValid()) item.insert(QStringLiteral("color"), color.name());
             // Keep one array entry per track even when every flag is false.
             result.append(item);
         }

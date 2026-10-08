@@ -1,3 +1,4 @@
+#include "../ClipGeometry.h"
 #include <QEventLoop>
 #include <QElapsedTimer>
 #include <QAction>
@@ -20,6 +21,8 @@
 #include <QFileInfo>
 #include <QList>
 #include <QTemporaryFile>
+#include <QStandardPaths>
+#include <QTest>
 #include <QTemporaryDir>
 #include <QNetworkAccessManager>
 #include <QNetworkReply>
@@ -42,6 +45,7 @@
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "../clipanim/ClipAnim.h"
 #include "../mcp/McpEditorTools.h"
@@ -49,14 +53,18 @@
 #include "../mcp/McpProtocol.h"
 #include "../mcp/McpStdioBridge.h"
 #include "../mcp/McpToolRegistry.h"
+#include "SelftestGate.h"
 #include "../AiChatDock.h"
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
 #include "../MainWindow.h"
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
+#include "../ExportUserPresets.h"
+#include "../LoudnessMaster.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "../UndoManager.h"
 
@@ -181,15 +189,29 @@ int rawHttpStatus(quint16 port, const QByteArray& request)
 int runMcpSelftest()
 {
     qInfo().noquote() << "[mcp] selftest start";
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
+    // Gate names start with "G<n> "; anything else is an explicit G0 FAIL.
+    auto gateNumber = [](const char* name) {
+        const QString text = QString::fromUtf8(name);
+        if (!text.startsWith(QLatin1Char('G'))) return 0;
+        int end = 1;
+        while (end < text.size() && text.at(end).isDigit()) ++end;
+        if (end == 1 || end >= text.size() || text.at(end) != QLatin1Char(' ')) return 0;
+        return text.mid(1, end - 1).toInt();
+    };
     auto pass = [&](const char* name) {
-        ++passed;
-        qInfo().noquote() << "[mcp] PASS" << name;
+        const int n = gateNumber(name);
+        if (n > 0) {
+            qInfo().noquote() << "[mcp] PASS" << name;
+            tally.gate(n, true);
+        } else {
+            qWarning().noquote() << "[mcp] FAIL" << name << ": unparsable gate name";
+            tally.gate(0, false, QByteArray(QByteArrayLiteral("unparsable gate name: ") + name).constData());
+        }
     };
     auto fail = [&](const char* name, const QString& message) {
-        ++failed;
         qWarning().noquote() << "[mcp] FAIL" << name << ":" << message;
+        tally.gate(gateNumber(name), false, message.toUtf8().constData());
     };
     auto toolResult = [](const QJsonObject& response) {
         return response.value(QStringLiteral("result")).toObject();
@@ -1193,7 +1215,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2; // US-308: compare_project; US-312: render/decompose
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -1317,7 +1339,7 @@ int runMcpSelftest()
         : fail("G82 save_project/open_project roundtrip",
                QStringLiteral("save/open did not preserve the project path and response contract"));
 
-    Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>();
+    Timeline *projectTimeline = projectInfoWindow.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     const QJsonObject missingImport = callProjectInfoTool(
         43, QStringLiteral("import_media"), QJsonObject{
             {QStringLiteral("filePath"),
@@ -1512,6 +1534,234 @@ int runMcpSelftest()
             projectTimeline->undoManager()->saveState(
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
+
+        // US-406 reserved G159-G160: track appearance is one undo; flags are not.
+        {
+            const QJsonObject original = projectTimeline->trackFlagsToJson();
+            saveTestUndoBaseline();
+            int requestId = 15900;
+            auto callTrack = [&](const QJsonObject &values) {
+                QJsonObject args = values;
+                if (!args.contains(QStringLiteral("kind"))) args.insert(QStringLiteral("kind"), QStringLiteral("video"));
+                if (!args.contains(QStringLiteral("trackIndex"))) args.insert(QStringLiteral("trackIndex"), 0);
+                return callProjectInfoTool(++requestId, QStringLiteral("set_track_property"), args);
+            };
+            auto readTrack = [&]() {
+                const auto tracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
+                    .value(QStringLiteral("video")).toArray();
+                return tracks.isEmpty() ? QJsonObject{} : tracks.at(0).toObject();
+            };
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const auto changed = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("name"), QStringLiteral("MCP 映像")},
+                {QStringLiteral("color"), QStringLiteral("#123abc")}}));
+            const auto track = readTrack();
+            bool g159 = changed.value(QStringLiteral("ok")).toBool()
+                && changed.value(QStringLiteral("undoRecorded")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("set_track_property"), changed)
+                && track.value(QStringLiteral("name")).toString() == QStringLiteral("MCP 映像")
+                && track.value(QStringLiteral("color")).toString() == QStringLiteral("#123abc")
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            const auto undone = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
+            g159 = g159 && undone.value(QStringLiteral("ok")).toBool()
+                && projectTimeline->trackFlagsToJson() == original;
+            g159 ? pass("G159 track name/color readback and single undo")
+                 : fail("G159 track name/color readback and single undo", QStringLiteral("appearance/undo mismatch"));
+            const quint64 flagSerial = projectTimeline->undoManager()->saveSerial();
+            const auto flags = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}, {QStringLiteral("hidden"), true}}));
+            const auto flagTrack = readTrack();
+            bool g160 = flags.value(QStringLiteral("ok")).toBool()
+                && !flags.value(QStringLiteral("undoRecorded")).toBool()
+                && flagTrack.value(QStringLiteral("muted")).toBool()
+                && flagTrack.value(QStringLiteral("solo")).toBool()
+                && flagTrack.value(QStringLiteral("hidden")).toBool()
+                && projectTimeline->undoManager()->saveSerial() == flagSerial;
+            const auto beforeInvalid = projectTimeline->trackFlagsToJson();
+            for (const QJsonObject &invalid : {
+                QJsonObject{{QStringLiteral("trackIndex"), 99999}},
+                QJsonObject{{QStringLiteral("name"), QStringLiteral("must not apply")}, {QStringLiteral("color"), QStringLiteral("red")}},
+                QJsonObject{{QStringLiteral("color"), QStringLiteral("#12345z")}},
+                QJsonObject{{QStringLiteral("color"), QStringLiteral("#12345678")}},
+                QJsonObject{{QStringLiteral("muted"), QStringLiteral("true")}}}) {
+                const auto response = callTrack(invalid);
+                g160 = g160 && (response.contains(QStringLiteral("error"))
+                    || toolResult(response).value(QStringLiteral("isError")).toBool());
+            }
+            g160 = g160 && projectTimeline->trackFlagsToJson() == beforeInvalid
+                && projectTimeline->undoManager()->saveSerial() == flagSerial;
+            const auto mixed = toolPayload(callTrack(QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("name"), QStringLiteral("MCP 音声")},
+                {QStringLiteral("color"), QStringLiteral("#ABCDEF")},
+                {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}}));
+            const auto audioTracks = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_timeline"), {}))
+                .value(QStringLiteral("audio")).toArray();
+            const auto audioTrack = audioTracks.isEmpty() ? QJsonObject{} : audioTracks.at(0).toObject();
+            g160 = g160 && mixed.value(QStringLiteral("ok")).toBool()
+                && mixed.value(QStringLiteral("undoRecorded")).toBool()
+                && audioTrack.value(QStringLiteral("name")).toString() == QStringLiteral("MCP 音声")
+                && audioTrack.value(QStringLiteral("color")).toString() == QStringLiteral("#abcdef");
+            const auto mixedUndo = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
+            g160 = g160 && mixedUndo.value(QStringLiteral("ok")).toBool()
+                && projectTimeline->trackAt(true, 0)->isMuted()
+                && projectTimeline->trackAt(true, 0)->isSolo()
+                && projectTimeline->trackAt(true, 0)->customName
+                    == original.value(QStringLiteral("audio")).toArray().at(0).toObject().value(QStringLiteral("name")).toString();
+            g160 ? pass("G160 track flags and invalid arguments")
+                 : fail("G160 track flags and invalid arguments", QStringLiteral("flags/validation mismatch"));
+            projectTimeline->applyTrackFlagsFromJson(original);
+            saveTestUndoBaseline();
+        }
+
+        // US-400 reserved G156-G158: actual MCP writes, reads and single-step undo.
+        {
+            video0->setClips({makeTestClip(QStringLiteral("mcp-color.mp4"), 0)});
+            video1->setClips({});
+            audio0->setClips({});
+            audio1->setClips({});
+            projectTimeline->clearSelection();
+            saveTestUndoBaseline();
+            auto isToolErrorResponse = [&toolResult](const QJsonObject &response) {
+                return toolResult(response).value(QStringLiteral("isError")).toBool(false);
+            };
+            int requestId = 15600;
+            auto callColor = [&](const QJsonObject &values, bool reset = false) {
+                return callProjectInfoTool(++requestId, QStringLiteral("set_color_correction"),
+                    QJsonObject{{QStringLiteral("clipIndex"), 0},
+                        {QStringLiteral("values"), values}, {QStringLiteral("reset"), reset}});
+            };
+            auto readClip = [&]() {
+                const auto payload = toolPayload(callProjectInfoTool(++requestId,
+                    QStringLiteral("get_timeline"), QJsonObject{}));
+                const auto tracks = payload.value(QStringLiteral("video")).toArray();
+                if (tracks.isEmpty()) return QJsonObject{};
+                const auto clips = tracks.at(0).toObject().value(QStringLiteral("clips")).toArray();
+                return clips.isEmpty() ? QJsonObject{} : clips.at(0).toObject();
+            };
+            auto undo = [&]() {
+                return toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), QJsonObject{}))
+                    .value(QStringLiteral("ok")).toBool();
+            };
+            // UI wheel values outside +/-1 must survive MCP readback and one undo.
+            const QJsonObject values{{QStringLiteral("liftR"), 1.5},
+                {QStringLiteral("gammaR"), 2.0}, {QStringLiteral("gammaG"), -3.3},
+                {QStringLiteral("gainB"), -1.5},
+                {QStringLiteral("exposure"), 1.5}};
+            const quint64 serial = projectTimeline->undoManager()->saveSerial();
+            const auto response = toolPayload(callColor(values));
+            const auto readback = readClip();
+            const auto correction = readback.value(QStringLiteral("colorCorrection")).toObject();
+            bool g156 = response.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("set_color_correction"), response)
+                && correction.size() == 28 && !correction.contains(QStringLiteral("hueSatWarp"))
+                && response.value(QStringLiteral("colorCorrection")).toObject() == correction
+                && readback.contains(QStringLiteral("lut"))
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            for (const auto &descriptorValue : projectInfoToolDescriptors) {
+                const auto descriptor = descriptorValue.toObject();
+                if (descriptor.value(QStringLiteral("name")).toString() != QStringLiteral("get_timeline")) continue;
+                const auto clipSchema = descriptor.value(QStringLiteral("outputSchema")).toObject()
+                    .value(QStringLiteral("properties")).toObject().value(QStringLiteral("video")).toObject()
+                    .value(QStringLiteral("items")).toObject().value(QStringLiteral("properties")).toObject()
+                    .value(QStringLiteral("clips")).toObject().value(QStringLiteral("items")).toObject();
+                const auto properties = clipSchema.value(QStringLiteral("properties")).toObject();
+                const auto required = clipSchema.value(QStringLiteral("required")).toArray();
+                g156 = g156 && properties.contains(QStringLiteral("colorCorrection"))
+                    && properties.contains(QStringLiteral("lut"))
+                    && !required.contains(QStringLiteral("colorCorrection"))
+                    && !required.contains(QStringLiteral("lut"));
+            }
+            for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+                g156 = g156 && correction.value(it.key()) == it.value();
+            g156 = undo() && video0->clips().at(0).colorCorrection.isDefault() && g156;
+            // Partial updates retain other fields; reset starts from defaults.
+            callColor(values);
+            callColor(QJsonObject{{QStringLiteral("brightness"), 12.0}});
+            g156 = g156 && video0->clips().at(0).colorCorrection.exposure == 1.5;
+            callColor(QJsonObject{{QStringLiteral("shadows"), 10.0}}, true);
+            g156 = g156 && video0->clips().at(0).colorCorrection.exposure == 0.0
+                && video0->clips().at(0).colorCorrection.brightness == 0.0
+                && video0->clips().at(0).colorCorrection.shadows == 10.0;
+            g156 = undo() && video0->clips().at(0).colorCorrection.brightness == 12.0 && g156;
+            g156 ? pass("G156 color correction readback and single undo")
+                 : fail("G156 color correction readback and single undo", QStringLiteral("color/undo mismatch"));
+
+            const auto beforeInvalid = readClip();
+            const quint64 invalidSerial = projectTimeline->undoManager()->saveSerial();
+            bool g157 = true;
+            const QVector<QJsonObject> invalidValues{
+                {{QStringLiteral("exposure"), 3.01}}, {{QStringLiteral("gamma"), 0.09}},
+                {{QStringLiteral("brightness"), 101}}, {{QStringLiteral("hue"), -181}},
+                {{QStringLiteral("liftR"), 2.01}}, {{QStringLiteral("gammaG"), -6.65}},
+                {{QStringLiteral("gammaR"), 4.01}},
+                {{QStringLiteral("logHighB"), 1.01}}, {{QStringLiteral("unknown"), 1}},
+                {{QStringLiteral("contrast"), QStringLiteral("bad")}},
+                {{QStringLiteral("brightness"), 15}, {QStringLiteral("unknown"), 1}}
+            };
+            for (const auto &invalid : invalidValues)
+                g157 = isToolErrorResponse(callColor(invalid)) && g157;
+            g157 = g157 && readClip() == beforeInvalid
+                && projectTimeline->undoManager()->saveSerial() == invalidSerial;
+            const auto warned = toolPayload(callColor(QJsonObject{
+                {QStringLiteral("hueSatWarp"), QJsonObject{{QStringLiteral("enabled"), true}}},
+                {QStringLiteral("tint"), 25.0}}));
+            const auto warnedColor = readClip().value(QStringLiteral("colorCorrection")).toObject();
+            g157 = g157 && warned.value(QStringLiteral("ok")).toBool()
+                && warned.value(QStringLiteral("warning")).toString().contains(QStringLiteral("hueSatWarp"))
+                && warnedColor.value(QStringLiteral("tint")).toDouble() == 25.0
+                && !warnedColor.contains(QStringLiteral("hueSatWarp"))
+                && video0->clips().at(0).colorCorrection.hueSatWarp.isDefault();
+            g157 = undo() && readClip() == beforeInvalid && g157;
+            g157 ? pass("G157 invalid color fields and hueSatWarp warning")
+                 : fail("G157 invalid color fields and hueSatWarp warning", QStringLiteral("validation was not atomic"));
+
+            QTemporaryDir lutDirectory;
+            const QString lutPath = QDir(lutDirectory.path()).filePath(QStringLiteral("identity.cube"));
+            QFile lutFile(lutPath);
+            const QByteArray cube("LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n");
+            bool g158 = lutDirectory.isValid() && lutFile.open(QIODevice::WriteOnly);
+            if (g158) g158 = lutFile.write(cube) == cube.size();
+            lutFile.close();
+            auto applyLut = [&](const QString &path, double intensity) {
+                return callProjectInfoTool(++requestId, QStringLiteral("apply_lut"), QJsonObject{
+                    {QStringLiteral("clipIndex"), 0}, {QStringLiteral("filePath"), path},
+                    {QStringLiteral("intensity"), intensity}});
+            };
+            saveTestUndoBaseline();
+            const quint64 lutSerial = projectTimeline->undoManager()->saveSerial();
+            const auto applied = toolPayload(applyLut(lutPath, 0.65));
+            const QJsonObject expectedLut{{QStringLiteral("filePath"), lutPath},
+                                         {QStringLiteral("intensity"), 0.65}};
+            g158 = g158 && applied.value(QStringLiteral("ok")).toBool()
+                && requiredOutputFieldsPresent(QStringLiteral("apply_lut"), applied)
+                && applied.value(QStringLiteral("lut")).toObject() == expectedLut
+                && readClip().value(QStringLiteral("lut")).toObject() == expectedLut
+                && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            // Repeated UI writes retain the existing no-change guard.
+            g158 = projectTimeline->setClipLut(0, 0, lutPath, 0.65) && g158;
+            g158 = g158 && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            const auto missingLut = applyLut(lutPath + QStringLiteral(".missing"), 1.0);
+            g158 = isToolErrorResponse(missingLut)
+                && toolErrorText(missingLut).contains(QStringLiteral("LUT ファイルが見つかりません: ")) && g158;
+            g158 = isToolErrorResponse(applyLut(lutPath, 1.01)) && g158;
+            g158 = g158 && projectTimeline->undoManager()->saveSerial() == lutSerial + 1;
+            const auto cleared = toolPayload(applyLut(QString(), 0.25));
+            const auto clearedLut = readClip().value(QStringLiteral("lut")).toObject();
+            g158 = g158 && cleared.value(QStringLiteral("ok")).toBool()
+                && clearedLut.value(QStringLiteral("filePath")).toString().isEmpty()
+                && clearedLut.value(QStringLiteral("intensity")).toDouble() == 1.0
+                && projectTimeline->undoManager()->saveSerial() == lutSerial + 2;
+            g158 = undo() && readClip().value(QStringLiteral("lut")).toObject() == expectedLut && g158;
+            g158 = undo() && video0->clips().at(0).lutFilePath.isEmpty() && g158;
+            const auto defaultLut = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("apply_lut"),
+                QJsonObject{{QStringLiteral("clipIndex"), 0}, {QStringLiteral("filePath"), lutPath}}));
+            g158 = g158 && defaultLut.value(QStringLiteral("ok")).toBool()
+                && defaultLut.value(QStringLiteral("lut")).toObject().value(QStringLiteral("intensity")).toDouble() == 1.0;
+            g158 = undo() && video0->clips().at(0).lutFilePath.isEmpty() && g158;
+            g158 ? pass("G158 LUT apply clear and single-step undo")
+                 : fail("G158 LUT apply clear and single-step undo", QStringLiteral("LUT/undo mismatch"));
+        }
 
         // US-308 reserved G154-G155: compare the same saved/current pair as
         // the UI and prove comparison does not add undo states or dirty it.
@@ -3489,6 +3739,54 @@ int runMcpSelftest()
         : fail("G55 export_video rejects missing parent directory",
                QStringLiteral("an output path below a missing directory was accepted"));
 
+    // US-415 G162: the synchronous branch must neither submit a job nor emit video.
+    {
+        bool g162 = exportRootReady && frameFixtureReady;
+        auto *queueBefore = projectInfoWindow.m_renderQueue;
+        const int jobsBefore = queueBefore ? queueBefore->jobs().size() : 0;
+        for (const QString &container : {QStringLiteral("m4a"), QStringLiteral("wav")}) {
+            if (!exportRootReady || !frameFixtureReady) break;
+            const bool wav = container == QStringLiteral("wav");
+            const QString audioPath = exportRoot.filePath(QStringLiteral("audio-only.") + container);
+            const auto response = callProjectInfoTool(wav ? 1622 : 1620, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("audioOnly"), true}, {QStringLiteral("outputPath"), audioPath},
+                {QStringLiteral("width"), 640}});
+            const auto payload = toolPayload(response);
+            g162 &= !toolResult(response).value(QStringLiteral("isError")).toBool(true)
+                && payload.value(QStringLiteral("ok")).toBool(false)
+                && payload.value(QStringLiteral("outputPath")).toString() == audioPath
+                && !payload.contains(QStringLiteral("jobId"))
+                && !payload.value(QStringLiteral("warnings")).toArray().isEmpty()
+                && requiredOutputFieldsPresent(QStringLiteral("export_video"), payload)
+                && QFileInfo(audioPath).size() > 0;
+            AVFormatContext *format = nullptr;
+            bool audio = false, video = false, expectedCodec = false;
+            if (avformat_open_input(&format, audioPath.toUtf8().constData(), nullptr, nullptr) >= 0) {
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned int i = 0; i < format->nb_streams; ++i) {
+                        audio |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO;
+                        video |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
+                        expectedCodec |= format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO
+                            && format->streams[i]->codecpar->codec_id
+                                == (wav ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_AAC);
+                    }
+                }
+                avformat_close_input(&format);
+            }
+            const auto duration = libavcore::probeDurationMicroseconds(audioPath.toStdString());
+            g162 &= audio && !video && expectedCodec && duration.has_value()
+                && std::abs(double(duration.value_or(0)) / 1000000.0 - projectTimeline->totalDuration()) <= 0.1;
+            const auto invalid = callProjectInfoTool(wav ? 1623 : 1621, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("audioOnly"), QStringLiteral("true")}, {QStringLiteral("outputPath"), audioPath}});
+            g162 &= toolResult(invalid).value(QStringLiteral("isError")).toBool(false);
+        }
+        g162 &= projectInfoWindow.m_renderQueue == queueBefore
+            && (!queueBefore || queueBefore->jobs().size() == jobsBefore);
+        g162 ? pass("G162 synchronous audio-only export and video-setting warning")
+             : fail("G162 synchronous audio-only export and video-setting warning",
+                    QStringLiteral("音声ストリーム、AAC/PCM コーデック、尺、同期応答、警告、またはキュー非起動の検証に失敗"));
+    }
+
     const QString exportOutputPath = exportRootReady
         ? QDir(exportRoot.path()).filePath(QStringLiteral("output.mp4"))
         : QString();
@@ -3521,6 +3819,408 @@ int runMcpSelftest()
     g56 ? pass("G56 export_video returns jobId without waiting")
         : fail("G56 export_video returns jobId without waiting",
                QStringLiteral("export_video did not return a queued job promptly"));
+
+    // G161: observe the actual RenderJob after the deferred MCP enqueue.
+    // Clear captured jobs synchronously so this argument test starts no encoder.
+    {
+        bool g161 = exportRootReady && timelineReady;
+        const QString qualityPath = exportRoot.filePath(QStringLiteral("quality.mp4"));
+        const QJsonObject qualityResponse = callProjectInfoTool(
+            1610, QStringLiteral("export_video"), QJsonObject{
+                {QStringLiteral("outputPath"), qualityPath},
+                {QStringLiteral("rateControl"), QStringLiteral("crf")},
+                {QStringLiteral("crf"), 20}});
+        const QString qualityId = toolPayload(qualityResponse).value(QStringLiteral("jobId")).toString();
+        const bool qualityIsError = toolResult(qualityResponse).value(QStringLiteral("isError")).toBool(true);
+        g161 &= !qualityId.isEmpty() && !qualityIsError;
+        const QList<QJsonObject> invalidArguments{
+            {{QStringLiteral("rateControl"), QStringLiteral("invalid")}},
+            {{QStringLiteral("rateControl"), 1}},
+            {{QStringLiteral("crf"), 52}},
+            {{QStringLiteral("crf"), -2}},
+            {{QStringLiteral("crf"), 20.5}},
+            {{QStringLiteral("crf"), QStringLiteral("20")}},
+            {{QStringLiteral("videoCodec"), QStringLiteral("libsvtav1")}, {QStringLiteral("crf"), 64}}
+        };
+        int requestId = 1611;
+        QStringList invalidDetail;
+        for (auto args : invalidArguments) {
+            const QString argsText = QString::fromUtf8(QJsonDocument(args).toJson(QJsonDocument::Compact));
+            args.insert(QStringLiteral("outputPath"), qualityPath);
+            const auto response = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
+            const bool invErr = toolResult(response).value(QStringLiteral("isError")).toBool(false);
+            const bool invPayloadEmpty = toolPayload(response).isEmpty();
+            const bool rejected = invErr && invPayloadEmpty;
+            invalidDetail << QStringLiteral("%1:%2:isError=%3(want 1):payloadEmpty=%4(want 1)")
+                                 .arg(requestId - 1).arg(argsText).arg(invErr).arg(invPayloadEmpty);
+            g161 &= rejected;
+        }
+        auto* queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        QHash<QString, QJsonObject> captured;
+        if (queue && queue->parent() == &projectInfoWindow) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged,
+                queue, [&]() {
+                    const auto jobs = queue->jobs();
+                    if (jobs.isEmpty()) return;
+                    for (const auto& job : jobs)
+                        captured.insert(job.uuid, job.exportConfig);
+                    queue->clear();
+                });
+            // The test-owned tool instance is allowed through the lifetime guard
+            // only while delivering its queued callbacks.
+            auto* previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        const QString qualityRate = captured.value(qualityId).value(QStringLiteral("rateControl")).toString();
+        const int qualityCrf = captured.value(qualityId).value(QStringLiteral("crf")).toInt(-1);
+        const QString exportRate = captured.value(exportJobId).value(QStringLiteral("rateControl")).toString(QStringLiteral("bitrate"));
+        const int exportCrf = captured.value(exportJobId).value(QStringLiteral("crf")).toInt(-1);
+        g161 &= captured.contains(qualityId) && captured.contains(exportJobId)
+            && qualityRate == QStringLiteral("crf") && qualityCrf == 20
+            && exportRate == QStringLiteral("bitrate") && exportCrf == -1;
+        g161 ? pass("G161 export_video rate control validation and queue wiring")
+             : fail("G161 export_video rate control validation and queue wiring",
+                    QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3 exportRootReady=%11 timelineReady=%12 "
+                                   "qualityId.empty=%13 qualityIsError=%14(want 0) invalid=[%4] "
+                                   "containsQuality=%5 containsExport=%6 quality.rateControl=%7(want crf) "
+                                   "quality.crf=%8(want 20) export.rateControl=%9(want bitrate) export.crf=%10(want -1)")
+                        .arg(queueFound).arg(parentOk).arg(captured.size()).arg(invalidDetail.join(QLatin1Char(' ')))
+                        .arg(captured.contains(qualityId)).arg(captured.contains(exportJobId))
+                        .arg(qualityRate).arg(qualityCrf).arg(exportRate).arg(exportCrf)
+                        .arg(exportRootReady).arg(timelineReady).arg(qualityId.isEmpty()).arg(qualityIsError));
+    }
+
+    // US-503: capture queued jobs without launching an encoder (same observation as G161).
+    {
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray previousDir = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        QTemporaryDir presetDir;
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+        ExportConfig userConfig;
+        userConfig.width = 1280; userConfig.height = 720; userConfig.fps = 24;
+        userConfig.videoCodec = "libx265"; userConfig.videoBitrate = 17000;
+        userConfig.rateControl = ExportConfig::RateControl::Crf; userConfig.crf = 18;
+        const QString userName = QStringLiteral("MCP/ユーザー:プリセット");
+        const bool presetDirValid = presetDir.isValid();
+        const bool presetSaved = presetDirValid && ExportUserPresets::save({userName, userConfig});
+        bool g164 = presetSaved;
+        const auto missing = callProjectInfoTool(1640, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("missing.mp4")}, {"preset", "US503-missing"}});
+        const bool missingIsError = toolResult(missing).value("isError").toBool(false);
+        const bool missingPayloadEmpty = toolPayload(missing).isEmpty();
+        const bool missingMessage = QJsonDocument(missing).toJson().contains(
+            QStringLiteral("プリセットが見つかりません: US503-missing").toUtf8());
+        g164 &= missingIsError && missingPayloadEmpty && missingMessage;
+        const QString builtinName = QStringLiteral("YouTube (1440p H.264)");
+        const auto builtin = callProjectInfoTool(1630, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("preset-builtin.mp4")}, {"preset", builtinName},
+            {"rateControl", "crf"}, {"crf", 20}});
+        const auto user = callProjectInfoTool(1641, QStringLiteral("export_video"), QJsonObject{
+            {"outputPath", exportRoot.filePath("preset-user.mp4")}, {"preset", userName}, {"audioBitrate", 256}});
+        const QString builtinId = toolPayload(builtin).value("jobId").toString();
+        const QString userId = toolPayload(user).value("jobId").toString();
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const auto b = captured.value(builtinId);
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        const bool g163 = exportRootReady && timelineReady && !builtinId.isEmpty()
+            && captured.contains(builtinId) && toolPayload(builtin).value("preset").toString() == builtinName
+            && b.value("width").toInt() == qMax(2, projectInfoWindow.m_projectConfig.width)
+            && b.value("height").toInt() == qMax(2, projectInfoWindow.m_projectConfig.height)
+            && b.value("videoCodec").toString() == "libx264" && b.value("videoBitrate").toInt() == 16000
+            && b.value("rateControl").toString() == "crf" && b.value("crf").toInt() == 20;
+        const auto u = captured.value(userId);
+        g164 &= captured.size() == 2 && !userId.isEmpty() && captured.contains(userId)
+            && toolPayload(user).value("preset").toString() == userName
+            && u.value("width").toInt() == 1280 && u.value("height").toInt() == 720
+            && u.value("fps").toInt() == 24 && u.value("videoCodec").toString() == "libx265"
+            && u.value("videoBitrate").toInt() == 17000 && u.value("audioBitrate").toInt() == 256
+            && u.value("rateControl").toString() == "crf" && u.value("crf").toInt() == 18;
+        g163 ? pass("G163 built-in export preset and explicit overrides")
+             : fail("G163 built-in export preset and explicit overrides",
+                    QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3 exportRootReady=%4 timelineReady=%5 "
+                                   "builtinId.empty=%6 contains=%7 preset=%8(want %9) width=%10(want %11) height=%12(want %13) "
+                                   "videoCodec=%14(want libx264) videoBitrate=%15(want 16000) rateControl=%16(want crf) crf=%17(want 20)")
+                        .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                        .arg(builtinId.isEmpty()).arg(captured.contains(builtinId))
+                        .arg(toolPayload(builtin).value("preset").toString(), builtinName)
+                        .arg(b.value("width").toInt()).arg(qMax(2, projectInfoWindow.m_projectConfig.width))
+                        .arg(b.value("height").toInt()).arg(qMax(2, projectInfoWindow.m_projectConfig.height))
+                        .arg(b.value("videoCodec").toString(), QString::number(b.value("videoBitrate").toInt()))
+                        .arg(b.value("rateControl").toString()).arg(b.value("crf").toInt()));
+        g164 ? pass("G164 user export preset and missing preset rejection")
+             : fail("G164 user export preset and missing preset rejection",
+                    QStringLiteral("queueFound=%1 parentOk=%2 presetDirValid=%3 presetSaved=%4 missingIsError=%5(want 1) "
+                                   "missingPayloadEmpty=%6(want 1) missingMessage=%7(want 1) captured.size=%8(want 2) "
+                                   "userId.empty=%9 contains=%10 preset=%11(want %12) width=%13(want 1280) height=%14(want 720) "
+                                   "fps=%15(want 24) videoCodec=%16(want libx265) videoBitrate=%17(want 17000) "
+                                   "audioBitrate=%18(want 256) rateControl=%19(want crf) crf=%20(want 18)")
+                        .arg(queueFound).arg(parentOk).arg(presetDirValid).arg(presetSaved).arg(missingIsError)
+                        .arg(missingPayloadEmpty).arg(missingMessage).arg(captured.size())
+                        .arg(userId.isEmpty()).arg(captured.contains(userId))
+                        .arg(toolPayload(user).value("preset").toString(), userName)
+                        .arg(u.value("width").toInt()).arg(u.value("height").toInt()).arg(u.value("fps").toInt())
+                        .arg(u.value("videoCodec").toString()).arg(u.value("videoBitrate").toInt())
+                        .arg(u.value("audioBitrate").toInt()).arg(u.value("rateControl").toString())
+                        .arg(u.value("crf").toInt()));
+        if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", previousDir);
+        else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
+
+    // US-504 G165: validate before enqueue, then inspect the real deferred job.
+    {
+        bool ok = exportRootReady && timelineReady;
+        const QString path = exportRoot.filePath("alpha.mov");
+        const QJsonObject valid{{"outputPath", path}, {"keepAlpha", true},
+            {"videoCodec", "prores"}, {"proresProfile", 4}};
+        const auto response = callProjectInfoTool(1650, QStringLiteral("export_video"), valid);
+        const QString id = toolPayload(response).value("jobId").toString();
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        ok &= !id.isEmpty() && !validIsError;
+        const QList<QJsonObject> invalid{
+            {{"videoCodec", "h264"}}, {{"proresProfile", 2}},
+            {{"keepAlpha", "true"}}, {{"keepAlpha", 1}},
+            {{"proresProfile", -1}}, {{"proresProfile", 6}},
+            {{"proresProfile", 4.5}}, {{"proresProfile", "4"}},
+            {{"audioOnly", true}}
+        };
+        int requestId = 1651;
+        QStringList invalidDetail;
+        for (const auto &overrides : invalid) {
+            auto args = valid;
+            QStringList keys;
+            for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+                args.insert(it.key(), it.value());
+                keys << QStringLiteral("%1=%2").arg(it.key(), it.value().toVariant().toString());
+            }
+            const auto rejected = callProjectInfoTool(requestId++, QStringLiteral("export_video"), args);
+            const bool invIsError = toolResult(rejected).value("isError").toBool(false);
+            const bool invPayloadEmpty = toolPayload(rejected).isEmpty();
+            invalidDetail << QStringLiteral("%1:isError=%2,payloadEmpty=%3")
+                                 .arg(keys.join(QLatin1Char(','))).arg(invIsError).arg(invPayloadEmpty);
+            ok &= invIsError && invPayloadEmpty;
+        }
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        ok &= captured.size() == 1 && captured.contains(id)
+            && captured.value(id).value("keepAlpha").toBool(false)
+            && captured.value(id).value("proresProfile").toInt(-1) == 4;
+        ok ? pass("G165 alpha export validation and queue wiring")
+           : fail("G165 alpha export validation and queue wiring",
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) invalid=[%8] contains=%9 "
+                                 "keepAlpha=%10(want 1) proresProfile=%11(want 4)")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(invalidDetail.join(QLatin1Char(' ')))
+                      .arg(captured.contains(id)).arg(captured.value(id).value("keepAlpha").toBool(false))
+                      .arg(captured.value(id).value("proresProfile").toInt(-1)));
+    }
+
+    // US-612 G174: the real MCP handler shares the alpha export policy.
+    {
+        bool ok = exportRootReady && timelineReady;
+        const QJsonObject valid{{"outputPath", exportRoot.filePath("alpha-vp9.webm")},
+            {"keepAlpha", true}, {"videoCodec", "libvpx-vp9"}, {"audioCodec", "libopus"}};
+        const auto response = callProjectInfoTool(1740, QStringLiteral("export_video"), valid);
+        const QString id = toolPayload(response).value("jobId").toString();
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        ok &= !id.isEmpty() && !validIsError;
+        auto invalid = valid;
+        invalid.insert("videoCodec", "libx264");
+        invalid.insert("outputPath", exportRoot.filePath("alpha-h264.mp4"));
+        const auto rejected = callProjectInfoTool(1741, QStringLiteral("export_video"), invalid);
+        const bool h264IsError = toolResult(rejected).value("isError").toBool(false);
+        const bool h264PayloadEmpty = toolPayload(rejected).isEmpty();
+        ok &= h264IsError && h264PayloadEmpty;
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        ok &= captured.size() == 1 && captured.contains(id)
+            && captured.value(id).value("keepAlpha").toBool(false)
+            && captured.value(id).value("videoCodec").toString() == QStringLiteral("libvpx-vp9");
+        ok ? pass("G174 VP9 alpha acceptance and H.264 rejection")
+           : fail("G174 VP9 alpha acceptance and H.264 rejection",
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) h264IsError=%8(want 1) h264PayloadEmpty=%9(want 1) contains=%10 "
+                                 "keepAlpha=%11(want 1) videoCodec=%12(want libvpx-vp9)")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(h264IsError).arg(h264PayloadEmpty)
+                      .arg(captured.contains(id)).arg(captured.value(id).value("keepAlpha").toBool(false))
+                      .arg(captured.value(id).value("videoCodec").toString()));
+    }
+
+    // US-614 G175: validate nested arguments and capture the actual queued job.
+    {
+        const QJsonObject metadata{{"title", "題名"}, {"author", "作成者"},
+            {"copyright", "権利"}, {"comment", "コメント"}};
+        QJsonObject args{{"outputPath", exportRoot.filePath("metadata.mp4")}, {"metadata", metadata}};
+        const auto response = callProjectInfoTool(1750, QStringLiteral("export_video"), args);
+        const QString id = toolPayload(response).value("jobId").toString();
+        const bool validIsError = toolResult(response).value("isError").toBool(true);
+        bool ok = exportRootReady && timelineReady && !id.isEmpty() && !validIsError;
+        QStringList invalidDetail;
+        for (const QJsonValue &invalid : {QJsonValue("invalid"), QJsonValue(QJsonObject{{"unknown", "x"}}),
+                QJsonValue(QJsonObject{{"title", 42}})}) {
+            args.insert("metadata", invalid);
+            const bool rejected = toolResult(callProjectInfoTool(1751, QStringLiteral("export_video"), args))
+                .value("isError").toBool(false);
+            invalidDetail << QStringLiteral("metadata=%1:rejected=%2")
+                .arg(invalid.isObject()
+                         ? QString::fromUtf8(QJsonDocument(invalid.toObject()).toJson(QJsonDocument::Compact))
+                         : invalid.toVariant().toString())
+                .arg(rejected);
+            ok &= rejected;
+        }
+        args.insert("metadata", metadata);
+        args.insert("unknownMetadata", "x");
+        const bool unknownRejected = toolResult(callProjectInfoTool(1752, QStringLiteral("export_video"), args))
+            .value("isError").toBool(false);
+        ok &= unknownRejected;
+        QHash<QString, QJsonObject> captured;
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        if (queue && queue->parent() == &projectInfoWindow) {
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                for (const auto &job : jobs) captured.insert(job.uuid, job.exportConfig);
+                queue->clear();
+            });
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            QCoreApplication::processEvents(QEventLoop::AllEvents);
+            projectInfoWindow.m_mcpTools = previousTools;
+            QObject::disconnect(connection);
+        }
+        const bool queueFound = queue != nullptr;
+        const bool parentOk = queue && queue->parent() == &projectInfoWindow;
+        ok &= captured.size() == 1 && captured.contains(id);
+        QStringList metadataDetail;
+        for (auto it = metadata.constBegin(); it != metadata.constEnd(); ++it) {
+            ok &= captured.value(id).value(it.key()) == it.value();
+            metadataDetail << QStringLiteral("%1=%2(want %3)").arg(it.key(),
+                captured.value(id).value(it.key()).toString(), it.value().toString());
+        }
+        ok ? pass("G175 export metadata")
+           : fail("G175 export metadata",
+                  QStringLiteral("queueFound=%1 parentOk=%2 captured.size=%3(want 1) exportRootReady=%4 timelineReady=%5 id.empty=%6 "
+                                 "validIsError=%7(want 0) invalid=[%8] unknownMetadataRejected=%9(want 1) contains=%10 %11")
+                      .arg(queueFound).arg(parentOk).arg(captured.size()).arg(exportRootReady).arg(timelineReady)
+                      .arg(id.isEmpty()).arg(validIsError).arg(invalidDetail.join(QLatin1Char(' ')))
+                      .arg(unknownRejected).arg(captured.contains(id)).arg(metadataDetail.join(QLatin1Char(' '))));
+    }
+
+    // US-616 G176: exercise the registered import tool and restore the fixture.
+    {
+        QTemporaryDir edlDir;
+        const QString path = edlDir.filePath(QStringLiteral("import.edl"));
+        QFile file(path);
+        const QByteArray contents("TITLE: MCP EDL\nFCM: NON-DROP FRAME\n"
+            "001 MISSING V C 00:00:00:00 00:00:01:00 00:00:00:00 00:00:01:00\n");
+        bool ok = edlDir.isValid() && file.open(QIODevice::WriteOnly);
+        if (ok) ok = file.write(contents) == contents.size();
+        file.close();
+        const QString beforeId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const int beforeCount = projectTimeline ? projectTimeline->sequenceList().size() : 0;
+        const auto response = callProjectInfoTool(1760, QStringLiteral("import_edl"), {{"filePath", path}});
+        const bool created = !toolResult(response).value("isError").toBool(true);
+        ok &= created && projectTimeline && projectTimeline->sequenceList().size() == beforeCount + 1
+            && projectTimeline->activeSequenceId() != beforeId
+            && toolPayload(response).value("unresolvedFiles").toInt() == 1;
+        const QString afterId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const auto rejected = callProjectInfoTool(1761, QStringLiteral("import_edl"),
+            {{"filePath", edlDir.filePath(QStringLiteral("absent.edl"))}});
+        ok &= toolResult(rejected).value("isError").toBool(false)
+            && projectTimeline && projectTimeline->activeSequenceId() == afterId;
+        if (created && projectTimeline) projectTimeline->undo();
+        ok &= projectTimeline && projectTimeline->activeSequenceId() == beforeId
+            && projectTimeline->sequenceList().size() == beforeCount;
+        ok ? pass("G176 import_edl creates a sequence and rejects missing paths")
+           : fail("G176 import_edl creates a sequence and rejects missing paths", QStringLiteral("import or undo mismatch"));
+    }
+
+    // US-617 G177: exercise the registered import tool and restore the fixture.
+    {
+        QTemporaryDir fcpxmlDir;
+        const QString path = fcpxmlDir.filePath(QStringLiteral("import.fcpxml"));
+        QFile file(path);
+        const QByteArray contents("<fcpxml><resources><asset id=\"a\" src=\"missing.mov\"/></resources>"
+            "<project name=\"MCP FCPXML\"><sequence><spine><asset-clip ref=\"a\" duration=\"1s\"/>"
+            "</spine></sequence></project></fcpxml>");
+        bool ok = fcpxmlDir.isValid() && file.open(QIODevice::WriteOnly);
+        if (ok) ok = file.write(contents) == contents.size();
+        file.close();
+        const QString beforeId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        const int beforeCount = projectTimeline ? projectTimeline->sequenceList().size() : 0;
+        const auto response = callProjectInfoTool(1770, QStringLiteral("import_fcpxml"), {{"filePath", path}});
+        const bool created = !toolResult(response).value("isError").toBool(true);
+        ok &= created && projectTimeline && projectTimeline->sequenceList().size() == beforeCount + 1
+            && projectTimeline->activeSequenceId() != beforeId
+            && toolPayload(response).value("unresolvedFiles").toInt() == 1;
+        const QString afterId = projectTimeline ? projectTimeline->activeSequenceId() : QString();
+        QFile invalid(fcpxmlDir.filePath(QStringLiteral("invalid.fcpxml")));
+        ok &= invalid.open(QIODevice::WriteOnly);
+        ok &= invalid.write("<fcpxml><project>") == 17;
+        invalid.close();
+        const auto serial = projectTimeline ? projectTimeline->undoManager()->saveSerial() : 0;
+        const auto rejected = callProjectInfoTool(1771, QStringLiteral("import_fcpxml"),
+            {{"filePath", invalid.fileName()}});
+        ok &= toolResult(rejected).value("isError").toBool(false)
+            && projectTimeline && projectTimeline->activeSequenceId() == afterId
+            && projectTimeline->undoManager()->saveSerial() == serial;
+        if (created && projectTimeline) projectTimeline->undo();
+        ok &= projectTimeline && projectTimeline->activeSequenceId() == beforeId
+            && projectTimeline->sequenceList().size() == beforeCount;
+        ok ? pass("G177 import_fcpxml creates a sequence and rejects malformed XML")
+           : fail("G177 import_fcpxml creates a sequence and rejects malformed XML", QStringLiteral("import or undo mismatch"));
+    }
 
     QJsonObject knownStatusResponse;
     if (!exportJobId.isEmpty()) {
@@ -3590,16 +4290,21 @@ int runMcpSelftest()
             });
         const QJsonObject addCaptionPayload = toolPayload(addCaptionResponse);
         CaptionEditorDialog *captionDialog =
-            projectInfoWindow.findChild<CaptionEditorDialog*>();
-        const bool g59 = noCaptionEditorBefore
-            && !toolResult(addCaptionResponse).value(QStringLiteral("isError"))
-                   .toBool(false)
-            && addCaptionPayload.value(QStringLiteral("ok")).toBool(false)
-            && addCaptionPayload.value(QStringLiteral("captionCount")).toInt(-1) == 1
-            && captionDialog != nullptr && !captionDialog->isVisible();
+            projectInfoWindow.findChild<CaptionEditorDialog*>(QStringLiteral("captionEditorDialog"));
+        const bool addCaptionIsError = toolResult(addCaptionResponse).value(QStringLiteral("isError"))
+                                           .toBool(false);
+        const bool addCaptionOk = addCaptionPayload.value(QStringLiteral("ok")).toBool(false);
+        const int addCaptionCount = addCaptionPayload.value(QStringLiteral("captionCount")).toInt(-1);
+        const bool captionDialogFound = captionDialog != nullptr;
+        const bool captionDialogVisible = captionDialog && captionDialog->isVisible();
+        const bool g59 = noCaptionEditorBefore && !addCaptionIsError && addCaptionOk
+            && addCaptionCount == 1 && captionDialogFound && !captionDialogVisible;
         g59 ? pass("G59 add_caption without open editor")
             : fail("G59 add_caption without open editor",
-                   QStringLiteral("add_caption did not create a hidden caption editor"));
+                   QStringLiteral("noCaptionEditorBefore=%1 isError=%2(want 0) ok=%3(want 1) "
+                                  "captionCount=%4(want 1) dialogFound=%5 visible=%6(want 0)")
+                       .arg(noCaptionEditorBefore).arg(addCaptionIsError).arg(addCaptionOk)
+                       .arg(addCaptionCount).arg(captionDialogFound).arg(captionDialogVisible));
 
         ClipInfo captionHost;
         captionHost.filePath = QStringLiteral("caption-host");
@@ -4614,16 +5319,23 @@ int runMcpSelftest()
                 && assistantButton->text() == QStringLiteral("LLM に指示を出す")
                 && assistantButton->parentWidget() == projectInfoWindow.statusBar()
                 && !assistantButton->isHidden();
-            bool assistantOpened = false;
+            bool toggleFound = false, toggleChecked = false, serverFound = false, serverRunning = false;
+            bool chatActionFound = false, chatActionChecked = false, dockFound = false, dockShown = false;
             if (buttonPresent) {
                 assistantButton->click();
-                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
-                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
-                assistantOpened = mcpToggle && mcpToggle->isChecked()
-                    && server && server->isRunning()
-                    && aiChatAction && aiChatAction->isChecked()
-                    && dock && !dock->isHidden();
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>(QStringLiteral("AiChatDock"));
+                toggleFound = mcpToggle != nullptr;
+                toggleChecked = mcpToggle && mcpToggle->isChecked();
+                serverFound = server != nullptr;
+                serverRunning = server && server->isRunning();
+                chatActionFound = aiChatAction != nullptr;
+                chatActionChecked = aiChatAction && aiChatAction->isChecked();
+                dockFound = dock != nullptr;
+                dockShown = dock && !dock->isHidden();
             }
+            const bool assistantOpened = toggleFound && toggleChecked && serverFound && serverRunning
+                && chatActionFound && chatActionChecked && dockFound && dockShown;
             if (aiChatAction)
                 aiChatAction->setChecked(false);
             if (mcpToggle && mcpToggle->isChecked())
@@ -4631,7 +5343,11 @@ int runMcpSelftest()
             const bool g109 = buttonPresent && assistantOpened;
             g109 ? pass("G109 status bar LLM button starts the MCP server and opens the AI chat")
                  : fail("G109 status bar LLM button starts the MCP server and opens the AI chat",
-                        QStringLiteral("present=%1 opened=%2").arg(buttonPresent).arg(assistantOpened));
+                        QStringLiteral("present=%1 opened=%2 toggleFound=%3 toggleChecked=%4 serverFound=%5 "
+                                       "serverRunning=%6 chatActionFound=%7 chatActionChecked=%8 dockFound=%9 dockShown=%10")
+                            .arg(buttonPresent).arg(assistantOpened).arg(toggleFound).arg(toggleChecked)
+                            .arg(serverFound).arg(serverRunning).arg(chatActionFound).arg(chatActionChecked)
+                            .arg(dockFound).arg(dockShown));
 
             QAction *toggle = actionByText(QStringLiteral("「LLM に指示を出す」ボタンを表示"));
             bool toggleWorks = toggle && toggle->isCheckable() && toggle->isChecked()
@@ -4652,39 +5368,65 @@ int runMcpSelftest()
             {
                 if (aiChatAction)
                     aiChatAction->setChecked(true);
-                auto *dock = projectInfoWindow.findChild<AiChatDock *>();
+                auto *dock = projectInfoWindow.findChild<AiChatDock *>(QStringLiteral("AiChatDock"));
                 auto *connectionLabel = dock
                     ? dock->findChild<QLabel *>(QStringLiteral("AiChatConnectionStatus")) : nullptr;
                 auto *connectButton = dock
                     ? dock->findChild<QPushButton *>(QStringLiteral("AiChatConnectButton")) : nullptr;
-                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
+                auto *server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                const bool dockFound111 = dock != nullptr;
+                const bool labelFound = connectionLabel != nullptr;
+                const bool buttonFound = connectButton != nullptr;
+                const bool serverFound111 = server != nullptr;
+                const bool serverRunningStopped = server && server->isRunning();
+                const QString labelTextStopped = connectionLabel ? connectionLabel->text() : QString();
+                const QString buttonTextStopped = connectButton ? connectButton->text() : QString();
                 const bool stoppedShown = connectionLabel && connectButton
-                    && !(server && server->isRunning())
-                    && connectionLabel->text().contains(QStringLiteral("停止中"))
-                    && connectionLabel->text().contains(QStringLiteral("CLI"))
-                    && connectButton->text() == QStringLiteral("接続");
+                    && !serverRunningStopped
+                    && labelTextStopped.contains(QStringLiteral("停止中"))
+                    && labelTextStopped.contains(QStringLiteral("CLI"))
+                    && buttonTextStopped == QStringLiteral("接続");
                 bool connected = false;
                 bool disconnected = false;
+                bool mcpToggleConnected = false, mcpToggleDisconnected = false;
+                bool serverRunningConnected = false, serverRunningDisconnected = false;
+                QString labelTextConnected, buttonTextConnected, labelTextDisconnected, buttonTextDisconnected;
                 if (stoppedShown) {
                     connectButton->click();
-                    server = projectInfoWindow.findChild<mcp::McpHttpServer *>();
-                    connected = server && server->isRunning()
-                        && connectionLabel->text().contains(QString::number(server->port()))
-                        && connectButton->text() == QStringLiteral("切断")
-                        && mcpToggle && mcpToggle->isChecked();
+                    server = projectInfoWindow.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
+                    serverRunningConnected = server && server->isRunning();
+                    labelTextConnected = connectionLabel->text();
+                    buttonTextConnected = connectButton->text();
+                    mcpToggleConnected = mcpToggle && mcpToggle->isChecked();
+                    connected = serverRunningConnected
+                        && labelTextConnected.contains(QString::number(server->port()))
+                        && buttonTextConnected == QStringLiteral("切断")
+                        && mcpToggleConnected;
                     connectButton->click();
-                    disconnected = !(server && server->isRunning())
-                        && connectionLabel->text().contains(QStringLiteral("停止中"))
-                        && connectButton->text() == QStringLiteral("接続")
-                        && mcpToggle && !mcpToggle->isChecked();
+                    serverRunningDisconnected = server && server->isRunning();
+                    labelTextDisconnected = connectionLabel->text();
+                    buttonTextDisconnected = connectButton->text();
+                    mcpToggleDisconnected = mcpToggle && mcpToggle->isChecked();
+                    disconnected = !serverRunningDisconnected
+                        && labelTextDisconnected.contains(QStringLiteral("停止中"))
+                        && buttonTextDisconnected == QStringLiteral("接続")
+                        && mcpToggle && !mcpToggleDisconnected;
                 }
                 if (aiChatAction)
                     aiChatAction->setChecked(false);
                 const bool g111 = stoppedShown && connected && disconnected;
                 g111 ? pass("G111 AI chat dock shows the connection state and its button starts/stops the server")
                      : fail("G111 AI chat dock shows the connection state and its button starts/stops the server",
-                            QStringLiteral("stoppedShown=%1 connected=%2 disconnected=%3")
-                                .arg(stoppedShown).arg(connected).arg(disconnected));
+                            QStringLiteral("stoppedShown=%1 connected=%2 disconnected=%3 dockFound=%4 labelFound=%5 "
+                                           "buttonFound=%6 serverFound=%7 serverRunning(stopped/connected/disconnected)=%8/%9/%10 "
+                                           "label(stopped/connected/disconnected)=[%11]/[%12]/[%13] "
+                                           "button(stopped/connected/disconnected)=[%14]/[%15]/[%16] mcpToggleFound=%17 mcpToggle(connected/disconnected)=%18(want 1)/%19(want 0)")
+                                .arg(stoppedShown).arg(connected).arg(disconnected)
+                                .arg(dockFound111).arg(labelFound).arg(buttonFound).arg(serverFound111)
+                                .arg(serverRunningStopped).arg(serverRunningConnected).arg(serverRunningDisconnected)
+                                .arg(labelTextStopped, labelTextConnected, labelTextDisconnected)
+                                .arg(buttonTextStopped, buttonTextConnected, buttonTextDisconnected)
+                                .arg(mcpToggle != nullptr).arg(mcpToggleConnected).arg(mcpToggleDisconnected));
             }
 
             // G112: codex exec の引数は stdio ブリッジを -c で渡し、cmd.exe 経由でも安全 (" を含まない)。
@@ -4912,6 +5654,11 @@ int runMcpSelftest()
                QStringLiteral("id presence was not distinguished"));
 
     if (!timelineReady) {
+        fail("G159 track name/color readback and single undo", QStringLiteral("Timeline was not available"));
+        fail("G160 track flags and invalid arguments", QStringLiteral("Timeline was not available"));
+        fail("G156 color correction readback and single undo", QStringLiteral("Timeline was not available"));
+        fail("G157 invalid color fields and hueSatWarp warning", QStringLiteral("Timeline was not available"));
+        fail("G158 LUT apply clear and single-step undo", QStringLiteral("Timeline was not available"));
         fail("G154 compare_project detects move and volume", QStringLiteral("Timeline was not available"));
         fail("G155 compare_project unchanged and invalid inputs", QStringLiteral("Timeline was not available"));
     }
@@ -5070,10 +5817,850 @@ int runMcpSelftest()
         fail("G152 render_in_place MCP picture and timeline", QStringLiteral("Timeline was not available"));
         fail("G153 decompose and undo restore media and effects", QStringLiteral("Timeline was not available"));
     }
+    // US-509 reserved G166-G167: list and non-editing sequence switch.
+    if (projectTimeline) {
+        const auto savedState = projectTimeline->currentState();
+        TimelineSequence root;
+        root.id = QStringLiteral("main");
+        root.name = QStringLiteral("メインシーケンス");
+        root.videoTracks = savedState.videoTracks;
+        root.audioTracks = savedState.audioTracks;
+        TimelineSequence child;
+        child.id = QStringLiteral("mcp-sequence-child");
+        child.name = QStringLiteral("MCP 子シーケンス");
+        child.videoTracks.append(QVector<ClipInfo>{});
+        projectTimeline->setSequences(QVector<TimelineSequence>{root, child}, root.id);
+        const auto listed = toolPayload(callProjectInfoTool(5090, QStringLiteral("get_sequences"), {}));
+        const auto sequences = listed.value(QStringLiteral("sequences")).toArray();
+        bool schemaRequired = false;
+        for (const auto &value : projectInfoToolDescriptors) {
+            const auto descriptor = value.toObject();
+            if (descriptor.value(QStringLiteral("name")).toString() == QStringLiteral("get_sequences")) {
+                const auto required = descriptor.value(QStringLiteral("outputSchema")).toObject()
+                    .value(QStringLiteral("required")).toArray();
+                schemaRequired = required.contains(QStringLiteral("ok"))
+                    && required.contains(QStringLiteral("activeId"))
+                    && required.contains(QStringLiteral("sequences"));
+            }
+        }
+        const bool g166 = listed.value(QStringLiteral("ok")).toBool()
+            && listed.value(QStringLiteral("activeId")).toString() == root.id
+            && sequences.size() == 2 && schemaRequired
+            && sequences[1].toObject().value(QStringLiteral("id")).toString() == child.id
+            && sequences[1].toObject().value(QStringLiteral("name")).toString() == child.name
+            && sequences[1].toObject().value(QStringLiteral("videoTrackCount")).toInt() == 1
+            && sequences[1].toObject().value(QStringLiteral("clipCount")).toInt(-1) == 0;
+        g166 ? pass("G166 sequence list and schema")
+             : fail("G166 sequence list and schema", QStringLiteral("sequence list/schema mismatch"));
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto switched = toolPayload(callProjectInfoTool(5091, QStringLiteral("set_active_sequence"),
+            QJsonObject{{"id", child.id}}));
+        const auto missing = callProjectInfoTool(5092, QStringLiteral("set_active_sequence"),
+            QJsonObject{{"id", QStringLiteral("missing-sequence")}});
+        const auto noId = callProjectInfoTool(5093, QStringLiteral("set_active_sequence"), {});
+        const auto after = toolPayload(callProjectInfoTool(5094, QStringLiteral("get_sequences"), {}));
+        const auto activeTimeline = toolPayload(callProjectInfoTool(5095, QStringLiteral("get_timeline"), {}));
+        const auto activeVideo = activeTimeline.value(QStringLiteral("video")).toArray();
+        const bool g167 = switched.value(QStringLiteral("ok")).toBool()
+            && switched.value(QStringLiteral("activeId")).toString() == child.id
+            && after.value(QStringLiteral("activeId")).toString() == child.id
+            && projectTimeline->activeSequenceId() == child.id
+            && !activeVideo.isEmpty()
+            && activeVideo[0].toObject().value(QStringLiteral("clips")).toArray().isEmpty()
+            && requiredOutputFieldsPresent(QStringLiteral("set_active_sequence"), switched)
+            && projectTimeline->undoManager()->saveSerial() == serial
+            && toolResult(missing).value(QStringLiteral("isError")).toBool()
+            && toolResult(noId).value(QStringLiteral("isError")).toBool();
+        g167 ? pass("G167 sequence switch without undo and invalid id")
+             : fail("G167 sequence switch without undo and invalid id", QStringLiteral("switch/undo/validation mismatch"));
+        projectTimeline->restoreState(savedState);
+    } else {
+        fail("G166 sequence list and schema", QStringLiteral("Timeline was not available"));
+        fail("G167 sequence switch without undo and invalid id", QStringLiteral("Timeline was not available"));
+    }
+    // US-511 reserved G168-G170: structural operations through the real MCP transport.
+    if (projectTimeline) {
+        const auto savedState = projectTimeline->currentState();
+        int requestId = 51100;
+        auto call = [&](const QString &name, const QJsonObject &args) {
+            return callProjectInfoTool(++requestId, name, args);
+        };
+        auto tracks = [&]() {
+            return toolPayload(call(QStringLiteral("get_timeline"), {})).value(QStringLiteral("video")).toArray();
+        };
+        auto baseline = [&]() {
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        };
+        const QVector<QVector<ClipInfo>> empty{{}};
+        Timeline cleanTimeline;
+        projectTimeline->restoreState(cleanTimeline.currentState());
+        baseline();
+        auto serial = projectTimeline->undoManager()->saveSerial();
+        const auto added = toolPayload(call(QStringLiteral("add_track"), {{"kind", "video"}}));
+        bool g168 = added.value("ok").toBool() && added.value("trackIndex").toInt(-1) == 1
+            && added.value("trackCount").toInt() == 2 && tracks().size() == 2
+            && requiredOutputFieldsPresent(QStringLiteral("add_track"), added)
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g168 = g168 && tracks().size() == 1 && !projectTimeline->canUndo();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto audioAdded = toolPayload(call(QStringLiteral("add_track"), {{"kind", "audio"}}));
+        g168 = g168 && audioAdded.value("ok").toBool() && audioAdded.value("trackCount").toInt() == 2
+            && projectTimeline->audioTrackCount() == 2
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g168 = g168 && projectTimeline->audioTrackCount() == 1 && !projectTimeline->canUndo();
+        const auto invalidAdd = call(QStringLiteral("add_track"), {{"kind", "invalid"}});
+        g168 = g168 && toolResult(invalidAdd).value("isError").toBool();
+        g168 ? pass("G168 add_track and single undo")
+             : fail("G168 add_track and single undo", QStringLiteral("count/undo/schema mismatch"));
+
+        ClipInfo middle, last;
+        middle.filePath = QStringLiteral("mcp-track-middle.mov");
+        middle.displayName = QStringLiteral("middle");
+        middle.duration = middle.outPoint = 2.0;
+        last = middle;
+        last.filePath = QStringLiteral("mcp-track-last.mov");
+        last.displayName = QStringLiteral("last");
+        const QVector<QVector<ClipInfo>> rows{{}, {middle}, {last}};
+        projectTimeline->restoreFromProject(rows, empty, 0.0, -1.0, -1.0, 100);
+        baseline();
+        const auto original = tracks();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto removed = toolPayload(call(QStringLiteral("remove_track"), {{"kind", "video"}, {"trackIndex", 1}}));
+        const auto afterRemove = tracks();
+        bool g169 = removed.value("ok").toBool() && removed.value("trackCount").toInt() == 2
+            && requiredOutputFieldsPresent(QStringLiteral("remove_track"), removed)
+            && afterRemove.size() == 2
+            && afterRemove[1].toObject().value("clips") == original[2].toObject().value("clips")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g169 = g169 && tracks() == original && !projectTimeline->canUndo();
+        projectTimeline->trackAt(false, 1)->setLocked(true);
+        const auto locked = call(QStringLiteral("remove_track"), {{"kind", "video"}, {"trackIndex", 1}});
+        g169 = g169 && toolResult(locked).value("isError").toBool() && tracks().size() == 3;
+        projectTimeline->trackAt(false, 1)->setLocked(false);
+        const auto lastTrack = call(QStringLiteral("remove_track"), {{"kind", "audio"}, {"trackIndex", 0}});
+        g169 = g169 && toolResult(lastTrack).value("isError").toBool() && projectTimeline->audioTrackCount() == 1;
+        g169 ? pass("G169 remove_track clips, undo and rejection")
+             : fail("G169 remove_track clips, undo and rejection", QStringLiteral("remove/undo/validation mismatch"));
+
+        projectTimeline->setTrackAppearance(false, 1, QStringLiteral("中央"), QColor(QStringLiteral("#123abc")));
+        projectTimeline->setTrackAppearance(false, 2, QStringLiteral("末尾"), QColor(QStringLiteral("#abcdef")));
+        baseline();
+        const auto beforeMove = tracks();
+        serial = projectTimeline->undoManager()->saveSerial();
+        const auto moved = toolPayload(call(QStringLiteral("move_track"),
+            {{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", 2}}));
+        const auto afterMove = tracks();
+        bool g170 = moved.value("ok").toBool() && moved.value("trackIndex").toInt(-1) == 2
+            && requiredOutputFieldsPresent(QStringLiteral("move_track"), moved)
+            && afterMove.size() == 3
+            && afterMove[1].toObject().value("name").toString() == QStringLiteral("末尾")
+            && afterMove[2].toObject().value("name").toString() == QStringLiteral("中央")
+            && afterMove[2].toObject().value("color").toString() == QStringLiteral("#123abc")
+            && projectTimeline->undoManager()->saveSerial() == serial + 1;
+        call(QStringLiteral("undo"), {});
+        g170 = g170 && tracks() == beforeMove && !projectTimeline->canUndo();
+        serial = projectTimeline->undoManager()->saveSerial();
+        for (const QJsonObject &args : {QJsonObject{{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", 3}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 3}, {"newTrackIndex", 0}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 1}, {"newTrackIndex", -1}},
+                QJsonObject{{"kind", "video"}, {"trackIndex", 1}}}) {
+            const auto rejected = call(QStringLiteral("move_track"), args);
+            g170 = g170 && toolResult(rejected).value("isError").toBool();
+        }
+        g170 = g170 && tracks() == beforeMove && serial == projectTimeline->undoManager()->saveSerial();
+        g170 ? pass("G170 move_track appearance, undo and bounds")
+             : fail("G170 move_track appearance, undo and bounds", QStringLiteral("move/undo/validation mismatch"));
+        projectTimeline->restoreState(savedState);
+    } else {
+        fail("G168 add_track and single undo", QStringLiteral("Timeline was not available"));
+        fail("G169 remove_track clips, undo and rejection", QStringLiteral("Timeline was not available"));
+        fail("G170 move_track appearance, undo and bounds", QStringLiteral("Timeline was not available"));
+    }
+    // US-600: the real transport must validate arguments and record one undo.
+    if (projectTimeline) {
+        const auto saved = projectTimeline->currentState();
+        Timeline clean;
+        projectTimeline->restoreState(clean.currentState());
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("clip-enable-test.mp4");
+        clip.duration = clip.outPoint = 1.0;
+        projectTimeline->videoTracks().first()->setClips({clip});
+        projectTimeline->audioTracks().first()->setClips({clip});
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        int requestId = 60000;
+        auto call = [&](const QString &name, const QJsonObject &args) {
+            return callProjectInfoTool(++requestId, name, args);
+        };
+        bool good = true;
+        for (const QString &kind : {QStringLiteral("video"), QStringLiteral("audio")}) {
+            const auto serial = projectTimeline->undoManager()->saveSerial();
+            const auto response = toolPayload(call(QStringLiteral("set_clip_enabled"),
+                {{"kind", kind}, {"clipIndex", 0}, {"enabled", false}}));
+            good = good && response.value("ok").toBool() && response.value("undoRecorded").toBool()
+                && projectTimeline->undoManager()->saveSerial() == serial + 1;
+            const auto tracks = toolPayload(call(QStringLiteral("get_timeline"), {}))
+                .value(kind).toArray();
+            const auto clips = tracks.isEmpty() ? QJsonArray{}
+                : tracks.first().toObject().value("clips").toArray();
+            good = good && !clips.isEmpty() && clips.first().toObject().contains("enabled")
+                && !clips.first().toObject().value("enabled").toBool(true);
+            projectTimeline->undo();
+            const auto *track = kind == QStringLiteral("audio")
+                ? projectTimeline->audioTracks().first() : projectTimeline->videoTracks().first();
+            good = good && track->clips().first().visible;
+        }
+        for (const QJsonObject &args : {
+                QJsonObject{{"clipIndex", 99}, {"enabled", false}},
+                QJsonObject{{"clipIndex", 0}, {"enabled", "false"}}})
+            good = toolResult(call(QStringLiteral("set_clip_enabled"), args)).value("isError").toBool() && good;
+        clip.filePath = clipgeom::nullObjectFilePath();
+        clip.visible = false;
+        projectTimeline->videoTracks().first()->setClips({clip});
+        good = toolResult(call(QStringLiteral("set_clip_enabled"),
+            {{"clipIndex", 0}, {"enabled", true}})).value("isError").toBool() && good;
+        good ? pass("G171 set_clip_enabled")
+             : fail("G171 set_clip_enabled", QStringLiteral("enable/undo/schema/validation mismatch"));
+        projectTimeline->restoreState(saved);
+    } else {
+        fail("G171 set_clip_enabled", QStringLiteral("Timeline was not available"));
+    }
+    // US-605: real transport validation and atomic grouping/ungrouping.
+    if (projectTimeline) {
+        const TimelineState saved = projectTimeline->currentState();
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("clip-group-test.mp4");
+        clip.duration = clip.outPoint = 2.0;
+        projectTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{clip, clip}, {clip}},
+            QVector<QVector<ClipInfo>>{{clip}}, 0.0, -1.0, -1.0, 100);
+        projectTimeline->undoManager()->clear();
+        projectTimeline->undoManager()->saveState(projectTimeline->currentState(), QStringLiteral("基準"));
+        int requestId = 60500;
+        auto call = [&](const QString &name, const QJsonArray &clips) {
+            return callProjectInfoTool(++requestId, name, {{"clips", clips}});
+        };
+        const QJsonObject v1{{"kind", "video"}, {"trackIndex", 0}, {"clipIndex", 0}};
+        const QJsonObject v2{{"kind", "video"}, {"trackIndex", 1}, {"clipIndex", 0}};
+        const QJsonObject a1{{"kind", "audio"}, {"trackIndex", 0}, {"clipIndex", 0}};
+        const QJsonArray targets{v1, v2, a1};
+        const auto before = projectTimeline->undoManager()->saveSerial();
+        bool good = true;
+        for (const auto &invalid : {QJsonArray{}, QJsonArray{v1}, QJsonArray{v1, v1},
+                QJsonArray{v1, QJsonObject{{"kind", "video"}, {"trackIndex", 0}, {"clipIndex", 1}}}})
+            good = toolResult(call(QStringLiteral("group_clips"), invalid)).value("isError").toBool() && good;
+        good = good && projectTimeline->undoManager()->saveSerial() == before;
+        const auto grouped = toolPayload(call(QStringLiteral("group_clips"), targets));
+        const int group = grouped.value("linkGroup").toInt();
+        good = good && grouped.value("ok").toBool() && group > 0
+            && grouped.value("undoRecorded").toBool()
+            && projectTimeline->undoManager()->saveSerial() == before + 1
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == group
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[0]->clips()[1].linkGroup == 0;
+        good ? pass("G172 group_clips")
+             : fail("G172 group_clips", QStringLiteral("group validation/identity/undo mismatch"));
+        const auto serial = projectTimeline->undoManager()->saveSerial();
+        good = toolResult(call(QStringLiteral("ungroup_clips"), QJsonArray{v1,
+            QJsonObject{{"kind", "audio"}, {"trackIndex", 0}, {"clipIndex", 99}}}))
+            .value("isError").toBool();
+        good = good && projectTimeline->undoManager()->saveSerial() == serial
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group;
+        const auto ungrouped = toolPayload(call(QStringLiteral("ungroup_clips"), targets));
+        good = good && ungrouped.value("ok").toBool() && ungrouped.value("undoRecorded").toBool()
+            && ungrouped.value("linkGroup").toInt(-1) == 0
+            && projectTimeline->undoManager()->saveSerial() == serial + 1
+            && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == 0
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == 0
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == 0;
+        projectTimeline->undo();
+        good = good && projectTimeline->videoTracks()[0]->clips()[0].linkGroup == group
+            && projectTimeline->videoTracks()[1]->clips()[0].linkGroup == group
+            && projectTimeline->audioTracks()[0]->clips()[0].linkGroup == group;
+        good ? pass("G173 ungroup_clips")
+             : fail("G173 ungroup_clips", QStringLiteral("ungroup validation/atomicity/undo mismatch"));
+        projectTimeline->restoreState(saved);
+    } else {
+        fail("G172 group_clips", QStringLiteral("Timeline was not available"));
+        fail("G173 ungroup_clips", QStringLiteral("Timeline was not available"));
+    }
+    // US-900 G178-G180: the MCP export_video mix (ducking_mix_*.m4a) is registered in the
+    // job's tempFiles and removed by RenderQueue at job end. The job is read synchronously
+    // from RenderQueue::jobsChanged (connected before the call) because removeTempFiles
+    // drops the key at job end.
+    {
+        const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        const QString videoAsset = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        const bool g178Ready = timelineReady && queue && QFileInfo(videoAsset).isFile()
+            && exportRootReady;
+        if (!g178Ready) {
+            const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4")
+                .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
+                .arg(exportRootReady);
+            for (int n = 178; n <= 180; ++n)
+                tally.gate(n, false, why.toUtf8().constData());
+        } else if (ffmpegExe.isEmpty()) {
+            for (int n = 178; n <= 180; ++n)
+                tally.skip(n, "ffmpeg.exe unavailable");
+        } else {
+            const QString tonePath = exportRoot.filePath(QStringLiteral("us900-tone.wav"));
+            std::vector<float> toneSamples(48000 * 2, 0.1f);
+            QString toneError;
+            const bool toneOk = libavcore::writeWavFloatInterleaved(tonePath, toneSamples, 48000, 2, &toneError);
+            // A separate audio file makes the passthrough shortcut inapplicable, so a mix is built.
+            ClipInfo videoClip;
+            videoClip.filePath = videoAsset;
+            videoClip.displayName = QStringLiteral("us900-video");
+            videoClip.duration = videoClip.outPoint = 1.0;
+            ClipInfo audioClip;
+            audioClip.filePath = tonePath;
+            audioClip.displayName = QStringLiteral("us900-audio");
+            audioClip.duration = audioClip.outPoint = 1.0;
+            TimelineTrack *videoTrack = projectTimeline->videoTracks().first();
+            TimelineTrack *audioTrack = projectTimeline->audioTracks().first();
+            const QVector<ClipInfo> savedVideoClips = videoTrack->clips();
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> savedAudioClips;
+            for (TimelineTrack *track : projectTimeline->audioTracks()) {
+                savedAudioClips.append(qMakePair(track, track->clips()));
+                track->setClips(QVector<ClipInfo>{});
+            }
+            videoTrack->setClips(QVector<ClipInfo>{videoClip});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            queue->clear();
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+            const QString mixDirPath = QDir::tempPath() + QStringLiteral("/v-simple-editor-audio-mix");
+
+            // G178 / G179: one successful export_video call.
+            RenderJob capturedJob;
+            bool captured = false;
+            bool mixExistedAtAdd = false;
+            QString mixPath;
+            const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                if (captured) return;
+                const auto jobs = queue->jobs();
+                if (jobs.isEmpty()) return;
+                capturedJob = jobs.first();
+                captured = true;
+                const QJsonArray files = capturedJob.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+                for (const QJsonValue &file : files) {
+                    const QString name = QFileInfo(file.toString()).fileName();
+                    if (name.startsWith(QStringLiteral("ducking_mix_")) && name.endsWith(QStringLiteral(".m4a")))
+                        mixPath = file.toString();
+                }
+                mixExistedAtAdd = !mixPath.isEmpty() && QFile::exists(mixPath);
+            });
+            const QJsonObject okResponse = callProjectInfoTool(1780, QStringLiteral("export_video"),
+                QJsonObject{{QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us900-ok.mp4"))}});
+            const QString okJobId = toolPayload(okResponse).value(QStringLiteral("jobId")).toString();
+            const bool okIsError = toolResult(okResponse).value(QStringLiteral("isError")).toBool(true);
+            const bool addedJob = QTest::qWaitFor([&]() { return captured; }, 60000);
+            const auto jobTerminal = [&]() {
+                for (const RenderJob &job : queue->jobs()) {
+                    if (job.uuid != okJobId) continue;
+                    return job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed
+                        || job.status == RenderJobStatus::Cancelled;
+                }
+                return false;
+            };
+            const bool terminal = addedJob && QTest::qWaitFor(jobTerminal, 120000);
+            QObject::disconnect(connection);
+            const bool mixGoneAtEnd = !mixPath.isEmpty() && !QFile::exists(mixPath);
+            const bool g178 = toneOk && !okIsError && !okJobId.isEmpty() && captured
+                && capturedJob.uuid == okJobId && mixExistedAtAdd && terminal && mixGoneAtEnd;
+            std::fprintf(stderr, "mcp G178 toneOk=%d isError=%d jobId=[%s] addedJob=%d captured=%d capturedUuid=[%s] mixPath=[%s] "
+                "existedAtAdd=%d terminal=%d existsAtEnd=%d\n", toneOk, okIsError, qPrintable(okJobId),
+                addedJob, captured, qPrintable(capturedJob.uuid), qPrintable(mixPath), mixExistedAtAdd, terminal,
+                !mixPath.isEmpty() && QFile::exists(mixPath));
+            tally.gate(178, g178, "the export_video audio mix was not registered in tempFiles or survived the job end");
+
+            const QJsonArray capturedTemp = capturedJob.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+            const bool tempHasMix = capturedTemp.contains(mixPath) && !mixPath.isEmpty();
+            const bool hasSourceKey = capturedJob.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+            const QString sourceProject = capturedJob.exportConfig.value(QStringLiteral("sourceProjectFilePath")).toString();
+            const QString queuePath = exportRoot.filePath(QStringLiteral("us900-queue.json"));
+            bool saved = false;
+            QByteArray savedBytes;
+            {
+                RenderQueue saveProbe;
+                saveProbe.addJob(capturedJob);
+                saved = saveProbe.saveQueue(queuePath);
+            }
+            {
+                QFile savedFile(queuePath);
+                if (savedFile.open(QIODevice::ReadOnly)) savedBytes = savedFile.readAll();
+            }
+            const QString mixName = QFileInfo(mixPath).fileName();
+            const bool savedHasMix = !mixName.isEmpty() && savedBytes.contains(mixName.toUtf8());
+            std::fprintf(stderr, "mcp G179 tempFilesHasMix=%d hasSourceKey=%d sourceProjectFilePath=[%s] "
+                "projectFilePathAtAdd=[%s] saved=%d savedBytes=%lld savedHasMixName=%d mixName=[%s]\n",
+                tempHasMix, hasSourceKey, qPrintable(sourceProject), qPrintable(capturedJob.projectFilePath),
+                saved, static_cast<long long>(savedBytes.size()), savedHasMix, qPrintable(mixName));
+            tally.gate(179, tempHasMix && hasSourceKey && sourceProject.isEmpty()
+                && capturedJob.projectFilePath == mixPath && saved && !savedBytes.isEmpty() && !savedHasMix,
+                "the MCP mix was not tracked as a temp intermediate or leaked into the saved queue");
+            queue->clear();
+
+            // G180: regression guard for the existing failure cleanup in finishMix (not a
+            // negative control for the US-900 change): a mix that fails after ffmpeg wrote
+            // the file leaves no ducking_mix_* file behind and the job reports failed.
+            const auto mixFiles = [&]() {
+                QSet<QString> names;
+                for (const QString &name : QDir(mixDirPath).entryList(QStringList{QStringLiteral("ducking_mix_*")},
+                                                                      QDir::Files))
+                    names.insert(name);
+                return names;
+            };
+            const QSet<QString> mixBefore = mixFiles();
+            exportaudio::failAfterWriteForTest = true;
+            exportaudio::outputExistedBeforeCleanupForTest = false;
+            const QJsonObject failResponse = callProjectInfoTool(1781, QStringLiteral("export_video"),
+                QJsonObject{{QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us900-fail.mp4"))}});
+            const QString failJobId = toolPayload(failResponse).value(QStringLiteral("jobId")).toString();
+            QString failStatus, failError;
+            int pollId = 1782;
+            const bool failed = QTest::qWaitFor([&]() {
+                const QJsonObject status = toolPayload(callProjectInfoTool(pollId++,
+                    QStringLiteral("get_export_status"), QJsonObject{{QStringLiteral("jobId"), failJobId}}));
+                failStatus = status.value(QStringLiteral("status")).toString();
+                failError = status.value(QStringLiteral("error")).toString();
+                return failStatus == QStringLiteral("failed");
+            }, 60000);
+            exportaudio::failAfterWriteForTest = false;
+            const bool existedBeforeCleanup = exportaudio::outputExistedBeforeCleanupForTest;
+            exportaudio::outputExistedBeforeCleanupForTest = false;
+            QSet<QString> leftover = mixFiles();
+            leftover.subtract(mixBefore);
+            std::fprintf(stderr, "mcp G180 jobId=[%s] status=[%s] error=[%s] existedBeforeCleanup=%d "
+                "newMixFiles=%lld jobsInQueue=%lld\n", qPrintable(failJobId), qPrintable(failStatus),
+                qPrintable(failError), existedBeforeCleanup, static_cast<long long>(leftover.size()),
+                static_cast<long long>(queue->jobs().size()));
+            tally.gate(180, !failJobId.isEmpty() && failed && existedBeforeCleanup && leftover.isEmpty()
+                && queue->jobs().isEmpty(),
+                "a failed export_video mix left a ducking_mix file or reached the queue");
+
+            queue->clear();
+            projectInfoWindow.m_mcpTools = previousTools;
+            videoTrack->setClips(savedVideoClips);
+            for (auto &entry : savedAudioClips)
+                entry.first->setClips(entry.second);
+        }
+    }
+
+    // US-909 G181-G187: export_video autoLoudness / targetLufs (explicit > preset > false),
+    // the prepareJob / prepareExportAudioMix exclusion, and audioBitrate reaching the mix.
+    {
+        // G181: the export_video descriptor as of the base (before US-909), pinned verbatim.
+        // The expected entry is that string plus two properties and one description sentence.
+        static const char kBaseExportVideoDescriptor[] = R"US909({"description":"audioOnly=true は m4a / wav / mp3 の音声のみを同期で書き出し、ok と outputPath を返す (jobId なし)。映像設定は無視して warnings を返す。通常は現在のタイムラインを動画ファイルへ非同期で書き出す。tools/call はジョブ投入後すぐに jobId を返し、完了は get_export_status で確認する。width / height / fps の省略時は現在のプロジェクト設定を使い、videoBitrate / audioBitrate は kbps (既定 10000 / 192)、videoCodec / audioCodec は ffmpeg のエンコーダ名 (既定 libx264 / aac)。音声はトリム・分割・並べ替え・音量・ミュートを反映したタイムラインのミックスを ffmpeg で作ってから多重化する (ffmpeg が PATH に無いと単純な 1 クリップ構成以外は failed になる)。","inputSchema":{"additionalProperties":false,"properties":{"audioBitrate":{"description":"kbps。既定 192","minimum":1,"type":"integer"},"audioCodec":{"description":"ffmpeg の音声エンコーダ名。既定 aac","type":"string"},"audioOnly":{"default":false,"type":"boolean"},"crf":{"description":"品質。-1 は既定、H.264/H.265 は 0..51、AV1 は 0..63","maximum":63,"minimum":-1,"type":"integer"},"fps":{"exclusiveMinimum":0,"type":"number"},"height":{"minimum":2,"type":"integer"},"keepAlpha":{"default":false,"description":"ProRes 4444 / 4444 XQ または VP9 でアルファチャンネルを保持","type":"boolean"},"metadata":{"additionalProperties":false,"properties":{"author":{"type":"string"},"comment":{"type":"string"},"copyright":{"type":"string"},"title":{"type":"string"}},"type":"object"},"outputPath":{"type":"string"},"preset":{"type":"string"},"proresProfile":{"default":1,"description":"ProRes プロファイル。省略時は既存の既定値 1","maximum":5,"minimum":0,"type":"integer"},"rateControl":{"enum":["bitrate","crf"],"type":"string"},"videoBitrate":{"description":"kbps","minimum":1,"type":"integer"},"videoCodec":{"type":"string"},"width":{"minimum":2,"type":"integer"}},"required":["outputPath"],"type":"object"},"name":"export_video","outputSchema":{"oneOf":[{"required":["jobId","status","progress","outputPath","width","height","fps","videoCodec","videoBitrate"]},{"not":{"required":["jobId"]},"required":["outputPath"]}],"properties":{"audioBitrate":{"type":"integer"},"audioCodec":{"type":"string"},"fps":{"type":"number"},"height":{"type":"integer"},"jobId":{"type":"string"},"ok":{"type":"boolean"},"outputPath":{"type":"string"},"preset":{"type":"string"},"progress":{"type":"integer"},"status":{"enum":["queued"],"type":"string"},"videoBitrate":{"type":"integer"},"videoCodec":{"type":"string"},"warnings":{"items":{"type":"string"},"type":"array"},"width":{"type":"integer"}},"required":["ok"],"type":"object"}})US909";
+        const QJsonObject baseDescriptor = QJsonDocument::fromJson(QByteArray(kBaseExportVideoDescriptor)).object();
+        QJsonObject currentDescriptor;
+        for (const QJsonValue &value : projectInfoToolDescriptors)
+            if (value.toObject().value(QStringLiteral("name")).toString() == QStringLiteral("export_video"))
+                currentDescriptor = value.toObject();
+        QJsonObject expectedDescriptor = baseDescriptor;
+        const QString addedSentence = QStringLiteral("autoLoudness / targetLufs を省略すると、preset 指定時はそのプリセットの自動ラウドネス設定に従う (audioOnly=true では行わない)。");
+        expectedDescriptor.insert(QStringLiteral("description"),
+            baseDescriptor.value(QStringLiteral("description")).toString() + addedSentence);
+        QJsonObject expectedSchema = baseDescriptor.value(QStringLiteral("inputSchema")).toObject();
+        QJsonObject expectedProps = expectedSchema.value(QStringLiteral("properties")).toObject();
+        expectedProps.insert(QStringLiteral("autoLoudness"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("boolean")},
+            {QStringLiteral("description"), QStringLiteral("音声を自動ラウドネス正規化する。省略時は preset の設定に従い、preset が無ければ OFF。audioOnly=true では自動ラウドネスを行わず、true の指定はエラー")}});
+        expectedProps.insert(QStringLiteral("targetLufs"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), -70},
+            {QStringLiteral("maximum"), -1},
+            {QStringLiteral("description"), QStringLiteral("自動ラウドネスの目標 LUFS。省略時は preset の値、無ければ -14")}});
+        expectedSchema.insert(QStringLiteral("properties"), expectedProps);
+        expectedDescriptor.insert(QStringLiteral("inputSchema"), expectedSchema);
+        QStringList diffKeys;
+        for (const QString &key : expectedDescriptor.keys())
+            if (expectedDescriptor.value(key) != currentDescriptor.value(key)) diffKeys << key;
+        for (const QString &key : currentDescriptor.keys())
+            if (!expectedDescriptor.contains(key)) diffKeys << key;
+        const QJsonObject currentSchema = currentDescriptor.value(QStringLiteral("inputSchema")).toObject();
+        QStringList propDiff;
+        const QJsonObject currentProps = currentSchema.value(QStringLiteral("properties")).toObject();
+        for (const QString &key : expectedProps.keys())
+            if (expectedProps.value(key) != currentProps.value(key)) propDiff << key;
+        for (const QString &key : currentProps.keys())
+            if (!expectedProps.contains(key)) propDiff << key;
+        const QJsonArray requiredNow = currentSchema.value(QStringLiteral("required")).toArray();
+        const bool descriptorBaseSane = !baseDescriptor.isEmpty()
+            && baseDescriptor.value(QStringLiteral("name")).toString() == QStringLiteral("export_video")
+            && !baseDescriptor.value(QStringLiteral("inputSchema")).toObject().value(QStringLiteral("properties"))
+                   .toObject().contains(QStringLiteral("autoLoudness"));
+        std::fprintf(stderr, "mcp G181 baseSane=%d equal=%d diffKeys=[%s] propDiff=[%s] required=%s outputSchemaSame=%d\n",
+            descriptorBaseSane, expectedDescriptor == currentDescriptor, qPrintable(diffKeys.join(QLatin1Char(','))),
+            qPrintable(propDiff.join(QLatin1Char(','))),
+            QJsonDocument(requiredNow).toJson(QJsonDocument::Compact).constData(),
+            baseDescriptor.value(QStringLiteral("outputSchema")) == currentDescriptor.value(QStringLiteral("outputSchema")));
+        tally.gate(181, descriptorBaseSane && expectedDescriptor == currentDescriptor
+            && requiredNow == QJsonArray{QStringLiteral("outputPath")}
+            && baseDescriptor.value(QStringLiteral("outputSchema")) == currentDescriptor.value(QStringLiteral("outputSchema")),
+            "the export_video descriptor differs from the pinned base plus the two US-909 properties and sentence");
+
+        const QString ffmpegExe = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+        const QString videoAsset = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        auto *queue = projectInfoWindow.findChild<RenderQueue*>(QStringLiteral("mainRenderQueue"));
+        QTemporaryDir presetDir;
+        const bool g182Ready = timelineReady && queue && QFileInfo(videoAsset).isFile()
+            && exportRootReady && presetDir.isValid();
+        if (!g182Ready) {
+            const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4 presetDir=%5")
+                .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
+                .arg(exportRootReady).arg(presetDir.isValid());
+            for (int n = 182; n <= 187; ++n)
+                tally.gate(n, false, why.toUtf8().constData());
+        } else if (ffmpegExe.isEmpty()) {
+            for (int n = 182; n <= 187; ++n)
+                tally.skip(n, "ffmpeg.exe unavailable");
+        } else {
+            const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
+            std::vector<float> toneSamples(48000 * 2 * 4);
+            for (size_t i = 0; i < toneSamples.size(); ++i)
+                toneSamples[i] = 0.1f * static_cast<float>(std::sin(2.0 * 3.14159265358979 * 440.0 * static_cast<double>(i / 2) / 48000.0));
+            QString toneError;
+            const bool toneOk = libavcore::writeWavFloatInterleaved(tonePath, toneSamples, 48000, 2, &toneError);
+            ClipInfo videoClip;
+            videoClip.filePath = videoAsset;
+            videoClip.displayName = QStringLiteral("us909-video");
+            videoClip.duration = videoClip.outPoint = 1.0;
+            ClipInfo audioClip;
+            audioClip.filePath = tonePath;
+            audioClip.displayName = QStringLiteral("us909-audio");
+            audioClip.duration = audioClip.outPoint = 4.0;
+            TimelineTrack *videoTrack = projectTimeline->videoTracks().first();
+            TimelineTrack *audioTrack = projectTimeline->audioTracks().first();
+            const QVector<ClipInfo> savedVideoClips = videoTrack->clips();
+            QVector<QPair<TimelineTrack *, QVector<ClipInfo>>> savedAudioClips;
+            for (TimelineTrack *track : projectTimeline->audioTracks()) {
+                savedAudioClips.append(qMakePair(track, track->clips()));
+                track->setClips(QVector<ClipInfo>{});
+            }
+            videoTrack->setClips(QVector<ClipInfo>{videoClip});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            queue->clear();
+            auto *previousTools = projectInfoWindow.m_mcpTools;
+            projectInfoWindow.m_mcpTools = &projectInfoTools;
+
+            const bool hadPresetEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+            const QByteArray oldPresetEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+            qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+            ExportUserPreset onPreset;
+            onPreset.name = QStringLiteral("us909-on");
+            onPreset.config.autoLoudness = true;
+            onPreset.config.targetLufs = -16.0;
+            ExportUserPreset offPreset;
+            offPreset.name = QStringLiteral("us909-off");
+            offPreset.config.autoLoudness = false;
+            offPreset.config.targetLufs = -16.0;
+            QString presetError;
+            const bool presetsSaved = ExportUserPresets::save(onPreset, &presetError)
+                && ExportUserPresets::save(offPreset, &presetError);
+
+            struct Run {
+                bool isError = true;
+                QString errorText;
+                QString jobId;
+                bool captured = false;
+                RenderJob job;
+                QJsonArray tempFiles;
+                bool mixInTemp = false;
+                qint64 mixBytes = -1;
+                qint64 mixDurationUs = -1;
+                qint64 mixStreamBitRate = -1;
+                bool mixIsAac = false;
+                int measureDelta = -1;
+                int mixDelta = -1;
+                bool terminal = false;
+                RenderJobStatus finalStatus = RenderJobStatus::Pending;
+                qsizetype queueAfter = -1;
+            };
+            // Audio stream bit_rate from the container headers (not size / duration).
+            const auto probeStreamBitRate = [](const QString &path) -> qint64 {
+                AVFormatContext *format = nullptr;
+                if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                    return -1;
+                qint64 rate = -1;
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned i = 0; i < format->nb_streams; ++i)
+                        if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                            rate = format->streams[i]->codecpar->bit_rate;
+                }
+                avformat_close_input(&format);
+                return rate;
+            };
+            // Codec of the first audio stream (the .m4a extension names the container, not the codec).
+            const auto firstAudioIsAac = [](const QString &path) -> bool {
+                AVFormatContext *format = nullptr;
+                if (avformat_open_input(&format, path.toUtf8().constData(), nullptr, nullptr) < 0)
+                    return false;
+                bool aac = false;
+                if (avformat_find_stream_info(format, nullptr) >= 0) {
+                    for (unsigned i = 0; i < format->nb_streams; ++i) {
+                        if (format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                            aac = format->streams[i]->codecpar->codec_id == AV_CODEC_ID_AAC;
+                            break;
+                        }
+                    }
+                }
+                avformat_close_input(&format);
+                return aac;
+            };
+            int callId = 1900;
+            // jobsChanged is connected before the call: the job's tempFiles and mix are gone at job end.
+            auto runExport = [&](QJsonObject args, bool expectJob = true) {
+                Run run;
+                queue->clear();
+                if (!args.contains(QStringLiteral("outputPath")))
+                    args.insert(QStringLiteral("outputPath"),
+                                exportRoot.filePath(QStringLiteral("us909-%1.mp4").arg(callId)));
+                if (!args.contains(QStringLiteral("audioOnly"))) {
+                    args.insert(QStringLiteral("width"), 320);
+                    args.insert(QStringLiteral("height"), 180);
+                    args.insert(QStringLiteral("fps"), 10);
+                }
+                const int queueBefore = queue->jobs().size();
+                const int measureBefore = RenderQueue::autoLoudnessMeasurementCountForTest();
+                const int mixBefore = projectInfoWindow.exportAudioMixCallCountForTest;
+                const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                    if (run.captured) return;
+                    const auto jobs = queue->jobs();
+                    if (jobs.isEmpty()) return;
+                    run.job = jobs.first();
+                    run.captured = true;
+                    run.tempFiles = run.job.exportConfig.value(QStringLiteral("tempFiles")).toArray();
+                    run.mixInTemp = !run.job.projectFilePath.isEmpty()
+                        && run.tempFiles.contains(run.job.projectFilePath);
+                    const QFileInfo mixInfo(run.job.projectFilePath);
+                    if (mixInfo.isFile()) {
+                        run.mixBytes = mixInfo.size();
+                        const auto duration = libavcore::probeDurationMicroseconds(
+                            run.job.projectFilePath.toStdString());
+                        if (duration) run.mixDurationUs = *duration;
+                        run.mixStreamBitRate = probeStreamBitRate(run.job.projectFilePath);
+                        run.mixIsAac = firstAudioIsAac(run.job.projectFilePath);
+                    }
+                });
+                const QJsonObject response = callProjectInfoTool(callId++, QStringLiteral("export_video"), args);
+                run.isError = toolResult(response).value(QStringLiteral("isError")).toBool(true);
+                run.jobId = toolPayload(response).value(QStringLiteral("jobId")).toString();
+                if (run.isError) {
+                    const QJsonArray content = toolResult(response).value(QStringLiteral("content")).toArray();
+                    run.errorText = content.isEmpty() ? QString()
+                        : content.first().toObject().value(QStringLiteral("text")).toString();
+                }
+                if (expectJob && !run.isError) {
+                    (void)QTest::qWaitFor([&]() { return run.captured; }, 60000);
+                    run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
+                    run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                    run.terminal = run.captured && QTest::qWaitFor([&]() {
+                        for (const RenderJob &job : queue->jobs()) {
+                            if (job.uuid != run.jobId) continue;
+                            run.finalStatus = job.status;
+                            return job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed
+                                || job.status == RenderJobStatus::Cancelled;
+                        }
+                        return false;
+                    }, 120000);
+                } else {
+                    // Returns as soon as a (wrongly) deferred job step is observed; the deferral is QTimer::singleShot(0).
+                    (void)QTest::qWaitFor([&]() {
+                        return queue->jobs().size() != queueBefore
+                            || RenderQueue::autoLoudnessMeasurementCountForTest() != measureBefore
+                            || projectInfoWindow.exportAudioMixCallCountForTest != mixBefore;
+                    }, 1000);
+                    run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
+                    run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                }
+                QObject::disconnect(connection);
+                run.queueAfter = queue->jobs().size();
+                return run;
+            };
+            const auto lufsOf = [](const Run &run, const char *key) {
+                return run.job.exportConfig.value(QLatin1String(key)).toDouble(std::numeric_limits<double>::quiet_NaN());
+            };
+            const auto autoOf = [](const Run &run) {
+                return run.job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false);
+            };
+            const auto describe = [&](const char *tag, const Run &run) {
+                std::fprintf(stderr, "mcp %s isError=%d err=[%s] captured=%d measureDelta=%d mixDelta=%d "
+                    "hasAutoKey=%d autoLoudness=%d targetLufs=%g measuredLufs=%g mixInTemp=%d "
+                    "mixIsAac=%d projectFilePath=[%s] terminal=%d status=%d\n", tag, run.isError, qPrintable(run.errorText),
+                    run.captured, run.measureDelta, run.mixDelta,
+                    run.job.exportConfig.contains(QStringLiteral("autoLoudness")), autoOf(run),
+                    lufsOf(run, "targetLufs"), lufsOf(run, "measuredLufs"), run.mixInTemp,
+                    run.mixIsAac, qPrintable(run.job.projectFilePath), run.terminal, static_cast<int>(run.finalStatus));
+            };
+            const auto finiteSane = [](double lufs) { return std::isfinite(lufs) && lufs > -30.0 && lufs < -18.0; };
+
+            // G182: explicit autoLoudness=true goes through prepareJob, not prepareExportAudioMix.
+            const Run explicitOn = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
+                                                         {QStringLiteral("targetLufs"), -14}});
+            describe("G182", explicitOn);
+
+            // G182 sub-case: autoLoudness resolved true on a timeline whose audio playback sequence is empty.
+            // prepareJob makes no mix there; without the MCP-side silent mix RenderQueue falls back to the
+            // V1 source audio (e2e_clip.mp4 has an audible AAC stream) that the user removed.
+            audioTrack->setClips(QVector<ClipInfo>{});
+            const QString silentOut = exportRoot.filePath(QStringLiteral("us909-emptyaudio.mp4"));
+            const Run emptyAudio = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
+                {QStringLiteral("outputPath"), silentOut}});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            describe("G182-empty", emptyAudio);
+            const double silentLufs = emptyAudio.terminal ? loudness::measureIntegratedLufs(silentOut)
+                                                          : std::numeric_limits<double>::quiet_NaN();
+            const double sourceLufs = loudness::measureIntegratedLufs(videoAsset);
+            const bool silentOk = !emptyAudio.isError && emptyAudio.captured
+                && emptyAudio.mixInTemp && emptyAudio.job.projectFilePath != videoAsset
+                && emptyAudio.mixDelta == 1
+                && emptyAudio.terminal && emptyAudio.finalStatus == RenderJobStatus::Completed
+                && std::isfinite(sourceLufs) && sourceLufs > -40.0
+                && std::isfinite(silentLufs) && silentLufs <= -70.0;
+            std::fprintf(stderr, "mcp G182-empty silentOk=%d outputLufs=%g sourceV1Lufs=%g mixDelta=%d measureDelta=%d "
+                "projectFilePathIsV1=%d\n", silentOk, silentLufs, sourceLufs, emptyAudio.mixDelta,
+                emptyAudio.measureDelta, emptyAudio.job.projectFilePath == videoAsset);
+            tally.gate(182, toneOk && presetsSaved && !explicitOn.isError && explicitOn.captured
+                && explicitOn.measureDelta == 1 && finiteSane(lufsOf(explicitOn, "measuredLufs"))
+                && explicitOn.mixInTemp && explicitOn.mixIsAac && explicitOn.mixDelta == 0
+                && explicitOn.terminal && explicitOn.finalStatus == RenderJobStatus::Completed
+                && silentOk,
+                "autoLoudness=true did not measure once via prepareJob (or also called prepareExportAudioMix), "
+                "or an empty audio sequence brought back the V1 source audio");
+
+            // G183 / G184: omitted + no preset is the base path; omitted + ON preset is the US-909 change.
+            const Run omitted = runExport(QJsonObject{});
+            describe("G183", omitted);
+            const bool g183Ext = QFileInfo(omitted.job.projectFilePath).suffix().toLower() == QStringLiteral("m4a")
+                || omitted.mixInTemp;
+            tally.gate(183, !omitted.isError && omitted.captured
+                && !omitted.job.exportConfig.contains(QStringLiteral("autoLoudness"))
+                && !omitted.job.exportConfig.contains(QStringLiteral("targetLufs"))
+                && omitted.measureDelta == 0 && omitted.mixDelta == 1 && omitted.mixInTemp && g183Ext
+                && omitted.terminal && omitted.finalStatus == RenderJobStatus::Completed,
+                "omitted autoLoudness without a preset left the base export path (key, measurement or mix call count changed)");
+            const Run presetOn = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")}});
+            describe("G184", presetOn);
+            tally.gate(184, !presetOn.isError && presetOn.captured && presetOn.measureDelta == 1
+                && presetOn.mixDelta == 0 && autoOf(presetOn)
+                && lufsOf(presetOn, "targetLufs") == -16.0 && finiteSane(lufsOf(presetOn, "measuredLufs"))
+                && presetOn.mixInTemp && presetOn.terminal && presetOn.finalStatus == RenderJobStatus::Completed,
+                "an ON preset with autoLoudness omitted was not measured (behavior change not applied)");
+
+            // G185: resolution rule explicit > preset > false.
+            const Run caseA = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")},
+                                                    {QStringLiteral("autoLoudness"), false}});
+            describe("G185a", caseA);
+            const Run caseB = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-off")},
+                                                    {QStringLiteral("autoLoudness"), true}});
+            describe("G185b", caseB);
+            const Run caseC = runExport(QJsonObject{{QStringLiteral("targetLufs"), -20}});
+            describe("G185c", caseC);
+            const Run caseD = runExport(QJsonObject{{QStringLiteral("preset"), QStringLiteral("us909-on")},
+                                                    {QStringLiteral("targetLufs"), -20}});
+            describe("G185d", caseD);
+            const bool a = !caseA.isError && caseA.captured && caseA.measureDelta == 0 && caseA.mixDelta == 1
+                && !autoOf(caseA)
+                && caseA.job.exportConfig.contains(QStringLiteral("autoLoudness"))
+                && caseA.job.exportConfig.value(QStringLiteral("autoLoudness")).isBool();
+            const bool b = !caseB.isError && caseB.captured && caseB.measureDelta == 1 && caseB.mixDelta == 0
+                && autoOf(caseB) && lufsOf(caseB, "targetLufs") == -16.0;
+            const bool c = !caseC.isError && caseC.captured && caseC.measureDelta == 0 && caseC.mixDelta == 1
+                && !autoOf(caseC) && lufsOf(caseC, "targetLufs") == -20.0;
+            const bool d = !caseD.isError && caseD.captured && caseD.measureDelta == 1 && caseD.mixDelta == 0
+                && autoOf(caseD) && lufsOf(caseD, "targetLufs") == -20.0;
+            std::fprintf(stderr, "mcp G185 a=%d b=%d c=%d d=%d\n", a, b, c, d);
+            tally.gate(185, a && b && c && d,
+                "the explicit > preset > false resolution of autoLoudness / targetLufs was violated");
+
+            // G186: invalid values are rejected without queuing; audioOnly + preset-derived true is ignored.
+            const QString audioOnlyPath = exportRoot.filePath(QStringLiteral("us909-audio.m4a"));
+            const QList<QJsonObject> invalidArgs{
+                QJsonObject{{QStringLiteral("targetLufs"), 0}},
+                QJsonObject{{QStringLiteral("targetLufs"), -80}},
+                QJsonObject{{QStringLiteral("autoLoudness"), QStringLiteral("yes")}},
+                QJsonObject{{QStringLiteral("audioOnly"), true}, {QStringLiteral("autoLoudness"), true},
+                            {QStringLiteral("outputPath"), audioOnlyPath}}};
+            bool invalidOk = true;
+            for (int i = 0; i < invalidArgs.size(); ++i) {
+                const Run run = runExport(invalidArgs.at(i), false);
+                std::fprintf(stderr, "mcp G186 invalid#%d isError=%d err=[%s] queueAfter=%lld measureDelta=%d mixDelta=%d\n",
+                    i, run.isError, qPrintable(run.errorText), static_cast<long long>(run.queueAfter),
+                    run.measureDelta, run.mixDelta);
+                invalidOk = invalidOk && run.isError && !run.errorText.isEmpty() && run.queueAfter == 0
+                    && run.measureDelta == 0 && run.mixDelta == 0;
+            }
+            // audioOnly + ON preset + omitted: decision 7 (Wave 10 exception) - MCP audioOnly never measures (base measured once).
+            const Run audioOnlyPreset = runExport(QJsonObject{{QStringLiteral("audioOnly"), true},
+                {QStringLiteral("preset"), QStringLiteral("us909-on")}, {QStringLiteral("outputPath"), audioOnlyPath}}, false);
+            const bool audioOnlyPresetFile = QFileInfo(audioOnlyPath).isFile();
+            std::fprintf(stderr, "mcp G186 audioOnly+ON preset isError=%d err=[%s] jobId=[%s] queueAfter=%lld measureDelta=%d outputExists=%d (decision 7: not measured; base measured)\n",
+                audioOnlyPreset.isError, qPrintable(audioOnlyPreset.errorText), qPrintable(audioOnlyPreset.jobId),
+                static_cast<long long>(audioOnlyPreset.queueAfter), audioOnlyPreset.measureDelta, audioOnlyPresetFile);
+            // Explicit autoLoudness=false overrides the preset: not measured.
+            const QString audioOnlyOffPath = exportRoot.filePath(QStringLiteral("us909-audio-off.m4a"));
+            const Run audioOnlyOff = runExport(QJsonObject{{QStringLiteral("audioOnly"), true},
+                {QStringLiteral("preset"), QStringLiteral("us909-on")}, {QStringLiteral("autoLoudness"), false},
+                {QStringLiteral("outputPath"), audioOnlyOffPath}}, false);
+            std::fprintf(stderr, "mcp G186 audioOnly+ON preset+autoLoudness=false isError=%d err=[%s] jobId=[%s] queueAfter=%lld measureDelta=%d outputExists=%d\n",
+                audioOnlyOff.isError, qPrintable(audioOnlyOff.errorText), qPrintable(audioOnlyOff.jobId),
+                static_cast<long long>(audioOnlyOff.queueAfter), audioOnlyOff.measureDelta, QFileInfo(audioOnlyOffPath).isFile());
+            tally.gate(186, invalidOk && !audioOnlyPreset.isError && audioOnlyPreset.jobId.isEmpty()
+                && audioOnlyPreset.queueAfter == 0 && audioOnlyPreset.measureDelta == 0 && audioOnlyPresetFile
+                && !audioOnlyOff.isError && audioOnlyOff.jobId.isEmpty() && audioOnlyOff.queueAfter == 0
+                && audioOnlyOff.measureDelta == 0 && QFileInfo(audioOnlyOffPath).isFile(),
+                "an invalid autoLoudness / targetLufs queued a job, or MCP audioOnly + ON preset measured (decision 7: not measured; base measured) / audioOnly + explicit false measured");
+
+            // G187: audioBitrate reaches the mix. The audio stream bit_rate is read from the m4a headers.
+            // Noise (a tone would not make the AAC encoder spend its bitrate), on the audio track for these two runs only.
+            const QString noisePath = exportRoot.filePath(QStringLiteral("us909-noise.wav"));
+            std::vector<float> noiseSamples(48000 * 2 * 4);
+            unsigned noiseState = 12345u;
+            for (float &v : noiseSamples) {
+                noiseState = noiseState * 1664525u + 1013904223u;
+                v = (static_cast<float>(noiseState >> 8) / 8388608.0f - 1.0f) * 0.3f;
+            }
+            QString noiseError;
+            const bool noiseOk = libavcore::writeWavFloatInterleaved(noisePath, noiseSamples, 48000, 2, &noiseError);
+            ClipInfo noiseClip = audioClip;
+            noiseClip.filePath = noisePath;
+            noiseClip.displayName = QStringLiteral("us909-noise");
+            audioTrack->setClips(QVector<ClipInfo>{noiseClip});
+            const Run bitrate96 = runExport(QJsonObject{{QStringLiteral("audioBitrate"), 96}});
+            const Run bitrate192 = runExport(QJsonObject{{QStringLiteral("audioBitrate"), 192}});
+            audioTrack->setClips(QVector<ClipInfo>{audioClip});
+            const double rate96 = static_cast<double>(bitrate96.mixStreamBitRate) / 1000.0;
+            const double rate192 = static_cast<double>(bitrate192.mixStreamBitRate) / 1000.0;
+            std::fprintf(stderr, "mcp G187 noiseOk=%d 96: isError=%d mixInTemp=%d bit_rate=%lld bytes=%lld durationUs=%lld | 192: isError=%d mixInTemp=%d bit_rate=%lld bytes=%lld durationUs=%lld\n",
+                noiseOk, bitrate96.isError, bitrate96.mixInTemp, static_cast<long long>(bitrate96.mixStreamBitRate),
+                static_cast<long long>(bitrate96.mixBytes), static_cast<long long>(bitrate96.mixDurationUs),
+                bitrate192.isError, bitrate192.mixInTemp, static_cast<long long>(bitrate192.mixStreamBitRate),
+                static_cast<long long>(bitrate192.mixBytes), static_cast<long long>(bitrate192.mixDurationUs));
+            tally.gate(187, noiseOk && !bitrate96.isError && bitrate96.mixInTemp && rate96 > 81.6 && rate96 < 110.4
+                && !bitrate192.isError && bitrate192.mixInTemp && rate192 > 163.2 && rate192 < 220.8
+                && rate192 > 1.4 * rate96,
+                "the MCP audioBitrate did not set the mix AAC stream bit_rate (about 96 / 192 kbps)");
+
+            queue->clear();
+            if (hadPresetEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldPresetEnv);
+            else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+            projectInfoWindow.m_mcpTools = previousTools;
+            videoTrack->setClips(savedVideoClips);
+            for (auto &entry : savedAudioClips)
+                entry.first->setClips(entry.second);
+        }
+    }
+
     server.stop();
-    qInfo().noquote().nospace() << "[mcp] selftest end, passed=" << passed
-                                << " failed=" << failed;
-    qInfo().noquote().nospace() << "summary: " << passed << " PASS, "
-                                << failed << " FAIL";
-    return failed;
+    qInfo().noquote().nospace() << "[mcp] selftest end";
+    return tally.finish("mcp");
 }

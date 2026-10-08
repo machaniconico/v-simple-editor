@@ -9,9 +9,11 @@
 #include <QString>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 #include "../playback/SnsFit.h"
+#include "SelftestGate.h"
 
 #if __has_include("../playback/clipgeom.h")
 #include "../playback/clipgeom.h"
@@ -90,20 +92,14 @@ bool allPixelsOpaque(const QImage& image)
 int runSnsFitSelftest()
 {
     qInfo().noquote() << "[sns-fit] selftest start";
-    int passed = 0, failed = 0;
-    auto pass = [&](const char* name) {
-        ++passed;
-        qInfo().noquote() << "[sns-fit] PASS" << name;
-    };
-    auto fail = [&](const char* name, const QString& msg) {
-        ++failed;
-        qWarning().noquote() << "[sns-fit] FAIL" << name << ":" << msg;
+    selftest::GateTally tally;
+    int gateNumber = 0;
+    auto pass = [&](const char* name, bool ok) {
+        tally.gate(++gateNumber, ok, name);
     };
     auto check = [&](const char* name, bool ok, const QString& msg = QString()) {
-        if (ok)
-            pass(name);
-        else
-            fail(name, msg);
+        std::fprintf(stderr, "[sns-fit] %s: %s\n", name, qPrintable(msg));
+        pass(name, ok);
     };
 
     {
@@ -215,9 +211,7 @@ int runSnsFitSelftest()
                   .arg(srcAspect, 0, 'f', 9));
     }
 #else
-    qInfo().noquote() << "[sns-fit] SKIP G8 contain->clipgeom preserves content aspect:"
-                      << "clipgeom header unavailable";
-    pass("G8 contain->clipgeom preserves content aspect (skipped)");
+    tally.skip(++gateNumber, "clipgeom header unavailable");
 #endif
 
     {
@@ -286,28 +280,20 @@ int runSnsFitSelftest()
                   .arg(fw, 0, 'f', 6).arg(fh, 0, 'f', 6));
     }
 
-    qInfo().noquote() << "[sns-fit] selftest done: passed=" << passed
-                      << "failed=" << failed;
-    return failed == 0 ? 0 : 1;
+    return tally.finish();
 }
 
 int runSnsCoverSelftest()
 {
     qInfo().noquote() << "[sns-cover] selftest start";
-    int passed = 0, failed = 0;
-    auto pass = [&](const char* name) {
-        ++passed;
-        qInfo().noquote() << "[sns-cover] PASS" << name;
-    };
-    auto fail = [&](const char* name, const QString& msg) {
-        ++failed;
-        qWarning().noquote() << "[sns-cover] FAIL" << name << ":" << msg;
+    selftest::GateTally tally;
+    int gateNumber = 0;
+    auto pass = [&](const char* name, bool ok) {
+        tally.gate(++gateNumber, ok, name);
     };
     auto check = [&](const char* name, bool ok, const QString& msg = QString()) {
-        if (ok)
-            pass(name);
-        else
-            fail(name, msg);
+        std::fprintf(stderr, "[sns-cover] %s: %s\n", name, qPrintable(msg));
+        pass(name, ok);
     };
 
     {
@@ -425,9 +411,7 @@ int runSnsCoverSelftest()
                   .arg(canvasSize.width()).arg(canvasSize.height()));
     }
 #else
-    qInfo().noquote() << "[sns-cover] SKIP G8 cover->clipgeom fills full rect:"
-                      << "clipgeom header unavailable";
-    pass("G8 cover->clipgeom fills full rect (skipped)");
+    tally.skip(++gateNumber, "clipgeom header unavailable");
 #endif
 
     {
@@ -508,7 +492,5 @@ int runSnsCoverSelftest()
                   .arg(snsfit::shouldFit(false, false, proj, src.size())));
     }
 
-    qInfo().noquote() << "[sns-cover] selftest done: passed=" << passed
-                      << "failed=" << failed;
-    return failed == 0 ? 0 : 1;
+    return tally.finish();
 }

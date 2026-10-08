@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QImage>
+#include <QMap>
+#include "AudioTrackFx.h"
 #include "ProjectSettings.h"
 #include "Timeline.h"
 #include "VideoEffect.h"
@@ -12,7 +14,7 @@
 #include "MaskSystem.h"
 #include "PlanarTracker.h"
 #include "ParticleSystem.h"
-#include "Rotoscope.h"
+#include "RotoClipEntry.h"
 #include "TimeRemap.h"
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
@@ -125,13 +127,6 @@ struct ClipNodeGraph {
     QString compositingMode = QStringLiteral("layer");
 };
 
-struct RotoClipEntry {
-    QString clipId;
-    RotoPath path;
-    QVector<RotoKeyframe> keyframes;
-    QImage brushMask;
-};
-
 struct TimeRemapClipEntry {
     QString clipId;
     timeremap::TimeRemapCurve curve;
@@ -236,6 +231,8 @@ struct ProjectData {
 
     // Audio mixer state
     QVector<TrackEqState> trackEqStates;
+    QMap<int, trackfx::Chain> trackFx; // Engine audio track indices (A1 = 0).
+    trackfx::Chain masterFx;
     CompressorState masterCompressor;
     AutoDuckState autoDuck;
     bool audioMetersDockVisible = true;

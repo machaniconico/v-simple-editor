@@ -85,6 +85,10 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::DirectionalBlur:
     case VideoEffectType::RadialBlur:
         return QStringLiteral("ブラー");
+    case VideoEffectType::BroadcastSafe:
+    case VideoEffectType::LeaveColor:
+    case VideoEffectType::LumaKey:
+    case VideoEffectType::ColorKey:
     case VideoEffectType::ChromaKey:
     case VideoEffectType::Sepia:
     case VideoEffectType::Grayscale:
@@ -99,6 +103,7 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::Vibrance:
     case VideoEffectType::PhotoFilter:
     case VideoEffectType::Tritone:
+    case VideoEffectType::LogToRec709:
     case VideoEffectType::BrightnessContrast:
         return QStringLiteral("カラー");
     case VideoEffectType::Mosaic:
@@ -110,10 +115,16 @@ QString videoCategory(VideoEffectType type)
     case VideoEffectType::GlitchVHS:
     case VideoEffectType::Bulge:
     case VideoEffectType::Twirl:
+    case VideoEffectType::Flip:
     case VideoEffectType::Mirror:
     case VideoEffectType::PolarCoordinates:
     case VideoEffectType::MotionTile:
     case VideoEffectType::RollingShutterRepair:
+    case VideoEffectType::WarpWave:
+    case VideoEffectType::WarpRipple:
+    case VideoEffectType::WarpSpherize:
+    case VideoEffectType::WarpFisheye:
+    case VideoEffectType::WarpPinch:
     case VideoEffectType::LensDistortion:
     case VideoEffectType::CornerPinSimple:
         return QStringLiteral("ディストーション");
@@ -421,6 +432,8 @@ void EffectLibraryModel::registerAll()
         data.entry.kind = SourceKind::AeFx;
         data.sourceName = sourceName;
         data.videoType = type;
+        if (type == VideoEffectType::LumaKey || type == VideoEffectType::ColorKey)
+            data.entry.tags.append(QStringLiteral("スタックの最後に置いてください (後続の効果で透明部分が失われます)"));
         addCommonTags(data.entry, sourceName);
         addEntry(data);
     }

@@ -21,6 +21,7 @@ class QTimer;
 // real-time floor estimate readout.
 class NoiseReductionPanel : public QWidget {
     Q_OBJECT
+    friend int runAudioTrackFxSelftest(); // selftest reads/sets the suppress state
 public:
     explicit NoiseReductionPanel(QWidget *parent = nullptr);
 
@@ -40,9 +41,15 @@ public:
 
     int currentTrackId() const;
 
+    // Number of *Changed emissions so far (selftests prove reseeds stay silent).
+    int changedEmitCountForTest() const { return m_emitCount; }
+
 signals:
     void noiseReductionChanged(int trackId,
                                AudioMixer::NoiseReductionSettings nr);
+    // One finished user gesture (drag release, wheel / keyboard step, checkbox,
+    // button) that emitted noiseReductionChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onAnyControlChanged();
@@ -57,9 +64,12 @@ private:
         const AudioMixer::NoiseReductionSettings &nr);
     void updateFloorReadoutEnabled();
     void emitChange();
+    void finishGesture();
 
     AudioMixer *m_mixer = nullptr;
     bool m_suppressEmit = false;
+    int m_emitCount = 0;
+    bool m_gestureDirty = false; // changed since the last gestureFinished
 
     QComboBox *m_trackCombo = nullptr;
     QCheckBox *m_enable = nullptr;

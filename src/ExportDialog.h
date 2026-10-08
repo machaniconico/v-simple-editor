@@ -1,8 +1,10 @@
 #pragma once
 
 #include <QDialog>
+#include <QJsonObject>
 #include <QComboBox>
 #include <QSpinBox>
+#include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QProgressBar>
 #include <QPushButton>
@@ -10,11 +12,13 @@
 #include <QCheckBox>
 #include <QPlainTextEdit>
 #include "ProjectSettings.h"
+#include "SubtitleIO.h"
 #include "Timeline.h"
 
 enum class ExportType {
     Video,       // 既存 video encode (preset/codec 設定を使う)
     PremiereXml, // Premiere Pro XML (FCP7) — PremiereXmlExporter を呼出
+    ImageSequence, // PNG / TIFF 連番静止画
 };
 
 struct ExportPreset {
@@ -39,6 +43,13 @@ struct HDRSettings {
 };
 
 struct ExportConfig {
+    enum class RateControl { Bitrate, Crf };
+    RateControl rateControl = RateControl::Bitrate;
+    subtitle::ExportMode subtitleMode = subtitle::ExportMode::BurnIn;
+    void appendSubtitleSettings(QJsonObject &json) const;
+    int crf = -1; // -1: codec default (23, or 30 for AV1)
+    QString title, author, copyright, comment; // Empty: omit container tags.
+    void appendMetadataSettings(QJsonObject &json) const;
     QString outputPath;
     QString videoCodec = "libx264";
     QString audioCodec = "aac";
@@ -53,11 +64,39 @@ struct ExportConfig {
     int maxFileSizeMB = 0;
     bool hdr10 = false;  // 10-bit BT.2020/PQ output when true (preserved for backward compat)
     int proresProfile = -1;  // -1 = not ProRes; 0..5 = Proxy/LT/SQ/HQ/4444/4444XQ
+    bool keepAlpha = false;
+    bool imageSequence = false;
+    QString sequenceFolder;
+    QString sequencePattern = "name_%06d.png";
+    int sequenceDigits = 6;
+    int sequenceStart = 0;
+    void appendSequenceSettings(QJsonObject &json) const;
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
+    bool autoLoudness = false;
+    double targetLufs = -14.0;
+    void appendLoudnessSettings(QJsonObject &json) const;
+    bool audioOnly = false;
+    static QString audioCodecForContainer(const QString &container);
 
     QString codecDisplayName() const;
 };
+
+namespace exportcfg {
+// Shared ExportConfig -> RenderJob::exportConfig mapping. Values that depend on
+// the live timeline or MainWindow are added by buildExportRenderJob.
+QJsonObject toJobJson(const ExportConfig &config);
+}
+
+namespace exportaudio {
+// ffmpeg codec/bitrate arguments for the AAC intermediate; kbps <= 0 falls back to 192.
+QStringList aacAudioArgs(int kbps);
+// selftest hooks: when set, a mix that ffmpeg wrote successfully is reported as failed, so
+// the failure cleanup runs on a real output file. The second records whether the output
+// existed at that moment (otherwise a "no leftover" check proves nothing).
+extern bool failAfterWriteForTest;
+extern bool outputExistedBeforeCleanupForTest;
+}
 
 class ExportDialog : public QDialog
 {
@@ -67,6 +106,8 @@ public:
     explicit ExportDialog(const ProjectConfig &project, QWidget *parent = nullptr);
 
     ExportConfig config() const { return m_config; }
+    // selftest: the config the dialog would accept right now (config() is set only on accept).
+    ExportConfig currentConfigForTest() const { return currentSettings(); }
     void setSourceIsHdr(bool hdr);
     void setMarkedRangeAvailable(bool hasRange);
 
@@ -89,8 +130,15 @@ private slots:
 
 private:
     void setupUI();
+    void ensureSequenceSettings();
+    void reloadUserPresets(const QString &selected = {});
+    void applyPreset(const ExportConfig &config, bool userPreset = true);
+    ExportConfig currentSettings() const;
     void updateSummary();
+    void updateAudioOnlyControls(bool exportTypeChanged = false);
+    void updateRateControlControls();
     void updateMarkedRangeCheckboxEnabled();
+    void updateLoudnessControlsEnabled();
     void regenerateChapters();
     QString defaultExtension() const;
 
@@ -98,14 +146,35 @@ private:
     ProjectConfig m_projectConfig;
     QVector<ClipInfo> m_clips;
 
+    QWidget *m_sequenceSettings = nullptr;
+    QComboBox *m_sequenceFormat = nullptr;
+    QLineEdit *m_sequencePattern = nullptr;
+    QSpinBox *m_sequenceDigits = nullptr;
+    QSpinBox *m_sequenceStart = nullptr;
+    QString m_videoOutputBeforeSequence; // video file path, restored when leaving sequence mode
+    QString m_sequenceOutputBeforeVideo; // sequence folder, restored when re-entering sequence mode
+    ExportType m_lastExportType = ExportType::Video;
+    QCheckBox *m_keepAlphaCheckbox = nullptr;
+    QCheckBox *m_audioOnlyCheckbox = nullptr;
+    QCheckBox *m_autoLoudness = nullptr;
+    QComboBox *m_loudnessPreset = nullptr;
+    QDoubleSpinBox *m_targetLufs = nullptr;
+    QComboBox *m_audioContainerCombo = nullptr;
     QComboBox *m_exportTypeCombo = nullptr;
     QComboBox *m_presetCombo;
     QComboBox *m_videoCodecCombo;
     QComboBox *m_audioCodecCombo;
     QComboBox *m_hwEncoderCombo;
+    QComboBox *m_subtitleModeCombo = nullptr;
+    QComboBox *m_rateControlCombo = nullptr;
+    QSpinBox *m_crfSpin = nullptr;
     QSpinBox *m_videoBitrateSpin;
     QSpinBox *m_audioBitrateSpin;
     QLineEdit *m_outputEdit;
+    QLineEdit *m_metadataTitle = nullptr;
+    QLineEdit *m_metadataAuthor = nullptr;
+    QLineEdit *m_metadataCopyright = nullptr;
+    QLineEdit *m_metadataComment = nullptr;
     QLabel *m_summaryLabel;
     QLabel *m_hdrWarningLabel = nullptr;
     QCheckBox *m_markedRangeCheckbox = nullptr;

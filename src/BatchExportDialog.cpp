@@ -45,9 +45,8 @@ bool chooseExportSettings(QWidget *parent, batchexport::ExportSettings *result)
     dialog.setWindowTitle(QObject::tr("Batch export settings"));
 
     auto *presetBox = new QComboBox(&dialog);
-    presetBox->addItems({QStringLiteral("1080p"),
-                         QStringLiteral("720p"),
-                         QStringLiteral("4K")});
+    presetBox->setObjectName(QStringLiteral("batchPreset"));
+    presetBox->addItems(batchexport::presetChoices());
 
     auto *codecEdit = new QLineEdit(&dialog);
     auto *videoCodecEdit = new QLineEdit(&dialog);

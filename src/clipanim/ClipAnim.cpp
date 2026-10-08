@@ -31,6 +31,10 @@ const QString kGradeContrastTrack = QStringLiteral("grade.contrast");
 const QString kGradeSaturationTrack = QStringLiteral("grade.saturation");
 const QString kGradeExposureTrack = QStringLiteral("grade.exposure");
 const QString kGradeTemperatureTrack = QStringLiteral("grade.temperature");
+const QString kGradeHueTrack = QStringLiteral("grade.hue");
+const QString kGradeGammaTrack = QStringLiteral("grade.gamma");
+const QString kGradeHighlightsTrack = QStringLiteral("grade.highlights");
+const QString kGradeShadowsTrack = QStringLiteral("grade.shadows");
 const QString kGradeLiftRTrack = QStringLiteral("grade.liftR");
 const QString kGradeLiftGTrack = QStringLiteral("grade.liftG");
 const QString kGradeLiftBTrack = QStringLiteral("grade.liftB");
@@ -343,7 +347,9 @@ bool evaluateSpatialSegment(const ClipInfo& clip,
     result.u = (pathSeconds - startTime) / (endTime - startTime);
     result.u = std::max(0.0, std::min(1.0, result.u));
     const KeyframePoint *easeKeyframe = xStart ? xStart : yStart;
-    result.u = easedProgress(result.u, easeKeyframe);
+    // Same rule as KeyframeTrack::valueAt: exactly on the end key, that key's
+    // point (a Hold segment holds p0 only over [start, end)).
+    result.u = pathSeconds >= endTime ? 1.0 : easedProgress(result.u, easeKeyframe);
     if (!std::isfinite(result.u))
         return false;
 
@@ -759,6 +765,14 @@ ColorCorrection effectiveColorCorrectionAt(const ClipInfo& clip,
                          clipLocalSeconds, cc.exposure);
     applyGradeTrackValue(clip, kGradeTemperatureTrack,
                          clipLocalSeconds, cc.temperature);
+    applyGradeTrackValue(clip, kGradeHueTrack,
+                         clipLocalSeconds, cc.hue);
+    applyGradeTrackValue(clip, kGradeGammaTrack,
+                         clipLocalSeconds, cc.gamma);
+    applyGradeTrackValue(clip, kGradeHighlightsTrack,
+                         clipLocalSeconds, cc.highlights);
+    applyGradeTrackValue(clip, kGradeShadowsTrack,
+                         clipLocalSeconds, cc.shadows);
 
     applyGradeTrackValue(clip, kGradeLiftRTrack,
                          clipLocalSeconds, cc.liftR);
