@@ -481,6 +481,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/clip_enable_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
     src/selftests/parent_gate_selftest.cpp
+    src/selftests/video_player_parent_selftest.cpp
     src/playback/AutoProxyPolicy.h
     src/playback/AutoProxyPolicy.cpp
     src/selftests/auto_proxy_policy_selftests.cpp

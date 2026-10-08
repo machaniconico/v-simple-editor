@@ -11,6 +11,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "AudioMixer.h"
+#include "ClipGeometry.h"  // US-910: clipgeom::ClipTransform in ParentAdmissionRecord
 #include "SpeedRampData.h"
 #include <QVector>
 #include <QHash>
@@ -331,6 +332,29 @@ public:
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
 
+    // US-910 PARENT-OBS test seam (video-player-parent selftest). While ON,
+    // each resolveDecodedLayerParentSources call in the two real layer
+    // admission paths ("cpu-composite" = refreshPreviewClipCpuComposite,
+    // "multi-track" = handlePlaybackTick compositor) appends one record per
+    // admitted layer. OFF (default) records nothing; turning it ON or OFF
+    // clears the records. Observation only: the composite is not changed.
+    struct ParentAdmissionRecord {
+        QString path;              // "cpu-composite" / "multi-track"
+        quint64 resolveSerial = 0; // groups the layers of one resolve call
+        qint64 timelineUs = 0;
+        QSize canvas;              // canvas the effective transforms use
+        int adaptiveCanvasDivisor = 1; // m_adaptiveCanvasDivisor at record time
+        int layerIndex = -1;       // index in the resolved layer vector
+        int sourceTrack = -1;
+        int sourceClipIndex = -1;
+        QString parentClipId;
+        int parentSourceIndex = -1;
+        clipgeom::ClipTransform localTransform;
+        clipgeom::ClipTransform effectiveTransform;
+    };
+    void setParentAdmissionObservationForTest(bool enabled);
+    QVector<ParentAdmissionRecord> parentAdmissionRecordsForTest() const;
+
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
     // composeFrameWithOverlays so the SSOT renderer's worker-thread export
@@ -567,6 +591,12 @@ public:
     };
 
 private:
+    void recordParentAdmissionForTest(const char *path,
+                                      const QVector<DecodedLayer> &layers,
+                                      QSize canvas);
+    bool m_parentAdmissionObservation = false;
+    quint64 m_parentAdmissionSerial = 0;
+    QVector<ParentAdmissionRecord> m_parentAdmissionRecords;
 
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
