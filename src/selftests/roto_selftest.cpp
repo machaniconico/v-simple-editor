@@ -359,8 +359,9 @@ bool writeTone(const QString &path)
 // V3 [20 @0 s, 21 @6 s], every clip 2 s. Dropping V2:1 on V3 at 3 s lands at
 // V3 index 1. Roto markers 1..5 sit on V2:0 / V2:1 / V2:2 / V3:0 / V3:1,
 // parents are V3:0 -> V2:2 and V2:1 -> V3:1, Timeline-side mattes sit on
-// V2:1 / V3:1. linked: V2:1 keeps linkGroup 12 and its audio partner is on A1.
-void seedCrossDrop(Timeline &tl, bool linked)
+// V2:1 / V3:1. linked: V2:1 keeps linkGroup 12 and its audio partner is on A1
+// (A2 with partnerOnA2, so a drop onto V3 creates exactly one track, A3).
+void seedCrossDrop(Timeline &tl, bool linked, bool partnerOnA2 = false)
 {
     auto at = [](int id, double leadInSec) {
         ClipInfo c = clip(id);
@@ -372,7 +373,8 @@ void seedCrossDrop(Timeline &tl, bool linked)
     const QVector<QVector<ClipInfo>> video{
         {clip(100)}, {at(10, 0.0), moved, at(12, 1.0)}, {at(20, 0.0), at(21, 4.0)}};
     QVector<QVector<ClipInfo>> audio{{}};
-    if (linked) audio[0].append(at(11, 3.0));
+    if (partnerOnA2) audio.append(QVector<ClipInfo>());
+    if (linked) audio[partnerOnA2 ? 1 : 0].append(at(11, 3.0));
     tl.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
     QHash<QString, RotoClipEntry> rotos;
     const QStringList rotoKeys{QStringLiteral("1:0"), QStringLiteral("1:1"),
@@ -453,7 +455,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 31;
+    constexpr int kRotoGateCount = 32;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -1848,11 +1850,11 @@ int runRotoSelftest()
                    "linked cross-track drop map differs or partner move changed roto / parent keys");
     }
 
-    // G24 Step 0: a cross-track drop pushes no undo entry (TimelineTrack::
-    // mouseMoveEvent returns after drag->exec without interactionCompleted;
-    // modified -> onTrackModified does not save). The gate prints the save
-    // point and checks that the next save captures the remapped keys: undo
-    // returns to the pre-drop keys and redo re-applies the map.
+    // G24 (US-1006): a cross-track drop pushes exactly one undo entry, taken at
+    // the end of TimelineTrack::dropEvent (interactionCompleted). The gate checks
+    // the undo description and saveSerial +1, then that undo returns to the
+    // pre-drop keys and redo re-applies the map. HEAD printed undoPoint=none and
+    // saveSerial 3->3 here (this gate then FAILs).
     {
         Timeline tl;
         seedCrossDrop(tl, false);
@@ -1862,8 +1864,9 @@ int runRotoSelftest()
         const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, tl.videoTracks()[2], 3.0,
                                              true, nullptr);
         const quint64 serialAfter = tl.undoManager()->saveSerial();
-        const bool undoPoint = serialAfter != serialBefore;
-        if (!undoPoint) tl.saveUndoState(QStringLiteral("cross-track drop (selftest save)"));
+        const QString undoPoint = tl.undoManager()->undoDescription();
+        const bool pointOk = serialAfter == serialBefore + 1
+            && undoPoint == QStringLiteral("クリップをトラック間移動");
         tl.undo();
         const QString rotoUndo = rotoLayout(tl.rotoEntries());
         const QString parentUndo = parentLayout(tl.clipParentEntries());
@@ -1871,14 +1874,13 @@ int runRotoSelftest()
         tl.redo();
         const bool redoMapped = crossMapped(tl, "G24 redo");
         const bool undoOk = rotoUndo == crossRotoBefore && parentUndo == crossParentBefore && v2Undo == 3;
-        std::cerr << "G24 undoPoint=" << (undoPoint ? tl.undoManager()->undoDescription().toStdString()
-                                                   : std::string("none"))
-                  << " saveSerial " << serialBefore << "->" << serialAfter
+        std::cerr << "G24 undoPoint=" << (undoPoint.isEmpty() ? std::string("none") : undoPoint.toStdString())
+                  << " saveSerial " << serialBefore << "->" << serialAfter << " (expected +1)"
                   << " accepted=" << accepted << " undo roto=" << rotoUndo.toStdString()
                   << " parent=" << parentUndo.toStdString() << " v2Clips=" << v2Undo
-                  << " undoOk=" << undoOk << '\n';
-        gates.gate(24, accepted && undoOk && redoMapped,
-                   "drop undo / redo did not restore and re-apply the roto / parent keys");
+                  << " pointOk=" << pointOk << " undoOk=" << undoOk << '\n';
+        gates.gate(24, accepted && pointOk && undoOk && redoMapped,
+                   "drop pushed no single undo point, or undo / redo did not restore and re-apply the roto / parent keys");
     }
 
     // G25 negative controls: (a) without the new signal connection the same drop
@@ -2393,5 +2395,162 @@ int runRotoSelftest()
         gates.gate(31, g31a && g31b,
                    "opaque layer clamped, or alpha media border not alpha 0 after grade / FX");
     }
+
+    // ── G32 (US-1006): one undo for a cross-track drop. (a) unlinked drop:
+    // undo returns the main clip to V2:1 with the pre-drop clip identities
+    // (ClipKeyId::sameAs) and roto / parent / matte keys, redo re-applies the
+    // map. (b) linked drop into V3 creates A2 / A3 for the partner (structural
+    // path): still exactly one save point, and undo restores the track counts,
+    // the clip identities and every carrier key. Detects HEAD's missing undo
+    // point (G32 FAILs: serial delta 0, undo does not return to pre-drop).
+    // Control: the pre-drop identity layout differs from the post-drop layout,
+    // so an undo that did nothing would FAIL the sameAs comparison.
+    {
+        auto identities = [](const Timeline &t) {
+            QVector<ClipKeyId> out;
+            for (TimelineTrack *tr : t.videoTracks())
+                for (const ClipInfo &c : tr->clips())
+                    out.append(ClipKeyId{c.filePath, c.linkGroup, c.inPoint});
+            for (TimelineTrack *tr : t.audioTracks())
+                for (const ClipInfo &c : tr->clips())
+                    out.append(ClipKeyId{c.filePath, c.linkGroup, c.inPoint});
+            return out;
+        };
+        auto sameIdentities = [](const QVector<ClipKeyId> &a, const QVector<ClipKeyId> &b) {
+            if (a.size() != b.size()) return false;
+            for (int i = 0; i < a.size(); ++i)
+                if (!a[i].sameAs(b[i])) return false;
+            return true;
+        };
+        auto trackLayout = [](const Timeline &t) {
+            QStringList out;
+            for (TimelineTrack *tr : t.videoTracks()) out.append(QStringLiteral("V%1").arg(tr->clipCount()));
+            for (TimelineTrack *tr : t.audioTracks()) out.append(QStringLiteral("A%1").arg(tr->clipCount()));
+            return out.join(QLatin1Char(','));
+        };
+        auto carriers = [](const Timeline &t) {
+            return rotoLayout(t.rotoEntries()) + QStringLiteral(" | ")
+                + parentLayout(t.clipParentEntries()) + QStringLiteral(" | ")
+                + show(keys(t.trackMatteEntries()));
+        };
+
+        Timeline a;
+        seedCrossDrop(a, false);
+        const QVector<ClipKeyId> idBeforeA = identities(a);
+        const QString carriersBeforeA = carriers(a);
+        a.undoManager()->clear();
+        a.undoManager()->saveState(a.currentState(), QStringLiteral("基準"));
+        const quint64 serialA0 = a.undoManager()->saveSerial();
+        const bool acceptedA = driveCrossDrop(a.videoTracks()[1], 1, a.videoTracks()[2], 3.0, true, nullptr);
+        const quint64 serialA1 = a.undoManager()->saveSerial();
+        const QVector<ClipKeyId> idDroppedA = identities(a);
+        const bool differsA = !sameIdentities(idBeforeA, idDroppedA);
+        const bool undone = a.undoManager()->canUndo();
+        a.undo();
+        std::cerr << "G32a undo carriers=" << carriers(a).toStdString() << " (expected "
+                  << carriersBeforeA.toStdString() << ")\n";
+        const int v2ClipsAfterUndo = a.videoTracks()[1]->clipCount();
+        const QString v2At1NameAfterUndo = v2ClipsAfterUndo > 1
+            ? a.videoTracks()[1]->clips()[1].displayName : QString();
+        const bool identitiesBackA = sameIdentities(idBeforeA, identities(a));
+        const bool backA = v2ClipsAfterUndo == 3
+            && v2At1NameAfterUndo == QStringLiteral("11")
+            && identitiesBackA
+            && rotoLayout(a.rotoEntries()) == crossRotoBefore
+            && parentLayout(a.clipParentEntries()) == crossParentBefore
+            && carriers(a) == carriersBeforeA;
+        a.redo();
+        const bool redoA = crossMapped(a, "G32a redo");
+        std::cerr << "G32a accepted=" << acceptedA << " saveSerial " << serialA0 << "->" << serialA1
+                  << " canUndo=" << undone << " identitiesDiffer=" << differsA
+                  << " v2ClipsAfterUndo=" << v2ClipsAfterUndo << " (expected 3) v2At1NameAfterUndo="
+                  << v2At1NameAfterUndo.toStdString() << " (expected 11) identitiesBack=" << identitiesBackA
+                  << " backAtV2:1=" << backA << " carriersBefore=" << carriersBeforeA.toStdString()
+                  << " redoMapped=" << redoA << '\n';
+        const bool gateA = acceptedA && serialA1 == serialA0 + 1 && differsA && backA && redoA;
+
+        // AC2(b) reads the V3 of "V2 -> nonexistent V3" as "V3 exists, its paired A3
+        // does not": dropEvent needs an existing destination TimelineTrack, so
+        // nothing in the same drop creates V3. The partner starts on A2 and the
+        // drop creates exactly A3. An external-state hook pair mirrors
+        // MainWindow::collectExternalTrackState (live Timeline mattes), and a matte
+        // added after the baseline save (no undo entry) must survive the undo.
+        Timeline b;
+        seedCrossDrop(b, true, true);
+        b.setExternalTrackStateHooks(
+            [&b]() {
+                QJsonArray mattes;
+                const auto entries = b.trackMatteEntries();
+                for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+                    mattes.append(QJsonObject{{"clipId", it.key()},
+                        {"source", it.value().matteSourceClipId}, {"type", int(it.value().matteType)}});
+                return QJsonObject{{"mattes", mattes}};
+            },
+            [&b](const QJsonObject &state) {
+                QHash<QString, TimelineTrackMatteEntry> parsed;
+                for (const auto &value : state.value("mattes").toArray()) {
+                    const auto obj = value.toObject();
+                    TimelineTrackMatteEntry e;
+                    e.matteSourceClipId = obj.value("source").toString();
+                    e.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
+                    parsed.insert(obj.value("clipId").toString(), e);
+                }
+                b.setTrackMatteEntries(parsed);
+            });
+        const QVector<ClipKeyId> idBeforeB = identities(b);
+        const QString layoutBeforeB = trackLayout(b);
+        const int audioTracksBeforeB = b.audioTracks().size();
+        b.undoManager()->clear();
+        b.undoManager()->saveState(b.currentState(), QStringLiteral("基準"));
+        {
+            auto withMatte = b.trackMatteEntries();
+            TimelineTrackMatteEntry late;
+            late.matteType = TrackMatteType::AlphaMatte;
+            late.matteSourceClipId = QStringLiteral("0:0");
+            withMatte.insert(QStringLiteral("1:2"), late);
+            b.setTrackMatteEntries(withMatte);
+        }
+        const QString carriersBeforeB = carriers(b);
+        const bool lateMatteSet = b.trackMatteEntries().contains(QStringLiteral("1:2"));
+        auto partnerOn = [&b](int track) {
+            if (track < 0 || track >= b.audioTracks().size()) return false;
+            for (const ClipInfo &c : b.audioTracks()[track]->clips())
+                if (c.linkGroup == clip(11).linkGroup) return true;
+            return false;
+        };
+        const bool partnerStartA2 = partnerOn(1);
+        const quint64 serialB0 = b.undoManager()->saveSerial();
+        const bool acceptedB = driveCrossDrop(b.videoTracks()[1], 1, b.videoTracks()[2], 3.0, true, nullptr);
+        const quint64 serialB1 = b.undoManager()->saveSerial();
+        const int audioTracksAfterB = b.audioTracks().size();
+        const QString layoutAfterB = trackLayout(b);
+        const bool partnerA3After = partnerOn(2);
+        const bool partnerA2After = partnerOn(1);
+        b.undo();
+        const bool partnerBackA2 = partnerOn(1) && !partnerOn(2);
+        const bool lateMatteBack = b.trackMatteEntries().contains(QStringLiteral("1:2"));
+        const bool identitiesBackB = sameIdentities(idBeforeB, identities(b));
+        const bool backB = b.audioTracks().size() == audioTracksBeforeB
+            && trackLayout(b) == layoutBeforeB
+            && identitiesBackB
+            && carriers(b) == carriersBeforeB
+            && lateMatteBack && partnerBackA2;
+        std::cerr << "G32b accepted=" << acceptedB << " saveSerial " << serialB0 << "->" << serialB1
+                  << " (expected +1) audioTracks " << audioTracksBeforeB << "->" << audioTracksAfterB
+                  << " (expected 2->3) partnerStartA2=" << partnerStartA2
+                  << " partnerOnA3AfterDrop=" << partnerA3After << " partnerOnA2AfterDrop=" << partnerA2After
+                  << " (expected 1/0) layout " << layoutBeforeB.toStdString() << " -> "
+                  << layoutAfterB.toStdString() << " undo: tracks=" << trackLayout(b).toStdString()
+                  << " audioTracks=" << b.audioTracks().size() << " partnerBackOnA2=" << partnerBackA2
+                  << " identitiesBack=" << identitiesBackB
+                  << " lateMatte1:2SetBefore=" << lateMatteSet << " lateMatte1:2AfterUndo=" << lateMatteBack
+                  << " carriers=" << carriers(b).toStdString()
+                  << " (expected " << carriersBeforeB.toStdString() << ") backB=" << backB << '\n';
+        const bool gateB = acceptedB && serialB1 == serialB0 + 1 && partnerStartA2 && lateMatteSet
+            && audioTracksAfterB == 3 && partnerA3After && !partnerA2After && backB;
+        gates.gate(32, gateA && gateB,
+                   "cross-track drop not undone in one step (unlinked, or linked with track creation)");
+    }
+
     return gates.finish("roto");
 }

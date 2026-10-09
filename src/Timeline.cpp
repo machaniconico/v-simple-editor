@@ -3608,6 +3608,10 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     // source never perturbs this track's indices, but doing it first also
     // matches the "move, not copy" semantics if src == this ever slips
     // through in the future).
+    // A linked drop may create partner tracks through addAudioTrack(false) /
+    // addVideoTrack(false), which skip the external-state capture; take it before
+    // the carrier remap so the undo snapshot keeps the live matte keys.
+    if (clipData.linkGroup > 0 && m_timeline) m_timeline->captureExternalTrackStateForCompoundEdit();
     src->removeClipPreservingDownstream(srcIdx);
     insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
 
@@ -3622,6 +3626,11 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     if (clipData.linkGroup > 0) {
         emit crossTrackDropped(plan.insertIdx, clipData.linkGroup, dropTime);
     }
+
+    // One drop = one undo point, taken after the partner move, track creation
+    // and carrier remaps above (drag->exec in mouseMoveEvent returns without
+    // an interactionCompleted of its own).
+    emit interactionCompleted(QStringLiteral("クリップをトラック間移動"));
 }
 
 // --- Timeline ---
