@@ -25,8 +25,10 @@
 
 namespace {
 
-constexpr int kFixtureCount = 6;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f"};
+constexpr int kFixtureCount = 7;
+// Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
+constexpr int kLegacyWrongSlot = 100;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g"};
 
 quint16 readLe16(const char *p)
 {
@@ -98,10 +100,29 @@ double rms(const QByteArray &pcm)
     return std::sqrt(squares / double(samples));
 }
 
-ClipInfo humClip(double in, double out)
+// Writes a 48 kHz mono PCM16 sine WAV (G8 in-band source: e2e_hum.wav is a pure
+// 50 Hz sine and carries no 1 kHz energy).
+bool writeToneWav(const QString &path, double freqHz, double amplitude, double seconds)
+{
+    constexpr int rate = 48000;
+    const quint32 frames = quint32(seconds * rate);
+    const quint32 dataBytes = frames * 2;
+    QByteArray wav;
+    const auto put32 = [&](quint32 v) { for (int i = 0; i < 4; ++i) wav.append(char((v >> (8 * i)) & 0xff)); };
+    const auto put16 = [&](quint16 v) { for (int i = 0; i < 2; ++i) wav.append(char((v >> (8 * i)) & 0xff)); };
+    wav.append("RIFF", 4); put32(36 + dataBytes); wav.append("WAVEfmt ", 8);
+    put32(16); put16(1); put16(1); put32(rate); put32(rate * 2); put16(2); put16(16);
+    wav.append("data", 4); put32(dataBytes);
+    for (quint32 i = 0; i < frames; ++i)
+        put16(quint16(qint16(std::lround(amplitude * 32767.0 * std::sin(2.0 * M_PI * freqHz * i / rate)))));
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(wav) == wav.size();
+}
+
+ClipInfo humClip(double in, double out, const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
 {
     ClipInfo clip;
-    clip.filePath = QStringLiteral("test_assets/e2e_hum.wav");
+    clip.filePath = source;
     clip.displayName = QStringLiteral("audio-fixture");
     clip.duration = 5.0;
     clip.inPoint = in;
@@ -111,6 +132,7 @@ ClipInfo humClip(double in, double out)
 
 // Variant e: 200 Hz low shelf -12 dB (50 Hz sits inside the shelf).
 // Variant f: 1 kHz peaking -12 dB (50 Hz is outside the band: frequency control).
+// Variant g: the same 1 kHz peaking -12 dB through the legacy 3-band AudioEQConfig.
 trackfx::Chain eqVariantChain(int variant)
 {
     trackfx::Chain chain;
@@ -118,6 +140,17 @@ trackfx::Chain eqVariantChain(int variant)
     if (variant == 4) chain.eq.low = trackfx::EqBand{200.0, -12.0, 0.7};
     if (variant == 5) chain.eq.lowMid = trackfx::EqBand{1000.0, -12.0, 1.0};
     return chain;
+}
+
+// Legacy EQ band slots are fixed: 0 = low shelf, 1 = peaking, 2 = high shelf
+// (AudioMixer::setTrackEqConfig). A peaking band therefore lives in slot 1.
+// peakingSlot = 0 builds the wrong-filter negative control (low shelf at 1 kHz).
+AudioEQConfig legacyEqConfig(int peakingSlot)
+{
+    AudioEQConfig cfg;
+    cfg.bands.resize(peakingSlot + 1);
+    cfg.bands[peakingSlot] = EQBand{1000.0, -12.0, 1.0};
+    return cfg;
 }
 
 // RMS over the steady window [0.1 s, 0.4 s) of interleaved PCM16.
@@ -157,13 +190,14 @@ double expectedRatio(int variant, int channels, int sampleRate)
 }
 
 bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
-              int *channels = nullptr, int *sampleRate = nullptr)
+              int *channels = nullptr, int *sampleRate = nullptr,
+              const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
 {
     AudioMixer mixer;
     Timeline timeline;
     timeline.setAudioMixer(&mixer);
-    ClipInfo first = humClip(0.0, 2.0);
-    ClipInfo second = humClip(0.5, 2.5);
+    ClipInfo first = humClip(0.0, 2.0, source);
+    ClipInfo second = humClip(0.5, 2.5, source);
     first.trailOut.type = TransitionType::FadeOut;
     first.trailOut.duration = 0.3;
     timeline.audioTracks().first()->setClips({first, second});
@@ -176,6 +210,10 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
     }
     if (variant == 4 || variant == 5)
         mixer.setTrackChain(0, eqVariantChain(variant));
+    if (variant == 6 || variant == kLegacyWrongSlot) {
+        mixer.setTrackEqEnabled(0, true);
+        mixer.setTrackEqConfig(0, legacyEqConfig(variant == 6 ? 1 : 0));
+    }
     double audioDuration = 0.0;
     for (const TimelineTrack *track : timeline.audioTracks()) {
         double trackDuration = 0.0;
@@ -184,7 +222,8 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
         audioDuration = qMax(audioDuration, trackDuration);
     }
     const double durationSeconds = qMax(timeline.totalDuration(), audioDuration);
-    std::fprintf(stderr, "G1 %s timelineDurationSec=%.12g\n", kNames[variant], durationSeconds);
+    std::fprintf(stderr, "G1 %s timelineDurationSec=%.12g\n",
+                 variant < kFixtureCount ? kNames[variant] : "control", durationSeconds);
     // This wrapper calls MainWindow.cpp's prepareTimelineAudioMixForExport
     // with the same forced WAV arguments.
     const QString written = renderinplace::prepareAudioMix(&timeline, path, durationSeconds, error);
@@ -203,6 +242,31 @@ qsizetype differentBytes(const QByteArray &a, const QByteArray &b)
     return count;
 }
 
+struct PcmComparison {
+    bool identical = false;
+    int maxDiffLsb = 0;
+    qsizetype firstDiffSample = -1; // interleaved PCM16 sample index, -1 when none
+};
+
+// Byte-level comparison of two PCM16 payloads. A length mismatch counts as a
+// difference at the first sample past the shorter payload.
+PcmComparison comparePcm16(const QByteArray &a, const QByteArray &b)
+{
+    PcmComparison result;
+    const qsizetype common = qMin(a.size(), b.size()) / 2;
+    for (qsizetype i = 0; i < common; ++i) {
+        const auto sample = [](const QByteArray &pcm, qsizetype index) {
+            return qint16(readLe16(pcm.constData() + 2 * index));
+        };
+        const int diff = std::abs(int(sample(a, i)) - int(sample(b, i)));
+        if (diff != 0 && result.firstDiffSample < 0) result.firstDiffSample = i;
+        result.maxDiffLsb = qMax(result.maxDiffLsb, diff);
+    }
+    if (a.size() != b.size() && result.firstDiffSample < 0) result.firstDiffSample = common;
+    result.identical = a == b;
+    return result;
+}
+
 } // namespace
 
 int runAudioFixtureSelftest()
@@ -213,7 +277,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 7; ++gate)
+        for (int gate = 1; gate <= 9; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -221,13 +285,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 9; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 9; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -247,12 +311,13 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 9; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
     QByteArray pcm[kFixtureCount];
     bool generated[kFixtureCount] = {};
+    bool repeatEqual[kFixtureCount] = {};
     int channels[kFixtureCount] = {};
     int sampleRates[kFixtureCount] = {};
     QJsonObject manifest;
@@ -281,7 +346,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "six PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "seven PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -295,7 +360,8 @@ int runAudioFixtureSelftest()
                      kNames[i], static_cast<long long>(pcm[i].size()),
                      static_cast<long long>(second.size()), static_cast<long long>(difference),
                      error.toUtf8().constData());
-        repeated &= generated[i] && ok && difference == 0;
+        repeatEqual[i] = generated[i] && ok && difference == 0;
+        repeated &= repeatEqual[i];
     }
     tally.gate(2, repeated, "two generations must have identical PCM data");
 
@@ -347,5 +413,101 @@ int runAudioFixtureSelftest()
              "200 Hz low shelf -12 dB must attenuate 50 Hz (catches low-band coefficient regressions)");
     bandGate(7, 5, 0.01, 0.97, 10.0,
              "1 kHz peaking -12 dB must leave 50 Hz unchanged (catches out-of-band EQ leakage)");
+
+    // G8: variant g (legacy 3-band EQ, 1 kHz peaking -12 dB) is deterministic and
+    // attenuates like variant f. The 50 Hz hum only shows out-of-band
+    // pass-through, so the in-band ratio is measured on a 1 kHz tone (0.125 FS):
+    // fTone = f/a, gTone = g/a must both sit in the -12 dB sanity band and agree
+    // within 1%. Detects: variant g missing (HEAD), legacy EQ not applied to the
+    // export, wrong filter slot, wrong legacy center frequency/gain/sample rate.
+    // Negative controls: the low-shelf slot (50 Hz and 1 kHz tone) must fall
+    // outside the 1% band, and g must differ from a.
+    {
+        const QString tonePath = QDir(repeat.path()).filePath(QStringLiteral("tone_1k.wav"));
+        const bool toneWritten = repeat.isValid() && writeToneWav(tonePath, 1000.0, 0.125, 5.0);
+        QByteArray toneA, toneF, toneG, toneWrong;
+        QString toneError;
+        int tc[4] = {}, tr[4] = {};
+        const bool toneOk = toneWritten
+            && generate(0, QDir(repeat.path()).filePath(QStringLiteral("tone_a.wav")), &toneA, &toneError, &tc[0], &tr[0], tonePath)
+            && generate(5, QDir(repeat.path()).filePath(QStringLiteral("tone_f.wav")), &toneF, &toneError, &tc[1], &tr[1], tonePath)
+            && generate(6, QDir(repeat.path()).filePath(QStringLiteral("tone_g.wav")), &toneG, &toneError, &tc[2], &tr[2], tonePath)
+            && generate(kLegacyWrongSlot, QDir(repeat.path()).filePath(QStringLiteral("tone_w.wav")), &toneWrong, &toneError, &tc[3], &tr[3], tonePath);
+        const double aTone = toneOk ? windowRms(toneA, tc[0], tr[0]) : 0.0;
+        const double fTone = aTone > 0.0 ? windowRms(toneF, tc[1], tr[1]) / aTone : 0.0;
+        const double gTone = aTone > 0.0 ? windowRms(toneG, tc[2], tr[2]) / aTone : 0.0;
+        const double wTone = aTone > 0.0 ? windowRms(toneWrong, tc[3], tr[3]) / aTone : 0.0;
+        const double toneRelError = fTone > 0.0 ? std::abs(gTone / fTone - 1.0)
+                                                : std::numeric_limits<double>::infinity();
+        const double wToneError = fTone > 0.0 ? std::abs(wTone / fTone - 1.0)
+                                              : std::numeric_limits<double>::infinity();
+        const bool toneSane = fTone >= 0.22 && fTone <= 0.29;
+        const bool toneControlRejected = toneOk && wToneError > 0.01;
+        std::fprintf(stderr, "G8 tone1k ok=%d aTone=%.12g fTone=%.12g gTone=%.12g relativeError=%.12g "
+                             "sane=%d sanity=[0.22,0.29] lowShelfSlotTone=%.12g toneControlRelErr=%.12g "
+                             "toneControlRejected=%d err=%s\n",
+                     toneOk, aTone, fTone, gTone, toneRelError, toneSane, wTone, wToneError,
+                     toneControlRejected, toneError.toUtf8().constData());
+
+        const double aWin = windowRms(pcm[0], channels[0], sampleRates[0]);
+        const double gWin = windowRms(pcm[6], channels[6], sampleRates[6]);
+        const double fWin = windowRms(pcm[5], channels[5], sampleRates[5]);
+        const double gRatio = aWin > 0.0 ? gWin / aWin : 0.0;
+        const double fRatio = aWin > 0.0 ? fWin / aWin : 0.0;
+        const double expected = expectedRatio(5, channels[5], sampleRates[5]);
+        const double error = expected > 0.0 ? std::abs(gRatio / expected - 1.0)
+                                            : std::numeric_limits<double>::infinity();
+        const bool sane = expected >= 0.97 && expected <= 10.0;
+        const qsizetype gVsA = differentBytes(pcm[6], pcm[0]);
+        QByteArray wrongPcm;
+        QString wrongError;
+        int wrongChannels = 0, wrongRate = 0;
+        const bool wrongOk = generate(kLegacyWrongSlot,
+            QDir(repeat.path()).filePath(QStringLiteral("g_wrong_slot.wav")), &wrongPcm,
+            &wrongError, &wrongChannels, &wrongRate);
+        const double wrongWin = windowRms(wrongPcm, wrongChannels, wrongRate);
+        const double wrongRatio = aWin > 0.0 ? wrongWin / aWin : 0.0;
+        const double wrongError2 = expected > 0.0 ? std::abs(wrongRatio / expected - 1.0)
+                                                  : std::numeric_limits<double>::infinity();
+        const bool controlRejected = wrongOk && wrongError2 > 0.01;
+        std::fprintf(stderr, "G8 g measuredRatio=%.12g fMeasuredRatio=%.12g expectedRatio=%.12g "
+                             "relativeError=%.12g sane=%d repeatEqual=%d diffBytesVsA=%lld\n",
+                     gRatio, fRatio, expected, error, sane, repeatEqual[6], static_cast<long long>(gVsA));
+        std::fprintf(stderr, "G8 control lowShelfSlot ratio=%.12g relativeError=%.12g rejected=%d error=%s\n",
+                     wrongRatio, wrongError2, controlRejected, wrongError.toUtf8().constData());
+        QFile firstWavFile(out.filePath(QStringLiteral("g.wav")));
+        QFile repeatWavFile(QDir(repeat.path()).filePath(QStringLiteral("g.wav")));
+        const bool wavRead = repeat.isValid() && firstWavFile.open(QIODevice::ReadOnly)
+            && repeatWavFile.open(QIODevice::ReadOnly);
+        const QByteArray firstWav = wavRead ? firstWavFile.readAll() : QByteArray();
+        const QByteArray repeatWav = wavRead ? repeatWavFile.readAll() : QByteArray();
+        const bool wavRepeatEqual = wavRead && !firstWav.isEmpty() && !repeatWav.isEmpty()
+            && firstWav == repeatWav;
+        std::fprintf(stderr, "G8 wavBytes=%lld repeatWavBytes=%lld wavDiffBytes=%lld wavRepeatEqual=%d\n",
+                     static_cast<long long>(firstWav.size()), static_cast<long long>(repeatWav.size()),
+                     static_cast<long long>(differentBytes(firstWav, repeatWav)), wavRepeatEqual);
+        tally.gate(8, generated[0] && generated[5] && generated[6] && repeatEqual[6] && wavRepeatEqual
+                       && sane && error <= 0.01 && gVsA > 0 && controlRejected
+                       && toneOk && toneSane && toneRelError <= 0.01 && toneControlRejected,
+                   "legacy 3-band 1 kHz peaking -12 dB (variant g) must be deterministic, pass 50 Hz like f and match f's 1 kHz tone ratio (catches wrong legacy center frequency/gain)");
+    }
+
+    // G9: record whether the legacy-EQ export (g) is byte-identical to the 4-band
+    // export (f). PASS means the comparison ran and produced values; identical=0
+    // is a legitimate result (US-1020 branches on it). Control: the comparator must
+    // report a difference for a vs b and identity for g vs g.
+    {
+        const PcmComparison gf = comparePcm16(pcm[6], pcm[5]);
+        const PcmComparison control = comparePcm16(pcm[0], pcm[1]);
+        const PcmComparison self = comparePcm16(pcm[6], pcm[6]);
+        std::fprintf(stderr, "G9 identical=%d maxDiffLsb=%d firstDiffSample=%lld\n",
+                     gf.identical, gf.maxDiffLsb, static_cast<long long>(gf.firstDiffSample));
+        std::fprintf(stderr, "G9 gBytes=%lld fBytes=%lld control(a,b) identical=%d maxDiffLsb=%d self(g,g) identical=%d\n",
+                     static_cast<long long>(pcm[6].size()), static_cast<long long>(pcm[5].size()),
+                     control.identical, control.maxDiffLsb, self.identical);
+        tally.gate(9, generated[5] && generated[6] && !pcm[5].isEmpty() && !pcm[6].isEmpty()
+                       && !control.identical && control.maxDiffLsb > 0 && self.identical,
+                   "g vs f PCM byte comparison must run and report values (control: a vs b differs)");
+    }
     return tally.finish();
 }
