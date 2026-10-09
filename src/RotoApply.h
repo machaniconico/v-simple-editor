@@ -4,6 +4,8 @@
 #include <QImage>
 #include <QtGlobal>
 
+enum class VideoEffectType;
+
 // Pure roto application shared by the special-composite preview
 // (MainWindow::buildSpecialClipComposite). Mask polarity: Rotoscope paints the
 // path interior 255 and applyToFrame multiplies every premultiplied channel by
@@ -51,5 +53,22 @@ double clipEffectiveSourceFps(double probedFps, double fallbackFps);
 
 // Test counter: number of sourceFrameIndexFor calls in this process.
 quint64 sourceFrameIndexForCallCount();
+
+// True when the image has an alpha channel and at least one pixel with
+// alpha < 255.
+bool hasTranslucentPixel(const QImage &image);
+
+// Alpha keep-out for the renderer's grade stage and per-effect FX pack (US-1004):
+// when input has a pixel with alpha < 255 and output has input's size, returns
+// output as Format_RGBA8888 with out.a = min(out.a, in.a) (RGB untouched);
+// otherwise returns output unchanged. Counted per clamping call.
+QImage clampAlphaToInput(const QImage &input, QImage output);
+
+// Test counter: number of clampAlphaToInput calls that clamped.
+quint64 clampAlphaCallCountForTest();
+
+// Effects that move pixels (geometric / temporal); their output alpha is not
+// clamped to their input.
+bool effectMovesPixels(VideoEffectType type);
 
 } // namespace roto

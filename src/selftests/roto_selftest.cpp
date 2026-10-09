@@ -453,7 +453,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 28;
+    constexpr int kRotoGateCount = 31;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -2171,6 +2171,227 @@ int runRotoSelftest()
             std::cerr << "G28 G21=" << (g21Passed ? "PASS" : "FAIL") << " forward=" << forward << '\n';
             gates.gate(28, g21Passed && forward, "forward bake control: G21 failed or the forward bake moved");
         }
+    }
+    // ── G29-G31 (US-1004): roto / alpha media keep their alpha through the
+    // grade stage (gradeClipNativeFrame) and the non-geometric FX pack
+    // (applyClipFxPack). Fixture: V1 hidden, V2 = the blue synthetic clip with
+    // saturation +50 and Vignette (or ChromaKey), roto hardRect on V2.
+    {
+        ColorCorrection saturated;
+        saturated.saturation = 50.0;
+        VideoEffect vignette;
+        vignette.type = VideoEffectType::Vignette;
+        vignette.param1 = 0.6;
+        vignette.param2 = 0.5;
+        const auto gradedClip = [&](int id, const QVector<VideoEffect> &effects) {
+            ClipInfo c = clip(id);
+            c.colorCorrection = saturated;
+            c.effects = effects;
+            return c;
+        };
+        const auto seedV2 = [&](Timeline *tl, const ClipInfo &v2, bool withRoto) {
+            tl->restoreFromProject(QVector<QVector<ClipInfo>>{{clip(290)}, {v2}},
+                                   QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            tl->videoTracks()[0]->setHidden(true);
+            tl->setRotoEntries(withRoto ? rotoAt(QStringLiteral("1:0"), hardRect)
+                                        : QHash<QString, RotoClipEntry>{});
+        };
+        const auto pixelText = [](const QImage &image, int x, int y) {
+            if (image.isNull()) return std::string("null");
+            const QRgb p = image.pixel(x, y);
+            return std::to_string(qRed(p)) + ',' + std::to_string(qGreen(p)) + ','
+                + std::to_string(qBlue(p)) + ',' + std::to_string(qAlpha(p));
+        };
+        // {min, max} alpha over the region ({256, -1} for a null image).
+        const auto alphaRange = [](const QImage &image, auto region) {
+            std::pair<int, int> range{256, -1};
+            if (image.isNull()) return range;
+            for (int y = 0; y < image.height(); ++y)
+                for (int x = 0; x < image.width(); ++x) {
+                    if (!region(x, y)) continue;
+                    const int a = qAlpha(image.pixel(x, y));
+                    range.first = qMin(range.first, a);
+                    range.second = qMax(range.second, a);
+                }
+            return range;
+        };
+
+        // G29 detects a grade / FX stage that refills the roto exterior (HEAD:
+        // the RGB888 stages return alpha 255 outside the mask). Inside must
+        // equal the same grade / FX without roto, and the grade must have run
+        // (differs from the ungraded clip). Sub-case roto + saturation +
+        // ChromaKey (soft key ~40 away from the graded colour): exterior alpha 0,
+        // interior = the key result (partial alpha) of the no-roto render.
+        Timeline g29Tl;
+        seedV2(&g29Tl, clip(292), false);
+        const QImage g29Raw = renderAt(&g29Tl, 0.5);
+        const ClipInfo fxClip = gradedClip(291, {vignette});
+        seedV2(&g29Tl, fxClip, false);
+        const QImage g29Plain = renderAt(&g29Tl, 0.5);
+        seedV2(&g29Tl, fxClip, true);
+        const quint64 g29ClampBefore = roto::clampAlphaCallCountForTest();
+        const QImage g29Roto = renderAt(&g29Tl, 0.5);
+        const quint64 g29Clamps = roto::clampAlphaCallCountForTest() - g29ClampBefore;
+        const RegionDiff g29Inside = regionDiff(g29Plain, g29Roto, insideRect);
+        const RegionDiff g29Graded = regionDiff(g29Raw, g29Plain, insideRect);
+        const auto g29Outside = alphaRange(g29Roto, outsideRect);
+        const auto g29PlainAlpha = alphaRange(g29Plain, everyPixel);
+        std::cerr << "G29 saturation+vignette inside(32,32) roto=" << pixelText(g29Roto, 32, 32)
+                  << " noRoto=" << pixelText(g29Plain, 32, 32) << " raw=" << pixelText(g29Raw, 32, 32)
+                  << " outside(4,4) roto=" << pixelText(g29Roto, 4, 4)
+                  << " noRoto=" << pixelText(g29Plain, 4, 4)
+                  << " outsideAlpha=" << g29Outside.first << ".." << g29Outside.second << " (== 0)"
+                  << " noRotoAlpha=" << g29PlainAlpha.first << ".." << g29PlainAlpha.second
+                  << " inside vs noRoto " << showDiff(g29Inside) << " (<= 2)"
+                  << " graded vs raw " << showDiff(g29Graded) << " (> 2)"
+                  << " clampAlphaCallCountForTest=" << g29Clamps << " (> 0)\n";
+        const bool g29Main = g29Outside.second == 0 && g29Inside.pixels > 0 && g29Inside.maxDiff <= 2
+            && g29Graded.maxDiff > 2 && g29PlainAlpha.first == 255 && g29Clamps > 0;
+
+        const QImage ccOnly = [&] {
+            seedV2(&g29Tl, gradedClip(294, {}), false);
+            return renderAt(&g29Tl, 0.5);
+        }();
+        const QRgb graded = ccOnly.isNull() ? 0 : ccOnly.pixel(32, 32);
+        VideoEffect chromaKey;
+        chromaKey.type = VideoEffectType::ChromaKey;
+        chromaKey.keyColor = QColor(qRed(graded), qBound(0, qGreen(graded) + 40, 255), qBlue(graded));
+        chromaKey.param1 = 10.0;
+        chromaKey.param2 = 60.0;
+        const ClipInfo keyClip = gradedClip(293, {chromaKey});
+        seedV2(&g29Tl, keyClip, false);
+        const QImage keyPlain = renderAt(&g29Tl, 0.5);
+        seedV2(&g29Tl, keyClip, true);
+        const quint64 keyClampBefore = roto::clampAlphaCallCountForTest();
+        const QImage keyRoto = renderAt(&g29Tl, 0.5);
+        const quint64 keyClamps = roto::clampAlphaCallCountForTest() - keyClampBefore;
+        const RegionDiff keyInside = regionDiff(keyPlain, keyRoto, insideRect);
+        const auto keyOutside = alphaRange(keyRoto, outsideRect);
+        const auto keyInsideAlpha = alphaRange(keyRoto, insideRect);
+        std::cerr << "G29 saturation+chromaKey key=" << chromaKey.keyColor.red() << ','
+                  << chromaKey.keyColor.green() << ',' << chromaKey.keyColor.blue()
+                  << " inside(32,32) roto=" << pixelText(keyRoto, 32, 32)
+                  << " noRoto=" << pixelText(keyPlain, 32, 32)
+                  << " outside(4,4) roto=" << pixelText(keyRoto, 4, 4)
+                  << " noRoto=" << pixelText(keyPlain, 4, 4)
+                  << " outsideAlpha=" << keyOutside.first << ".." << keyOutside.second << " (== 0)"
+                  << " insideAlpha=" << keyInsideAlpha.first << ".." << keyInsideAlpha.second
+                  << " (partial key, within 40..215)"
+                  << " inside vs noRoto " << showDiff(keyInside) << " (<= 2)"
+                  << " clampAlphaCallCountForTest=" << keyClamps << " (> 0)\n";
+        const bool g29Key = keyOutside.second == 0 && keyInside.pixels > 0 && keyInside.maxDiff <= 2
+            && keyInsideAlpha.first >= 40 && keyInsideAlpha.second <= 215 && keyClamps > 0;
+
+        // Sub-case roto + saturation + Vignette + a DISABLED Flip: the disabled
+        // pixel-moving effect does not run (applyEffect returns its input), so
+        // it must not restart the carried alpha from the opaque Vignette output.
+        VideoEffect disabledFlip;
+        disabledFlip.type = VideoEffectType::Flip;
+        disabledFlip.enabled = false;
+        const ClipInfo flipClip = gradedClip(295, {vignette, disabledFlip});
+        seedV2(&g29Tl, flipClip, false);
+        const QImage flipPlain = renderAt(&g29Tl, 0.5);
+        seedV2(&g29Tl, flipClip, true);
+        const QImage flipRoto = renderAt(&g29Tl, 0.5);
+        const RegionDiff flipInside = regionDiff(flipPlain, flipRoto, insideRect);
+        const auto flipOutside = alphaRange(flipRoto, outsideRect);
+        std::cerr << "G29 saturation+vignette+disabledFlip inside(32,32) roto=" << pixelText(flipRoto, 32, 32)
+                  << " noRoto=" << pixelText(flipPlain, 32, 32)
+                  << " outside(4,4) roto=" << pixelText(flipRoto, 4, 4)
+                  << " noRoto=" << pixelText(flipPlain, 4, 4)
+                  << " outsideAlpha=" << flipOutside.first << ".." << flipOutside.second << " (== 0)"
+                  << " inside vs noRoto " << showDiff(flipInside) << " (<= 2)\n";
+        const bool g29DisabledFlip = flipOutside.second == 0 && flipInside.pixels > 0 && flipInside.maxDiff <= 2;
+        std::cerr << "G29 main=" << g29Main << " key=" << g29Key << " disabledFlip=" << g29DisabledFlip << '\n';
+        gates.gate(29, g29Main && g29Key && g29DisabledFlip,
+                   "roto exterior not alpha 0 after grade / non-geometric FX, or interior differs from the unmasked grade");
+
+        // G30 detects preview/export drift of the clamped alpha: the special-
+        // composite preview (G14 procedure, 64x64, no proxy) and renderFrameAt
+        // agree within maxDiff <= 2 (premultiplied ARGB) and the preview keeps
+        // the exterior at alpha 0 (HEAD: 255). Control: the no-roto export must
+        // differ from the preview.
+        wtl->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+        wtl->setClipParentEntries(QHash<QString, QString>{});
+        bool g30 = true;
+        struct ParityCase { const char *name; ClipInfo clip; };
+        for (const ParityCase &pc : {ParityCase{"saturation+vignette", fxClip},
+                                     ParityCase{"saturation+chromaKey", keyClip}}) {
+            seedV2(wtl, pc.clip, false);
+            const QImage noRotoExport = renderAt(wtl, 0.5);
+            seedV2(wtl, pc.clip, true);
+            const QImage preview = window.buildSpecialClipComposite(0.5);
+            const QImage exported = renderAt(wtl, 0.5);
+            const RegionDiff parity = regionDiff(preview, exported, everyPixel);
+            const RegionDiff control = regionDiff(preview, noRotoExport, everyPixel);
+            const auto previewOutside = alphaRange(preview, outsideRect);
+            const bool ok = parity.pixels == 64 * 64 && parity.maxDiff <= 2
+                && previewOutside.second == 0 && control.maxDiff > 2;
+            std::cerr << "G30 " << pc.name << " parity " << showDiff(parity) << " (<= 2)"
+                      << " preview outsideAlpha=" << previewOutside.first << ".." << previewOutside.second
+                      << " (== 0) preview(4,4)=" << pixelText(preview, 4, 4)
+                      << " export(4,4)=" << pixelText(exported, 4, 4)
+                      << " preview(32,32)=" << pixelText(preview, 32, 32)
+                      << " export(32,32)=" << pixelText(exported, 32, 32)
+                      << " control noRotoExport " << showDiff(control) << " (> 2) ok=" << ok << '\n';
+            g30 = g30 && ok;
+        }
+        wtl->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        gates.gate(30, g30, "preview and renderFrameAt differ on roto + grade / FX alpha, or the preview exterior is opaque");
+
+        // G31 (a) detects a clamp on opaque layers: no roto + saturation +
+        // Vignette renders alpha 255 everywhere with clampAlphaCallCountForTest
+        // unchanged. (b) detects alpha media losing its alpha in the grade / FX
+        // stage (HEAD: 255): a QImage ARGB frame with an 8 px alpha-0 border
+        // through applyClipFxStackFromSource keeps the border at alpha 0 and the
+        // core equal to the same stage on the opaque frame.
+        Timeline g31Tl;
+        seedV2(&g31Tl, fxClip, false);
+        const quint64 g31ClampBefore = roto::clampAlphaCallCountForTest();
+        const QImage g31Opaque = renderAt(&g31Tl, 0.5);
+        const quint64 g31Clamps = roto::clampAlphaCallCountForTest() - g31ClampBefore;
+        const auto g31Alpha = alphaRange(g31Opaque, everyPixel);
+        const RegionDiff g31Graded = regionDiff(g29Raw, g31Opaque, everyPixel);
+        std::cerr << "G31a noRoto saturation+vignette alpha=" << g31Alpha.first << ".." << g31Alpha.second
+                  << " (== 255) graded vs raw " << showDiff(g31Graded) << " (> 2)"
+                  << " clampAlphaCallCountForTest=" << g31Clamps << " (== 0)\n";
+        const bool g31a = g31Alpha.first == 255 && g31Alpha.second == 255 && g31Graded.maxDiff > 2
+            && g31Clamps == 0;
+
+        const auto core = [](int x, int y) { return inRect(x, y, 8, 8, 56, 56); };
+        const auto border = [&core](int x, int y) { return !core(x, y); };
+        QImage opaqueMedia(64, 64, QImage::Format_ARGB32);
+        opaqueMedia.fill(QColor(32, 80, 160));
+        QImage alphaMedia(64, 64, QImage::Format_ARGB32);
+        alphaMedia.fill(Qt::transparent);
+        for (int y = 8; y < 56; ++y)
+            for (int x = 8; x < 56; ++x)
+                alphaMedia.setPixel(x, y, qRgba(32, 80, 160, 255));
+        bool g31b = true;
+        struct MediaCase { const char *name; ClipInfo clip; };
+        for (const MediaCase &mc : {MediaCase{"saturation", gradedClip(295, {})},
+                                    MediaCase{"saturation+vignette", gradedClip(296, {vignette})}}) {
+            const quint64 clampBefore = roto::clampAlphaCallCountForTest();
+            const QImage out = tlrender::applyClipFxStackFromSource(alphaMedia, mc.clip, 0.5);
+            const quint64 clamps = roto::clampAlphaCallCountForTest() - clampBefore;
+            const QImage ref = tlrender::applyClipFxStackFromSource(opaqueMedia, mc.clip, 0.5);
+            const auto borderAlpha = alphaRange(out, border);
+            const auto coreAlpha = alphaRange(out, core);
+            const RegionDiff coreDiff = regionDiff(out, ref, core);
+            const RegionDiff graded = regionDiff(opaqueMedia, ref, core);
+            const bool ok = borderAlpha.second == 0 && coreAlpha.first == 255 && coreDiff.pixels > 0
+                && coreDiff.maxDiff <= 2 && graded.maxDiff > 2 && clamps > 0;
+            std::cerr << "G31b alphaMedia " << mc.name << " border(2,2)=" << pixelText(out, 2, 2)
+                      << " core(32,32)=" << pixelText(out, 32, 32) << " opaqueRef(32,32)=" << pixelText(ref, 32, 32)
+                      << " borderAlpha=" << borderAlpha.first << ".." << borderAlpha.second << " (== 0)"
+                      << " coreAlpha=" << coreAlpha.first << ".." << coreAlpha.second << " (== 255)"
+                      << " core vs opaqueRef " << showDiff(coreDiff) << " (<= 2)"
+                      << " graded vs source " << showDiff(graded) << " (> 2)"
+                      << " clampAlphaCallCountForTest=" << clamps << " (> 0) ok=" << ok << '\n';
+            g31b = g31b && ok;
+        }
+        gates.gate(31, g31a && g31b,
+                   "opaque layer clamped, or alpha media border not alpha 0 after grade / FX");
     }
     return gates.finish("roto");
 }
