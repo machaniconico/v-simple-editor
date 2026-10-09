@@ -13,9 +13,11 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QSignalSpy>
 #include <QSlider>
 #include <QTemporaryDir>
 #include <QTest>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -123,6 +125,28 @@ double pcmEnergy(const QByteArray &pcm)
     return sum / 35200.0;
 }
 bool near(double a, double b) { return std::abs(a - b) < 1e-9; }
+// 4800 interleaved stereo frames of a 1 kHz sine at 48 kHz; the right channel
+// is a quarter period ahead so a channel swap cannot match.
+std::vector<int16_t> sineBlock(double amplitude)
+{
+    std::vector<int16_t> block(4800 * 2);
+    for (int i = 0; i < 4800; ++i) {
+        const double phase = 2.0 * 3.141592653589793 * 1000 * i / 48000;
+        block[2 * i] = int16_t(std::lround(amplitude * 32767 * std::sin(phase)));
+        block[2 * i + 1] = int16_t(std::lround(amplitude * 32767 * std::cos(phase)));
+    }
+    return block;
+}
+// Largest |tap - source/32768| over the frames both hold; 1.0 when the frame
+// counts differ so a short or long take cannot pass.
+double tapError(const QVector<float> &tap, const int16_t *source, int frames)
+{
+    if (tap.size() != frames * 2) return 1.0;
+    double worst = 0.0;
+    for (int i = 0; i < frames * 2; ++i)
+        worst = std::max(worst, std::abs(double(tap[i]) - source[i] / 32768.0));
+    return worst;
+}
 
 // G6 forwards every message to the handler main() installed, counting the
 // wildcard-disconnect warnings on the way so the gate proves they reached it.
@@ -340,6 +364,127 @@ int runMixerDockSelftest()
                      kSenders, connected, int(handlerInstalled), g_wildcardWarnings.load(), stillConnected);
         gate(6, handlerInstalled && connected == kSenders && g_wildcardWarnings == kSenders
              && stillConnected == 0);
+    }
+    constexpr double kTapTolerance = 1.0 / 32768.0;
+    {
+        // Published blocks come back in order, one coalesced notification
+        // covers both, and readData itself feeds the tap with its output.
+        auto mixer = std::make_unique<AudioMixer>();
+        QSignalSpy spy(mixer.get(), &AudioMixer::masterTapAvailable);
+        mixer->subscribeMasterTap();
+        const auto first = sineBlock(0.5);
+        const auto second = sineBlock(0.25);
+        QVector<float> tapFirst, tapSecond;
+        mixer->publishMasterBlockForTest(first.data(), 4800);
+        const int takenFirst = mixer->takeMasterTap(&tapFirst, AudioMixer::kMasterTapFrames);
+        mixer->publishMasterBlockForTest(second.data(), 4800);
+        const int takenSecond = mixer->takeMasterTap(&tapSecond, AudioMixer::kMasterTapFrames);
+        const double error = std::max(tapError(tapFirst, first.data(), 4800),
+                                      tapError(tapSecond, second.data(), 4800));
+        // The two blocks differ, so a reordered take could not match.
+        const double swapped = tapError(tapFirst, second.data(), 4800);
+        const bool notified = QTest::qWaitFor([&] { return spy.count() >= 1; }, 2000);
+        QCoreApplication::processEvents();
+        const int emits = spy.count();
+
+        auto played = std::make_unique<AudioMixer>();
+        Timeline timeline;
+        wire(timeline, *played);
+        fixture(timeline, source);
+        played->setSequence(timeline.computeAudioPlaybackSequence());
+        played->subscribeMasterTap();
+        const auto pcm = played->renderPcmForTest(9600);
+        QVector<float> tapPlayed;
+        const int takenPlayed = played->takeMasterTap(&tapPlayed, 9600);
+        const int kept = AudioMixer::kMasterTapFrames;
+        const auto *pcmTail = pcm.size() == 9600 * AudioMixer::kBytesPerFrame
+            ? reinterpret_cast<const int16_t *>(pcm.constData()) + (9600 - kept) * 2 : nullptr;
+        const double playError = pcmTail ? tapError(tapPlayed, pcmTail, kept) : 1.0;
+        double playPeak = 0.0;
+        for (float value : tapPlayed) playPeak = std::max(playPeak, std::abs(double(value)));
+        const std::string detail = QString::asprintf(
+            "taken=%d+%d maxError=%g swappedError=%g notified=%d emits=%d | readData: pcmBytes=%lld taken=%d maxError=%g peak=%g copies=%llu",
+            takenFirst, takenSecond, error, swapped, int(notified), emits,
+            static_cast<long long>(pcm.size()), takenPlayed, playError, playPeak,
+            static_cast<unsigned long long>(played->tapCopyCountForTest())).toStdString();
+        tally.gate(7, takenFirst == 4800 && takenSecond == 4800 && error <= kTapTolerance
+                   && swapped > 0.01 && notified && emits == 1
+                   && sourceOk && takenPlayed == kept && playError <= kTapTolerance
+                   && playPeak > 0.05, detail);
+    }
+    {
+        // Negative control: without subscribers neither the test entry nor
+        // readData copies. The control mixer proves the same calls do copy
+        // once subscribed, and that the last unsubscribe discards the ring.
+        auto mixer = std::make_unique<AudioMixer>();
+        const auto block = sineBlock(0.5);
+        QVector<float> tap;
+        mixer->publishMasterBlockForTest(block.data(), 4800);
+        const int idleFrames = mixer->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        const quint64 idleCopies = mixer->tapCopyCountForTest();
+        mixer->subscribeMasterTap();
+        mixer->unsubscribeMasterTap();
+        mixer->publishMasterBlockForTest(block.data(), 4800);
+        const int unsubscribedFrames = mixer->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        const quint64 unsubscribedCopies = mixer->tapCopyCountForTest();
+
+        auto control = std::make_unique<AudioMixer>();
+        control->subscribeMasterTap();
+        control->publishMasterBlockForTest(block.data(), 4800);
+        const quint64 controlCopies = control->tapCopyCountForTest();
+        control->unsubscribeMasterTap();
+        const int discarded = control->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        control->subscribeMasterTap();
+        control->publishMasterBlockForTest(block.data(), 4800);
+        const int controlFrames = control->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+
+        auto played = std::make_unique<AudioMixer>();
+        Timeline timeline;
+        wire(timeline, *played);
+        fixture(timeline, source);
+        played->setSequence(timeline.computeAudioPlaybackSequence());
+        const double playEnergy = pcmEnergy(played->renderPcmForTest(48000));
+        const int playFrames = played->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        const quint64 playCopies = played->tapCopyCountForTest();
+        const std::string detail = QString::asprintf(
+            "idle frames=%d copies=%llu | unsubscribed frames=%d copies=%llu | control copies=%llu discarded=%d frames=%d | readData energy=%g frames=%d copies=%llu",
+            idleFrames, static_cast<unsigned long long>(idleCopies),
+            unsubscribedFrames, static_cast<unsigned long long>(unsubscribedCopies),
+            static_cast<unsigned long long>(controlCopies), discarded, controlFrames,
+            playEnergy, playFrames, static_cast<unsigned long long>(playCopies)).toStdString();
+        tally.gate(8, idleFrames == 0 && idleCopies == 0 && unsubscribedFrames == 0
+                   && unsubscribedCopies == 0 && controlCopies == 1 && discarded == 0
+                   && controlFrames == 4800 && sourceOk && playEnergy > 0.001
+                   && playFrames == 0 && playCopies == 0, detail);
+    }
+    {
+        // Three 4800-frame blocks overflow the 8192-frame ring: the oldest
+        // frames are dropped. Each frame carries its own index, so the take
+        // names the first frame it kept.
+        auto mixer = std::make_unique<AudioMixer>();
+        mixer->subscribeMasterTap();
+        constexpr int kTotal = 3 * 4800;
+        std::vector<int16_t> stream(kTotal * 2);
+        for (int i = 0; i < kTotal; ++i) {
+            stream[2 * i] = int16_t(i - 7200);
+            stream[2 * i + 1] = int16_t(7200 - i);
+        }
+        for (int block = 0; block < 3; ++block)
+            mixer->publishMasterBlockForTest(stream.data() + block * 4800 * 2, 4800);
+        QVector<float> tap;
+        const int taken = mixer->takeMasterTap(&tap, kTotal);
+        const int kept = AudioMixer::kMasterTapFrames;
+        const double error = tapError(tap, stream.data() + (kTotal - kept) * 2, kept);
+        const int firstFrame = tap.isEmpty() ? -1 : int(std::lround(tap[0] * 32768.0)) + 7200;
+        QVector<float> rest;
+        const int remaining = mixer->takeMasterTap(&rest, kTotal);
+        const std::string detail = QString::asprintf(
+            "capacity=%d taken=%d firstFrame=%d expectedFirst=%d maxError=%g remaining=%d copies=%llu",
+            kept, taken, firstFrame, kTotal - kept, error, remaining,
+            static_cast<unsigned long long>(mixer->tapCopyCountForTest())).toStdString();
+        tally.gate(9, kept == 8192 && taken == kept && firstFrame == kTotal - kept
+                   && error <= kTapTolerance && remaining == 0
+                   && mixer->tapCopyCountForTest() == 3, detail);
     }
     return tally.finish("mixer-dock");
 }

@@ -341,10 +341,28 @@ public:
     void setAutoDuckParams(const AutoDuckParams &params);
     AutoDuckParams autoDuckParams() const;
 
+    // Master tap: the final s16 block readData hands to the sink, normalized
+    // to float and kept in a fixed ring of the newest kMasterTapFrames stereo
+    // frames. Without subscribers readData copies nothing. The audio thread
+    // only tryLocks m_tapMutex and drops the block when the GUI holds it.
+    // masterTapAvailable is queued and coalesced: one pending notification at
+    // most. All four calls below are for the GUI thread.
+    static constexpr int kMasterTapFrames = 8192;
+    void subscribeMasterTap();
+    // The last unsubscribe discards the buffered frames.
+    void unsubscribeMasterTap();
+    // Moves the oldest min(buffered, maxFrames) frames into *interleaved
+    // (L, R, ...) and returns that frame count.
+    int takeMasterTap(QVector<float> *interleaved, int maxFrames);
+    // Runs the same tap write as readData.
+    void publishMasterBlockForTest(const int16_t *interleaved, int frames);
+    quint64 tapCopyCountForTest() const;
+
 signals:
     void decoderError(const QString &message);
     void levelChanged(int trackIdx, float peakL, float peakR, float rmsL, float rmsR);
     void masterLevelChanged(float pkL, float pkR, float rmsL, float rmsR);
+    void masterTapAvailable();
 
 private:
     friend class MixerIODevice;
@@ -589,6 +607,18 @@ private:
     QVector<LevelAccum> m_trackLevelAccum;
     LevelAccum m_masterLevelAccum;
     qint64 m_lastLevelEmitNs = 0;
+
+    // Master tap ring (see subscribeMasterTap). m_tapRing / m_tapWrite /
+    // m_tapFill are guarded by m_tapMutex; the ring is allocated on the first
+    // subscribe so an unused tap costs no memory.
+    void writeMasterTap(const int16_t *interleaved, int frames);
+    QMutex m_tapMutex;
+    QVector<float> m_tapRing;
+    int m_tapWrite = 0;
+    int m_tapFill = 0;
+    std::atomic<int> m_tapSubscribers{0};
+    std::atomic<bool> m_tapNotifyPending{false};
+    std::atomic<quint64> m_tapCopyCount{0};
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
 };

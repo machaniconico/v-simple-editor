@@ -1487,10 +1487,12 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     Q_ARG(float, masterSnapshot.peakL), Q_ARG(float, masterSnapshot.peakR),
                     Q_ARG(float, rmsL), Q_ARG(float, rmsR));
             }
-            return maxlen;
         }
     }
 
+    // Master tap: the single write point, fed with the final s16 block the
+    // sink receives. No copy without subscribers; never blocks this thread.
+    m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
     return maxlen;
 }
 
@@ -2856,6 +2858,81 @@ void AudioMixer::setAutoDuckParams(const AutoDuckParams &params) {
 AudioMixer::AutoDuckParams AudioMixer::autoDuckParams() const {
     QMutexLocker lock(&m_controlMutex);
     return m_autoDuckParams;
+}
+
+void AudioMixer::subscribeMasterTap()
+{
+    QMutexLocker lock(&m_tapMutex);
+    if (m_tapRing.isEmpty()) m_tapRing.resize(kMasterTapFrames * kChannels);
+    m_tapSubscribers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void AudioMixer::unsubscribeMasterTap()
+{
+    QMutexLocker lock(&m_tapMutex);
+    const int subscribers = m_tapSubscribers.load(std::memory_order_acquire);
+    if (subscribers <= 0) return;
+    m_tapSubscribers.store(subscribers - 1, std::memory_order_release);
+    if (subscribers == 1) m_tapWrite = m_tapFill = 0;
+}
+
+int AudioMixer::takeMasterTap(QVector<float> *interleaved, int maxFrames)
+{
+    if (!interleaved) return 0;
+    interleaved->clear();
+    if (maxFrames <= 0) return 0;
+    QMutexLocker lock(&m_tapMutex);
+    const int frames = qMin(m_tapFill, maxFrames);
+    interleaved->resize(frames * kChannels);
+    // m_tapWrite is the slot after the newest frame; the oldest sits m_tapFill
+    // frames behind it.
+    int read = (m_tapWrite - m_tapFill + kMasterTapFrames) % kMasterTapFrames;
+    for (int f = 0; f < frames; ++f) {
+        (*interleaved)[f * kChannels] = m_tapRing[read * kChannels];
+        (*interleaved)[f * kChannels + 1] = m_tapRing[read * kChannels + 1];
+        read = (read + 1) % kMasterTapFrames;
+    }
+    m_tapFill -= frames;
+    return frames;
+}
+
+void AudioMixer::writeMasterTap(const int16_t *interleaved, int frames)
+{
+    // Audio thread: never wait for the GUI reader; a contended block is dropped.
+    if (!interleaved || frames <= 0
+        || m_tapSubscribers.load(std::memory_order_acquire) <= 0
+        || !m_tapMutex.tryLock())
+        return;
+    if (m_tapSubscribers.load(std::memory_order_acquire) <= 0 || m_tapRing.isEmpty()) {
+        m_tapMutex.unlock();
+        return;
+    }
+    // Only the newest kMasterTapFrames of a larger block can survive.
+    const int first = qMax(0, frames - kMasterTapFrames);
+    for (int f = first; f < frames; ++f) {
+        m_tapRing[m_tapWrite * kChannels] = interleaved[f * kChannels] / 32768.0f;
+        m_tapRing[m_tapWrite * kChannels + 1] = interleaved[f * kChannels + 1] / 32768.0f;
+        m_tapWrite = (m_tapWrite + 1) % kMasterTapFrames;
+    }
+    m_tapFill = qMin(kMasterTapFrames, m_tapFill + frames - first);
+    m_tapCopyCount.fetch_add(1, std::memory_order_relaxed);
+    m_tapMutex.unlock();
+    if (!m_tapNotifyPending.exchange(true, std::memory_order_acq_rel)) {
+        QMetaObject::invokeMethod(this, [this] {
+            m_tapNotifyPending.store(false, std::memory_order_release);
+            emit masterTapAvailable();
+        }, Qt::QueuedConnection);
+    }
+}
+
+void AudioMixer::publishMasterBlockForTest(const int16_t *interleaved, int frames)
+{
+    writeMasterTap(interleaved, frames);
+}
+
+quint64 AudioMixer::tapCopyCountForTest() const
+{
+    return m_tapCopyCount.load(std::memory_order_relaxed);
 }
 
 bool AudioMixer::ensureSinkLocked() {
