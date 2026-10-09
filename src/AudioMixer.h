@@ -5,6 +5,7 @@
 #include <QVector>
 #include <QString>
 #include <QHash>
+#include <QSet>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QIODevice>
@@ -211,6 +212,10 @@ public:
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);
     void setMasterDeEsser(const trackfx::DeEsserSettings &settings);
+    // Sets the master EQ and DeEsser together in one locked section.
+    void setMasterChain(const EqSettings &eq, bool eqEnabled,
+                        const trackfx::DeEsserSettings &deesser);
+    quint64 applyMasterChainLockedCallCountForTest() const;
     void setMasterEqBypassForTest(bool bypass);
     quint64 masterEqProcessCallsForTest() const;
     // Exercises the same post-sum, pre-normalizer stage as readData.
@@ -433,12 +438,24 @@ private:
     // The one writer of the master EQ / DeEsser: updates m_masterFxChain and the
     // m_masterEqFilter processor together. Caller holds m_controlMutex.
     void applyMasterChainLocked(const trackfx::Chain &chain);
+    quint64 m_applyMasterChainLockedCalls = 0;
     trackfx::Chain m_masterFxChain;
     MasterEqFilter m_masterEqFilter;
     bool m_masterEqBypassForTest = false;
     quint64 m_masterEqProcessCalls = 0;
     QHash<int, trackfx::Chain> m_trackFxChains;
     QHash<int, trackfx::Processor> m_trackFxProcessors;
+    // One identity per track index: remapTrackIndices moves it with the track
+    // and collectTrackState stores it ("trackIds"), so applyTrackState carries
+    // the live DeEsser listen monitor by track identity, never by index. An
+    // index past the snapshot's track count ("trackCount") gets a new identity.
+    std::array<quint64, kMaxAudioTracks> m_trackIdentities{};
+    // Identities that left the live tracks while their listen monitor was on.
+    // An entry lives until its identity is restored by applyTrackState (undo /
+    // redo brings the track back) or until clearTrackFx (project load); a track
+    // that never returns leaves one entry (8 bytes) until the next project load.
+    QSet<quint64> m_listenOfRemovedTracks;
+    void rememberListenLocked(quint64 identity, int liveIndex);
     bool m_legacyTrackFxPath = false;
     quint64 m_trackFxProcessCalls = 0;
     QHash<int, EqSettings> m_trackEq;

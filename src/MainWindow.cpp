@@ -9780,7 +9780,13 @@ void MainWindow::handleMediaRelinkHistoryChanged()
 QJsonObject MainWindow::collectExternalTrackState() const
 {
     QJsonObject state;
-    if (auto *mixer = m_timeline->audioMixer()) state["mixer"] = mixer->collectTrackState();
+    if (auto *mixer = m_timeline->audioMixer()) {
+        // applyTrackState carries the DeEsser listen only by the identities of
+        // these audio tracks, not by those of the unused mixer indices.
+        QJsonObject mixerState = mixer->collectTrackState();
+        mixerState["trackCount"] = m_timeline->audioTrackCount();
+        state["mixer"] = mixerState;
+    }
     state["buses"] = m_audioBusRouting.toJson();
     // Timeline playback flags (muted/solo/hidden) are not undoable.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
@@ -9957,8 +9963,7 @@ void MainWindow::applyAudioState(const ProjectData &data)
         mixer->clearTrackFx();
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
             mixer->setTrackChain(it.key(), it.value());
-        mixer->setMasterEq(data.masterFx.eq, data.masterFx.eqEnabled);
-        mixer->setMasterDeEsser(data.masterFx.deesser);
+        mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled, data.masterFx.deesser);
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);
@@ -20012,8 +20017,7 @@ void MainWindow::restoreAudioFxUndoState(const QJsonObject &audioFx)
     if (audioFx.value("masterChain") != live.value("masterChain")) {
         auto master = trackfx::Chain::fromJson(audioFx.value("masterChain").toObject());
         master.deesser.listen = mixer->masterChain().deesser.listen;
-        mixer->setMasterEq(master.eq, master.eqEnabled);
-        mixer->setMasterDeEsser(master.deesser);
+        mixer->setMasterChain(master.eq, master.eqEnabled, master.deesser);
     }
     reseedAudioFxDocks();
 }
