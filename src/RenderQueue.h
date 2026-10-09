@@ -297,4 +297,9 @@ namespace loudnessauto {
 QString prepareJob(RenderJob &job);
 // Number of prepareJob calls that ran with autoLoudness ON (selftest counter).
 int prepareJobCallCountForTest();
+// Selftest: makes one prepareJob step report failure (after it ran). None (default) = production.
+enum class ForcedFailure { None, PcmMix, SilentMix, AacConvert };
+void setForcedFailureForTest(ForcedFailure failure);
+// Number of silent tracks prepareJob made for an empty audio playback sequence (selftest counter).
+int silentMixCallCountForTest();
 }

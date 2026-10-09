@@ -2928,22 +2928,40 @@ QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &output
 
 namespace {
 std::atomic<int> s_prepareJobCalls{0};
+std::atomic<int> s_silentMixCalls{0};
+std::atomic<loudnessauto::ForcedFailure> s_forcedFailure{loudnessauto::ForcedFailure::None};
 }
 
 int loudnessauto::prepareJobCallCountForTest() { return s_prepareJobCalls.load(); }
+int loudnessauto::silentMixCallCountForTest() { return s_silentMixCalls.load(); }
+void loudnessauto::setForcedFailureForTest(ForcedFailure failure) { s_forcedFailure = failure; }
 
+// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here, so a
+// failed mix never falls back to the unnormalized V1 source audio: it sets loudnessAutoError
+// and RenderQueue::addJob rejects the job.
 QString loudnessauto::prepareJob(RenderJob &job)
 {
     if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
     ++s_prepareJobCalls;
     job.exportConfig.remove("loudnessAutoError");
+    const ForcedFailure forced = s_forcedFailure.load();
+    const bool hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+    const bool hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
+    const bool hasSequence = hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
     QString error;
     QString mix;
-    if (job.timeline && job.timeline->totalDuration() > 0.0
-        && !job.timeline->computeAudioPlaybackSequence().isEmpty()) {
+    if (hasSequence) {
         // Force the existing mixer to produce PCM even for passthrough clips.
         mix = prepareTimelineAudioMixForExport(job.timeline, &error,
             nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration());
+        if (forced == ForcedFailure::PcmMix) {
+            QFile::remove(mix); // a failed mix leaves no output behind (finishMix)
+            mix.clear();
+            error = QStringLiteral("test: forced PCM mix failure");
+        }
+        if (mix.isEmpty() && !hasIntermediate)
+            job.exportConfig["loudnessAutoError"] = error.isEmpty()
+                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
     }
     // The measurement WAV is removed below; registering it makes removeTempFiles retry if that fails.
     if (!mix.isEmpty()) RenderQueue::addTempFile(job.exportConfig, mix);
@@ -2978,7 +2996,12 @@ QString loudnessauto::prepareJob(RenderJob &job)
         QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix, QStringLiteral("-vn")};
         args << exportaudio::aacAudioArgs(job.exportConfig.value("audioBitrate").toInt()) << muxPath;
         RenderQueue::addTempFile(job.exportConfig, muxPath);
-        if (runFfmpegForAudioMix(args, &error)) RenderQueue::setIntermediateProjectFile(job, muxPath);
+        bool converted = runFfmpegForAudioMix(args, &error);
+        if (converted && forced == ForcedFailure::AacConvert) {
+            converted = false;
+            error = QStringLiteral("test: forced AAC conversion failure");
+        }
+        if (converted) RenderQueue::setIntermediateProjectFile(job, muxPath);
         else {
             message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
             job.exportConfig["loudnessAutoStatus"] = message;
@@ -2986,6 +3009,31 @@ QString loudnessauto::prepareJob(RenderJob &job)
             qWarning().noquote() << message;
         }
         QFile::remove(mix);
+    } else if (hasDuration && !hasSequence && !hasIntermediate
+               && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath)) {
+        // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
+        // removed. Make the silent track the ordinary export makes (nothing to measure: 0 dB).
+        const int audioKbps = job.exportConfig.value("audioBitrate").toInt();
+        QString silentError;
+        const QString silent = prepareTimelineAudioMixForExport(job.timeline, &silentError,
+            {}, 0.0, audioKbps > 0 ? audioKbps : 192);
+        // Passthrough (V1 empty): the ordinary export makes no mix either, so leave the job as is.
+        const bool passthrough = silent.isEmpty() && silentError.isEmpty()
+            && timelineAudioMatchesPassthrough(job.timeline);
+        if (!passthrough) {
+            ++s_silentMixCalls;
+            RenderQueue::addTempFile(job.exportConfig, silent);
+            if (forced == ForcedFailure::SilentMix && silentError.isEmpty())
+                silentError = QStringLiteral("test: forced silent mix failure");
+            if (!silent.isEmpty() && silentError.isEmpty()) RenderQueue::setIntermediateProjectFile(job, silent);
+            else {
+                if (silentError.isEmpty()) silentError = QStringLiteral("音声ミックスの作成に失敗しました");
+                message += QStringLiteral(" / 無音トラック作成失敗: ") + silentError;
+                job.exportConfig["loudnessAutoStatus"] = message;
+                job.exportConfig["loudnessAutoError"] = silentError;
+                qWarning().noquote() << message;
+            }
+        }
     }
     job.loudnessGainDb = job.exportConfig.value("loudnessGainDb").toDouble();
     qInfo().noquote() << job.name << message;

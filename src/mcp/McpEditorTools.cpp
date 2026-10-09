@@ -2851,41 +2851,10 @@ void McpEditorTools::registerWriteTools()
                 if (!queueGuard || !windowGuard || windowGuard->m_mcpTools != this)
                     return;
                 if (job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false)) {
-                    // Same exclusion as the GUI: auto loudness builds its own AAC intermediate,
-                    // so the ordinary mix is not made. A failure of the AAC conversion sets
-                    // loudnessAutoError and addJob rejects the job. A failure of the PCM mix only
-                    // adds a warning to loudnessAutoStatus, so promote it to an error here (MCP only)
-                    // to keep the "failed" observation the ordinary mix path gave.
+                    // Same exclusion as the GUI: auto loudness builds its own AAC intermediate (or the
+                    // silent track for an empty audio sequence), so the ordinary mix is not made. Any
+                    // mix failure sets loudnessAutoError and addJob rejects the job (status failed).
                     loudnessauto::prepareJob(job);
-                    if (job.timeline && job.timeline->totalDuration() > 0.0
-                        && !job.timeline->computeAudioPlaybackSequence().isEmpty()
-                        && !job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"))
-                        && job.exportConfig.value(QStringLiteral("loudnessAutoError")).toString().isEmpty()) {
-                        const QString status = job.exportConfig.value(QStringLiteral("loudnessAutoStatus")).toString();
-                        job.exportConfig[QStringLiteral("loudnessAutoError")] = status.isEmpty()
-                            ? QStringLiteral("音声ミックスの作成に失敗しました") : status;
-                    }
-                    // Empty audio playback sequence: prepareJob makes no mix, and RenderQueue would fall
-                    // back to the V1 source audio the user removed. Make the silent track the ordinary
-                    // path makes (the only case where both prepareJob and the ordinary mix run).
-                    if (job.timeline && job.timeline->totalDuration() > 0.0
-                        && job.timeline->computeAudioPlaybackSequence().isEmpty()
-                        && !job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"))
-                        && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray()
-                               .contains(job.projectFilePath)) {
-                        QString audioMixError;
-                        const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError, audioBitrate);
-                        if (!audioMixError.isEmpty()) {
-                            ExportJobObservation& observation = m_exportJobObservations[jobId];
-                            observation.status = QStringLiteral("failed");
-                            observation.error = audioMixError;
-                            return;
-                        }
-                        if (!audioMixPath.isEmpty()) {
-                            RenderQueue::addTempFile(job.exportConfig, audioMixPath);
-                            RenderQueue::setIntermediateProjectFile(job, audioMixPath);
-                        }
-                    }
                 } else {
                     QString audioMixError;
                     const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError, audioBitrate);

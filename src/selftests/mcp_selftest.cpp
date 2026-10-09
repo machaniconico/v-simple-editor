@@ -60,6 +60,7 @@
 #include "../MainWindow.h"
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
+#include "../ShapeLayer.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../Timeline.h"
@@ -6318,10 +6319,10 @@ int runMcpSelftest()
             const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4 presetDir=%5")
                 .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
                 .arg(exportRootReady).arg(presetDir.isValid());
-            for (int n = 182; n <= 187; ++n)
+            for (int n = 182; n <= 188; ++n)
                 tally.gate(n, false, why.toUtf8().constData());
         } else if (ffmpegExe.isEmpty()) {
-            for (int n = 182; n <= 187; ++n)
+            for (int n = 182; n <= 188; ++n)
                 tally.skip(n, "ffmpeg.exe unavailable");
         } else {
             const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
@@ -6381,6 +6382,7 @@ int runMcpSelftest()
                 bool mixIsAac = false;
                 int measureDelta = -1;
                 int mixDelta = -1;
+                int silentMixDelta = -1;
                 bool terminal = false;
                 RenderJobStatus finalStatus = RenderJobStatus::Pending;
                 qsizetype queueAfter = -1;
@@ -6432,6 +6434,7 @@ int runMcpSelftest()
                 const int queueBefore = queue->jobs().size();
                 const int measureBefore = RenderQueue::autoLoudnessMeasurementCountForTest();
                 const int mixBefore = projectInfoWindow.exportAudioMixCallCountForTest;
+                const int silentMixBefore = loudnessauto::silentMixCallCountForTest();
                 const auto connection = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
                     if (run.captured) return;
                     const auto jobs = queue->jobs();
@@ -6463,6 +6466,7 @@ int runMcpSelftest()
                     (void)QTest::qWaitFor([&]() { return run.captured; }, 60000);
                     run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
                     run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                    run.silentMixDelta = loudnessauto::silentMixCallCountForTest() - silentMixBefore;
                     run.terminal = run.captured && QTest::qWaitFor([&]() {
                         for (const RenderJob &job : queue->jobs()) {
                             if (job.uuid != run.jobId) continue;
@@ -6481,6 +6485,7 @@ int runMcpSelftest()
                     }, 1000);
                     run.measureDelta = RenderQueue::autoLoudnessMeasurementCountForTest() - measureBefore;
                     run.mixDelta = projectInfoWindow.exportAudioMixCallCountForTest - mixBefore;
+                    run.silentMixDelta = loudnessauto::silentMixCallCountForTest() - silentMixBefore;
                 }
                 QObject::disconnect(connection);
                 run.queueAfter = queue->jobs().size();
@@ -6509,8 +6514,8 @@ int runMcpSelftest()
             describe("G182", explicitOn);
 
             // G182 sub-case: autoLoudness resolved true on a timeline whose audio playback sequence is empty.
-            // prepareJob makes no mix there; without the MCP-side silent mix RenderQueue falls back to the
-            // V1 source audio (e2e_clip.mp4 has an audible AAC stream) that the user removed.
+            // prepareJob makes the silent track itself (US-1002: not prepareExportAudioMix, mixDelta 0); without
+            // it RenderQueue falls back to the V1 source audio (e2e_clip.mp4 has an audible AAC stream).
             audioTrack->setClips(QVector<ClipInfo>{});
             const QString silentOut = exportRoot.filePath(QStringLiteral("us909-emptyaudio.mp4"));
             const Run emptyAudio = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
@@ -6522,13 +6527,13 @@ int runMcpSelftest()
             const double sourceLufs = loudness::measureIntegratedLufs(videoAsset);
             const bool silentOk = !emptyAudio.isError && emptyAudio.captured
                 && emptyAudio.mixInTemp && emptyAudio.job.projectFilePath != videoAsset
-                && emptyAudio.mixDelta == 1
+                && emptyAudio.mixDelta == 0 && emptyAudio.silentMixDelta == 1
                 && emptyAudio.terminal && emptyAudio.finalStatus == RenderJobStatus::Completed
                 && std::isfinite(sourceLufs) && sourceLufs > -40.0
                 && std::isfinite(silentLufs) && silentLufs <= -70.0;
-            std::fprintf(stderr, "mcp G182-empty silentOk=%d outputLufs=%g sourceV1Lufs=%g mixDelta=%d measureDelta=%d "
-                "projectFilePathIsV1=%d\n", silentOk, silentLufs, sourceLufs, emptyAudio.mixDelta,
-                emptyAudio.measureDelta, emptyAudio.job.projectFilePath == videoAsset);
+            std::fprintf(stderr, "mcp G182-empty silentOk=%d outputLufs=%g sourceV1Lufs=%g mixDelta=%d silentMixDelta=%d "
+                "measureDelta=%d projectFilePathIsV1=%d\n", silentOk, silentLufs, sourceLufs, emptyAudio.mixDelta,
+                emptyAudio.silentMixDelta, emptyAudio.measureDelta, emptyAudio.job.projectFilePath == videoAsset);
             tally.gate(182, toneOk && presetsSaved && !explicitOn.isError && explicitOn.captured
                 && explicitOn.measureDelta == 1 && finiteSane(lufsOf(explicitOn, "measuredLufs"))
                 && explicitOn.mixInTemp && explicitOn.mixIsAac && explicitOn.mixDelta == 0
@@ -6649,6 +6654,104 @@ int runMcpSelftest()
                 && !bitrate192.isError && bitrate192.mixInTemp && rate192 > 163.2 && rate192 < 220.8
                 && rate192 > 1.4 * rate96,
                 "the MCP audioBitrate did not set the mix AAC stream bit_rate (about 96 / 192 kbps)");
+
+            // G188 (US-1002): a PCM mix failure inside prepareJob rejects the export_video job (addJob ->
+            // get_export_status failed + error, nothing queued). Control: hook None, same call -> queued.
+            {
+                const QJsonObject onArgs{{QStringLiteral("autoLoudness"), true},
+                                         {QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us1002-fail.mp4"))}};
+                queue->clear();
+                int jobsSeen = 0;
+                const auto seen = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                    jobsSeen += static_cast<int>(queue->jobs().size());
+                });
+                loudnessauto::setForcedFailureForTest(loudnessauto::ForcedFailure::PcmMix);
+                const QJsonObject failResponse = callProjectInfoTool(callId++, QStringLiteral("export_video"), onArgs);
+                const bool failCallError = toolResult(failResponse).value(QStringLiteral("isError")).toBool(true);
+                const QString failJobId = toolPayload(failResponse).value(QStringLiteral("jobId")).toString();
+                QString failStatus, failError;
+                const bool failed = !failJobId.isEmpty() && QTest::qWaitFor([&]() {
+                    const QJsonObject status = toolPayload(callProjectInfoTool(callId++,
+                        QStringLiteral("get_export_status"), QJsonObject{{QStringLiteral("jobId"), failJobId}}));
+                    failStatus = status.value(QStringLiteral("status")).toString();
+                    failError = status.value(QStringLiteral("error")).toString();
+                    return failStatus == QStringLiteral("failed");
+                }, 60000);
+                loudnessauto::setForcedFailureForTest(loudnessauto::ForcedFailure::None);
+                QObject::disconnect(seen);
+                const qsizetype jobsAfterFail = queue->jobs().size();
+                const Run control = runExport(onArgs);
+                describe("G188-control", control);
+                std::fprintf(stderr, "mcp G188 isError=%d jobId=[%s] status=[%s] error=[%s] jobsSeen=%d jobsAfter=%lld "
+                    "| control captured=%d status=%d\n", failCallError, qPrintable(failJobId), qPrintable(failStatus),
+                    qPrintable(failError), jobsSeen, static_cast<long long>(jobsAfterFail), control.captured,
+                    static_cast<int>(control.finalStatus));
+
+                // G188-emptyV1: V1 empty, video only on an upper track, empty audio sequence. The ordinary mix is a
+                // passthrough here (no mix), so prepareJob must leave the job as HEAD did: no silent track, no audio.
+                // The upper clip is a shape clip: with V1 empty the renderer draws a frame only for an upper shape.
+                const bool addedUpper = projectTimeline->videoTracks().size() < 2;
+                if (addedUpper) projectTimeline->addVideoTrack(false);
+                TimelineTrack *upperTrack = projectTimeline->videoTracks().at(1);
+                const QVector<ClipInfo> savedUpperClips = upperTrack->clips();
+                ShapeFill upperFill;
+                upperFill.color = Qt::white;
+                ShapeStroke upperStroke;
+                upperStroke.enabled = false;
+                Shape upperShape = ShapeLayer::createRectangle(QSizeF(64, 64), upperFill, upperStroke);
+                upperShape.position = QPointF(160, 90);
+                ClipInfo upperClip;
+                upperClip.displayName = QStringLiteral("us1002-upper-shape");
+                upperClip.duration = upperClip.outPoint = 1.0;
+                upperClip.shapes = {upperShape};
+                videoTrack->setClips(QVector<ClipInfo>{});
+                upperTrack->setClips(QVector<ClipInfo>{upperClip});
+                audioTrack->setClips(QVector<ClipInfo>{});
+                const QString emptyV1Out = exportRoot.filePath(QStringLiteral("us1002-emptyv1.mp4"));
+                const Run emptyV1 = runExport(QJsonObject{{QStringLiteral("autoLoudness"), true},
+                    {QStringLiteral("outputPath"), emptyV1Out}});
+                upperTrack->setClips(savedUpperClips);
+                videoTrack->setClips(QVector<ClipInfo>{videoClip});
+                audioTrack->setClips(QVector<ClipInfo>{audioClip});
+                if (addedUpper) projectTimeline->removeTrack(false, projectTimeline->videoTracks().size() - 1);
+                describe("G188-emptyV1", emptyV1);
+                QString emptyV1JobError;
+                for (const RenderJob &job : queue->jobs())
+                    if (job.uuid == emptyV1.jobId) emptyV1JobError = job.error.isEmpty() ? job.errorMessage : job.error;
+                int emptyV1AudioStreams = -1;
+                AVFormatContext *emptyV1Format = nullptr;
+                if (emptyV1.terminal
+                    && avformat_open_input(&emptyV1Format, emptyV1Out.toUtf8().constData(), nullptr, nullptr) >= 0) {
+                    if (avformat_find_stream_info(emptyV1Format, nullptr) >= 0) {
+                        emptyV1AudioStreams = 0;
+                        for (unsigned i = 0; i < emptyV1Format->nb_streams; ++i)
+                            if (emptyV1Format->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+                                ++emptyV1AudioStreams;
+                    }
+                    avformat_close_input(&emptyV1Format);
+                }
+                int emptyV1M4aTemps = 0;
+                for (const QJsonValue &temp : emptyV1.tempFiles)
+                    if (temp.toString().endsWith(QStringLiteral(".m4a"), Qt::CaseInsensitive)) ++emptyV1M4aTemps;
+                const bool emptyV1HasError = emptyV1.job.exportConfig.contains(QStringLiteral("loudnessAutoError"));
+                const bool emptyV1Ok = !emptyV1.isError && emptyV1.captured && emptyV1.terminal
+                    && emptyV1.finalStatus == RenderJobStatus::Completed
+                    && emptyV1.mixDelta == 0 && emptyV1.silentMixDelta == 0 && !emptyV1HasError
+                    && !emptyV1.mixInTemp && emptyV1M4aTemps == 0 && emptyV1AudioStreams == 0;
+                std::fprintf(stderr, "mcp G188-emptyV1 ok=%d isError=%d captured=%d terminal=%d status=%d mixDelta=%d "
+                    "silentMixDelta=%d loudnessAutoError=%d[%s] mixInTemp=%d m4aTemps=%d tempFiles=%lld "
+                    "projectFilePath=[%s] outputAudioStreams=%d addedUpper=%d jobError=[%s]\n", emptyV1Ok, emptyV1.isError,
+                    emptyV1.captured, emptyV1.terminal, static_cast<int>(emptyV1.finalStatus), emptyV1.mixDelta,
+                    emptyV1.silentMixDelta, emptyV1HasError,
+                    qPrintable(emptyV1.job.exportConfig.value(QStringLiteral("loudnessAutoError")).toString()),
+                    emptyV1.mixInTemp, emptyV1M4aTemps, static_cast<long long>(emptyV1.tempFiles.size()),
+                    qPrintable(emptyV1.job.projectFilePath), emptyV1AudioStreams, addedUpper, qPrintable(emptyV1JobError));
+                tally.gate(188, !failCallError && failed && !failError.isEmpty() && jobsSeen == 0 && jobsAfterFail == 0
+                    && !control.isError && control.captured && control.measureDelta == 1
+                    && control.terminal && control.finalStatus == RenderJobStatus::Completed && emptyV1Ok,
+                    "a forced PCM mix failure under autoLoudness=true did not end as failed (or the control was not "
+                    "queued), or an empty V1 export got a silent track the ordinary passthrough does not make");
+            }
 
             queue->clear();
             if (hadPresetEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldPresetEnv);
