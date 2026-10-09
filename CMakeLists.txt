@@ -646,6 +646,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/WhisperTranscriber.cpp
     src/selftests/WhisperWordTimingSelftest.cpp
     src/selftests/CaptionOverlayBuilderSelftest.cpp
+    src/selftests/caption_edit_selftest.cpp
     src/WhisperTranscribeDialog.h
     src/WhisperTranscribeDialog.cpp
     src/selftests/whisper_transcribe_selftest.cpp

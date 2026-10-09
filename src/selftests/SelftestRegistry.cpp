@@ -74,6 +74,7 @@ int runCameraSolveSelftest();
 int runCamtrackSolveSelftest();
 int runCamtrackUiSelftest();
 int runCapcutCaptionSelftest();
+int runCaptionEditSelftest();
 int runCaptionOverlayBuilderSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
@@ -1042,6 +1043,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Whisper transcription service scaffold smoke" },
     { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, true,
       "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary checks" },
+    { "caption-edit",     "VEDITOR_CAPTION_EDIT_SELFTEST",       runCaptionEditSelftest,        true,
+      "Caption split/merge pure functions and editor dialog buttons (6 gates)" },
     { "caption-overlay-builder", "VEDITOR_CAPTION_OVERLAY_BUILDER_SELFTEST", runCaptionOverlayBuilderSelftest, true,
       "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary checks" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
