@@ -38,7 +38,9 @@ namespace {
 
 QString gSyntheticClipPath;
 
-bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80, 160))
+// lumaStep > 0 writes frame n as uniform gray of luma lumaStep * n instead of `color`.
+bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80, 160),
+                        int lumaStep = 0, int frameCount = 20)
 {
     libavcore::EncodeRequest request;
     request.width = 64;
@@ -55,8 +57,10 @@ bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80
     if (encoder.open(request)) return false;
     QImage frame(64, 64, QImage::Format_RGB888);
     frame.fill(color);
-    for (int i = 0; i < 20; ++i)
+    for (int i = 0; i < frameCount; ++i) {
+        if (lumaStep > 0) frame.fill(QColor(lumaStep * i, lumaStep * i, lumaStep * i));
         if (!encoder.pushFrame(frame, i)) return false;
+    }
     return !encoder.finalize().has_value() && QFile::exists(path);
 }
 
@@ -449,7 +453,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 26;
+    constexpr int kRotoGateCount = 28;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -1567,6 +1571,8 @@ int runRotoSelftest()
     // (entry left on the source key) or loses it on undo; (d) pins the known
     // limitation that decompose does not restore the entry.
     const QString ffmpegPath = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
+    bool g21Ran = false;
+    bool g21Passed = false;
     QString proresUnavailable;
     if (ffmpegPath.isEmpty()) {
         gates.skip(21, "ffmpeg.exe not found (the linked-audio prefix case needs the export mix)");
@@ -1762,7 +1768,8 @@ int runRotoSelftest()
             }
             g21 = g21 && f;
         }
-        gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose limitation mismatch");
+        g21Ran = true;
+        g21Passed = gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose limitation mismatch");
     }
 
     // ── G22-G25 (US-915): cross-track drop through TimelineTrack::dropEvent.
@@ -1953,6 +1960,217 @@ int runRotoSelftest()
                        && touched && uncachedOpens == 1 && std::abs(uncachedFps - 10.0) < 0.01
                        && cachedFps == uncachedFps && lastIndex == expectedLastIndex,
                    "roto fps probe reopened the media per frame or the cached fps differs from a real probe");
+    }
+
+    // ── G27-G28 (US-1003): RenderInPlace bake over the synthetic time-remap
+    // curve (inPoint 0.13, handles 0.2 -> isolated inPoint < 0). Fixture: source
+    // frame n is uniform gray of luma 20*n (n = 0..12, 10 fps); a frame number
+    // is identified from the mean luma inside the opaque roto rect (+-6). The
+    // trim is 0.03 s off the source frame grid, so no source second lands on a
+    // frame start (the fixture's stored pts sit a hair below n/10). Roto keys:
+    // source frame 5 = left rect, 6 = right rect; timeline 0.4 / 0.5 s map to
+    // roto frames 6 / 5 (reversed) and 5 / 6 (forward), across the key boundary.
+    // G27 also bakes a reversed time-remap clip with handles 0.2 and an
+    // untrimmed out point (outPoint 0 = media end 1.3 s; curve srcTime
+    // 0.23 + t, so sourceSec = 1.07 - t, roto frames 6 / 5 at 0.4 / 0.5 s).
+    // G27 also bakes a reversed tail clip (inPoint 0.16, outPoint 0.96, handles
+    // 0.2, 30 fps bake, roto keys 1 = left / 2 = right) at timeline 22/30 and
+    // 23/30 s (sourceSec 0.2267 / 0.1933, the last source frame): the source
+    // timeline shows frame 2 and roto frame llround(1.6) = 2 (right rect).
+    // G27 also bakes a reversed identity-slope time-remap tail clip whose curve
+    // sourceFps (30) differs from the stream rate (10): inPoint 0.16, outPoint
+    // 0.95, handles 0.2, 60 fps bake, roto keys 5 = left / 6 = right (30 fps
+    // frames). At the last two retained ticks 46/60 and 47/60 s (sourceSec
+    // 0.1833 / 0.1667) the source timeline shows frame 2 (first frame at or
+    // after inPoint) and roto frame llround(0.16 * 30) = 5 (left rect).
+    // G27 also bakes a reversed clip with a descending time-remap curve, whose
+    // source time runs forward (inPoint 0.16, outPoint 0.96, keys (0, 0.8) /
+    // (0.8, 0), sourceFps 10, handles 0.2, 40 fps bake, roto keys 1 = left /
+    // 2 = right). At 1/40 and 3/40 s (sourceSec 0.185 / 0.235, inside the
+    // first 1/sourceFps after inPoint) the source timeline samples forward:
+    // frames 2 / 3 and roto frame llround(sourceSec * 10) = 2 (right rect).
+    // G27 detects a reversed bake that samples one source frame later than the
+    // source timeline in the picture and the mask (a2d552e bakes n+1: FAIL),
+    // and a tail bake that reads the lowered isolated inPoint (frame 1 or roto
+    // frame 1 = left rect: FAIL) or picks the tail frame on the sourceFps grid
+    // instead of the stream timestamps (remap tail: frame 1: FAIL), or that
+    // applies the tail rule to forward-running samples (descending: frame 1,
+    // roto frame 1 = left rect: FAIL).
+    // G28 (control) detects a fix that also moves forward bakes: G21 stays PASS
+    // and the forward counterpart of the G27 clip bakes the source frames.
+    QString rampProresUnavailable;
+    if (!selftest::requireEncoder(QStringLiteral("prores_ks"), &rampProresUnavailable)) {
+        gates.skip(27, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+        gates.skip(28, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+    } else {
+        const QString rampPath = media.filePath(QStringLiteral("roto-g27-luma-ramp.mp4"));
+        const bool rampReady = writeSyntheticClip(rampPath, QColor(), 20, 13);
+        RotoClipEntry rampKeyed;
+        RotoKeyframe key5;
+        key5.frameNumber = 5;
+        key5.path = rectPath(6, 8, 30, 56);
+        RotoKeyframe key6;
+        key6.frameNumber = 6;
+        key6.path = rectPath(34, 8, 58, 56);
+        rampKeyed.keyframes = {key5, key6};
+        // rect: 0 = left (key 5), 1 = right (key 6), -1 = neither opaque.
+        struct FrameId {
+            int rect = -1;
+            double luma = -1.0;
+            int frame = -1;
+            int innerAlphaMin = -1;
+            int outerAlphaMax = -1;
+        };
+        const auto identify = [](const QImage &image) {
+            FrameId id;
+            if (image.isNull()) return id;
+            const QImage argb = image.convertToFormat(QImage::Format_ARGB32);
+            // Inner = the rect shrunk by 3 px, outer = beyond the rect grown by 3 px.
+            const int inner[2][4] = {{9, 11, 27, 53}, {37, 11, 55, 53}};
+            const int outer[2][4] = {{3, 5, 33, 59}, {31, 5, 61, 59}};
+            double alphaMean[2] = {0.0, 0.0};
+            for (int r = 0; r < 2; ++r) {
+                int count = 0;
+                for (int y = inner[r][1]; y < inner[r][3]; ++y)
+                    for (int x = inner[r][0]; x < inner[r][2]; ++x, ++count)
+                        alphaMean[r] += qAlpha(argb.pixel(x, y));
+                alphaMean[r] /= count;
+            }
+            const int r = alphaMean[1] > alphaMean[0] ? 1 : 0;
+            if (alphaMean[r] <= 128.0) return id;
+            id.rect = r;
+            const auto in = [&](int x, int y) { return inRect(x, y, inner[r][0], inner[r][1], inner[r][2], inner[r][3]); };
+            const auto out = [&](int x, int y) { return !inRect(x, y, outer[r][0], outer[r][1], outer[r][2], outer[r][3]); };
+            id.luma = meanLuma(argb, in);
+            const int n = int(std::lround(id.luma / 20.0));
+            id.frame = std::abs(id.luma - 20.0 * n) <= 6.0 ? n : -1;
+            id.innerAlphaMin = 255;
+            id.outerAlphaMax = 0;
+            for (int y = 0; y < argb.height(); ++y) {
+                for (int x = 0; x < argb.width(); ++x) {
+                    if (in(x, y)) id.innerAlphaMin = qMin(id.innerAlphaMin, qAlpha(argb.pixel(x, y)));
+                    if (out(x, y)) id.outerAlphaMax = qMax(id.outerAlphaMax, qAlpha(argb.pixel(x, y)));
+                }
+            }
+            return id;
+        };
+        const QVector<double> rampTimes{0.4, 0.5};
+        const QVector<double> tailTimes{22.0 / 30.0, 23.0 / 30.0};
+        const QVector<double> remapTailTimes{46.0 / 60.0, 47.0 / 60.0};
+        const QVector<double> descendingTimes{1.0 / 40.0, 3.0 / 40.0};
+        RotoClipEntry tailKeyed;
+        RotoKeyframe key1 = key5;
+        key1.frameNumber = 1;
+        RotoKeyframe key2 = key6;
+        key2.frameNumber = 2;
+        tailKeyed.keyframes = {key1, key2};
+        struct RampBake {
+            QVector<double> times;
+            bool baked = false;
+            QString error;
+            double inPoint = -1.0;
+            ClipInfo original;
+            FrameId source[2];
+            FrameId bakedId[2];
+        };
+        // remap && tail = the identity-slope remap tail clip at sourceFps 30;
+        // descending (with tail, remap false) = the descending-curve tail clip.
+        const auto bakeRamp = [&](bool reversed, double handlesSec, bool remap, bool tail,
+                                  bool descending = false) {
+            RampBake r;
+            const bool remapTail = remap && tail;
+            r.times = descending ? descendingTimes : remapTail ? remapTailTimes : tail ? tailTimes : rampTimes;
+            ClipInfo video = clip(270);
+            video.filePath = rampPath;
+            video.duration = 1.3;
+            video.inPoint = tail ? 0.16 : 0.13;
+            video.outPoint = remapTail ? 0.95 : tail ? 0.96 : 1.13;
+            video.reversed = reversed;
+            if (descending) {
+                video.timeRemapCurve.keys = {{0.0, 0.8}, {0.8, 0.0}};
+                video.timeRemapCurve.sourceFps = 10.0;
+            } else if (remapTail) {
+                video.timeRemapCurve.keys = {{0.0, 0.0}, {0.79, 0.79}};
+                video.timeRemapCurve.sourceFps = 30.0;
+            } else if (remap) {
+                video.outPoint = 0.0;
+                video.timeRemapCurve.keys = {{0.0, 0.23}, {0.8, 1.03}};
+                video.timeRemapCurve.sourceFps = 10.0;
+            }
+            r.original = video;
+            Timeline tl;
+            tl.restoreFromProject(oneTrack({video}), QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 10);
+            tl.setRotoEntries(rotoAt(QStringLiteral("0:0"), tail && !remapTail ? tailKeyed : rampKeyed));
+            for (int i = 0; i < r.times.size(); ++i)
+                r.source[i] = identify(renderAt(&tl, r.times[i]));
+            renderinplace::Options options;
+            options.handlesSec = handlesSec;
+            options.outputDir = temporary.path();
+            options.outputSize = frameSize;
+            options.fps = descending ? 40.0 : remapTail ? 60.0 : tail ? 30.0 : 10.0;
+            QString path;
+            r.baked = renderinplace::renderClipInPlace(tl, 0, 0, options, &path, &r.error);
+            if (!r.baked) return r;
+            r.inPoint = tl.videoTracks()[0]->clips()[0].inPoint;
+            for (int i = 0; i < r.times.size(); ++i)
+                r.bakedId[i] = identify(libavcore::grabFrameAt(path, r.inPoint + r.times[i]));
+            return r;
+        };
+        // Expected source frames / rects are literals (sanity band): reversed
+        // shows the last frame before 1.13 - t (remap: 1.07 - t), forward the
+        // first frame at 0.13 + t; the rect follows the roto frame llround(sourceSec * 10)
+        // (one frame earlier when reversed); the reversed tail clamps the roto
+        // second to inPoint 0.16 (roto frame 2; remap tail at 30 fps: frame 5);
+        // the descending clip runs forward (first frame at 0.16 + t, no offset).
+        const auto rampMatches = [&](const char *label, const RampBake &r, double handlesSec,
+                                     const int (&expectedFrame)[2], const int (&expectedRect)[2]) {
+            bool ok = rampReady && r.baked && std::abs(r.inPoint - handlesSec) <= 1e-6;
+            std::cerr << label << " rampReady=" << rampReady << " baked=" << r.baked
+                      << " error=" << r.error.toStdString() << " replacementInPoint=" << r.inPoint
+                      << " (expected " << handlesSec << ")\n";
+            for (int i = 0; i < r.times.size(); ++i) {
+                const double timelineSec = r.times[i];
+                const double localSec = timelineSec;
+                const double sourceSec = r.original.sourceSecondAtLocalTime(localSec);
+                const FrameId &s = r.source[i];
+                const FrameId &b = r.bakedId[i];
+                const bool sourceSane = s.frame == expectedFrame[i] && s.rect == expectedRect[i];
+                const bool same = b.frame == s.frame && b.rect == s.rect
+                    && b.innerAlphaMin == 255 && b.outerAlphaMax == 0;
+                std::cerr << label << " timelineSec=" << timelineSec << " localSec=" << localSec
+                          << " sourceSec=" << sourceSec << " expectedFrame=" << expectedFrame[i]
+                          << " expectedRect=" << expectedRect[i]
+                          << " sourceFrame=" << s.frame << " (luma " << s.luma << ", rect " << s.rect
+                          << ") bakedFrame=" << b.frame << " (luma " << b.luma << ", rect " << b.rect
+                          << ") baked innerAlphaMin=" << b.innerAlphaMin << " (== 255) outerAlphaMax="
+                          << b.outerAlphaMax << " (== 0) -> sourceSane=" << sourceSane
+                          << " same=" << same << '\n';
+                ok = ok && sourceSane && same;
+            }
+            return ok;
+        };
+        const bool g27Handles = rampMatches("G27 reversed+handles0.2", bakeRamp(true, 0.2, false, false), 0.2,
+                                            {7, 6}, {1, 0});
+        const bool g27Remap = rampMatches("G27 reversed+remap+handles0.2", bakeRamp(true, 0.2, true, false), 0.2,
+                                          {6, 5}, {1, 0});
+        const bool g27Tail = rampMatches("G27 reversed+handles0.2+tail30fps", bakeRamp(true, 0.2, false, true), 0.2,
+                                         {2, 2}, {1, 1});
+        const bool g27RemapTail = rampMatches("G27 reversed+remap30+handles0.2+tail60fps",
+                                              bakeRamp(true, 0.2, true, true), 0.2, {2, 2}, {0, 0});
+        const bool g27Descending = rampMatches("G27 reversed+descendingRemap+handles0.2+tail40fps",
+                                               bakeRamp(true, 0.2, false, true, true), 0.2, {2, 3}, {1, 1});
+        std::cerr << "G27 handles=" << g27Handles << " remap=" << g27Remap << " tail=" << g27Tail
+                  << " remapTail=" << g27RemapTail << " descending=" << g27Descending << '\n';
+        gates.gate(27, g27Handles && g27Remap && g27Tail && g27RemapTail && g27Descending,
+                   "reversed bake picture or roto frame differs from the source timeline");
+        if (!g21Ran) {
+            gates.skip(28, "ffmpeg.exe not found (G21 did not run)");
+        } else {
+            const bool forward = rampMatches("G28 forward+handles0.2", bakeRamp(false, 0.2, false, false), 0.2,
+                                             {6, 7}, {0, 1});
+            std::cerr << "G28 G21=" << (g21Passed ? "PASS" : "FAIL") << " forward=" << forward << '\n';
+            gates.gate(28, g21Passed && forward, "forward bake control: G21 failed or the forward bake moved");
+        }
     }
     return gates.finish("roto");
 }
