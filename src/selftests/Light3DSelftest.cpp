@@ -626,9 +626,16 @@ int runLight3DSelftest()
     dialog.setLights(threeLights);
     tally.gate(15,
         dialogChanges == 0,
-        "rebuilding the light list emitted settingsChanged");
+        std::string("dialogChanges=") + std::to_string(dialogChanges)
+            + " (rebuilding the light list must not emit settingsChanged)");
 
     bool selectionGate = false;
+    bool opened = false;
+    bool dialogFound = false;
+    bool diffuseFound = false;
+    int selectedClipCount = -1;
+    double firstDiffuseCoeff = -1.0;
+    double secondDiffuseCoeff = -1.0;
     {
         MainWindow window;
         Timeline *timeline = window.findChild<Timeline *>();
@@ -648,19 +655,25 @@ int runLight3DSelftest()
             track->setSelectedClip(0);
             QCoreApplication::processEvents();
 
-            const bool opened = QMetaObject::invokeMethod(
+            opened = QMetaObject::invokeMethod(
                 &window, "openLight3DDialog", Qt::DirectConnection);
             auto *lightDialog = window.findChild<Light3DDialog *>();
+            dialogFound = lightDialog != nullptr;
             track->setSelectedClip(1);
             QCoreApplication::processEvents();
             auto *diffuse = lightDialog
                 ? lightDialog->findChild<QDoubleSpinBox *>(
                       QStringLiteral("light3dDiffuseCoeff"))
                 : nullptr;
-            if (opened && lightDialog && diffuse) {
+            diffuseFound = diffuse != nullptr;
+            const bool editorReady = opened && lightDialog && diffuse;
+            if (editorReady) {
                 diffuse->setValue(0.75);
                 QCoreApplication::processEvents();
                 const auto clips = track->clips();
+                selectedClipCount = static_cast<int>(clips.size());
+                if (selectedClipCount > 0) firstDiffuseCoeff = clips[0].material.diffuseCoeff;
+                if (selectedClipCount > 1) secondDiffuseCoeff = clips[1].material.diffuseCoeff;
                 selectionGate = clips.size() == 2
                     && closeTo(clips[0].material.diffuseCoeff, 0.10)
                     && closeTo(clips[1].material.diffuseCoeff, 0.75);
@@ -671,7 +684,13 @@ int runLight3DSelftest()
     }
     tally.gate(16,
         selectionGate,
-        "material edit followed the dialog-open clip instead of the current selection");
+        QStringLiteral("opened=%1 dialog=%2 diffuse=%3 clips.size()=%4 diffuseCoeff[0]=%5 "
+                       "diffuseCoeff[1]=%6 (material edit followed the dialog-open clip instead "
+                       "of the current selection)")
+            .arg(opened).arg(dialogFound).arg(diffuseFound).arg(selectedClipCount)
+            .arg(firstDiffuseCoeff, 0, 'g', 17)
+            .arg(secondDiffuseCoeff, 0, 'g', 17)
+            .toStdString());
 
     return tally.finish("light3d");
 }
