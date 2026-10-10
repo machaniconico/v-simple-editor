@@ -11671,8 +11671,26 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             srcPartnerTrack->removeClipPreservingDownstream(ci);
             targetTrack->insertClipPreservingDownstream(plan.insertIdx, partnerClip, plan.newLeadIn);
             // RM-5: remap carrier after cross-track move changed clip indices.
-            remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
-            remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+            if (destIsVideo) {
+                // Audio partner: no video key moved, the snapshot walk is exact.
+                remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+                remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+            } else {
+                // Video partner moved V[ti]:ci -> V[destIdx]:insertIdx. The
+                // snapshot walk aligns within a track and would prune its keys,
+                // so roto / parent take the explicit map. The memo then records
+                // that roto already matches this placement, so the matte
+                // helper below does not remap roto a second time; the matte
+                // carrier itself still goes through the snapshot walk.
+                remapCarriersAfterCrossTrackMove(ti, ci, destIdx, plan.insertIdx);
+                {
+                    const TrackClipSnapshot after = snapshotTrackClips(this);
+                    QMutexLocker lock(&m_rotoMutex);
+                    m_rotoRemapMemoAfter = after;
+                    m_rotoRemapMemoValid = true;
+                }
+                remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+            }
             return;  // Only one partner per linkGroup on the other track type
         }
     }
@@ -11681,6 +11699,7 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
 void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
                                                 int destTrackIdx, int destIdx)
 {
+    ++m_crossTrackMoveRemapCount;
     if (srcTrackIdx < 0 && destTrackIdx < 0) return;   // audio -> audio: no keys
     // Called after the move: the source track lost one clip, the destination
     // gained one. An empty value drops the key (a video clip moved to audio).

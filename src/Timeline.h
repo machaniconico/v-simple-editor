@@ -1325,6 +1325,8 @@ public:
     void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
     QHash<QString, RotoClipEntry> rotoEntries() const;
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
+    // Calls of remapCarriersAfterCrossTrackMove on this Timeline (selftest).
+    quint64 crossTrackMoveRemapCountForTest() const { return m_crossTrackMoveRemapCount; }
 signals:
     void skimPreviewRequested(const QImage &image);
     void skimPreviewCleared();
@@ -1460,6 +1462,7 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
+    quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
@@ -1585,7 +1588,8 @@ private:
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
-    // Explicit index map for one clip moved between tracks by dropEvent:
+    // Explicit index map for one clip moved between tracks by dropEvent, or
+    // for the linked video partner moved by handleCrossTrackLinkedDrop:
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
     // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
     // -1 for an audio track (not keyed). Applies to roto and clip-parent

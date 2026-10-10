@@ -455,7 +455,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 32;
+    constexpr int kRotoGateCount = 33;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -1820,34 +1820,48 @@ int runRotoSelftest()
                    "unlinked cross-track drop did not remap roto / parent keys");
     }
 
-    // G23 detects the linked path re-aligning roto / parent after the audio
-    // partner move (handleCrossTrackLinkedDrop) and losing the explicit map.
+    // G23 (US-1007): the audio partner of V2:1 is dropped from A1 on A3, so
+    // handleCrossTrackLinkedDrop moves the video clip V2:1 -> V3:1. Its roto /
+    // parent keys take the G22 map (remapCarriersAfterCrossTrackMove, 2 calls:
+    // the audio main move and the video partner). The matte carrier is printed
+    // but not asserted (snapshot walk, prunes until US-1009). Detects the
+    // snapshot walk pruning the moved partner's keys (HEAD: roto marker 2 and
+    // the parent link 2:1>2:2 are dropped, so this gate FAILs).
     {
         Timeline tl;
         seedCrossDrop(tl, true);
-        TimelineTrack *dest = tl.videoTracks()[2];
-        QString rotoAtSignal, parentAtSignal;
-        QObject::connect(dest, &TimelineTrack::clipMovedAcrossTracks, &tl,
-            [&](TimelineTrack *, int, int) {
-                rotoAtSignal = rotoLayout(tl.rotoEntries());
-                parentAtSignal = parentLayout(tl.clipParentEntries());
-            });
-        QSignalSpy linkedSpy(dest, &TimelineTrack::crossTrackDropped);
-        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, dest, 3.0, true, nullptr);
-        int partnerTrack = -1;
-        for (int t = 0; t < tl.audioTracks().size(); ++t)
-            for (const ClipInfo &c : tl.audioTracks()[t]->clips())
-                if (c.linkGroup == clip(11).linkGroup) partnerTrack = t;
-        const bool mapped = crossMapped(tl, "G23 after-partner");
-        const bool stable = rotoAtSignal == rotoLayout(tl.rotoEntries())
-            && parentAtSignal == parentLayout(tl.clipParentEntries());
-        std::cerr << "G23 accepted=" << accepted << " crossTrackDropped=" << linkedSpy.count()
-                  << " partnerAudioTrack=" << partnerTrack << " (expected 2, from 0)"
-                  << " rotoAtSignal=" << rotoAtSignal.toStdString()
-                  << " parentAtSignal=" << parentAtSignal.toStdString()
-                  << " stableAfterPartnerMove=" << stable << '\n';
-        gates.gate(23, accepted && linkedSpy.count() == 1 && partnerTrack == 2 && mapped && stable,
-                   "linked cross-track drop map differs or partner move changed roto / parent keys");
+        tl.addAudioTrack(false);
+        tl.addAudioTrack(false);
+        TimelineTrack *srcAudio = tl.audioTracks()[0];
+        TimelineTrack *destAudio = tl.audioTracks()[2];
+        const QString rotoPre = rotoLayout(tl.rotoEntries());
+        const QString parentPre = parentLayout(tl.clipParentEntries());
+        const QString mattePre = show(keys(tl.trackMatteEntries()));
+        QSignalSpy linkedSpy(destAudio, &TimelineTrack::crossTrackDropped);
+        const quint64 remapBefore = tl.crossTrackMoveRemapCountForTest();
+        const bool accepted = driveCrossDrop(srcAudio, 0, destAudio, 3.0, true, nullptr);
+        const quint64 remapCalls = tl.crossTrackMoveRemapCountForTest() - remapBefore;
+        const bool partnerOnA3 = srcAudio->clipCount() == 0 && destAudio->clipCount() == 1
+            && destAudio->clips()[0].linkGroup == clip(11).linkGroup;
+        const auto rotos = tl.rotoEntries();
+        const QString roto = rotoLayout(rotos);
+        const QString parent = parentLayout(tl.clipParentEntries());
+        const bool moved = droppedIntoV3(tl);
+        const bool mapped = moved && roto == crossRotoAfter && invariant(rotos)
+            && parent == crossParentAfter;
+        std::cerr << "G23 before roto=" << rotoPre.toStdString()
+                  << " parent=" << parentPre.toStdString() << " matte=" << mattePre.toStdString() << '\n'
+                  << "G23 after accepted=" << accepted << " crossTrackDropped=" << linkedSpy.count()
+                  << " audioPartnerOnA3=" << partnerOnA3 << " videoMovedV2:1->V3:1=" << moved
+                  << " roto=" << roto.toStdString() << " (expected " << crossRotoAfter.toStdString() << ")"
+                  << " clipIdOk=" << invariant(rotos)
+                  << " parent=" << parent.toStdString() << " (expected " << crossParentAfter.toStdString() << ")"
+                  << " matte=" << show(keys(tl.trackMatteEntries())).toStdString() << " (not asserted, US-1009)"
+                  << " marker2At=" << whereMarker(rotos, 2).toStdString() << " (expected 2:1)"
+                  << " remapCalls=" << remapCalls << " (expected 2) -> " << mapped << '\n';
+        gates.gate(23, rotoPre == crossRotoBefore && parentPre == crossParentBefore && accepted
+                           && linkedSpy.count() == 1 && partnerOnA3 && mapped && remapCalls == 2,
+                   "linked partner drop on A3 did not carry the video partner's roto / parent keys to V3");
     }
 
     // G24 (US-1006): a cross-track drop pushes exactly one undo entry, taken at
@@ -2550,6 +2564,47 @@ int runRotoSelftest()
             && audioTracksAfterB == 3 && partnerA3After && !partnerA2After && backB;
         gates.gate(32, gateA && gateB,
                    "cross-track drop not undone in one step (unlinked, or linked with track creation)");
+    }
+
+    // ── G33 (US-1007): negative control for G23. The main clip V2:1 is dropped on
+    // V3 and its audio partner moves A2 -> A3 (dest is video: snapshot path).
+    // The video keys equal the G22 map, are unchanged since the main-move
+    // signal, and remapCarriersAfterCrossTrackMove runs once (the main move).
+    // Detects the partner branch running the explicit map for an audio partner
+    // (remapCalls 2) or re-aligning the main move's keys (stable 0).
+    {
+        Timeline tl;
+        seedCrossDrop(tl, true, true);
+        TimelineTrack *dest = tl.videoTracks()[2];
+        QString rotoAtSignal, parentAtSignal;
+        quint64 remapAtSignal = 0;
+        const quint64 remapBefore = tl.crossTrackMoveRemapCountForTest();
+        QObject::connect(dest, &TimelineTrack::clipMovedAcrossTracks, &tl,
+            [&](TimelineTrack *, int, int) {
+                rotoAtSignal = rotoLayout(tl.rotoEntries());
+                parentAtSignal = parentLayout(tl.clipParentEntries());
+                remapAtSignal = tl.crossTrackMoveRemapCountForTest() - remapBefore;
+            });
+        QSignalSpy linkedSpy(dest, &TimelineTrack::crossTrackDropped);
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, dest, 3.0, true, nullptr);
+        const quint64 remapCalls = tl.crossTrackMoveRemapCountForTest() - remapBefore;
+        int partnerTrack = -1;
+        for (int t = 0; t < tl.audioTracks().size(); ++t)
+            for (const ClipInfo &c : tl.audioTracks()[t]->clips())
+                if (c.linkGroup == clip(11).linkGroup) partnerTrack = t;
+        const bool mapped = crossMapped(tl, "G33 after-partner");
+        const bool stable = rotoAtSignal == rotoLayout(tl.rotoEntries())
+            && parentAtSignal == parentLayout(tl.clipParentEntries());
+        std::cerr << "G33 accepted=" << accepted << " crossTrackDropped=" << linkedSpy.count()
+                  << " partnerAudioTrack=" << partnerTrack << " (expected 2, from 1)"
+                  << " rotoAtSignal=" << rotoAtSignal.toStdString()
+                  << " parentAtSignal=" << parentAtSignal.toStdString()
+                  << " stableAfterPartnerMove=" << stable
+                  << " remapCallsAtSignal=" << remapAtSignal << " remapCalls=" << remapCalls
+                  << " (expected 1/1)\n";
+        gates.gate(33, accepted && linkedSpy.count() == 1 && partnerTrack == 2 && mapped && stable
+                           && remapAtSignal == 1 && remapCalls == 1,
+                   "audio partner move re-mapped the video keys or called the explicit map");
     }
 
     return gates.finish("roto");
