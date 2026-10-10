@@ -181,6 +181,7 @@ int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMainWindowLifecycleSelftest();
 int runMatte16ParitySelftest();
+int runMatteSsotSelftest();
 int runMcpSelftest();
 int runMediaPoolDragSelftest();
 int runMediaPoolRatingSelftest();
@@ -909,6 +910,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "preview16 policy predicate checks" },
     { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
       "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
+    { "matte-ssot", "VEDITOR_MATTE_SSOT_SELFTEST", runMatteSsotSelftest, true,
+      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (3 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,

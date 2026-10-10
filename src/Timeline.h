@@ -1311,17 +1311,16 @@ public:
     // tlrender::renderClipId). renderFrameAt reads ONLY this — never a live
     // MainWindow off the worker thread (kills the C2 data race + C1
     // edit≠export divergence on the queue/file export path).
-    void setTrackMatteEntries(const QHash<QString, TimelineTrackMatteEntry> &entries) {
-        m_trackMatteEntries = entries;
-    }
+    void setTrackMatteEntries(const QHash<QString, TimelineTrackMatteEntry> &entries);
     // RM-3: return BY VALUE (a cheap Qt copy-on-write snapshot), NOT a
     // const reference. The RenderQueue worker thread reads this while the
     // GUI thread may call setTrackMatteEntries(); handing back a reference
     // let a reader observe a half-reassigned QHash (data race). A value
     // return atomically detaches a stable snapshot for the reader.
-    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const {
-        return m_trackMatteEntries;
-    }
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries() const;
+    // MainWindow's direct track->setClips edits use this one catch-all after
+    // taking a pre-mutation snapshot. It updates roto, matte, and parents.
+    void remapCarriersAfterExternalMutation(const TrackClipSnapshot &before);
     void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
     QHash<QString, RotoClipEntry> rotoEntries() const;
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
@@ -1393,6 +1392,8 @@ private slots:
     void onPlayheadAutoScrollTick();
 
 private:
+    void commitTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry> next);
+    void remapTrackMatteLocked(const TrackClipSnapshot &before);
     void commitRotoEntries(QHash<QString, RotoClipEntry> next, bool clearMemo);
     ClipInfo copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups);
     double m_nudgeFrameRate = 30.0;
@@ -1457,6 +1458,7 @@ private:
     int m_activeVideoTrackIndex = -1; // last video row that originated selection
     // TM-8: track-matte wiring carried by the Timeline (see
     // setTrackMatteEntries). Keyed by "trackIdx:clipIdx".
+    mutable QMutex m_trackMatteMutex;
     QHash<QString, TimelineTrackMatteEntry> m_trackMatteEntries;
     mutable QMutex m_rotoMutex;
     QHash<QString, RotoClipEntry> m_rotoEntries;
