@@ -486,5 +486,38 @@ int runMixerDockSelftest()
                    && error <= kTapTolerance && remaining == 0
                    && mixer->tapCopyCountForTest() == 3, detail);
     }
+    {
+        // A decoder stall returns a zeroed block to the sink without moving the
+        // clock; the tap must receive that silence too, or the spectrum keeps
+        // showing the previous block. Detects the stall return skipping the tap
+        // (0 frames, copy delta 0). An advancing clock means the stall branch
+        // was not taken, which fails rather than passing vacuously.
+        auto mixer = std::make_unique<AudioMixer>();
+        Timeline timeline;
+        wire(timeline, *mixer);
+        fixture(timeline, source);
+        mixer->setSequence(timeline.computeAudioPlaybackSequence());
+        mixer->subscribeMasterTap();
+        const auto tone = sineBlock(0.5);
+        mixer->publishMasterBlockForTest(tone.data(), 4800);
+        QVector<float> tap;
+        const int drained = mixer->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        const quint64 copiesBefore = mixer->tapCopyCountForTest();
+        const qint64 clockBefore = mixer->masterClockUs();
+        const auto pcm = mixer->pullStalledBlockForTest(480);
+        const qint64 clockAfter = mixer->masterClockUs();
+        const quint64 copyDelta = mixer->tapCopyCountForTest() - copiesBefore;
+        const int taken = mixer->takeMasterTap(&tap, AudioMixer::kMasterTapFrames);
+        double maxAbs = 0.0;
+        for (float value : tap) maxAbs = std::max(maxAbs, std::abs(double(value)));
+        const std::string detail = QString::asprintf(
+            "drained=%d pcmBytes=%lld taken=%d maxAbs=%g clockBefore=%lld clockAfter=%lld copyDelta=%llu",
+            drained, static_cast<long long>(pcm.size()), taken, maxAbs,
+            static_cast<long long>(clockBefore), static_cast<long long>(clockAfter),
+            static_cast<unsigned long long>(copyDelta)).toStdString();
+        tally.gate(10, sourceOk && drained == 4800 && pcm.size() == 480 * AudioMixer::kBytesPerFrame
+                   && clockAfter == clockBefore && copyDelta == 1 && taken == 480
+                   && maxAbs == 0.0, detail);
+    }
     return tally.finish("mixer-dock");
 }

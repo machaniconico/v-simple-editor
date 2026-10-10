@@ -168,6 +168,9 @@ public:
     // Production readData probe with the hardware sink stopped. Consumes the
     // sequence from zero and stops the decode worker; dedicated test mixers only.
     QByteArray renderPcmForTest(int frames);
+    // One readData pull after seekTo(0) without refilling the rings, so an
+    // entry active at zero takes the decoder-stall return. Same constraints.
+    QByteArray pullStalledBlockForTest(int frames);
 
     // Bus / submix / aux-send routing (AB-4). Replaces the per-track →
     // master bus-gain map consulted in the mix loop. The routing object is

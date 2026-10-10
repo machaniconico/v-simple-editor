@@ -1422,6 +1422,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // chance to refill before this stall budget runs out.
         if (m_mixer->m_decodeRunner) m_mixer->m_decodeRunner->wake();
         if (stalls < kMaxStallCallbacks) {
+            // The sink still receives this zeroed block; feed it to the master tap
+            // like the final write below so tap readers see the silence.
+            m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
             return maxlen;
         }
         // Fall through and advance the cursor so video can keep moving.
@@ -1490,8 +1493,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
-    // Master tap: the single write point, fed with the final s16 block the
-    // sink receives. No copy without subscribers; never blocks this thread.
+    // Master tap: fed with the final s16 block the sink receives (the stall
+    // return above feeds its zeroed block the same way). No copy without
+    // subscribers; never blocks this thread.
     m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
     return maxlen;
 }
@@ -2347,6 +2351,30 @@ QByteArray AudioMixer::renderPcmForTest(int frames)
         }
     }
     m_playing.store(false, std::memory_order_release);
+    return result;
+}
+
+QByteArray AudioMixer::pullStalledBlockForTest(int frames)
+{
+    if (frames <= 0 || frames > kSampleRateHz || isPlaying()
+        || (m_sink && m_sink->state() != QAudio::StoppedState))
+        return {};
+    // Same set-up as renderPcmForTest, but no refillRings(): an entry active
+    // at zero keeps an empty ring, so this one pull takes the stall return.
+    if (m_decodeRunner) {
+        m_decodeRunner->requestStop();
+        m_decodeRunner->wait();
+        delete m_decodeRunner;
+        m_decodeRunner = nullptr;
+    }
+    seekTo(0);
+    MixerIODevice io(this);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QByteArray result(frames * kBytesPerFrame, '\0');
+    m_playing.store(true, std::memory_order_release);
+    if (io.read(result.data(), result.size()) != result.size()) result.clear();
+    m_playing.store(false, std::memory_order_release);
+    m_consecutiveStallCallbacks.store(0, std::memory_order_release);
     return result;
 }
 
