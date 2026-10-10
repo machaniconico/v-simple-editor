@@ -4389,6 +4389,21 @@ void MainWindow::setupUI()
     }
 }
 
+namespace {
+// The legacy 3-band EQ of one track in collectTrackState's per-track keys. Only
+// the two undo entries of an EQ migration carry it (audio FX sidecar key
+// "legacyEq"): legacy EQ writes record no undo, so other entries leave it alone.
+QJsonObject legacyEqUndoState(AudioMixer *mixer, int track)
+{
+    const AudioEQConfig cfg = mixer->trackEqConfig(track);
+    QJsonArray bands;
+    for (const auto &band : cfg.bands)
+        bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
+    return QJsonObject{{"eqEnabled", mixer->trackEqEnabled(track)},
+                       {"preamp", cfg.preamp}, {"bands", bands}};
+}
+} // namespace
+
 void MainWindow::setupMenuBar()
 {
     // ファイル メニュー
@@ -5496,6 +5511,7 @@ void MainWindow::setupMenuBar()
     // Track EQ submenu — rebuilt on aboutToShow with one entry per
     // audio track, each exposing the 5 built-in EQ presets.
     auto *trackEqMenu = audioMenu->addMenu("Track EQ");
+    trackEqMenu->setObjectName(QStringLiteral("trackEqMenu"));
     connect(trackEqMenu, &QMenu::aboutToShow, this, [this, trackEqMenu]() {
         trackEqMenu->clear();
         if (!m_timeline) return;
@@ -5536,6 +5552,66 @@ void MainWindow::setupMenuBar()
                 statusBar()->showMessage(
                     QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
            });
+            // Explicit migration only (projects are never converted on load):
+            // the legacy EQ moves into the trackfx chain's 4-band EQ as one undo.
+            auto *migrateAct = trackSub->addAction("4 バンド EQ へ移行");
+            migrateAct->setObjectName(QStringLiteral("trackEqMigrateTo4Band"));
+            connect(migrateAct, &QAction::triggered, this,
+                    [this, mixer, ti2]() {
+                if (!mixer || !m_timeline) return;
+                const AudioEQConfig legacy = mixer->trackEqConfig(ti2);
+                if (!mixer->trackEqEnabled(ti2) || legacy.isDefault()) {
+                    statusBar()->showMessage(
+                        QString("A%1 の旧 EQ は使われていません").arg(ti2 + 1), 3000);
+                    return;
+                }
+                trackfx::Chain chain = mixer->trackChain(ti2);
+                if (!trackfx::eqFromLegacy(legacy, &chain.eq)) {
+                    statusBar()->showMessage(
+                        QString("A%1: この EQ 設定は 4 バンド EQ で表現できません (preamp / 3 帯以上)")
+                            .arg(ti2 + 1), 3000);
+                    return;
+                }
+                // The legacy EQ runs after the whole trackfx chain, the 4-band EQ
+                // before its de-esser / compressor / reverb (same predicates as
+                // trackfx::Processor): with any of them active the order changes.
+                const trackfx::Chain live = mixer->trackChain(ti2);
+                if (live.deesser.enabled
+                    || (live.compEnabled && live.comp.enabled && live.comp.ratio > 1.0001)
+                    || (live.reverbEnabled && live.reverb.enabled && live.reverb.mixRatio > 1e-6)) {
+                    statusBar()->showMessage(
+                        QString("A%1: ディエッサー / コンプレッサー / リバーブが有効なため 4 バンド EQ へ移行できません (処理順が変わります)")
+                            .arg(ti2 + 1), 3000);
+                    return;
+                }
+                chain.eqEnabled = true;
+                // Pin the legacy EQ on the entry before and after the migration;
+                // the current entry also takes the live chains, since legacy EQ
+                // writes record no undo (as applyAudioState refreshes on load).
+                const QString key = QString::number(ti2);
+                UndoManager *undo = m_timeline->undoManager();
+                int index = undo->currentIndex();
+                if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()) {
+                    // Keep the pins of earlier migrations on this entry (other tracks).
+                    QJsonObject pins = m_mediaRelinkSidecarHistory[index]
+                                           .audioFx.value("legacyEq").toObject();
+                    pins.insert(key, legacyEqUndoState(mixer, ti2));
+                    QJsonObject before = audiofxui::undoState(mixer);
+                    before.insert("legacyEq", pins);
+                    m_mediaRelinkSidecarHistory[index].audioFx = before;
+                }
+                mixer->setTrackChain(ti2, chain);
+                mixer->setTrackEqEnabled(ti2, false);
+                mixer->setTrackEqConfig(ti2, AudioEQConfig{});
+                reseedAudioFxDocks();
+                m_timeline->saveUndoState(QStringLiteral("EQ を 4 バンドへ移行"));
+                index = undo->currentIndex();
+                if (index >= 0 && index < m_mediaRelinkSidecarHistory.size())
+                    m_mediaRelinkSidecarHistory[index].audioFx.insert(
+                        "legacyEq", QJsonObject{{key, legacyEqUndoState(mixer, ti2)}});
+                statusBar()->showMessage(
+                    QString("A%1 EQ → 4 バンド EQ").arg(ti2 + 1), 3000);
+            });
         }
     });
 
@@ -9689,12 +9765,17 @@ void MainWindow::captureMediaRelinkSidecarsAtCurrentUndoIndex()
     const int index = m_timeline->undoManager()->currentIndex();
     if (index < 0)
         return;
+    // An EQ migration's legacy EQ pins stay on the entry (restore needs them).
+    const QJsonValue legacyEq = index < m_mediaRelinkSidecarHistory.size()
+        ? m_mediaRelinkSidecarHistory.at(index).audioFx.value("legacyEq") : QJsonValue();
     if (m_mediaRelinkSidecarHistory.size() <= index)
         m_mediaRelinkSidecarHistory.resize(index + 1);
     auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    QJsonObject audioFx = mixer ? audiofxui::undoState(mixer) : QJsonObject{};
+    if (mixer && legacyEq.isObject())
+        audioFx.insert("legacyEq", legacyEq);
     m_mediaRelinkSidecarHistory[index] = {
-        m_projectOverlays, m_particleClipConfigs,
-        mixer ? audiofxui::undoState(mixer) : QJsonObject{}
+        m_projectOverlays, m_particleClipConfigs, audioFx
     };
 }
 
@@ -19951,9 +20032,11 @@ void MainWindow::connectAudioFxDockUndo(Panel *panel, const QString &tag)
         auto *mixer = m_player ? m_player->audioMixer() : nullptr;
         if (!mixer || !m_timeline) return;
         const int index = m_timeline->undoManager()->currentIndex();
-        if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()
-            && m_mediaRelinkSidecarHistory[index].audioFx == audiofxui::undoState(mixer))
-            return;
+        if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()) {
+            QJsonObject recorded = m_mediaRelinkSidecarHistory[index].audioFx;
+            recorded.remove(QStringLiteral("legacyEq")); // pinned by the EQ migration
+            if (recorded == audiofxui::undoState(mixer)) return;
+        }
         m_timeline->saveUndoState(tag);
     });
 }
@@ -19979,6 +20062,21 @@ void MainWindow::restoreAudioFxUndoState(const QJsonObject &audioFx)
         auto master = trackfx::Chain::fromJson(audioFx.value("masterChain").toObject());
         master.deesser.listen = mixer->masterChain().deesser.listen;
         mixer->setMasterChain(master.eq, master.eqEnabled, master.deesser);
+    }
+    const QJsonObject legacyEq = audioFx.value("legacyEq").toObject();
+    for (auto it = legacyEq.begin(); it != legacyEq.end(); ++it) {
+        const int track = it.key().toInt();
+        const QJsonObject state = it.value().toObject();
+        if (legacyEqUndoState(mixer, track) == state) continue;
+        AudioEQConfig cfg;
+        cfg.preamp = state.value("preamp").toDouble();
+        for (const QJsonValue &value : state.value("bands").toArray()) {
+            const QJsonObject band = value.toObject();
+            cfg.bands.append(EQBand{band.value("frequency").toDouble(),
+                                    band.value("gain").toDouble(), band.value("q").toDouble()});
+        }
+        mixer->setTrackEqConfig(track, cfg);
+        mixer->setTrackEqEnabled(track, state.value("eqEnabled").toBool());
     }
     reseedAudioFxDocks();
 }

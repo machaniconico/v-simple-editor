@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 
+struct AudioEQConfig;
+
 namespace trackfx {
 struct EqBand {
     double freq;
@@ -19,6 +21,11 @@ struct EqSettings {
     EqBand highMid{3000.0, 0.0, 1.0};
     EqBand high{10000.0, 0.0, 0.7};
 };
+
+// Maps the legacy 3-band track EQ onto the 4-band EQ when the same filters can
+// express it: preamp 0 dB, at most two non-flat bands, values inside the 4-band
+// clamps. Otherwise returns false and leaves *out untouched.
+bool eqFromLegacy(const AudioEQConfig &legacy, EqSettings *out);
 
 struct EqBandCoefsParam {
     double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;

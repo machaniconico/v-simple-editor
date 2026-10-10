@@ -1,4 +1,5 @@
 #include "AudioTrackFx.h"
+#include "AudioMixer.h"
 
 #include <QVarLengthArray>
 #include <QtMath>
@@ -93,6 +94,30 @@ EqBandCoefsParam computeEqBand(const EqBand &band,
     return out;
 }
 } // namespace
+
+bool eqFromLegacy(const AudioEQConfig &legacy, EqSettings *out)
+{
+    if (!out || legacy.preamp != 0.0) return false;
+    // Legacy slots are fixed (AudioMixer::setTrackEqConfig): 0 = low shelf,
+    // 1 = peaking, 2 = high shelf; bands past slot 2 are never applied. They use
+    // the same RBJ formulas as computeEqBand's kinds 0 / 1 / 3.
+    EqSettings eq;
+    EqBand *const targets[3] = {&eq.low, &eq.lowMid, &eq.high};
+    constexpr double fs = AudioMixer::kSampleRateHz;
+    int active = 0;
+    for (int i = 0; i < legacy.bands.size() && i < 3; ++i) {
+        const EQBand &band = legacy.bands[i];
+        if (band.isFlat()) continue;
+        // computeEqBand would clamp these, so they cannot be carried over as is.
+        const bool inRange = band.frequency >= 20.0 && band.frequency <= fs / 2.0 - 100.0
+            && band.gain >= -24.0 && band.gain <= 24.0
+            && (i != 1 || (band.q >= 0.1 && band.q <= 10.0));
+        if (!inRange || ++active > 2) return false;
+        *targets[i] = EqBand{band.frequency, band.gain, band.q};
+    }
+    *out = eq;
+    return true;
+}
 
 void DeEsserProcessor::setSettings(const DeEsserSettings &settings, int sampleRate)
 {
