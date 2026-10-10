@@ -218,6 +218,7 @@ struct ClipMotion;
 class PasteAttributesDialog;
 class LoudnessPanel;
 class QDockWidget;
+class SpectrumAnalyzerDock;
 class QToolButton;
 class AiChatDock;
 class NodeCanvasWidget;
@@ -1101,6 +1102,7 @@ private:
     // Audio meters dock
     QDockWidget *m_audioMetersDock = nullptr;
     QDockWidget *m_audioMixerDock = nullptr;
+    SpectrumAnalyzerDock *m_spectrumAnalyzerDock = nullptr;
     QList<QMetaObject::Connection> m_meterConnections;
     QList<class AudioMeterWidget *> m_audioMeterWidgets;
     class AudioMeterWidget *m_masterMeter = nullptr;

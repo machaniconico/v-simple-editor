@@ -305,6 +305,7 @@ double exporter_loudnessGainDb();
 #include <limits>
 #include "AudioMeterWidget.h"
 #include "AudioMixerDock.h"
+#include "SpectrumAnalyzerDock.h"
 #include "GradientStopBar.h"
 #include "BrushAnimationDialog.h"
 #include "PathText.h"
@@ -8049,6 +8050,11 @@ void MainWindow::setupMenuBar()
     addDockWidget(Qt::BottomDockWidgetArea, m_audioMixerDock);
     m_audioMixerDock->hide();
     viewMenu->addAction(m_audioMixerDock->toggleViewAction());
+
+    m_spectrumAnalyzerDock = new SpectrumAnalyzerDock(m_player->audioMixer(), this);
+    addDockWidget(Qt::RightDockWidgetArea, m_spectrumAnalyzerDock);
+    m_spectrumAnalyzerDock->hide();
+    viewMenu->addAction(m_spectrumAnalyzerDock->toggleViewAction());
 
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);

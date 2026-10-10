@@ -357,6 +357,7 @@ public:
     // Runs the same tap write as readData.
     void publishMasterBlockForTest(const int16_t *interleaved, int frames);
     quint64 tapCopyCountForTest() const;
+    int tapSubscriberCountForTest() const;
 
 signals:
     void decoderError(const QString &message);

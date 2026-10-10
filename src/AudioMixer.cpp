@@ -2935,6 +2935,11 @@ quint64 AudioMixer::tapCopyCountForTest() const
     return m_tapCopyCount.load(std::memory_order_relaxed);
 }
 
+int AudioMixer::tapSubscriberCountForTest() const
+{
+    return m_tapSubscribers.load(std::memory_order_acquire);
+}
+
 bool AudioMixer::ensureSinkLocked() {
     // NOTE: callers may hold m_controlMutex. We must not call
     // m_sink->start() here because Qt's audio sink (especially the

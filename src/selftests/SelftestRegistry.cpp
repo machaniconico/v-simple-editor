@@ -254,6 +254,7 @@ int runSocialSelftest();
 int runSpatialPathSelftest();
 int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
+int runSpectrumSelftest();
 int runStereoPanSelftest();
 int runStillCompareSelftest();
 int runSubMovtextSelftest();
@@ -751,6 +752,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (4 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "spectrum", nullptr, runSpectrumSelftest, true,
+      "2048-point Hann FFT and visible-only master tap spectrum dock (4 gates)" },
     { "noise-print", "VEDITOR_NOISE_PRINT_SELFTEST", runNoisePrintSelftest, false,
       "Noise print: SNR, amplitude, bypass, stereo independence, validation and determinism (6 gates)" },
     { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,
