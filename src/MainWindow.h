@@ -257,6 +257,7 @@ class MainWindow : public QMainWindow
     friend int runDeEsserSelftest();
     friend int runAudioTrackFxSelftest();
     friend int runRotoSelftest();
+    friend int runMatteSsotSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -775,7 +776,6 @@ private:
     void restoreAudioFxUndoState(const QJsonObject &audioFx);
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
-    void syncTrackMatteEntriesFromTimeline();
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
@@ -872,7 +872,6 @@ private:
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
-    QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
     QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
     std::function<double(double)> linkedAudioSampler(const ClipInfo &clip,

@@ -976,18 +976,12 @@ int runRotoSelftest()
         rotos.insert(QStringLiteral("2:0"), entry(3));
         rotos.insert(QStringLiteral("0:1"), entry(4));
         tl->setRotoEntries(rotos);
-        window.m_trackMatteClipEntries.clear();
         QHash<QString, TimelineTrackMatteEntry> carrier;
         QHash<QString, QString> parents;
         for (auto it = rotos.cbegin(); it != rotos.cend(); ++it) {
-            TrackMatteClipEntry m;
-            m.clipId = it.key();
-            m.matteType = matteTypeForMarker(it.value().path.points.size());
-            m.matteSourceClipId = QStringLiteral("3:0");
-            window.m_trackMatteClipEntries.insert(it.key(), m);
             TimelineTrackMatteEntry c;
-            c.matteType = m.matteType;
-            c.matteSourceClipId = m.matteSourceClipId;
+            c.matteType = matteTypeForMarker(it.value().path.points.size());
+            c.matteSourceClipId = QStringLiteral("3:0");
             carrier.insert(it.key(), c);
             parents.insert(it.key(), QStringLiteral("3:0"));
         }
@@ -1040,8 +1034,8 @@ int runRotoSelftest()
         && invariant(afterStore) && invariant(afterStoreRedo) && populatedSame;
     gates.gate(9, g9, "storeRotoEntry carrier, clipId, undo serial or populateProjectData mismatch");
 
-    // G10 detects roto keys drifting from the MainWindow matte keys on the GUI
-    // edit paths (each path remaps twice: inside Timeline and in MainWindow).
+    // G10 detects roto keys drifting from the Timeline matte keys on the GUI
+    // edit paths (MainWindow slots and menu actions driving Timeline edits).
     // The text-based range ripple compares against parents (matte does not
     // follow that path, an existing defect).
     struct EditPath { const char *name; std::function<void()> run; bool parentPeer; };
@@ -1080,14 +1074,15 @@ int runRotoSelftest()
         const QString layoutAfter = layoutSignature(wtl);
         const auto rotos = wtl->rotoEntries();
         const QSet<QString> rotoKeys = keys(rotos);
+        const auto mattes = wtl->trackMatteEntries();
         const QSet<QString> peerKeys = path.parentPeer
-            ? keys(wtl->clipParentEntries()) : keys(window.m_trackMatteClipEntries);
+            ? keys(wtl->clipParentEntries()) : keys(mattes);
         QStringList pairing;
         bool paired = true;
         if (!path.parentPeer) {
             for (auto it = rotos.cbegin(); it != rotos.cend(); ++it) {
                 const int marker = it.value().path.points.size();
-                const TrackMatteType matte = window.m_trackMatteClipEntries.value(it.key()).matteType;
+                const TrackMatteType matte = mattes.value(it.key()).matteType;
                 if (matte != matteTypeForMarker(marker)) {
                     paired = false;
                     pairing.append(QStringLiteral("%1:marker%2/matte%3").arg(it.key())
@@ -1220,7 +1215,6 @@ int runRotoSelftest()
     window.m_projectConfig.height = 64;
     window.m_projectConfig.fps = 24;
     wtl->setProjectOutputConfig(64, 64, true, 24.0);
-    window.m_trackMatteClipEntries.clear();
     wtl->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
     wtl->setClipParentEntries(QHash<QString, QString>{});
     wtl->restoreFromProject(oneTrack({clip(140)}), QVector<QVector<ClipInfo>>{},

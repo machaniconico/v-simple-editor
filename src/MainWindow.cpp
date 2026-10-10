@@ -2515,33 +2515,6 @@ QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
 }
 #endif
 
-// TM-8: mirror MainWindow's m_trackMatteClipEntries onto the Timeline so
-// the SSOT renderFrameAt (src/TimelineFrameRenderer.cpp) reads matte
-// wiring from the Timeline object itself instead of walking QObject
-// parents up to this live MainWindow off the RenderQueue worker thread
-// (the old #define-private-public path — C1+C2). The QHash key is
-// MainWindow::brushClipId(track,clip) == tlrender::renderClipId, so this
-// is a straight per-entry copy into the 2-field TimelineTrackMatteEntry
-// the consumer reads. Called on every m_trackMatteClipEntries mutation
-// (configure dialog) and after a project load rebuilds it, so the GUI
-// preview keeps working — now through the Timeline carrier.
-void syncTrackMatteEntriesToTimeline(
-    Timeline *timeline,
-    const QHash<QString, TrackMatteClipEntry> &source)
-{
-    if (!timeline)
-        return;
-    QHash<QString, TimelineTrackMatteEntry> out;
-    out.reserve(source.size());
-    for (auto it = source.cbegin(); it != source.cend(); ++it) {
-        TimelineTrackMatteEntry e;
-        e.matteType = it.value().matteType;
-        e.matteSourceClipId = it.value().matteSourceClipId;
-        out.insert(it.key(), e);
-    }
-    timeline->setTrackMatteEntries(out);
-}
-
 void syncTimeRemapEntriesToTimelineImpl(
     Timeline *timeline,
     const QHash<QString, TimeRemapClipEntry> &source)
@@ -2575,8 +2548,8 @@ void syncTimeRemapEntriesToTimelineImpl(
         timeline->refreshPlaybackSequence();
 }
 
-// RM-1.2 / RM-4: snapshotTrackClips and remapTrackMatteEntriesAfterMutation
-// are defined in TrackMatteKey.cpp (hoisted for testability). The types
+// RM-1.2 / RM-4: snapshotTrackClips is defined in TrackMatteKey.cpp
+// (hoisted for testability). The types
 // ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
 
 constexpr int kLoudnessSampleRate = 48000;
@@ -3301,8 +3274,6 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QJsonObject &state) { applyExternalTrackState(state); });
     connect(m_timeline, &Timeline::trackIndicesRemapped,
             this, &MainWindow::remapExternalTrackIndices);
-    connect(m_timeline, &Timeline::trackStateRestored,
-            this, &MainWindow::syncTrackMatteEntriesFromTimeline);
 
     rebuildAudioMeters();
 
@@ -4763,10 +4734,7 @@ void MainWindow::setupMenuBar()
     m_moveClipHeadAction = editMenu->addAction("クリップの先頭を再生ヘッドへ移動");
     m_moveClipTailAction = editMenu->addAction("クリップの末尾を再生ヘッドへ移動");
     auto moveToPlayhead = [this](bool tail) {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->moveSelectedClipToPlayhead(tail);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     };
     connect(m_moveClipHeadAction, &QAction::triggered, this,
@@ -4816,58 +4784,40 @@ void MainWindow::setupMenuBar()
     m_duplicateAction = editMenu->addAction("複製");
     m_duplicateAction->setShortcut(QKeySequence("Ctrl+D"));
     connect(m_duplicateAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->duplicateSelectedClips();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeLeftAction = editMenu->addAction("1フレーム左へ移動");
     m_nudgeLeftAction->setShortcut(QKeySequence("Alt+Left"));
     connect(m_nudgeLeftAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(-1);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeRightAction = editMenu->addAction("1フレーム右へ移動");
     m_nudgeRightAction->setShortcut(QKeySequence("Alt+Right"));
     connect(m_nudgeRightAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(1);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeLeft10Action = editMenu->addAction("10フレーム左へ移動");
     m_nudgeLeft10Action->setShortcut(QKeySequence("Alt+Shift+Left"));
     connect(m_nudgeLeft10Action, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(-10);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeRight10Action = editMenu->addAction("10フレーム右へ移動");
     m_nudgeRight10Action->setShortcut(QKeySequence("Alt+Shift+Right"));
     connect(m_nudgeRight10Action, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(10);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_closeAllGapsAction = editMenu->addAction("すべてのギャップを詰める");
     connect(m_closeAllGapsAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->closeAllGaps();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
@@ -4888,10 +4838,7 @@ void MainWindow::setupMenuBar()
         updateEditActions();
     });
     connect(m_bladeAllAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->bladeAllTracksAtPlayhead();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     connect(m_liftAction, &QAction::triggered, this, [this]() {
@@ -4899,10 +4846,7 @@ void MainWindow::setupMenuBar()
             statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
             return;
         }
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->deleteSelectedClip();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
         updateEditActions();
     });
@@ -7130,8 +7074,7 @@ void MainWindow::setupMenuBar()
         auto clips = track->clips();
         clips[clipIdx].keyframes = km;
         track->setClips(clips);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->remapCarriersAfterExternalMutation(snap);
         m_timeline->saveUndoState(QStringLiteral("グレードのキーフレーム追加"));
         m_timeline->refreshPlaybackSequence();
         pushAnimatedHslPreview(m_timeline->playheadPosition());
@@ -7155,8 +7098,7 @@ void MainWindow::setupMenuBar()
         const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         clips[clipIdx].colorCorrection = cc;
         track->setClips(clips);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->remapCarriersAfterExternalMutation(snap);
         dirty = true;
         m_timeline->refreshPlaybackSequence();
         m_player->setColorCorrection(cc);
@@ -8793,6 +8735,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     };
 
     const auto rotoEntries = m_timeline->rotoEntries();
+    const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
@@ -8819,7 +8762,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || rotoEntries.contains(clipId)
                 || m_timeRemapClipEntries.contains(clipId)
                 || clip.hasTimeRemap()
-                || m_trackMatteClipEntries.contains(clipId)
+                || trackMatteEntries.contains(clipId)
                 || m_text3DClipConfigs.contains(clipId)
                 || m_clipExpressionBindings.contains(clipId)
                 || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled)
@@ -9041,8 +8984,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.layer.material = clip.material;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;
-            if (auto matteIt = m_trackMatteClipEntries.constFind(clipId);
-                matteIt != m_trackMatteClipEntries.cend()) {
+            if (auto matteIt = trackMatteEntries.constFind(clipId);
+                matteIt != trackMatteEntries.cend()) {
                 active.layer.matteType = matteIt.value().matteType;
             }
             activeLayers.append(active);
@@ -9059,8 +9002,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         indexByClipId.insert(activeLayers[i].clipId, i);
 
     for (int i = 0; i < activeLayers.size(); ++i) {
-        const auto matteIt = m_trackMatteClipEntries.constFind(activeLayers[i].clipId);
-        if (matteIt == m_trackMatteClipEntries.cend())
+        const auto matteIt = trackMatteEntries.constFind(activeLayers[i].clipId);
+        if (matteIt == trackMatteEntries.cend())
             continue;
         activeLayers[i].layer.matteType = matteIt.value().matteType;
         activeLayers[i].layer.matteSourceLayerIndex =
@@ -9141,7 +9084,7 @@ void MainWindow::refreshSpecialClipPreview()
         light3d::statesAt(m_projectLights, playheadSeconds));
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
-        && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
+        && m_timeline->trackMatteEntries().isEmpty() && m_text3DClipConfigs.isEmpty()
         && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
@@ -9211,8 +9154,10 @@ void MainWindow::populateProjectData(ProjectData &data)
     std::sort(data.timeRemapClipEntries.begin(), data.timeRemapClipEntries.end(),
               [](const TimeRemapClipEntry &a, const TimeRemapClipEntry &b) { return a.clipId < b.clipId; });
     data.trackMatteClipEntries.clear();
-    for (auto it = m_trackMatteClipEntries.cbegin(); it != m_trackMatteClipEntries.cend(); ++it)
-        data.trackMatteClipEntries.append(it.value());
+    const auto trackMatteEntries = m_timeline->trackMatteEntries();
+    for (auto it = trackMatteEntries.cbegin(); it != trackMatteEntries.cend(); ++it)
+        data.trackMatteClipEntries.append(
+            TrackMatteClipEntry{it.key(), it.value().matteType, it.value().matteSourceClipId});
     std::sort(data.trackMatteClipEntries.begin(), data.trackMatteClipEntries.end(),
               [](const TrackMatteClipEntry &a, const TrackMatteClipEntry &b) { return a.clipId < b.clipId; });
     data.clipParentEntries.clear();
@@ -9458,14 +9403,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         if (!entry.clipId.isEmpty())
             m_timeRemapClipEntries.insert(entry.clipId, entry);
     }
-    m_trackMatteClipEntries.clear();
+    // TM-8 / US-1016: the Timeline carrier is the matte SSOT (preview AND
+    // export read it), so the loaded wiring goes there directly.
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     for (const auto &entry : data.trackMatteClipEntries) {
         if (!entry.clipId.isEmpty())
-            m_trackMatteClipEntries.insert(entry.clipId, entry);
+            trackMatteEntries.insert(entry.clipId,
+                TimelineTrackMatteEntry{entry.matteType, entry.matteSourceClipId});
     }
-    // TM-8: push the freshly-loaded matte wiring onto the Timeline so the
-    // SSOT renderer (preview AND export) sources it from the Timeline.
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->setTrackMatteEntries(trackMatteEntries);
     QHash<QString, QString> parentEntries;
     for (const auto &entry : data.clipParentEntries) {
         if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
@@ -9826,16 +9772,16 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     if (auto *mixer = m_timeline->audioMixer()) mixer->setBusRouting(m_audioBusRouting);
     m_timeline->setAdjustmentLayers(adjustmentLayersFromJsonArray(state.value("adjustments").toArray()));
     if (state.contains("mattes")) {
-        m_trackMatteClipEntries.clear();
+        // Runs after restoreState, so this external capture wins a structural undo.
+        QHash<QString, TimelineTrackMatteEntry> mattes;
         for (const auto &value : state.value("mattes").toArray()) {
             const auto obj = value.toObject();
-            TrackMatteClipEntry entry;
-            entry.clipId = obj.value("clipId").toString();
+            TimelineTrackMatteEntry entry;
             entry.matteSourceClipId = obj.value("source").toString();
             entry.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
-            m_trackMatteClipEntries.insert(entry.clipId, entry);
+            mattes.insert(obj.value("clipId").toString(), entry);
         }
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->setTrackMatteEntries(mattes);
     }
     ProjectData particles;
     if (ProjectFile::fromJsonString(state.value("particles").toString(), particles)) {
@@ -9846,20 +9792,6 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     if (m_audioBusPanel) m_audioBusPanel->refresh();
     rebuildAudioMeters();
     reseedAudioFxDocks();
-}
-
-void MainWindow::syncTrackMatteEntriesFromTimeline()
-{
-    // The Timeline carrier is authoritative after remapping and undo/redo.
-    m_trackMatteClipEntries.clear();
-    const auto mattes = m_timeline->trackMatteEntries();
-    for (auto it = mattes.cbegin(); it != mattes.cend(); ++it) {
-        TrackMatteClipEntry entry;
-        entry.clipId = it.key();
-        entry.matteSourceClipId = it.value().matteSourceClipId;
-        entry.matteType = it.value().matteType;
-        m_trackMatteClipEntries.insert(entry.clipId, entry);
-    }
 }
 
 void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew)
@@ -9885,7 +9817,6 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
         if (layer.trackIndex >= 0) layers.append(layer);
     }
     m_timeline->setAdjustmentLayers(layers);
-    syncTrackMatteEntriesFromTimeline();
     QHash<QString, ParticleEmitterConfig> particles;
     for (const auto *track : m_timeline->videoTracks()) {
         for (const auto &clip : track->clips()) {
@@ -10997,12 +10928,9 @@ void MainWindow::exportVideo()
 
     // RM-1.3: this is a job.timeline != nullptr path — RenderQueue's
     // resolveTimeline early-returns before its persisted-project matte
-    // population, so the live Timeline's matte carrier MUST be current
-    // here or the export silently drops every track matte. Re-sync the
-    // GUI map onto m_timeline immediately before submission so an edit
-    // made after the last configure-matte/load is reflected.
+    // population, so it exports the live Timeline's matte carrier (the
+    // matte SSOT since US-1016; no re-sync is needed).
     syncProjectLightingToTimeline();
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     // AC: production export 経路に ACES SSOT を push (start() 前)。プレビュー /
     // legacy Exporter には openColorManagement / load で既に push 済み。
     // RenderQueue は 8bit 経路でのみ適用し、enabled=false 時はビット同一。
@@ -11017,12 +10945,8 @@ void MainWindow::exportVideo()
 
 void MainWindow::splitClip()
 {
-    // RM-1.2: remap positional matte keys across the clip-index shift.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Timeline remaps the positional matte keys across the clip-index shift.
     m_timeline->splitAtPlayhead();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Split clip at playhead");
     updateEditActions();
 }
@@ -11030,12 +10954,8 @@ void MainWindow::splitClip()
 void MainWindow::deleteClip()
 {
     if (!m_timeline->hasSelection()) return;
-    // RM-1.2: drop matte entries for the removed clip + reindex survivors.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Timeline drops the removed clip's matte entries and reindexes survivors.
     m_timeline->deleteSelectedClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Deleted clip");
     updateEditActions();
 }
@@ -11043,12 +10963,8 @@ void MainWindow::deleteClip()
 void MainWindow::rippleDelete()
 {
     if (!m_timeline->hasAnySelection()) return;
-    // RM-1.2: same as deleteClip — Timeline reindexes, matte keys must follow.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Same as deleteClip: Timeline reindexes and remaps the matte keys.
     m_timeline->rippleDeleteSelectedClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Ripple deleted clip");
     updateEditActions();
 }
@@ -11062,14 +10978,9 @@ void MainWindow::copyClip()
 
 void MainWindow::pasteClip()
 {
-    // RM-1.2: paste inserts a clip → downstream indices shift; matte keys
-    // for clips after the insertion point must be bumped. The pasted clip
-    // itself is new and carries no matte entry (unmatched → no remap).
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Paste shifts downstream indices; Timeline bumps their matte keys. The
+    // pasted clip itself is new and carries no matte entry.
     m_timeline->pasteClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Pasted clip");
     updateEditActions();
 }
@@ -14759,7 +14670,7 @@ void MainWindow::configureTrackMatte()
         sourceCombo->addItem(candidate.label, candidate.id);
 
     const QString targetClipId = brushClipId(targetTrackIdx, targetClipIdx);
-    const TrackMatteClipEntry existing = m_trackMatteClipEntries.value(targetClipId);
+    const TimelineTrackMatteEntry existing = m_timeline->trackMatteEntries().value(targetClipId);
     const int existingTypeIndex = typeCombo->findData(static_cast<int>(existing.matteType));
     if (existingTypeIndex >= 0)
         typeCombo->setCurrentIndex(existingTypeIndex);
@@ -14784,9 +14695,11 @@ void MainWindow::configureTrackMatte()
 
     const TrackMatteType matteType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
     const QString matteSourceId = sourceCombo->currentData().toString();
+    // Matte edits do not save an undo state; the external "mattes" capture keeps them.
+    auto mattes = m_timeline->trackMatteEntries();
     if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
-        m_trackMatteClipEntries.remove(targetClipId);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        mattes.remove(targetClipId);
+        m_timeline->setTrackMatteEntries(mattes);
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
         return;
@@ -14797,12 +14710,11 @@ void MainWindow::configureTrackMatte()
         return;
     }
 
-    TrackMatteClipEntry entry;
-    entry.clipId = targetClipId;
+    TimelineTrackMatteEntry entry;
     entry.matteType = matteType;
     entry.matteSourceClipId = matteSourceId;
-    m_trackMatteClipEntries.insert(targetClipId, entry);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    mattes.insert(targetClipId, entry);
+    m_timeline->setTrackMatteEntries(mattes);
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
@@ -15118,8 +15030,7 @@ void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)
     clips[clipIndex].keyframes.removeTrack(keys.propertyName());
     clips[clipIndex].keyframes.addTrack(keys);
     track->setClips(clips);
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->remapCarriersAfterExternalMutation(snap);
     m_timeline->saveUndoState(title);
     m_timeline->refreshPlaybackSequence();
 }
@@ -17198,11 +17109,9 @@ void MainWindow::onMobileExport()
                             });
                     connect(progress, &QProgressDialog::canceled,
                             m_renderQueue, &RenderQueue::stop);
-                    // RM-1.3: job.timeline != nullptr path — same carrier
-                    // re-sync requirement as File→Export above.
+                    // RM-1.3: job.timeline != nullptr path — exports the
+                    // live matte carrier, as File→Export above.
                     syncProjectLightingToTimeline();
-                    syncTrackMatteEntriesToTimeline(
-                        m_timeline, m_trackMatteClipEntries);
                     // AC: production export 経路に ACES SSOT を push (start()
                     // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
                     m_renderQueue->setAcesPipeline(m_acesPipeline);
@@ -20459,11 +20368,9 @@ void MainWindow::openRenderQueueDialog()
     }
     if (m_renderQueueDialog->queue())
         m_renderQueueDialog->queue()->setLoudnessGainDb(exporter_loudnessGainDb());
-    // RM-1.4/RM-1.3: keep the live Timeline's matte carrier current so a
-    // "current project" queue job exports the same track matte the GUI
-    // preview shows (the dialog has no save step before submitting).
+    // RM-1.4/RM-1.3: a "current project" queue job exports the live
+    // Timeline's matte carrier, the same one the GUI preview shows.
     syncProjectLightingToTimeline();
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     m_renderQueueDialog->show();
     m_renderQueueDialog->raise();
     m_renderQueueDialog->activateWindow();

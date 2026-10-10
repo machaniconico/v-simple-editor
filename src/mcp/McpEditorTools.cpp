@@ -2824,17 +2824,8 @@ void McpEditorTools::registerWriteTools()
 
             // ライブ Timeline を渡す経路は GUI の表示内容をそのまま使うため、
             // RenderQueue のワーカー開始前に MainWindow 側の補助データを同期する。
+            // マットは Timeline の trackMatteEntries() が SSOT なので同期しない。
             m_window->syncProjectLightingToTimeline();
-            QHash<QString, TimelineTrackMatteEntry> matteEntries;
-            matteEntries.reserve(m_window->m_trackMatteClipEntries.size());
-            for (auto it = m_window->m_trackMatteClipEntries.cbegin();
-                 it != m_window->m_trackMatteClipEntries.cend(); ++it) {
-                TimelineTrackMatteEntry entry;
-                entry.matteType = it.value().matteType;
-                entry.matteSourceClipId = it.value().matteSourceClipId;
-                matteEntries.insert(it.key(), entry);
-            }
-            timeline()->setTrackMatteEntries(matteEntries);
             queue->setAcesPipeline(m_window->m_acesPipeline);
             queue->setLoudnessGainDb(loudnessGainDb);
             m_exportJobObservations.insert(job.uuid,
