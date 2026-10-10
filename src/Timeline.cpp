@@ -10652,6 +10652,7 @@ void Timeline::rippleDeleteTimeRangeActive(double startSec, double endSec)
     const bool changed = track->rippleDeleteTimeRange(startSec, endSec);
     // no-op だった場合 (範囲外/空) は Undo スナップショットを積まない。
     if (changed) {
+        remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
         saveUndoState("リップル削除 (範囲)");
     }
@@ -11680,18 +11681,9 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             } else {
                 // Video partner moved V[ti]:ci -> V[destIdx]:insertIdx. The
                 // snapshot walk aligns within a track and would prune its keys,
-                // so roto / parent take the explicit map. The memo then records
-                // that roto already matches this placement, so the matte
-                // helper below does not remap roto a second time; the matte
-                // carrier itself still goes through the snapshot walk.
+                // so roto / parent / matte take the explicit map only (no
+                // snapshot walk on top of it in the same drop).
                 remapCarriersAfterCrossTrackMove(ti, ci, destIdx, plan.insertIdx);
-                {
-                    const TrackClipSnapshot after = snapshotTrackClips(this);
-                    QMutexLocker lock(&m_rotoMutex);
-                    m_rotoRemapMemoAfter = after;
-                    m_rotoRemapMemoValid = true;
-                }
-                remapTrackMatteLocked(snapBefore);
             }
             return;  // Only one partner per linkGroup on the other track type
         }
@@ -11730,6 +11722,23 @@ void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
             if (!newKey.isEmpty()) rebuilt.insert(newKey, it.value());
         }
         commitRotoEntries(std::move(rebuilt), true);
+    }
+    // The matte key and its matteSourceClipId take the same map.
+    const auto mattesBefore = trackMatteEntries();
+    if (!mattesBefore.isEmpty()) {
+        QHash<QString, TimelineTrackMatteEntry> rebuilt;
+        rebuilt.reserve(mattesBefore.size());
+        for (auto it = mattesBefore.cbegin(); it != mattesBefore.cend(); ++it) {
+            const QString newKey = oldToNew.value(it.key(), it.key());
+            TimelineTrackMatteEntry e = it.value();
+            const auto srcIt = oldToNew.constFind(e.matteSourceClipId);
+            if (srcIt != oldToNew.cend()) {
+                if (srcIt.value().isEmpty()) continue;   // source moved to audio
+                e.matteSourceClipId = srcIt.value();
+            }
+            if (!newKey.isEmpty()) rebuilt.insert(newKey, e);
+        }
+        commitTrackMatteEntries(std::move(rebuilt));
     }
     if (!m_clipParentEntries.isEmpty()) {
         QHash<QString, QString> rebuilt;

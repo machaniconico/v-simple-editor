@@ -359,8 +359,9 @@ bool writeTone(const QString &path)
 // V3 [20 @0 s, 21 @6 s], every clip 2 s. Dropping V2:1 on V3 at 3 s lands at
 // V3 index 1. Roto markers 1..5 sit on V2:0 / V2:1 / V2:2 / V3:0 / V3:1,
 // parents are V3:0 -> V2:2 and V2:1 -> V3:1, Timeline-side mattes sit on
-// V2:1 / V3:1. linked: V2:1 keeps linkGroup 12 and its audio partner is on A1
-// (A2 with partnerOnA2, so a drop onto V3 creates exactly one track, A3).
+// V2:1 (source V2:2) / V3:1 (source V2:1). linked: V2:1 keeps linkGroup 12 and
+// its audio partner is on A1 (A2 with partnerOnA2, so a drop onto V3 creates
+// exactly one track, A3).
 void seedCrossDrop(Timeline &tl, bool linked, bool partnerOnA2 = false)
 {
     auto at = [](int id, double leadInSec) {
@@ -390,10 +391,53 @@ void seedCrossDrop(Timeline &tl, bool linked, bool partnerOnA2 = false)
     QHash<QString, TimelineTrackMatteEntry> mattes;
     TimelineTrackMatteEntry m;
     m.matteType = TrackMatteType::AlphaMatte;
-    m.matteSourceClipId = QStringLiteral("0:0");
+    m.matteSourceClipId = QStringLiteral("1:2");
     mattes.insert(QStringLiteral("1:1"), m);
+    m.matteSourceClipId = QStringLiteral("1:1");
     mattes.insert(QStringLiteral("2:1"), m);
     tl.setTrackMatteEntries(mattes);
+}
+
+// G35-G36 (US-1009) fixture: V1 [100], V2 [10, 11, 12, 13] back to back from
+// 0 s (2 s each), V3 [20]. roto markers 2 / 3 / 4 on V2:1 / V2:2 / V3:0,
+// mattes V2:1 (source V2:2), V2:2 (source V1:0), V3:0 (source V2:2), parents
+// V2:1 -> V1:0, V2:2 -> V2:1, V3:0 -> V2:2. V2:0 and V2:3 carry nothing.
+void seedRangeRipple(Timeline &tl)
+{
+    const QVector<QVector<ClipInfo>> video{
+        {clip(100)}, {clip(10), clip(11), clip(12), clip(13)}, {clip(20)}};
+    const QVector<QVector<ClipInfo>> audio{{}};
+    tl.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+    QHash<QString, RotoClipEntry> rotos;
+    rotos.insert(QStringLiteral("1:1"), entry(2));
+    rotos.insert(QStringLiteral("1:2"), entry(3));
+    rotos.insert(QStringLiteral("2:0"), entry(4));
+    tl.setRotoEntries(rotos);
+    QHash<QString, TimelineTrackMatteEntry> mattes;
+    TimelineTrackMatteEntry m;
+    m.matteType = TrackMatteType::AlphaMatte;
+    m.matteSourceClipId = QStringLiteral("1:2");
+    mattes.insert(QStringLiteral("1:1"), m);
+    m.matteSourceClipId = QStringLiteral("0:0");
+    mattes.insert(QStringLiteral("1:2"), m);
+    m.matteSourceClipId = QStringLiteral("1:2");
+    mattes.insert(QStringLiteral("2:0"), m);
+    tl.setTrackMatteEntries(mattes);
+    QHash<QString, QString> parents;
+    parents.insert(QStringLiteral("1:1"), QStringLiteral("0:0"));
+    parents.insert(QStringLiteral("1:2"), QStringLiteral("1:1"));
+    parents.insert(QStringLiteral("2:0"), QStringLiteral("1:2"));
+    tl.setClipParentEntries(parents);
+}
+
+// "key<matteSourceClipId" sorted, so a key whose source missed the map shows.
+QString matteLayout(const QHash<QString, TimelineTrackMatteEntry> &entries)
+{
+    QStringList out;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        out.append(it.key() + QLatin1Char('<') + it.value().matteSourceClipId);
+    out.sort();
+    return out.join(QLatin1Char(','));
 }
 
 // "key=marker" sorted, so a key that kept the wrong payload is visible.
@@ -455,7 +499,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 33;
+    constexpr int kRotoGateCount = 36;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -1036,8 +1080,8 @@ int runRotoSelftest()
 
     // G10 detects roto keys drifting from the Timeline matte keys on the GUI
     // edit paths (MainWindow slots and menu actions driving Timeline edits).
-    // The text-based range ripple compares against parents (matte does not
-    // follow that path, an existing defect).
+    // The text-based range ripple compares against parents (its matte map is
+    // asserted in G35).
     struct EditPath { const char *name; std::function<void()> run; bool parentPeer; };
     const auto select = [&](int track, int clipIndex) {
         wtl->clearSelection();
@@ -1770,55 +1814,60 @@ int runRotoSelftest()
 
     // ── G22-G25 (US-915): cross-track drop through TimelineTrack::dropEvent.
     // Map: 1:1 -> 2:1 (moved), 1:2 -> 1:1 (src shift), 2:1 -> 2:2 (dest shift),
-    // 1:0 / 2:0 fixed. The matte carrier is intentionally not remapped.
+    // 1:0 / 2:0 fixed. The matte key and matteSourceClipId take the same map
+    // (US-1009): 1:1<1:2 -> 2:1<1:1, 2:1<1:1 -> 2:2<2:1.
     const QString crossRotoBefore = QStringLiteral("1:0=1,1:1=2,1:2=3,2:0=4,2:1=5");
     const QString crossRotoAfter = QStringLiteral("1:0=1,1:1=3,2:0=4,2:1=2,2:2=5");
     const QString crossParentBefore = QStringLiteral("1:1>2:1,2:0>1:2");
     const QString crossParentAfter = QStringLiteral("2:0>1:1,2:1>2:2");
-    const QString crossMatte = QStringLiteral("1:1,2:1");
+    const QString crossMatteBefore = QStringLiteral("1:1<1:2,2:1<1:1");
+    const QString crossMatteAfter = QStringLiteral("2:1<1:1,2:2<2:1");
     std::cerr << "G22 map V2:1(1:1)->V3:1(2:1) V2:2(1:2)->V2:1(1:1) V3:1(2:1)->V3:2(2:2)"
                  " fixed V2:0(1:0) V3:0(2:0)\n";
     auto crossMapped = [&](const Timeline &tl, const char *label) {
         const auto rotos = tl.rotoEntries();
         const QString roto = rotoLayout(rotos);
         const QString parent = parentLayout(tl.clipParentEntries());
-        const QString matte = show(keys(tl.trackMatteEntries()));
+        const QString matte = matteLayout(tl.trackMatteEntries());
         const bool ok = droppedIntoV3(tl) && roto == crossRotoAfter && invariant(rotos)
-            && parent == crossParentAfter && matte == crossMatte;
+            && parent == crossParentAfter && matte == crossMatteAfter;
         std::cerr << label << " moved=" << droppedIntoV3(tl)
                   << " roto=" << roto.toStdString() << " (expected " << crossRotoAfter.toStdString() << ")"
                   << " clipIdOk=" << invariant(rotos)
                   << " parent=" << parent.toStdString() << " (expected " << crossParentAfter.toStdString() << ")"
-                  << " matte=" << matte.toStdString() << " (unchanged " << crossMatte.toStdString() << ")"
+                  << " matte=" << matte.toStdString() << " (expected " << crossMatteAfter.toStdString() << ")"
                   << " marker2At=" << whereMarker(rotos, 2).toStdString() << " -> " << ok << '\n';
         return ok;
     };
 
-    // G22 detects an unlinked cross-track drop that leaves roto / parent keys on
-    // the pre-drop indices (HEAD emitted no signal for linkGroup 0).
+    // G22 detects an unlinked cross-track drop that leaves roto / parent / matte
+    // keys on the pre-drop indices (HEAD emitted no signal for linkGroup 0; at
+    // US-1016 the matte keys stayed at 1:1<1:2,2:1<1:1 and this gate FAILed).
     {
         Timeline tl;
         seedCrossDrop(tl, false);
         const QString rotoPre = rotoLayout(tl.rotoEntries());
         const QString parentPre = parentLayout(tl.clipParentEntries());
+        const QString mattePre = matteLayout(tl.trackMatteEntries());
         bool qtSourceNull = false;
         const bool accepted = driveCrossDrop(tl.videoTracks()[1], 1, tl.videoTracks()[2], 3.0,
                                              true, &qtSourceNull);
         std::cerr << "G22 before roto=" << rotoPre.toStdString()
                   << " parent=" << parentPre.toStdString()
+                  << " matte=" << mattePre.toStdString()
                   << " linkGroup=" << tl.videoTracks()[2]->clips().value(1).linkGroup
                   << " accepted=" << accepted << " qtSourceNull=" << qtSourceNull << '\n';
         const bool mapped = crossMapped(tl, "G22 after");
         gates.gate(22, rotoPre == crossRotoBefore && parentPre == crossParentBefore
-                           && accepted && mapped,
-                   "unlinked cross-track drop did not remap roto / parent keys");
+                           && mattePre == crossMatteBefore && accepted && mapped,
+                   "unlinked cross-track drop did not remap roto / parent / matte keys");
     }
 
     // G23 (US-1007): the audio partner of V2:1 is dropped from A1 on A3, so
     // handleCrossTrackLinkedDrop moves the video clip V2:1 -> V3:1. Its roto /
     // parent keys take the G22 map (remapCarriersAfterCrossTrackMove, 2 calls:
     // the audio main move and the video partner). The matte carrier is printed
-    // but not asserted (snapshot walk, prunes until US-1009). Detects the
+    // here and asserted in G34. Detects the
     // snapshot walk pruning the moved partner's keys (HEAD: roto marker 2 and
     // the parent link 2:1>2:2 are dropped, so this gate FAILs).
     {
@@ -1830,7 +1879,7 @@ int runRotoSelftest()
         TimelineTrack *destAudio = tl.audioTracks()[2];
         const QString rotoPre = rotoLayout(tl.rotoEntries());
         const QString parentPre = parentLayout(tl.clipParentEntries());
-        const QString mattePre = show(keys(tl.trackMatteEntries()));
+        const QString mattePre = matteLayout(tl.trackMatteEntries());
         QSignalSpy linkedSpy(destAudio, &TimelineTrack::crossTrackDropped);
         const quint64 remapBefore = tl.crossTrackMoveRemapCountForTest();
         const bool accepted = driveCrossDrop(srcAudio, 0, destAudio, 3.0, true, nullptr);
@@ -1850,7 +1899,7 @@ int runRotoSelftest()
                   << " roto=" << roto.toStdString() << " (expected " << crossRotoAfter.toStdString() << ")"
                   << " clipIdOk=" << invariant(rotos)
                   << " parent=" << parent.toStdString() << " (expected " << crossParentAfter.toStdString() << ")"
-                  << " matte=" << show(keys(tl.trackMatteEntries())).toStdString() << " (not asserted, US-1009)"
+                  << " matte=" << matteLayout(tl.trackMatteEntries()).toStdString() << " (asserted in G34)"
                   << " marker2At=" << whereMarker(rotos, 2).toStdString() << " (expected 2:1)"
                   << " remapCalls=" << remapCalls << " (expected 2) -> " << mapped << '\n';
         gates.gate(23, rotoPre == crossRotoBefore && parentPre == crossParentBefore && accepted
@@ -2600,6 +2649,107 @@ int runRotoSelftest()
                            && remapAtSignal == 1 && remapCalls == 1,
                    "audio partner move re-mapped the video keys or called the explicit map");
     }
+
+    // ── G34 (US-1009): the G23 drop (audio partner A1 -> A3, so the video
+    // partner moves V2:1 -> V3:1) with the seeded mattes. The partner's matte
+    // key and matteSourceClipId take the G22 map, and the partner move runs
+    // remapCarriersAfterCrossTrackMove exactly once (counter after the audio
+    // main-move signal). Detects the snapshot walk pruning the partner's matte
+    // (US-1016: both entries are pruned, matte is empty and this gate FAILs)
+    // and a second remap of the same drop (a snapshot walk after the explicit
+    // map prunes both entries too).
+    {
+        Timeline tl;
+        seedCrossDrop(tl, true);
+        tl.addAudioTrack(false);
+        tl.addAudioTrack(false);
+        TimelineTrack *srcAudio = tl.audioTracks()[0];
+        TimelineTrack *destAudio = tl.audioTracks()[2];
+        const QString mattePre = matteLayout(tl.trackMatteEntries());
+        quint64 remapAtSignal = 0;
+        const quint64 remapBefore = tl.crossTrackMoveRemapCountForTest();
+        QObject::connect(destAudio, &TimelineTrack::clipMovedAcrossTracks, &tl,
+            [&](TimelineTrack *, int, int) {
+                remapAtSignal = tl.crossTrackMoveRemapCountForTest() - remapBefore;
+            });
+        const bool accepted = driveCrossDrop(srcAudio, 0, destAudio, 3.0, true, nullptr);
+        const quint64 remapCalls = tl.crossTrackMoveRemapCountForTest() - remapBefore;
+        const quint64 partnerRemaps = remapCalls - remapAtSignal;
+        const QString matte = matteLayout(tl.trackMatteEntries());
+        const bool moved = droppedIntoV3(tl);
+        std::cerr << "G34 before matte=" << mattePre.toStdString()
+                  << " (expected " << crossMatteBefore.toStdString() << ")\n"
+                  << "G34 after accepted=" << accepted << " videoMovedV2:1->V3:1=" << moved
+                  << " matte=" << matte.toStdString() << " (expected " << crossMatteAfter.toStdString() << ")"
+                  << " roto=" << rotoLayout(tl.rotoEntries()).toStdString()
+                  << " parent=" << parentLayout(tl.clipParentEntries()).toStdString()
+                  << " remapCallsAtMainSignal=" << remapAtSignal << " partnerRemaps=" << partnerRemaps
+                  << " (expected 1/1)\n";
+        gates.gate(34, mattePre == crossMatteBefore && accepted && moved && matte == crossMatteAfter
+                           && remapAtSignal == 1 && partnerRemaps == 1,
+                   "linked drop did not carry the video partner's matte key / source to V3 in one remap");
+    }
+
+    // ── G35-G36 (US-1009): text-based-edit range ripple
+    // (Timeline::rippleDeleteTimeRangeActive, the MainWindow::openTextBasedEdit
+    // path) on V2 of seedRangeRipple. G35 deletes [0 s, 2 s) = V2:0, so V2:i ->
+    // V2:i-1 for the matte key, matteSourceClipId, roto and parent alike.
+    // Detects the matte carrier missing the range ripple (US-1016: matte stays
+    // 1:1<1:2,1:2<0:0,2:0<1:2 and this gate FAILs).
+    const QString rippleRotoBefore = QStringLiteral("1:1=2,1:2=3,2:0=4");
+    const QString rippleMatteBefore = QStringLiteral("1:1<1:2,1:2<0:0,2:0<1:2");
+    const QString rippleParentBefore = QStringLiteral("1:1>0:0,1:2>1:1,2:0>1:2");
+    auto rangeRipple = [&](int selectClip, double startSec, double endSec, const char *label,
+                           const QString &rotoExpected, const QString &matteExpected,
+                           const QString &parentExpected) {
+        Timeline tl;
+        seedRangeRipple(tl);
+        const QString rotoPre = rotoLayout(tl.rotoEntries());
+        const QString mattePre = matteLayout(tl.trackMatteEntries());
+        const QString parentPre = parentLayout(tl.clipParentEntries());
+        QString error;
+        const bool selected = tl.selectClipByIndex(false, 1, selectClip, &error);
+        const quint64 serialBefore = tl.undoManager()->saveSerial();
+        tl.rippleDeleteTimeRangeActive(startSec, endSec);
+        const quint64 serialAfter = tl.undoManager()->saveSerial();
+        const int v2Clips = tl.videoTracks()[1]->clipCount();
+        const auto rotos = tl.rotoEntries();
+        const auto mattes = tl.trackMatteEntries();
+        const auto parents = tl.clipParentEntries();
+        const QString roto = rotoLayout(rotos);
+        const QString matte = matteLayout(mattes);
+        const QString parent = parentLayout(parents);
+        const bool sameKeys = keys(rotos) == keys(mattes) && keys(mattes) == keys(parents);
+        const bool ok = rotoPre == rippleRotoBefore && mattePre == rippleMatteBefore
+            && parentPre == rippleParentBefore && selected && serialAfter == serialBefore + 1
+            && v2Clips == 3 && roto == rotoExpected && invariant(rotos) && matte == matteExpected
+            && parent == parentExpected && sameKeys;
+        std::cerr << label << " range timelineSec=[" << startSec << ", " << endSec << ")"
+                  << " before roto=" << rotoPre.toStdString() << " matte=" << mattePre.toStdString()
+                  << " parent=" << parentPre.toStdString() << '\n'
+                  << label << " after selected=" << selected << " saveSerial " << serialBefore
+                  << "->" << serialAfter << " (expected +1) v2Clips=" << v2Clips << " (expected 3)"
+                  << " roto=" << roto.toStdString() << " (expected " << rotoExpected.toStdString() << ")"
+                  << " clipIdOk=" << invariant(rotos)
+                  << " matte=" << matte.toStdString() << " (expected " << matteExpected.toStdString() << ")"
+                  << " parent=" << parent.toStdString() << " (expected " << parentExpected.toStdString() << ")"
+                  << " sameKeys(roto/matte/parent)=" << sameKeys << " -> " << ok << '\n';
+        return ok;
+    };
+    gates.gate(35, rangeRipple(0, 0.0, 2.0, "G35",
+                               QStringLiteral("1:0=2,1:1=3,2:0=4"),
+                               QStringLiteral("1:0<1:1,1:1<0:0,2:0<1:1"),
+                               QStringLiteral("1:0>0:0,1:1>1:0,2:0>1:1")),
+               "range ripple did not move the matte key / source with roto and parent");
+
+    // G36 control: the tail range [6 s, 8 s) deletes V2:3, which carries
+    // nothing, so the map is the identity and every carrier must stay as
+    // seeded (detects a remap that shifts or prunes surviving keys). The
+    // production mutation (the range-ripple matte remap removed, G35 FAILs) is
+    // logged in .omc/state/ralph4-results/US-1009-mutation.txt.
+    gates.gate(36, rangeRipple(3, 6.0, 8.0, "G36", rippleRotoBefore, rippleMatteBefore,
+                               rippleParentBefore),
+               "tail range ripple changed carrier keys under an identity map");
 
     return gates.finish("roto");
 }
