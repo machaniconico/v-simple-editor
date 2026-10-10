@@ -8203,6 +8203,17 @@ void MainWindow::setupMenuBar()
             .setValue("autoPlayOnFirstSequence", on);
     });
     prefsMenu->addAction(autoPlayAction);
+
+    auto *renderNotifyAction = new QAction(QStringLiteral("書き出し完了を通知する"), this);
+    renderNotifyAction->setCheckable(true);
+    renderNotifyAction->setChecked(
+        QSettings("VSimpleEditor", "Preferences").value("notify/renderComplete", false).toBool());
+    connect(renderNotifyAction, &QAction::toggled, this, [](bool on) {
+        QSettings("VSimpleEditor", "Preferences").setValue("notify/renderComplete", on);
+    });
+    prefsMenu->addAction(renderNotifyAction);
+    m_menuHelpEntries.append({renderNotifyAction,
+        QStringLiteral("書き出しがすべて終わったとき、ステータスバーに件数を表示し、ウィンドウを点滅させて音を鳴らします。")});
     prefsMenu->addSeparator();
 
     auto *loudnessAction = new QAction(
@@ -10782,10 +10793,48 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
     return job;
 }
 
+RenderQueue *MainWindow::ensureRenderQueue()
+{
+    if (m_renderQueue)
+        return m_renderQueue;
+    m_renderQueue = new RenderQueue(this);
+    // 書き出し完了の通知 (既定 OFF)。jobsChanged で終端ジョブを控え、allCompleted で集計する
+    // (終端後の jobs() 読み取りは空振りになるため)。バッチの専用キュー・RenderInPlace のローカル
+    // キュー・RenderQueueDialog の手動追加 (ダイアログは専用キューを持つ) はここを通らないので対象外。
+    connect(m_renderQueue, &RenderQueue::jobsChanged, this, [this]() {
+        m_renderNotifyTerminal.clear();
+        for (const RenderJob &job : m_renderQueue->jobs()) {
+            if (job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed)
+                m_renderNotifyTerminal.insert(job.uuid, job.status == RenderJobStatus::Failed);
+        }
+    });
+    connect(m_renderQueue, &RenderQueue::allCompleted, this, [this]() {
+        int total = 0;
+        int failed = 0;
+        for (auto it = m_renderNotifyTerminal.cbegin(); it != m_renderNotifyTerminal.cend(); ++it) {
+            if (m_renderNotifyReported.contains(it.key()))
+                continue;
+            m_renderNotifyReported.insert(it.key());
+            ++total;
+            if (it.value())
+                ++failed;
+        }
+        const bool enabled = QSettings("VSimpleEditor", "Preferences")
+                                 .value("notify/renderComplete", false).toBool();
+        if (!enabled || total == 0)
+            return;
+        statusBar()->showMessage(
+            QStringLiteral("書き出しが完了しました (%1 件、失敗 %2 件)").arg(total).arg(failed), 10000);
+        QApplication::alert(this);
+        QApplication::beep();
+        ++renderCompleteNotificationCountForTest;
+    });
+    return m_renderQueue;
+}
+
 bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error)
 {
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
     QString mixError;
     const QString preparedAudioMixPath = config.imageSequence
         ? QString() : (config.autoLoudness ? QString()
@@ -10849,8 +10898,7 @@ void MainWindow::exportVideo()
     // Exporter::doExport (limited applyEffectStack subset, graph skipped for
     // 10-bit/HDR) is NO LONGER reached from any UI action. See progress.txt
     // "### S12 single-path audit".
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
 
     double projectLoudnessGainDb = 0.0;
     RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal, &projectLoudnessGainDb);
@@ -13953,8 +14001,7 @@ void MainWindow::exportChapters()
 
 void MainWindow::openRenderQueue()
 {
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
 
     auto jobs = m_renderQueue->jobs();
     QString info = QString("Render Queue (%1 jobs):\n\n").arg(jobs.size());
@@ -17074,8 +17121,7 @@ void MainWindow::onMobileExport()
                     // S12 single-path: mobile export also routes through
                     // RenderQueue -> tlrender::renderFrameAt (S8), NOT the
                     // legacy CPU-only Exporter. See progress.txt S12.
-                    if (!m_renderQueue)
-                        m_renderQueue = new RenderQueue(this);
+                    ensureRenderQueue();
 
                     double projectLoudnessGainDb = 0.0;
                     RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,

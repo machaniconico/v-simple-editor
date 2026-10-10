@@ -258,6 +258,7 @@ class MainWindow : public QMainWindow
     friend int runAudioTrackFxSelftest();
     friend int runRotoSelftest();
     friend int runMatteSsotSelftest();
+    friend int runRenderNotifySelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -758,6 +759,9 @@ private:
     bool finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error);
     QString m_exportAudioMixErrorForTest; // selftest: non-empty forces a mix failure
     int exportAudioMixCallCountForTest = 0; // selftest: prepareExportAudioMix calls
+    // 共有 RenderQueue (通常 / モバイル / MCP export_video) の唯一の生成点。
+    RenderQueue *ensureRenderQueue();
+    int renderCompleteNotificationCountForTest = 0; // selftest: shown completion notifications
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
@@ -958,6 +962,8 @@ private:
     AudioEQProcessor *m_audioEQ = nullptr;
     MarkerManager m_markerManager;
     RenderQueue *m_renderQueue = nullptr;
+    QHash<QString, bool> m_renderNotifyTerminal; // uuid -> failed, latest jobsChanged snapshot
+    QSet<QString> m_renderNotifyReported;        // uuids already counted by a notification
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
     // Phase 6 Wave 4 (US-6D-4): 直近の文字起こしハイライト検出結果。

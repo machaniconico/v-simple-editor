@@ -229,6 +229,7 @@ int runPuppetPinSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
 int runRenderInPlaceSelftest();
+int runRenderNotifySelftest();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
 int runReverseClipSelftest();
@@ -931,6 +932,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-required (needsQApplication=true) ----------------------
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
       "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (8 gates)" },
+    { "render-notify", nullptr, runRenderNotifySelftest, true,
+      "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (4 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
       "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },
     { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,

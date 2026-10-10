@@ -1291,10 +1291,9 @@ RenderQueue* McpEditorTools::ensureRenderQueue(QString* err)
     if (!m_window)
         return setError(err, QStringLiteral("editor not available")), nullptr;
 
-    if (!m_window->m_renderQueue)
-        m_window->m_renderQueue = new RenderQueue(m_window);
-    observeRenderQueue(m_window->m_renderQueue);
-    return m_window->m_renderQueue;
+    RenderQueue* queue = m_window->ensureRenderQueue();
+    observeRenderQueue(queue);
+    return queue;
 }
 
 void McpEditorTools::observeRenderQueue(RenderQueue* queue)
