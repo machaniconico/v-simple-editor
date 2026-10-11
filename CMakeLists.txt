@@ -536,6 +536,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/LiveMatteResolve.cpp
     src/selftests/live_matte_resolve_selftests.cpp
     src/selftests/matte_ssot_selftest.cpp
+    src/selftests/matte_export_selftest.cpp
     src/selftests/render_notify_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
