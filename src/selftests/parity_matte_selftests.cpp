@@ -22,6 +22,7 @@
 #include "libavcore/Encode.h"  // libavcore::EncodeRequest, libavcore::FrameEncoder
 
 #include <QApplication>
+#include <QByteArray>
 #include <QCoreApplication>
 #include <QProcess>
 #include <QProcessEnvironment>
@@ -40,6 +41,7 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <cmath>
+#include <optional>
 
 using selftests::requireSelftest;
 
@@ -4787,6 +4789,56 @@ int runParitySelftest()
         QTemporaryDir tmpDir;
         if (!tmpDir.isValid()) {
             qCritical() << "PARITY S11 FAILED: could not create temp dir";
+            return 1;
+        }
+        // Probe the same libavcore HDR10 encoder path used by RenderQueue on
+        // its worker thread. Only an encoder-open failure is an environment
+        // SKIP; a failed frame push/finalize is a test failure.
+        std::optional<std::string> hdrProbeOpenError;
+        bool hdrProbeFrameOk = false;
+        QString hdrProbeFrameError;
+        const QString hdrProbePath = tmpDir.filePath(QStringLiteral("s11_hdr_probe.mp4"));
+        QThread *hdrProbeThread = QThread::create([&]() {
+            libavcore::EncodeRequest request;
+            request.width = outW;
+            request.height = outH;
+            request.fps = request.fpsNum = 30;
+            request.fpsDen = 1;
+            request.videoBitrateBits = 40'000'000;
+            request.videoCodecName = "libx265";
+            request.isHdr10 = true;
+            request.outputPath = hdrProbePath.toUtf8().toStdString();
+            request.encoderAvailableHook = [](const std::string &name) {
+                return CodecDetector::isEncoderAvailable(QString::fromStdString(name));
+            };
+            libavcore::FrameEncoder encoder;
+            hdrProbeOpenError = encoder.open(request);
+            if (hdrProbeOpenError) return;
+            const QByteArray pixels(outW * outH * 3, '\0');
+            if (!encoder.pushFrameRgb24(
+                    reinterpret_cast<const uint8_t *>(pixels.constData()), outW * 3, 0)) {
+                hdrProbeFrameError = QStringLiteral("one-frame push failed");
+                return;
+            }
+            if (const auto error = encoder.finalize()) {
+                hdrProbeFrameError = QString::fromStdString(*error);
+                return;
+            }
+            hdrProbeFrameOk = true;
+        });
+        hdrProbeThread->start();
+        hdrProbeThread->wait();
+        delete hdrProbeThread;
+        if (hdrProbeOpenError) {
+            qWarning() << "PARITY S11: HDR10 main10 encoder open probe failed:"
+                       << QString::fromStdString(*hdrProbeOpenError)
+                       << "(skipping S11)";
+            qInfo() << "[INFO] PARITY selftest OK";
+            return 0;
+        }
+        if (!hdrProbeFrameOk) {
+            qCritical() << "PARITY S11 FAILED: HDR10 probe frame encode failed:"
+                        << hdrProbeFrameError;
             return 1;
         }
         auto extractAllFrames = [&](const QString &mp4,

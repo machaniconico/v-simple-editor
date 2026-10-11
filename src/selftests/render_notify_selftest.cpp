@@ -2,7 +2,6 @@
 // MainWindow::ensureRenderQueue. Batch (dedicated queue) and RenderInPlace (local queue) are out of scope.
 #include "SelftestGate.h"
 #include "../BatchExportQueue.h"
-#include "../CodecDetector.h"
 #include "../MainWindow.h"
 #include "../RenderQueue.h"
 #include "../RenderQueueDialog.h"
@@ -92,8 +91,10 @@ int runRenderNotifySelftest()
 
     QTemporaryDir work;
     const QString video = work.filePath("notify-video.mp4");
-    if (!CodecDetector::isEncoderAvailable(QStringLiteral("mpeg4"))) {
-        for (int n = 1; n <= 4; ++n) tally.skip(n, "mpeg4 encoder unavailable");
+    QString encoderReason;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderReason)) {
+        const QByteArray reason = encoderReason.toUtf8();
+        for (int n = 1; n <= 4; ++n) tally.skip(n, reason.constData());
         return tally.finish("render-notify");
     }
     const bool fixture = work.isValid() && writeVideo(video);

@@ -439,7 +439,7 @@ int runTrackOpsSelftest()
         // Exercise the real MainWindow hook, which used to overwrite the
         // carrier with its stale pre-split sidecar on redo.
         MainWindow window;
-        auto *t = window.findChild<Timeline *>();
+        auto *t = window.findChild<Timeline *>("mainTimeline");
         bool ok = t != nullptr;
         if (t) {
             const QVector<QVector<ClipInfo>> video{{clip(0), clip(1)}};
@@ -492,7 +492,7 @@ int runTrackOpsSelftest()
     }
     {
         MainWindow window;
-        auto *t = window.findChild<Timeline *>();
+        auto *t = window.findChild<Timeline *>("mainTimeline");
         bool ok = t != nullptr;
         if (t) {
             const QVector<QVector<ClipInfo>> video{{clip(0), clip(1)}, {clip(2)}};

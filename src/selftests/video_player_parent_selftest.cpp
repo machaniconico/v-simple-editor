@@ -482,7 +482,12 @@ int runVideoPlayerParentSelftest()
             bool allInWindow = true;
             bool anyParentHit = false;
             for (const tlrender::detail::ObservedLayerTime &o : p.d.rendererChildTimes) {
-                const qint64 timelineUs = usecOf(o.localSec);
+                const auto &clips = tl.videoTracks().at(o.trackIdx)->clips();
+                double clipStartSec = 0.0;
+                for (int i = 0; i < o.clipIdx; ++i)
+                    clipStartSec += clips.at(i).leadInSec + clips.at(i).effectiveDuration();
+                clipStartSec += clips.at(o.clipIdx).leadInSec;
+                const qint64 timelineUs = usecOf(clipStartSec + o.localSec);
                 const std::optional<ParentLayerHit> hit =
                     tlrender::parentLayerAt(&tl, timelineUs, parentTrack, parentClip);
                 p.d.rendererChildParentHits.append(hit);
@@ -491,7 +496,7 @@ int runVideoPlayerParentSelftest()
                 anyParentHit = anyParentHit || hit.has_value();
                 std::ostringstream s;
                 s.precision(17);
-                s << "  routed child layer timelineSec=" << o.localSec
+                s << "  routed child layer timelineSec=" << clipStartSec + o.localSec
                   << " localSec=" << o.localSec << " sourceSec=" << o.sourceSec
                   << " inWindow=" << (inWindow ? 1 : 0) << ' '
                   << hitText("parentLayerAt(parent)", hit);

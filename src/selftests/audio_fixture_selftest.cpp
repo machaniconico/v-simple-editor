@@ -272,6 +272,7 @@ struct PcmComparison {
     bool identical = false;
     int maxDiffLsb = 0;
     qsizetype firstDiffSample = -1; // interleaved PCM16 sample index, -1 when none
+    qsizetype lengthDiffSamples = 0;
 };
 
 // Byte-level comparison of two PCM16 payloads. A length mismatch counts as a
@@ -279,6 +280,7 @@ struct PcmComparison {
 PcmComparison comparePcm16(const QByteArray &a, const QByteArray &b)
 {
     PcmComparison result;
+    result.lengthDiffSamples = (a.size() >= b.size() ? a.size() - b.size() : b.size() - a.size()) / 2;
     const qsizetype common = qMin(a.size(), b.size()) / 2;
     for (qsizetype i = 0; i < common; ++i) {
         const auto sample = [](const QByteArray &pcm, qsizetype index) {
@@ -526,8 +528,9 @@ int runAudioFixtureSelftest()
         const PcmComparison gf = comparePcm16(pcm[6], pcm[5]);
         const PcmComparison control = comparePcm16(pcm[0], pcm[1]);
         const PcmComparison self = comparePcm16(pcm[6], pcm[6]);
-        std::fprintf(stderr, "G9 identical=%d maxDiffLsb=%d firstDiffSample=%lld\n",
-                     gf.identical, gf.maxDiffLsb, static_cast<long long>(gf.firstDiffSample));
+        std::fprintf(stderr, "G9 identical=%d maxDiffLsb=%d firstDiffSample=%lld lengthDiffSamples=%lld\n",
+                     gf.identical, gf.maxDiffLsb, static_cast<long long>(gf.firstDiffSample),
+                     static_cast<long long>(gf.lengthDiffSamples));
         std::fprintf(stderr, "G9 gBytes=%lld fBytes=%lld control(a,b) identical=%d maxDiffLsb=%d self(g,g) identical=%d\n",
                      static_cast<long long>(pcm[6].size()), static_cast<long long>(pcm[5].size()),
                      control.identical, control.maxDiffLsb, self.identical);
