@@ -1478,10 +1478,10 @@ QString renderScopedClipId(int trackIdx,
         : QStringLiteral("sequence:%1:%2").arg(scope, localId);
 }
 
-// TM-8: the track-matte wiring is now intrinsic to the Timeline. Both
-// producers populate it: MainWindow on every m_trackMatteClipEntries
-// mutation (GUI preview path), and RenderQueue::resolveTimeline after
-// rebuilding a parentless Timeline from a loaded project (queue / file /
+// TM-8: the track-matte wiring is now intrinsic to the Timeline, its single
+// source of truth. MainWindow writes it through Timeline::setTrackMatteEntries
+// (GUI preview path), and RenderQueue::resolveTimeline rebuilds it after
+// loading a project into a parentless Timeline (queue / file /
 // batch export path). This runs on the RenderQueue WORKER thread and
 // touches NOTHING but the Timeline's own QHash — no MainWindow, no
 // QObject::parent() walk, no QWidget deref off the worker thread. That
@@ -2090,8 +2090,16 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         if (it == rotoEntries.cend())
             return raw;
         const double fps = rotoSourceFps(c, timeline->projectFrameRate());
-        if (c.reversed && c.sourceTimeRunsBackwardAtLocalTime(localSec))
-            sourceSec = qMax(c.inPoint, sourceSec - 1.0 / fps);
+        if (c.reversed && c.sourceTimeRunsBackwardAtLocalTime(localSec)) {
+            // A RenderInPlace stand-in (its original on the same media) has an
+            // inPoint lowered by the handles. Its retained samples clamp to the
+            // original's inPoint, as the source timeline does.
+            const ClipInfo *original = c.renderInPlaceOriginal.get();
+            const double inSec = original && original->filePath == c.filePath
+                    && sourceSec >= original->inPoint
+                ? original->inPoint : c.inPoint;
+            sourceSec = qMax(inSec, sourceSec - 1.0 / fps);
+        }
         return roto::applyEntryForRender(
             it.value(), raw, roto::sourceFrameIndexFor(sourceSec, fps));
     };

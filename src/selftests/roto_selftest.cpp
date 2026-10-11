@@ -38,15 +38,16 @@ namespace {
 
 QString gSyntheticClipPath;
 
-// lumaStep > 0 writes frame n as uniform gray of luma lumaStep * n instead of `color`.
+// lumaStep > 0 writes frame n as uniform gray of luma lumaStep * n instead of
+// `color`, wrapping to 0 past 255 (lumaStep 20: n mod 13).
 bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80, 160),
-                        int lumaStep = 0, int frameCount = 20)
+                        int lumaStep = 0, int frameCount = 20, int fps = 10)
 {
     libavcore::EncodeRequest request;
     request.width = 64;
     request.height = 64;
-    request.fps = 10;
-    request.fpsNum = 10;
+    request.fps = fps;
+    request.fpsNum = fps;
     request.fpsDen = 1;
     request.videoBitrateBits = 600000;
     request.outputPath = path.toStdString();
@@ -58,7 +59,10 @@ bool writeSyntheticClip(const QString &path, const QColor &color = QColor(32, 80
     QImage frame(64, 64, QImage::Format_RGB888);
     frame.fill(color);
     for (int i = 0; i < frameCount; ++i) {
-        if (lumaStep > 0) frame.fill(QColor(lumaStep * i, lumaStep * i, lumaStep * i));
+        if (lumaStep > 0) {
+            const int luma = lumaStep * (i % (255 / lumaStep + 1));
+            frame.fill(QColor(luma, luma, luma));
+        }
         if (!encoder.pushFrame(frame, i)) return false;
     }
     return !encoder.finalize().has_value() && QFile::exists(path);
@@ -499,7 +503,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 36;
+    constexpr int kRotoGateCount = 39;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -2061,6 +2065,8 @@ int runRotoSelftest()
     if (!selftest::requireEncoder(QStringLiteral("prores_ks"), &rampProresUnavailable)) {
         gates.skip(27, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
         gates.skip(28, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+        for (int gate = 37; gate <= 39; ++gate)
+            gates.skip(gate, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
     } else {
         const QString rampPath = media.filePath(QStringLiteral("roto-g27-luma-ramp.mp4"));
         const bool rampReady = writeSyntheticClip(rampPath, QColor(), 20, 13);
@@ -2230,6 +2236,195 @@ int runRotoSelftest()
             std::cerr << "G28 G21=" << (g21Passed ? "PASS" : "FAIL") << " forward=" << forward << '\n';
             gates.gate(28, g21Passed && forward, "forward bake control: G21 failed or the forward bake moved");
         }
+
+        // ── G37-G39 (US-1103): reversed bake tails and the media end.
+        // G37: in-bounds handles (24-frame 10 fps ramp, luma 20 * (n mod 13),
+        // inPoint 1.03, outPoint 2.03, handles 0.2 -> isolated 0.83..2.23 inside
+        // the 2.4 s media), 60 fps bake, roto keys 9 = left / 10 = right /
+        // 11 = left (only roto 10 renders the right rect). At
+        // 57/60 and 59/60 s (sourceSec 1.08 / 1.0467, the last tail sample) the
+        // source timeline shows frame 11 (first frame at or after inPoint) and
+        // roto frame llround(1.03 * 10) = 10. G37 detects a bake that keeps the
+        // lowered isolated inPoint for in-bounds handles (e081831: picture 10,
+        // roto 9 at 59/60 s: FAIL); the mutation without the reversed branch
+        // trigger is logged in .omc/state/ralph4-results/US-1103-mutation.txt.
+        // G38: a 60 fps stream under a 30 fps time-remap curve (13-frame ramp,
+        // inPoint 0.16, outPoint 0.205, identity-slope keys, handles 0.2, 60 fps
+        // bake, roto keys 4 = left / 5 = right / 6 = left). At 1/60 and 2/60 s (sourceSec
+        // 0.1883 / 0.1717) the source timeline shows frames 11 / 10 and roto
+        // frame llround(0.16 * 30) = 5. No second inside frame 10 indexes roto 5
+        // from the lowered inPoint, so G38 detects a renderer roto clamp that
+        // ignores the original's inPoint (e081831: frame 10 with roto 4: FAIL).
+        // G39: a forward clip whose handles pass the media end (13-frame ramp,
+        // inPoint 0.13, outPoint 1.13, handles 0.2), baked at 120 fps. The last
+        // baked frame holds the last real frame 12. G39 detects a bake clamped
+        // one bake frame before the media end, past the last frame (e081831:
+        // "renderFrameAt returned a null image": FAIL). Its reversed sub-case
+        // (inPoint 0.3, outPoint 1.1, handles 0.2: the handles end at the
+        // media end) bakes and starts on frame 12; a flat clamped curve head
+        // aborts with the same null image.
+        const auto bakeClip = [&](const ClipInfo &video, const RotoClipEntry &keyed, double handlesSec,
+                                  double fps, const QVector<double> &times) {
+            RampBake r;
+            r.times = times;
+            r.original = video;
+            Timeline tl;
+            tl.restoreFromProject(oneTrack({video}), QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 10);
+            tl.setRotoEntries(rotoAt(QStringLiteral("0:0"), keyed));
+            for (int i = 0; i < r.times.size(); ++i)
+                r.source[i] = identify(renderAt(&tl, r.times[i]));
+            renderinplace::Options options;
+            options.handlesSec = handlesSec;
+            options.outputDir = temporary.path();
+            options.outputSize = frameSize;
+            options.fps = fps;
+            QString path;
+            r.baked = renderinplace::renderClipInPlace(tl, 0, 0, options, &path, &r.error);
+            if (!r.baked) return r;
+            r.inPoint = tl.videoTracks()[0]->clips()[0].inPoint;
+            for (int i = 0; i < r.times.size(); ++i)
+                r.bakedId[i] = identify(libavcore::grabFrameAt(path, r.inPoint + r.times[i]));
+            return r;
+        };
+        // Picture frame / roto frame of the last sample. Only roto index
+        // rotoBase + 1 renders rect 1 (keyedAt), so rect 0 is any other index.
+        const auto printLastTail = [](const char *label, const RampBake &r, int rotoBase) {
+            const int last = r.times.size() - 1;
+            const auto roto = [rotoBase](const FrameId &id) {
+                return id.rect < 0 ? std::string("-1")
+                    : id.rect == 1 ? std::to_string(rotoBase + 1)
+                                   : "!=" + std::to_string(rotoBase + 1) + " (rect 0)";
+            };
+            std::cerr << label << " last tail sample timelineSec=" << r.times[last]
+                      << " localSec=" << r.times[last]
+                      << " sourceSec=" << r.original.sourceSecondAtLocalTime(r.times[last])
+                      << ": source timeline picture/roto=" << r.source[last].frame << '/' << roto(r.source[last])
+                      << " bake picture/roto=" << r.bakedId[last].frame << '/' << roto(r.bakedId[last]) << '\n';
+        };
+        const auto keyedAt = [&](int leftFrame) {
+            RotoClipEntry keyed;
+            RotoKeyframe left = key5;
+            left.frameNumber = leftFrame;
+            RotoKeyframe right = key6;
+            right.frameNumber = leftFrame + 1;
+            // Every index from leftFrame + 2 on holds rect 0 again, so an
+            // index past leftFrame + 1 fails the rect 1 expectation.
+            RotoKeyframe after = key5;
+            after.frameNumber = leftFrame + 2;
+            keyed.keyframes = {left, right, after};
+            return keyed;
+        };
+
+        const QString longRampPath = media.filePath(QStringLiteral("roto-g37-luma-ramp-24.mp4"));
+        const bool longRampReady = writeSyntheticClip(longRampPath, QColor(), 20, 24);
+        ClipInfo inBounds = clip(270);
+        inBounds.filePath = longRampPath;
+        inBounds.duration = 2.4;
+        inBounds.inPoint = 1.03;
+        inBounds.outPoint = 2.03;
+        inBounds.reversed = true;
+        const RampBake g37 = bakeClip(inBounds, keyedAt(9), 0.2, 60.0, {57.0 / 60.0, 59.0 / 60.0});
+        const bool g37Match = rampMatches("G37 reversed+inBoundsHandles0.2+60fps", g37, 0.2, {11, 11}, {1, 1});
+        printLastTail("G37", g37, 9);
+
+        const QString fastRampPath = media.filePath(QStringLiteral("roto-g38-luma-ramp-60fps.mp4"));
+        const bool fastRampReady = writeSyntheticClip(fastRampPath, QColor(), 20, 13, 60);
+        // G37 sub-case: in-bounds reversed clip at speed 0.25 on the 60 fps
+        // ramp (last frame 12 at 0.2 s, media end 13/60 s), baked at 30 fps.
+        // The head handle runs sourceSec 0.21 -> 0.16 (outPoint 0.16 +
+        // 0.2 * 0.25 = 0.21 <= 13/60, above the one-bake-frame bound
+        // 13/60 - 1/30). Bake samples 0 / 1 (sourceSec 0.21 / 0.20167) show
+        // the last real frame 12. It detects head samples clamped below the
+        // last frame: the flat curve head decodes forward to frame 11.
+        ClipInfo slowReversed = clip(270);
+        slowReversed.filePath = fastRampPath;
+        slowReversed.duration = 13.0 / 60.0;
+        slowReversed.inPoint = 0.06;
+        slowReversed.outPoint = 0.16;
+        slowReversed.speed = 0.25;
+        slowReversed.reversed = true;
+        // Probe each sample at its start: grabFrameAt takes the first frame
+        // at or after the probe less 1/120 s, so a mid-frame probe at 30 fps
+        // would read the next sample.
+        const RampBake g37Slow = bakeClip(slowReversed, rampKeyed, 0.2, 30.0, {-0.2, 1.0 / 30.0 - 0.2});
+        const FrameId fastLastReal = identify(libavcore::grabFrameAt(fastRampPath, 12.0 / 60.0));
+        const bool fastLastRealSane = fastLastReal.frame == 12;
+        bool g37SlowOk = fastRampReady && g37Slow.baked && g37Slow.error.isEmpty() && fastLastRealSane;
+        std::cerr << "G37 reversed+speed0.25+stream60+handles0.2+30fps: fastRampReady=" << fastRampReady
+                  << " baked=" << g37Slow.baked << " error=" << g37Slow.error.toStdString()
+                  << " replacementInPoint=" << g37Slow.inPoint << " last real frame=" << fastLastReal.frame
+                  << " (luma " << fastLastReal.luma << ", expected 12) sane=" << fastLastRealSane << '\n';
+        for (int i = 0; i < g37Slow.times.size(); ++i) {
+            const double timelineSec = g37Slow.times[i];
+            const double localSec = i / 30.0 - 0.2;
+            const double sourceSec = slowReversed.outPoint - localSec * slowReversed.speed;
+            const bool head = g37Slow.bakedId[i].frame == fastLastReal.frame;
+            std::cerr << "G37 reversed+speed0.25 head sample " << i << " probe timelineSec=" << timelineSec
+                      << " sample localSec=" << localSec << " sourceSec=" << sourceSec
+                      << " expectedFrame=12 bakedFrame=" << g37Slow.bakedId[i].frame
+                      << " (luma " << g37Slow.bakedId[i].luma << ") -> " << head << '\n';
+            g37SlowOk = g37SlowOk && head;
+        }
+        const bool g37Ok = longRampReady && g37Match && g37SlowOk;
+        std::cerr << "G37 longRampReady=" << longRampReady << " match=" << g37Match
+                  << " slowReversed=" << g37SlowOk << " -> " << g37Ok << '\n';
+        gates.gate(37, g37Ok, "in-bounds reversed bake tail picture or roto frame differs from the source timeline");
+
+        ClipInfo fastStream = clip(270);
+        fastStream.filePath = fastRampPath;
+        fastStream.duration = 13.0 / 60.0;
+        fastStream.inPoint = 0.16;
+        fastStream.outPoint = 0.205;
+        fastStream.reversed = true;
+        fastStream.timeRemapCurve.keys = {{0.0, 0.0}, {0.045, 0.045}};
+        fastStream.timeRemapCurve.sourceFps = 30.0;
+        const RampBake g38 = bakeClip(fastStream, keyedAt(4), 0.2, 60.0, {1.0 / 60.0, 2.0 / 60.0});
+        const bool g38Match = rampMatches("G38 reversed+stream60+remap30+handles0.2+60fps", g38, 0.2, {11, 10}, {1, 1});
+        const bool g38Ok = fastRampReady && g38Match;
+        std::cerr << "G38 fastRampReady=" << fastRampReady << " match=" << g38Match << '\n';
+        printLastTail("G38", g38, 4);
+        gates.gate(38, g38Ok, "tail roto frame of a stream faster than sourceFps differs from the source timeline");
+
+        ClipInfo pastEnd = clip(270);
+        pastEnd.filePath = rampPath;
+        pastEnd.duration = 1.3;
+        pastEnd.inPoint = 0.13;
+        pastEnd.outPoint = 1.13;
+        // The last baked frame: bake length 1.4 s at 120 fps, mid-frame of tick 167.
+        const double lastBakedSec = 1.4 - 0.2 - 0.5 / 120.0;
+        const RampBake g39 = bakeClip(pastEnd, rampKeyed, 0.2, 120.0, {lastBakedSec});
+        const FrameId lastReal = identify(libavcore::grabFrameAt(rampPath, 1.25));
+        const bool lastRealSane = lastReal.frame == 12;
+        bool g39Ok = rampReady && g39.baked && g39.error.isEmpty() && lastRealSane
+            && g39.bakedId[0].frame == lastReal.frame;
+        std::cerr << "G39 forward+handles0.2 past media end 1.3 s at 120 fps: baked=" << g39.baked
+                  << " error=" << g39.error.toStdString() << " replacementInPoint=" << g39.inPoint
+                  << " last baked frame (timelineSec " << lastBakedSec << ")=" << g39.bakedId[0].frame
+                  << " (luma " << g39.bakedId[0].luma << ") last real media frame=" << lastReal.frame
+                  << " (luma " << lastReal.luma << ", expected 12) rampReady=" << rampReady
+                  << " lastRealSane=" << lastRealSane << " -> " << g39Ok << '\n';
+        // Reversed sub-case: handles end exactly at the media end (outPoint
+        // 1.1 + 0.2 = 1.3). The first baked sample (baked-file second 0.5/120,
+        // head handle, sourceSec 1.3 clamped below the end) shows the last
+        // real frame 12. It detects a flat clamped curve head, which the
+        // renderer decodes forward past the last frame (null image).
+        ClipInfo reversedEnd = pastEnd;
+        reversedEnd.inPoint = 0.3;
+        reversedEnd.outPoint = 1.1;
+        reversedEnd.reversed = true;
+        const double firstBakedSec = 0.5 / 120.0;
+        const RampBake g39Rev = bakeClip(reversedEnd, rampKeyed, 0.2, 120.0, {firstBakedSec - 0.2});
+        const bool g39RevBaked = g39Rev.baked;
+        const bool g39RevNoError = g39Rev.error.isEmpty();
+        const bool g39RevFirst = g39Rev.bakedId[0].frame == lastReal.frame;
+        std::cerr << "G39 reversed+handles0.2 ending at media end 1.3 s at 120 fps: baked=" << g39RevBaked
+                  << " error=" << g39Rev.error.toStdString() << " (empty " << g39RevNoError
+                  << ") replacementInPoint=" << g39Rev.inPoint << " first baked frame (baked-file second "
+                  << firstBakedSec << ", timelineSec " << firstBakedSec - 0.2 << ")=" << g39Rev.bakedId[0].frame
+                  << " (luma " << g39Rev.bakedId[0].luma << ", expected last real frame " << lastReal.frame
+                  << ") -> " << g39RevFirst << '\n';
+        g39Ok = g39Ok && g39RevBaked && g39RevNoError && g39RevFirst;
+        gates.gate(39, g39Ok, "bake past the media end at a fast bake fps failed or does not hold the last frame");
     }
     // ── G29-G31 (US-1004): roto / alpha media keep their alpha through the
     // grade stage (gradeClipNativeFrame) and the non-geometric FX pack

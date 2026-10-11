@@ -211,12 +211,14 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         // sourceSecondAtLocalTime folds it back to the same descending source
         // second, so the renderer keeps its reverse sampling (last frame before
         // that second, roto one source frame earlier) as on the source timeline.
-        // Tail rule: the reverse decoder and the roto clamp take their lower
-        // bound from the lowered isolated inPoint. The decoder picks frames by
-        // the stream's real timestamps (the last frame before the second at or
-        // after the in point, else the first frame at or after it), and roto
-        // indexes by sourceFps, which can differ from the stream rate. A
-        // retained sample whose source time runs backward and that lies at or
+        // Tail rule: the reverse decoder takes its lower bound from the lowered
+        // isolated inPoint (the roto clamp of retained samples reads
+        // original.inPoint, see renderInPlaceOriginal below). The decoder
+        // picks frames by the stream's real timestamps (the last frame before
+        // the second at or after the in point, else the first frame at or
+        // after it), and roto indexes by sourceFps, which can differ from the
+        // stream rate.
+        // A retained sample whose source time runs backward and that lies at or
         // before the first frame at or after original.inPoint, or below
         // original.inPoint + 1/sourceFps, is therefore moved (still strictly
         // below the previous backward sample) into the stream frame interval
@@ -226,8 +228,11 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         // whose source time runs forward (a reversed clip with a descending
         // curve) keep their source second: the source timeline samples them
         // forward without the reverse roto offset.
+        // A reversed clip always takes this branch, also when its handles stay
+        // inside the media: the lowered inPoint moves the tail otherwise.
         if (original.hasTimeRemap() || !original.speedRamp.isIdentity()
-            || isolated.inPoint < 0.0 || isolated.outPoint > original.duration) {
+            || isolated.inPoint < 0.0 || isolated.outPoint > original.duration
+            || original.reversed) {
             isolated.speedRamp = speedramp::SpeedRamp::identity();
             isolated.timeRemapCurve.keys.clear();
             // The renderer indexes roto by the curve's sourceFps once the clip
@@ -252,10 +257,35 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                          n / streamFps <= untilSec; ++n)
                         frameTimes.append(n / streamFps);
                 }
+                // The renderer bounds the roto second of retained samples
+                // (source second >= original.inPoint) by the in point of this
+                // same-media original, as on the source timeline. Without it a
+                // stream faster than sourceFps leaves no second in a tail frame
+                // that indexes the source timeline's roto frame.
+                isolated.renderInPlaceOriginal = std::make_shared<ClipInfo>(original);
             }
-            const auto rotoIndexAt = [sourceFps](double inPoint, double sourceSec) {
+            // The renderer's reverse roto second (TimelineFrameRenderer applyRoto).
+            const auto rotoIndexAt = [&](double sourceSec) {
+                const double inPoint = sourceSec >= original.inPoint ? original.inPoint : isolated.inPoint;
                 return roto::sourceFrameIndexFor(qMax(inPoint, sourceSec - 1.0 / sourceFps), sourceFps);
             };
+            // Samples past the last real frame (bake fps above the stream
+            // rate, clamped one bake frame before the media end) must still
+            // decode it. The renderer reads the direction from the isolated
+            // curve: a flat run decodes forward, finds no frame at or after
+            // its second, and the queue refuses the null image. Forward-running
+            // samples hold the last real frame. Backward-running samples of a
+            // reversed clip, including head-handle samples, are bounded by the
+            // media end instead of one bake frame before it (that bound can
+            // fall below the last frame and flatten the head) and stay
+            // strictly descending above the last frame, so the reverse decoder
+            // presents the last frame (EOF predecessor).
+            const QVector<double> endFrameTimes = probeVideoFrameTimes(
+                original.filePath, qMax(0.0, original.duration - 1.0), original.duration + 1.0);
+            const double lastFrameSec = !endFrameTimes.isEmpty()
+                ? endFrameTimes.last()
+                : original.duration - 1.0 / roto::clipEffectiveSourceFps(
+                      roto::probeVideoStreamFps(original.filePath), timeline.projectFrameRate());
             double previousSource = std::numeric_limits<double>::infinity();
             int rotoMismatches = 0;
             int mismatchSourceRoto = -1;
@@ -269,8 +299,14 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                     source = original.reversed ? sourceOut - local * original.speed
                                                : original.inPoint + local * original.speed;
                 }
-                source = qBound(0.0, source, qMax(0.0, original.duration - 1.0 / options.fps));
                 const bool runsBackward = original.sourceTimeRunsBackwardAtLocalTime(qBound(0.0, local, length));
+                source = original.reversed && runsBackward
+                    ? qBound(0.0, source, original.duration)
+                    : qBound(0.0, source, qMax(0.0, original.duration - 1.0 / options.fps));
+                if (!runsBackward && source > lastFrameSec + 1e-6)
+                    source = lastFrameSec;
+                if (runsBackward && source > lastFrameSec + 1e-6)
+                    source = qMin(source, previousSource - 1e-6);
                 if (!frameTimes.isEmpty() && runsBackward && local > -1e-9 && local < length - 1e-9) {
                     // k = the decoder's frame on the source timeline: the last
                     // frame before source (-1: the first frame at or after it).
@@ -281,15 +317,19 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                         const double pictureLo = frameTimes[pictureIndex];
                         const double pictureHi = pictureIndex + 1 < frameTimes.size()
                             ? frameTimes[pictureIndex + 1] : std::numeric_limits<double>::infinity();
-                        const int sourceRoto = rotoIndexAt(original.inPoint, source);
+                        // The decoder seeks to the nearest stream tick, which
+                        // lands on the next frame from the upper half of the
+                        // interval: stay in the lower half.
+                        const double pictureMid = pictureLo + (pictureHi - pictureLo) / 2.0;
+                        const int sourceRoto = rotoIndexAt(source);
                         const double rotoHi = (sourceRoto + 1.5) / sourceFps;
-                        double adjusted = qMin(qMin(pictureHi, rotoHi), previousSource) - 1e-6;
+                        double adjusted = qMin(qMin(pictureMid, rotoHi), previousSource) - 1e-6;
                         if (!(adjusted > pictureLo + 1e-6)
-                            || rotoIndexAt(isolated.inPoint, adjusted) != sourceRoto) {
-                            adjusted = qMin(pictureHi, previousSource) - 1e-6;
+                            || rotoIndexAt(adjusted) != sourceRoto) {
+                            adjusted = qMin(pictureMid, previousSource) - 1e-6;
                             if (rotoMismatches++ == 0) {
                                 mismatchSourceRoto = sourceRoto;
-                                mismatchBakedRoto = rotoIndexAt(isolated.inPoint, adjusted);
+                                mismatchBakedRoto = rotoIndexAt(adjusted);
                             }
                         }
                         source = adjusted;
@@ -380,8 +420,8 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     // synthetic curve whose sourceFps is the source timeline's roto rate) and
     // keeps the reversed flag, so the renderer samples the same picture frame
     // and the same roto source frame (one frame earlier where the source time
-    // runs backward). The exception is the reversed tail: the decoder and roto
-    // lower bounds read the lowered isolated inPoint, so backward-running
+    // runs backward). The exception is the reversed tail: the decoder lower
+    // bound reads the lowered isolated inPoint, so backward-running
     // samples up to the stream's first frame at or after original.inPoint (by
     // its real timestamps) or within one sourceFps frame of original.inPoint
     // are moved in the curve above to a second that decodes the same stream
