@@ -309,7 +309,11 @@ void Queue::processNext()
                             "自動ラウドネス: 無音・音声なし・測定失敗のため正規化できません");
                 }
             } else if (job.timeline && job.timeline->totalDuration() > 0.0
-                       && !job.timeline->computeAudioPlaybackSequence().isEmpty()) {
+                       && (!job.timeline->computeAudioPlaybackSequence().isEmpty()
+                           || (job.timeline->videoClips().isEmpty()
+                               && !loudnessauto::timelineAudioMatchesPassthrough(job.timeline)))) {
+                // Empty V1 with video on an upper track: also a silent / mixed track, as
+                // the normal export (the V1 source-audio fallback has no clip to read).
                 // Same AAC timeline-mix intermediate as the normal export: the queue
                 // muxes audio by stream copy, so this must not be a .wav. Built from
                 // the timeline as it is now (task dispatch), like the video frames.
@@ -323,6 +327,13 @@ void Queue::processNext()
                     task.audioBitrateKbps);
                 if (mixed == mixPath && QFileInfo::exists(mixPath)) {
                     RenderQueue::setIntermediateProjectFile(job, mixPath);
+                } else if (job.timeline->videoClips().isEmpty()) {
+                    // Empty V1: there is no source audio to fall back to (the render would
+                    // be video-only), so reject like the other entry points.
+                    job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                        "タイムライン音声ミックスの作成に失敗しました: %1").arg(mixError);
+                    qWarning().noquote() << job.exportConfig.value(
+                        QStringLiteral("loudnessAutoError")).toString();
                 } else {
                     // Fall back to the previous audio source, but keep the reason.
                     job.exportConfig[QStringLiteral("audioMixWarning")] = QStringLiteral(

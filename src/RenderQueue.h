@@ -302,4 +302,6 @@ enum class ForcedFailure { None, PcmMix, SilentMix, AacConvert };
 void setForcedFailureForTest(ForcedFailure failure);
 // Number of silent tracks prepareJob made for an empty audio playback sequence (selftest counter).
 int silentMixCallCountForTest();
+// True when the ordinary export needs no audio mix (RenderQueue muxes the V1 source audio as is).
+bool timelineAudioMatchesPassthrough(Timeline *timeline);
 }

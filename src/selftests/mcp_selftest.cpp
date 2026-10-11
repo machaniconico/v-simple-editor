@@ -6748,8 +6748,8 @@ int runMcpSelftest()
                     qPrintable(failError), jobsSeen, static_cast<long long>(jobsAfterFail), control.captured,
                     static_cast<int>(control.finalStatus));
 
-                // G188-emptyV1: V1 empty, video only on an upper track, empty audio sequence. The ordinary mix is a
-                // passthrough here (no mix), so prepareJob must leave the job as HEAD did: no silent track, no audio.
+                // G188-emptyV1: V1 empty, video only on an upper track, empty audio sequence. With V1 empty and video
+                // on an upper track the ordinary export makes a silent track (US-1109), so prepareJob must too: one silent mix, one audio stream.
                 // The upper clip is a shape clip: with V1 empty the renderer draws a frame only for an upper shape.
                 const bool addedUpper = projectTimeline->videoTracks().size() < 2;
                 if (addedUpper) projectTimeline->addVideoTrack(false);
@@ -6797,8 +6797,8 @@ int runMcpSelftest()
                 const bool emptyV1HasError = emptyV1.job.exportConfig.contains(QStringLiteral("loudnessAutoError"));
                 const bool emptyV1Ok = observeTerm(188, "!emptyV1.isError", static_cast<bool>(!emptyV1.isError)) && observeTerm(188, "emptyV1.captured", static_cast<bool>(emptyV1.captured)) && observeTerm(188, "emptyV1.terminal", static_cast<bool>(emptyV1.terminal))
                     && observeTerm(188, "emptyV1.finalStatus == RenderJobStatus::Completed", static_cast<bool>(emptyV1.finalStatus == RenderJobStatus::Completed))
-                    && observeTerm(188, "emptyV1.mixDelta == 0", static_cast<bool>(emptyV1.mixDelta == 0)) && observeTerm(188, "emptyV1.silentMixDelta == 0", static_cast<bool>(emptyV1.silentMixDelta == 0)) && observeTerm(188, "!emptyV1HasError", static_cast<bool>(!emptyV1HasError))
-                    && observeTerm(188, "!emptyV1.mixInTemp", static_cast<bool>(!emptyV1.mixInTemp)) && observeTerm(188, "emptyV1M4aTemps == 0", static_cast<bool>(emptyV1M4aTemps == 0)) && observeTerm(188, "emptyV1AudioStreams == 0", static_cast<bool>(emptyV1AudioStreams == 0));
+                    && observeTerm(188, "emptyV1.mixDelta == 0", static_cast<bool>(emptyV1.mixDelta == 0)) && observeTerm(188, "emptyV1.silentMixDelta == 1", static_cast<bool>(emptyV1.silentMixDelta == 1)) && observeTerm(188, "!emptyV1HasError", static_cast<bool>(!emptyV1HasError))
+                    && observeTerm(188, "emptyV1.mixInTemp", static_cast<bool>(emptyV1.mixInTemp)) && observeTerm(188, "emptyV1M4aTemps == 1", static_cast<bool>(emptyV1M4aTemps == 1)) && observeTerm(188, "emptyV1AudioStreams == 1", static_cast<bool>(emptyV1AudioStreams == 1));
                 std::fprintf(stderr, "mcp G188-emptyV1 ok=%d isError=%d captured=%d terminal=%d status=%d mixDelta=%d "
                     "silentMixDelta=%d loudnessAutoError=%d[%s] mixInTemp=%d m4aTemps=%d tempFiles=%lld "
                     "projectFilePath=[%s] outputAudioStreams=%d addedUpper=%d jobError=[%s]\n", emptyV1Ok, emptyV1.isError,
@@ -6811,7 +6811,7 @@ int runMcpSelftest()
                     && observeTerm(188, "!control.isError", static_cast<bool>(!control.isError)) && observeTerm(188, "control.captured", static_cast<bool>(control.captured)) && observeTerm(188, "control.measureDelta == 1", static_cast<bool>(control.measureDelta == 1))
                     && observeTerm(188, "control.terminal", static_cast<bool>(control.terminal)) && observeTerm(188, "control.finalStatus == RenderJobStatus::Completed", static_cast<bool>(control.finalStatus == RenderJobStatus::Completed)) && observeTerm(188, "emptyV1Ok", static_cast<bool>(emptyV1Ok)),
                     "a forced PCM mix failure under autoLoudness=true did not end as failed (or the control was not "
-                    "queued), or an empty V1 export got a silent track the ordinary passthrough does not make");
+                    "queued), or an empty V1 export (video on an upper track) did not get its silent audio track");
             }
 
             queue->clear();

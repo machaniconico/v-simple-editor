@@ -840,6 +840,39 @@ bool applyDuckingToTimeline(Timeline *timeline,
     return true;
 }
 
+// どの映像トラックにもクリップが無ければ書き出す映像が無い。
+bool timelineHasAnyVideoClip(Timeline *timeline)
+{
+    for (TimelineTrack *videoTrack : timeline->videoTracks()) {
+        if (videoTrack && !videoTrack->clips().isEmpty())
+            return true;
+    }
+    return false;
+}
+
+// GUI 書き出しの入口ガード。V1 に映像があるか、V1 が空でも上位トラックに図形
+// クリップがある(レンダラが描ける)ときだけ書き出せる。V1 が非表示のときは
+// レンダラが透明の下地から上位レイヤーまで描くので、上位の通常映像も書き出せる。
+// V1 が表示のまま空で上位が通常映像だけのプロジェクトは、レンダリング時に null
+// 画像で失敗するため従来どおり拒否する。
+bool timelineHasExportableVideo(Timeline *timeline)
+{
+    if (!timeline->videoClips().isEmpty())
+        return true;
+    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
+    if (!tracks.isEmpty() && tracks.first() && tracks.first()->isHidden())
+        return timelineHasAnyVideoClip(timeline);
+    for (int i = 1; i < tracks.size(); ++i) {
+        if (!tracks[i])
+            continue;
+        for (const ClipInfo &clip : tracks[i]->clips()) {
+            if (!clip.shapes.isEmpty())
+                return true;
+        }
+    }
+    return false;
+}
+
 // RenderQueue の音声パススルーは「V1 先頭クリップの元ファイルの音声を 0 秒から
 // そのまま mux」する。音声タイムラインが厳密にそれと一致するときだけ省略できる。
 // トリム・分割・並べ替え・複数クリップ・音量/パン/エンベロープ/トランジション・
@@ -847,8 +880,11 @@ bool applyDuckingToTimeline(Timeline *timeline,
 bool timelineAudioMatchesPassthrough(Timeline *timeline)
 {
     const QVector<ClipInfo> &v1 = timeline->videoClips();
-    if (v1.isEmpty())
-        return true; // 映像が無ければ書き出し自体が成立しない
+    if (v1.isEmpty()) {
+        // 映像が無ければ書き出し自体が成立しない。V1 が空で上位に映像があるときは
+        // v1.first() に到達させず、無音 / 混合ミックスを作らせる。
+        return !timelineHasAnyVideoClip(timeline);
+    }
     const ClipInfo *only = nullptr;
     for (TimelineTrack *track : timeline->audioTracks()) {
         if (!track || track->isMuted())
@@ -2908,6 +2944,10 @@ std::atomic<loudnessauto::ForcedFailure> s_forcedFailure{loudnessauto::ForcedFai
 
 int loudnessauto::prepareJobCallCountForTest() { return s_prepareJobCalls.load(); }
 int loudnessauto::silentMixCallCountForTest() { return s_silentMixCalls.load(); }
+bool loudnessauto::timelineAudioMatchesPassthrough(Timeline *timeline)
+{
+    return ::timelineAudioMatchesPassthrough(timeline);
+}
 void loudnessauto::setForcedFailureForTest(ForcedFailure failure) { s_forcedFailure = failure; }
 
 // Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here, so a
@@ -2991,7 +3031,7 @@ QString loudnessauto::prepareJob(RenderJob &job)
         QString silentError;
         const QString silent = prepareTimelineAudioMixForExport(job.timeline, &silentError,
             {}, 0.0, audioKbps > 0 ? audioKbps : 192);
-        // Passthrough (V1 empty): the ordinary export makes no mix either, so leave the job as is.
+        // Passthrough (no clip on any video track): nothing to export, so leave the job as is.
         const bool passthrough = silent.isEmpty() && silentError.isEmpty()
             && timelineAudioMatchesPassthrough(job.timeline);
         if (!passthrough) {
@@ -10974,7 +11014,7 @@ void MainWindow::exportVideo()
     }
     const auto &clips = m_timeline->videoClips();
 
-    if (clips.isEmpty()) {
+    if (!timelineHasExportableVideo(m_timeline)) {
         QMessageBox::warning(this, "Export", "No clips in timeline to export.");
         return;
     }
@@ -17199,8 +17239,7 @@ void MainWindow::onMobileExport()
         connect(m_mobileExportDialog, &MobileExportDialog::exportRequested,
                 this, [this](const ExportConfig &cfg) {
                     if (!m_timeline) return;
-                    const auto &clips = m_timeline->videoClips();
-                    if (clips.isEmpty()) {
+                    if (!timelineHasExportableVideo(m_timeline)) {
                         QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
                             QStringLiteral("タイムラインにクリップがありません。"));
                         return;
@@ -17213,6 +17252,16 @@ void MainWindow::onMobileExport()
                     double projectLoudnessGainDb = 0.0;
                     RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,
                                                          &projectLoudnessGainDb);
+                    // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
+                    // 作る。OFF 時だけここで無音 / 混合トラックを作る。
+                    if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
+                        QString audioMixError;
+                        if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
+                            QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
+                                                 audioMixError);
+                            return;
+                        }
+                    }
 
                     auto *progress = new QProgressDialog(
                         QStringLiteral("モバイル向けエクスポート中..."),
