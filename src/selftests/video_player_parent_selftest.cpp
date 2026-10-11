@@ -5,6 +5,9 @@
 // + effectiveLayerTransforms) in its two real layer-admission paths through
 // VideoPlayer::setParentAdmissionObservationForTest, and compares the result
 // with the renderer's gate tlrender::parentLayerAt (adopted = hit && decodable).
+// US-1005: VideoPlayer adopts a parent only through that same gate; each record
+// carries the parentLayerAt result VideoPlayer decided with (vpHit), printed
+// next to the selftest's own parentLayerAt call (vpHitAgrees).
 //   cpu-composite: refreshPreviewClipCpuComposite (paused, CPU preview FX)
 //   multi-track:   handlePlaybackTick compositor (playing)
 // Layout: V1 (track 0) real base clip, V2 (track 1) parent at clip index 1
@@ -19,18 +22,22 @@
 //   G4 disabled parent, G5 overlap with the incoming clip as parent, G6
 //      TransitionAlignment::Start borrowed trail, G7 offline parent: verdict
 //      EQUAL / DIVERGES per path printed with timeline / local / source
-//      seconds; each path's current verdict label (KNOWN-DIVERGENCE tag for a
-//      divergence), adoption operands {vpAdopts, vpCorrectLayer,
-//      rendererAdopts} and a case-specific check are pinned, so a change in
-//      either side fails the gate. A timeline holding a disabled clip makes
+//      seconds; each path's current verdict label (a divergence is labelled
+//      KNOWN-DIVERGENCE and is never pinned since US-1005), adoption operands
+//      {vpAdopts, vpCorrectLayer, rendererAdopts} and a case-specific check
+//      are pinned, so a change in either side fails the gate. Pins: G4
+//      cpu-composite EQUAL (neither adopts), multi-track SSOT-ROUTED; G5 both
+//      paths EQUAL (parentLayerAt(incoming B) = none, neither adopts); G6 / G7
+//      both paths EQUAL. A timeline holding a disabled clip makes
 //      playback serve tlrender::renderFrameAt (timelineHasActiveShapeClip), so
 //      the multi-track loop is never entered there: that state is pinned as
 //      SSOT-ROUTED (no multi-track record, frames composited, renderFrameAt
 //      admitted the child layer inside the window, and parentLayerAt rejected
 //      the disabled parent at every one of those times).
 //      Controls: G4 an enabled parent beside a disabled spacer (still routed,
-//      renderer adopts -> not SSOT-ROUTED); G5 reversed divergence, G6 both
-//      sides stop adopting, G7 both sides adopt (label kept, pin must reject).
+//      renderer adopts -> not SSOT-ROUTED) and cpu-composite both adopt; G5
+//      reversed divergence and both adopt, G6 both sides stop adopting, G7
+//      both sides adopt (operands changed, pin must reject).
 //   Fixture media failure fails all gates; only a missing mpeg4 encoder SKIPs.
 //   G8 observation OFF records nothing while the paths still run.
 //   G9 each admission path produced records.
@@ -263,6 +270,8 @@ struct PathResult {
     bool vpAdopts = false;
     bool vpCorrectLayer = false;
     bool rendererAdopts = false;
+    bool vpHitAgrees = false; // VideoPlayer's parentLayerAt result == `hit`
+    bool parentLayerPresent = false; // parent decoded in the child's resolve group
     QString verdict = QStringLiteral("NOT-DRIVEN");
 };
 
@@ -291,6 +300,9 @@ PathResult evaluate(const Timeline &tl, const QVector<Record> &records,
             res.pointed = r;
             res.pointedValid = true;
         }
+        if (r.resolveSerial == res.child.resolveSerial
+            && r.sourceTrack == parentTrack && r.sourceClipIndex == parentClip)
+            res.parentLayerPresent = true;
     }
     res.hit = tlrender::parentLayerAt(&tl, res.child.timelineUs, parentTrack, parentClip);
     if (peerClip >= 0)
@@ -300,6 +312,12 @@ PathResult evaluate(const Timeline &tl, const QVector<Record> &records,
         && res.pointed.sourceTrack == parentTrack
         && res.pointed.sourceClipIndex == parentClip;
     res.rendererAdopts = res.hit && res.hit->decodable;
+    // Same gate, same (timeline, usec, track, clip): exact equality.
+    res.vpHitAgrees = res.child.parentHit == res.hit.has_value()
+        && (!res.hit
+            || (res.child.parentHitDecodable == res.hit->decodable
+                && res.child.parentLocalSeconds == res.hit->clipLocalSeconds
+                && res.child.parentSourceSeconds == res.hit->sourceSeconds));
     if (res.vpAdopts && !res.vpCorrectLayer)
         res.verdict = QStringLiteral("WRONG-LAYER");
     else
@@ -352,6 +370,21 @@ void report(int gate, const char *path, const PathResult &r)
           << " rendererAdopts=" << (r.rendererAdopts ? 1 : 0) << ' '
           << hitText("parentLayerAt(parent)", r.hit);
         s << ' ' << hitText("parentLayerAt(peer)", r.peerHit);
+        s << " parentLayerPresent=" << (r.parentLayerPresent ? 1 : 0);
+        if (!r.parentLayerPresent) {
+            // VideoPlayer only asks parentLayerAt once the parent layer decoded.
+            s << " vpHit=not-evaluated(parent layer not decoded) vpHitAgrees=n/a";
+        } else {
+            std::optional<ParentLayerHit> vpHit;
+            if (r.child.parentHit) {
+                vpHit = ParentLayerHit{static_cast<double>(r.child.timelineUs) / 1e6,
+                                       r.child.parentLocalSeconds,
+                                       r.child.parentSourceSeconds,
+                                       r.child.parentHitDecodable};
+            }
+            s << ' ' << hitText("vpHit", vpHit)
+              << " vpHitAgrees=" << (r.vpHitAgrees ? 1 : 0);
+        }
         s << " child.effective=" << tText(r.child.effectiveTransform);
     }
     std::cerr << s.str() << '\n';
@@ -507,7 +540,8 @@ int runVideoPlayerParentSelftest()
             // Sanity band on the expected value: parenting really moved the child.
             const bool expectedMoves = !sameT(expected, kChildT, 1e-3);
             return r.recorded && r.verdict == QStringLiteral("EQUAL") && r.vpCorrectLayer
-                && r.rendererAdopts && parentLocalOk && transformOk && expectedMoves;
+                && r.rendererAdopts && r.vpHitAgrees && parentLocalOk && transformOk
+                && expectedMoves;
         };
         const bool cpuOk = pathOk(kCpuPath, p1.cpu);
         const bool trackOk = pathOk(kTrackPath, p1.track);
@@ -672,7 +706,7 @@ int runVideoPlayerParentSelftest()
         report(gate, kTrackPath, p.track);
         const bool ok = pinMatches(gate, p, cpuPin, trackPin, check, what);
         tally.gate(gate, ok && controlOk,
-                   "verdict or adoption operands differ from the pinned EQUAL / KNOWN-DIVERGENCE state, or a control was not rejected");
+                   "verdict or adoption operands differ from the pinned EQUAL / SSOT-ROUTED state, or a control was not rejected");
     };
 
     // ── G4: disabled parent ────────────────────────────────────────────────
@@ -699,11 +733,22 @@ int runVideoPlayerParentSelftest()
                   << c.track.verdict.toStdString()
                   << " rendererAdopts=" << (c.track.rendererAdopts ? 1 : 0)
                   << " notRouted=" << (routedControlOk ? 1 : 0) << '\n';
-        // multi-track: SSOT-ROUTED (renderFrameAt rejected the disabled
-        // parent at every admitted child time; VideoPlayer adoption n/a).
-        pinnedGate(4, observeCase(tl, 2.0, 4.0, 1, 1, -1),
-                   PathPin{"KNOWN-DIVERGENCE", 1, 1, 0}, PathPin{"SSOT-ROUTED", -1, -1, 0},
-                   CaseCheck{}, "disabled parent", routedControlOk);
+        // cpu-composite: EQUAL (parentLayerAt rejects the disabled parent,
+        // VideoPlayer does not adopt, as in export). multi-track: SSOT-ROUTED
+        // (renderFrameAt rejected the disabled parent at every admitted child
+        // time; VideoPlayer adoption n/a, so the check is n/a there too).
+        const PathPair p = observeCase(tl, 2.0, 4.0, 1, 1, -1);
+        const PathPin cpuPin{"EQUAL", 0, 0, 0};
+        const PathPin trackPin{"SSOT-ROUTED", -1, -1, 0};
+        const CaseCheck check{"vpHit agrees with parentLayerAt (n/a when routed)",
+                              [](const PathResult &r) {
+            return !r.recorded || r.vpHitAgrees;
+        }};
+        // Control: cpu-composite both adopt keeps the EQUAL label.
+        const bool controlOk = controlRejected(4, p, true, true, true, cpuPin, trackPin,
+                                               check, "cpu-composite both adopt");
+        pinnedGate(4, p, cpuPin, trackPin, check, "disabled parent",
+                   routedControlOk && controlOk);
     }
 
     // ── G5: overlap, incoming clip (V2 clip 1) as parent ───────────────────
@@ -717,17 +762,22 @@ int runVideoPlayerParentSelftest()
             addClip(t, 1, a);
             addClip(t, 1, b);
         }, parentKey);
-        // The renderer picks the outgoing A (V2 clip 0) as the active clip.
+        // The renderer picks the outgoing A (V2 clip 0) as the active clip;
+        // parentLayerAt(B) = none, so neither side adopts B.
         const PathPair p = observeCase(tl, 1.6, 2.4, 1, 1, 0);
-        const PathPin pin{"KNOWN-DIVERGENCE", 1, 1, 0};
-        const CaseCheck check{"peerHit(outgoing A) decodable", [](const PathResult &r) {
-            return r.peerHit.has_value() && r.peerHit->decodable;
+        const PathPin pin{"EQUAL", 0, 0, 0};
+        const CaseCheck check{"peerHit(outgoing A) decodable && vpHit agrees (none)",
+                              [](const PathResult &r) {
+            return r.peerHit.has_value() && r.peerHit->decodable
+                && !r.hit.has_value() && r.vpHitAgrees;
         }};
-        // Control: reversed divergence (VP rejects, renderer adopts) keeps
-        // the DIVERGES label.
-        const bool controlOk = controlRejected(5, p, false, false, true, pin, pin, check,
-                                               "reversed divergence");
-        pinnedGate(5, p, pin, pin, check, "overlap incoming parent", controlOk);
+        // Controls: reversed divergence (VP rejects, renderer adopts) and both
+        // adopt keep the pinned label (the pin must reject both).
+        const bool reversedOk =
+            controlRejected(5, p, false, false, true, pin, pin, check, "reversed divergence");
+        const bool bothAdoptOk =
+            controlRejected(5, p, true, true, true, pin, pin, check, "both adopt");
+        pinnedGate(5, p, pin, pin, check, "overlap incoming parent", reversedOk && bothAdoptOk);
     }
 
     // ── G6: TransitionAlignment::Start borrowed trail ──────────────────────

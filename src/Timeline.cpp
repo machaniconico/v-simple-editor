@@ -3608,6 +3608,10 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     // source never perturbs this track's indices, but doing it first also
     // matches the "move, not copy" semantics if src == this ever slips
     // through in the future).
+    // A linked drop may create partner tracks through addAudioTrack(false) /
+    // addVideoTrack(false), which skip the external-state capture; take it before
+    // the carrier remap so the undo snapshot keeps the live matte keys.
+    if (clipData.linkGroup > 0 && m_timeline) m_timeline->captureExternalTrackStateForCompoundEdit();
     src->removeClipPreservingDownstream(srcIdx);
     insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
 
@@ -3622,6 +3626,11 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     if (clipData.linkGroup > 0) {
         emit crossTrackDropped(plan.insertIdx, clipData.linkGroup, dropTime);
     }
+
+    // One drop = one undo point, taken after the partner move, track creation
+    // and carrier remaps above (drag->exec in mouseMoveEvent returns without
+    // an interactionCompleted of its own).
+    emit interactionCompleted(QStringLiteral("クリップをトラック間移動"));
 }
 
 // --- Timeline ---
@@ -4524,8 +4533,9 @@ void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
             const int newTrack = oldToNew.value(oldTrack, -1);
             return newTrack < 0 ? QString() : QString::number(newTrack) + key.mid(colon);
         };
+        const auto currentMattes = trackMatteEntries();
         QHash<QString, TimelineTrackMatteEntry> mattes;
-        for (auto it = m_trackMatteEntries.cbegin(); it != m_trackMatteEntries.cend(); ++it) {
+        for (auto it = currentMattes.cbegin(); it != currentMattes.cend(); ++it) {
             const QString key = remapKey(it.key());
             auto entry = it.value();
             const QString source = remapKey(entry.matteSourceClipId);
@@ -4533,7 +4543,7 @@ void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
             entry.matteSourceClipId = source;
             mattes.insert(key, entry);
         }
-        m_trackMatteEntries = mattes;
+        commitTrackMatteEntries(std::move(mattes));
         const auto rotoBefore = rotoEntries();
         QHash<QString, RotoClipEntry> rotos;
         rotos.reserve(rotoBefore.size());
@@ -5099,7 +5109,7 @@ bool Timeline::importMedia(const QString &filePath,
         audioTrack->insertClipPreservingDownstream(audioPlan.insertIdx, clip,
                                                    audioPlan.newLeadIn);
     }
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState("Add clip");
     if (result) {
@@ -5293,7 +5303,7 @@ void Timeline::bladeAllTracksAtPlayhead()
         emit statusMessageRequested(QStringLiteral("再生ヘッド位置に分割できるクリップがありません。"), 3000);
         return;
     }
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("全トラックを再生ヘッドで分割"));
     // Refresh edit targets without triggering linked-selection propagation.
@@ -5367,7 +5377,7 @@ void Timeline::splitAtPlayhead()
     for (auto *t : m_videoTracks) splitTrack(t);
     for (auto *t : m_audioTracks) splitTrack(t);
     if (anySplit) {
-        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+        remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
         saveUndoState("Split clip");
         updateInfoLabel();
@@ -5434,7 +5444,7 @@ bool Timeline::freezeFrameAtPlayhead(TimelineTrack *track, int clipIndex)
     track->setClips(updated);
     track->setSelectedClip(holdIndex);
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Freeze frame"));
     ensureSequenceFitsViewport();
@@ -5841,7 +5851,7 @@ bool Timeline::arrangeSelectedLayers(LayerArrangement arrangement)
             QStringLiteral("%1 個のクリップは整列位置に合わせられないため変更しませんでした。")
                 .arg(unresolved), 5000);
     if (!wrote) return unresolved == 0;
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapTrackMatteLocked(before);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(distribute ? QStringLiteral("均等配置") : QStringLiteral("整列"));
     refreshPlaybackSequence();
@@ -5900,7 +5910,7 @@ bool Timeline::setClipGrouping(const QVector<GroupClipTarget> &clips, bool group
         // new identity at the same slot so parent/matte entries survive.
         if (!target.audio) before[target.trackIndex][target.clipIndex].linkGroup = group;
     }
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapTrackMatteLocked(before);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(grouped ? QStringLiteral("グループ化") : QStringLiteral("グループ解除"));
     scheduleEmitSequenceChanged();
@@ -5929,7 +5939,7 @@ void Timeline::deleteSelectedClip()
     for (auto *t : m_videoTracks) deleteFrom(t);
     for (auto *t : m_audioTracks) deleteFrom(t);
     if (anyRemoved) {
-        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+        remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
         saveUndoState("Delete clip");
         updateInfoLabel();
@@ -6140,7 +6150,7 @@ bool Timeline::splitClipByIndex(bool audio, int trackIndex, int clipIndex,
             track->setClips(track->clips());
     }
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Split clip (MCP)"));
     updateInfoLabel();
@@ -6210,7 +6220,7 @@ bool Timeline::deleteClipByIndex(bool audio, int trackIndex, int clipIndex,
 
     if (!changed)
         return setTimelineEditError(err, QStringLiteral("clip could not be deleted"));
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Delete clip (MCP)"));
     updateInfoLabel();
@@ -6604,7 +6614,7 @@ bool Timeline::moveClipByIndex(bool audio, int trackIndex, int clipIndex,
     // 既存規約: snapshotTrackClips -> 変更 -> remap*AfterMutation -> saveUndoState。
     for (const PendingTrack &plan : pending)
         plan.track->setClips(plan.clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     if (!m_nudgeBatchActive && selectionTrack && selectionIndex >= 0
         && selectionIndex < selectionTrack->clipCount()) {
@@ -6698,7 +6708,7 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
         }
     }
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Set clip property (MCP)"));
     updateInfoLabel();
@@ -6767,7 +6777,7 @@ bool Timeline::setClipReversed(TrackKind kind, int trackIndex, int clipIndex,
         affected->setClips(clips);
     }
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("逆再生"));
     updateInfoLabel();
@@ -6793,7 +6803,7 @@ bool Timeline::setClipAutoOrientEnabled(TrackKind kind, int trackIndex,
     clips[clipIndex].autoOrientEnabled = enabled;
     track->setClips(clips);
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("パスに沿って自動回転"));
     updateInfoLabel();
@@ -6926,7 +6936,7 @@ bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
     // Replacement preserves the position; update its identity before remap
     // (the same convention as replaceClipMedia).
     before[trackIndex][clipIndex] = {clip.filePath, clip.linkGroup, clip.inPoint};
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapTrackMatteLocked(before);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(description);
     updateInfoLabel();
@@ -7104,7 +7114,7 @@ bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
     if (!changed)
         return fail(QStringLiteral("置き換え対象のクリップがありません"));
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapTrackMatteLocked(remapSnapshot);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
     saveUndoState(QStringLiteral("Replace clip media"));
     updateInfoLabel();
@@ -7236,7 +7246,7 @@ bool Timeline::relinkMediaPaths(const QHash<QString, QString> &oldToNew,
     if (!changed)
         return fail(QStringLiteral("置換対象のメディア参照がありません"));
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, remapSnapshot);
+    remapTrackMatteLocked(remapSnapshot);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, remapSnapshot);
     saveUndoState(QStringLiteral("メディアを再リンク"));
     updateInfoLabel();
@@ -7257,7 +7267,7 @@ bool Timeline::setClipEnabled(TrackKind kind, int trackIndex, int clipIndex, boo
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIndex].visible = enabled;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("クリップの有効切替"));
     updateInfoLabel();
@@ -7296,7 +7306,7 @@ bool Timeline::setClipLabel(TrackKind kind, int trackIndex, int clipIndex,
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIndex].label = label;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("Clip label"));
     updateInfoLabel();
@@ -7393,7 +7403,7 @@ bool Timeline::applyRippleDeleteTimeRangesToAllTracks(QVector<TimeRangeSec> rang
     if (!changed)
         return false;
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(undoLabel);
     if (!hasAnySelection()) {
@@ -7486,7 +7496,7 @@ void Timeline::duplicateSelectedClips()
         // Shared paste/insert primitive preserves the complete ClipInfo payload.
         copy.track->insertClipPreservingDownstream(insertAt, duplicate, start - cursor);
     }
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, before);
+    remapTrackMatteLocked(before);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
     saveUndoState(QStringLiteral("複製"));
     ensureSequenceFitsViewport();
@@ -8307,7 +8317,7 @@ void Timeline::pasteClip()
     m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);
     m_audioTrack->setSelectedClip(insertAt);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState("Paste clip");
     updateInfoLabel();
@@ -8710,7 +8720,7 @@ bool Timeline::applyMusicRemix(int trackIndex, int clipIndex,
     track->setClips(after);
     track->setSelectedClip(clipIndex);
 
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("ミュージックリミックス"));
     updateInfoLabel();
@@ -8759,7 +8769,7 @@ bool Timeline::applyDialogueLevel(
     clips[clipIndex].volumeEnvelope = envelope;
     track->setClips(clips);
     track->setSelectedClip(clipIndex);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("ダイアログレベラー"));
     updateInfoLabel();
@@ -8826,7 +8836,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         }
         if (!changed)
             return;
-        remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+        remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
         saveUndoState(QStringLiteral("Clip label"));
         updateInfoLabel();
@@ -10097,7 +10107,7 @@ void Timeline::setClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPi
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIdx].puppetPins = pins;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("パペットピン"));
     refreshPlaybackSequence();
@@ -10129,7 +10139,7 @@ void Timeline::setClipMeshWarp(int trackIdx, int clipIdx, const MeshGrid &grid)
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIdx].meshWarp = grid;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("メッシュワープ"));
     refreshPlaybackSequence();
@@ -10166,7 +10176,7 @@ void Timeline::setClipShapeModifiers(int trackIdx, int clipIdx,
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIdx].shapes[0].modifiers = modifiers;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     if (recordUndo) saveUndoState(QStringLiteral("シェイプモディファイア"));
     scheduleEmitSequenceChanged();
@@ -10193,7 +10203,7 @@ bool Timeline::applyAudioCrossfade(int trackIndex, int clipIndexA,
     if (!audioxfade::applyCrossfade(clips, clipIndexA, durationSec, errorOut))
         return false;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("音声クロスフェード"));
     scheduleEmitSequenceChanged();
@@ -10222,7 +10232,7 @@ bool Timeline::applyAudioFade(int trackIndex, int clipIndex,
     if (!audioxfade::applyFade(clips, clipIndex, edge, durationSec, errorOut))
         return false;
     track->setClips(clips);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(edge == AudioFadeEdge::In
                       ? QStringLiteral("音声フェードイン")
@@ -10617,7 +10627,7 @@ bool Timeline::insertShapeClipAtPlayhead(const ClipInfo &clip)
 
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     track->insertClip3Point(qMax(0.0, m_playheadPos), clip);
-    remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
+    remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState(QStringLiteral("シェイプクリップを挿入"));
     updateInfoLabel();
@@ -10642,6 +10652,7 @@ void Timeline::rippleDeleteTimeRangeActive(double startSec, double endSec)
     const bool changed = track->rippleDeleteTimeRange(startSec, endSec);
     // no-op だった場合 (範囲外/空) は Undo スナップショットを積まない。
     if (changed) {
+        remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
         saveUndoState("リップル削除 (範囲)");
     }
@@ -11405,7 +11416,7 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
     //   clips in [to..from-1] (if from>to) shift to [to+1..from]  (up by 1)
     connect(track, &TimelineTrack::clipMoved, this,
         [this, track](int fromIdx, int toIdx) {
-            if (m_trackMatteEntries.isEmpty() && m_clipParentEntries.isEmpty()
+            if (trackMatteEntries().isEmpty() && m_clipParentEntries.isEmpty()
                 && rotoEntries().isEmpty()) return;
             const int t = m_videoTracks.indexOf(track);
             if (t < 0) return;   // audio track — no video clip sidecars
@@ -11422,18 +11433,19 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
                     oldToNew.insert(trackMatteClipKey(t, i),
                                     trackMatteClipKey(t, i + 1));
             }
-            if (!m_trackMatteEntries.isEmpty()) {
+            const auto currentMattes = trackMatteEntries();
+            if (!currentMattes.isEmpty()) {
                 QHash<QString, TimelineTrackMatteEntry> rebuilt;
-                rebuilt.reserve(m_trackMatteEntries.size());
-                for (auto it = m_trackMatteEntries.cbegin();
-                     it != m_trackMatteEntries.cend(); ++it) {
+                rebuilt.reserve(currentMattes.size());
+                for (auto it = currentMattes.cbegin();
+                     it != currentMattes.cend(); ++it) {
                     const QString newKey = oldToNew.value(it.key(), it.key());
                     TimelineTrackMatteEntry e = it.value();
                     e.matteSourceClipId = oldToNew.value(
                         e.matteSourceClipId, e.matteSourceClipId);
                     rebuilt.insert(newKey, e);
                 }
-                m_trackMatteEntries = rebuilt;
+                commitTrackMatteEntries(std::move(rebuilt));
             }
             const auto rotoBefore = rotoEntries();
             if (!rotoBefore.isEmpty()) {
@@ -11662,8 +11674,17 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
             srcPartnerTrack->removeClipPreservingDownstream(ci);
             targetTrack->insertClipPreservingDownstream(plan.insertIdx, partnerClip, plan.newLeadIn);
             // RM-5: remap carrier after cross-track move changed clip indices.
-            remapTimelineCarrierAfterMutation(this, m_trackMatteEntries, snapBefore);
-            remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+            if (destIsVideo) {
+                // Audio partner: no video key moved, the snapshot walk is exact.
+                remapTrackMatteLocked(snapBefore);
+                remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+            } else {
+                // Video partner moved V[ti]:ci -> V[destIdx]:insertIdx. The
+                // snapshot walk aligns within a track and would prune its keys,
+                // so roto / parent / matte take the explicit map only (no
+                // snapshot walk on top of it in the same drop).
+                remapCarriersAfterCrossTrackMove(ti, ci, destIdx, plan.insertIdx);
+            }
             return;  // Only one partner per linkGroup on the other track type
         }
     }
@@ -11672,6 +11693,7 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
 void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
                                                 int destTrackIdx, int destIdx)
 {
+    ++m_crossTrackMoveRemapCount;
     if (srcTrackIdx < 0 && destTrackIdx < 0) return;   // audio -> audio: no keys
     // Called after the move: the source track lost one clip, the destination
     // gained one. An empty value drops the key (a video clip moved to audio).
@@ -11700,6 +11722,23 @@ void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
             if (!newKey.isEmpty()) rebuilt.insert(newKey, it.value());
         }
         commitRotoEntries(std::move(rebuilt), true);
+    }
+    // The matte key and its matteSourceClipId take the same map.
+    const auto mattesBefore = trackMatteEntries();
+    if (!mattesBefore.isEmpty()) {
+        QHash<QString, TimelineTrackMatteEntry> rebuilt;
+        rebuilt.reserve(mattesBefore.size());
+        for (auto it = mattesBefore.cbegin(); it != mattesBefore.cend(); ++it) {
+            const QString newKey = oldToNew.value(it.key(), it.key());
+            TimelineTrackMatteEntry e = it.value();
+            const auto srcIt = oldToNew.constFind(e.matteSourceClipId);
+            if (srcIt != oldToNew.cend()) {
+                if (srcIt.value().isEmpty()) continue;   // source moved to audio
+                e.matteSourceClipId = srcIt.value();
+            }
+            if (!newKey.isEmpty()) rebuilt.insert(newKey, e);
+        }
+        commitTrackMatteEntries(std::move(rebuilt));
     }
     if (!m_clipParentEntries.isEmpty()) {
         QHash<QString, QString> rebuilt;
@@ -12242,6 +12281,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                   return a.trackIdx < b.trackIdx;
               });
 
+    const auto matteSnapshot = trackMatteEntries();
     result.reserve(visible.size());
     for (const auto &iv : visible) {
         if (iv.timelineEnd - iv.timelineStart < 1e-6) continue;
@@ -12286,14 +12326,13 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         // (TimelineFrameRenderer.cpp:792-814). This is pure data plumbing —
         // no behavior changes until part 2 wires the GPU gate. The matte hash
         // is keyed by trackMatteClipKey(trackIdx,clipIdx), the same key space
-        // export uses (renderClipId). Read m_trackMatteEntries directly: this
-        // is a const member access (computePlaybackSequence is const) and the
-        // hash is COW so no aliasing risk. Default-OFF (no matte entry) leaves
+        // export uses (renderClipId). Read a locked carrier snapshot so the
+        // GUI setter cannot race the playback reader. Default-OFF leaves
         // matteTypeOrdinal=0 / matteSourceClipId empty == today's behavior.
         {
             const QString matteKey = trackMatteClipKey(e.sourceTrack, e.sourceClipIndex);
-            const auto mit = m_trackMatteEntries.constFind(matteKey);
-            if (mit != m_trackMatteEntries.cend()) {
+            const auto mit = matteSnapshot.constFind(matteKey);
+            if (mit != matteSnapshot.cend()) {
                 e.matteTypeOrdinal = static_cast<int>(mit.value().matteType);
                 e.matteSourceClipId = mit.value().matteSourceClipId;
             }
@@ -13115,6 +13154,42 @@ void Timeline::clearClipParent(const QString& childKey)
     scheduleEmitSequenceChanged();
 }
 
+void Timeline::commitTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry> next)
+{
+    QMutexLocker lock(&m_trackMatteMutex);
+    m_trackMatteEntries = std::move(next);
+}
+
+void Timeline::setTrackMatteEntries(
+    const QHash<QString, TimelineTrackMatteEntry> &entries)
+{
+    commitTrackMatteEntries(entries);
+}
+
+QHash<QString, TimelineTrackMatteEntry> Timeline::trackMatteEntries() const
+{
+    QMutexLocker lock(&m_trackMatteMutex);
+    return m_trackMatteEntries;
+}
+
+void Timeline::remapTrackMatteLocked(const TrackClipSnapshot &before)
+{
+    // The helper mutates its argument in place. Work on a stable snapshot and
+    // publish the result through the sole writer after the helper returns.
+    auto next = trackMatteEntries();
+    remapTimelineCarrierAfterMutation(this, next, before);
+    commitTrackMatteEntries(std::move(next));
+}
+
+void Timeline::remapCarriersAfterExternalMutation(const TrackClipSnapshot &before)
+{
+    // The matte and parent helpers also invoke the roto remapper. Its
+    // post-mutation memo makes their repeated calls idempotent.
+    remapRotoEntriesAfterMutation(before);
+    remapTrackMatteLocked(before);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, before);
+}
+
 void Timeline::commitRotoEntries(QHash<QString, RotoClipEntry> next, bool clearMemo)
 {
     QMutexLocker lock(&m_rotoMutex);
@@ -13218,7 +13293,7 @@ TimelineState Timeline::currentState() const
     state.activeAudioTrackIndex = m_activeAudioTrackIndex;
     state.playheadPos = m_playheadPos;
     state.clipParentEntries = clipParentEntries();
-    state.trackMatteEntries = m_trackMatteEntries;
+    state.trackMatteEntries = trackMatteEntries();
     state.rotoEntries = rotoEntries();
     state.trackStructureRevision = m_trackStructureRevision;
 
@@ -13274,7 +13349,7 @@ void Timeline::restoreState(const TimelineState &state)
         m_audioTracks[i]->update();
     }
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
-    m_trackMatteEntries = state.trackMatteEntries;
+    commitTrackMatteEntries(state.trackMatteEntries);
     commitRotoEntries(state.rotoEntries, true);
     setClipParentEntries(state.clipParentEntries);
     rebuildTimelineBreadcrumbBar(this);

@@ -18,6 +18,7 @@
 #include <QUuid>
 #include <cmath>
 #include <algorithm>
+#include <limits>
 
 namespace renderinplace {
 namespace {
@@ -67,6 +68,48 @@ QSize nativeVideoSize(const QString &path)
     }
     avformat_close_input(&context);
     return size;
+}
+
+// Presentation times (seconds) of the first video stream's frames in
+// [fromSec, untilSec], ascending, computed as the reverse decoder computes
+// frame pts. Empty when the media cannot be read.
+QVector<double> probeVideoFrameTimes(const QString &path, double fromSec, double untilSec)
+{
+    QVector<double> times;
+    AVFormatContext *context = nullptr;
+    if (avformat_open_input(&context, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return times;
+    int stream = -1;
+    if (avformat_find_stream_info(context, nullptr) >= 0) {
+        for (unsigned i = 0; i < context->nb_streams; ++i) {
+            if (context->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+                stream = int(i);
+                break;
+            }
+        }
+    }
+    AVPacket *packet = stream >= 0 ? av_packet_alloc() : nullptr;
+    if (packet) {
+        const AVRational timeBase = context->streams[stream]->time_base;
+        const int64_t seekTarget = static_cast<int64_t>(fromSec * AV_TIME_BASE);
+        if (seekTarget > 0)
+            av_seek_frame(context, -1, seekTarget, AVSEEK_FLAG_BACKWARD);
+        // Packets arrive in decode order: read one second past the window so
+        // reordered frames inside it are not missed.
+        while (av_read_frame(context, packet) >= 0) {
+            const bool video = packet->stream_index == stream;
+            const int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+            av_packet_unref(packet);
+            if (!video || pts == AV_NOPTS_VALUE) continue;
+            const double sec = static_cast<double>(pts) * av_q2d(timeBase);
+            if (sec > untilSec + 1.0) break;
+            if (sec + 1e-9 >= fromSec && sec <= untilSec) times.append(sec);
+        }
+        av_packet_free(&packet);
+    }
+    avformat_close_input(&context);
+    std::sort(times.begin(), times.end());
+    return times;
 }
 }
 
@@ -164,9 +207,27 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         // Preserve the nonlinear source map over the retained interval.
         // Sampling at export ticks uses ClipInfo's existing mapping, never a
         // second speed-ramp integrator. Boundary handles hold when exhausted.
+        // A reversed clip stays reversed with an ascending curve:
+        // sourceSecondAtLocalTime folds it back to the same descending source
+        // second, so the renderer keeps its reverse sampling (last frame before
+        // that second, roto one source frame earlier) as on the source timeline.
+        // Tail rule: the reverse decoder and the roto clamp take their lower
+        // bound from the lowered isolated inPoint. The decoder picks frames by
+        // the stream's real timestamps (the last frame before the second at or
+        // after the in point, else the first frame at or after it), and roto
+        // indexes by sourceFps, which can differ from the stream rate. A
+        // retained sample whose source time runs backward and that lies at or
+        // before the first frame at or after original.inPoint, or below
+        // original.inPoint + 1/sourceFps, is therefore moved (still strictly
+        // below the previous backward sample) into the stream frame interval
+        // that decodes the source timeline's frame, intersected with the
+        // seconds whose roto index matches the source timeline's. If no second
+        // satisfies both, the picture wins and a warning is logged. Samples
+        // whose source time runs forward (a reversed clip with a descending
+        // curve) keep their source second: the source timeline samples them
+        // forward without the reverse roto offset.
         if (original.hasTimeRemap() || !original.speedRamp.isIdentity()
             || isolated.inPoint < 0.0 || isolated.outPoint > original.duration) {
-            isolated.reversed = false;
             isolated.speedRamp = speedramp::SpeedRamp::identity();
             isolated.timeRemapCurve.keys.clear();
             // The renderer indexes roto by the curve's sourceFps once the clip
@@ -177,6 +238,28 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                 isolated.timeRemapCurve.sourceFps = roto::clipEffectiveSourceFps(
                     roto::probeVideoStreamFps(original.filePath), timeline.projectFrameRate());
             const int frames = int(std::ceil((length + 2.0 * handles) * options.fps));
+            const double sourceFps = isolated.timeRemapCurve.sourceFps;
+            // Frame times from original.inPoint on (real pts, else the probed
+            // stream-rate grid), never the sourceFps grid.
+            QVector<double> frameTimes;
+            if (isolated.reversed && sourceFps > 0.0) {
+                const double untilSec = original.inPoint + 1.0 / sourceFps + 1.0;
+                frameTimes = probeVideoFrameTimes(original.filePath, original.inPoint, untilSec);
+                if (frameTimes.isEmpty()) {
+                    const double streamFps = roto::clipEffectiveSourceFps(
+                        roto::probeVideoStreamFps(original.filePath), timeline.projectFrameRate());
+                    for (qint64 n = qint64(std::ceil(original.inPoint * streamFps - 1e-6));
+                         n / streamFps <= untilSec; ++n)
+                        frameTimes.append(n / streamFps);
+                }
+            }
+            const auto rotoIndexAt = [sourceFps](double inPoint, double sourceSec) {
+                return roto::sourceFrameIndexFor(qMax(inPoint, sourceSec - 1.0 / sourceFps), sourceFps);
+            };
+            double previousSource = std::numeric_limits<double>::infinity();
+            int rotoMismatches = 0;
+            int mismatchSourceRoto = -1;
+            int mismatchBakedRoto = -1;
             for (int f = 0; f <= frames; ++f) {
                 const double t = f / options.fps;
                 const double local = t - handles;
@@ -187,8 +270,39 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
                                                : original.inPoint + local * original.speed;
                 }
                 source = qBound(0.0, source, qMax(0.0, original.duration - 1.0 / options.fps));
-                isolated.timeRemapCurve.keys.append({t, source - isolated.inPoint});
+                const bool runsBackward = original.sourceTimeRunsBackwardAtLocalTime(qBound(0.0, local, length));
+                if (!frameTimes.isEmpty() && runsBackward && local > -1e-9 && local < length - 1e-9) {
+                    // k = the decoder's frame on the source timeline: the last
+                    // frame before source (-1: the first frame at or after it).
+                    int k = -1;
+                    while (k + 1 < frameTimes.size() && frameTimes[k + 1] + 1e-9 < source) ++k;
+                    if (k < 0 || source < original.inPoint + 1.0 / sourceFps) {
+                        const int pictureIndex = qMax(0, k);
+                        const double pictureLo = frameTimes[pictureIndex];
+                        const double pictureHi = pictureIndex + 1 < frameTimes.size()
+                            ? frameTimes[pictureIndex + 1] : std::numeric_limits<double>::infinity();
+                        const int sourceRoto = rotoIndexAt(original.inPoint, source);
+                        const double rotoHi = (sourceRoto + 1.5) / sourceFps;
+                        double adjusted = qMin(qMin(pictureHi, rotoHi), previousSource) - 1e-6;
+                        if (!(adjusted > pictureLo + 1e-6)
+                            || rotoIndexAt(isolated.inPoint, adjusted) != sourceRoto) {
+                            adjusted = qMin(pictureHi, previousSource) - 1e-6;
+                            if (rotoMismatches++ == 0) {
+                                mismatchSourceRoto = sourceRoto;
+                                mismatchBakedRoto = rotoIndexAt(isolated.inPoint, adjusted);
+                            }
+                        }
+                        source = adjusted;
+                    }
+                }
+                previousSource = runsBackward ? source : std::numeric_limits<double>::infinity();
+                isolated.timeRemapCurve.keys.append({t, isolated.reversed ? isolated.outPoint - source
+                                                                          : source - isolated.inPoint});
             }
+            if (rotoMismatches > 0)
+                qWarning("RenderInPlace: reversed clip '%s': %d tail frame(s) bake roto frame %d instead of %d",
+                         qPrintable(original.displayName.isEmpty() ? original.filePath : original.displayName),
+                         rotoMismatches, mismatchBakedRoto, mismatchSourceRoto);
         }
     }
     // A1 contains only linked audio, positioned relative to the baked video.
@@ -263,8 +377,16 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     // Bake the clip's roto entry: key it to the isolated clip (after the
     // optional prefix black clip). The isolated clip maps each frame to the
     // same source second as on the source timeline (directly, or through the
-    // synthetic curve whose sourceFps is the source timeline's roto rate), so
-    // the renderer samples the same roto source frame.
+    // synthetic curve whose sourceFps is the source timeline's roto rate) and
+    // keeps the reversed flag, so the renderer samples the same picture frame
+    // and the same roto source frame (one frame earlier where the source time
+    // runs backward). The exception is the reversed tail: the decoder and roto
+    // lower bounds read the lowered isolated inPoint, so backward-running
+    // samples up to the stream's first frame at or after original.inPoint (by
+    // its real timestamps) or within one sourceFps frame of original.inPoint
+    // are moved in the curve above to a second that decodes the same stream
+    // frame and indexes the same roto frame (picture first, with a warning,
+    // when no second does both).
     const QString rotoKey = trackMatteClipKey(trackIndex, clipIndex);
     const QHash<QString, RotoClipEntry> sourceRoto = timeline.rotoEntries();
     const bool bakesRoto = sourceRoto.contains(rotoKey);

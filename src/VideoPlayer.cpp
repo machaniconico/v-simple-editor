@@ -880,7 +880,13 @@ QString clipIdForLayer(const VideoPlayer::DecodedLayer &layer)
     return trackMatteClipKey(layer.sourceTrack, layer.sourceClipIndex);
 }
 
-void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers)
+// US-1005 PARENT-SSOT: a parent candidate is adopted only when the renderer's
+// gate tlrender::parentLayerAt(timeline, timelineUsec, parent) hits and is
+// decodable (disabled parent, the borrowed incoming clip of an overlap, etc.
+// are rejected exactly as in renderFrameAt). The gate is evaluated once per
+// parent candidate, and only for layers that carry a parentClipId.
+void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers,
+                                      const Timeline *timeline, qint64 timelineUsec)
 {
     QVector<int> order;
     order.reserve(layers.size());
@@ -902,8 +908,13 @@ void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers
         if (!clipId.isEmpty())
             canonicalByClipId.insert(clipId, ci);
         layers[actual].parentSourceIndex = -1;
+        layers[actual].parentHit = false;
+        layers[actual].parentHitDecodable = false;
+        layers[actual].parentLocalSeconds = 0.0;
+        layers[actual].parentSourceSeconds = 0.0;
     }
 
+    QHash<int, std::optional<tlrender::ParentLayerHit>> hitByParentActual;
     for (int actual = 0; actual < layers.size(); ++actual) {
         if (layers[actual].parentClipId.isEmpty())
             continue;
@@ -913,7 +924,26 @@ void resolveDecodedLayerParentSources(QVector<VideoPlayer::DecodedLayer> &layers
         if (parentCanonical <= 0 || parentCanonical == childCanonical)
             continue;
         const int parentActual = actualByCanonical.value(parentCanonical, -1);
-        if (parentActual >= 0 && parentActual != actual)
+        if (parentActual < 0 || parentActual == actual)
+            continue;
+        auto cached = hitByParentActual.constFind(parentActual);
+        if (cached == hitByParentActual.cend()) {
+            const VideoPlayer::DecodedLayer &parent = layers.at(parentActual);
+            cached = hitByParentActual.insert(
+                parentActual,
+                timeline ? tlrender::parentLayerAt(timeline, timelineUsec,
+                                                   parent.sourceTrack,
+                                                   parent.sourceClipIndex)
+                         : std::nullopt);
+        }
+        const std::optional<tlrender::ParentLayerHit> &hit = cached.value();
+        if (!hit)
+            continue;
+        layers[actual].parentHit = true;
+        layers[actual].parentHitDecodable = hit->decodable;
+        layers[actual].parentLocalSeconds = hit->clipLocalSeconds;
+        layers[actual].parentSourceSeconds = hit->sourceSeconds;
+        if (hit->decodable)
             layers[actual].parentSourceIndex = parentActual;
     }
 }
@@ -3628,6 +3658,10 @@ void VideoPlayer::recordParentAdmissionForTest(
         record.sourceClipIndex = layer.sourceClipIndex;
         record.parentClipId = layer.parentClipId;
         record.parentSourceIndex = layer.parentSourceIndex;
+        record.parentHit = layer.parentHit;
+        record.parentHitDecodable = layer.parentHitDecodable;
+        record.parentLocalSeconds = layer.parentLocalSeconds;
+        record.parentSourceSeconds = layer.parentSourceSeconds;
         record.localTransform = transformForLayer(layer);
         record.effectiveTransform = effective.value(i, record.localTransform);
         m_parentAdmissionRecords.append(record);
@@ -5719,7 +5753,7 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     std::stable_sort(
         layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
     if (veditor::parentingEnabledFromEnv())
-        resolveDecodedLayerParentSources(layers);
+        resolveDecodedLayerParentSources(layers, timeline, m_timelinePositionUs);
 
     QSize canvasSize = m_projectOutputSize.isValid()
         ? m_projectOutputSize : QSize(m_canvasWidth, m_canvasHeight);
@@ -6707,7 +6741,8 @@ void VideoPlayer::handlePlaybackTick()
         // re-inversion breaks the selftest.
         std::stable_sort(layers.begin(), layers.end(), clipstack::layerPaintOrderLess);
         if (veditor::parentingEnabledFromEnv())
-            resolveDecodedLayerParentSources(layers);
+            resolveDecodedLayerParentSources(layers, previewTimeline,
+                                             m_timelinePositionUs);
         // Phase 1e Win #9 — canvas proxy (rationale + invariants
         // in canvasProxyDivisor() at top of file). m_textOverlays
         // runtime gate keeps text overlays on the full-res path so

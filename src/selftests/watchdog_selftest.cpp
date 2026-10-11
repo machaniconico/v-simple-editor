@@ -48,6 +48,11 @@ std::mutex g_watchdogProbeReadyMutex;
 std::condition_variable g_watchdogProbeReadyCv;
 bool g_watchdogProbeReady = false;
 
+const QRegularExpression kDumpWrittenLine(QStringLiteral(
+    R"(watchdog: dump written to (\S+\.dmp) stacks=(yes|no) elapsedMs=(\d+))"));
+const QRegularExpression kProbeDumpPathLine(QStringLiteral(
+    R"(watchdog: (?:minidump ready|dump written to) (\S+\.dmp))"));
+
 #ifdef _WIN32
 #define WATCHDOG_NOINLINE __declspec(noinline)
 #else
@@ -83,6 +88,53 @@ QSet<QString> dumpFiles()
         files.insert(name);
     return files;
 }
+
+// Only remove paths printed by this selftest's children. Other lanes may use
+// the same hang-dumps directory at the same time.
+struct ProbeDumpCleanup {
+    QSet<QString> ownedDumpPaths;
+
+    void clean(const QString& stderrText)
+    {
+        const QString dumpDir = QDir::cleanPath(
+            QDir::current().absoluteFilePath(QStringLiteral(".omc/artifacts/hang-dumps")));
+        // A probe may be terminated after the minidump line but before the
+        // final dump-written line. Collect both forms, with the full line
+        // shared with G6's dump verification.
+        for (const QRegularExpression* pattern : {&kDumpWrittenLine, &kProbeDumpPathLine}) {
+            auto matches = pattern->globalMatch(stderrText);
+            while (matches.hasNext()) {
+                const QString path = QDir::cleanPath(QFileInfo(
+                    QDir::current().filePath(matches.next().captured(1))).absoluteFilePath());
+                if (QFileInfo(path).absolutePath() != dumpDir) {
+                    std::fprintf(stderr, "[watchdog] refusing cleanup outside hang-dumps: %s\n",
+                                 path.toUtf8().constData());
+                    continue;
+                }
+                if (ownedDumpPaths.contains(path)) continue;
+                ownedDumpPaths.insert(path);
+                removeFiles(path);
+            }
+        }
+    }
+
+    ~ProbeDumpCleanup()
+    {
+        for (const QString& path : ownedDumpPaths)
+            removeFiles(path);
+    }
+
+private:
+    static void removeFiles(const QString& dumpPath)
+    {
+        const QString textPath = dumpPath.left(dumpPath.size() - 4) + QStringLiteral(".txt");
+        for (const QString& path : {dumpPath, textPath}) {
+            if (QFileInfo::exists(path) && !QFile::remove(path))
+                std::fprintf(stderr, "[watchdog] probe dump cleanup failed: %s\n",
+                             path.toUtf8().constData());
+        }
+    }
+};
 
 bool isWslDirectExec()
 {
@@ -231,6 +283,7 @@ int runWatchdogSelftest()
     if (!QCoreApplication::instance())
         localApp = std::make_unique<QCoreApplication>(s_argc, s_argv);
 
+    ProbeDumpCleanup probeDumps;
     selftest::GateTally tally;
     auto gate = [&](const char* id, bool ok) {
         tally.gate(std::atoi(id + 1), ok);
@@ -249,6 +302,7 @@ int runWatchdogSelftest()
         std::fprintf(stderr, "[watchdog] G1 terms: finished=%d exit124=%d within15s=%d timeoutLine=%d\n",
                      r.finished, r.exitCode == 124, r.elapsedMs < 15000, hasLine);
         gate("G1", r.finished && r.exitCode == 124 && r.elapsedMs < 15000 && hasLine);
+        probeDumps.clean(r.stdErr);
     }
 
     // G2: default timeout -> armed 900s, exit 0, no TIMEOUT. Checked on the
@@ -275,6 +329,8 @@ int runWatchdogSelftest()
                      "legacyExit0=%d legacyArmed900=%d legacyNoTimeout=%d\n",
                      r.finished, ok, armed, !timeout, legacyOk, legacyArmed, !legacyTimeout);
         gate("G2", ok && armed && !timeout && legacyOk && legacyArmed && !legacyTimeout);
+        probeDumps.clean(r.stdErr);
+        probeDumps.clean(legacy.stdErr);
     }
 
     // G3: TIMEOUT_SEC=0 + hang -> still running after 3 s, `[watchdog] disabled`.
@@ -289,6 +345,7 @@ int runWatchdogSelftest()
         std::fprintf(stderr, "[watchdog] G3 terms: runningAt3s=%d disabledLine=%d noTimeout=%d\n",
                      !r.finished, disabled, !timeout);
         gate("G3", !r.finished && disabled && !timeout);
+        probeDumps.clean(r.stdErr);
     }
 
     // G4: 20 consecutive ports occupied -> start() false within 2 s + warning.
@@ -367,6 +424,7 @@ int runWatchdogSelftest()
                      armed, timeouts, static_cast<long long>(r.elapsedMs));
         gate("G5", r.finished && r.exitCode == 0 && r.exitStatus == QProcess::NormalExit
                    && armed == 3 && timeouts == 0);
+        probeDumps.clean(r.stdErr);
     }
 
     // G6 detects a timeout path that exits without producing its required
@@ -380,9 +438,7 @@ int runWatchdogSelftest()
         env.insert(QStringLiteral("VEDITOR_SELFTEST_TIMEOUT_SEC"), QStringLiteral("2"));
         env.insert(QStringLiteral("VEDITOR_WATCHDOG_PROBE_MODE"), QStringLiteral("hang"));
         const ChildRun r = runChild(env, probeArgs, 15000, true);
-        const QRegularExpression dumpLine(QStringLiteral(
-            R"(watchdog: dump written to (\S+\.dmp) stacks=(yes|no) elapsedMs=(\d+))"));
-        const QRegularExpressionMatch match = dumpLine.match(r.stdErr);
+        const QRegularExpressionMatch match = kDumpWrittenLine.match(r.stdErr);
         const QString dumpPath = match.captured(1);
         const QFileInfo dumpInfo(QDir::current().filePath(dumpPath));
         const bool timeoutLine = r.stdErr.contains(
@@ -419,6 +475,8 @@ int runWatchdogSelftest()
             mainTid >= 0 && workerTid >= 0 && mainTid != workerTid);
         gate("G6", r.finished && r.exitCode == 124 && timeoutLine &&
                     match.hasMatch() && dumpExists && dumpElapsedMs >= 0 && dumpElapsedMs < 10000);
+        stackFile.close();
+        probeDumps.clean(r.stdErr);
 
         // G7 detects a regression where disabled or normally completed entries
         // still leave dump artifacts. The hang child is deliberately killed.
@@ -442,6 +500,8 @@ int runWatchdogSelftest()
             normalExit, normal.exitCode, static_cast<int>(added.size()));
         gate("G7", !disabled.finished && disabled.exitCode != 124 && disabledLine &&
                     normalArmed && normalExit && added.isEmpty());
+        probeDumps.clean(disabled.stdErr);
+        probeDumps.clean(normal.stdErr);
     }
 #else
     tally.skip(6, "Windows minidump requires Windows");

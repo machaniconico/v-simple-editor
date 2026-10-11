@@ -34,56 +34,48 @@
 // ---------------------------------------------------------------------------
 int runAIHighlightSelftest();
 int runAcesColorSelftest();
+int runAdjustmentLayerSelftest();
 int runAeFxBlurSelftest();
-int runAeFxColorSelftest();
 int runAeFxColor2Selftest();
-int runLensDistortSelftest();
-int runAeFxDistortSelftest();
+int runAeFxColorSelftest();
 int runAeFxDistort2Selftest();
+int runAeFxDistortSelftest();
 int runAeFxGenerateSelftest();
 int runAeFxStylizeSelftest();
-int runAdjustmentLayerSelftest();
 int runAffinitySelftest();
 int runAlignDistributeSelftest();
+int runAnimExportSelftest();
 int runAscCdlExportSelftest();
 int runAtempoResolveSelftest();
-int runOAuthMockE2eSelftest();
-int runOAuthRefreshE2eSelftest();
-int runAudioChannelMapSelftest();
-int runAnimExportSelftest();
 int runAudioBusSelftest();
+int runAudioChannelMapSelftest();
 int runAudioClipDragUndoSelftest();
 int runAudioFixtureSelftest();
-int runAudioXfadeSelftest();
-int runMorphCutSelftest();
-int runTransitionExportSelftest();
-int runTransitionParamsSelftest();
 int runAudioKeyframesSelftest();
 int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAudioTrackFxSelftest();
+int runAudioXfadeSelftest();
 int runAutoClipGenSelftest();
-int runAutoColorSelftest();
 int runAutoColorPreserveGradeSelftest();
+int runAutoColorSelftest();
 int runAutoDuckingSelftest();
 int runAutoMatteSelftest();
-int runDeflickerSelftest();
-int runObjectRemovalSelftest();
-int runLight3DSelftest();
-int runCamera3DSelftest();
-int runCameraSolveSelftest();
-int runFeatureTrackerSelftest();
-int runVoiceIsolationSelftest();
-int runNoisePrintSelftest();
-int runBatchExportSelftest();
+int runAutoProxyPolicySelftest();
 int runBatchExportE2ESelftest();
+int runBatchExportSelftest();
+int runBeatDetectSelftest();
 int runBezierEasingSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runBundleAdjustSelftest();
+int runCamera3DSelftest();
+int runCameraSolveSelftest();
 int runCamtrackSolveSelftest();
 int runCamtrackUiSelftest();
 int runCapcutCaptionSelftest();
+int runCaptionEditSelftest();
+int runCaptionOverlayBuilderSelftest();
 int runCaptionSelftest();
 int runChromaSelftest();
 int runClipColorSelftest();
@@ -91,37 +83,38 @@ int runClipCurvesSelftest();
 int runClipEnableSelftest();
 int runClipFilmstripSelftest();
 int runClipGroupSelftest();
+int runClipIdtSelftest();
 int runClipLutSelftest();
 int runClipMaskSelftest();
-int runClipParentParitySelftest();
-int runClipIdtSelftest();
 int runClipOdtSelftest();
+int runClipParentParitySelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
 int runColorMatchApplySelftest();
 int runColorMatchSelftest();
+int runColorWarperSelftest();
 int runCommandSearchSelftest();
+int runCompositeFrameCacheSelftest();
 int runCredAuditLogSelftest();
 int runCredTtlSelftest();
 int runCredentialVaultSelftest();
 int runDavinciSelftest();
 int runDeEsserSelftest();
+int runDeflickerSelftest();
 int runDialogueLevelerSelftest();
 int runDolbyVisionSelftest();
 int runDvTimelineSelftest();
 int runDynzoomSelftest();
+int runE2eSelftest();
+int runEasingPresetsSelftest();
+int runEasingSelftest();
 int runEdlExportSelftest();
 int runEdlImportSelftest();
-int runE2eSelftest();
-int runEasingSelftest();
-int runEasingPresetsSelftest();
 int runEffectKeyframeParitySelftest();
 int runEffectLibrarySelftest();
 int runEffectMaskSelftest();
-int runVfxFootageSelftest();
 int runEffectPresetSelftest();
 int runEffectTimingSelftest();
-int runExposureAidsSelftest();
 int runExportAlphaSelftest();
 int runExportAuditSelftest();
 int runExportCfgSelftest();
@@ -129,24 +122,35 @@ int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
+int runExposureAidsSelftest();
 int runFcpxmlImportSelftest();
+int runFcpxmlSelftest();
+int runFeatureTrackerSelftest();
 int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
 int runFrameExportSelftest();
-int runFcpxmlSelftest();
-int runFreezeFrameSelftest();
 int runFrameIoSelftest();
-int runRollingShutterSelftest();
+int runFreezeFrameSelftest();
 int runFxGrainEchoSelftest();
 int runGateCountProbeSelftest();
 int runGateTallySelftest();
-int runGradeKeyframeSelftest();
+int runGpuCompositeFlagSelftest();
+int runGpuCompositeMathSelftest();
+int runGpuCompositeParity16MatteSelftest();
+int runGpuCompositeParitySelftest();
+int runGpuIdtMatteParitySelftest();
+int runGpuIdtParitySelftest();
 int runGradeKeyframeExtSelftest();
-int runColorWarperSelftest();
+int runGradeKeyframeSelftest();
+int runGradeLggSerializationSelftest();
 int runGradeLogWheelSelftest();
 int runGradeWheelWiringSelftest();
 int runGraphEditorSelftest();
-int runGradeLggSerializationSelftest();
+int runHdrCompositeMathSelftest();
+int runHdrCompositeParitySelftest();
+int runHdrExport16Selftest();
+int runHdrIngestColorMetaSelftest();
+int runHdrOverlayPolicySelftest();
 int runHdrRoutingSelftest();
 int runHdrSelftest();
 int runHslSecondarySelftest();
@@ -163,8 +167,10 @@ int runKeywordBinsSelftest();
 int runLayerStyleSelftest();
 int runLayerStyleUiSelftest();
 int runLegacyKfSelftest();
+int runLensDistortSelftest();
 int runLibavcoreDecodeSelftest();
 int runLibavcoreEncodeSelftest();
+int runLight3DSelftest();
 int runLinkedTrimSelftest();
 int runLiveMatteResolveSelftest();
 int runLogToRec709Selftest();
@@ -173,7 +179,10 @@ int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
 int runLowerThirdSelftest();
+int runMainWindowLifecycleSelftest();
 int runMatte16ParitySelftest();
+int runMatteSsotSelftest();
+int runMcpSelftest();
 int runMediaPoolDragSelftest();
 int runMediaPoolRatingSelftest();
 int runMediaPoolSelftest();
@@ -183,52 +192,60 @@ int runMeshWarpSelftest();
 int runMixerDockSelftest();
 int runMobileSelftest();
 int runMographSelftest();
+int runMorphCutSelftest();
 int runMotionBlurP2Selftest();
 int runMotionBlurParitySelftest();
 int runMotionPresetSelftest();
-int runMusicRemixSelftest();
 int runMultiCamSelftest();
+int runMusicRemixSelftest();
 int runNestSequenceSelftest();
+int runNoisePrintSelftest();
+int runOAuthMockE2eSelftest();
+int runOAuthRefreshE2eSelftest();
+int runObjectRemovalSelftest();
 int runObsSelftest();
 int runOffsetWheelSelftest();
 int runOnionSkinSelftest();
 int runParentGateSelftest();
 int runParitySelftest();
-int runPlanarSelftest();
 #if __has_include("PlanarTrackerPreset.h")
 int runPlanarPresetSelftest();
 #define HAVE_PLANARTRACKER_PRESET 1
 #endif
+int runPlanarSelftest();
 int runPlatformMockE2eSelftest();
+int runPlaybackQualityPolicySelftest();
 int runPptxExportSelftest();
 int runPrecomposeE2ESelftest();
-int runMainWindowLifecycleSelftest();
+int runPremiereXmlSelftest();
+int runPreview16PolicySelftest();
 int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
+int runProjectDiffSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runPuppetPinSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
 int runRenderInPlaceSelftest();
+int runRenderNotifySelftest();
 int runRenderQueueAcesDecisionSelftest();
 int runRenderQueueFpsRationalSelftest();
-int runRightclickPausePrefSelftest();
 int runReverseClipSelftest();
-int runRippleDeleteSelftest();
 int runRgbParadeSelftest();
+int runRightclickPausePrefSelftest();
+int runRippleDeleteSelftest();
+int runRollingShutterSelftest();
 int runRotoSelftest();
+int runSafeLeaveColorSelftest();
+int runSafeZoneSelftest();
 int runSeqFromClipSelftest();
 int runSequenceDockSelftest();
 int runSfmTwoViewSelftest();
+int runShapeClipSelftest();
 int runShortcutSelftest();
 int runSilenceCutSelftest();
-int runBeatDetectSelftest();
-int runSafeLeaveColorSelftest();
-int runSafeZoneSelftest();
-int runShapeClipSelftest();
-int runStillCompareSelftest();
 int runSmartEditSelftest();
 int runSmartRenderSelftest();
 int runSnsCoverSelftest();
@@ -237,18 +254,20 @@ int runSocialSelftest();
 int runSpatialPathSelftest();
 int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
+int runSpectrumSelftest();
 int runStereoPanSelftest();
+int runStillCompareSelftest();
 int runSubMovtextSelftest();
+int runSubXlatSelftest();
 int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
-int runSubXlatSelftest();
 int runSurfaceToolSelftest();
 int runSwsColorSelftest();
-int runTextBasedEditSelftest();
-int runTextSpacingSelftest();
-int runText3dPreviewSelftest();
-int runTextExportSelftest();
 int runTcburnSelftest();
+int runText3dPreviewSelftest();
+int runTextBasedEditSelftest();
+int runTextExportSelftest();
+int runTextSpacingSelftest();
 int runThreePointEditSelftest();
 int runTimelineErgoSelftest();
 int runTimelineSkimSelftest();
@@ -259,50 +278,35 @@ int runTrackMatteReindexSelftest();
 int runTrackMatteRm5ReorderSelftest();
 int runTrackMatteRm6DuplicateSelftest();
 int runTrackOpsSelftest();
+int runTrackerPresetSelftest();
 int runTranscriptHighlighterOfflineSelftest();
 int runTranscriptHighlighterSelftest();
-int runMcpSelftest();
-int runTrackerPresetSelftest();
+int runTransitionExportSelftest();
+int runTransitionParamsSelftest();
 int runTrimOpsSelftest();
 int runTwitchSelftest();
-int runVfxSelftest();
-int runVfxGeneratorsSelftest();
 int runVersionedSaveSelftest();
-int runProjectDiffSelftest();
+int runVfxFootageSelftest();
+int runVfxGeneratorsSelftest();
+int runVfxSelftest();
 int runVideoPlayerParentSelftest();
 int runVideostabDeshakeSelftest();
 int runVimeoSelftest();
+int runVoiceIsolationSelftest();
 int runWarpFxSelftest();
-int runWatchdogSelftest();
 int runWatchdogProbeSelftest();
+int runWatchdogSelftest();
 int runWatermarkSelftest();
 int runWbEyedropperSelftest();
 int runWhisperGuideSelftest();
 int runWhisperTranscribeSelftest();
 int runWhisperWordTimingSelftest();
-int runCaptionOverlayBuilderSelftest();
 int runWorkflowSelftest();
 int runWorkspaceSelftest();
 int runXUploadSelftest();
+int runYoutubeChapterSelftest();
 int runYoutubeSelftest();
 int runYtdlpDownloaderSelftest();
-int runPremiereXmlSelftest();
-int runYoutubeChapterSelftest();
-int runAutoProxyPolicySelftest();
-int runCompositeFrameCacheSelftest();
-int runPlaybackQualityPolicySelftest();
-int runGpuCompositeFlagSelftest();
-int runGpuCompositeMathSelftest();
-int runHdrCompositeMathSelftest();
-int runHdrExport16Selftest();
-int runHdrIngestColorMetaSelftest();
-int runHdrOverlayPolicySelftest();
-int runGpuCompositeParitySelftest();
-int runGpuCompositeParity16MatteSelftest();
-int runGpuIdtParitySelftest();
-int runGpuIdtMatteParitySelftest();
-int runHdrCompositeParitySelftest();
-int runPreview16PolicySelftest();
 
 namespace {
 
@@ -637,7 +641,7 @@ void disarmWatchdog()
 const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-free (needsQApplication=false) -------------------------
     { "gate-tally", nullptr, runGateTallySelftest, false,
-      "PASS / FAIL / SKIP tally, gate-count dispatch, and missing encoder (13 gates)" },
+      "PASS / FAIL / SKIP tally, gate-count dispatch, and missing encoder (14 gates)" },
     { "gate-count-probe", "VEDITOR_GATE_COUNT_PROBE_SELFTEST", runGateCountProbeSelftest, false,
       "内部用 (2 gates)" },
     { "proxy",             nullptr,                               runProxySelftestV2,            false,
@@ -651,7 +655,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "legacy-kf", nullptr, runLegacyKfSelftest, true,
       "Legacy colorCorrection.* keyframe tracks migrate to grade.* on project load + dialog initial values + nested sequences (8 gates)" },
     { "loudness-auto", nullptr, runLoudnessAutoSelftest, true,
-      "Automatic export loudness normalization (8 gates)" },
+      "Automatic export loudness normalization (12 gates)" },
     { "loudness-persist", nullptr, runLoudnessPersistSelftest, true,
       "Project loudness gain and playback normalizer persistence (4 gates)" },
     { "loudness-export-wire", "VEDITOR_LOUDNESS_EXPORT_WIRE_SELFTEST", runLoudnessExportWireSelftest, false,
@@ -748,6 +752,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (4 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
+    { "spectrum", nullptr, runSpectrumSelftest, true,
+      "2048-point Hann FFT and visible-only master tap spectrum dock (4 gates)" },
     { "noise-print", "VEDITOR_NOISE_PRINT_SELFTEST", runNoisePrintSelftest, false,
       "Noise print: SNR, amplitude, bypass, stereo independence, validation and determinism (6 gates)" },
     { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,
@@ -908,6 +914,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "preview16 policy predicate checks" },
     { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
       "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
+    { "matte-ssot", "VEDITOR_MATTE_SSOT_SELFTEST", runMatteSsotSelftest, true,
+      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (6 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
@@ -927,6 +935,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     // QApplication-required (needsQApplication=true) ----------------------
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
       "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (8 gates)" },
+    { "render-notify", nullptr, runRenderNotifySelftest, true,
+      "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (4 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
       "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },
     { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,
@@ -950,7 +960,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
-      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (7 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
+      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (10 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
@@ -1003,7 +1013,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "roto", "VEDITOR_ROTO_SELFTEST", runRotoSelftest, true,
-      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (26 gates)" },
+      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (36 gates)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
@@ -1042,6 +1052,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Whisper transcription service scaffold smoke" },
     { "whisper-word-timing", "VEDITOR_WHISPER_WORD_TIMING_SELFTEST", runWhisperWordTimingSelftest, true,
       "Whisper word-level timestamps: JSON full parse -> speech::Word -> SubtitleWord monotonic/boundary checks" },
+    { "caption-edit",     "VEDITOR_CAPTION_EDIT_SELFTEST",       runCaptionEditSelftest,        true,
+      "Caption split/merge pure functions and editor dialog buttons (6 gates)" },
     { "caption-overlay-builder", "VEDITOR_CAPTION_OVERLAY_BUILDER_SELFTEST", runCaptionOverlayBuilderSelftest, true,
       "Single-word caption builder, V1 bulk apply/undo, persistence, and renderer boundary checks" },
     { "transcript-highlighter", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_SELFTEST", runTranscriptHighlighterSelftest, true,
@@ -1051,13 +1063,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (187 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (188 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence, live dock, seek counter, dock follows project/track changes (8 gates)" },
     { "mixer-dock", nullptr, runMixerDockSelftest, true,
-      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (6 gates)" },
+      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (10 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
@@ -1151,7 +1163,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "transition-export", "VEDITOR_TRANSITION_EXPORT_SELFTEST", runTransitionExportSelftest, true,
       "Video transition export/preview shared steps and no-transition identity (9 gates)" },
     { "audio-trackfx", "VEDITOR_AUDIO_TRACKFX_SELFTEST", runAudioTrackFxSelftest, true,
-      "Track DSP parity, headroom, overlap ordering, panel IDs and master EQ playback/export, open-dock reseed (36 gates)" },
+      "Track DSP parity, headroom, overlap ordering, panel IDs and master EQ playback/export, open-dock reseed (39 gates)" },
     { "audio-xfade",       "VEDITOR_AUDIO_XFADE_SELFTEST",         runAudioXfadeSelftest,       true,
       "Audio constant-power crossfade/fade API and export afade=qsin contract (11 gates); QApplication required for Timeline undo/mirror checks" },
     { "oauth-mock-e2e",   "VEDITOR_OAUTH_MOCK_SELFTEST",        runOAuthMockE2eSelftest,       true,

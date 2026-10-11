@@ -218,6 +218,7 @@ struct ClipMotion;
 class PasteAttributesDialog;
 class LoudnessPanel;
 class QDockWidget;
+class SpectrumAnalyzerDock;
 class QToolButton;
 class AiChatDock;
 class NodeCanvasWidget;
@@ -257,6 +258,8 @@ class MainWindow : public QMainWindow
     friend int runDeEsserSelftest();
     friend int runAudioTrackFxSelftest();
     friend int runRotoSelftest();
+    friend int runMatteSsotSelftest();
+    friend int runRenderNotifySelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -757,6 +760,9 @@ private:
     bool finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error);
     QString m_exportAudioMixErrorForTest; // selftest: non-empty forces a mix failure
     int exportAudioMixCallCountForTest = 0; // selftest: prepareExportAudioMix calls
+    // 共有 RenderQueue (通常 / モバイル / MCP export_video) の唯一の生成点。
+    RenderQueue *ensureRenderQueue();
+    int renderCompleteNotificationCountForTest = 0; // selftest: shown completion notifications
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
@@ -775,7 +781,6 @@ private:
     void restoreAudioFxUndoState(const QJsonObject &audioFx);
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
-    void syncTrackMatteEntriesFromTimeline();
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
@@ -872,7 +877,6 @@ private:
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
-    QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
     QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
     std::function<double(double)> linkedAudioSampler(const ClipInfo &clip,
@@ -959,6 +963,8 @@ private:
     AudioEQProcessor *m_audioEQ = nullptr;
     MarkerManager m_markerManager;
     RenderQueue *m_renderQueue = nullptr;
+    QHash<QString, bool> m_renderNotifyTerminal; // uuid -> failed, latest jobsChanged snapshot
+    QSet<QString> m_renderNotifyReported;        // uuids already counted by a notification
     ScreenRecorder *m_screenRecorder = nullptr;
     AIHighlight *m_aiHighlight = nullptr;
     // Phase 6 Wave 4 (US-6D-4): 直近の文字起こしハイライト検出結果。
@@ -1096,6 +1102,7 @@ private:
     // Audio meters dock
     QDockWidget *m_audioMetersDock = nullptr;
     QDockWidget *m_audioMixerDock = nullptr;
+    SpectrumAnalyzerDock *m_spectrumAnalyzerDock = nullptr;
     QList<QMetaObject::Connection> m_meterConnections;
     QList<class AudioMeterWidget *> m_audioMeterWidgets;
     class AudioMeterWidget *m_masterMeter = nullptr;

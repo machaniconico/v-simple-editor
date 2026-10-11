@@ -2,22 +2,31 @@
 // Run from the repository root and compare data chunks across baseline/HEAD.
 #include "../AudioMixer.h"
 #include "../AudioTrackFx.h"
+#include "../MainWindow.h"
 #include "../RenderInPlace.h"
 #include "../Timeline.h"
+#include "../UndoManager.h"
+#include "../mcp/McpEditorTools.h"
+#include "../mcp/McpToolRegistry.h"
 #include "SelftestGate.h"
 
+#include <QAction>
 #include <QByteArrayView>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMenu>
 #include <QStandardPaths>
+#include <QStatusBar>
 #include <QTemporaryDir>
 
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <utility>
 
 #ifndef M_PI
 #  define M_PI 3.14159265358979323846
@@ -25,8 +34,14 @@
 
 namespace {
 
-constexpr int kFixtureCount = 6;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f"};
+constexpr int kFixtureCount = 7;
+// Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
+constexpr int kLegacyWrongSlot = 100;
+// G10 (US-1020): g's legacy EQ migrated by trackfx::eqFromLegacy, and the
+// control that lands the migrated peaking band in the low shelf instead.
+constexpr int kLegacyMigrated = 101;
+constexpr int kMigratedWrongShelf = 102;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g"};
 
 quint16 readLe16(const char *p)
 {
@@ -98,10 +113,29 @@ double rms(const QByteArray &pcm)
     return std::sqrt(squares / double(samples));
 }
 
-ClipInfo humClip(double in, double out)
+// Writes a 48 kHz mono PCM16 sine WAV (G8 in-band source: e2e_hum.wav is a pure
+// 50 Hz sine and carries no 1 kHz energy).
+bool writeToneWav(const QString &path, double freqHz, double amplitude, double seconds)
+{
+    constexpr int rate = 48000;
+    const quint32 frames = quint32(seconds * rate);
+    const quint32 dataBytes = frames * 2;
+    QByteArray wav;
+    const auto put32 = [&](quint32 v) { for (int i = 0; i < 4; ++i) wav.append(char((v >> (8 * i)) & 0xff)); };
+    const auto put16 = [&](quint16 v) { for (int i = 0; i < 2; ++i) wav.append(char((v >> (8 * i)) & 0xff)); };
+    wav.append("RIFF", 4); put32(36 + dataBytes); wav.append("WAVEfmt ", 8);
+    put32(16); put16(1); put16(1); put32(rate); put32(rate * 2); put16(2); put16(16);
+    wav.append("data", 4); put32(dataBytes);
+    for (quint32 i = 0; i < frames; ++i)
+        put16(quint16(qint16(std::lround(amplitude * 32767.0 * std::sin(2.0 * M_PI * freqHz * i / rate)))));
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(wav) == wav.size();
+}
+
+ClipInfo humClip(double in, double out, const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
 {
     ClipInfo clip;
-    clip.filePath = QStringLiteral("test_assets/e2e_hum.wav");
+    clip.filePath = source;
     clip.displayName = QStringLiteral("audio-fixture");
     clip.duration = 5.0;
     clip.inPoint = in;
@@ -111,6 +145,7 @@ ClipInfo humClip(double in, double out)
 
 // Variant e: 200 Hz low shelf -12 dB (50 Hz sits inside the shelf).
 // Variant f: 1 kHz peaking -12 dB (50 Hz is outside the band: frequency control).
+// Variant g: the same 1 kHz peaking -12 dB through the legacy 3-band AudioEQConfig.
 trackfx::Chain eqVariantChain(int variant)
 {
     trackfx::Chain chain;
@@ -118,6 +153,17 @@ trackfx::Chain eqVariantChain(int variant)
     if (variant == 4) chain.eq.low = trackfx::EqBand{200.0, -12.0, 0.7};
     if (variant == 5) chain.eq.lowMid = trackfx::EqBand{1000.0, -12.0, 1.0};
     return chain;
+}
+
+// Legacy EQ band slots are fixed: 0 = low shelf, 1 = peaking, 2 = high shelf
+// (AudioMixer::setTrackEqConfig). A peaking band therefore lives in slot 1.
+// peakingSlot = 0 builds the wrong-filter negative control (low shelf at 1 kHz).
+AudioEQConfig legacyEqConfig(int peakingSlot)
+{
+    AudioEQConfig cfg;
+    cfg.bands.resize(peakingSlot + 1);
+    cfg.bands[peakingSlot] = EQBand{1000.0, -12.0, 1.0};
+    return cfg;
 }
 
 // RMS over the steady window [0.1 s, 0.4 s) of interleaved PCM16.
@@ -157,13 +203,14 @@ double expectedRatio(int variant, int channels, int sampleRate)
 }
 
 bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
-              int *channels = nullptr, int *sampleRate = nullptr)
+              int *channels = nullptr, int *sampleRate = nullptr,
+              const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
 {
     AudioMixer mixer;
     Timeline timeline;
     timeline.setAudioMixer(&mixer);
-    ClipInfo first = humClip(0.0, 2.0);
-    ClipInfo second = humClip(0.5, 2.5);
+    ClipInfo first = humClip(0.0, 2.0, source);
+    ClipInfo second = humClip(0.5, 2.5, source);
     first.trailOut.type = TransitionType::FadeOut;
     first.trailOut.duration = 0.3;
     timeline.audioTracks().first()->setClips({first, second});
@@ -176,6 +223,23 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
     }
     if (variant == 4 || variant == 5)
         mixer.setTrackChain(0, eqVariantChain(variant));
+    if (variant == 6 || variant == kLegacyWrongSlot || variant == kLegacyMigrated
+        || variant == kMigratedWrongShelf) {
+        mixer.setTrackEqEnabled(0, true);
+        mixer.setTrackEqConfig(0, legacyEqConfig(variant == kLegacyWrongSlot ? 0 : 1));
+    }
+    if (variant == kLegacyMigrated || variant == kMigratedWrongShelf) {
+        trackfx::Chain chain = mixer.trackChain(0);
+        if (!trackfx::eqFromLegacy(mixer.trackEqConfig(0), &chain.eq)) {
+            *error = QStringLiteral("eqFromLegacy rejected variant g's legacy EQ");
+            return false;
+        }
+        if (variant == kMigratedWrongShelf) std::swap(chain.eq.low, chain.eq.lowMid);
+        chain.eqEnabled = true;
+        mixer.setTrackChain(0, chain);
+        mixer.setTrackEqEnabled(0, false);
+        mixer.setTrackEqConfig(0, AudioEQConfig{});
+    }
     double audioDuration = 0.0;
     for (const TimelineTrack *track : timeline.audioTracks()) {
         double trackDuration = 0.0;
@@ -184,7 +248,8 @@ bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
         audioDuration = qMax(audioDuration, trackDuration);
     }
     const double durationSeconds = qMax(timeline.totalDuration(), audioDuration);
-    std::fprintf(stderr, "G1 %s timelineDurationSec=%.12g\n", kNames[variant], durationSeconds);
+    std::fprintf(stderr, "G1 %s timelineDurationSec=%.12g\n",
+                 variant < kFixtureCount ? kNames[variant] : "control", durationSeconds);
     // This wrapper calls MainWindow.cpp's prepareTimelineAudioMixForExport
     // with the same forced WAV arguments.
     const QString written = renderinplace::prepareAudioMix(&timeline, path, durationSeconds, error);
@@ -203,6 +268,31 @@ qsizetype differentBytes(const QByteArray &a, const QByteArray &b)
     return count;
 }
 
+struct PcmComparison {
+    bool identical = false;
+    int maxDiffLsb = 0;
+    qsizetype firstDiffSample = -1; // interleaved PCM16 sample index, -1 when none
+};
+
+// Byte-level comparison of two PCM16 payloads. A length mismatch counts as a
+// difference at the first sample past the shorter payload.
+PcmComparison comparePcm16(const QByteArray &a, const QByteArray &b)
+{
+    PcmComparison result;
+    const qsizetype common = qMin(a.size(), b.size()) / 2;
+    for (qsizetype i = 0; i < common; ++i) {
+        const auto sample = [](const QByteArray &pcm, qsizetype index) {
+            return qint16(readLe16(pcm.constData() + 2 * index));
+        };
+        const int diff = std::abs(int(sample(a, i)) - int(sample(b, i)));
+        if (diff != 0 && result.firstDiffSample < 0) result.firstDiffSample = i;
+        result.maxDiffLsb = qMax(result.maxDiffLsb, diff);
+    }
+    if (a.size() != b.size() && result.firstDiffSample < 0) result.firstDiffSample = common;
+    result.identical = a == b;
+    return result;
+}
+
 } // namespace
 
 int runAudioFixtureSelftest()
@@ -213,7 +303,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 7; ++gate)
+        for (int gate = 1; gate <= 10; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -221,13 +311,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 10; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 10; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -247,12 +337,13 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 7; ++gate)
+        for (int gate = 2; gate <= 10; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
     QByteArray pcm[kFixtureCount];
     bool generated[kFixtureCount] = {};
+    bool repeatEqual[kFixtureCount] = {};
     int channels[kFixtureCount] = {};
     int sampleRates[kFixtureCount] = {};
     QJsonObject manifest;
@@ -281,7 +372,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "six PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "seven PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -295,7 +386,8 @@ int runAudioFixtureSelftest()
                      kNames[i], static_cast<long long>(pcm[i].size()),
                      static_cast<long long>(second.size()), static_cast<long long>(difference),
                      error.toUtf8().constData());
-        repeated &= generated[i] && ok && difference == 0;
+        repeatEqual[i] = generated[i] && ok && difference == 0;
+        repeated &= repeatEqual[i];
     }
     tally.gate(2, repeated, "two generations must have identical PCM data");
 
@@ -347,5 +439,439 @@ int runAudioFixtureSelftest()
              "200 Hz low shelf -12 dB must attenuate 50 Hz (catches low-band coefficient regressions)");
     bandGate(7, 5, 0.01, 0.97, 10.0,
              "1 kHz peaking -12 dB must leave 50 Hz unchanged (catches out-of-band EQ leakage)");
+
+    // G8: variant g (legacy 3-band EQ, 1 kHz peaking -12 dB) is deterministic and
+    // attenuates like variant f. The 50 Hz hum only shows out-of-band
+    // pass-through, so the in-band ratio is measured on a 1 kHz tone (0.125 FS):
+    // fTone = f/a, gTone = g/a must both sit in the -12 dB sanity band and agree
+    // within 1%. Detects: variant g missing (HEAD), legacy EQ not applied to the
+    // export, wrong filter slot, wrong legacy center frequency/gain/sample rate.
+    // Negative controls: the low-shelf slot (50 Hz and 1 kHz tone) must fall
+    // outside the 1% band, and g must differ from a.
+    {
+        const QString tonePath = QDir(repeat.path()).filePath(QStringLiteral("tone_1k.wav"));
+        const bool toneWritten = repeat.isValid() && writeToneWav(tonePath, 1000.0, 0.125, 5.0);
+        QByteArray toneA, toneF, toneG, toneWrong;
+        QString toneError;
+        int tc[4] = {}, tr[4] = {};
+        const bool toneOk = toneWritten
+            && generate(0, QDir(repeat.path()).filePath(QStringLiteral("tone_a.wav")), &toneA, &toneError, &tc[0], &tr[0], tonePath)
+            && generate(5, QDir(repeat.path()).filePath(QStringLiteral("tone_f.wav")), &toneF, &toneError, &tc[1], &tr[1], tonePath)
+            && generate(6, QDir(repeat.path()).filePath(QStringLiteral("tone_g.wav")), &toneG, &toneError, &tc[2], &tr[2], tonePath)
+            && generate(kLegacyWrongSlot, QDir(repeat.path()).filePath(QStringLiteral("tone_w.wav")), &toneWrong, &toneError, &tc[3], &tr[3], tonePath);
+        const double aTone = toneOk ? windowRms(toneA, tc[0], tr[0]) : 0.0;
+        const double fTone = aTone > 0.0 ? windowRms(toneF, tc[1], tr[1]) / aTone : 0.0;
+        const double gTone = aTone > 0.0 ? windowRms(toneG, tc[2], tr[2]) / aTone : 0.0;
+        const double wTone = aTone > 0.0 ? windowRms(toneWrong, tc[3], tr[3]) / aTone : 0.0;
+        const double toneRelError = fTone > 0.0 ? std::abs(gTone / fTone - 1.0)
+                                                : std::numeric_limits<double>::infinity();
+        const double wToneError = fTone > 0.0 ? std::abs(wTone / fTone - 1.0)
+                                              : std::numeric_limits<double>::infinity();
+        const bool toneSane = fTone >= 0.22 && fTone <= 0.29;
+        const bool toneControlRejected = toneOk && wToneError > 0.01;
+        std::fprintf(stderr, "G8 tone1k ok=%d aTone=%.12g fTone=%.12g gTone=%.12g relativeError=%.12g "
+                             "sane=%d sanity=[0.22,0.29] lowShelfSlotTone=%.12g toneControlRelErr=%.12g "
+                             "toneControlRejected=%d err=%s\n",
+                     toneOk, aTone, fTone, gTone, toneRelError, toneSane, wTone, wToneError,
+                     toneControlRejected, toneError.toUtf8().constData());
+
+        const double aWin = windowRms(pcm[0], channels[0], sampleRates[0]);
+        const double gWin = windowRms(pcm[6], channels[6], sampleRates[6]);
+        const double fWin = windowRms(pcm[5], channels[5], sampleRates[5]);
+        const double gRatio = aWin > 0.0 ? gWin / aWin : 0.0;
+        const double fRatio = aWin > 0.0 ? fWin / aWin : 0.0;
+        const double expected = expectedRatio(5, channels[5], sampleRates[5]);
+        const double error = expected > 0.0 ? std::abs(gRatio / expected - 1.0)
+                                            : std::numeric_limits<double>::infinity();
+        const bool sane = expected >= 0.97 && expected <= 10.0;
+        const qsizetype gVsA = differentBytes(pcm[6], pcm[0]);
+        QByteArray wrongPcm;
+        QString wrongError;
+        int wrongChannels = 0, wrongRate = 0;
+        const bool wrongOk = generate(kLegacyWrongSlot,
+            QDir(repeat.path()).filePath(QStringLiteral("g_wrong_slot.wav")), &wrongPcm,
+            &wrongError, &wrongChannels, &wrongRate);
+        const double wrongWin = windowRms(wrongPcm, wrongChannels, wrongRate);
+        const double wrongRatio = aWin > 0.0 ? wrongWin / aWin : 0.0;
+        const double wrongError2 = expected > 0.0 ? std::abs(wrongRatio / expected - 1.0)
+                                                  : std::numeric_limits<double>::infinity();
+        const bool controlRejected = wrongOk && wrongError2 > 0.01;
+        std::fprintf(stderr, "G8 g measuredRatio=%.12g fMeasuredRatio=%.12g expectedRatio=%.12g "
+                             "relativeError=%.12g sane=%d repeatEqual=%d diffBytesVsA=%lld\n",
+                     gRatio, fRatio, expected, error, sane, repeatEqual[6], static_cast<long long>(gVsA));
+        std::fprintf(stderr, "G8 control lowShelfSlot ratio=%.12g relativeError=%.12g rejected=%d error=%s\n",
+                     wrongRatio, wrongError2, controlRejected, wrongError.toUtf8().constData());
+        QFile firstWavFile(out.filePath(QStringLiteral("g.wav")));
+        QFile repeatWavFile(QDir(repeat.path()).filePath(QStringLiteral("g.wav")));
+        const bool wavRead = repeat.isValid() && firstWavFile.open(QIODevice::ReadOnly)
+            && repeatWavFile.open(QIODevice::ReadOnly);
+        const QByteArray firstWav = wavRead ? firstWavFile.readAll() : QByteArray();
+        const QByteArray repeatWav = wavRead ? repeatWavFile.readAll() : QByteArray();
+        const bool wavRepeatEqual = wavRead && !firstWav.isEmpty() && !repeatWav.isEmpty()
+            && firstWav == repeatWav;
+        std::fprintf(stderr, "G8 wavBytes=%lld repeatWavBytes=%lld wavDiffBytes=%lld wavRepeatEqual=%d\n",
+                     static_cast<long long>(firstWav.size()), static_cast<long long>(repeatWav.size()),
+                     static_cast<long long>(differentBytes(firstWav, repeatWav)), wavRepeatEqual);
+        tally.gate(8, generated[0] && generated[5] && generated[6] && repeatEqual[6] && wavRepeatEqual
+                       && sane && error <= 0.01 && gVsA > 0 && controlRejected
+                       && toneOk && toneSane && toneRelError <= 0.01 && toneControlRejected,
+                   "legacy 3-band 1 kHz peaking -12 dB (variant g) must be deterministic, pass 50 Hz like f and match f's 1 kHz tone ratio (catches wrong legacy center frequency/gain)");
+    }
+
+    // G9: record whether the legacy-EQ export (g) is byte-identical to the 4-band
+    // export (f). PASS means the comparison ran and produced values; identical=0
+    // is a legitimate result (US-1020 branches on it). Control: the comparator must
+    // report a difference for a vs b and identity for g vs g.
+    {
+        const PcmComparison gf = comparePcm16(pcm[6], pcm[5]);
+        const PcmComparison control = comparePcm16(pcm[0], pcm[1]);
+        const PcmComparison self = comparePcm16(pcm[6], pcm[6]);
+        std::fprintf(stderr, "G9 identical=%d maxDiffLsb=%d firstDiffSample=%lld\n",
+                     gf.identical, gf.maxDiffLsb, static_cast<long long>(gf.firstDiffSample));
+        std::fprintf(stderr, "G9 gBytes=%lld fBytes=%lld control(a,b) identical=%d maxDiffLsb=%d self(g,g) identical=%d\n",
+                     static_cast<long long>(pcm[6].size()), static_cast<long long>(pcm[5].size()),
+                     control.identical, control.maxDiffLsb, self.identical);
+        tally.gate(9, generated[5] && generated[6] && !pcm[5].isEmpty() && !pcm[6].isEmpty()
+                       && !control.identical && control.maxDiffLsb > 0 && self.identical,
+                   "g vs f PCM byte comparison must run and report values (control: a vs b differs)");
+    }
+
+    // G10 (US-1020): the explicit legacy -> 4-band EQ migration. Variant g's legacy
+    // EQ goes through trackfx::eqFromLegacy into the trackfx chain with the legacy
+    // EQ off (kLegacyMigrated). The branch follows G9: A (g == f bytes) needs the
+    // migrated PCM to equal g; B needs the migrated 1 kHz tone ratio to match g's
+    // within 1% inside the -12 dB sanity band, records maxDiffLsb vs g (<= 8), and
+    // needs the migrated chain to reproduce f byte for byte. Controls: the band
+    // landing in the low shelf must miss g's tone ratio; preamp 3 dB and three
+    // active bands return false with *out untouched. The Track EQ menu action
+    // records one undo "EQ を 4 バンドへ移行" that undo / redo reverse; an
+    // unrepresentable EQ only shows the status message. Detects (HEAD): no
+    // eqFromLegacy, no menu action.
+    {
+        const PcmComparison gf = comparePcm16(pcm[6], pcm[5]);
+        const bool branchA = gf.identical;
+        const QDir tmp(repeat.path());
+        QByteArray migrated;
+        QString migError;
+        const bool migOk = repeat.isValid() && generate(kLegacyMigrated,
+            tmp.filePath(QStringLiteral("g_migrated.wav")), &migrated, &migError);
+        const PcmComparison mg = comparePcm16(migrated, pcm[6]);
+        const PcmComparison mf = comparePcm16(migrated, pcm[5]);
+        std::fprintf(stderr, "G10 branch=%s identical=%d maxDiffLsb=%d\n",
+                     branchA ? "A" : "B", mg.identical, mg.maxDiffLsb);
+        std::fprintf(stderr, "G10 migrated ok=%d bytes=%lld vsG firstDiffSample=%lld vsF identical=%d "
+                             "vsF maxDiffLsb=%d error=%s\n",
+                     migOk, static_cast<long long>(migrated.size()),
+                     static_cast<long long>(mg.firstDiffSample), mf.identical, mf.maxDiffLsb,
+                     migError.toUtf8().constData());
+
+        const QString tonePath = tmp.filePath(QStringLiteral("tone10_1k.wav"));
+        QByteArray toneA, toneG, toneM, toneW;
+        QString toneError;
+        int tc[4] = {}, tr[4] = {};
+        const bool toneOk = repeat.isValid() && writeToneWav(tonePath, 1000.0, 0.125, 5.0)
+            && generate(0, tmp.filePath(QStringLiteral("tone10_a.wav")), &toneA, &toneError, &tc[0], &tr[0], tonePath)
+            && generate(6, tmp.filePath(QStringLiteral("tone10_g.wav")), &toneG, &toneError, &tc[1], &tr[1], tonePath)
+            && generate(kLegacyMigrated, tmp.filePath(QStringLiteral("tone10_m.wav")), &toneM, &toneError, &tc[2], &tr[2], tonePath)
+            && generate(kMigratedWrongShelf, tmp.filePath(QStringLiteral("tone10_w.wav")), &toneW, &toneError, &tc[3], &tr[3], tonePath);
+        const double aTone = toneOk ? windowRms(toneA, tc[0], tr[0]) : 0.0;
+        const double gTone = aTone > 0.0 ? windowRms(toneG, tc[1], tr[1]) / aTone : 0.0;
+        const double mTone = aTone > 0.0 ? windowRms(toneM, tc[2], tr[2]) / aTone : 0.0;
+        const double wTone = aTone > 0.0 ? windowRms(toneW, tc[3], tr[3]) / aTone : 0.0;
+        const double mRelError = gTone > 0.0 ? std::abs(mTone / gTone - 1.0)
+                                             : std::numeric_limits<double>::infinity();
+        const double wRelError = gTone > 0.0 ? std::abs(wTone / gTone - 1.0)
+                                             : std::numeric_limits<double>::infinity();
+        const bool toneSane = gTone >= 0.22 && gTone <= 0.29;
+        const bool shelfControlRejected = toneOk && wRelError > 0.01;
+        std::fprintf(stderr, "G10 tone1k ok=%d gTone=%.12g migratedTone=%.12g relativeError=%.12g "
+                             "sane=%d sanity=[0.22,0.29] lowShelfControlTone=%.12g controlRelErr=%.12g "
+                             "controlRejected=%d error=%s\n",
+                     toneOk, gTone, mTone, mRelError, toneSane, wTone, wRelError,
+                     shelfControlRejected, toneError.toUtf8().constData());
+        const bool pcmOk = branchA
+            ? migOk && mg.identical
+            : migOk && mf.identical && mg.maxDiffLsb <= 8
+                && toneOk && toneSane && mRelError <= 0.01 && shelfControlRejected;
+
+        // eqFromLegacy negative controls: *out must keep the sentinel.
+        const auto sameBand = [](const trackfx::EqBand &x, const trackfx::EqBand &y) {
+            return x.freq == y.freq && x.gainDb == y.gainDb && x.q == y.q && x.enabled == y.enabled;
+        };
+        const auto sameEq = [&](const trackfx::EqSettings &x, const trackfx::EqSettings &y) {
+            return sameBand(x.low, y.low) && sameBand(x.lowMid, y.lowMid)
+                && sameBand(x.highMid, y.highMid) && sameBand(x.high, y.high);
+        };
+        trackfx::EqSettings sentinel;
+        sentinel.highMid = trackfx::EqBand{4321.0, 3.0, 2.0};
+        AudioEQConfig preampCfg = legacyEqConfig(1);
+        preampCfg.preamp = 3.0;
+        AudioEQConfig threeBandCfg;
+        threeBandCfg.bands = {EQBand{100.0, 4.0, 1.0}, EQBand{1000.0, -12.0, 1.0}, EQBand{8000.0, 3.0, 1.0}};
+        trackfx::EqSettings preampOut = sentinel, threeOut = sentinel, gOut = sentinel;
+        const bool preampResult = trackfx::eqFromLegacy(preampCfg, &preampOut);
+        const bool threeResult = trackfx::eqFromLegacy(threeBandCfg, &threeOut);
+        const bool gResult = trackfx::eqFromLegacy(legacyEqConfig(1), &gOut);
+        const bool rejectOk = !preampResult && sameEq(preampOut, sentinel)
+            && !threeResult && sameEq(threeOut, sentinel);
+        const bool gMapped = gResult && sameBand(gOut.lowMid, trackfx::EqBand{1000.0, -12.0, 1.0})
+            && gOut.low.gainDb == 0.0 && gOut.highMid.gainDb == 0.0 && gOut.high.gainDb == 0.0;
+        std::fprintf(stderr, "G10 eqFromLegacy preamp3dB=%d outUnchanged=%d threeBands=%d outUnchanged=%d "
+                             "g=%d lowMid=%g/%g/%g\n",
+                     preampResult, sameEq(preampOut, sentinel), threeResult, sameEq(threeOut, sentinel),
+                     gResult, gOut.lowMid.freq, gOut.lowMid.gainDb, gOut.lowMid.q);
+
+        // Track EQ > A1 > "4 バンド EQ へ移行" in a real MainWindow.
+        bool menuOk = false, migratedOk = false, undoOk = false, redoOk = false, refusedOk = true;
+        {
+            MainWindow window;
+            Timeline *timeline = window.findChild<Timeline *>();
+            AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
+            if (timeline && timeline->audioTrackCount() < 1)
+                timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+            auto *trackEqMenu = window.findChild<QMenu *>(QStringLiteral("trackEqMenu"));
+            QMenu *a1 = nullptr;
+            if (trackEqMenu) {
+                emit trackEqMenu->aboutToShow();
+                for (QAction *action : trackEqMenu->actions())
+                    if (action->menu() && action->text() == QStringLiteral("A1")) a1 = action->menu();
+            }
+            QAction *migrate = a1 ? a1->findChild<QAction *>(QStringLiteral("trackEqMigrateTo4Band")) : nullptr;
+            menuOk = migrate && migrate->text() == QStringLiteral("4 バンド EQ へ移行")
+                && migrate->shortcut().isEmpty();
+            std::fprintf(stderr, "G10 menu trackEqMenu=%d A1=%d action=%d text=%s shortcutEmpty=%d\n",
+                         trackEqMenu != nullptr, a1 != nullptr, migrate != nullptr,
+                         migrate ? migrate->text().toUtf8().constData() : "",
+                         migrate ? migrate->shortcut().isEmpty() : 0);
+            if (menuOk && mixer) {
+                UndoManager *undo = timeline->undoManager();
+                mixer->setTrackEqEnabled(0, true);
+                mixer->setTrackEqConfig(0, legacyEqConfig(1));
+                trackfx::Chain before = mixer->trackChain(0);
+                before.eq.highMid = trackfx::EqBand{5000.0, 4.0, 1.0}; // must come back on undo
+                mixer->setTrackChain(0, before);
+                const QJsonObject chainBefore = mixer->trackChain(0).toJson();
+                const quint64 serial = undo->saveSerial();
+                migrate->trigger();
+                const trackfx::Chain after = mixer->trackChain(0);
+                migratedOk = undo->saveSerial() == serial + 1
+                    && undo->undoDescription() == QStringLiteral("EQ を 4 バンドへ移行")
+                    && !mixer->trackEqEnabled(0) && mixer->trackEqConfig(0).bands.isEmpty()
+                    && after.eqEnabled && sameEq(after.eq, gOut);
+                std::fprintf(stderr, "G10 migrate saves=%llu undoText=%s legacyEnabled=%d legacyBands=%lld "
+                                     "eqEnabled=%d lowMid=%g/%g/%g highMidGain=%g\n",
+                             static_cast<unsigned long long>(undo->saveSerial() - serial),
+                             undo->undoDescription().toUtf8().constData(), mixer->trackEqEnabled(0),
+                             static_cast<long long>(mixer->trackEqConfig(0).bands.size()), after.eqEnabled,
+                             after.eq.lowMid.freq, after.eq.lowMid.gainDb, after.eq.lowMid.q,
+                             after.eq.highMid.gainDb);
+                timeline->undo();
+                const AudioEQConfig undone = mixer->trackEqConfig(0);
+                undoOk = mixer->trackEqEnabled(0) && undone.bands.size() == 2
+                    && undone.bands[1].frequency == 1000.0 && undone.bands[1].gain == -12.0
+                    && undone.bands[1].q == 1.0 && mixer->trackChain(0).toJson() == chainBefore;
+                std::fprintf(stderr, "G10 undo legacyEnabled=%d legacyBands=%lld chainRestored=%d highMidGain=%g\n",
+                             mixer->trackEqEnabled(0), static_cast<long long>(undone.bands.size()),
+                             mixer->trackChain(0).toJson() == chainBefore,
+                             mixer->trackChain(0).eq.highMid.gainDb);
+                timeline->redo();
+                redoOk = !mixer->trackEqEnabled(0) && mixer->trackEqConfig(0).bands.isEmpty()
+                    && mixer->trackChain(0).toJson() == after.toJson();
+                std::fprintf(stderr, "G10 redo legacyEnabled=%d legacyBands=%lld chainMigrated=%d\n",
+                             mixer->trackEqEnabled(0),
+                             static_cast<long long>(mixer->trackEqConfig(0).bands.size()),
+                             mixer->trackChain(0).toJson() == after.toJson());
+                // Unrepresentable legacy EQs: only the status message, no state change.
+                for (const AudioEQConfig &cfg : {preampCfg, threeBandCfg}) {
+                    mixer->setTrackEqEnabled(0, true);
+                    mixer->setTrackEqConfig(0, cfg);
+                    const QJsonObject trackState = mixer->collectTrackState();
+                    const QJsonObject chainState = mixer->trackChain(0).toJson();
+                    const quint64 refusedSerial = undo->saveSerial();
+                    window.statusBar()->clearMessage();
+                    migrate->trigger();
+                    const QString message = window.statusBar()->currentMessage();
+                    const bool ok = message.contains(QStringLiteral(
+                            "この EQ 設定は 4 バンド EQ で表現できません (preamp / 3 帯以上)"))
+                        && mixer->collectTrackState() == trackState
+                        && mixer->trackChain(0).toJson() == chainState
+                        && undo->saveSerial() == refusedSerial;
+                    std::fprintf(stderr, "G10 refused preamp=%g bands=%lld message=%s unchanged=%d\n",
+                                 cfg.preamp, static_cast<long long>(cfg.bands.size()),
+                                 message.toUtf8().constData(), ok);
+                    refusedOk &= ok;
+                }
+                // A representable legacy EQ with an active post-EQ stage (compressor):
+                // migrating would move the EQ ahead of it, so it is refused too.
+                {
+                    mixer->setTrackEqEnabled(0, true);
+                    mixer->setTrackEqConfig(0, legacyEqConfig(1));
+                    trackfx::Chain withComp = mixer->trackChain(0);
+                    withComp.compEnabled = true;
+                    withComp.comp.enabled = true;
+                    withComp.comp.ratio = 4.0;
+                    withComp.comp.thresholdDb = -20.0;
+                    mixer->setTrackChain(0, withComp);
+                    const QJsonObject trackState = mixer->collectTrackState();
+                    const QJsonObject chainState = mixer->trackChain(0).toJson();
+                    const quint64 refusedSerial = undo->saveSerial();
+                    window.statusBar()->clearMessage();
+                    migrate->trigger();
+                    const QString message = window.statusBar()->currentMessage();
+                    const bool ok = message.contains(QStringLiteral(
+                            "ディエッサー / コンプレッサー / リバーブが有効なため 4 バンド EQ へ移行できません (処理順が変わります)"))
+                        && mixer->collectTrackState() == trackState
+                        && mixer->trackChain(0).toJson() == chainState
+                        && undo->saveSerial() == refusedSerial;
+                    std::fprintf(stderr, "G10 refused postEqFx=comp message=%s unchanged=%d\n",
+                                 message.toUtf8().constData(), ok);
+                    refusedOk &= ok;
+                }
+            } else {
+                refusedOk = false;
+            }
+        }
+
+        // "4 バンド EQ へ移行" of A1 / A2 after one aboutToShow (it rebuilds the submenus).
+        const auto migrateActions = [](MainWindow &window, QAction **a1, QAction **a2) {
+            auto *trackEqMenu = window.findChild<QMenu *>(QStringLiteral("trackEqMenu"));
+            if (!trackEqMenu) return;
+            emit trackEqMenu->aboutToShow();
+            for (QAction *action : trackEqMenu->actions()) {
+                if (!action->menu()) continue;
+                QAction *migrate = action->menu()->findChild<QAction *>(QStringLiteral("trackEqMigrateTo4Band"));
+                if (action->text() == QStringLiteral("A1")) *a1 = migrate;
+                if (a2 && action->text() == QStringLiteral("A2")) *a2 = migrate;
+            }
+        };
+        const auto legacyOn = [](AudioMixer *mixer, int track) {
+            const AudioEQConfig cfg = mixer->trackEqConfig(track);
+            return mixer->trackEqEnabled(track) && cfg.bands.size() == 2
+                && cfg.bands[1].frequency == 1000.0 && cfg.bands[1].gain == -12.0;
+        };
+        const auto legacyOff = [](AudioMixer *mixer, int track) {
+            return !mixer->trackEqEnabled(track) && mixer->trackEqConfig(track).bands.isEmpty();
+        };
+
+        // Two migrations (A1, then A2): the second keeps the first one's pin on the
+        // entry between them, so redo to it disables A1's legacy EQ again.
+        bool twoTrackOk = false;
+        {
+            MainWindow window;
+            Timeline *timeline = window.findChild<Timeline *>();
+            AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
+            if (timeline)
+                timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}, QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+            QAction *m1 = nullptr, *m2 = nullptr;
+            migrateActions(window, &m1, &m2);
+            const int tracks = timeline ? timeline->audioTrackCount() : 0;
+            std::fprintf(stderr, "G10 twoTrack setup tracks=%d A1action=%d A2action=%d\n",
+                         tracks, m1 != nullptr, m2 != nullptr);
+            if (mixer && m1 && m2 && tracks == 2) {
+                QJsonObject chainBefore[2], chainMigrated[2];
+                for (int t = 0; t < 2; ++t) {
+                    mixer->setTrackEqEnabled(t, true);
+                    mixer->setTrackEqConfig(t, legacyEqConfig(1));
+                    chainBefore[t] = mixer->trackChain(t).toJson();
+                }
+                m1->trigger();
+                chainMigrated[0] = mixer->trackChain(0).toJson();
+                m2->trigger();
+                chainMigrated[1] = mixer->trackChain(1).toJson();
+                const auto chainIs = [&](int t, const QJsonObject &json) {
+                    return mixer->trackChain(t).toJson() == json;
+                };
+                const bool migrated = legacyOff(mixer, 0) && legacyOff(mixer, 1)
+                    && chainMigrated[0] != chainBefore[0] && chainMigrated[1] != chainBefore[1];
+                timeline->undo();
+                timeline->undo();
+                const bool undone = legacyOn(mixer, 0) && legacyOn(mixer, 1)
+                    && chainIs(0, chainBefore[0]) && chainIs(1, chainBefore[1]);
+                std::fprintf(stderr, "G10 twoTrack migrated=%d undo2 A1legacyOn=%d A2legacyOn=%d "
+                                     "A1chainBefore=%d A2chainBefore=%d\n",
+                             migrated, legacyOn(mixer, 0), legacyOn(mixer, 1),
+                             chainIs(0, chainBefore[0]), chainIs(1, chainBefore[1]));
+                timeline->redo();
+                const bool redo1 = legacyOff(mixer, 0) && chainIs(0, chainMigrated[0])
+                    && legacyOn(mixer, 1) && chainIs(1, chainBefore[1]);
+                std::fprintf(stderr, "G10 twoTrack redo1 A1legacyOff=%d A1chainMigrated=%d "
+                                     "A2legacyOn=%d A2chainBefore=%d\n",
+                             legacyOff(mixer, 0), chainIs(0, chainMigrated[0]),
+                             legacyOn(mixer, 1), chainIs(1, chainBefore[1]));
+                timeline->redo();
+                const bool redo2 = legacyOff(mixer, 0) && chainIs(0, chainMigrated[0])
+                    && legacyOff(mixer, 1) && chainIs(1, chainMigrated[1]);
+                std::fprintf(stderr, "G10 twoTrack redo2 A1legacyOff=%d A1chainMigrated=%d "
+                                     "A2legacyOff=%d A2chainMigrated=%d\n",
+                             legacyOff(mixer, 0), chainIs(0, chainMigrated[0]),
+                             legacyOff(mixer, 1), chainIs(1, chainMigrated[1]));
+                twoTrackOk = migrated && undone && redo1 && redo2;
+            }
+        }
+
+        // Relink after a migration (MCP relink_media -> relinkMediaPaths, which
+        // re-captures the current entry first) keeps the migration's pin.
+        bool relinkOk = false;
+        {
+            const QString fromPath = tmp.filePath(QStringLiteral("relink10_from.wav"));
+            const QString toPath = tmp.filePath(QStringLiteral("relink10_to.wav"));
+            const bool filesOk = repeat.isValid() && writeToneWav(fromPath, 440.0, 0.125, 1.0)
+                && writeToneWav(toPath, 440.0, 0.125, 1.0);
+            mcp::McpToolRegistry registry;
+            MainWindow window;
+            mcp::McpEditorTools tools(&window, &registry);
+            tools.registerWriteTools();
+            Timeline *timeline = window.findChild<Timeline *>();
+            AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
+            if (timeline)
+                timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{humClip(0.0, 1.0, fromPath)}},
+                    0.0, -1.0, -1.0, 100);
+            QAction *m1 = nullptr;
+            migrateActions(window, &m1, nullptr);
+            std::fprintf(stderr, "G10 relink setup files=%d A1action=%d\n", filesOk, m1 != nullptr);
+            if (filesOk && mixer && m1) {
+                UndoManager *undo = timeline->undoManager();
+                mixer->setTrackEqEnabled(0, true);
+                mixer->setTrackEqConfig(0, legacyEqConfig(1));
+                m1->trigger();
+                const QJsonObject migratedChain = mixer->trackChain(0).toJson();
+                const bool migrated = legacyOff(mixer, 0)
+                    && undo->undoDescription() == QStringLiteral("EQ を 4 バンドへ移行");
+                bool found = false;
+                QString relinkError;
+                const QJsonObject result = registry.callTool(QStringLiteral("relink_media"),
+                    QJsonObject{{QStringLiteral("mapping"), QJsonArray{QJsonObject{
+                        {QStringLiteral("from"), fromPath}, {QStringLiteral("to"), toPath}}}}},
+                    &found, &relinkError);
+                const QVector<ClipInfo> clips = timeline->audioTracks().first()->clips();
+                const bool relinked = found && result.value(QStringLiteral("ok")).toBool()
+                    && clips.size() == 1 && clips.first().filePath == toPath
+                    && undo->undoDescription() == QStringLiteral("メディアを再リンク");
+                std::fprintf(stderr, "G10 relink migrated=%d found=%d ok=%d undoText=%s error=%s\n",
+                             migrated, found, result.value(QStringLiteral("ok")).toBool(),
+                             undo->undoDescription().toUtf8().constData(),
+                             relinkError.toUtf8().constData());
+                timeline->undo();
+                timeline->undo();
+                const bool undone = legacyOn(mixer, 0);
+                timeline->redo();
+                const bool redone = legacyOff(mixer, 0) && mixer->trackChain(0).toJson() == migratedChain;
+                std::fprintf(stderr, "G10 relink undo2 A1legacyOn=%d redo1 A1legacyOff=%d A1chainMigrated=%d\n",
+                             undone, legacyOff(mixer, 0), mixer->trackChain(0).toJson() == migratedChain);
+                relinkOk = migrated && relinked && undone && redone;
+            }
+        }
+        std::fprintf(stderr, "G10 terms pcmOk=%d rejectOk=%d gMapped=%d menuOk=%d migratedOk=%d "
+                             "undoOk=%d redoOk=%d refusedOk=%d twoTrackOk=%d relinkOk=%d\n",
+                     pcmOk, rejectOk, gMapped, menuOk, migratedOk, undoOk, redoOk, refusedOk,
+                     twoTrackOk, relinkOk);
+        tally.gate(10, generated[5] && generated[6] && pcmOk && rejectOk && gMapped
+                       && menuOk && migratedOk && undoOk && redoOk && refusedOk
+                       && twoTrackOk && relinkOk,
+                   "migrated legacy EQ must match g (branch A bytes / branch B 1 kHz ratio), reject preamp / three bands, and undo / redo as one step");
+    }
     return tally.finish();
 }

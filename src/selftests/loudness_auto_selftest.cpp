@@ -22,10 +22,11 @@
 #include <vector>
 
 namespace {
-bool writeVideo(const QString &path, QString &error)
+bool writeVideo(const QString &path, QString &error, const QString &audioSourcePath = QString())
 {
     libavcore::EncodeRequest request;
     request.outputPath = path.toStdString();
+    request.audioSourcePath = audioSourcePath.toStdString();
     request.width = 64;
     request.height = 64;
     request.fps = request.fpsNum = 10;
@@ -81,6 +82,60 @@ bool render(RenderJob job, QString &error)
     loop.exec();
     queue.stop();
     return ok;
+}
+
+// G7-G12 environment rule: only a missing ffmpeg.exe is an environment SKIP. A failed fixture
+// (libavcore writes it) is a production failure and FAILs, whether ffmpeg exists or not.
+enum class FixtureVerdict { Run, Skip, Fail };
+FixtureVerdict fixtureVerdict(bool fixtureOk, bool ffmpegFound)
+{
+    if (!fixtureOk) return FixtureVerdict::Fail;
+    return ffmpegFound ? FixtureVerdict::Run : FixtureVerdict::Skip;
+}
+
+// addJob on a fresh queue: jobsChanged (connected before the call) reads jobs() synchronously.
+struct Submission {
+    int failedCount = 0;
+    QString error;
+    bool sawJob = false;
+    qsizetype jobsAfter = -1;
+};
+Submission submit(const RenderJob &job)
+{
+    Submission result;
+    RenderQueue queue;
+    QObject::connect(&queue, &RenderQueue::jobsChanged, &queue, [&]() {
+        result.sawJob = result.sawJob || !queue.jobs().isEmpty();
+    });
+    QObject::connect(&queue, &RenderQueue::jobFailed, &queue, [&](int, const QString &error) {
+        ++result.failedCount;
+        result.error = error;
+    });
+    queue.addJob(job);
+    result.jobsAfter = queue.jobs().size();
+    queue.clear(); // an accepted job is discarded through removeTempFiles, never started
+    return result;
+}
+
+// Peak of the first audio stream, decoded by libavcore (-1 when it cannot be read).
+double audioPeak(const QString &media, const QString &wavPath)
+{
+    std::vector<double> mono;
+    int rate = 0;
+    if (!libavcore::extractAudioToWav(media, wavPath, 48000)
+        || !libavcore::readPcm16WavToMono(wavPath, mono, rate) || mono.empty())
+        return -1.0;
+    double peak = 0.0;
+    for (double value : mono) peak = std::max(peak, std::abs(value));
+    return peak;
+}
+
+QStringList tempFilesOf(const RenderJob &job)
+{
+    QStringList paths;
+    for (const QJsonValue &value : job.exportConfig.value("tempFiles").toArray())
+        paths << value.toString();
+    return paths;
 }
 }
 
@@ -288,8 +343,8 @@ int runLoudnessAutoSelftest()
     // G7: when exportVideo's audio step (MainWindow::finalizeExportJobAudio) fails after
     // buildExportRenderJob -> prepareJob already created intermediates, it must return
     // false and leave none behind. Detects removing that cleanup call (the temp file
-    // would survive). The failure is forced via m_exportAudioMixErrorForTest; ffmpeg or
-    // fixture unavailable (no intermediate created) -> SKIP, never FAIL.
+    // would survive). The failure is forced via m_exportAudioMixErrorForTest; ffmpeg.exe
+    // unavailable -> SKIP, a failed fixture -> FAIL (fixtureVerdict, G12).
     {
         MainWindow window;
         window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
@@ -312,17 +367,20 @@ int runLoudnessAutoSelftest()
         const bool wavRegistered = wavPaths.size() == 1;
         const bool wavGone = wavRegistered && !QFile::exists(wavPaths.first());
         const bool createdExists = otherExists && wavRegistered && wavGone;
-        const bool g7EnvMissing = !fixture || QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
-        if (g7EnvMissing || !createdExists) {
+        const FixtureVerdict g7Verdict = fixtureVerdict(fixture,
+            !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty());
+        if (g7Verdict != FixtureVerdict::Run || !createdExists) {
             std::fprintf(stderr, "[loudness-auto] G7 fixture=%d created=%lld otherCount=%lld "
-                "otherExists=%d wavRegistered=%d wavGone=%d createdExists=%d envMissing=%d\n",
+                "otherExists=%d wavRegistered=%d wavGone=%d createdExists=%d verdict=%d fixtureError=%s\n",
                 fixture, static_cast<long long>(created.size()),
                 static_cast<long long>(otherPaths.size()), otherExists, wavRegistered, wavGone,
-                createdExists, g7EnvMissing);
-            if (g7EnvMissing) {
-                tally.skip(7, "ffmpeg.exe or audio fixture unavailable");
+                createdExists, static_cast<int>(g7Verdict), qPrintable(fixtureError));
+            if (g7Verdict == FixtureVerdict::Skip) {
+                tally.skip(7, "ffmpeg.exe unavailable");
             } else {
-                tally.gate(7, false, "prepareJob temp registration invalid: WAV not registered/removed or mux missing");
+                tally.gate(7, false, g7Verdict == FixtureVerdict::Fail
+                    ? "audio fixture generation (libavcore) failed"
+                    : "prepareJob temp registration invalid: WAV not registered/removed or mux missing");
                 RenderQueue q;
                 q.removeTempFiles(&g7);
             }
@@ -345,7 +403,7 @@ int runLoudnessAutoSelftest()
     // G8: prepareJob registers both intermediates, the PCM measurement WAV (<mix>.m4a.wav,
     // which it also removes itself) and the AAC mux file, in exportConfig["tempFiles"].
     // Detects dropping the WAV registration: removeTempFiles could then not retry a
-    // failed remove. No fixture / no mix created (no ffmpeg) -> SKIP.
+    // failed remove. ffmpeg.exe unavailable -> SKIP, a failed fixture -> FAIL.
     {
         RenderJob g8 = normal;
         g8.exportConfig.remove("tempFiles");
@@ -362,8 +420,12 @@ int runLoudnessAutoSelftest()
             if (path.endsWith(QStringLiteral(".m4a.wav"))) wavPath = path;
             else if (path.endsWith(QStringLiteral(".m4a"))) muxPath = path;
         }
-        if (!fixture || !g8Ffmpeg) {
-            tally.skip(8, "ffmpeg.exe or audio fixture unavailable");
+        const FixtureVerdict g8Verdict = fixtureVerdict(fixture, g8Ffmpeg);
+        if (g8Verdict == FixtureVerdict::Skip) {
+            tally.skip(8, "ffmpeg.exe unavailable");
+        } else if (g8Verdict == FixtureVerdict::Fail) {
+            std::fprintf(stderr, "[loudness-auto] G8 fixtureError=%s\n", qPrintable(fixtureError));
+            tally.gate(8, false, "audio fixture generation (libavcore) failed");
         } else if (muxPath.isEmpty() || !QFile::exists(muxPath)) {
             std::fprintf(stderr, "[loudness-auto] G8 status=[%s] muxPath=[%s]\n",
                 qPrintable(g8Status), qPrintable(muxPath));
@@ -380,6 +442,170 @@ int runLoudnessAutoSelftest()
             RenderQueue g8Queue;
             g8Queue.removeTempFiles(&g8);
         }
+    }
+
+    // G9-G11 share the timelines: tone = V1 video + audio clip (G7), avOnly = V1 video with an
+    // audible audio stream and no audio clip (empty audio playback sequence).
+    const bool ffmpegFound = !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+    const QString avSource = temporary.filePath("av-tone.wav");
+    const QString avVideo = temporary.filePath("av.mkv");
+    QByteArray pcm(48000 * 4 * 2 * 2, Qt::Uninitialized);
+    for (int i = 0; i < 48000 * 4 * 2; ++i) {
+        const qint16 value = static_cast<qint16>(8000.0 * std::sin(2.0 * 3.141592653589793 * 440.0 * (i / 2) / 48000.0));
+        pcm[2 * i] = static_cast<char>(value & 0xff);
+        pcm[2 * i + 1] = static_cast<char>((value >> 8) & 0xff);
+    }
+    QString avError;
+    const bool avFixture = temporary.isValid()
+        && libavcore::writePcm16AsWav(avSource, pcm, 48000, 2, &avError)
+        && writeVideo(avVideo, avError, avSource);
+    ClipInfo avPicture = picture;
+    avPicture.filePath = avVideo;
+    const auto useTimeline = [&](MainWindow &window, bool withAudioClip) {
+        window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{withAudioClip ? picture : avPicture}},
+            withAudioClip ? QVector<QVector<ClipInfo>>{{audio}} : QVector<QVector<ClipInfo>>(1), 0, -1, -1, 10);
+    };
+    ExportConfig autoConfig = settings;
+    autoConfig.autoLoudness = true;
+    int outputSerial = 0;
+    const auto buildJob = [&](MainWindow &window) {
+        autoConfig.outputPath = temporary.filePath(QStringLiteral("g9-%1.mp4").arg(++outputSerial));
+        return window.buildExportRenderJob(autoConfig, MainWindow::ExportEntry::Normal);
+    };
+
+    // G9: ON + empty audio playback sequence (GUI normal entry): prepareJob puts a silent .m4a in
+    // tempFiles and projectFilePath, so RenderQueue no longer muxes the V1 source audio. Detects
+    // dropping the silent track (HEAD: projectFilePath stays the project / V1 audio).
+    {
+        const FixtureVerdict verdict = fixtureVerdict(avFixture, ffmpegFound);
+        if (verdict == FixtureVerdict::Skip) {
+            tally.skip(9, "ffmpeg.exe unavailable");
+        } else if (verdict == FixtureVerdict::Fail) {
+            std::fprintf(stderr, "[loudness-auto] G9 avFixtureError=%s\n", qPrintable(avError));
+            tally.gate(9, false, "audio+video fixture generation (libavcore) failed");
+        } else {
+            MainWindow window;
+            useTimeline(window, false);
+            const qsizetype sequenceSize = window.m_timeline->computeAudioPlaybackSequence().size();
+            const int mixBefore = window.exportAudioMixCallCountForTest;
+            const int silentBefore = loudnessauto::silentMixCallCountForTest();
+            RenderJob g9 = buildJob(window);
+            const int mixDelta = window.exportAudioMixCallCountForTest - mixBefore;
+            const int silentDelta = loudnessauto::silentMixCallCountForTest() - silentBefore;
+            const QStringList temps = tempFilesOf(g9);
+            const bool silentIsProject = g9.projectFilePath.endsWith(QStringLiteral(".m4a"))
+                && temps.contains(g9.projectFilePath) && QFile::exists(g9.projectFilePath);
+            const double silentPeak = silentIsProject
+                ? audioPeak(g9.projectFilePath, temporary.filePath("g9-silent.wav")) : -1.0;
+            const double sourcePeak = audioPeak(avVideo, temporary.filePath("g9-source.wav"));
+            const QString autoError = g9.exportConfig.value("loudnessAutoError").toString();
+            std::fprintf(stderr, "[loudness-auto] G9 sequenceSize=%lld projectFilePath=[%s] tempFiles=%lld "
+                "silentIsProject=%d silentDelta=%d mixDelta=%d silentPeak=%g sourceV1Peak=%g autoError=[%s]\n",
+                static_cast<long long>(sequenceSize), qPrintable(g9.projectFilePath),
+                static_cast<long long>(temps.size()), silentIsProject, silentDelta, mixDelta, silentPeak,
+                sourcePeak, qPrintable(autoError));
+            tally.gate(9, sequenceSize == 0 && silentIsProject && silentDelta == 1 && mixDelta == 0
+                && silentPeak == 0.0 && sourcePeak > 0.0 && autoError.isEmpty(),
+                "ON + empty audio sequence did not put a silent track on the job (V1 source audio would be muxed)");
+            RenderQueue cleanup;
+            cleanup.removeTempFiles(&g9);
+        }
+    }
+
+    // G10: a PCM mix failure rejects the job through RenderQueue::addJob (jobFailed, nothing
+    // queued) instead of exporting unnormalized audio. Control: hook None, same input -> accepted.
+    {
+        const FixtureVerdict verdict = fixtureVerdict(fixture, ffmpegFound);
+        if (verdict == FixtureVerdict::Skip) {
+            tally.skip(10, "ffmpeg.exe unavailable");
+        } else if (verdict == FixtureVerdict::Fail) {
+            tally.gate(10, false, "audio fixture generation (libavcore) failed");
+        } else {
+            MainWindow window;
+            useTimeline(window, true);
+            loudnessauto::setForcedFailureForTest(loudnessauto::ForcedFailure::PcmMix);
+            const RenderJob failing = buildJob(window);
+            loudnessauto::setForcedFailureForTest(loudnessauto::ForcedFailure::None);
+            const QString autoError = failing.exportConfig.value("loudnessAutoError").toString();
+            const Submission rejected = submit(failing);
+            const RenderJob control = buildJob(window);
+            const QString controlError = control.exportConfig.value("loudnessAutoError").toString();
+            const Submission accepted = submit(control);
+            std::fprintf(stderr, "[loudness-auto] G10 error=[%s] failedCount=%d rejection=[%s] sawJob=%d "
+                "jobsAfter=%lld | control error=[%s] failedCount=%d sawJob=%d jobsAfter=%lld\n",
+                qPrintable(autoError), rejected.failedCount, qPrintable(rejected.error), rejected.sawJob,
+                static_cast<long long>(rejected.jobsAfter), qPrintable(controlError), accepted.failedCount,
+                accepted.sawJob, static_cast<long long>(accepted.jobsAfter));
+            tally.gate(10, !autoError.isEmpty() && rejected.failedCount == 1 && rejected.error.contains(autoError)
+                && !rejected.sawJob && rejected.jobsAfter == 0
+                && controlError.isEmpty() && accepted.failedCount == 0 && accepted.sawJob && accepted.jobsAfter == 1,
+                "a PCM mix failure did not reject the job (or the unforced control was rejected)");
+        }
+    }
+
+    // G11: AAC conversion failure (tone timeline) and silent mix failure (G9 input) take the same
+    // rejection path, and the measurement WAV / AAC / silent m4a they registered are gone after the
+    // rejection's removeTempFiles. The forced failures run after the file was written.
+    {
+        const FixtureVerdict verdict = fixtureVerdict(fixture && avFixture, ffmpegFound);
+        if (verdict == FixtureVerdict::Skip) {
+            tally.skip(11, "ffmpeg.exe unavailable");
+        } else if (verdict == FixtureVerdict::Fail) {
+            tally.gate(11, false, "audio fixture generation (libavcore) failed");
+        } else {
+            bool ok = true;
+            const std::pair<loudnessauto::ForcedFailure, bool> cases[] = {
+                {loudnessauto::ForcedFailure::AacConvert, true}, {loudnessauto::ForcedFailure::SilentMix, false}};
+            for (const auto &[failure, withAudioClip] : cases) {
+                MainWindow window;
+                useTimeline(window, withAudioClip);
+                loudnessauto::setForcedFailureForTest(failure);
+                const RenderJob failing = buildJob(window);
+                loudnessauto::setForcedFailureForTest(loudnessauto::ForcedFailure::None);
+                const QString autoError = failing.exportConfig.value("loudnessAutoError").toString();
+                const QStringList temps = tempFilesOf(failing);
+                QStringList written;
+                for (const QString &path : temps)
+                    if (path.endsWith(QStringLiteral(".m4a")) && QFile::exists(path)) written << path;
+                const Submission rejected = submit(failing);
+                QStringList leftover;
+                for (const QString &path : temps)
+                    if (QFile::exists(path)) leftover << path;
+                const bool wavRegistered = !withAudioClip
+                    || std::any_of(temps.cbegin(), temps.cend(), [](const QString &path) {
+                           return path.endsWith(QStringLiteral(".m4a.wav")); });
+                std::fprintf(stderr, "[loudness-auto] G11 case=%d error=[%s] failedCount=%d rejection=[%s] "
+                    "sawJob=%d jobsAfter=%lld tempFiles=[%s] writtenM4a=%lld wavRegistered=%d leftover=[%s]\n",
+                    static_cast<int>(failure), qPrintable(autoError), rejected.failedCount,
+                    qPrintable(rejected.error), rejected.sawJob, static_cast<long long>(rejected.jobsAfter),
+                    qPrintable(temps.join(QLatin1Char(','))), static_cast<long long>(written.size()),
+                    wavRegistered, qPrintable(leftover.join(QLatin1Char(','))));
+                ok = ok && !autoError.isEmpty() && rejected.failedCount == 1 && rejected.error.contains(autoError)
+                    && !rejected.sawJob && rejected.jobsAfter == 0
+                    && written.size() == 1 && wavRegistered && leftover.isEmpty();
+            }
+            tally.gate(11, ok, "an AAC / silent mix failure was not rejected or left a registered temp file");
+        }
+    }
+
+    // G12: the G7-G11 environment rule. A fixture that libavcore fails to write (output directory
+    // missing) takes the FAIL branch, not SKIP; only a missing ffmpeg.exe SKIPs. Detects folding a
+    // fixture failure back into the environment SKIP.
+    {
+        QString g12Error;
+        const bool g12Fixture = writeVideo(temporary.filePath("missing-dir/g12.mp4"), g12Error);
+        const FixtureVerdict failed = fixtureVerdict(g12Fixture, true);
+        const FixtureVerdict failedNoFfmpeg = fixtureVerdict(g12Fixture, false);
+        const FixtureVerdict control = fixtureVerdict(true, true);
+        const FixtureVerdict noFfmpeg = fixtureVerdict(true, false);
+        std::fprintf(stderr, "[loudness-auto] G12 fixture=%d error=[%s] verdict=%d verdictNoFfmpeg=%d "
+            "control=%d noFfmpeg=%d (0=Run 1=Skip 2=Fail)\n", g12Fixture, qPrintable(g12Error),
+            static_cast<int>(failed), static_cast<int>(failedNoFfmpeg), static_cast<int>(control),
+            static_cast<int>(noFfmpeg));
+        tally.gate(12, !g12Fixture && !g12Error.isEmpty() && failed == FixtureVerdict::Fail
+            && failedNoFfmpeg == FixtureVerdict::Fail && control == FixtureVerdict::Run
+            && noFfmpeg == FixtureVerdict::Skip,
+            "a failed fixture generation was classified as SKIP (or the environment rule changed)");
     }
     return tally.finish("loudness-auto");
 }
