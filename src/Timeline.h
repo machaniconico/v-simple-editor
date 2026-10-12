@@ -366,6 +366,9 @@ struct ClipInfo {
 
     // US-307: absent for ordinary clips; persistence retains one level only.
     std::shared_ptr<ClipInfo> renderInPlaceOriginal;
+    // The roto entry the bake removed from the timeline; decompose puts it back
+    // under the clip's key. Null when the original had no roto.
+    std::shared_ptr<RotoClipEntry> renderInPlaceOriginalRoto;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;

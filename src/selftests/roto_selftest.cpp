@@ -503,7 +503,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 39;
+    constexpr int kRotoGateCount = 41;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -1612,16 +1612,20 @@ int runRotoSelftest()
 
     // G21 detects a RenderInPlace bake that drops the roto (temporary key not
     // shifted past the prefix black clip), applies it twice after the bake
-    // (entry left on the source key) or loses it on undo; (d) pins the known
-    // limitation that decompose does not restore the entry.
+    // (entry left on the source key) or loses it on undo; (d) pins that decompose
+    // restores the entry (US-1102; G40 / G41 cover the saved-file round trip).
     const QString ffmpegPath = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
     bool g21Ran = false;
     bool g21Passed = false;
     QString proresUnavailable;
     if (ffmpegPath.isEmpty()) {
         gates.skip(21, "ffmpeg.exe not found (the linked-audio prefix case needs the export mix)");
+        gates.skip(40, "ffmpeg.exe not found (G21 prerequisite)");
+        gates.skip(41, "ffmpeg.exe not found (G21 prerequisite)");
     } else if (!selftest::requireEncoder(QStringLiteral("prores_ks"), &proresUnavailable)) {
         gates.skip(21, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+        gates.skip(40, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
+        gates.skip(41, "prores_ks encoder unavailable (a roto bake needs ProRes 4444 alpha)");
     } else {
         const QString tonePath = temporary.filePath(QStringLiteral("g21-tone.wav"));
         const bool toneReady = writeTone(tonePath);
@@ -1700,7 +1704,7 @@ int runRotoSelftest()
                 && std::abs(r.inner - control.inner) <= 6.0 && control.outer - r.outer >= 30.0;
             const bool b = r.baked && !r.keyAfterBake;
             const bool cUndo = r.baked && r.undoClip && r.undoKey && r.redoClip && !r.redoKey;
-            const bool d = r.baked && r.decomposeClip && !r.decomposeKey;
+            const bool d = r.baked && r.decomposeClip && r.decomposeKey;
             std::cerr << "G21 case=" << c.name << " baked=" << r.baked
                       << " error=" << r.error.toStdString()
                       << " replacementInPoint=" << r.inPoint << " (expected " << c.expectedInPoint << ")"
@@ -1813,7 +1817,108 @@ int runRotoSelftest()
             g21 = g21 && f;
         }
         g21Ran = true;
-        g21Passed = gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose limitation mismatch");
+        g21Passed = gates.gate(21, g21, "RenderInPlace roto bake, source-key removal, undo/redo or decompose roto restore mismatch");
+
+        // ── G40-G41 (US-1102): the baked clip keeps the roto entry it removed
+        // (renderInPlaceOriginalRoto) through a saved file, and decompose
+        // ("元のクリップに戻す") puts it back under the clip's key in one undo
+        // point. G41 is the negative control: no roto -> no field, no JSON key,
+        // no entry after decompose, and a file without the key still loads.
+        {
+            renderinplace::Options keepOptions;
+            keepOptions.outputDir = temporary.path();
+            keepOptions.outputSize = frameSize;
+            keepOptions.fps = 10.0;
+            const QString key = QStringLiteral("0:0");
+            const auto bakeAndReload = [&](int id, const RotoClipEntry *roto, Timeline *reloaded,
+                                           ClipInfo *bakedClip) {
+                ClipInfo video = clip(id);
+                video.inPoint = 0.5;
+                video.outPoint = 1.5;
+                Timeline tl;
+                tl.restoreFromProject(oneTrack({video}), QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 10);
+                if (roto) tl.setRotoEntries(rotoAt(key, *roto));
+                QString path, error;
+                if (!renderinplace::renderClipInPlace(tl, 0, 0, keepOptions, &path, &error)) return false;
+                *bakedClip = tl.videoTracks()[0]->clips()[0];
+                ProjectData project;
+                project.videoTracks = oneTrack({*bakedClip});
+                const QString projectPath = temporary.filePath(QStringLiteral("g40-%1.veditor").arg(id));
+                ProjectData loaded;
+                if (!ProjectFile::save(projectPath, project) || !ProjectFile::load(projectPath, loaded)
+                    || loaded.videoTracks.isEmpty() || loaded.videoTracks[0].isEmpty())
+                    return false;
+                reloaded->restoreFromProject(loaded.videoTracks, loaded.audioTracks,
+                                             0.0, -1.0, -1.0, 10);
+                return true;
+            };
+
+            RotoClipEntry keyed = hardRect;
+            RotoKeyframe keyframe;
+            keyframe.frameNumber = 3;
+            keyframe.path = rectPath(20, 20, 44, 44);
+            keyed.keyframes.append(keyframe);
+            Timeline reloaded;
+            ClipInfo bakedClip;
+            const bool g40Baked = bakeAndReload(220, &keyed, &reloaded, &bakedClip);
+            const bool g40Field = g40Baked && bakedClip.renderInPlaceOriginalRoto;
+            const bool g40Loaded = g40Baked
+                && reloaded.videoTracks()[0]->clips()[0].renderInPlaceOriginalRoto
+                && reloaded.rotoEntries().isEmpty();
+            reloaded.undoManager()->clear();
+            reloaded.saveUndoState(QStringLiteral("roto 復元前"));
+            const quint64 serialBefore = reloaded.undoManager()->saveSerial();
+            const bool g40Decomposed = g40Loaded && renderinplace::decomposeRenderInPlace(reloaded, 0, 0);
+            const quint64 serialDiff = reloaded.undoManager()->saveSerial() - serialBefore;
+            const QHash<QString, RotoClipEntry> restoredEntries = reloaded.rotoEntries();
+            bool g40Same = g40Decomposed && restoredEntries.contains(key);
+            if (g40Same) {
+                const RotoClipEntry &back = restoredEntries[key];
+                g40Same = back.path.toJson() == keyed.path.toJson() && back.keyframes.size() == 1
+                    && back.keyframes[0].frameNumber == 3
+                    && back.keyframes[0].toJson() == keyed.keyframes[0].toJson();
+            }
+            const bool g40Clip = g40Decomposed
+                && reloaded.videoTracks()[0]->clips()[0].filePath == gSyntheticClipPath;
+            reloaded.undo();
+            const bool g40Undo = g40Decomposed && !reloaded.rotoEntries().contains(key)
+                && reloaded.videoTracks()[0]->clips()[0].filePath != gSyntheticClipPath;
+            std::cerr << "G40 baked=" << g40Baked << " field=" << g40Field << " reloadedField=" << g40Loaded
+                      << " decomposed=" << g40Decomposed << " saveSerialDiff=" << serialDiff
+                      << " (== 1) entryBack(path+keyframes)=" << g40Same << " clipBack=" << g40Clip
+                      << " undoDropsEntry=" << g40Undo << '\n';
+            gates.gate(40, g40Field && g40Loaded && g40Same && g40Clip && serialDiff == 1 && g40Undo,
+                       "decompose after save / reload did not restore the roto entry in one undo point");
+
+            Timeline plain;
+            ClipInfo plainBaked;
+            const bool g41Baked = bakeAndReload(221, nullptr, &plain, &plainBaked);
+            const QString roKey = QStringLiteral("\"renderInPlaceOriginalRoto\"");
+            ProjectData plainData;
+            plainData.videoTracks = oneTrack({plainBaked});
+            const bool g41NoField = g41Baked && !plainBaked.renderInPlaceOriginalRoto
+                && !ProjectFile::toJsonString(plainData).contains(roKey);
+            // Positive side of the key check: the roto'd bake does write it.
+            ProjectData keyedData;
+            keyedData.videoTracks = oneTrack({bakedClip});
+            QString keyedJson = ProjectFile::toJsonString(keyedData);
+            const bool g41KeyWritten = g40Baked && keyedJson.contains(roKey);
+            // An old file (no key) reads as before: rename the key away.
+            keyedJson.replace(roKey, QStringLiteral("\"unknownKey\""));
+            ProjectData oldData;
+            const bool g41Old = g40Baked && ProjectFile::fromJsonString(keyedJson, oldData)
+                && !oldData.videoTracks.isEmpty() && !oldData.videoTracks[0].isEmpty()
+                && oldData.videoTracks[0][0].renderInPlaceOriginal
+                && !oldData.videoTracks[0][0].renderInPlaceOriginalRoto;
+            const bool g41Decomposed = g41Baked && renderinplace::decomposeRenderInPlace(plain, 0, 0)
+                && plain.videoTracks()[0]->clips()[0].filePath == gSyntheticClipPath;
+            const bool g41Empty = plain.rotoEntries().isEmpty();
+            std::cerr << "G41 baked=" << g41Baked << " noFieldNoKey=" << g41NoField
+                      << " rotoBakeWritesKey=" << g41KeyWritten << " oldFileLoads=" << g41Old
+                      << " decomposed=" << g41Decomposed << " rotoEntriesEmpty=" << g41Empty << '\n';
+            gates.gate(41, g41NoField && g41KeyWritten && g41Old && g41Decomposed && g41Empty,
+                       "a roto-less bake wrote the field / key, an old file failed to load or decompose added a roto entry");
+        }
     }
 
     // ── G22-G25 (US-915): cross-track drop through TimelineTrack::dropEvent.

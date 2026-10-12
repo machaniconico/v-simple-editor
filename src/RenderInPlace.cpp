@@ -557,6 +557,8 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     // undo restores it together with the original clip.
     const QHash<QString, RotoClipEntry> rotoBeforeReplace = timeline.rotoEntries();
     if (rotoBeforeReplace.contains(rotoKey)) {
+        replacement.renderInPlaceOriginalRoto =
+            std::make_shared<RotoClipEntry>(rotoBeforeReplace.value(rotoKey));
         QHash<QString, RotoClipEntry> withoutBaked = rotoBeforeReplace;
         withoutBaked.remove(rotoKey);
         timeline.setRotoEntries(withoutBaked);
@@ -578,7 +580,20 @@ bool decomposeRenderInPlace(Timeline &timeline, int trackIndex, int clipIndex)
     const auto *track = timeline.videoTracks()[trackIndex];
     if (clipIndex < 0 || clipIndex >= track->clipCount()) return false;
     const auto original = track->clips()[clipIndex].renderInPlaceOriginal;
-    return original && timeline.replaceRenderedClip(trackIndex, clipIndex, *original,
-                                                    QStringLiteral("元のクリップに戻す"));
+    if (!original) return false;
+    // Restore the baked-away roto first (no undo point of its own) so the
+    // single undo state saved by replaceRenderedClip covers both.
+    const auto originalRoto = track->clips()[clipIndex].renderInPlaceOriginalRoto;
+    const QHash<QString, RotoClipEntry> rotoBefore = timeline.rotoEntries();
+    if (originalRoto) {
+        QHash<QString, RotoClipEntry> restored = rotoBefore;
+        restored.insert(trackMatteClipKey(trackIndex, clipIndex), *originalRoto);
+        timeline.setRotoEntries(restored);
+    }
+    if (timeline.replaceRenderedClip(trackIndex, clipIndex, *original,
+                                     QStringLiteral("元のクリップに戻す")))
+        return true;
+    if (originalRoto) timeline.setRotoEntries(rotoBefore);
+    return false;
 }
 }

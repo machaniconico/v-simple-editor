@@ -2104,6 +2104,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         original.renderInPlaceOriginal.reset();
         obj["renderInPlaceOriginal"] = clipToJson(original);
     }
+    if (clip.renderInPlaceOriginalRoto)
+        obj["renderInPlaceOriginalRoto"] = rotoClipEntryToJson(*clip.renderInPlaceOriginalRoto);
 
     return obj;
 }
@@ -2227,6 +2229,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         original.remove("renderInPlaceOriginal");
         clip.renderInPlaceOriginal = std::make_shared<ClipInfo>(clipFromJson(original));
     }
+    if (obj.value("renderInPlaceOriginalRoto").isObject())
+        clip.renderInPlaceOriginalRoto = std::make_shared<RotoClipEntry>(
+            rotoClipEntryFromJson(obj.value("renderInPlaceOriginalRoto").toObject()));
 
     return clip;
 }
