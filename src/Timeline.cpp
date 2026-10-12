@@ -4928,6 +4928,9 @@ bool Timeline::importMedia(const QString &filePath,
     const ImportPlacement placement = static_cast<ImportPlacement>(
         prefs.value("importPlacement", static_cast<int>(ImportPlacement::ParallelTrack)).toInt());
 
+    // addVideoTrack(false) / addAudioTrack(false) below skip the capture; take
+    // it before any track is created so undoing the import restores live state.
+    captureExternalTrackState();
     int videoTrackIdx = -1;
     int audioTrackIdx = -1;
     if (requestedTrackIndex >= 0) {
@@ -12725,6 +12728,18 @@ void Timeline::captureExternalTrackState()
         m_undoManager->updateCurrentExternalTrackState(m_collectExternalTrackState());
 }
 
+void Timeline::setBusRoutingBridge(std::function<QJsonObject()> provider,
+                                   std::function<void(const QJsonObject&)> applier)
+{
+    m_busRoutingProvider = std::move(provider);
+    m_busRoutingApplier = std::move(applier);
+}
+
+void Timeline::absorbIntoCurrentUndoPoint()
+{
+    m_undoManager->updateCurrentState(currentState());
+}
+
 void Timeline::saveUndoState(const QString &description)
 {
     m_undoManager->saveState(currentState(), description);
@@ -13305,6 +13320,7 @@ TimelineState Timeline::currentState() const
     }
 
     if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
+    if (m_busRoutingProvider) state.audioBusRouting = m_busRoutingProvider();
     state.projectWidth = m_projectWidth;
     state.projectHeight = m_projectHeight;
     state.projectExplicitOutput = m_projectExplicitOutput;
@@ -13451,6 +13467,10 @@ void Timeline::restoreState(const TimelineState &state)
     // Restore external owners only when crossing a track-structure change.
     if (structureChanged && m_applyExternalTrackState)
         m_applyExternalTrackState(state.externalTrackState);
+    // Bus routing is ordinary undo state: applied on every restore, after the
+    // external "buses" capture above (same undo point), so this one wins.
+    if (m_busRoutingApplier && !state.audioBusRouting.isEmpty())
+        m_busRoutingApplier(state.audioBusRouting);
     emit trackStateRestored();
     syncActiveSequenceFromCurrentTracks();
     const QString beforeSequenceCreation = state.externalTrackState

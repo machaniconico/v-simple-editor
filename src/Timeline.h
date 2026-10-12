@@ -877,6 +877,14 @@ public:
                                     std::function<void(const QJsonObject&)> apply);
     // Call once before a compound edit that changes tracks without recording undo.
     void captureExternalTrackStateForCompoundEdit();
+    // Bus routing undo carrier: currentState() stores provider() in
+    // TimelineState::audioBusRouting and restoreState() hands a non-empty one to
+    // applier() on every undo / redo. MainWindow keeps the routing SSOT.
+    void setBusRoutingBridge(std::function<QJsonObject()> provider,
+                             std::function<void(const QJsonObject&)> applier);
+    // Catch-all for edits that record no undo point (matte dialog, bus panel):
+    // folds currentState() into the current undo entry and drops the redo stack.
+    void absorbIntoCurrentUndoPoint();
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
     void saveUndoState(const QString &description);
 
@@ -1304,10 +1312,11 @@ public:
                             const ProjectTrackClips &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
-    // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
-    // m_trackMatteClipEntries mutation; RenderQueue::resolveTimeline after
-    // rebuilding a parentless Timeline from a loaded project) push the
-    // QHash here keyed by "trackIdx:clipIdx" (== MainWindow::brushClipId ==
+    // TM-8: track-matte wiring. Timeline is the SSOT of the matte carrier
+    // (MainWindow keeps no copy): MainWindow::configureTrackMatte and project
+    // load write it here, as does RenderQueue::resolveTimeline after
+    // rebuilding a parentless Timeline from a loaded project. Keyed by
+    // "trackIdx:clipIdx" (== MainWindow::brushClipId ==
     // tlrender::renderClipId). renderFrameAt reads ONLY this — never a live
     // MainWindow off the worker thread (kills the C2 data race + C1
     // edit≠export divergence on the queue/file export path).
@@ -1411,6 +1420,8 @@ private:
     void remapTrackIndices(bool audio, const QVector<int> &oldToNew);
     std::function<QJsonObject()> m_collectExternalTrackState;
     std::function<void(const QJsonObject&)> m_applyExternalTrackState;
+    std::function<QJsonObject()> m_busRoutingProvider;
+    std::function<void(const QJsonObject&)> m_busRoutingApplier;
     void captureExternalTrackState();
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
@@ -1464,6 +1475,7 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
+    // Number of remapCarriersAfterCrossTrackMove calls (selftest counter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
@@ -1594,8 +1606,8 @@ private:
     // for the linked video partner moved by handleCrossTrackLinkedDrop:
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
     // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
-    // -1 for an audio track (not keyed). Applies to roto and clip-parent
-    // entries only; the matte carrier is overwritten by MainWindow's copy.
+    // -1 for an audio track (not keyed). Applies to the roto, clip-parent and
+    // matte carriers (the matte source key takes the same map).
     void remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
                                           int destTrackIdx, int destIdx);
 

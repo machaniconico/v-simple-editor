@@ -6789,6 +6789,17 @@ void MainWindow::setupMenuBar()
     m_audioBusPanel->setVisible(false);
     connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
             this, &MainWindow::onAudioBusRoutingChanged);
+    // Undo carries the routing in TimelineState through this bridge; panel
+    // edits record no undo point and are folded into the current one.
+    m_timeline->setBusRoutingBridge(
+        [this] { return m_audioBusRouting.toJson(); },
+        [this](const QJsonObject &routing) {
+            m_audioBusRouting.fromJson(routing);
+            onAudioBusRoutingChanged();
+            m_audioBusPanel->setRouting(&m_audioBusRouting);
+        });
+    connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
+            m_timeline, &Timeline::absorbIntoCurrentUndoPoint);
 
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");
@@ -9846,15 +9857,17 @@ void MainWindow::handleMediaRelinkHistoryChanged()
             m_projectOverlays, m_particleClipConfigs,
             mixer ? audiofxui::undoState(mixer) : QJsonObject{}
         };
-    } else if (index < m_mediaRelinkSidecarHistory.size()) {
+    } else if (index != m_mediaRelinkObservedUndoIndex
+               && index < m_mediaRelinkSidecarHistory.size()) {
+        // Undo / redo / history jump. An absorbed edit (same serial and index,
+        // redo dropped) moves nothing and must not reload these sidecars.
         const MediaRelinkSidecarState &state =
             m_mediaRelinkSidecarHistory.at(index);
         m_projectOverlays = state.overlays;
         m_particleClipConfigs = state.particleClipConfigs;
-        // Undo / redo / history jump: the Timeline carrier reaches the mixer only
-        // across track-structure changes, so the dock-edited FX follow here.
-        if (index != m_mediaRelinkObservedUndoIndex)
-            restoreAudioFxUndoState(QJsonObject(state.audioFx));
+        // The Timeline carrier reaches the mixer only across track-structure
+        // changes, so the dock-edited FX follow here.
+        restoreAudioFxUndoState(QJsonObject(state.audioFx));
     }
 
     m_mediaRelinkObservedSaveSerial = saveSerial;
@@ -14869,11 +14882,16 @@ void MainWindow::configureTrackMatte()
 
     const TrackMatteType matteType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
     const QString matteSourceId = sourceCombo->currentData().toString();
-    // Matte edits do not save an undo state; the external "mattes" capture keeps them.
+    // Matte edits record no undo point of their own: each one is folded into
+    // the current undo point (which also drops the redo stack). A dialog that
+    // leaves the matte unchanged absorbs nothing, so redo survives it.
     auto mattes = m_timeline->trackMatteEntries();
     if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
-        mattes.remove(targetClipId);
-        m_timeline->setTrackMatteEntries(mattes);
+        const bool removed = mattes.remove(targetClipId);
+        if (removed) {
+            m_timeline->setTrackMatteEntries(mattes);
+            m_timeline->absorbIntoCurrentUndoPoint();
+        }
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
         return;
@@ -14884,11 +14902,18 @@ void MainWindow::configureTrackMatte()
         return;
     }
 
-    TimelineTrackMatteEntry entry;
-    entry.matteType = matteType;
-    entry.matteSourceClipId = matteSourceId;
-    mattes.insert(targetClipId, entry);
-    m_timeline->setTrackMatteEntries(mattes);
+    const auto current = mattes.constFind(targetClipId);
+    const bool unchanged = current != mattes.constEnd()
+        && current->matteType == matteType
+        && current->matteSourceClipId == matteSourceId;
+    if (!unchanged) {
+        TimelineTrackMatteEntry entry;
+        entry.matteType = matteType;
+        entry.matteSourceClipId = matteSourceId;
+        mattes.insert(targetClipId, entry);
+        m_timeline->setTrackMatteEntries(mattes);
+        m_timeline->absorbIntoCurrentUndoPoint();
+    }
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")

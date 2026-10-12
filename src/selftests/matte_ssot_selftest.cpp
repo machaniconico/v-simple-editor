@@ -1,10 +1,12 @@
-// --selftest=matte-ssot: Timeline matte carrier synchronization, remap and undo.
+// --selftest=matte-ssot: Timeline matte carrier synchronization, remap and undo,
+// plus the absorption of undo-less edits and the bus routing undo carrier.
 #include "SelftestGate.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../TrackMatteKey.h"
 #include "../libavcore/Encode.h"
 #include "../MainWindow.h"
+#include "../AudioBusPanel.h"
 
 #include <QAction>
 #include <QApplication>
@@ -451,9 +453,9 @@ int runMatteSsotSelftest()
         tally.gate(5, ok, detail);
     }
 
-    // G6 catches a structural undo that restores the TimelineState matte
-    // snapshot (empty here: the matte edit saved no undo) instead of the
-    // external "mattes" capture. Same flow as track-ops G11.
+    // G6 catches a structural undo that loses the matte edit, which saved no
+    // undo point (the baseline is absorbed; the external "mattes" capture also
+    // carries it). Same flow as track-ops G11.
     {
         bool configured = false, captured = false, removed = false;
         bool undone = false, redone = false;
@@ -493,6 +495,245 @@ int runMatteSsotSelftest()
                    + " undo=" + std::to_string(undone)
                    + " redo=" + std::to_string(redone)
                    + " messages=" + text(messages.join(QLatin1Char('|'))));
+    }
+
+    // G7-G9 share one flow: an empty-matte baseline, then the dialog on V2:1.
+    const auto serialNow = [&] { return wtl->undoManager()->saveSerial(); };
+    const auto hasMatte00 = [&] {
+        return containsOne(wtl->trackMatteEntries(), trackMatteClipKey(1, 1),
+                           trackMatteClipKey(0, 0), TrackMatteType::LumaMatte);
+    };
+    const auto emptyBaseline = [&] {
+        seedWindow(*wtl, path);
+        wtl->setTrackMatteEntries({});
+        wtl->undoManager()->clear();
+        wtl->undoManager()->saveState(wtl->currentState(), QStringLiteral("基準"));
+        wtl->restoreState(wtl->currentState());
+    };
+    // V2:2 is the last clip, so a nudge to the right only grows its lead-in.
+    const auto lastLeadIn = [&] {
+        const auto clips = wtl->videoTracks()[1]->clips();
+        return clips.size() == 3 ? clips[2].leadInSec : -1.0;
+    };
+    int historySignals = 0;
+    QMetaObject::Connection historyCounter;
+    if (wtl)
+        historyCounter = QObject::connect(wtl->undoManager(), &UndoManager::historyChanged,
+                                          wtl, [&historySignals] { ++historySignals; });
+
+    // G7 catches a matte edit lost by undoing the next ordinary edit: the
+    // dialog saves no undo point, so the pre-matte snapshot came back (HEAD
+    // FAIL). The edit is absorbed into the current undo point instead.
+    {
+        bool configured = false, undone = false;
+        quint64 serialBefore = 0, serialConfigured = 0, serialNudged = 0;
+        int absorbHistory = -1;
+        double startBefore = -1.0, startNudged = -1.0, startUndone = -1.0;
+        QStringList messages;
+        if (mediaReady && wtl) {
+            emptyBaseline();
+            selectClip(*wtl, 1, 1);
+            serialBefore = serialNow();
+            const int history = historySignals;
+            configured = configureMatte(window, TrackMatteType::LumaMatte,
+                                        trackMatteClipKey(0, 0), &messages) && hasMatte00();
+            absorbHistory = historySignals - history;
+            serialConfigured = serialNow();
+            startBefore = lastLeadIn();
+            selectClip(*wtl, 1, 2);
+            wtl->nudgeSelectedClips(5);
+            serialNudged = serialNow();
+            startNudged = lastLeadIn();
+            wtl->undo();
+            startUndone = lastLeadIn();
+            undone = hasMatte00();
+        }
+        tally.gate(7, mediaReady && wtl && configured && serialConfigured == serialBefore
+                   && absorbHistory == 0 && serialNudged == serialBefore + 1
+                   && startNudged > startBefore && startUndone == startBefore && undone
+                   && messages.isEmpty(),
+                   "configured=" + std::to_string(configured)
+                   + " saveSerial=" + std::to_string(serialBefore) + "->"
+                   + std::to_string(serialConfigured) + "->" + std::to_string(serialNudged)
+                   + " absorbHistorySignals=" + std::to_string(absorbHistory)
+                   + " V2:2 leadIn=" + std::to_string(startBefore) + "->"
+                   + std::to_string(startNudged) + "->" + std::to_string(startUndone)
+                   + " undoKeepsMatte=" + std::to_string(undone)
+                   + " got=" + (wtl ? show(wtl->trackMatteEntries()) : std::string("-"))
+                   + " messages=" + text(messages.join(QLatin1Char('|'))));
+    }
+
+    // G8 (a) is the G6 flow with the absorbed matte and addVideoTrack: the
+    // structural undo must keep it (detects an absorb that breaks structural
+    // undo). (b) catches importMedia creating a track without the external
+    // capture: undoing the import restored the stale baseline matte (HEAD FAIL).
+    {
+        bool configured = false, added = false, undoneA = false;
+        bool imported = false, undoneB = false;
+        int tracksA = -1, tracksB = -1, tracksUndoneB = -1;
+        quint64 serialA = 0, serialAddA = 0;
+        QString importError;
+        Entries gotB;
+        QStringList messages;
+        if (mediaReady && wtl) {
+            emptyBaseline();
+            selectClip(*wtl, 1, 1);
+            const quint64 serial = serialNow();
+            configured = configureMatte(window, TrackMatteType::LumaMatte,
+                                        trackMatteClipKey(0, 0), &messages) && hasMatte00();
+            serialA = serialNow() - serial;
+            wtl->addVideoTrack();
+            tracksA = wtl->videoTrackCount();
+            serialAddA = serialNow() - serial;
+            added = tracksA == 3 && hasMatte00();
+            wtl->undo();
+            undoneA = wtl->videoTrackCount() == 2 && hasMatte00();
+
+            seedWindow(*wtl, path);   // baseline matte V2:1 <- V1:1
+            wtl->setTrackMatteEntries(matteAt(trackMatteClipKey(1, 1), trackMatteClipKey(0, 0)));
+            imported = wtl->importMedia(path, 2, 0.0, nullptr, &importError,
+                                        Timeline::ImportMediaKind::VideoOnly);
+            tracksB = wtl->videoTrackCount();
+            wtl->undo();
+            tracksUndoneB = wtl->videoTrackCount();
+            gotB = wtl->trackMatteEntries();
+            undoneB = tracksUndoneB == 2
+                && containsOne(gotB, trackMatteClipKey(1, 1), trackMatteClipKey(0, 0));
+        }
+        tally.gate(8, mediaReady && wtl && configured && serialA == 0 && serialAddA == 1
+                   && added && undoneA && imported && tracksB == 3 && undoneB
+                   && messages.isEmpty(),
+                   "a: configured=" + std::to_string(configured)
+                   + " saves=" + std::to_string(serialA) + "/" + std::to_string(serialAddA)
+                   + " tracks=" + std::to_string(tracksA)
+                   + " undoKeepsMatte=" + std::to_string(undoneA)
+                   + " b: imported=" + std::to_string(imported)
+                   + " tracks=" + std::to_string(tracksB) + "->" + std::to_string(tracksUndoneB)
+                   + " undoKeepsLiveMatte=" + std::to_string(undoneB) + " got=" + show(gotB)
+                   + " importError=" + text(importError)
+                   + " messages=" + text(messages.join(QLatin1Char('|'))));
+    }
+
+    // G9 catches a matte edit after an undo that leaves the redo entry alive:
+    // redo then restored the pre-matte snapshot (HEAD FAIL). The absorption
+    // drops the redo stack, signals historyChanged once and keeps saveSerial.
+    // Two no-op controls keep redo: (i) clearing V2:1, which has no matte, and
+    // (ii) re-applying the identical matte after nudge -> undo. An absorb that
+    // runs without a change drops redo and signals historyChanged.
+    {
+        bool configured = false, redoBefore = false, redoAfter = true, kept = false;
+        bool clearedNoop = false, clearRedo = false;
+        bool sameBefore = false, sameNoop = false, sameRedo = false;
+        quint64 serialUndone = 0, serialConfigured = 0;
+        int absorbHistory = -1, clearHistory = -1, sameHistory = -1;
+        QStringList messages;
+        if (mediaReady && wtl) {
+            emptyBaseline();
+            selectClip(*wtl, 1, 2);
+            wtl->nudgeSelectedClips(5);
+            wtl->undo();
+            redoBefore = wtl->canRedo();
+            serialUndone = serialNow();
+            selectClip(*wtl, 1, 1);
+            int history = historySignals;
+            clearedNoop = configureMatte(window, TrackMatteType::None, QString(), &messages)
+                && wtl->trackMatteEntries().isEmpty();
+            clearHistory = historySignals - history;
+            clearRedo = wtl->canRedo();
+            history = historySignals;
+            configured = configureMatte(window, TrackMatteType::LumaMatte,
+                                        trackMatteClipKey(0, 0), &messages) && hasMatte00();
+            absorbHistory = historySignals - history;
+            serialConfigured = serialNow();
+            redoAfter = wtl->canRedo();
+            wtl->redo();
+            kept = hasMatte00();
+
+            selectClip(*wtl, 1, 2);
+            wtl->nudgeSelectedClips(5);
+            wtl->undo();
+            sameBefore = wtl->canRedo() && hasMatte00();
+            selectClip(*wtl, 1, 1);
+            history = historySignals;
+            sameNoop = configureMatte(window, TrackMatteType::LumaMatte,
+                                      trackMatteClipKey(0, 0), &messages) && hasMatte00();
+            sameHistory = historySignals - history;
+            sameRedo = wtl->canRedo();
+        }
+        tally.gate(9, mediaReady && wtl && redoBefore && configured && !redoAfter && kept
+                   && absorbHistory == 1 && serialConfigured == serialUndone
+                   && clearedNoop && clearRedo && clearHistory == 0
+                   && sameBefore && sameNoop && sameRedo && sameHistory == 0
+                   && messages.isEmpty(),
+                   "canRedo=" + std::to_string(redoBefore) + "->" + std::to_string(redoAfter)
+                   + " configured=" + std::to_string(configured)
+                   + " absorbHistorySignals=" + std::to_string(absorbHistory)
+                   + " saveSerial=" + std::to_string(serialUndone) + "->"
+                   + std::to_string(serialConfigured)
+                   + " matteAfterRedo=" + std::to_string(kept)
+                   + " noopClear: configured=" + std::to_string(clearedNoop)
+                   + " canRedo=" + std::to_string(clearRedo)
+                   + " historySignals=" + std::to_string(clearHistory)
+                   + " noopSame: redoAndMatteBefore=" + std::to_string(sameBefore)
+                   + " configured=" + std::to_string(sameNoop)
+                   + " canRedo=" + std::to_string(sameRedo)
+                   + " historySignals=" + std::to_string(sameHistory)
+                   + " messages=" + text(messages.join(QLatin1Char('|'))));
+    }
+    QObject::disconnect(historyCounter);
+
+    // G10 catches bus routing missing from TimelineState: undo / redo left the
+    // routing untouched (HEAD has no carrier). Track 0 goes to bus 1, then bus 2,
+    // one undo point each. A bus panel edit is then absorbed into the bus-2
+    // point (redo brings it back) without a new undo point.
+    {
+        auto &routing = window.m_audioBusRouting;
+        int busUndo = -2, busRedo = -2, busPanelUndo = -2, busPanelRedo = -2;
+        bool assigned = false, muteUndo = true, muteRedo = false;
+        quint64 serialPanel = 0, serialPanelAfter = 1;
+        const auto bus2Muted = [&] {
+            const auto *bus = routing.bus(2);
+            return bus && bus->mute;
+        };
+        if (wtl && window.m_audioBusPanel) {
+            routing.fromJson(QJsonObject{});
+            routing.addBus(QStringLiteral("バス 0"));
+            routing.addBus(QStringLiteral("バス 1"));
+            routing.addBus(QStringLiteral("バス 2"));
+            window.onAudioBusRoutingChanged();
+            wtl->undoManager()->clear();
+            wtl->undoManager()->saveState(wtl->currentState(), QStringLiteral("基準"));
+            assigned = routing.assignTrackToBus(0, 1);
+            wtl->saveUndoState(QStringLiteral("トラックのバスを変更"));
+            assigned = routing.assignTrackToBus(0, 2) && assigned;
+            wtl->saveUndoState(QStringLiteral("トラックのバスを変更"));
+            wtl->undo();
+            busUndo = routing.trackBus(0);
+            wtl->redo();
+            busRedo = routing.trackBus(0);
+            routing.setBusMute(2, true);
+            serialPanel = serialNow();
+            emit window.m_audioBusPanel->routingChanged();
+            serialPanelAfter = serialNow();
+            wtl->undo();
+            busPanelUndo = routing.trackBus(0);
+            muteUndo = bus2Muted();
+            wtl->redo();
+            busPanelRedo = routing.trackBus(0);
+            muteRedo = bus2Muted();
+        }
+        tally.gate(10, wtl && assigned && busUndo == 1 && busRedo == 2
+                   && serialPanelAfter == serialPanel && busPanelUndo == 1 && !muteUndo
+                   && busPanelRedo == 2 && muteRedo,
+                   "assigned=" + std::to_string(assigned)
+                   + " trackBus(0) undo=" + std::to_string(busUndo)
+                   + " redo=" + std::to_string(busRedo)
+                   + " panel saveSerial=" + std::to_string(serialPanel) + "->"
+                   + std::to_string(serialPanelAfter)
+                   + " panel undo bus=" + std::to_string(busPanelUndo)
+                   + " mute=" + std::to_string(muteUndo)
+                   + " redo bus=" + std::to_string(busPanelRedo)
+                   + " mute=" + std::to_string(muteRedo));
     }
     return tally.finish("matte-ssot");
 }
