@@ -3617,9 +3617,7 @@ void MainWindow::applyStillCompareConfig()
         return;
     const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
     if (!special.isNull()) {
-        m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(
-                special, m_player->timelinePositionUs(), true));
+        m_player->displaySpecialComposite(special);
     }
 }
 
@@ -4409,14 +4407,22 @@ void MainWindow::setupUI()
         // paused seeks and stop's rewind-to-zero display. Calling
         // refreshSpecialClipPreview() here can fall back to previewSeek(),
         // re-arming VideoPlayer's deferred seek timer while playback is
-        // stopped and creating a self-sustaining repaint loop.
-        const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
-        if (!composed.isNull())
-            m_player->glPreview()->displayFrame(
-                m_player->applyStillCompareForDisplay(
-                    composed, m_player->timelinePositionUs(), true));
+        // stopped and creating a self-sustaining repaint loop. The special
+        // composite of that frame comes from the provider below instead.
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
+    });
+    // US-1106: the paused displayFrame pulls the special composite (roto /
+    // matte / time-remap ...) and presents it in place of the ordinary frame.
+    m_player->setSpecialCompositeProvider([this](qint64 tUs) -> QImage {
+        if (!m_timeline || !m_player || !m_player->glPreview())
+            return {};
+        // Player-driven seeks update the Timeline playhead only afterwards, so
+        // build at the displayed frame's time, not the (stale) playhead.
+        const double sec = m_player->hasActiveSequence()
+            ? static_cast<double>(tUs) / AV_TIME_BASE
+            : m_timeline->playheadPosition();
+        return buildSpecialClipComposite(sec);
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -9242,9 +9248,7 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
-        m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(
-                composed, m_player->timelinePositionUs(), true));
+        m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;

@@ -1,4 +1,5 @@
 #include "VideoPlayer.h"
+#include <QScopedValueRollback>
 #include <QSet>
 #include "GLPreview.h"
 #include "TimelineFrameRenderer.h"
@@ -2602,7 +2603,10 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
         // though it now needs the entry's scale applied. The next
         // playback tick re-sets the flag based on willComposite, so this
         // is always safe.
-        setCompositeBakedModeForDisplay(nestedSequenceRendered);
+        // Keep the latch when a special composite was the last upload (the
+        // paused displayFrame above already presented it).
+        if (!m_lastDisplayWasSpecial)
+            setCompositeBakedModeForDisplay(nestedSequenceRendered);
     }
     m_suppressUiUpdates = prevSuppress;
 
@@ -3692,6 +3696,78 @@ QImage VideoPlayer::displayFrameForTest(
     return player.m_currentFrameImage;
 }
 
+// Display-local finalization shared by displayFrame and displaySpecialComposite:
+// exposure aid, onion skin, safe zone and preview cap on a copy only.
+QImage VideoPlayer::finalizeDisplayLocalCopy(QImage display) const
+{
+    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
+        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
+    }
+    auto applyPreviewCap = [this](const QImage &src) {
+        if (m_previewMaxLongSide > 0 && !src.isNull()
+            && qMax(src.width(), src.height()) > m_previewMaxLongSide) {
+            return (src.width() >= src.height())
+                ? src.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
+                : src.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
+        }
+        return src;
+    };
+
+    if (m_onionSkin.enabled && !display.isNull()) {
+        // SAFE-ZONE: onion skin 有効時はユーザー指定どおり full-res の表示用コピーへ
+        // セーフゾーンを先に焼き、ghost 合成後に PV-C 縮小する。書き出しは非通過。
+        if (m_safeZonePlatform != safezone::Platform::None)
+            display = safezone::apply(display, m_safeZonePlatform);
+
+        // ONION-SKIN: renderFrameAt は独立した libav decoder を開く SSOT 経路。
+        // 再生中は重い前後フレーム decode を避け、通常のプレビュー描画だけ継続する。
+        if (!m_playing) {
+            QVector<QImage> before;
+            QVector<QImage> after;
+            const Timeline *tl = previewTimeline();
+            const qint64 durationUs = (m_sequenceDurationUs > 0)
+                ? m_sequenceDurationUs
+                : (tl ? static_cast<qint64>(tl->totalDuration() * AV_TIME_BASE) : 0);
+            const qint64 frameUs = (m_frameDurationUs > 0)
+                ? m_frameDurationUs
+                : (AV_TIME_BASE / 30);
+            const qint64 posUs = sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
+
+            auto collectGhosts = [&](int count, int direction, QVector<QImage> *out) {
+                if (!tl || !out || count <= 0 || durationUs <= 0 || frameUs <= 0)
+                    return;
+                for (int k = 1; k <= count; ++k) {
+                    const qint64 targetUs = posUs + static_cast<qint64>(direction) * frameUs * k;
+                    if (targetUs < 0 || targetUs > durationUs)
+                        continue;
+                    const QImage ghost = tlrender::renderFrameAt(tl, targetUs, display.size());
+                    if (!ghost.isNull())
+                        out->append(ghost);
+                }
+            };
+            collectGhosts(qMax(0, m_onionSkin.framesBefore), -1, &before);
+            collectGhosts(qMax(0, m_onionSkin.framesAfter), 1, &after);
+            if (!before.isEmpty() || !after.isEmpty())
+                display = onionskin::compose(display, before, after, m_onionSkin);
+        }
+
+        // PV-C: プレビュー最大解像度キャップ。onion skin 合成後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        display = applyPreviewCap(display);
+    } else {
+        // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
+        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
+        // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
+        // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
+        display = applyPreviewCap(display);
+        // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
+        if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
+            display = safezone::apply(display, m_safeZonePlatform);
+        }
+    }
+    return display;
+}
+
 void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
                                qint64 displayTimelineUsec)
 {
@@ -3773,6 +3849,22 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     m_currentFrameImage = composed;
     emit frameComposited(composed);
 
+    // US-1106: a paused frame shows the special composite (roto / matte /
+    // time-remap ...) when the provider has one for this time. The ordinary
+    // frame stays the frameComposited payload and m_currentFrameImage; only
+    // the presented image is replaced.
+    QImage special;
+    if (!m_playing && m_specialCompositeProvider && !m_inSpecialCompositeProvider
+        && m_useGL && m_glPreview) {
+        QScopedValueRollback<bool> guard(m_inSpecialCompositeProvider, true);
+        special = m_specialCompositeProvider(timelineUsec);
+    }
+    presentDisplay(composed, timelineUsec, special);
+}
+
+void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
+                                 const QImage &special)
+{
     // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
     // これは画面確認専用のオーバーレイなので「表示用の一時コピー」にだけ適用し、
     // m_currentFrameImage / frameComposited のペイロード / 合成キャッシュ
@@ -3790,72 +3882,12 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     // clip grade later in GLPreview.  Resolve only the display-local copy from
     // renderFrameAt; m_currentFrameImage, frameComposited, and preview caches
     // remain on the normal path, so comparison cannot affect export/cache.
-    QImage display = stillCompareDisplaySource(composed, timelineUsec);
-    if (m_exposureAidMode != exposureaid::AidMode::None && !display.isNull()) {
-        display = exposureaid::apply(display, m_exposureAidMode, m_exposureAidConfig);
-    }
-    auto applyPreviewCap = [this](const QImage &src) {
-        if (m_previewMaxLongSide > 0 && !src.isNull()
-            && qMax(src.width(), src.height()) > m_previewMaxLongSide) {
-            return (src.width() >= src.height())
-                ? src.scaledToWidth(m_previewMaxLongSide, Qt::SmoothTransformation)
-                : src.scaledToHeight(m_previewMaxLongSide, Qt::SmoothTransformation);
-        }
-        return src;
-    };
-
-    if (m_onionSkin.enabled && !display.isNull()) {
-        // SAFE-ZONE: onion skin 有効時はユーザー指定どおり full-res の表示用コピーへ
-        // セーフゾーンを先に焼き、ghost 合成後に PV-C 縮小する。書き出しは非通過。
-        if (m_safeZonePlatform != safezone::Platform::None)
-            display = safezone::apply(display, m_safeZonePlatform);
-
-        // ONION-SKIN: renderFrameAt は独立した libav decoder を開く SSOT 経路。
-        // 再生中は重い前後フレーム decode を避け、通常のプレビュー描画だけ継続する。
-        if (!m_playing) {
-            QVector<QImage> before;
-            QVector<QImage> after;
-            const Timeline *tl = previewTimeline();
-            const qint64 durationUs = (m_sequenceDurationUs > 0)
-                ? m_sequenceDurationUs
-                : (tl ? static_cast<qint64>(tl->totalDuration() * AV_TIME_BASE) : 0);
-            const qint64 frameUs = (m_frameDurationUs > 0)
-                ? m_frameDurationUs
-                : (AV_TIME_BASE / 30);
-            const qint64 posUs = sequenceActive() ? m_timelinePositionUs : m_currentPositionUs;
-
-            auto collectGhosts = [&](int count, int direction, QVector<QImage> *out) {
-                if (!tl || !out || count <= 0 || durationUs <= 0 || frameUs <= 0)
-                    return;
-                for (int k = 1; k <= count; ++k) {
-                    const qint64 targetUs = posUs + static_cast<qint64>(direction) * frameUs * k;
-                    if (targetUs < 0 || targetUs > durationUs)
-                        continue;
-                    const QImage ghost = tlrender::renderFrameAt(tl, targetUs, display.size());
-                    if (!ghost.isNull())
-                        out->append(ghost);
-                }
-            };
-            collectGhosts(qMax(0, m_onionSkin.framesBefore), -1, &before);
-            collectGhosts(qMax(0, m_onionSkin.framesAfter), 1, &after);
-            if (!before.isEmpty() || !after.isEmpty())
-                display = onionskin::compose(display, before, after, m_onionSkin);
-        }
-
-        // PV-C: プレビュー最大解像度キャップ。onion skin 合成後の display 専用コピーにだけ
-        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
-        display = applyPreviewCap(display);
-    } else {
-        // PV-C: プレビュー最大解像度キャップ。エイド適用後の display 専用コピーにだけ
-        // 縮小を掛け、GL アップロード/描画/スコープ前段の負荷を軽くする。
-        // m_currentFrameImage / frameComposited (上で full res 送出済) と書き出し
-        // (renderFrameAt 系=この経路を通らない) は不変。0=無制限で従来ビット同一。
-        display = applyPreviewCap(display);
-        // SAFE-ZONE: SNS セーフゾーンオーバーレイ。display-local 適用のみ。export 非通過。
-        if (m_safeZonePlatform != safezone::Platform::None && !display.isNull()) {
-            display = safezone::apply(display, m_safeZonePlatform);
-        }
-    }
+    // US-1106: a special composite is not a timeline frame; it stays the live
+    // side of the comparison instead of being replaced by renderFrameAt.
+    QImage display = special.isNull()
+        ? stillCompareDisplaySource(composed, timelineUsec)
+        : finishSpecialComposite(special, timelineUsec);
+    display = finalizeDisplayLocalCopy(display);
 
     // STILLS-WIPE: 保存スチルとの比較は display 専用コピーに 1 回だけ適用する。
     // m_currentFrameImage / frameComposited / 合成キャッシュは上で確定済みであり、
@@ -3898,12 +3930,29 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
         // A clip-local CPU stack already includes each clip's grade/LUT and
         // ordered FX. Running the GL branch on that frame would reorder or
         // duplicate the stack and no longer match export.
+        // US-1106: a special composite already holds every clip grade/FX, so
+        // it is shown in baked mode. The next ordinary frame ends that state
+        // (unless a playback path has since set the baked mode itself, which
+        // clears the latch in setCompositeBakedModeForDisplay).
+        const bool isSpecial = !special.isNull();
+        if (isSpecial) {
+            setCompositeBakedModeForDisplay(true);
+            m_lastDisplayWasSpecial = true;
+        } else {
+            endSpecialDisplayLatch();
+        }
         const bool glEffectsAlreadyBaked =
             updateGlEffectsForBakedDisplay(timelineUsec);
         if (!glEffectsAlreadyBaked)
             pushActiveClipColorCorrectionToGlPreview();
         if (stillCompareActive())
             applyStillCompareGlBypass();
+        // ACES / exposure aids return straight RGBA8888 / ARGB32; GLPreview's
+        // output stage reads premultiplied, so keep special alpha frames
+        // premultiplied. Ordinary frames are uploaded unchanged.
+        if (isSpecial && display.hasAlphaChannel()
+            && display.format() != QImage::Format_ARGB32_Premultiplied)
+            display = display.convertToFormat(QImage::Format_ARGB32_Premultiplied);
         undotrace::log("displayFrame:beforeGL");
         m_glPreview->displayFrame(display);
         undotrace::log("displayFrame:afterGL");
@@ -4178,7 +4227,16 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
         return runProxy(source);
     }
 
-    const double nowSec = static_cast<double>(previewTimelineUsec) / AV_TIME_BASE;
+    const QImage composed = bakeTextOverlaysForDisplay(source, previewTimelineUsec);
+    if (applyPreviewFx)
+        return runProxy(composed);
+    return composed;
+}
+
+QImage VideoPlayer::bakeTextOverlaysForDisplay(const QImage &source,
+                                               qint64 timelineUsec) const
+{
+    const double nowSec = static_cast<double>(timelineUsec) / AV_TIME_BASE;
 
     // US-T32 WYSIWYG: the inline text tool draws at the literal pointSize
     // in widget coordinates. When compose bakes overlays into the source
@@ -4203,11 +4261,22 @@ QImage VideoPlayer::composeFrameWithOverlays(const QImage &source,
     // SAME function directly (no VideoPlayer / no QWidget off the GUI
     // thread), so an exported frame's text pixel-matches this preview bake
     // by construction.
-    const QImage composed = textbake::bakeOverlays(
+    return textbake::bakeOverlays(
         source, m_textOverlays, nowSec, m_hiddenTextOverlayIndex, fontScale);
-    if (applyPreviewFx)
-        return runProxy(composed);
-    return composed;
+}
+
+// US-1106: the special composite's share of displayFrame's frame finishing:
+// title bake and ACES. No preview FX and no transitions (the special
+// composite already holds every clip FX).
+QImage VideoPlayer::finishSpecialComposite(const QImage &frame,
+                                           qint64 timelineUsec) const
+{
+    QImage finished = frame;
+    if (!m_textOverlays.isEmpty())
+        finished = bakeTextOverlaysForDisplay(finished, timelineUsec);
+    if (m_acesPipeline.enabled && !m_lastFrameOdtApplied)
+        finished = aces::applyPipelineToImage(finished, m_acesPipeline);
+    return finished;
 }
 
 void VideoPlayer::setHiddenTextOverlayIndex(int index)
@@ -4490,11 +4559,31 @@ QImage VideoPlayer::applyStillCompareForDisplay(const QImage &image,
     QImage display = externalPreview
         ? image
         : stillCompareDisplaySource(image, timelineUsec);
+    // US-1106: the direct MainWindow redisplays skip presentDisplay, so they
+    // end a special-composite latch here and restore the GL grade/effects.
+    if (externalPreview && m_lastDisplayWasSpecial) {
+        endSpecialDisplayLatch();
+        const bool baked = updateGlEffectsForBakedDisplay(timelineUsec);
+        if (!baked)
+            pushActiveClipColorCorrectionToGlPreview();
+    }
     if (externalPreview && stillCompareActive())
         setCompositeBakedModeForDisplay(true);
     if (stillCompareActive())
         applyStillCompareGlBypass();
     return compositeStillCompare(display);
+}
+
+void VideoPlayer::setSpecialCompositeProvider(SpecialCompositeProvider provider)
+{
+    m_specialCompositeProvider = std::move(provider);
+}
+
+void VideoPlayer::displaySpecialComposite(const QImage &frame)
+{
+    if (frame.isNull())
+        return;
+    presentDisplay(QImage(), m_timelinePositionUs, frame);
 }
 
 const Timeline *VideoPlayer::previewTimeline() const
@@ -4516,8 +4605,17 @@ bool VideoPlayer::stillCompareActive() const
     return m_stillCompare.enabled && !m_stillCompare.still.isNull();
 }
 
+void VideoPlayer::endSpecialDisplayLatch()
+{
+    if (m_lastDisplayWasSpecial) {
+        m_lastDisplayWasSpecial = false;
+        setCompositeBakedModeForDisplay(false);
+    }
+}
+
 void VideoPlayer::setCompositeBakedModeForDisplay(bool baked)
 {
+    m_lastDisplayWasSpecial = false;
     m_stillCompareNormalCompositeBakedMode = baked;
     if (!m_glPreview)
         return;
@@ -4708,7 +4806,8 @@ bool VideoPlayer::updateGlEffectsForBakedDisplay(qint64 timelineUsec)
     // GLPreview must not apply the current clip's grade/effects to the whole
     // image (especially the saved-still side). The shared latch also restores
     // the prior GPU preview stack as soon as neither baked condition remains.
-    const bool glEffectsAlreadyBaked = clipCpuFxBaked || stillCompareActive();
+    const bool glEffectsAlreadyBaked =
+        clipCpuFxBaked || stillCompareActive() || m_lastDisplayWasSpecial;
     if (!m_glPreview)
         return glEffectsAlreadyBaked;
     if (glEffectsAlreadyBaked && !m_clipCpuDisabledGlGrade) {
