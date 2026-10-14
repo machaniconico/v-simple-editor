@@ -10456,7 +10456,7 @@ RenderQueue *MainWindow::ensureRenderQueue()
     m_renderQueue = new RenderQueue(this);
     // 書き出し完了の通知 (既定 OFF)。jobsChanged で終端ジョブを控え、allCompleted で集計する
     // (終端後の jobs() 読み取りは空振りになるため)。バッチの専用キュー・RenderInPlace のローカル
-    // キュー・RenderQueueDialog の手動追加 (ダイアログは専用キューを持つ) はここを通らないので対象外。
+    // キューは対象外。RenderQueueDialog は US-1125 以降この共有キューを使うので、手動追加ジョブも集計に入る。
     connect(m_renderQueue, &RenderQueue::jobsChanged, this, [this]() {
         m_renderNotifyTerminal.clear();
         for (const RenderJob &job : m_renderQueue->jobs()) {
@@ -20102,6 +20102,11 @@ void MainWindow::openRenderQueueDialog()
 {
     if (!m_renderQueueDialog) {
         m_renderQueueDialog = new RenderQueueDialog(this);
+        // US-1125: share the GUI / MCP queue (and its export notification); the dialog's
+        // jobs state the project's ACES pipeline and loudness gain themselves.
+        m_renderQueueDialog->setQueue(ensureRenderQueue());
+        m_renderQueueDialog->setAcesProvider([this]() { return m_acesPipeline; });
+        m_renderQueueDialog->setLoudnessGainProvider([]() { return exporter_loudnessGainDb(); });
         if (m_timeline) {
             const qint64 totalUs =
                 static_cast<qint64>(m_timeline->totalDuration() * 1000000.0);
@@ -20111,8 +20116,6 @@ void MainWindow::openRenderQueueDialog()
         // carry the live edit-graph instead of resolving to nullptr.
         m_renderQueueDialog->setLiveTimeline(m_timeline);
     }
-    if (m_renderQueueDialog->queue())
-        m_renderQueueDialog->queue()->setLoudnessGainDb(exporter_loudnessGainDb());
     // RM-1.4/RM-1.3: a "current project" queue job exports the live
     // Timeline's matte carrier, the same one the GUI preview shows.
     syncProjectLightingToTimeline();
