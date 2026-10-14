@@ -48,6 +48,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QUuid>
 #include <QMessageBox>
 #include <QMutexLocker>
 #include <QInputDialog>
@@ -1850,11 +1851,23 @@ void TimelineTrack::setRowHeight(int h)
     update();
 }
 
-void TimelineTrack::addClip(const ClipInfo &clip) { m_clips.append(clip); updateMinimumWidth(); update(); emit modified(); }
+void TimelineTrack::ensureUid(ClipInfo &clip)
+{
+    if (clip.uid.isEmpty()) clip.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+void TimelineTrack::addClip(const ClipInfo &clip)
+{
+    ClipInfo added = clip;
+    ensureUid(added);
+    m_clips.append(added); updateMinimumWidth(); update(); emit modified();
+}
 void TimelineTrack::insertClip(int index, const ClipInfo &clip)
 {
     if (index < 0 || index > m_clips.size()) index = m_clips.size();
-    m_clips.insert(index, clip); updateMinimumWidth(); update(); emit modified();
+    ClipInfo inserted = clip;
+    ensureUid(inserted);
+    m_clips.insert(index, inserted); updateMinimumWidth(); update(); emit modified();
 }
 
 void TimelineTrack::removeClip(int index)
@@ -1903,6 +1916,9 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // is no longer the original's trailOut. Reset those so neither transition
     // is duplicated onto both halves.
     secondHalf.leadIn = Transition{};
+    // The right half is a new clip; the left half keeps the original's uid.
+    secondHalf.uid.clear();
+    ensureUid(secondHalf);
     original.outPoint = splitPoint;
     original.trailOut = Transition{};
     m_clips.insert(index + 1, secondHalf);
@@ -1990,6 +2006,7 @@ void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &cl
     if (index < 0) index = 0;
     if (index > m_clips.size()) index = m_clips.size();
     ClipInfo newClip = clip;
+    ensureUid(newClip);
     newClip.leadInSec = qMax(0.0, leadInSec);
     const double consumed = newClip.leadInSec + newClip.effectiveDuration();
     m_clips.insert(index, newClip);
@@ -2157,7 +2174,22 @@ TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDura
     return plan;
 }
 
-void TimelineTrack::setClips(const QVector<ClipInfo> &clips) { m_clips = clips; updateMinimumWidth(); update(); }
+void TimelineTrack::setClips(const QVector<ClipInfo> &clips)
+{
+    m_clips = clips;
+    // Every clip leaving setClips has a uid; a uid repeated within the track
+    // keeps it on the earlier clip and gives the later one a fresh uid.
+    QSet<QString> seen;
+    for (ClipInfo &clip : m_clips) {
+        if (!clip.uid.isEmpty() && seen.contains(clip.uid)) {
+            clip.uid.clear();
+            ++m_duplicateUidRepairCount;
+        }
+        ensureUid(clip);
+        seen.insert(clip.uid);
+    }
+    updateMinimumWidth(); update();
+}
 void TimelineTrack::setSelectedClip(int index) {
     QList<int> newSel;
     if (index >= 0) newSel.append(index);
@@ -8442,6 +8474,9 @@ void Timeline::copySelectedClip()
 ClipInfo Timeline::copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups)
 {
     ClipInfo result = source;
+    // A paste / duplicate is a new clip with its own identity.
+    result.uid.clear();
+    TimelineTrack::ensureUid(result);
     if (source.linkGroup <= 0) return result;
     if (!groups.contains(source.linkGroup)) {
         QSet<int> used;
@@ -8470,7 +8505,8 @@ void Timeline::pasteClip()
     // original together with the copy).
     QHash<int, int> groups;
     const ClipInfo pastedVideo = copyClipForPaste(m_clipboard.value(), groups);
-    const ClipInfo pastedAudio = pastedVideo;
+    // Same linkGroup through `groups`, own uid for the audio partner.
+    const ClipInfo pastedAudio = copyClipForPaste(m_clipboard.value(), groups);
     m_videoTrack->insertClip(insertAt, pastedVideo);
     m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);

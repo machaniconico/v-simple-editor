@@ -376,6 +376,12 @@ struct ClipInfo {
     // under the clip's key. Null when the original had no roto.
     std::shared_ptr<RotoClipEntry> renderInPlaceOriginalRoto;
 
+    // US-1118 stable clip identity. Minted by TimelineTrack::ensureUid when a
+    // clip enters a track (add / insert / setClips), fresh for paste clones and
+    // the right half of a split. Saved as "uid" only when non-empty; never
+    // affects rendering, and ProjectDiff ignores it.
+    QString uid;
+
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
         return (out - inPoint) / speed;
@@ -496,6 +502,9 @@ public:
     QVector<FilmstripTile> filmstripTilesForTest(int clipIndex) const;
     quint64 filmstripBranchCountForTest() const { return m_filmstripBranchCount; }
     quint64 paintCountForTest() const { return m_paintCount; }
+    quint64 duplicateUidRepairCountForTest() const { return m_duplicateUidRepairCount; }
+    // US-1118: mint a fresh uid when the clip has none (an existing uid is kept).
+    static void ensureUid(ClipInfo &clip);
     quint64 filmstripDrawCountForTest() const { return m_filmstripDrawCount; }
     static int filmstripTileCount(int width, int thumbnailWidth);
     static int filmstripImageIndex(double sourceSeconds, double mediaDuration, int count = 8);
@@ -694,6 +703,7 @@ private:
     quint64 m_paintCount = 0;
     quint64 m_filmstripDrawCount = 0;
     quint64 m_filmstripBranchCount = 0;
+    quint64 m_duplicateUidRepairCount = 0;
     QHash<int, QVector<FilmstripTile>> m_filmstripTiles;
     QVector<ClipInfo> m_clips;
     QList<int> m_selectedClips;

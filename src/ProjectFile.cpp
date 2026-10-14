@@ -1987,6 +1987,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["visible"] = false;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.uid.isEmpty())
+        obj["uid"] = clip.uid;
     if (!clip.shapes.isEmpty()) {
         QJsonArray shapes;
         for (const Shape &shape : clip.shapes)
@@ -2124,6 +2126,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.visible = !clipgeom::isNullObjectFilePath(clip.filePath)
         && obj.value("visible").toBool(true);
     clip.displayName = obj["displayName"].toString();
+    // Read as saved; a missing uid is minted by TimelineTrack::setClips on load.
+    clip.uid = obj["uid"].toString();
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())
             clip.shapes.append(Shape::fromJson(value.toObject()));

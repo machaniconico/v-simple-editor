@@ -480,6 +480,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/sns_fit_selftest.cpp
     src/selftests/clip_enable_selftest.cpp
     src/selftests/clip_eq_selftest.cpp
+    src/selftests/clip_uid_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
     src/selftests/parent_gate_selftest.cpp
     src/selftests/video_player_parent_selftest.cpp

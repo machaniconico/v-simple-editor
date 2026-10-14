@@ -89,6 +89,7 @@ int runClipLutSelftest();
 int runClipMaskSelftest();
 int runClipOdtSelftest();
 int runClipParentParitySelftest();
+int runClipUidSelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
 int runColorMatchApplySelftest();
@@ -864,6 +865,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip EQ: audio-clip setter, save/load, undo, playback entries, nested child-first rule and mixer playback (2 gates)" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
+    { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
+      "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo (4 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
