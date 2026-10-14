@@ -1,7 +1,9 @@
+#include "../AudioExportMix.h"
 #include "../ExportDialog.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../MainWindow.h"
+#include "../RenderInPlace.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../libavcore/AudioExtract.h"
@@ -13,12 +15,16 @@
 #include <QImage>
 #include <QJsonArray>
 #include <QStandardPaths>
+#include <QTest>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
+#include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -606,6 +612,129 @@ int runLoudnessAutoSelftest()
             && failedNoFfmpeg == FixtureVerdict::Fail && control == FixtureVerdict::Run
             && noFfmpeg == FixtureVerdict::Skip,
             "a failed fixture generation was classified as SKIP (or the environment rule changed)");
+    }
+
+    // G13: the export mix plan is a value snapshot. Per case (plain single-pass mix / track-FX
+    // path), buildMixPlan runs once on the GUI thread, then the Timeline and the mixer are deleted
+    // and the global channel-mode / reversed bindings cleared, and executeMixPlan runs under
+    // QtConcurrent::run. Its WAV must equal the synchronous wrapper's WAV (renderinplace::
+    // prepareAudioMix) byte for byte. Control: the plan a hidden read of the cleared bindings would
+    // execute (all Stereo, none reversed) must differ, so the comparison cannot pass vacuously.
+    {
+        const QString lrSource = temporary.filePath("g13-lr.wav");
+        std::vector<float> lr(48000 * 4 * 2);
+        for (int i = 0; i < 48000 * 4; ++i) {
+            lr[2 * i] = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 1000.0 * i / 48000.0));
+            lr[2 * i + 1] = static_cast<float>(0.1 * std::sin(2.0 * 3.141592653589793 * 440.0 * i / 48000.0));
+        }
+        QString lrError;
+        const bool lrFixture = temporary.isValid()
+            && libavcore::writeWavFloatInterleaved(lrSource, lr, 48000, 2, &lrError);
+        const FixtureVerdict verdict = fixtureVerdict(fixture && lrFixture, ffmpegFound);
+        if (verdict == FixtureVerdict::Skip) {
+            tally.skip(13, "ffmpeg.exe unavailable");
+        } else if (verdict == FixtureVerdict::Fail) {
+            std::fprintf(stderr, "[loudness-auto] G13 fixtureError=%s lrError=%s\n",
+                qPrintable(fixtureError), qPrintable(lrError));
+            tally.gate(13, false, "audio fixture generation (libavcore) failed");
+        } else {
+            ClipInfo first;
+            first.filePath = lrSource;
+            first.duration = 4.0;
+            first.outPoint = 1.5;
+            first.volume = 0.8;
+            first.audioChannelMode = AudioChannelMode::FillLeft;
+            ClipInfo second;
+            second.filePath = lrSource;
+            second.duration = 4.0;
+            second.inPoint = 1.0;
+            second.outPoint = 2.5;
+            second.reversed = true;
+            second.pan = 0.4;
+            const double durationSec = 3.0;
+            const auto readAll = [](const QString &path) {
+                QFile in(path);
+                return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
+            };
+            const auto runAsync = [](const audioexport::MixPlan &plan, QThread **workerThread) {
+                QFuture<std::pair<QString, QString>> future = QtConcurrent::run([plan, workerThread]() {
+                    *workerThread = QThread::currentThread();
+                    QString error;
+                    const QString written = audioexport::executeMixPlan(plan, [] { return false; }, &error);
+                    return std::make_pair(written, error);
+                });
+                // waitForFinished() may run a not-yet-started task on the waiting (GUI) thread;
+                // polling isFinished() never steals it.
+                const bool finished = QTest::qWaitFor([&future]() { return future.isFinished(); }, 120000);
+                std::pair<QString, QString> result = future.result(); // the task writes *workerThread
+                if (!finished) result.second = QStringLiteral("executeMixPlan ran past 120000 ms");
+                return result;
+            };
+            bool ok = true;
+            for (const bool trackFx : {false, true}) {
+                const char *name = trackFx ? "trackfx" : "plain";
+                auto *mixer = new AudioMixer;
+                auto *planTimeline = new Timeline;
+                planTimeline->setAudioMixer(mixer);
+                planTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+                    QVector<QVector<ClipInfo>>{{first, second}}, 0, -1, -1, 10);
+                if (trackFx) mixer->setTrackGain(0, 0.5);
+                const QString syncPath = temporary.filePath(QStringLiteral("g13-%1-sync.wav").arg(name));
+                const QString asyncPath = temporary.filePath(QStringLiteral("g13-%1-async.wav").arg(name));
+                const QString controlPath = temporary.filePath(QStringLiteral("g13-%1-control.wav").arg(name));
+                QString syncError;
+                const bool syncOk = renderinplace::prepareAudioMix(planTimeline, syncPath, durationSec, &syncError)
+                    == syncPath;
+                const int guiBefore = audioexport::buildMixPlanGuiThreadCallsForTest();
+                const int otherBefore = audioexport::buildMixPlanOtherThreadCallsForTest();
+                const audioexport::MixPlan plan = audioexport::buildMixPlan(planTimeline, mixer,
+                    {asyncPath, durationSec});
+                delete planTimeline;
+                delete mixer;
+                setAudioChannelModePlaybackBindings({});
+                setAudioReversedPlaybackBindings({});
+                audioexport::MixPlan control = plan;
+                control.outputPath = controlPath;
+                control.channelModes.fill(AudioChannelMode::Stereo);
+                control.reversed.fill(false);
+                QThread *asyncThread = nullptr;
+                QThread *controlThread = nullptr;
+                const auto [asyncWritten, asyncError] = runAsync(plan, &asyncThread);
+                const auto [controlWritten, controlError] = runAsync(control, &controlThread);
+                const int guiDelta = audioexport::buildMixPlanGuiThreadCallsForTest() - guiBefore;
+                const int otherDelta = audioexport::buildMixPlanOtherThreadCallsForTest() - otherBefore;
+                const QByteArray syncBytes = readAll(syncPath);
+                const QByteArray asyncBytes = readAll(asyncPath);
+                const QByteArray controlBytes = readAll(controlPath);
+                const bool offGuiThread = asyncThread && asyncThread != QThread::currentThread()
+                    && controlThread && controlThread != QThread::currentThread();
+                const bool planShape = plan.entries.size() == 2 && plan.channelModes.size() == 2
+                    && plan.channelModes.contains(AudioChannelMode::FillLeft) && plan.reversed.contains(true)
+                    && plan.useTrackFx == trackFx && !plan.passthrough;
+                // >= 2.5 s of 48 kHz stereo pcm_s16le: the mix is not an empty / truncated file.
+                const bool sized = syncBytes.size() >= 48000 * 2 * 2 * 5 / 2;
+                const bool identical = syncOk && asyncWritten == asyncPath && asyncError.isEmpty() && sized
+                    && asyncBytes == syncBytes;
+                const bool controlDiffers = controlWritten == controlPath && controlBytes.size() >= 44
+                    && controlBytes != syncBytes;
+                std::fprintf(stderr, "[loudness-auto] G13 case=%s syncOk=%d syncBytes=%lld asyncBytes=%lld "
+                    "identical=%d controlBytes=%lld controlDiffers=%d guiDelta=%d otherDelta=%d offGuiThread=%d "
+                    "entries=%lld modes=[%d,%d] reversed=[%d,%d] useTrackFx=%d syncError=[%s] asyncError=[%s] "
+                    "controlError=[%s]\n",
+                    name, syncOk, static_cast<long long>(syncBytes.size()),
+                    static_cast<long long>(asyncBytes.size()), identical,
+                    static_cast<long long>(controlBytes.size()), controlDiffers, guiDelta, otherDelta,
+                    offGuiThread, static_cast<long long>(plan.entries.size()),
+                    static_cast<int>(plan.channelModes.value(0, AudioChannelMode::Stereo)),
+                    static_cast<int>(plan.channelModes.value(1, AudioChannelMode::Stereo)),
+                    plan.reversed.value(0, false), plan.reversed.value(1, false), plan.useTrackFx,
+                    qPrintable(syncError), qPrintable(asyncError), qPrintable(controlError));
+                ok = ok && planShape && identical && controlDiffers && guiDelta == 1 && otherDelta == 0
+                    && offGuiThread;
+            }
+            tally.gate(13, ok, "executeMixPlan off the GUI thread after the Timeline was deleted did not "
+                "reproduce the synchronous mix byte for byte (or the control / counters / plan shape failed)");
+        }
     }
     return tally.finish("loudness-auto");
 }

@@ -683,6 +683,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioTrackFx.h
     src/AudioTrackFx.cpp
     src/AudioMixer.cpp
+    src/AudioExportMix.cpp
     src/PlanarTracker.cpp
     src/FeatureTracker.cpp
     src/FeatureTracker.h
