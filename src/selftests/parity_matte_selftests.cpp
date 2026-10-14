@@ -5592,21 +5592,19 @@ int runTrackMatteRm6DuplicateSelftest()
     // Entry: key="0:2" (B is the FG), matteSourceClipId="0:1" (A-copy is src).
     // Mutation: delete A (index 0). Post-state: [A-copy(0), B(5)].
     //
-    // Expected remap (monotonic nc walk):
-    //   old[0]=A(a,0):     nc=0 → new[0]=A-copy(a,0) matches → "0:0"→"0:0", nc=1
-    //   old[1]=A-copy(a,0): nc=1 → new[1]=B(b,5) no match → A-copy unmapped (deleted)
-    //   old[2]=B(b,5):     nc=1 → new[1]=B(b,5) matches → "0:2"→"0:1", nc=2
-    //   Entry key="0:2"→"0:1", src="0:1"→NOT in map (A-copy unmapped) → PRUNED.
+    // Expected remap (monotonic nc walk; since US-1119 ClipKeyId::sameAs compares
+    // the clip uid first, and addClip gives A and A-copy different uids):
+    //   old[0]=A:      nc=0 → no new slot has A's uid → A unmapped (deleted)
+    //   old[1]=A-copy: nc=0 → new[0]=A-copy matches → "0:1"→"0:0", nc=1
+    //   old[2]=B:      nc=1 → new[1]=B matches → "0:2"→"0:1", nc=2
+    //   Entry key="0:2"→"0:1", src="0:1"→"0:0" → entry SURVIVES on A-copy.
     //
-    // Correct result: entry PRUNED (matte source A-copy is "lost" — indistinguishable
-    // from deleted A — so the entry correctly vanishes). This is the right behaviour:
-    // when the user deletes one of two identical clips and the matte source was on
-    // the other (now-ambiguous) clone, the entry must be pruned rather than
-    // silently bound to the wrong clip.
+    // Correct result: exactly 1 entry, key="0:1", src="0:0". Before US-1119 the
+    // three equal fields bound A's slot to A-copy, A-copy went unmapped and the
+    // entry was pruned; that loss of a paste clone's matte is what the uid fixes.
     //
     // A stale-key regression would be: entry remains at key="0:2" (not remapped).
-    // Assert that exactly: entry at "0:2" is ABSENT after remap AND entry at "0:1"
-    // is ABSENT (pruned because source lost). entryMap must be EMPTY.
+    // Assert that exactly: 1 entry, at "0:1", with src "0:0".
     //
     // Second part: entry on B with src=A-copy, delete A-copy (not A). Post: [A(0),B(5)].
     //   old[0]=A: nc=0 → new[0]=A matches → "0:0"→"0:0", nc=1.
@@ -5645,7 +5643,10 @@ int runTrackMatteRm6DuplicateSelftest()
     }
 
     // Part 1: entry on B (index 2), src=A-copy (index 1). Delete A (index 0).
-    // Expected: entry PRUNED (A-copy indistinguishable from deleted A, src lost).
+    // addClip gives A and A-copy their own uids, so since US-1119 ClipKeyId::
+    // sameAs tells them apart: A-copy survives at index 0 and the entry
+    // follows, key "0:2"->"0:1", src "0:1"->"0:0" (before the uid the three
+    // equal fields bound A's slot to A-copy and the entry was pruned).
     {
         QHash<QString, TrackMatteClipEntry> em;
         TrackMatteClipEntry e;
@@ -5655,14 +5656,18 @@ int runTrackMatteRm6DuplicateSelftest()
         const TrackClipSnapshot snap = snapshotTrackClips(&tl);
         v1->removeClip(0);   // delete A; post: [A-copy(0), B(5)]
         remapTrackMatteEntriesAfterMutation(&tl, em, snap);
-        if (!em.isEmpty()) {
-            qCritical() << "TRACKMATTE-RM6-DUPLICATE Part1 FAILED: entry should be "
-                           "PRUNED (src=A-copy lost after A deleted; identical "
-                           "identities mean A-copy's slot is consumed by A's mapping)"
-                        << "got" << em.size() << "entries. Keys:" << em.keys();
+        if (em.size() != 1 || !em.contains(trackMatteClipKey(0, 1))
+            || em.value(trackMatteClipKey(0, 1)).matteSourceClipId
+                   != trackMatteClipKey(0, 0)) {
+            qCritical() << "TRACKMATTE-RM6-DUPLICATE Part1 FAILED: expected 1 "
+                           "entry at key \"0:1\" with src \"0:0\" (A-copy keeps "
+                           "its uid after A is deleted)"
+                        << "got" << em.size() << "entries. Keys:" << em.keys()
+                        << "src:" << em.value(trackMatteClipKey(0, 1)).matteSourceClipId;
             return 1;
         }
-        qInfo() << "TRACKMATTE-RM6-DUPLICATE Part1: entry pruned (src lost). PASS";
+        qInfo() << "TRACKMATTE-RM6-DUPLICATE Part1: entry followed A-copy by uid "
+                   "(key 0:1, src 0:0). PASS";
         // Restore: re-insert A at index 0.
         v1->insertClip(0, ca);  // back to [A(0), A-copy(0), B(5)]
     }
@@ -5708,8 +5713,8 @@ int runTrackMatteRm6DuplicateSelftest()
     }
 
     qInfo() << "[INFO] TRACKMATTE-RM6-DUPLICATE OK — paste-duplicate remap "
-               "prunes entries whose source is indistinguishable from deleted "
-               "clone (Part1) and correctly remaps entries with distinct-identity "
+               "keeps entries whose source is the surviving uid-distinct clone "
+               "(Part1) and correctly remaps entries with distinct-identity "
                "source after clone delete (Part3)";
     return 0;
 }

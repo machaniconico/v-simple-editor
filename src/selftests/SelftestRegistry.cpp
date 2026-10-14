@@ -924,7 +924,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "matte-export", "VEDITOR_MATTE_EXPORT_SELFTEST", runMatteExportSelftest, true,
       "Luma matte RenderQueue live, no-matte control, projectFilePath, repeat, MCP export_video (5 gates)" },
     { "matte-ssot", "VEDITOR_MATTE_SSOT_SELFTEST", runMatteSsotSelftest, true,
-      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (10 gates)" },
+      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (13 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,

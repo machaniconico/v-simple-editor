@@ -55,7 +55,7 @@
 #include "ProjectFile.h"
 #include "MaskSystem.h"
 #include "TrackMatteBake.h"  // TM-6 parity: shared trackmatte::composite SSOT under test
-#include "TrackMatteKey.h"   // RM-4: hoisted snapshotTrackClips / remapTrackMatteEntriesAfterMutation
+#include "TrackMatteKey.h"   // RM-4: clip-key remap helpers (their selftests moved to selftests/parity_matte_selftests.cpp)
 #include "TrackerPreset.h"         // US-TP-7: tracker preset selftest
 #include "TrackerPresetRegistry.h" // US-TP-7: Registry CRUD gate
 #include "MotionTracker.h"         // US-TP-7: applyToMotionTracker target

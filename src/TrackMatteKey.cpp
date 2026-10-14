@@ -5,6 +5,8 @@
 
 bool ClipKeyId::sameAs(const ClipKeyId &o) const
 {
+    if (!uid.isEmpty() && !o.uid.isEmpty())
+        return uid == o.uid;
     return filePath == o.filePath
         && linkGroup == o.linkGroup
         && qFuzzyCompare(inPoint + 1.0, o.inPoint + 1.0);
@@ -23,7 +25,7 @@ TrackClipSnapshot snapshotTrackClips(const Timeline *timeline)
             const QVector<ClipInfo> &clips = trk->clips();
             ids.reserve(clips.size());
             for (const ClipInfo &c : clips)
-                ids.append({c.filePath, c.linkGroup, c.inPoint});
+                ids.append({c.filePath, c.linkGroup, c.inPoint, c.uid});
         }
         snap.append(ids);
     }
@@ -33,23 +35,18 @@ TrackClipSnapshot snapshotTrackClips(const Timeline *timeline)
 // Order-preserving alignment: walk old[] and new[] together with a monotonic
 // nc pointer, recording old->new for each surviving clip.
 //
-// Duplicate-identity tie-break (RM-6): paste inserts a byte-identical
-// ClipInfo, so equal-identity runs can exist within a track. The walk must
-// NOT use a lookahead probe that resets nc — that would let a later duplicate
-// steal the slot of an earlier one. Instead nc always advances monotonically:
-// after binding old[oc]->new[nc], nc++ immediately, so the next old clip can
-// only match at nc or beyond. Within an equal-identity run this means the
-// k-th surviving old duplicate is bound to the k-th new occurrence of that
-// identity, which is the correct position-within-run tie-break.
-// LIMITATION: identity-only snapshot — paste-clone ambiguity.
-// ClipKeyId compares {filePath, linkGroup, inPoint}. When two or more clips in
-// the same track are byte-identical (e.g. after a paste that duplicates an
-// existing clip), they are indistinguishable in the snapshot. The monotonic
-// walk assigns the k-th surviving old duplicate to the k-th new occurrence of
-// that identity; if the first clone is deleted, the entry for the second clone
-// may be pruned rather than remapped. This is deliberate conservative behaviour
-// (prune rather than misassign). A true fix requires a stable per-clip UID
-// threaded through ClipInfo and ProjectFile serialization — out of scope here.
+// Duplicate-identity tie-break (RM-6): the walk must NOT use a lookahead probe
+// that resets nc — that would let a later duplicate steal the slot of an
+// earlier one. Instead nc always advances monotonically: after binding
+// old[oc]->new[nc], nc++ immediately, so the next old clip can only match at
+// nc or beyond.
+// US-1119: ClipKeyId::sameAs compares the clip uid when both sides carry one,
+// so a paste clone (same filePath, linkGroup and inPoint, its own uid) is told
+// apart from its original and the first match is the clip itself. Only a key
+// without a uid (a hand-made ClipInfo or snapshot) falls back to those three
+// fields, where equal clones stay ambiguous: the k-th surviving old duplicate
+// binds to the k-th new occurrence, and deleting the first clone can prune
+// the second clone's entry.
 QHash<QString, QString> alignedClipKeyMap(
     const Timeline *timeline,
     const TrackClipSnapshot &before)
@@ -78,7 +75,8 @@ QHash<QString, QString> alignedClipKeyMap(
             while (probe < newClips.size()) {
                 const ClipKeyId cur{newClips[probe].filePath,
                                     newClips[probe].linkGroup,
-                                    newClips[probe].inPoint};
+                                    newClips[probe].inPoint,
+                                    newClips[probe].uid};
                 if (oldIds[oc].sameAs(cur))
                     break;
                 ++probe;
@@ -94,8 +92,8 @@ QHash<QString, QString> alignedClipKeyMap(
     return oldToNew;
 }
 
-// MainWindow GUI-map variant (TrackMatteClipEntry, has clipId field).
-// Ownership: called by the 4 MainWindow mutation slots on m_trackMatteClipEntries.
+// GUI-map variant (TrackMatteClipEntry, has clipId field). Selftest only:
+// MainWindow keeps no matte map since the Timeline carrier became the SSOT.
 // Each remap helper first asks Timeline to remap roto; its post-mutation
 // snapshot memo skips repeated calls from the same mutation site.
 void remapTrackMatteEntriesAfterMutation(
@@ -129,15 +127,20 @@ void remapTrackMatteEntriesAfterMutation(
 // Ownership rules:
 //   • within-track reorder (moveClip): handled by the connectTrack clipMoved
 //     lambda via direct index arithmetic — this function is NOT called there.
-//   • cross-track drop (handleCrossTrackLinkedDrop): Timeline calls this
-//     function directly via snapshot walk.
-//   • deleteSelectedClip: Timeline calls this function directly. This path is
-//     LOAD-BEARING for direct callers (context-menu, keyboard shortcut) that
-//     never pass through a MainWindow slot. When a MainWindow slot (deleteClip,
-//     rippleDelete) does call deleteSelectedClip, Timeline's internal remap runs
-//     first, then MainWindow's remapTrackMatteEntriesAfterMutation + sync runs
-//     after — the final syncTrackMatteEntriesToTimeline overwrites the carrier
-//     with the GUI-map result, so the double-remap is redundant but harmless.
+//   • cross-track drop of a video clip (TimelineTrack::clipMovedAcrossTracks):
+//     handled by Timeline::remapCarriersAfterCrossTrackMove, an explicit
+//     index map with no snapshot walk and no sameAs — this function is NOT
+//     called there.
+//   • linked-partner drop (handleCrossTrackLinkedDrop): returns at once when
+//     linkGroup <= 0. Only an audio partner (the destIsVideo branch) reaches
+//     this function, through remapTrackMatteLocked(snapBefore); a video
+//     partner takes remapCarriersAfterCrossTrackMove instead.
+//   • deleteSelectedClip and the other Timeline edit paths: Timeline calls
+//     this function through remapTrackMatteLocked. MainWindow slots that edit
+//     through Timeline (deleteClip, rippleDelete, ...) rely on that remap;
+//     MainWindow edits made outside Timeline call
+//     Timeline::remapCarriersAfterExternalMutation. The carrier is the SSOT and
+//     nothing overwrites it after the remap.
 // All three helpers call Timeline::remapRotoEntriesAfterMutation first, even
 // when their own carrier is empty. Roto's post-mutation snapshot memo skips
 // repeated remaps at the same site, including the carrier/parent pair.
