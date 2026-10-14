@@ -214,6 +214,11 @@ struct ClipInfo {
     bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
+    // US-1110 per-clip 4-band EQ. Off by default; saved as "clipEq" only when
+    // clipEqEnabled. Nested sequences take the child's EQ when it is on,
+    // otherwise the parent's (child first, never both in series).
+    trackfx::EqSettings clipEq;
+    bool clipEqEnabled = false;
     AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
     // Pro-NLE "rubber band" volume automation. Each point is (clip-local
     // seconds, gain). Empty vector = static `volume` for the whole clip.
@@ -1066,6 +1071,10 @@ public:
     void setClipSpeed(double speed);
     void setClipVolume(double volume, bool recordUndo = true);
     void setClipPan(double pan, bool recordUndo = true);
+    // US-1110: per-clip EQ of audio track audioTrackIdx (0 = A1), clip clipIdx.
+    // Addressed by the audio clip itself, not by the V1 selection.
+    void setClipEq(int audioTrackIdx, int clipIdx, bool enabled,
+                   const trackfx::EqSettings &eq, bool recordUndo = true);
 
     // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
     // index. Returns the identity ramp for invalid indices so callers can
@@ -1375,6 +1384,8 @@ signals:
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
     void replaceClipRequested(TrackKind kind, int trackIndex, int clipIndex);
+    // US-1110: audio clip context menu "クリップ EQ…" (audio track index, clip index).
+    void audioClipEqRequested(int trackIdx, int clipIndex);
     void clipParentDialogRequested();
     void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration

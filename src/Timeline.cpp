@@ -8893,6 +8893,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
                                                       AudioChannelMode::Mono);
         aMenu.addSeparator();
+        QAction *aClipEq = aMenu.addAction(QStringLiteral("クリップ EQ…"));
         QAction *aEnabledAction = aMenu.addAction(QStringLiteral("クリップを有効にする"));
         aEnabledAction->setCheckable(true);
         aEnabledAction->setChecked(track->clips()[clipIndex].visible);
@@ -8976,6 +8977,9 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aReplace) {
             emit replaceClipRequested(TrackKind::Audio,
                                       m_audioTracks.indexOf(track), clipIndex);
+        }
+        else if (aChosen == aClipEq) {
+            emit audioClipEqRequested(m_audioTracks.indexOf(track), clipIndex);
         }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
         else if (aChosen == aNormalize) {
@@ -9968,6 +9972,23 @@ void Timeline::setClipPan(double pan, bool recordUndo)
     }
     if (recordUndo && !AudioClipEditor::isSliderDragUndoSuppressed())
         saveUndoState(QString("Set pan %1").arg(pan, 0, 'f', 2));
+    scheduleEmitSequenceChanged();
+}
+
+void Timeline::setClipEq(int audioTrackIdx, int clipIdx, bool enabled,
+                         const trackfx::EqSettings &eq, bool recordUndo)
+{
+    if (audioTrackIdx < 0 || audioTrackIdx >= m_audioTracks.size()
+        || !m_audioTracks[audioTrackIdx])
+        return;
+    auto clips = m_audioTracks[audioTrackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+    clips[clipIdx].clipEq = eq;
+    clips[clipIdx].clipEqEnabled = enabled;
+    m_audioTracks[audioTrackIdx]->setClips(clips);
+    if (recordUndo)
+        saveUndoState(QStringLiteral("クリップ EQ を変更"));
     scheduleEmitSequenceChanged();
 }
 
@@ -11992,6 +12013,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         LayerStyle layerStyle;
         double volume = 1.0;
         double pan = 0.0;
+        trackfx::EqSettings clipEq;
+        bool clipEqEnabled = false;
         QVector<AudioGainPoint> volumeEnvelope;
         TransitionAlignment leadInAlignment = TransitionAlignment::Center;
         QVector<StabilizerKeyframe> stabilizerKeyframes;
@@ -12096,6 +12119,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                     nested.opacity = child.opacity * parentClip.opacity;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    // US-1110 clip EQ: child first, else the parent's (never both).
+                    if (!child.clipEqEnabled) {
+                        nested.clipEq = parentClip.clipEq;
+                        nested.clipEqEnabled = parentClip.clipEqEnabled;
+                    }
                     appendSequenceIntervals(nested, childTimelineStart,
                                             parentTrackIdx, parentClipIdx,
                                             out, depth + 1, sequenceStack);
@@ -12141,6 +12169,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.layerStyle = child.layerStyle;
                 iv.volume = child.volume * parentClip.volume;
                 iv.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                const ClipInfo &clipEqOwner = child.clipEqEnabled ? child : parentClip;
+                iv.clipEq = clipEqOwner.clipEq;
+                iv.clipEqEnabled = clipEqOwner.clipEqEnabled;
                 iv.volumeEnvelope = child.volumeEnvelope;
                 iv.clipIdx = parentClipIdx;
                 iv.leadInType = child.leadIn.type;
@@ -12220,6 +12251,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.layerStyle = c.layerStyle;
                 iv.volume = c.volume;
                 iv.pan = c.pan;
+                iv.clipEq = c.clipEq;
+                iv.clipEqEnabled = c.clipEqEnabled;
                 iv.volumeEnvelope = c.volumeEnvelope;
                 iv.clipIdx = ci;
                 iv.leadInType = c.leadIn.type;
@@ -12311,6 +12344,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         e.layerStyle = iv.layerStyle;
         e.volume = iv.volume;
         e.pan = iv.pan;
+        e.clipEq = iv.clipEq;
+        e.clipEqEnabled = iv.clipEqEnabled;
         e.volumeEnvelope = iv.volumeEnvelope;
         e.sourceClipIndex = iv.clipIdx;
         e.leadInType = iv.leadInType;
@@ -12573,6 +12608,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                     nested.reversed = effectiveReversed;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    // US-1110 clip EQ: child first, else the parent's (never both).
+                    if (!child.clipEqEnabled) {
+                        nested.clipEq = parentClip.clipEq;
+                        nested.clipEqEnabled = parentClip.clipEqEnabled;
+                    }
                     appendSequenceAudioEntries(nested, childTimelineStart,
                                                parentTrackIdx, parentClipIdx,
                                                trackMuted, depth + 1,
@@ -12594,6 +12634,10 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.audioMuted = trackMuted;
                 e.volume = child.volume * parentClip.volume;
                 e.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                // US-1110 clip EQ: child first, else the parent's (never both).
+                const ClipInfo &clipEqOwner = child.clipEqEnabled ? child : parentClip;
+                e.clipEq = clipEqOwner.clipEq;
+                e.clipEqEnabled = clipEqOwner.clipEqEnabled;
                 e.volumeEnvelope = child.volumeEnvelope;
                 e.sourceClipIndex = parentClipIdx;
                 // Transitions are attached to timeline edges, not source
@@ -12666,6 +12710,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.audioMuted = trackMuted;
             e.volume = c.volume;
             e.pan = c.pan;
+            e.clipEq = c.clipEq;
+            e.clipEqEnabled = c.clipEqEnabled;
             e.volumeEnvelope = c.volumeEnvelope;
             e.sourceClipIndex = ci;
             e.leadInType = c.leadIn.type;

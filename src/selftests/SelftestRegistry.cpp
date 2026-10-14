@@ -81,6 +81,7 @@ int runChromaSelftest();
 int runClipColorSelftest();
 int runClipCurvesSelftest();
 int runClipEnableSelftest();
+int runClipEqSelftest();
 int runClipFilmstripSelftest();
 int runClipGroupSelftest();
 int runClipIdtSelftest();
@@ -859,6 +860,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Linked edge-drag trim across AV pairs / groups, Alt solo, clamps, locked partners and undo (9 gates)" },
     { "clip-enable", "VEDITOR_CLIP_ENABLE_SELFTEST", runClipEnableSelftest, true,
       "Clip enable: rendering, persistence, undo, audio and Null Object parenting (5 gates)" },
+    { "clip-eq", "VEDITOR_CLIP_EQ_SELFTEST", runClipEqSelftest, true,
+      "Clip EQ: audio-clip setter, save/load, undo, playback entries, nested child-first rule and mixer playback (2 gates)" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,

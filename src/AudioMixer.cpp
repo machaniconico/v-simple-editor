@@ -20,6 +20,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <vector>
 #include <utility>
 
 extern "C" {
@@ -97,6 +99,9 @@ struct AudioDecoderEntry {
     bool postSeekFullDrop = false;
     AVPacket *pkt = nullptr;
     AVFrame *frame = nullptr;
+    // US-1110: per-clip EQ for entry.clipEqEnabled, null otherwise. Built by
+    // setSequence outside m_controlMutex and swapped in under it.
+    std::unique_ptr<trackfx::Processor> clipEq;
 
     AudioDecoderEntry() = default;
     AudioDecoderEntry(const AudioDecoderEntry &) = delete;
@@ -1100,7 +1105,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
 
         QVarLengthArray<int16_t, 8192> scratchTrackFx(copySamples);
-        m_mixer->processTrackFxLocked(trackIdx, src, scratchTrackFx.data(), copySamples);
+        m_mixer->processTrackFxLocked(trackIdx, src, scratchTrackFx.data(), copySamples,
+                                      e->clipEq.get());
         src = scratchTrackFx.constData();
 
         // Per-sample 5ms gain ramp at fragment seam to suppress click at entry
@@ -1565,6 +1571,28 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
     qInfo() << "AudioMixer::setSequence in=" << entries.size()
             << "existing=" << m_entries.size();
     QStringList pendingErrors;
+    // US-1110: build the clip EQ processors before taking the lock. A retained
+    // entry whose clip EQ did not change keeps its own processor (and filter
+    // history); replaced processors are destroyed after the lock is released.
+    std::vector<std::unique_ptr<trackfx::Processor>> clipEqProcessors(entries.size());
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        if (!entries[entryIndex].clipEqEnabled) continue;
+        trackfx::Chain chain;
+        chain.eq = entries[entryIndex].clipEq;
+        chain.eqEnabled = true;
+        clipEqProcessors[entryIndex] =
+            std::make_unique<trackfx::Processor>(chain, kSampleRateHz, kChannels);
+    }
+    const auto sameEqBand = [](const trackfx::EqBand &a, const trackfx::EqBand &b) {
+        return a.freq == b.freq && a.gainDb == b.gainDb && a.q == b.q && a.enabled == b.enabled;
+    };
+    const auto sameClipEq = [&sameEqBand](const PlaybackEntry &a, const PlaybackEntry &b) {
+        return a.clipEqEnabled == b.clipEqEnabled
+            && sameEqBand(a.clipEq.low, b.clipEq.low)
+            && sameEqBand(a.clipEq.lowMid, b.clipEq.lowMid)
+            && sameEqBand(a.clipEq.highMid, b.clipEq.highMid)
+            && sameEqBand(a.clipEq.high, b.clipEq.high);
+    };
     {
         QMutexLocker lock(&m_controlMutex);
 
@@ -1646,6 +1674,8 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
                     && (!qFuzzyCompare(oldClipIn, e.clipIn)
                         || !qFuzzyCompare(oldClipOut, e.clipOut)
                         || !qFuzzyCompare(oldSpeed, e.speed));
+                if (!sameClipEq(de->entry, e))
+                    std::swap(de->clipEq, clipEqProcessors[entryIndex]);
                 de->entry = e;
                 de->trackKey = key;
                 de->channelMode = channelMode;
@@ -1678,6 +1708,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
             } else {
                 de = new AudioDecoderEntry;
                 de->entry = e;
+                std::swap(de->clipEq, clipEqProcessors[entryIndex]);
                 de->trackKey = key;
                 de->channelMode = channelMode;
                 de->reversed = reversed;
@@ -2183,6 +2214,8 @@ void AudioMixer::seekTo(int64_t timelineUs) {
             QMutexLocker lock(&m_controlMutex);
             for (auto it = m_trackFxProcessors.begin(); it != m_trackFxProcessors.end(); ++it)
                 it.value().resetFeedback();
+            for (AudioDecoderEntry *de : qAsConst(m_entries))
+                if (de->clipEq) de->clipEq->resetFeedback();
             m_masterEqFilter.reset();
             for (auto it = m_trackReverbState.begin();
                  it != m_trackReverbState.end(); ++it) {
@@ -3594,8 +3627,32 @@ int64_t AudioMixer::audibleClockUs() const {
 // Retained legacy DSP arithmetic for the Wave 5 same-binary playback oracle.
 // Called under m_controlMutex by readData and the headless selftest entry.
 void AudioMixer::processTrackFxLocked(int trackIdx, const int16_t *src,
-                                     int16_t *output, int copySamples)
+                                     int16_t *output, int copySamples,
+                                     trackfx::Processor *clipEq)
 {
+    // US-1110 float 1 pass: clip EQ -> track chain -> one saturating PCM16
+    // conversion. Entries without a clip EQ keep the paths below unchanged.
+    QVarLengthArray<int16_t, 8192> clipEqPcm;
+    if (clipEq) {
+        QVarLengthArray<float, 8192> samples(copySamples);
+        for (int i = 0; i < copySamples; ++i) samples[i] = src[i] / 32768.0f;
+        clipEq->process(samples.data(), copySamples / kChannels);
+        auto it = m_trackFxProcessors.find(trackIdx);
+        if (!m_legacyTrackFxPath && trackIdx >= 0 && it != m_trackFxProcessors.end()) {
+            ++m_trackFxProcessCalls;
+            it.value().process(samples.data(), copySamples / kChannels);
+        }
+        int16_t *dst = output;
+        if (m_legacyTrackFxPath) {
+            clipEqPcm.resize(copySamples);
+            dst = clipEqPcm.data();
+        }
+        for (int i = 0; i < copySamples; ++i)
+            dst[i] = static_cast<int16_t>(qBound(-32768L, lrintf(samples[i] * 32768.0f), 32767L));
+        if (!m_legacyTrackFxPath) return;
+        // The legacy oracle keeps its own track arithmetic after the clip EQ.
+        src = clipEqPcm.constData();
+    }
     if (!m_legacyTrackFxPath) {
         auto it = m_trackFxProcessors.find(trackIdx);
         if (trackIdx >= 0 && it != m_trackFxProcessors.end()) {

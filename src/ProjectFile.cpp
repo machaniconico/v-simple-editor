@@ -2010,6 +2010,13 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
         obj["pan"] = clip.pan;
+    // US-1110: the clip EQ is written only while it is on, in the same form as
+    // the "eq" part of trackfx::Chain::toJson (default band fields omitted).
+    if (clip.clipEqEnabled) {
+        trackfx::Chain chain;
+        chain.eq = clip.clipEq;
+        obj["clipEq"] = chain.toJson()["eq"].toObject();
+    }
     if (clip.audioChannelMode != AudioChannelMode::Stereo)
         obj["audioChannelMode"] = audioChannelModeToProjectString(clip.audioChannelMode);
     obj["videoScale"] = clip.videoScale;
@@ -2134,6 +2141,12 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.reversed = obj["reversed"].toBool(false);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
+    if (obj.contains("clipEq")) {
+        QJsonObject chainObj;
+        chainObj["eq"] = obj["clipEq"].toObject();
+        clip.clipEq = trackfx::Chain::fromJson(chainObj).eq;
+        clip.clipEqEnabled = true;
+    }
     clip.audioChannelMode = obj.contains("audioChannelMode")
         ? audioChannelModeFromProjectValue(obj["audioChannelMode"])
         : AudioChannelMode::Stereo;
