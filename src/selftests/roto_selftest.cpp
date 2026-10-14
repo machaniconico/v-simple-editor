@@ -32,6 +32,9 @@
 #include <QCoreApplication>
 #include <QDropEvent>
 #include <QMimeData>
+#include <QLabel>
+#include <QScrollArea>
+#include <QTest>
 #include <iostream>
 
 namespace {
@@ -463,33 +466,148 @@ QString parentLayout(const QHash<QString, QString> &entries)
     return out.join(QLatin1Char(','));
 }
 
-// Sends a synthetic QDropEvent ("srcIdx:0" payload) to dest at dropTimelineSec.
-// Qt 6 resolves QDropEvent::source() only through an active QDrag, so the
-// source track is supplied through TimelineTrack's selftest seam.
-bool driveCrossDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest,
-                    double dropTimelineSec, bool useSeam, bool *qtSourceNull)
+// Sends a synthetic QDropEvent ("srcIdx:0" payload) at pos to dest and returns
+// whether it was accepted. Qt 6 resolves QDropEvent::source() only through an
+// active QDrag, so the source track is supplied through TimelineTrack's
+// selftest seam.
+bool sendClipDrop(TimelineTrack *src, int srcIdx, QObject *dest, const QPointF &pos,
+                  bool useSeam, bool *qtSourceNull)
 {
     QMimeData mime;
     mime.setData(QStringLiteral("application/x-vse-clip"),
                  QByteArray::number(srcIdx) + QByteArray(":0"));
-    const QPointF pos(dropTimelineSec * dest->pixelsPerSecond(), 4.0);
-    const double clipDurSec = srcIdx < src->clipCount()
-        ? src->clips()[srcIdx].effectiveDuration() : -1.0;
-    const auto plan = dest->planDrop(dropTimelineSec, clipDurSec);
     QDropEvent event(pos, Qt::MoveAction, &mime, Qt::LeftButton, Qt::NoModifier);
     event.ignore();
     if (qtSourceNull) *qtSourceNull = event.source() == nullptr;
     TimelineTrack::setSelftestDropSource(useSeam ? src : nullptr);
     // QApplication::notify does not deliver a Drop outside an active QDrag, so
     // dispatch through the virtual QObject::event (QWidget::event -> dropEvent).
-    static_cast<QObject *>(dest)->event(&event);
+    dest->event(&event);
     TimelineTrack::setSelftestDropSource(nullptr);
+    return event.isAccepted();
+}
+
+// Drop on a track at dropTimelineSec.
+bool driveCrossDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest,
+                    double dropTimelineSec, bool useSeam, bool *qtSourceNull)
+{
+    const QPointF pos(dropTimelineSec * dest->pixelsPerSecond(), 4.0);
+    const double clipDurSec = srcIdx < src->clipCount()
+        ? src->clips()[srcIdx].effectiveDuration() : -1.0;
+    const auto plan = dest->planDrop(dropTimelineSec, clipDurSec);
+    const bool accepted = sendClipDrop(src, srcIdx, dest, pos, useSeam, qtSourceNull);
     std::cerr << "  drop srcIdx=" << srcIdx << " timelineSec=" << dropTimelineSec
               << " x=" << pos.x() << " pps=" << dest->pixelsPerSecond()
               << " clipDurSec=" << clipDurSec << " planValid=" << plan.valid
               << " insertIdx=" << plan.insertIdx << " seam=" << useSeam
-              << " accepted=" << event.isAccepted() << '\n';
-    return event.isAccepted();
+              << " accepted=" << accepted << '\n';
+    return accepted;
+}
+
+// Drop on a new-track band (US-1117, a plain QWidget found by objectName) at
+// dropTimelineSec; every row shares the zoom, so x uses the source's scale.
+bool driveCrossDrop(TimelineTrack *src, int srcIdx, QObject *dest, double dropTimelineSec)
+{
+    const QPointF pos(dropTimelineSec * src->pixelsPerSecond(), 4.0);
+    const bool accepted = dest && sendClipDrop(src, srcIdx, dest, pos, true, nullptr);
+    std::cerr << "  band drop srcIdx=" << srcIdx << " srcAudio=" << src->isAudioTrack()
+              << " dest=" << (dest ? dest->objectName().toStdString() : std::string("missing"))
+              << " timelineSec=" << dropTimelineSec << " x=" << pos.x()
+              << " accepted=" << accepted << '\n';
+    return accepted;
+}
+
+// G42-G44 (US-1117) fixture: V1 [100], V2 [10 @0 s, 11 @3 s], A1 [50 @0 s],
+// every clip 2 s and unlinked; with `linked`, V2:0 keeps linkGroup 11 and its
+// audio partner sits on A2 (so a V-band drop creates V3 and A3). Roto markers
+// 1 / 2 on V2:0 / V2:1, parents V2:0 -> V1:0 and V2:1 -> V2:0.
+void seedNewTrackDrop(Timeline &tl, bool linked)
+{
+    auto unlinked = [](int id, double leadInSec) {
+        ClipInfo c = clip(id);
+        c.linkGroup = 0;
+        c.leadInSec = leadInSec;
+        return c;
+    };
+    ClipInfo moved = unlinked(10, 0.0);
+    if (linked) moved.linkGroup = clip(10).linkGroup;
+    const QVector<QVector<ClipInfo>> video{{unlinked(100, 0.0)}, {moved, unlinked(11, 1.0)}};
+    QVector<QVector<ClipInfo>> audio{{unlinked(50, 0.0)}};
+    if (linked) audio.append(QVector<ClipInfo>{moved});
+    tl.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+    QHash<QString, RotoClipEntry> rotos;
+    rotos.insert(QStringLiteral("1:0"), entry(1));
+    rotos.insert(QStringLiteral("1:1"), entry(2));
+    tl.setRotoEntries(rotos);
+    QHash<QString, QString> parents;
+    parents.insert(QStringLiteral("1:0"), QStringLiteral("0:0"));
+    parents.insert(QStringLiteral("1:1"), QStringLiteral("1:0"));
+    tl.setClipParentEntries(parents);
+}
+
+// Every V / A row's header sits at its track's y, rows are contiguous, the
+// video band follows the last V row and precedes A1, and the audio band
+// follows the last A row; both bands are 10 px. y is taken in each column's
+// scroll content (timelineScrollArea / timelineHeaderScrollArea widget), the
+// frame both columns are aligned in: the tracks scroll area keeps its default
+// frame and the header one has none, so Timeline coordinates differ by the
+// frame width on every row at the base build too (V1 included); that offset
+// is printed as "frame". `detail` gets "name:trackY/headerY" per row and
+// "band:y/height".
+bool newTrackBandLayout(Timeline &tl, std::string *detail)
+{
+    auto *trackArea = tl.findChild<QScrollArea *>(QStringLiteral("timelineScrollArea"));
+    auto *headerArea = tl.findChild<QScrollArea *>(QStringLiteral("timelineHeaderScrollArea"));
+    QWidget *trackContent = trackArea ? trackArea->widget() : nullptr;
+    QWidget *headerContent = headerArea ? headerArea->widget() : nullptr;
+    auto yIn = [](const QWidget *w, const QWidget *content) {
+        return w && content && content->isAncestorOf(w) ? w->mapTo(content, QPoint(0, 0)).y() : -1;
+    };
+    auto yOf = [&](const QWidget *w) { return yIn(w, trackContent); };
+    auto headerYOf = [&](const QWidget *w) { return yIn(w, headerContent); };
+    auto headerOf = [&tl](const QString &name) -> QWidget * {
+        for (auto *label : tl.findChildren<QLabel *>(QStringLiteral("timelineTrackName"))) {
+            QWidget *header = label->parentWidget();
+            if (label->property("defaultName").toString() == name && header->parentWidget()
+                && header->parentWidget()->layout()
+                && header->parentWidget()->layout()->indexOf(header) >= 0)
+                return header;
+        }
+        return nullptr;
+    };
+    std::string out;
+    bool ok = true;
+    // Rows follow each other at the 2 px layout spacing; the video band sits
+    // over the 3 px V/A separator in one row. A stale geometry (a removed row
+    // not yet laid out) leaves a gap or an overlap and fails the check.
+    int lastBottom = -1;
+    auto follows = [&](int y) { return lastBottom < 0 || y == lastBottom + 2; };
+    auto row = [&](const QString &name, TimelineTrack *track) {
+        const int trackY = yOf(track);
+        const int headerY = headerYOf(headerOf(name));
+        ok = ok && trackY >= 0 && trackY == headerY && follows(trackY);
+        lastBottom = trackY + track->height();
+        out += name.toStdString() + ":" + std::to_string(trackY) + "/" + std::to_string(headerY) + " ";
+    };
+    auto band = [&](const char *objectName, int rowExtra) {
+        auto *w = tl.findChild<QWidget *>(QString::fromLatin1(objectName));
+        const int y = yOf(w);
+        const int h = w ? w->height() : -1;
+        ok = ok && w && y >= 0 && h == 10 && follows(y);
+        lastBottom = y + h + rowExtra;
+        out += std::string(objectName) + ":" + std::to_string(y) + "/" + std::to_string(h) + " ";
+    };
+    for (int i = 0; i < tl.videoTracks().size(); ++i)
+        row(QStringLiteral("V%1").arg(i + 1), tl.videoTracks()[i]);
+    band("newVideoTrackDropZone", 3);
+    for (int i = 0; i < tl.audioTracks().size(); ++i)
+        row(QStringLiteral("A%1").arg(i + 1), tl.audioTracks()[i]);
+    band("newAudioTrackDropZone", 0);
+    if (trackContent && headerContent)
+        out += "frame:" + std::to_string(trackContent->mapTo(&tl, QPoint(0, 0)).y()
+                                         - headerContent->mapTo(&tl, QPoint(0, 0)).y());
+    if (detail) *detail = out;
+    return ok;
 }
 
 bool droppedIntoV3(const Timeline &tl)
@@ -503,7 +621,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 41;
+    constexpr int kRotoGateCount = 44;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -3050,6 +3168,253 @@ int runRotoSelftest()
     gates.gate(36, rangeRipple(3, 6.0, 8.0, "G36", rippleRotoBefore, rippleMatteBefore,
                                rippleParentBefore),
                "tail range ripple changed carrier keys under an identity map");
+
+    // ── G42-G44 (US-1117): drop on the new-track bands (seedNewTrackDrop).
+    // V2:0 (clip 10) dropped on the video band at 0 s creates V3 and lands at
+    // V3:0; V2:1 (clip 11) becomes V2:0, so roto / parent keys map
+    // 1:0 -> 2:0 and 1:1 -> 1:0. The Timeline is laid out (shown off-screen)
+    // so the band rows and header rows can be compared by y.
+    const QString bandRotoBefore = QStringLiteral("1:0=1,1:1=2");
+    const QString bandParentBefore = QStringLiteral("1:0>0:0,1:1>1:0");
+    const QString bandRotoAfter = QStringLiteral("1:0=2,2:0=1");
+    const QString bandParentAfter = QStringLiteral("1:0>2:0,2:0>0:0");
+    const QString bandUndoText = QStringLiteral("クリップを新しいトラックへ移動");
+    auto showForLayout = [](Timeline &tl) {
+        tl.setAttribute(Qt::WA_DontShowOnScreen);
+        tl.resize(1000, 700);
+        tl.show();
+    };
+    auto waitBandLayout = [](Timeline &tl, std::string *detail) {
+        const bool ok = QTest::qWaitFor([&tl] { return newTrackBandLayout(tl, nullptr); }, 3000);
+        newTrackBandLayout(tl, detail);
+        return ok;
+    };
+    auto names = [](const TimelineTrack *track) {
+        QStringList out;
+        for (const ClipInfo &c : track->clips()) out.append(c.displayName);
+        return out.join(QLatin1Char(','));
+    };
+    auto partnerTrackOf = [](const Timeline &tl, int linkGroup) {
+        int found = -1;
+        for (int t = 0; t < tl.audioTracks().size(); ++t)
+            for (const ClipInfo &c : tl.audioTracks()[t]->clips())
+                if (c.linkGroup == linkGroup) found = t;
+        return found;
+    };
+
+    // G42 detects a video-band drop that does not create V3 / move the clip
+    // there, keys that stay on the pre-drop indices, a missing or second undo
+    // point (or the old 「クリップをトラック間移動」 text), an undo that leaves
+    // V3 behind, and band / header rows out of line. HEAD has no band
+    // (findChild returns null), so this gate FAILs there.
+    auto bandDrop = [&](bool linked, const char *label, bool *partnerOk) {
+        Timeline tl;
+        seedNewTrackDrop(tl, linked);
+        showForLayout(tl);
+        tl.undoManager()->clear();
+        tl.undoManager()->saveState(tl.currentState(), QStringLiteral("基準"));
+        const QString rotoPre = rotoLayout(tl.rotoEntries());
+        const QString parentPre = parentLayout(tl.clipParentEntries());
+        const int videoBefore = tl.videoTracks().size();
+        const int audioBefore = tl.audioTracks().size();
+        const int partnerBefore = partnerTrackOf(tl, clip(10).linkGroup);
+        const quint64 serialBefore = tl.undoManager()->saveSerial();
+        const bool accepted = driveCrossDrop(tl.videoTracks()[1], 0,
+            tl.findChild<QWidget *>(QStringLiteral("newVideoTrackDropZone")), 0.0);
+        const quint64 serialAfter = tl.undoManager()->saveSerial();
+        const QString undoPoint = tl.undoManager()->undoDescription();
+        const int videoAfter = tl.videoTracks().size();
+        const int audioAfter = tl.audioTracks().size();
+        const QString v2After = names(tl.videoTracks()[1]);
+        const QString v3After = videoAfter > 2 ? names(tl.videoTracks()[2]) : QStringLiteral("none");
+        const int partnerAfter = partnerTrackOf(tl, clip(10).linkGroup);
+        const auto rotos = tl.rotoEntries();
+        const QString roto = rotoLayout(rotos);
+        const QString parent = parentLayout(tl.clipParentEntries());
+        std::string layoutDetail;
+        const bool layoutOk = waitBandLayout(tl, &layoutDetail);
+        tl.undo();
+        const int videoUndo = tl.videoTracks().size();
+        const int audioUndo = tl.audioTracks().size();
+        const QString v2Undo = names(tl.videoTracks()[1]);
+        const int partnerUndo = partnerTrackOf(tl, clip(10).linkGroup);
+        const QString rotoUndo = rotoLayout(tl.rotoEntries());
+        const QString parentUndo = parentLayout(tl.clipParentEntries());
+        std::string undoLayoutDetail;
+        const bool undoLayoutOk = waitBandLayout(tl, &undoLayoutDetail);
+        const int audioExpected = linked ? 3 : 1;
+        const int partnerExpected = linked ? 2 : -1;
+        const int partnerStart = linked ? 1 : -1;
+        *partnerOk = audioBefore == (linked ? 2 : 1) && partnerBefore == partnerStart
+            && audioAfter == audioExpected && partnerAfter == partnerExpected
+            && audioUndo == audioBefore && partnerUndo == partnerStart;
+        const bool ok = rotoPre == bandRotoBefore && parentPre == bandParentBefore && accepted
+            && videoBefore == 2 && serialAfter == serialBefore + 1 && undoPoint == bandUndoText
+            && videoAfter == 3 && v2After == QStringLiteral("11") && v3After == QStringLiteral("10")
+            && roto == bandRotoAfter && invariant(rotos) && parent == bandParentAfter && layoutOk
+            && videoUndo == 2 && v2Undo == QStringLiteral("10,11") && rotoUndo == bandRotoBefore
+            && parentUndo == bandParentBefore && undoLayoutOk;
+        std::cerr << label << " before roto=" << rotoPre.toStdString()
+                  << " parent=" << parentPre.toStdString() << " tracks V" << videoBefore
+                  << "/A" << audioBefore << " partnerAudioTrack=" << partnerBefore << '\n'
+                  << label << " after accepted=" << accepted << " saveSerial " << serialBefore
+                  << "->" << serialAfter << " (expected +1) undoPoint=" << undoPoint.toStdString()
+                  << " tracks V" << videoAfter << "/A" << audioAfter << " (expected V3/A"
+                  << audioExpected << ") V2=[" << v2After.toStdString() << "] V3=["
+                  << v3After.toStdString() << "] partnerAudioTrack=" << partnerAfter
+                  << " (expected " << partnerExpected << ") roto=" << roto.toStdString()
+                  << " (expected " << bandRotoAfter.toStdString() << ") clipIdOk=" << invariant(rotos)
+                  << " parent=" << parent.toStdString() << " (expected "
+                  << bandParentAfter.toStdString() << ")\n"
+                  << label << " layout ok=" << layoutOk << " " << layoutDetail << '\n'
+                  << label << " undo tracks V" << videoUndo << "/A" << audioUndo << " V2=["
+                  << v2Undo.toStdString() << "] partnerAudioTrack=" << partnerUndo
+                  << " roto=" << rotoUndo.toStdString() << " parent=" << parentUndo.toStdString()
+                  << " layout ok=" << undoLayoutOk << " " << undoLayoutDetail
+                  << " partnerOk=" << *partnerOk << " -> " << ok << '\n';
+        return ok;
+    };
+    // A MoveClip drag turns into the QDrag that reaches a band only through
+    // TimelineTrack::promotesCrossTrackDrag (QDrag::exec blocks under Windows
+    // OLE, so the predicate is checked instead of a real mouse drag). The band
+    // starts one layout spacing below the last row of its kind, inside the
+    // 10 px CROSS_TRACK_DRAG_THRESHOLD dead zone (checked), so the last track
+    // must promote at the band's vertical centre; the track above it keeps the
+    // threshold at the same offset below its own bottom edge (the next row of
+    // the same kind sits there). Linked fixture: V1 / V2 and A1 / A2. Detects
+    // a band reachable only from its bottom 2 px (threshold-only promotion).
+    auto bandPromotion = [&](bool audio, const char *label) {
+        Timeline tl;
+        seedNewTrackDrop(tl, true);
+        showForLayout(tl);
+        const bool layoutOk = waitBandLayout(tl, nullptr);
+        const auto &tracks = audio ? tl.audioTracks() : tl.videoTracks();
+        TimelineTrack *last = tracks.last();
+        TimelineTrack *above = tracks[tracks.size() - 2];
+        const QWidget *band = tl.findChild<QWidget *>(audio ? QStringLiteral("newAudioTrackDropZone")
+                                                            : QStringLiteral("newVideoTrackDropZone"));
+        const int bandCentreY = band
+            ? band->mapTo(last->parentWidget(), QPoint(0, band->height() / 2)).y() : -1;
+        const int belowBottom = bandCentreY - (last->y() + last->height());
+        const bool inDeadZone = belowBottom >= 0 && belowBottom < 10;
+        const bool lastPromotes = last->promotesCrossTrackDrag(last->height() + belowBottom);
+        const int aboveY = above->height() + belowBottom;
+        const bool abovePromotes = above->promotesCrossTrackDrag(aboveY);
+        const int aboveCursorY = above->y() + aboveY;
+        const bool aboveOverLast = aboveCursorY >= last->y() && aboveCursorY < last->y() + last->height();
+        const bool ok = layoutOk && band && tracks.size() == 2 && inDeadZone && lastPromotes
+            && !abovePromotes && aboveOverLast;
+        std::cerr << label << " promotion layout ok=" << layoutOk << " band=" << (band != nullptr)
+                  << " bandCentreY=" << bandCentreY << " lastTrack y=" << last->y() << " h="
+                  << last->height() << " belowBottom=" << belowBottom << " (expected 0..9) lastPromotes="
+                  << lastPromotes << " (expected 1) aboveTrack y=" << above->y() << " h="
+                  << above->height() << " aboveCursorY=" << aboveCursorY << " overLastTrack="
+                  << aboveOverLast << " abovePromotes=" << abovePromotes << " (expected 0) -> " << ok
+                  << '\n';
+        return ok;
+    };
+    {
+        bool partnerOk = false;
+        const bool ok = bandDrop(false, "G42", &partnerOk);
+        const bool promotionOk = bandPromotion(false, "G42");
+        gates.gate(42, ok && partnerOk && promotionOk,
+                   "video-band drop did not create V3 with the clip and its keys in one undo point");
+    }
+
+    // G43: the same drop with the audio partner on A2 creates V3 and A3 and
+    // the partner moves A2 -> A3 (the G33 shape, through the existing
+    // handleCrossTrackLinkedDrop track creation); undo removes both tracks.
+    // Detects a band path that bypasses crossTrackDropped (partner stays on A2).
+    {
+        bool partnerOk = false;
+        const bool ok = bandDrop(true, "G43", &partnerOk);
+        gates.gate(43, ok && partnerOk,
+                   "linked video-band drop did not create V3 / A3 with the partner on A3");
+    }
+
+    // G44 negative control: a video clip on the audio band and an audio clip on
+    // the video band are ignored (no track, no key change, no undo point). The
+    // positive control in the same fixture, the audio clip A1:0 on the audio
+    // band, creates A2, so the bands are live and the ignore is the kind check.
+    // Detects a band that accepts any timeline clip (a video clip lands on a
+    // new audio track). HEAD has no band, so the control FAILs there.
+    {
+        Timeline tl;
+        seedNewTrackDrop(tl, false);
+        tl.undoManager()->clear();
+        tl.undoManager()->saveState(tl.currentState(), QStringLiteral("基準"));
+        QWidget *videoBand = tl.findChild<QWidget *>(QStringLiteral("newVideoTrackDropZone"));
+        QWidget *audioBand = tl.findChild<QWidget *>(QStringLiteral("newAudioTrackDropZone"));
+        const QString rotoPre = rotoLayout(tl.rotoEntries());
+        const QString parentPre = parentLayout(tl.clipParentEntries());
+        const quint64 serial0 = tl.undoManager()->saveSerial();
+        const bool videoOnAudioBand = driveCrossDrop(tl.videoTracks()[1], 0, audioBand, 0.0);
+        const bool audioOnVideoBand = driveCrossDrop(tl.audioTracks()[0], 0, videoBand, 0.0);
+        const quint64 serial1 = tl.undoManager()->saveSerial();
+        const int video1 = tl.videoTracks().size();
+        const int audio1 = tl.audioTracks().size();
+        const QString v2After = names(tl.videoTracks()[1]);
+        const QString a1After = names(tl.audioTracks()[0]);
+        const QString roto1 = rotoLayout(tl.rotoEntries());
+        const QString parent1 = parentLayout(tl.clipParentEntries());
+        const bool ignored = videoBand && audioBand && !videoOnAudioBand && !audioOnVideoBand
+            && serial1 == serial0 && video1 == 2 && audio1 == 1 && v2After == QStringLiteral("10,11")
+            && a1After == QStringLiteral("50") && roto1 == bandRotoBefore && parent1 == bandParentBefore
+            && rotoPre == bandRotoBefore && parentPre == bandParentBefore;
+        const bool control = driveCrossDrop(tl.audioTracks()[0], 0, audioBand, 0.0);
+        const quint64 serial2 = tl.undoManager()->saveSerial();
+        const int audio2 = tl.audioTracks().size();
+        const QString a1Control = names(tl.audioTracks()[0]);
+        const QString a2Control = audio2 > 1 ? names(tl.audioTracks()[1]) : QStringLiteral("none");
+        const QString undoPoint = tl.undoManager()->undoDescription();
+        const bool controlOk = control && serial2 == serial1 + 1 && audio2 == 2
+            && tl.videoTracks().size() == 2 && a1Control.isEmpty() && a2Control == QStringLiteral("50")
+            && undoPoint == bandUndoText && rotoLayout(tl.rotoEntries()) == bandRotoBefore;
+        std::cerr << "G44 bands video=" << (videoBand != nullptr) << " audio=" << (audioBand != nullptr)
+                  << " videoClipOnAudioBand=" << videoOnAudioBand
+                  << " audioClipOnVideoBand=" << audioOnVideoBand << " (expected 0/0) saveSerial "
+                  << serial0 << "->" << serial1 << " (expected +0) tracks V" << video1 << "/A" << audio1
+                  << " (expected V2/A1) V2=[" << v2After.toStdString() << "] A1=["
+                  << a1After.toStdString() << "] roto=" << roto1.toStdString()
+                  << " parent=" << parent1.toStdString() << " ignored=" << ignored << '\n'
+                  << "G44 control audioClipOnAudioBand=" << control << " saveSerial " << serial1
+                  << "->" << serial2 << " (expected +1) audioTracks=" << audio2 << " (expected 2) A1=["
+                  << a1Control.toStdString() << "] A2=[" << a2Control.toStdString()
+                  << "] undoPoint=" << undoPoint.toStdString() << " controlOk=" << controlOk << '\n';
+
+        // Linked variant of the control: A2:0 (partner V2:0) on the audio band
+        // creates A3 (and V3 for the partner). The undo point it leaves behind
+        // must keep the pre-drop external state; the hook pair mirrors
+        // MainWindow::collectExternalTrackState's mixer trackCount. Detects a
+        // second capture after addAudioTrack (restored trackCount 3, not 2).
+        Timeline linkedTl;
+        seedNewTrackDrop(linkedTl, true);
+        int restoredTrackCount = -1;
+        linkedTl.setExternalTrackStateHooks(
+            [&linkedTl] { return QJsonObject{{"trackCount", linkedTl.audioTrackCount()}}; },
+            [&restoredTrackCount](const QJsonObject &state) {
+                restoredTrackCount = state.value("trackCount").toInt(-1);
+            });
+        linkedTl.undoManager()->clear();
+        linkedTl.undoManager()->saveState(linkedTl.currentState(), QStringLiteral("基準"));
+        const int linkedAudioPre = linkedTl.audioTrackCount();
+        const bool linkedAccepted = driveCrossDrop(linkedTl.audioTracks()[1], 0,
+            linkedTl.findChild<QWidget *>(QStringLiteral("newAudioTrackDropZone")), 0.0);
+        const int linkedAudioPost = linkedTl.audioTrackCount();
+        const int linkedVideoPost = linkedTl.videoTrackCount();
+        linkedTl.undo();
+        const int linkedAudioUndo = linkedTl.audioTrackCount();
+        const bool externalOk = linkedAccepted && linkedAudioPre == 2 && linkedAudioPost == 3
+            && linkedVideoPost == 3 && linkedAudioUndo == linkedAudioPre
+            && restoredTrackCount == linkedAudioPre;
+        std::cerr << "G44 linked audioBand accepted=" << linkedAccepted << " tracks A" << linkedAudioPre
+                  << "->A" << linkedAudioPost << "/V" << linkedVideoPost << " (expected A2->A3/V3) undo A"
+                  << linkedAudioUndo << " restored externalTrackState trackCount=" << restoredTrackCount
+                  << " (expected " << linkedAudioPre << ") externalOk=" << externalOk << '\n';
+        const bool promotionOk = bandPromotion(true, "G44");
+        gates.gate(44, ignored && controlOk && externalOk && promotionOk,
+                   "new-track band accepted a clip of the other kind, or the audio band is dead");
+    }
 
     return gates.finish("roto");
 }

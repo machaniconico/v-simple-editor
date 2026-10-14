@@ -119,6 +119,7 @@ class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
 class QDropEvent;
+class QMimeData;
 class QTimer;
 
 // TR-3: トリム種別。実体は src/TrimOps.h。TrimOps.h は ClipInfo のために
@@ -623,6 +624,19 @@ public:
     // QDrag, so a synthetic drop has no source. dropEvent falls back to this
     // track when source() is null. Production never sets it (nullptr).
     static void setSelftestDropSource(TimelineTrack *src);
+
+    // The one cross-track clip move (application/x-vse-clip payload from src,
+    // pos in this track's coordinates): move, clipMovedAcrossTracks, the
+    // linked-partner crossTrackDropped and one undo point. dropEvent and the
+    // new-track drop bands (toNewTrack, US-1117) both call it. Returns false
+    // with nothing changed when the payload, the source or the slot is invalid.
+    bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
+                        bool toNewTrack = false);
+    // Whether an in-track MoveClip drag at y (this track's coordinates) turns
+    // into a cross-track QDrag: CROSS_TRACK_DRAG_THRESHOLD px outside the row,
+    // or, on the last track of its kind, anywhere over that kind's new-track
+    // band (US-1117), which starts within the threshold.
+    bool promotesCrossTrackDrag(int y) const;
 
 signals:
     void clipClicked(int index);
@@ -1509,6 +1523,10 @@ private:
     QWidget *m_magnetArea = nullptr;
     QWidget *m_vaSeparator = nullptr;
     QWidget *m_vaSeparatorHeader = nullptr;
+    // Header-column rows mirroring the new-track drop bands (US-1117): the
+    // V/A boundary row (band spacer + separator) and the audio band spacer.
+    QWidget *m_vaBoundaryHeader = nullptr;
+    QWidget *m_newAudioTrackDropZoneHeader = nullptr;
     int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
     void refreshTextStrip();
     void beginTextOverlayTimeEdit();
@@ -1616,6 +1634,12 @@ private:
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+    // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
+    // moves it there through TimelineTrack::acceptClipDrop (one undo point).
+    // Only a timeline clip of the band's kind is accepted.
+    friend class TimelineNewTrackDropZone;
+    bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
+                            TimelineTrack *src);
     // Explicit index map for one clip moved between tracks by dropEvent, or
     // for the linked video partner moved by handleCrossTrackLinkedDrop:
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
