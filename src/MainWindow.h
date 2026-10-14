@@ -764,6 +764,14 @@ private:
     // 共有 RenderQueue (通常 / モバイル / MCP export_video) の唯一の生成点。
     RenderQueue *ensureRenderQueue();
     int renderCompleteNotificationCountForTest = 0; // selftest: shown completion notifications
+    // Normal / mobile export progress dialog (objectName "exportProgressDialog") for the
+    // shared queue's job `jobUuid` only: other jobs' progress / completion are ignored and
+    // Cancel calls RenderQueue::cancelJob(jobUuid). onFinished runs once that job ends.
+    void showExportProgressDialog(const QString &jobUuid, const QString &label,
+        const QString &cancelText, const std::function<void(bool, const QString &)> &onFinished);
+    QHash<QString, int> m_progressDialogUpdatesForTest; // selftest: dialog progress updates per job
+    int progressDialogUpdateCountForTest(const QString &jobUuid) const
+    { return m_progressDialogUpdatesForTest.value(jobUuid); }
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);

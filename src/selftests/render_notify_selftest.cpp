@@ -1,7 +1,9 @@
 // --selftest=render-notify: export-complete notification (default OFF) wired once at
 // MainWindow::ensureRenderQueue. Batch (dedicated queue) and RenderInPlace (local queue) are out of scope.
 #include "SelftestGate.h"
+#include "../AcesColor.h"
 #include "../BatchExportQueue.h"
+#include "../ExportDialog.h"
 #include "../MainWindow.h"
 #include "../RenderQueue.h"
 #include "../RenderQueueDialog.h"
@@ -16,11 +18,14 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QSet>
 #include <QSettings>
 #include <QSignalSpy>
 #include <QStatusBar>
 #include <QTemporaryDir>
+#include <QUuid>
 #include <QVector>
 
 #include <cstdio>
@@ -91,10 +96,53 @@ int runRenderNotifySelftest()
 
     QTemporaryDir work;
     const QString video = work.filePath("notify-video.mp4");
+
+    // G6: a queued job keeps the ACES pipeline that was set when it was added; a later
+    // setAcesPipeline is only the default for later jobs, and a pipeline the caller put on
+    // the job is kept. Detects the worker reading the queue's live pipeline (HEAD: RenderJob
+    // had no acesPipeline) and addJob not copying it (mutation in US-1108-mutation.txt).
+    // Needs no encoder (nothing is rendered), so it runs before the mpeg4 check.
+    const auto gateAcesPerJob = [&]() {
+        RenderQueue queue;
+        QVector<RenderJob> seen;
+        QObject::connect(&queue, &RenderQueue::jobsChanged, &queue, [&]() { seen = queue.jobs(); });
+        aces::AcesPipeline on;
+        on.enabled = true;
+        on.input = aces::ColorSpace::Rec709;
+        on.output = aces::ColorSpace::sRGB;
+        queue.setAcesPipeline(on);
+        queue.addJob(makeJob(nullptr, work.filePath("g6-a.mp4")));
+        queue.setAcesPipeline(aces::AcesPipeline{});
+        queue.addJob(makeJob(nullptr, work.filePath("g6-b.mp4")));
+        RenderJob explicitJob = makeJob(nullptr, work.filePath("g6-c.mp4"));
+        explicitJob.acesPipeline = on;
+        queue.addJob(explicitJob);
+        const auto describe = [](const RenderJob &job) {
+            if (!job.acesPipeline) return QStringLiteral("unset");
+            return QStringLiteral("enabled=%1 input=%2 output=%3").arg(job.acesPipeline->enabled)
+                .arg(aces::colorSpaceName(job.acesPipeline->input), aces::colorSpaceName(job.acesPipeline->output));
+        };
+        const auto isOn = [&](const RenderJob &job) {
+            return job.acesPipeline && job.acesPipeline->enabled && job.acesPipeline->input == on.input
+                && job.acesPipeline->output == on.output;
+        };
+        const bool three = seen.size() == 3;
+        const bool firstKept = three && isOn(seen[0]);
+        const bool secondOff = three && seen[1].acesPipeline && !seen[1].acesPipeline->enabled;
+        const bool explicitKept = three && isOn(seen[2]);
+        std::fprintf(stderr, "[render-notify] G6 jobs=%lld first=%s second=%s explicit=%s\n",
+            static_cast<long long>(seen.size()),
+            qPrintable(three ? describe(seen[0]) : QString()),
+            qPrintable(three ? describe(seen[1]) : QString()),
+            qPrintable(three ? describe(seen[2]) : QString()));
+        tally.gate(6, firstKept && secondOff && explicitKept);
+    };
+
     QString encoderReason;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderReason)) {
         const QByteArray reason = encoderReason.toUtf8();
-        for (int n = 1; n <= 4; ++n) tally.skip(n, reason.constData());
+        for (int n = 1; n <= 5; ++n) tally.skip(n, reason.constData());
+        gateAcesPerJob();
         return tally.finish("render-notify");
     }
     const bool fixture = work.isValid() && writeVideo(video);
@@ -258,6 +306,98 @@ int runRenderNotifySelftest()
             && window.renderCompleteNotificationCountForTest == 1
             && messageOf(window).contains(QStringLiteral("(2 件、失敗 0 件)")));
     }
+    // G5: on the shared queue the normal / mobile export progress dialog follows only the
+    // uuid buildExportRenderJob gave its job, and Cancel / cancelJob touch only that job.
+    // Detects the dialog reacting to another job's jobProgressUuid (HEAD connected without
+    // the uuid; mutation in US-1108-mutation.txt) and Cancel stopping the whole queue.
+    {
+        MainWindow window;
+        window.hide();
+        RenderQueue *queue = window.ensureRenderQueue();
+        ExportConfig cfg;
+        cfg.outputPath = work.filePath("g5-gui.mp4");
+        cfg.width = cfg.height = 64;
+        cfg.fps = 10;
+        cfg.videoCodec = QStringLiteral("mpeg4");
+        cfg.videoBitrate = 200;
+        const RenderJob guiJob = window.buildExportRenderJob(cfg, MainWindow::ExportEntry::Normal);
+        const bool uuidSet = !QUuid::fromString(guiJob.uuid).isNull();
+        window.showExportProgressDialog(guiJob.uuid, QStringLiteral("g5"), QStringLiteral("Cancel"),
+                                        [](bool, const QString &) {});
+        QPointer<QProgressDialog> dialog =
+            window.findChild<QProgressDialog *>(QStringLiteral("exportProgressDialog"));
+        const bool dialogFound = !dialog.isNull();
+
+        RenderJob other = makeJob(&tl, work.filePath("g5-other.mp4"));
+        QVector<RenderJob> seen;
+        QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() { seen = queue->jobs(); });
+        queue->addJob(other);
+        queue->addJob(guiJob);
+        const bool queuedBoth = seen.size() == 2 && seen[0].uuid == other.uuid
+            && seen[1].uuid == guiJob.uuid;
+
+        // While `other` renders: an unknown uuid changes nothing, the dialog's Cancel removes
+        // its pending job only, and cancelJob(other) cancels the running job.
+        bool cancelsDone = false, unknownNoop = false, pendingRemoved = false, stillRunning = false;
+        bool runningCancelled = false;
+        const auto statusOf = [&](const QString &uuid) {
+            for (const RenderJob &job : seen)
+                if (job.uuid == uuid) return static_cast<int>(job.status);
+            return -1;
+        };
+        QObject::connect(queue, &RenderQueue::jobProgressUuid, queue, [&](QString uuid, int) {
+            if (cancelsDone || uuid != other.uuid) return;
+            cancelsDone = true;
+            seen = queue->jobs();
+            queue->cancelJob(QStringLiteral("render-notify-g5-no-such-job"));
+            unknownNoop = seen.size() == 2
+                && statusOf(other.uuid) == static_cast<int>(RenderJobStatus::Rendering)
+                && statusOf(guiJob.uuid) == static_cast<int>(RenderJobStatus::Pending);
+            if (dialog) emit dialog->canceled();
+            pendingRemoved = seen.size() == 1 && statusOf(guiJob.uuid) == -1;
+            stillRunning = queue->isRunning()
+                && statusOf(other.uuid) == static_cast<int>(RenderJobStatus::Rendering);
+            queue->cancelJob(other.uuid);
+            runningCancelled = statusOf(other.uuid) == static_cast<int>(RenderJobStatus::Cancelled);
+        });
+        QSignalSpy all(queue, &RenderQueue::allCompleted);
+        queue->start();
+        const bool done = fixture && (all.wait(120000) || !all.isEmpty());
+        // A finished (cancelled) job is not touched again.
+        queue->cancelJob(other.uuid);
+        const bool finishedNoop = seen.size() == 1
+            && statusOf(other.uuid) == static_cast<int>(RenderJobStatus::Cancelled);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        const bool dialogClosed = dialog.isNull();
+        const int realProgress = window.progressDialogUpdateCountForTest(guiJob.uuid);
+
+        // The other job's progress must not move a dialog; its own uuid does (positive control).
+        window.showExportProgressDialog(guiJob.uuid, QStringLiteral("g5"), QStringLiteral("Cancel"),
+                                        [](bool, const QString &) {});
+        QPointer<QProgressDialog> probe =
+            window.findChild<QProgressDialog *>(QStringLiteral("exportProgressDialog"));
+        const int valueBefore = probe ? probe->value() : -2;
+        emit queue->jobProgressUuid(other.uuid, 37);
+        const int otherCount = window.progressDialogUpdateCountForTest(guiJob.uuid);
+        const int otherValue = probe ? probe->value() : -2;
+        emit queue->jobProgressUuid(guiJob.uuid, 41);
+        const int ownCount = window.progressDialogUpdateCountForTest(guiJob.uuid);
+        const int ownValue = probe ? probe->value() : -2;
+        delete probe.data();
+        std::fprintf(stderr, "[render-notify] G5 uuidSet=%d uuid=%s dialogFound=%d queuedBoth=%d "
+            "done=%d realProgressUpdates=%d\n"
+            "[render-notify] G5 cancelJob unknown->noop=%d dialogCancel pending->removed=%d "
+            "queueStillRunning=%d running->cancelled=%d finished->noop=%d dialogClosed=%d\n"
+            "[render-notify] G5 probe valueBefore=%d otherUuid count=%d value=%d ownUuid count=%d value=%d\n",
+            uuidSet, qPrintable(guiJob.uuid), dialogFound, queuedBoth,
+            done, realProgress, unknownNoop, pendingRemoved, stillRunning, runningCancelled,
+            finishedNoop, dialogClosed, valueBefore, otherCount, otherValue, ownCount, ownValue);
+        tally.gate(5, uuidSet && dialogFound && queuedBoth && done && cancelsDone && realProgress == 0
+            && unknownNoop && pendingRemoved && stillRunning && runningCancelled && finishedNoop
+            && dialogClosed && otherCount == 0 && otherValue == valueBefore
+            && ownCount == 1 && ownValue == 41);
+    }
+    gateAcesPerJob();
     restore();
     return tally.finish("render-notify");
 }

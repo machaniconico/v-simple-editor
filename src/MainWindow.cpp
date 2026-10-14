@@ -275,6 +275,7 @@ double exporter_loudnessGainDb();
 #include <QTimer>
 #include <QPointer>
 #include <QUrl>
+#include <QUuid>
 #include <QDebug>
 #include <QSizeF>
 #include <QActionGroup>
@@ -10414,6 +10415,8 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
                                            double *projectLoudnessGainDb)
 {
     RenderJob job;
+    // The progress dialog follows this job by uuid on the shared queue (see showExportProgressDialog).
+    job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     job.name = QFileInfo(config.outputPath).fileName();
     job.projectFilePath = m_projectFilePath;
     job.outputPath = config.outputPath;
@@ -10511,6 +10514,38 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
     return true;
 }
 
+void MainWindow::showExportProgressDialog(const QString &jobUuid, const QString &label,
+    const QString &cancelText, const std::function<void(bool, const QString &)> &onFinished)
+{
+    auto *progress = new QProgressDialog(label, cancelText, 0, 100, this);
+    progress->setObjectName(QStringLiteral("exportProgressDialog"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+
+    // The queue is shared with MCP export_video, so only this job drives the dialog.
+    // Connections are scoped to `progress` so they auto-disconnect when it is destroyed.
+    connect(m_renderQueue, &RenderQueue::jobProgressUuid, progress,
+            [this, progress, jobUuid](const QString &uuid, int percent) {
+        if (uuid != jobUuid) return;
+        ++m_progressDialogUpdatesForTest[jobUuid];
+        progress->setValue(percent);
+    });
+    connect(m_renderQueue, &RenderQueue::jobCompletedUuid, progress,
+            [progress, jobUuid, onFinished](const QString &uuid, bool success, const QString &err) {
+        if (uuid != jobUuid) return;
+        progress->close();
+        progress->deleteLater();
+        onFinished(success, err);
+    });
+    connect(progress, &QProgressDialog::canceled, m_renderQueue, [this, progress, jobUuid]() {
+        m_renderQueue->cancelJob(jobUuid);
+        // A pending job is removed without jobCompletedUuid, so close the dialog here.
+        for (const RenderJob &job : m_renderQueue->jobs())
+            if (job.uuid == jobUuid) return;
+        progress->deleteLater();
+    });
+}
+
 void MainWindow::exportVideo()
 {
     ExportDialog dialog(m_projectConfig, this);
@@ -10603,29 +10638,16 @@ void MainWindow::exportVideo()
         }
     }
 
-    auto *progress = new QProgressDialog("Exporting...", "Cancel", 0, 100, this);
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(0);
-
     // Bridge RenderQueue's uuid-keyed signals to the same progress/finish UX
-    // the old Exporter path showed. Connections are scoped to `progress` so
-    // they auto-disconnect when the dialog is destroyed.
-    connect(m_renderQueue, &RenderQueue::jobProgressUuid, progress,
-            [progress](const QString &, int percent) {
-        progress->setValue(percent);
-    });
-    connect(m_renderQueue, &RenderQueue::jobCompletedUuid, progress,
-            [this, progress](const QString &, bool success, const QString &err) {
-        progress->close();
-        progress->deleteLater();
+    // the old Exporter path showed.
+    showExportProgressDialog(job.uuid, QStringLiteral("Exporting..."), QStringLiteral("Cancel"),
+                             [this](bool success, const QString &err) {
         if (success)
             statusBar()->showMessage("Export complete: rendered via timeline SSOT");
         else
             QMessageBox::critical(this, "Export Failed",
                 err.isEmpty() ? QStringLiteral("Export failed") : err);
     });
-    connect(progress, &QProgressDialog::canceled, m_renderQueue,
-            &RenderQueue::stop);
 
     // RM-1.3: this is a job.timeline != nullptr path — RenderQueue's
     // resolveTimeline early-returns before its persisted-project matte
@@ -16801,22 +16823,10 @@ void MainWindow::onMobileExport()
                         }
                     }
 
-                    auto *progress = new QProgressDialog(
+                    showExportProgressDialog(job.uuid,
                         QStringLiteral("モバイル向けエクスポート中..."),
-                        QStringLiteral("キャンセル"), 0, 100, this);
-                    progress->setWindowModality(Qt::WindowModal);
-                    progress->setMinimumDuration(0);
-                    connect(m_renderQueue, &RenderQueue::jobProgressUuid,
-                            progress,
-                            [progress](const QString &, int percent) {
-                                progress->setValue(percent);
-                            });
-                    connect(m_renderQueue, &RenderQueue::jobCompletedUuid,
-                            progress,
-                            [this, progress](const QString &, bool ok,
-                                             const QString &err) {
-                                progress->close();
-                                progress->deleteLater();
+                        QStringLiteral("キャンセル"),
+                            [this](bool ok, const QString &err) {
                                 if (ok)
                                     statusBar()->showMessage(QStringLiteral(
                                         "モバイル書き出し完了 (timeline SSOT)"));
@@ -16827,8 +16837,6 @@ void MainWindow::onMobileExport()
                                             ? QStringLiteral("Export failed")
                                             : err);
                             });
-                    connect(progress, &QProgressDialog::canceled,
-                            m_renderQueue, &RenderQueue::stop);
                     // RM-1.3: job.timeline != nullptr path — exports the
                     // live matte carrier, as File→Export above.
                     syncProjectLightingToTimeline();
