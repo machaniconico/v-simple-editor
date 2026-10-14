@@ -200,6 +200,10 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
                 || (plan.legacyEqEnabled.value(track) && !plan.legacyEqConfigs.value(track).isDefault());
         }
     }
+    const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
+    // Any un-muted clip EQ needs the DSP path (and rules out passthrough).
+    for (const PlaybackEntry &entry : entries)
+        plan.useTrackFx = plan.useTrackFx || (entry.clipEqEnabled && !entry.audioMuted);
     plan.useMasterEq = (plan.masterChain.eqEnabled || plan.masterChain.deesser.enabled)
         && !audiofxexport::masterEqBypass;
     if (options.forcedOutputPath.isEmpty() && !plan.useTrackFx && !plan.useMasterEq
@@ -208,7 +212,6 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
         return plan;
     }
 
-    const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
     plan.renderInPlace = !options.forcedOutputPath.isEmpty();
     plan.durationSeconds = qMax(0.001, plan.renderInPlace
         ? options.forcedDurationSeconds : timeline->totalDuration());
@@ -392,6 +395,10 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
                                    std::move(samples)});
                 clipPaths[i] = clipPath;
             }
+            for (int k = 0; k < it.value().size(); ++k) {
+                const PlaybackEntry &entry = validEntries[it.value()[k]];
+                if (entry.clipEqEnabled) processClipEq(buffers[k], entry.clipEq);
+            }
             processTrackEntries(buffers, plan.trackChains.value(track),
                 plan.legacyEqCoeffs.value(track), plan.legacyEqEnabled.value(track, false),
                 plan.legacyEqConfigs.value(track).preamp);
@@ -574,4 +581,17 @@ void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
         // Gaps do not advance DSP histories or feed silence to NR/reverb.
         t = active ? blockEnd : next;
     }
+}
+
+void audioexport::processClipEq(DspEntry &entry, const trackfx::EqSettings &eq)
+{
+    if (entry.samples.empty()) return;
+    trackfx::Chain chain;
+    chain.eq = eq;
+    chain.eqEnabled = true;
+    trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
+    processor.reset();
+    const qint64 frames = static_cast<qint64>(entry.samples.size() / 2);
+    for (qint64 f = 0; f < frames; f += 1024)
+        processor.process(entry.samples.data() + 2 * f, static_cast<int>(std::min<qint64>(1024, frames - f)));
 }

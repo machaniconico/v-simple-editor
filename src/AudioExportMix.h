@@ -27,6 +27,9 @@ void processTrackEntries(std::vector<DspEntry> &entries, const trackfx::Chain &c
                          const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
                          bool eqEnabled, double preampDb);
 
+// Runs one entry's per-clip EQ (fresh filter history) before the track chain sees it.
+void processClipEq(DspEntry &entry, const trackfx::EqSettings &eq);
+
 QString findFfmpegBinary();
 QString ffmpegNumber(double value);
 QVector<AudioGainPoint> sortedDedupedEnvelope(QVector<AudioGainPoint> env);
