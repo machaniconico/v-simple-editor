@@ -6319,6 +6319,23 @@ void MainWindow::setupMenuBar()
         });
     connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
             m_timeline, &Timeline::absorbIntoCurrentUndoPoint);
+    // An AUX send edit is one undo point: sendEdited fires before routingChanged,
+    // so the absorb above only refreshes the point recorded here.
+    connect(m_audioBusPanel, &AudioBusPanel::sendEdited, this, [this] {
+        m_timeline->saveUndoState(tr("AUX センドを変更"));
+    });
+    m_audioBusPanel->setTrackCountProvider([this] { return m_timeline->audioTrackCount(); });
+    // Timeline::addAudioTrack emits no audioSequenceChanged (it only saves an undo
+    // state), so UndoManager::stateChanged also drives the refresh; it covers
+    // track add and its undo / redo.
+    connect(m_timeline, &Timeline::audioSequenceChanged, m_audioBusPanel, [this] {
+        if (m_audioBusPanel->isVisible())
+            m_audioBusPanel->refresh();
+    });
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged, m_audioBusPanel, [this] {
+        if (m_audioBusPanel->isVisible())
+            m_audioBusPanel->refresh();
+    });
 
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");

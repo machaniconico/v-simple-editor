@@ -721,6 +721,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioMixerDock.cpp
     src/AudioMixerDock.h
     src/selftests/mixer_dock_selftest.cpp
+    src/selftests/aux_send_selftest.cpp
     src/SpectrumAnalyzerDock.cpp
     src/SpectrumAnalyzerDock.h
     src/selftests/spectrum_selftest.cpp

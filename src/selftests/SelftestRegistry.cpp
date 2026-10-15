@@ -62,6 +62,7 @@ int runAutoColorSelftest();
 int runAutoDuckingSelftest();
 int runAutoMatteSelftest();
 int runAutoProxyPolicySelftest();
+int runAuxSendSelftest();
 int runBatchExportE2ESelftest();
 int runBatchExportSelftest();
 int runBeatDetectSelftest();
@@ -1079,6 +1080,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence, live dock, seek counter, dock follows project/track changes (8 gates)" },
     { "mixer-dock", nullptr, runMixerDockSelftest, true,
       "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (10 gates)" },
+    { "aux-send", nullptr, runAuxSendSelftest, true,
+      "AUX send table: per-bus send level and pre-fader edit with one undo point per edit, hidden refresh writes nothing (3 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,
