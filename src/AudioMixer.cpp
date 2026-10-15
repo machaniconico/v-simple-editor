@@ -703,6 +703,17 @@ private:
     std::atomic<bool> m_workPending{false};
 };
 
+namespace {
+// Track mute / solo rule shared by effectiveGain and the route mix (US-1122):
+// with any track soloed only soloed tracks sound, otherwise every unmuted one.
+bool trackAudible(const QVector<AudioMixer::TrackState> &tracks, int trackIdx)
+{
+    bool anySolo = false;
+    for (const auto &t : tracks) if (t.solo) { anySolo = true; break; }
+    return anySolo ? tracks[trackIdx].solo : !tracks[trackIdx].muted;
+}
+} // namespace
+
 // =====================================================================
 // MixerIODevice — sums samples across every active entry into an int32
 // accumulator, then clamps to s16 stereo. Per-clip volume + per-track
@@ -930,19 +941,27 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         double gain = qBound(0.0, clipGain, 4.0);
         if (e->entry.audioMuted) gain = 0.0;
         const int trackIdx = e->entry.sourceTrack;
-        if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
-            gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
-        // AB-4: bus / submix / aux-send routing. Multiply the per-track
-        // bus-chain gain (track → assigned bus → outputBus chain → master,
-        // with bus mute/solo/cycle handling) into the effective gain. With
-        // no buses defined and no track assigned, resolveTrackToMasterGain
-        // returns 1.0 (identity), so the default preview/export path is
-        // bit-identical to pre-AB-4. The resolve is a cheap O(bus-count)
-        // double accumulation and runs under m_controlMutex (held for the
-        // whole readData fragment), so the GUI-thread setBusRouting swap is
-        // race-free against this read.
-        if (trackIdx >= 0)
-            gain *= m_mixer->m_busRouting.resolveTrackToMasterGain(trackIdx);
+        // AB-4 / US-1122: bus / submix / aux-send routing. route.post is the
+        // main bus chain (track → assigned bus → outputBus chain → master,
+        // with bus mute/solo/cycle handling) plus the post-fader sends and
+        // rides the track fader; route.pre sums the pre-fader sends, which
+        // skip the fader but still follow the track mute / solo. With no
+        // buses and no sends route = {1, 0}, so the factor is the plain
+        // track gain (bit-identical to pre-AB-4). The resolve is a cheap
+        // O(bus-count + send-count) accumulation under m_controlMutex (held
+        // for the whole readData fragment), so the GUI-thread setBusRouting
+        // swap is race-free against this read.
+        if (trackIdx >= 0) {
+            const audiobus::RouteGains route =
+                m_mixer->m_busRouting.resolveTrackRouteGains(trackIdx);
+            double trackFactor = route.post + route.pre; // no track state: fader 1
+            if (trackIdx < m_mixer->m_trackStates.size()) {
+                trackFactor = trackAudible(m_mixer->m_trackStates, trackIdx)
+                    ? m_mixer->m_trackStates[trackIdx].gain * route.post + route.pre
+                    : 0.0;
+            }
+            gain *= trackFactor;
+        }
 
         // Edge-attached audio fade. Equal-power (sqrt) curve so A.trailOut^2
         // + B.leadIn^2 == 1 at the midpoint of an overlap crossfade — linear
@@ -3107,11 +3126,9 @@ bool AudioMixer::ensureSinkLocked() {
 }
 
 void AudioMixer::recomputeEffectiveGainsLocked() {
-    bool anySolo = false;
-    for (const auto &t : m_trackStates) if (t.solo) { anySolo = true; break; }
-    for (auto &t : m_trackStates) {
-        const bool audible = anySolo ? t.solo : !t.muted;
-        t.effectiveGain = audible ? t.gain : 0.0;
+    for (int i = 0; i < m_trackStates.size(); ++i) {
+        auto &t = m_trackStates[i];
+        t.effectiveGain = trackAudible(m_trackStates, i) ? t.gain : 0.0;
     }
 }
 

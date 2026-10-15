@@ -1,5 +1,6 @@
 // US-704: persistent PCM fixture for the real timeline export audio mixer.
 // Run from the repository root and compare data chunks across baseline/HEAD.
+#include "../AudioBusRouting.h"
 #include "../AudioMixer.h"
 #include "../AudioTrackFx.h"
 #include "../MainWindow.h"
@@ -35,7 +36,7 @@
 
 namespace {
 
-constexpr int kFixtureCount = 10;
+constexpr int kFixtureCount = 13;
 // Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
 constexpr int kLegacyWrongSlot = 100;
 // G10 (US-1020): g's legacy EQ migrated by trackfx::eqFromLegacy, and the
@@ -55,7 +56,18 @@ constexpr int kTrackPan = 8;
 constexpr int kClipPan = 9;
 constexpr int kPanZero = 105;
 constexpr int kTrackPanMid = 106;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
+// US-1122: variant k (index 10) is a + bus "Bus 1" gain 0.5 with track 0 assigned to it; l (11)
+// is a + track 0 on master + a post-fader AUX send to Bus 1 (gain 1) at level 0.5; m (12) is a +
+// track 0 gain 0.25 + a pre-fader AUX send to Bus 1 at level 0.5. Controls: k with Bus 1 muted,
+// an explicitly empty routing, a Bus 1 (gain 0.5) that no track uses, and m with track 0 muted.
+constexpr int kBusGain = 10;
+constexpr int kAuxPost = 11;
+constexpr int kAuxPre = 12;
+constexpr int kBusMuted = 107;
+constexpr int kRoutingEmpty = 108;
+constexpr int kBusUnused = 109;
+constexpr int kAuxPreTrackMuted = 110;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"};
 
 // Explicit-instantiation access keeps MainWindow.h unchanged: the project save / load
 // round trip reads the private audio-state pair.
@@ -285,6 +297,22 @@ bool setupVariant(int variant, AudioMixer &mixer, Timeline &timeline, QString *e
         mixer.setTrackPan(0, 0.0);
         mixer.setTrackGain(0, 1.0);
     }
+    if (variant == kBusGain || variant == kBusMuted || variant == kAuxPost || variant == kAuxPre
+        || variant == kAuxPreTrackMuted || variant == kRoutingEmpty || variant == kBusUnused) {
+        audiobus::AudioBusRouting routing;
+        if (variant != kRoutingEmpty) {
+            const int bus = routing.addBus(QStringLiteral("Bus 1"));
+            if (variant == kBusGain || variant == kBusMuted || variant == kBusUnused)
+                routing.setBusGain(bus, 0.5);
+            if (variant == kBusMuted) routing.setBusMute(bus, true);
+            if (variant == kBusGain || variant == kBusMuted) routing.assignTrackToBus(0, bus);
+            if (variant == kAuxPost) routing.addAuxSend({0, bus, 0.5, false});
+            if (variant == kAuxPre || variant == kAuxPreTrackMuted) routing.addAuxSend({0, bus, 0.5, true});
+        }
+        mixer.setBusRouting(routing);
+    }
+    if (variant == kAuxPre || variant == kAuxPreTrackMuted) mixer.setTrackGain(0, 0.25);
+    if (variant == kAuxPreTrackMuted) mixer.setTrackMute(0, true);
     if (variant == 1 || variant == 3)
         mixer.setTrackGain(0, 0.5);
     if (variant == 2 || variant == 3) {
@@ -386,7 +414,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 15; ++gate)
+        for (int gate = 1; gate <= 18; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -394,13 +422,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 15; ++gate)
+        for (int gate = 2; gate <= 18; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 15; ++gate)
+        for (int gate = 2; gate <= 18; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -420,7 +448,7 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 15; ++gate)
+        for (int gate = 2; gate <= 18; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
@@ -455,7 +483,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "ten PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "thirteen PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -1232,6 +1260,117 @@ int runAudioFixtureSelftest()
         tally.gate(15, generated[0] && generated[kClipPan] && repeatEqual[kClipPan] && firstSilent
                        && deltaDb <= 0.1 && aCentred && secondOk,
                    "a clip pan -1 without track FX must silence the right channel of the export's first clip and leave the second clip within 2 LSB of a");
+    }
+    // US-1122 G16: the export applies the bus chain and the AUX sends (resolveTrackRouteGains).
+    // Variant k (track 0 on Bus 1, gain 0.5) exports at a x 0.5 and l (master + post-fader send at
+    // 0.5 into a unity Bus 1) at a x 1.5, each within 0.1 dB; muting Bus 1 silences k; k and l are
+    // deterministic. Controls: an explicitly empty routing and a Bus 1 (gain 0.5) that no track uses
+    // both export byte-identical to a. Detects: the export ignoring the routing (k == a, l == a, as
+    // at the base where the export reads only trackGain) or a send counted twice / dropped.
+    const auto routeExport = [&](int variant, const char *name, QByteArray *pcmOut, QString *error) {
+        return repeat.isValid() && generate(variant, panFile(name), pcmOut, error);
+    };
+    const auto dbError = [](double measured, double expected) {
+        return (measured > 0.0 && expected > 0.0) ? std::abs(20.0 * std::log10(measured / expected))
+                                                   : std::numeric_limits<double>::infinity();
+    };
+    {
+        QByteArray mutedPcm, emptyPcm, unusedPcm;
+        QString mutedError, emptyError, unusedError;
+        const bool mutedOk = routeExport(kBusMuted, "bus_muted.wav", &mutedPcm, &mutedError);
+        const bool emptyOk = routeExport(kRoutingEmpty, "routing_empty.wav", &emptyPcm, &emptyError);
+        const bool unusedOk = routeExport(kBusUnused, "bus_unused.wav", &unusedPcm, &unusedError);
+        const double aRms = rms(pcm[0]);
+        const double kRms = rms(pcm[kBusGain]);
+        const double lRms = rms(pcm[kAuxPost]);
+        const double mutedRms = rms(mutedPcm);
+        const double kDb = dbError(kRms, aRms * 0.5);
+        const double lDb = dbError(lRms, aRms * 1.5);
+        const bool aSane = aRms > 0.01;
+        const bool kMuted = mutedOk && !mutedPcm.isEmpty() && mutedRms < 1e-6;
+        const bool emptyIdentical = emptyOk && emptyPcm == pcm[0];
+        const bool unusedIdentical = unusedOk && unusedPcm == pcm[0];
+        const bool kIdenticalToA = pcm[kBusGain] == pcm[0];
+        std::fprintf(stderr, "G16 aRms=%.12g kRms=%.12g kRatio=%.12g kDeltaDb=%.12g lRms=%.12g lRatio=%.12g "
+                             "lDeltaDb=%.12g aSane=%d kIdenticalToA=%d\n",
+                     aRms, kRms, aRms > 0.0 ? kRms / aRms : -1.0, kDb, lRms, aRms > 0.0 ? lRms / aRms : -1.0,
+                     lDb, aSane, kIdenticalToA);
+        std::fprintf(stderr, "G16 busMuted rms=%.12g bytes=%lld silent=%d error=%s deterministic k=%d l=%d\n",
+                     mutedRms, static_cast<long long>(mutedPcm.size()), kMuted, mutedError.toUtf8().constData(),
+                     repeatEqual[kBusGain], repeatEqual[kAuxPost]);
+        std::fprintf(stderr, "G16 controls routingEmptyIdenticalToA=%d bytes=%lld error=%s "
+                             "busUnusedIdenticalToA=%d bytes=%lld error=%s\n",
+                     emptyIdentical, static_cast<long long>(emptyPcm.size()), emptyError.toUtf8().constData(),
+                     unusedIdentical, static_cast<long long>(unusedPcm.size()), unusedError.toUtf8().constData());
+        tally.gate(16, generated[0] && generated[kBusGain] && generated[kAuxPost] && aSane && kDb <= 0.1
+                       && lDb <= 0.1 && kMuted && repeatEqual[kBusGain] && repeatEqual[kAuxPost]
+                       && emptyIdentical && unusedIdentical,
+                   "bus gain 0.5 must export a x 0.5, a post-fader send 0.5 must export a x 1.5 (0.1 dB), a muted bus must silence k, and empty / unused routing must export byte-identical to a");
+    }
+    // G17: playback (renderPcmForTest) and export agree within 0.5 dB on the k / a and l / a level
+    // ratios over [0.1 s, 0.4 s). Sanity bands: k 0.45..0.55, l 1.4..1.6 on both sides. Detects
+    // playback and export resolving the routing differently (e.g. one side dropping the sends).
+    const auto playbackPcm = [&](int variant) {
+        AudioMixer mixer;
+        Timeline timeline;
+        QString error;
+        if (!setupVariant(variant, mixer, timeline, &error, source)) return QByteArray();
+        mixer.setSequence(timeline.computeAudioPlaybackSequence());
+        return mixer.renderPcmForTest(48000);
+    };
+    const QByteArray playA = playbackPcm(0);
+    const double playARms = windowRms(playA, 2, 48000);
+    const double exportARms = windowRms(pcm[0], channels[0], sampleRates[0]);
+    {
+        const double playK = playARms > 0.0 ? windowRms(playbackPcm(kBusGain), 2, 48000) / playARms : 0.0;
+        const double playL = playARms > 0.0 ? windowRms(playbackPcm(kAuxPost), 2, 48000) / playARms : 0.0;
+        const double exportK = exportARms > 0.0
+            ? windowRms(pcm[kBusGain], channels[kBusGain], sampleRates[kBusGain]) / exportARms : 0.0;
+        const double exportL = exportARms > 0.0
+            ? windowRms(pcm[kAuxPost], channels[kAuxPost], sampleRates[kAuxPost]) / exportARms : 0.0;
+        const double kDb = dbError(playK, exportK);
+        const double lDb = dbError(playL, exportL);
+        const auto within = [](double v, double lo, double hi) { return v >= lo && v <= hi; };
+        const bool sane = within(playK, 0.45, 0.55) && within(exportK, 0.45, 0.55)
+            && within(playL, 1.4, 1.6) && within(exportL, 1.4, 1.6);
+        std::fprintf(stderr, "G17 playARms=%.12g exportARms=%.12g k play=%.12g export=%.12g deltaDb=%.12g "
+                             "l play=%.12g export=%.12g deltaDb=%.12g sane=%d sanity=k[0.45,0.55] l[1.4,1.6]\n",
+                     playARms, exportARms, playK, exportK, kDb, playL, exportL, lDb, sane);
+        tally.gate(17, generated[0] && generated[kBusGain] && generated[kAuxPost] && sane && kDb <= 0.5
+                       && lDb <= 0.5,
+                   "playback and export must agree within 0.5 dB on the bus (k) and AUX send (l) level ratios");
+    }
+    // G18: variant m (track gain 0.25 + pre-fader send 0.5) exports at a x (0.25 + 0.5) = a x 0.75
+    // within 0.1 dB: the pre-fader send skips the track fader. Playback agrees within 0.5 dB, and a
+    // track 0 mute silences playback (the pre-fader send follows the track mute), while the export
+    // of the muted project stays at a x 0.75 (track mute / solo are not exported, decision 3-3).
+    // Detects: a pre-fader send scaled by the fader (a x 0.375), a pre-fader send surviving the
+    // playback mute (a x 0.5), or the export applying the track mute (silence).
+    {
+        QByteArray mutedPcm;
+        QString mutedError;
+        const bool mutedOk = routeExport(kAuxPreTrackMuted, "aux_pre_track_muted.wav", &mutedPcm, &mutedError);
+        const double aRms = rms(pcm[0]);
+        const double mRms = rms(pcm[kAuxPre]);
+        const double mutedRms = rms(mutedPcm);
+        const double mDb = dbError(mRms, aRms * 0.75);
+        const double mutedDb = dbError(mutedRms, aRms * 0.75);
+        const double playM = playARms > 0.0 ? windowRms(playbackPcm(kAuxPre), 2, 48000) / playARms : 0.0;
+        const double exportM = exportARms > 0.0
+            ? windowRms(pcm[kAuxPre], channels[kAuxPre], sampleRates[kAuxPre]) / exportARms : 0.0;
+        const double playDb = dbError(playM, exportM);
+        const QByteArray playMuted = playbackPcm(kAuxPreTrackMuted);
+        const double playMutedRms = windowRms(playMuted, 2, 48000);
+        const bool playSilent = !playMuted.isEmpty() && playARms > 0.01 && playMutedRms < 1e-6;
+        std::fprintf(stderr, "G18 aRms=%.12g mRms=%.12g mRatio=%.12g mDeltaDb=%.12g deterministic=%d\n",
+                     aRms, mRms, aRms > 0.0 ? mRms / aRms : -1.0, mDb, repeatEqual[kAuxPre]);
+        std::fprintf(stderr, "G18 exportTrackMuted rms=%.12g ratio=%.12g deltaDb=%.12g error=%s\n",
+                     mutedRms, aRms > 0.0 ? mutedRms / aRms : -1.0, mutedDb, mutedError.toUtf8().constData());
+        std::fprintf(stderr, "G18 playback m=%.12g export=%.12g deltaDb=%.12g trackMutedRms=%.12g silent=%d\n",
+                     playM, exportM, playDb, playMutedRms, playSilent);
+        tally.gate(18, generated[0] && generated[kAuxPre] && repeatEqual[kAuxPre] && mDb <= 0.1 && mutedOk
+                       && mutedDb <= 0.1 && playDb <= 0.5 && playSilent,
+                   "a pre-fader send must bypass the track fader (a x 0.75), vanish on a playback track mute and stay in the export of the muted project");
     }
     return tally.finish();
 }

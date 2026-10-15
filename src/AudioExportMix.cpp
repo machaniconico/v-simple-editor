@@ -185,6 +185,7 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
     }
     if (mixer) {
         plan.masterChain = mixer->masterChain();
+        const audiobus::AudioBusRouting routing = mixer->busRouting();
         for (int track = 0; track < timeline->audioTracks().size(); ++track) {
             const trackfx::Chain chain = mixer->trackChain(track);
             plan.trackChains.insert(track, chain);
@@ -197,6 +198,10 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
             // including when no track effect is enabled.
             plan.useTrackFx = plan.useTrackFx || mixer->trackGain(track) != 1.0;
             plan.useTrackFx = plan.useTrackFx || mixer->trackPan(track) != 0.0;
+            // US-1122: a bus gain / mute / solo or an AUX send scales the track on the DSP path.
+            const audiobus::RouteGains route = routing.resolveTrackRouteGains(track);
+            plan.routeGains.insert(track, route);
+            plan.useTrackFx = plan.useTrackFx || !route.isIdentity();
             plan.useTrackFx = plan.useTrackFx || chain.eqEnabled || chain.compEnabled
                 || chain.reverbEnabled || chain.nrEnabled || chain.deesser.enabled
                 || (plan.legacyEqEnabled.value(track) && !plan.legacyEqConfigs.value(track).isDefault());
@@ -425,13 +430,15 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
                 qMax(0, qRound(entry.timelineStart * 1000.0)),
                 volumeExpressionForEntry(entry), clipDuration,
                 entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
-            // Static track gain and clip balance also belong after the DSP.
+            // Static track gain, bus / AUX route gains and clip balance also belong after the DSP.
+            // Route mix = trackGain × post + pre (pre-fader sends skip the fader, US-1122).
             const auto clipPan = audiopan::balanceGains(entry.pan);
             const double trackPan = plan.trackPans.value(entry.sourceTrack, 0.0);
             const auto trackPanGains = audiopan::balanceGains(trackPan);
             const audiopan::BalanceGains pan{clipPan.left * trackPanGains.left,
                                              clipPan.right * trackPanGains.right};
-            const double gain = plan.trackGains.value(entry.sourceTrack, 1.0);
+            const audiobus::RouteGains route = plan.routeGains.value(entry.sourceTrack);
+            const double gain = plan.trackGains.value(entry.sourceTrack, 1.0) * route.post + route.pre;
             if (gain != 1.0 || entry.pan != 0.0 || trackPan != 0.0) {
                 post.insert(QStringLiteral("[%1:a]").arg(i).size(),
                     QStringLiteral("pan=stereo|c0=%1*c0|c1=%2*c1,")

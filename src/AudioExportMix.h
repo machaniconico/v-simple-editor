@@ -56,6 +56,9 @@ struct MixPlan {
     QMap<int, bool> legacyEqEnabled;
     QMap<int, double> trackGains;
     QMap<int, double> trackPans;
+    // US-1122: bus chain + AUX sends per track (AudioBusRouting::resolveTrackRouteGains).
+    // Track mute / solo stay out of the export (decision 3-3).
+    QMap<int, audiobus::RouteGains> routeGains;
     bool useTrackFx = false;
     trackfx::Chain masterChain;
     bool useMasterEq = false;
