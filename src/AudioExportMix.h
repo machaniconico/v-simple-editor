@@ -55,6 +55,7 @@ struct MixPlan {
     QMap<int, std::array<AudioMixer::EqBandCoefs, 3>> legacyEqCoeffs;
     QMap<int, bool> legacyEqEnabled;
     QMap<int, double> trackGains;
+    QMap<int, double> trackPans;
     bool useTrackFx = false;
     trackfx::Chain masterChain;
     bool useMasterEq = false;

@@ -39,6 +39,7 @@ struct TimelineState {
     QVector<QString> videoTrackNames, audioTrackNames;
     QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
+    QVector<double> audioTrackPans;
     QJsonObject externalTrackState;
     // Bus routing snapshot (MainWindow::m_audioBusRouting stays the SSOT) taken
     // through Timeline::setBusRoutingBridge. Empty = not captured: restore skips it.

@@ -9501,11 +9501,18 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
 void MainWindow::collectAudioState(ProjectData &data)
 {
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
         data.trackEqStates.resize(n);
         data.masterFx = mixer->masterChain();
+        // Fader gain and pan (decision 3-1); trimmed to the last non-default track.
+        int mixCount = 0;
+        for (int i = 0; i < n; ++i)
+            if (mixer->trackGain(i) != 1.0 || mixer->trackPan(i) != 0.0) mixCount = i + 1;
+        for (int i = 0; i < mixCount; ++i)
+            data.trackMix.append({mixer->trackGain(i), mixer->trackPan(i)});
         for (int i = 0; i < n; ++i) {
             const trackfx::Chain chain = mixer->trackChain(i);
             if (!chain.isDefault()) data.trackFx.insert(i, chain);
@@ -9566,6 +9573,12 @@ void MainWindow::applyAudioState(const ProjectData &data)
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
             mixer->setTrackChain(it.key(), it.value());
         mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled, data.masterFx.deesser);
+        // Fader gain and pan: tracks absent from trackMix return to the defaults.
+        for (int i = 0; i < AudioMixer::kMaxAudioTracks; ++i) {
+            const TrackMixState mix = i < data.trackMix.size() ? data.trackMix[i] : TrackMixState{};
+            if (mixer->trackGain(i) != mix.gain) mixer->setTrackGain(i, mix.gain);
+            if (mixer->trackPan(i) != mix.pan) mixer->setTrackPan(i, mix.pan);
+        }
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);

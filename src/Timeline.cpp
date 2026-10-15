@@ -13553,8 +13553,11 @@ TimelineState Timeline::currentState() const
     if (m_audioMixer) {
         const int n = audioTrackCount();
         state.audioTrackGains.resize(n);
-        for (int i = 0; i < n; ++i)
+        state.audioTrackPans.resize(n);
+        for (int i = 0; i < n; ++i) {
             state.audioTrackGains[i] = m_audioMixer->trackGain(i);
+            state.audioTrackPans[i] = m_audioMixer->trackPan(i);
+        }
     }
 
     if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
@@ -13680,6 +13683,11 @@ void Timeline::restoreState(const TimelineState &state)
         const int n = qMin(state.audioTrackGains.size(), audioTrackCount());
         for (int i = 0; i < n; ++i)
             m_audioMixer->setTrackGain(i, state.audioTrackGains[i]);
+    }
+    if (m_audioMixer && !state.audioTrackPans.isEmpty()) {
+        const int n = qMin(state.audioTrackPans.size(), audioTrackCount());
+        for (int i = 0; i < n; ++i)
+            m_audioMixer->setTrackPan(i, state.audioTrackPans[i]);
     }
 
     // スナップショットに捕捉されたプロジェクト出力ジオメトリ(サイズ)を復元する。

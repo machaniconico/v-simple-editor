@@ -3,6 +3,7 @@
 #include "../AudioMixer.h"
 #include "../AudioTrackFx.h"
 #include "../MainWindow.h"
+#include "../ProjectFile.h"
 #include "../RenderInPlace.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -34,7 +35,7 @@
 
 namespace {
 
-constexpr int kFixtureCount = 8;
+constexpr int kFixtureCount = 10;
 // Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
 constexpr int kLegacyWrongSlot = 100;
 // G10 (US-1020): g's legacy EQ migrated by trackfx::eqFromLegacy, and the
@@ -47,7 +48,25 @@ constexpr int kMigratedWrongShelf = 102;
 constexpr int kClipEq = 7;
 constexpr int kClipEqFlat = 103;
 constexpr int kClipEqOff = 104;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h"};
+// US-1114: variant i (index 8) is a + the track pan -1 (hard left); variant j (index 9) is a +
+// the first clip's pan -1 with no track FX. Controls: explicit track pan 0 / gain 1 (must export
+// like a), and the track pan -0.3 (a pan whose two channels both stay audible).
+constexpr int kTrackPan = 8;
+constexpr int kClipPan = 9;
+constexpr int kPanZero = 105;
+constexpr int kTrackPanMid = 106;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"};
+
+// Explicit-instantiation access keeps MainWindow.h unchanged: the project save / load
+// round trip reads the private audio-state pair.
+template<class Tag, typename Tag::Type Member>
+struct Access {
+    friend typename Tag::Type member(Tag) { return Member; }
+};
+struct CollectAudioTag { using Type = void (MainWindow::*)(ProjectData &); friend Type member(CollectAudioTag); };
+struct ApplyAudioTag { using Type = void (MainWindow::*)(const ProjectData &); friend Type member(ApplyAudioTag); };
+template struct Access<CollectAudioTag, &MainWindow::collectAudioState>;
+template struct Access<ApplyAudioTag, &MainWindow::applyAudioState>;
 
 quint16 readLe16(const char *p)
 {
@@ -221,6 +240,23 @@ trackfx::EqSettings clipEqFor(int variant)
     return eq;
 }
 
+// RMS of one channel over [fromSec, toSec) of interleaved PCM16.
+double channelRms(const QByteArray &pcm, int channels, int sampleRate, int channel,
+                  double fromSec, double toSec)
+{
+    if (channels <= 0 || sampleRate <= 0 || channel < 0 || channel >= channels) return 0.0;
+    const qsizetype first = qsizetype(fromSec * sampleRate);
+    const qsizetype last = qMin(qsizetype(toSec * sampleRate), pcm.size() / (2 * channels));
+    if (last <= first) return 0.0;
+    double squares = 0.0;
+    for (qsizetype frame = first; frame < last; ++frame) {
+        const qint16 sample = static_cast<qint16>(readLe16(pcm.constData() + 2 * (frame * channels + channel)));
+        const double normalized = double(sample) / 32768.0;
+        squares += normalized * normalized;
+    }
+    return std::sqrt(squares / double(last - first));
+}
+
 // Interleaved PCM16 bytes of [fromSec, toSec).
 QByteArray pcmRange(const QByteArray &pcm, int channels, int sampleRate, double fromSec, double toSec)
 {
@@ -241,7 +277,14 @@ bool setupVariant(int variant, AudioMixer &mixer, Timeline &timeline, QString *e
         first.clipEq = clipEqFor(variant);
         first.clipEqEnabled = variant != kClipEqOff;
     }
+    if (variant == kClipPan) first.pan = -1.0;
     timeline.audioTracks().first()->setClips({first, second});
+    if (variant == kTrackPan) mixer.setTrackPan(0, -1.0);
+    if (variant == kTrackPanMid) mixer.setTrackPan(0, -0.3);
+    if (variant == kPanZero) {
+        mixer.setTrackPan(0, 0.0);
+        mixer.setTrackGain(0, 1.0);
+    }
     if (variant == 1 || variant == 3)
         mixer.setTrackGain(0, 0.5);
     if (variant == 2 || variant == 3) {
@@ -343,7 +386,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 12; ++gate)
+        for (int gate = 1; gate <= 15; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -351,13 +394,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 12; ++gate)
+        for (int gate = 2; gate <= 15; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 12; ++gate)
+        for (int gate = 2; gate <= 15; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -377,7 +420,7 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 12; ++gate)
+        for (int gate = 2; gate <= 15; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
@@ -412,7 +455,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "eight PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "ten PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -1009,6 +1052,186 @@ int runAudioFixtureSelftest()
                      hRatio, playbackRatio, deltaDb, playbackSane, offIdentical);
         tally.gate(12, toneOk && playbackSane && deltaDb <= 0.5 && offIdentical,
                    "playback and export must agree within 0.5 dB on the clip EQ ratio; clip EQ off must export like a");
+    }
+    // US-1114 G13: variant i (a + track pan -1) is deterministic, the right channel falls under
+    // 1 % of the left one over the whole file, and the left channel stays within 0.1 dB of a's
+    // left channel (balance(-1) = {1, 0}). Controls: a itself must have a right channel above
+    // 50 % of its left one (the measurement tells a centred file from a panned one), and an
+    // explicit track pan 0 / gain 1 must export byte-identical to a (no spurious route change).
+    // Detects: the track pan missing from the export plan or the useTrackFx condition.
+    const QString panDir = repeat.isValid() ? repeat.path() : QString();
+    const auto panFile = [&](const char *name) { return QDir(panDir).filePath(QString::fromLatin1(name)); };
+    QByteArray panZeroPcm, panMidPcm;
+    QString panError;
+    int panZeroCh = 0, panMidCh = 0, panZeroRate = 0, panMidRate = 0;
+    const bool panExtraOk = repeat.isValid()
+        && generate(kPanZero, panFile("pan_zero.wav"), &panZeroPcm, &panError, &panZeroCh, &panZeroRate)
+        && generate(kTrackPanMid, panFile("pan_mid.wav"), &panMidPcm, &panError, &panMidCh, &panMidRate);
+    {
+        const double tEnd = 4.0;
+        const double aL = channelRms(pcm[0], channels[0], sampleRates[0], 0, 0.0, tEnd);
+        const double aR = channelRms(pcm[0], channels[0], sampleRates[0], 1, 0.0, tEnd);
+        const double iL = channelRms(pcm[kTrackPan], channels[kTrackPan], sampleRates[kTrackPan], 0, 0.0, tEnd);
+        const double iR = channelRms(pcm[kTrackPan], channels[kTrackPan], sampleRates[kTrackPan], 1, 0.0, tEnd);
+        const double deltaDb = (aL > 0.0 && iL > 0.0) ? std::abs(20.0 * std::log10(iL / aL))
+                                                        : std::numeric_limits<double>::infinity();
+        const bool rightSilent = iL > 0.01 && iR < iL * 0.01;
+        const bool aCentred = aL > 0.01 && aR > aL * 0.5;
+        const bool zeroIdentical = panExtraOk && panZeroPcm == pcm[0];
+        std::fprintf(stderr, "G13 iL=%.12g iR=%.12g iRatio=%.12g aL=%.12g aR=%.12g aRatio=%.12g "
+                             "leftDeltaDb=%.12g deterministic=%d aCentred=%d panZeroIdenticalToA=%d "
+                             "panZeroBytes=%lld aBytes=%lld error=%s\n",
+                     iL, iR, iL > 0.0 ? iR / iL : -1.0, aL, aR, aL > 0.0 ? aR / aL : -1.0, deltaDb,
+                     repeatEqual[kTrackPan], aCentred, zeroIdentical,
+                     static_cast<long long>(panZeroPcm.size()), static_cast<long long>(pcm[0].size()),
+                     panError.toUtf8().constData());
+        tally.gate(13, generated[0] && generated[kTrackPan] && repeatEqual[kTrackPan] && rightSilent
+                       && deltaDb <= 0.1 && aCentred && zeroIdentical,
+                   "track pan -1 must silence the right channel of the export, keep the left within 0.1 dB and leave pan 0 / gain 1 byte-identical to a");
+    }
+    // G14: playback (renderPcmForTest) and export agree within 0.5 dB on the R/L level ratio of a
+    // -0.3 track pan (balance gains {1, 0.7}: both channels audible, so the ratio is a finite
+    // number; sanity band 0.65..0.75), playback at pan -1 silences the right channel, an undo
+    // returns the pan to 0 (currentState().audioTrackPans), and a saved project (gain 0.5 / pan
+    // -0.3) restores trackGain(0) == 0.5 and trackPan(0) == -0.3 after a reload while a default
+    // project writes no trackMix key (decision 3-1).
+    {
+        const auto playback = [&](int variant) {
+            AudioMixer mixer;
+            Timeline timeline;
+            QString error;
+            if (!setupVariant(variant, mixer, timeline, &error, source)) return QByteArray();
+            mixer.setSequence(timeline.computeAudioPlaybackSequence());
+            return mixer.renderPcmForTest(48000);
+        };
+        const QByteArray playMid = panExtraOk ? playback(kTrackPanMid) : QByteArray();
+        const QByteArray playHard = panExtraOk ? playback(kTrackPan) : QByteArray();
+        const double pmL = channelRms(playMid, 2, 48000, 0, 0.1, 0.4);
+        const double pmR = channelRms(playMid, 2, 48000, 1, 0.1, 0.4);
+        const double phL = channelRms(playHard, 2, 48000, 0, 0.1, 0.4);
+        const double phR = channelRms(playHard, 2, 48000, 1, 0.1, 0.4);
+        const double emL = channelRms(panMidPcm, panMidCh, panMidRate, 0, 0.1, 0.4);
+        const double emR = channelRms(panMidPcm, panMidCh, panMidRate, 1, 0.1, 0.4);
+        const double playRatio = pmL > 0.0 ? pmR / pmL : 0.0;
+        const double exportRatio = emL > 0.0 ? emR / emL : 0.0;
+        const double deltaDb = (playRatio > 0.0 && exportRatio > 0.0)
+            ? std::abs(20.0 * std::log10(playRatio / exportRatio))
+            : std::numeric_limits<double>::infinity();
+        const bool ratiosSane = playRatio >= 0.65 && playRatio <= 0.75 && exportRatio >= 0.65 && exportRatio <= 0.75;
+        const bool playbackHardLeft = phL > 0.01 && phR < phL * 0.01;
+
+        bool undoOk = false;
+        double undoBefore = 0.0, undoAfter = 0.0, undoMixerAfter = 1.0;
+        {
+            AudioMixer mixer;
+            Timeline timeline;
+            timeline.setAudioMixer(&mixer);
+            timeline.undoManager()->clear();
+            timeline.saveUndoState(QStringLiteral("基準"));
+            mixer.setTrackPan(0, -1.0);
+            timeline.saveUndoState(QStringLiteral("トラックのパンを変更"));
+            const QVector<double> panned = timeline.currentState().audioTrackPans;
+            undoBefore = panned.isEmpty() ? 99.0 : panned[0];
+            timeline.undo();
+            const QVector<double> restored = timeline.currentState().audioTrackPans;
+            undoAfter = restored.isEmpty() ? 99.0 : restored[0];
+            undoMixerAfter = mixer.trackPan(0);
+            undoOk = undoBefore == -1.0 && undoAfter == 0.0 && undoMixerAfter == 0.0;
+        }
+
+        bool saveOk = false, defaultNoKey = false;
+        double reGain = -1.0, rePan = -1.0, keyGain = -1.0, keyPan = -1.0;
+        int trackMixSize = -1;
+        {
+            MainWindow window;
+            Timeline *timeline = window.findChild<Timeline *>();
+            AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
+            if (timeline && timeline->audioTrackCount() < 1)
+                timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+            if (mixer && repeat.isValid()) {
+                const auto readMixer = [&](const QString &path) {
+                    QFile f(path);
+                    if (!f.open(QIODevice::ReadOnly)) return QJsonObject();
+                    return QJsonDocument::fromJson(f.readAll()).object().value("audioMixer").toObject();
+                };
+                ProjectData defaults;
+                (window.*member(CollectAudioTag{}))(defaults);
+                const QString defaultPath = panFile("default_project.json");
+                const bool defaultSaved = ProjectFile::save(defaultPath, defaults);
+                defaultNoKey = defaultSaved && defaults.trackMix.isEmpty()
+                    && !readMixer(defaultPath).contains(QStringLiteral("trackMix"));
+
+                mixer->setTrackGain(0, 0.5);
+                mixer->setTrackPan(0, -0.3);
+                ProjectData saved;
+                (window.*member(CollectAudioTag{}))(saved);
+                const QString projectPath = panFile("pan_project.json");
+                const bool wrote = ProjectFile::save(projectPath, saved);
+                const QJsonArray mixKey = readMixer(projectPath).value(QStringLiteral("trackMix")).toArray();
+                if (!mixKey.isEmpty()) {
+                    keyGain = mixKey[0].toObject().value("gain").toDouble(-1.0);
+                    keyPan = mixKey[0].toObject().value("pan").toDouble(-1.0);
+                }
+                mixer->setTrackGain(0, 1.0);
+                mixer->setTrackPan(0, 0.0);
+                ProjectData loaded;
+                const bool read = wrote && ProjectFile::load(projectPath, loaded);
+                trackMixSize = int(loaded.trackMix.size());
+                (window.*member(ApplyAudioTag{}))(loaded);
+                reGain = mixer->trackGain(0);
+                rePan = mixer->trackPan(0);
+                saveOk = read && trackMixSize == 1 && keyGain == 0.5 && keyPan == -0.3
+                    && reGain == 0.5 && rePan == -0.3;
+            }
+        }
+        std::fprintf(stderr, "G14 playback pmL=%.12g pmR=%.12g ratio=%.12g hardL=%.12g hardR=%.12g hardLeft=%d "
+                             "export emL=%.12g emR=%.12g ratio=%.12g deltaDb=%.12g sane=%d sanity=[0.65,0.75] "
+                             "extraOk=%d error=%s\n",
+                     pmL, pmR, playRatio, phL, phR, playbackHardLeft, emL, emR, exportRatio, deltaDb,
+                     ratiosSane, panExtraOk, panError.toUtf8().constData());
+        std::fprintf(stderr, "G14 undo panned=%g afterUndo=%g mixerAfterUndo=%g ok=%d\n",
+                     undoBefore, undoAfter, undoMixerAfter, undoOk);
+        std::fprintf(stderr, "G14 saveReload trackMixSize=%d keyGain=%g keyPan=%g trackGain(0)=%g trackPan(0)=%g "
+                             "defaultProjectHasNoTrackMix=%d ok=%d\n",
+                     trackMixSize, keyGain, keyPan, reGain, rePan, defaultNoKey, saveOk);
+        tally.gate(14, panExtraOk && ratiosSane && deltaDb <= 0.5 && playbackHardLeft && undoOk && saveOk
+                       && defaultNoKey,
+                   "playback and export must agree within 0.5 dB on the track pan ratio; undo returns the pan to 0; a saved gain 0.5 / pan -0.3 must reload and a default project must write no trackMix");
+    }
+    // G15: variant j (a + first clip pan -1, no track FX) silences the right channel over the first
+    // clip [0.1 s, 1.5 s) and keeps the left within 0.1 dB of a's left channel. The second clip
+    // [2.1 s, 4.0 s) stays within 2 LSB of a (the FX path quantises after a float pass, so the
+    // route difference is recorded, not forced to zero). Controls: a's right channel over the same
+    // range is above 50 % of its left one, and the second clip carries signal. HEAD drops the clip
+    // pan on this route (L = R), so the right-channel check fails there.
+    {
+        const int jc = channels[kClipPan], jr = sampleRates[kClipPan];
+        const double jL = channelRms(pcm[kClipPan], jc, jr, 0, 0.1, 1.5);
+        const double jR = channelRms(pcm[kClipPan], jc, jr, 1, 0.1, 1.5);
+        const double aL = channelRms(pcm[0], channels[0], sampleRates[0], 0, 0.1, 1.5);
+        const double aR = channelRms(pcm[0], channels[0], sampleRates[0], 1, 0.1, 1.5);
+        const double deltaDb = (aL > 0.0 && jL > 0.0) ? std::abs(20.0 * std::log10(jL / aL))
+                                                        : std::numeric_limits<double>::infinity();
+        const bool firstSilent = jL > 0.01 && jR < jL * 0.01;
+        const bool aCentred = aL > 0.01 && aR > aL * 0.5;
+        const QByteArray j2nd = pcmRange(pcm[kClipPan], jc, jr, 2.1, 4.0);
+        const QByteArray a2nd = pcmRange(pcm[0], channels[0], sampleRates[0], 2.1, 4.0);
+        const PcmComparison second = comparePcm16(j2nd, a2nd);
+        const bool secondOk = !j2nd.isEmpty() && second.lengthDiffSamples == 0 && second.maxDiffLsb <= 2
+            && rms(j2nd) > 0.01;
+        std::fprintf(stderr, "G15 first jL=%.12g jR=%.12g jRatio=%.12g aL=%.12g aR=%.12g aRatio=%.12g "
+                             "leftDeltaDb=%.12g aCentred=%d deterministic=%d\n",
+                     jL, jR, jL > 0.0 ? jR / jL : -1.0, aL, aR, aL > 0.0 ? aR / aL : -1.0, deltaDb,
+                     aCentred, repeatEqual[kClipPan]);
+        std::fprintf(stderr, "G15 second bytes=%lld aBytes=%lld identical=%d maxDiffLsb=%d lengthDiffSamples=%lld "
+                             "firstDiffSample=%lld rms=%.12g\n",
+                     static_cast<long long>(j2nd.size()), static_cast<long long>(a2nd.size()), second.identical,
+                     second.maxDiffLsb, static_cast<long long>(second.lengthDiffSamples),
+                     static_cast<long long>(second.firstDiffSample), rms(j2nd));
+        tally.gate(15, generated[0] && generated[kClipPan] && repeatEqual[kClipPan] && firstSilent
+                       && deltaDb <= 0.1 && aCentred && secondOk,
+                   "a clip pan -1 without track FX must silence the right channel of the export's first clip and leave the second clip within 2 LSB of a");
     }
     return tally.finish();
 }

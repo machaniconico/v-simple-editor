@@ -192,9 +192,11 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
             plan.legacyEqCoeffs.insert(track, mixer->trackEqCoeffs(track));
             plan.legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
             plan.trackGains.insert(track, mixer->trackGain(track));
+            plan.trackPans.insert(track, mixer->trackPan(track));
             // MIXER-DOCK: non-unity gain needs the existing post-DSP gain path,
             // including when no track effect is enabled.
             plan.useTrackFx = plan.useTrackFx || mixer->trackGain(track) != 1.0;
+            plan.useTrackFx = plan.useTrackFx || mixer->trackPan(track) != 0.0;
             plan.useTrackFx = plan.useTrackFx || chain.eqEnabled || chain.compEnabled
                 || chain.reverbEnabled || chain.nrEnabled || chain.deesser.enabled
                 || (plan.legacyEqEnabled.value(track) && !plan.legacyEqConfigs.value(track).isDefault());
@@ -204,6 +206,9 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
     // Any un-muted clip EQ needs the DSP path (and rules out passthrough).
     for (const PlaybackEntry &entry : entries)
         plan.useTrackFx = plan.useTrackFx || (entry.clipEqEnabled && !entry.audioMuted);
+    // A clip pan has no passthrough / legacy-chain equivalent: it needs the DSP path's pan=.
+    for (const PlaybackEntry &entry : entries)
+        plan.useTrackFx = plan.useTrackFx || (entry.pan != 0.0 && !entry.audioMuted);
     plan.useMasterEq = (plan.masterChain.eqEnabled || plan.masterChain.deesser.enabled)
         && !audiofxexport::masterEqBypass;
     if (options.forcedOutputPath.isEmpty() && !plan.useTrackFx && !plan.useMasterEq
@@ -421,9 +426,13 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
                 volumeExpressionForEntry(entry), clipDuration,
                 entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
             // Static track gain and clip balance also belong after the DSP.
-            const auto pan = audiopan::balanceGains(entry.pan);
+            const auto clipPan = audiopan::balanceGains(entry.pan);
+            const double trackPan = plan.trackPans.value(entry.sourceTrack, 0.0);
+            const auto trackPanGains = audiopan::balanceGains(trackPan);
+            const audiopan::BalanceGains pan{clipPan.left * trackPanGains.left,
+                                             clipPan.right * trackPanGains.right};
             const double gain = plan.trackGains.value(entry.sourceTrack, 1.0);
-            if (gain != 1.0 || entry.pan != 0.0) {
+            if (gain != 1.0 || entry.pan != 0.0 || trackPan != 0.0) {
                 post.insert(QStringLiteral("[%1:a]").arg(i).size(),
                     QStringLiteral("pan=stereo|c0=%1*c0|c1=%2*c1,")
                         .arg(ffmpegNumber(gain * pan.left), ffmpegNumber(gain * pan.right)));

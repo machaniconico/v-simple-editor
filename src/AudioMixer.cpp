@@ -1117,10 +1117,17 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // prevGain is intentionally NOT reset on seek/setSequence — the click is
         // between two fragments of the OS sink callback, not within the entry's
         // data lifecycle.
-        const bool panActive = e->entry.pan != 0.0;
-        const audiopan::BalanceGains panGains = panActive
-            ? audiopan::balanceGains(e->entry.pan)
-            : audiopan::BalanceGains{};
+        // Playback pan = balanceGains(clip pan) x balanceGains(track pan); the
+        // export plan multiplies the same two factors (audioexport pan=).
+        const double trackPan = (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
+            ? m_mixer->m_trackStates[trackIdx].pan : 0.0;
+        const bool panActive = e->entry.pan != 0.0 || trackPan != 0.0;
+        audiopan::BalanceGains panGains;
+        if (panActive) {
+            const auto clipGains = audiopan::balanceGains(e->entry.pan);
+            const auto trackGains = audiopan::balanceGains(trackPan);
+            panGains = {clipGains.left * trackGains.left, clipGains.right * trackGains.right};
+        }
         const int rampLen = qMin(copySamples, 240);
         const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
 
@@ -2340,6 +2347,22 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
         m_trackStates.resize(trackIdx + 1);
     m_trackStates[trackIdx].gain = qBound(0.0, gain, 4.0);
     recomputeEffectiveGainsLocked();
+}
+
+void AudioMixer::setTrackPan(int trackIdx, double pan) {
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return;
+    if (m_trackStates.size() < trackIdx + 1)
+        m_trackStates.resize(trackIdx + 1);
+    m_trackStates[trackIdx].pan = audiopan::clampPan(pan);
+}
+
+double AudioMixer::trackPan(int trackIdx) const
+{
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return 0.0;
+    if (trackIdx >= m_trackStates.size()) return 0.0;
+    return m_trackStates[trackIdx].pan;
 }
 
 double AudioMixer::trackGain(int trackIdx) const
@@ -4128,7 +4151,7 @@ QJsonObject AudioMixer::collectTrackState() const
         QJsonArray bands;
         for (const auto &band : state.eq.bands)
             bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
-        states.append(QJsonObject{{"gain", state.gain}, {"mute", state.muted},
+        states.append(QJsonObject{{"gain", state.gain}, {"pan", state.pan}, {"mute", state.muted},
             {"solo", state.solo}, {"eqEnabled", state.eqEnabled},
             {"preamp", state.eq.preamp}, {"bands", bands}});
     }
@@ -4159,6 +4182,7 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
         const auto obj = states[i].toObject();
         TrackState state;
         state.gain = qBound(0.0, obj.value("gain").toDouble(1.0), 4.0);
+        state.pan = audiopan::clampPan(obj.value("pan").toDouble(0.0));
         state.muted = obj.value("mute").toBool();
         state.solo = obj.value("solo").toBool();
         state.eqEnabled = obj.value("eqEnabled").toBool();

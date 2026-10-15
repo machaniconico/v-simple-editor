@@ -165,6 +165,9 @@ public:
     void setTrackSolo(int trackIdx, bool solo);
     void setTrackGain(int trackIdx, double gain);
     double trackGain(int trackIdx) const;
+    // Track balance -1 (left) .. +1 (right); multiplied with the clip pan.
+    void setTrackPan(int trackIdx, double pan);
+    double trackPan(int trackIdx) const;
     // Production readData probe with the hardware sink stopped. Consumes the
     // sequence from zero and stops the decode worker; dedicated test mixers only.
     QByteArray renderPcmForTest(int frames);
@@ -394,6 +397,7 @@ public:
         bool muted = false;
         bool solo = false;
         double gain = 1.0;
+        double pan = 0.0;            // track balance, see setTrackPan
         double effectiveGain = 1.0;  // gain * mute factor * solo factor
         bool eqEnabled = false;
         AudioEQConfig eq;

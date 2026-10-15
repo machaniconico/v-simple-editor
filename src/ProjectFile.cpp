@@ -753,6 +753,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             fxArray.append(chain);
         }
         if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        // Only written when a track has a non-default fader gain or pan.
+        QJsonArray mixArray;
+        bool anyMix = false;
+        for (const auto &mix : data.trackMix) {
+            anyMix = anyMix || !mix.isDefault();
+            mixArray.append(QJsonObject{{"gain", mix.gain}, {"pan", mix.pan}});
+        }
+        if (anyMix) am["trackMix"] = mixArray;
         const QJsonObject masterFx = data.masterFx.toJson();
         if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
@@ -1077,6 +1085,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.trackEqStates.clear();
     // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
@@ -1088,6 +1097,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             if (!chain.isDefault()) data.trackFx.insert(track, chain);
         }
         data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
+        for (const auto &value : am["trackMix"].toArray()) {
+            const QJsonObject object = value.toObject();
+            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
+        }
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1387,6 +1400,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             fxArray.append(chain);
         }
         if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        // Only written when a track has a non-default fader gain or pan.
+        QJsonArray mixArray;
+        bool anyMix = false;
+        for (const auto &mix : data.trackMix) {
+            anyMix = anyMix || !mix.isDefault();
+            mixArray.append(QJsonObject{{"gain", mix.gain}, {"pan", mix.pan}});
+        }
+        if (anyMix) am["trackMix"] = mixArray;
         const QJsonObject masterFx = data.masterFx.toJson();
         if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
@@ -1681,6 +1702,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.trackEqStates.clear();
     // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
@@ -1692,6 +1714,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             if (!chain.isDefault()) data.trackFx.insert(track, chain);
         }
         data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
+        for (const auto &value : am["trackMix"].toArray()) {
+            const QJsonObject object = value.toObject();
+            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
+        }
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
