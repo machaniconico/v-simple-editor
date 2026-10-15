@@ -7709,7 +7709,16 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_llmAssistantToggleAction,
         QStringLiteral("画面右下の「LLM に指示を出す」ボタンを表示するかどうかを切り替えます。")});
 
-    m_audioMixerDock = new AudioMixerDock(m_timeline, m_player->audioMixer(), this);
+    auto *mixerDock = new AudioMixerDock(m_timeline, m_player->audioMixer(), this);
+    m_audioMixerDock = mixerDock;
+    mixerDock->setBusRouting(&m_audioBusRouting);
+    // The Dock only requests; the routing stays owned here (m_audioBusRouting is the SSOT).
+    connect(mixerDock, &AudioMixerDock::trackBusRequested, this, [this](int track, int busId) {
+        if (!m_audioBusRouting.assignTrackToBus(track, busId)) return;
+        m_timeline->saveUndoState(tr("トラックのバスを変更"));
+        onAudioBusRoutingChanged();
+        if (m_audioBusPanel) m_audioBusPanel->setRouting(&m_audioBusRouting);
+    });
     addDockWidget(Qt::BottomDockWidgetArea, m_audioMixerDock);
     m_audioMixerDock->hide();
     viewMenu->addAction(m_audioMixerDock->toggleViewAction());
@@ -10221,6 +10230,9 @@ void MainWindow::onAudioBusRoutingChanged()
 {
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr)
         mixer->setBusRouting(m_audioBusRouting);
+    // Panel edits, the Dock's own requests and the undo bridge all land here.
+    if (auto *dock = qobject_cast<AudioMixerDock *>(m_audioMixerDock))
+        dock->synchronize();
 }
 
 // TR-4: 選択クリップの先頭を再生ヘッドへ合わせる (RippleIn)。

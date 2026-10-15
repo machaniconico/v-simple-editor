@@ -1079,7 +1079,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "deesser", nullptr, runDeEsserSelftest, true,
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence, live dock, seek counter, dock follows project/track changes (8 gates)" },
     { "mixer-dock", nullptr, runMixerDockSelftest, true,
-      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (10 gates)" },
+      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock, pan slider and bus combo, hidden sync writes nothing (13 gates)" },
     { "aux-send", nullptr, runAuxSendSelftest, true,
       "AUX send table: per-bus send level and pre-fader edit with one undo point per edit, hidden refresh writes nothing (3 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,

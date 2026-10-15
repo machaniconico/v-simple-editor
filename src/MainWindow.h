@@ -262,6 +262,7 @@ class MainWindow : public QMainWindow
     friend int runMatteSsotSelftest();
     friend int runRenderNotifySelftest();
     friend int runClipEqSelftest();
+    friend int runMixerDockSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
