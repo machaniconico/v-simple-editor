@@ -4,8 +4,10 @@
 #include <QPen>
 #include <QBrush>
 #include <QMouseEvent>
+#include <QCheckBox>
 #include <QContextMenuEvent>
 #include <QDoubleSpinBox>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMenu>
@@ -24,6 +26,17 @@ struct SliderDragUndoSuppressionScope {
     SliderDragUndoSuppressionScope() { ++s_sliderDragUndoSuppressionDepth; }
     ~SliderDragUndoSuppressionScope() { --s_sliderDragUndoSuppressionDepth; }
 };
+
+// Band 1 = lowMid, Band 2 = highMid, Band 3 = low shelf, Band 4 = high shelf.
+trackfx::EqBand& eqBandRef(trackfx::EqSettings& eq, int band)
+{
+    switch (band) {
+    case 0: return eq.lowMid;
+    case 1: return eq.highMid;
+    case 2: return eq.low;
+    default: return eq.high;
+    }
+}
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -42,12 +55,14 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
     m_points     = { {0, 0.0}, {10000, 0.0} };
 
     m_controlPanel = new QWidget(this);
+    m_controlPanel->setObjectName(QStringLiteral("clipVolumePanRow"));
     auto* row = new QHBoxLayout(m_controlPanel);
     row->setContentsMargins(8, 4, 8, 4);
     row->setSpacing(8);
 
     auto* volumeLabel = new QLabel(QStringLiteral("音量"), m_controlPanel);
     m_volumeSlider = new QSlider(Qt::Horizontal, m_controlPanel);
+    m_volumeSlider->setObjectName(QStringLiteral("clipVolumeSlider"));
     m_volumeSlider->setRange(0, 200);
     m_volumeSlider->setValue(100);
     m_volumeSlider->setFixedWidth(150);
@@ -59,6 +74,7 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
 
     m_panLabel = new QLabel(QStringLiteral("パン (L/C/R)"), m_controlPanel);
     m_panSlider = new QSlider(Qt::Horizontal, m_controlPanel);
+    m_panSlider->setObjectName(QStringLiteral("clipPanSlider"));
     m_panSlider->setRange(-100, 100);
     m_panSlider->setValue(0);
     m_panSlider->setFixedWidth(150);
@@ -76,6 +92,65 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
     row->addWidget(m_panSlider);
     row->addWidget(m_panSpin);
     row->addStretch();
+
+    m_clipEqPanel = new QWidget(this);
+    m_clipEqPanel->setObjectName(QStringLiteral("clipEqPanel"));
+    auto* eqGrid = new QGridLayout(m_clipEqPanel);
+    eqGrid->setContentsMargins(8, 4, 8, 4);
+    eqGrid->setSpacing(4);
+    m_clipEqEnable = new QCheckBox(QStringLiteral("クリップ EQ"), m_clipEqPanel);
+    m_clipEqEnable->setObjectName(QStringLiteral("clipEqEnable"));
+    eqGrid->addWidget(m_clipEqEnable, 0, 0, 1, 2);
+    static const char* const kBandNames[4] = {"Band 1 (低中域)", "Band 2 (高中域)",
+                                              "Band 3 (低域シェルフ)", "Band 4 (高域シェルフ)"};
+    for (int band = 0; band < 4; ++band) {
+        const QString n = QString::number(band + 1);
+        m_clipEqFreq[band] = new QDoubleSpinBox(m_clipEqPanel);
+        m_clipEqFreq[band]->setObjectName(QStringLiteral("clipEqBand%1Freq").arg(n));
+        m_clipEqFreq[band]->setRange(20.0, 20000.0);
+        m_clipEqFreq[band]->setDecimals(1);
+        m_clipEqFreq[band]->setSuffix(QStringLiteral(" Hz"));
+        m_clipEqGain[band] = new QDoubleSpinBox(m_clipEqPanel);
+        m_clipEqGain[band]->setObjectName(QStringLiteral("clipEqBand%1Gain").arg(n));
+        m_clipEqGain[band]->setRange(-24.0, 24.0);
+        m_clipEqGain[band]->setDecimals(1);
+        m_clipEqGain[band]->setSuffix(QStringLiteral(" dB"));
+        m_clipEqQ[band] = new QDoubleSpinBox(m_clipEqPanel);
+        m_clipEqQ[band]->setObjectName(QStringLiteral("clipEqBand%1Q").arg(n));
+        m_clipEqQ[band]->setRange(0.1, 10.0);
+        m_clipEqQ[band]->setDecimals(2);
+        eqGrid->addWidget(new QLabel(QString::fromUtf8(kBandNames[band]), m_clipEqPanel), band + 1, 0);
+        eqGrid->addWidget(m_clipEqFreq[band], band + 1, 1);
+        eqGrid->addWidget(m_clipEqGain[band], band + 1, 2);
+        eqGrid->addWidget(m_clipEqQ[band], band + 1, 3);
+        // One typed value = one valueChanged (Enter / focus-out), so one undo point.
+        // Each spin writes only its own field so untouched values keep their stored precision.
+        for (QDoubleSpinBox* spin : {m_clipEqFreq[band], m_clipEqGain[band], m_clipEqQ[band]})
+            spin->setKeyboardTracking(false);
+        connect(m_clipEqFreq[band], qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, band](double v) {
+            if (m_updatingControls) return;
+            eqBandRef(m_clipEq, band).freq = v;
+            emitClipEqChanged();
+        });
+        connect(m_clipEqGain[band], qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, band](double v) {
+            if (m_updatingControls) return;
+            eqBandRef(m_clipEq, band).gainDb = v;
+            emitClipEqChanged();
+        });
+        connect(m_clipEqQ[band], qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this, band](double v) {
+            if (m_updatingControls) return;
+            eqBandRef(m_clipEq, band).q = v;
+            emitClipEqChanged();
+        });
+    }
+    connect(m_clipEqEnable, &QCheckBox::toggled, this, [this](bool on) {
+        if (m_updatingControls) return;
+        m_clipEqEnabled = on;
+        emitClipEqChanged();
+    });
+    m_clipEqPanel->installEventFilter(this);
+    m_clipEqPanel->hide();
+    setClipEq(false, trackfx::EqSettings{});
 
     connect(m_volumeSlider, &QSlider::sliderPressed, this, [this]() {
         m_volumeSliderDragging = true;
@@ -130,6 +205,51 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
 }
 
 // ─── public API ─────────────────────────────────────────────────────────────
+
+void AudioClipEditor::setClipEq(bool enabled, const trackfx::EqSettings& eq)
+{
+    m_clipEqEnabled = enabled;
+    m_clipEq = eq;
+    m_updatingControls = true;
+    m_clipEqEnable->setChecked(enabled);
+    for (int band = 0; band < 4; ++band) {
+        const trackfx::EqBand& eb = eqBandRef(m_clipEq, band);
+        m_clipEqFreq[band]->setValue(eb.freq);
+        m_clipEqGain[band]->setValue(eb.gainDb);
+        m_clipEqQ[band]->setValue(eb.q);
+    }
+    m_updatingControls = false;
+}
+
+bool AudioClipEditor::clipEqEnabled() const
+{
+    return m_clipEqEnabled;
+}
+
+trackfx::EqSettings AudioClipEditor::clipEq() const
+{
+    return m_clipEq;
+}
+
+void AudioClipEditor::setClipEqVisible(bool visible)
+{
+    m_clipEqPanel->setVisible(visible);
+    layoutClipEqPanel();
+    update();
+}
+
+void AudioClipEditor::setVolumePanVisible(bool visible)
+{
+    m_controlPanel->setVisible(visible);
+}
+
+void AudioClipEditor::setEnvelopeEditable(bool editable)
+{
+    if (m_envelopeEditable == editable) return;
+    m_envelopeEditable = editable;
+    m_dragIndex = -1;
+    update();
+}
 
 void AudioClipEditor::setClipDuration(qint64 durationMs)
 {
@@ -236,6 +356,45 @@ bool AudioClipEditor::isSliderDragUndoSuppressed()
 
 // ─── private helpers ─────────────────────────────────────────────────────────
 
+int AudioClipEditor::eqReserve() const
+{
+    return (m_clipEqPanel && !m_clipEqPanel->isHidden()) ? clipEqPanelHeight() : 0;
+}
+
+// Computed per call so a runtime theme change (spin padding / min-height) is picked up.
+int AudioClipEditor::clipEqPanelHeight() const
+{
+    return std::max(m_clipEqPanel->sizeHint().height(), m_clipEqPanel->layout()->minimumSize().height());
+}
+
+void AudioClipEditor::layoutClipEqPanel()
+{
+    const int reserve = eqReserve();
+    if (minimumHeight() != 160 + reserve)
+        setMinimumSize(560, 160 + reserve);
+    const int panelH = clipEqPanelHeight();
+    m_clipEqPanel->setGeometry(0, height() - panelH, width(), panelH);
+}
+
+void AudioClipEditor::changeEvent(QEvent* e)
+{
+    QWidget::changeEvent(e);
+    if (e->type() == QEvent::StyleChange && m_clipEqPanel && !m_clipEqPanel->isHidden())
+        layoutClipEqPanel();
+}
+
+bool AudioClipEditor::eventFilter(QObject* watched, QEvent* e)
+{
+    if (watched == m_clipEqPanel && e->type() == QEvent::LayoutRequest && !m_clipEqPanel->isHidden())
+        layoutClipEqPanel();
+    return QWidget::eventFilter(watched, e);
+}
+
+void AudioClipEditor::emitClipEqChanged()
+{
+    emit clipEqChanged(m_clipEqEnabled, m_clipEq);
+}
+
 void AudioClipEditor::emitVolumeChangedForUndo(bool recordUndo)
 {
     if (recordUndo) {
@@ -261,7 +420,7 @@ void AudioClipEditor::emitPanChangedForUndo(bool recordUndo)
 QPointF AudioClipEditor::pointToPixel(const VolumeEnvelopePoint& p) const
 {
     const double w = width()  - kMarginLeft - kMarginRight;
-    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom;
+    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom - eqReserve();
 
     const double xRatio = (m_durationMs > 0)
                           ? static_cast<double>(p.timeMs) / static_cast<double>(m_durationMs)
@@ -276,7 +435,7 @@ QPointF AudioClipEditor::pointToPixel(const VolumeEnvelopePoint& p) const
 VolumeEnvelopePoint AudioClipEditor::pixelToPoint(const QPointF& px) const
 {
     const double w = width()  - kMarginLeft - kMarginRight;
-    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom;
+    const double h = height() - kControlsHeight - kMarginTop - kMarginBottom - eqReserve();
 
     const double xRatio = (w > 0.0) ? (px.x() - kMarginLeft) / w : 0.0;
     const double yRatio = (h > 0.0) ? (px.y() - kControlsHeight - kMarginTop) / h : 0.0;  // 0=top
@@ -320,6 +479,8 @@ void AudioClipEditor::resizeEvent(QResizeEvent* e)
     QWidget::resizeEvent(e);
     if (m_controlPanel)
         m_controlPanel->setGeometry(0, 0, width(), kControlsHeight);
+    if (m_clipEqPanel)
+        layoutClipEqPanel();
 }
 
 void AudioClipEditor::paintEvent(QPaintEvent*)
@@ -328,7 +489,7 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
     p.setRenderHint(QPainter::Antialiasing, true);
 
     const int W = width();
-    const int H = height();
+    const int H = height() - eqReserve();
 
     // Background
     p.fillRect(rect(), QColor(0x1e, 0x1e, 0x1e));
@@ -378,7 +539,7 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
 
     // ── Envelope polyline ─────────────────────────────────────────────────
     if (m_points.size() >= 2) {
-        p.setPen(QPen(QColor(0x4c, 0xaf, 0x50), 2));
+        p.setPen(QPen(m_envelopeEditable ? QColor(0x4c, 0xaf, 0x50) : QColor(0x60, 0x60, 0x60), 2));
         for (int i = 1; i < m_points.size(); ++i) {
             p.drawLine(pointToPixel(m_points[i - 1]), pointToPixel(m_points[i]));
         }
@@ -390,11 +551,14 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
         const bool selected = (i == m_dragIndex);
         const double r = selected ? 7.0 : 5.0;
 
-        p.setBrush(QColor(0x4c, 0xaf, 0x50));
-        if (selected) {
+        const QColor pointColor = m_envelopeEditable ? QColor(0x4c, 0xaf, 0x50) : QColor(0x60, 0x60, 0x60);
+        p.setBrush(pointColor);
+        if (!m_envelopeEditable) {
+            p.setPen(QPen(pointColor, 1));
+        } else if (selected) {
             p.setPen(QPen(QColor(0xff, 0xeb, 0x3b), 2));
         } else {
-            p.setPen(QPen(QColor(0x4c, 0xaf, 0x50), 1));
+            p.setPen(QPen(pointColor, 1));
         }
         p.drawEllipse(pp, r, r);
     }
@@ -404,6 +568,7 @@ void AudioClipEditor::paintEvent(QPaintEvent*)
 
 void AudioClipEditor::mousePressEvent(QMouseEvent* e)
 {
+    if (!m_envelopeEditable) return;
     if (e->button() != Qt::LeftButton) return;
     if (e->position().y() < kControlsHeight) return;
     const int idx = hitTest(e->position());
@@ -415,6 +580,7 @@ void AudioClipEditor::mousePressEvent(QMouseEvent* e)
 
 void AudioClipEditor::mouseMoveEvent(QMouseEvent* e)
 {
+    if (!m_envelopeEditable) return;
     if (m_dragIndex < 0 || m_dragIndex >= m_points.size()) return;
 
     VolumeEnvelopePoint np = pixelToPoint(e->position());
@@ -444,6 +610,7 @@ void AudioClipEditor::mouseReleaseEvent(QMouseEvent* e)
 
 void AudioClipEditor::mouseDoubleClickEvent(QMouseEvent* e)
 {
+    if (!m_envelopeEditable) return;
     if (e->button() != Qt::LeftButton) return;
     if (e->position().y() < kControlsHeight) return;
     if (hitTest(e->position()) >= 0) return;  // hit existing point — ignore
@@ -459,6 +626,7 @@ void AudioClipEditor::mouseDoubleClickEvent(QMouseEvent* e)
 
 void AudioClipEditor::contextMenuEvent(QContextMenuEvent* e)
 {
+    if (!m_envelopeEditable) return;
     if (e->pos().y() < kControlsHeight) return;
     const int idx = hitTest(QPointF(e->pos()));
     if (idx < 0) return;

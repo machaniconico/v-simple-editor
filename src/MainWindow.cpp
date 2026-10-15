@@ -2753,6 +2753,8 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_timeline, &Timeline::renderInPlaceRequested,
             this, &MainWindow::renderClipInPlaceDialog);
+    connect(m_timeline, &Timeline::audioClipEqRequested, this,
+            qOverload<int, int>(&MainWindow::openAudioClipEditorDialog));
     connect(m_timeline, &Timeline::replaceClipRequested, this,
             [this](TrackKind kind, int trackIndex, int clipIndex) {
                 replaceClipFromMediaPool(kind, trackIndex, clipIndex);
@@ -5283,7 +5285,8 @@ void MainWindow::setupMenuBar()
     // US-WF-D: Sprint 11 workflow — per-clip volume envelope editor (AudioClipEditor).
     auto *clipVolumeEditorAction = audioMenu->addAction("クリップボリュームエンベロープエディタ…");
     clipVolumeEditorAction->setObjectName("action_audio_clip_editor");
-    connect(clipVolumeEditorAction, &QAction::triggered, this, &MainWindow::openAudioClipEditorDialog);
+    connect(clipVolumeEditorAction, &QAction::triggered, this,
+            qOverload<>(&MainWindow::openAudioClipEditorDialog));
     m_menuHelpEntries.append({clipVolumeEditorAction,
         QStringLiteral("クリップ内のボリュームエンベロープ (時間 × dB) を点で編集する画面を開きます。")});
 
@@ -9135,6 +9138,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                        data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
+    // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
+    // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).
+    syncAudioClipEditorEq(true);
 
     rebuildAudioMeters();
     applyAudioState(data);
@@ -9609,6 +9615,7 @@ void MainWindow::newProject()
         stopMeshEditTool();
         stopPuppetPinTool();
         applyAudioState(ProjectData{});
+        syncAudioClipEditorEq(true);
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
@@ -15467,6 +15474,8 @@ void MainWindow::openAudioClipEditorDialog()
 
     double selectedVolume = selectedClip.volume;
     double selectedPan = selectedClip.pan;
+    int eqTrackIdx = -1;
+    int eqClipIdx = -1;
     const auto &audioTracks = m_timeline->audioTracks();
     const auto *audioTrack = audioTracks.value(0, nullptr);
     if (audioTrack && clipIdx >= 0 && clipIdx < audioTrack->clips().size()) {
@@ -15474,9 +15483,47 @@ void MainWindow::openAudioClipEditorDialog()
         selectedVolume = audioClip.volume;
         selectedPan = audioClip.pan;
     }
+    // The EQ target is the selected clip's real audio link partner (same linkGroup), not the A1
+    // clip at the V1 index: that is an unrelated clip for a V2+ or unlinked selection. No
+    // partner -> no EQ panel in this mode. Volume / pan keep reading A1:clipIdx as before.
+    if (selectedClip.linkGroup != 0) {
+        for (int ti = 0; ti < audioTracks.size() && eqTrackIdx < 0; ++ti) {
+            const auto *t = audioTracks.at(ti);
+            if (!t) continue;
+            for (int ci = 0; ci < t->clips().size(); ++ci) {
+                if (t->clips().at(ci).linkGroup == selectedClip.linkGroup) {
+                    eqTrackIdx = ti;
+                    eqClipIdx = ci;
+                    break;
+                }
+            }
+        }
+    }
     const qint64 selectedDurationMs = qMax<qint64>(
         1, qRound64(qMax(0.0, selectedClip.effectiveDuration()) * 1000.0));
 
+    showAudioClipEditorDialog(eqTrackIdx, eqClipIdx, true, selectedDurationMs, selectedVolume, selectedPan);
+}
+
+// US-1111: edits audio clip `clipIdx` of audio track `audioTrackIdx` (0 = A1) itself, not the V1
+// selection. Only the clip EQ is editable here: volume / pan write through the V1 selection into
+// A1 (Timeline::setClipVolume / setClipPan), which would hit the wrong clip, so those handlers are
+// disconnected and the row hidden. The envelope is not wired to the Timeline in either mode, so
+// in this mode the envelope canvas is disabled (greyed, ignores edits), not hidden.
+void MainWindow::openAudioClipEditorDialog(int audioTrackIdx, int clipIdx)
+{
+    const auto &audioTracks = m_timeline->audioTracks();
+    const auto *audioTrack = audioTracks.value(audioTrackIdx, nullptr);
+    if (!audioTrack || clipIdx < 0 || clipIdx >= audioTrack->clips().size())
+        return;
+    const ClipInfo clip = audioTrack->clips().at(clipIdx);
+    const qint64 durationMs = qMax<qint64>(1, qRound64(qMax(0.0, clip.effectiveDuration()) * 1000.0));
+    showAudioClipEditorDialog(audioTrackIdx, clipIdx, false, durationMs, clip.volume, clip.pan);
+}
+
+void MainWindow::showAudioClipEditorDialog(int eqTrackIdx, int clipIdx, bool volumePanEditable,
+                                           qint64 durationMs, double volume, double pan)
+{
     if (!m_audioClipEditorDialog) {
         m_audioClipEditorDialog = new QDialog(this);
         m_audioClipEditorDialog->setWindowTitle(QStringLiteral("クリップボリュームエンベロープ"));
@@ -15484,35 +15531,140 @@ void MainWindow::openAudioClipEditorDialog()
         auto *layout = new QVBoxLayout(m_audioClipEditorDialog);
         auto *editor = new AudioClipEditor(m_audioClipEditorDialog);
         editor->setObjectName(QStringLiteral("audioClipEditor"));
-        {
-            const QSignalBlocker blocker(editor);
-            editor->setClipDuration(selectedDurationMs);
-            editor->setVolume(selectedVolume);
-            editor->setPan(selectedPan);
-        }
-        connect(editor, &AudioClipEditor::volumeChanged, this, [this](double volume) {
-            if (m_timeline && m_timeline->hasSelection())
-                m_timeline->setClipVolume(volume);
-        });
-        connect(editor, &AudioClipEditor::panChanged, this, [this](double pan) {
-            if (m_timeline && m_timeline->hasSelection())
-                m_timeline->setClipPan(pan);
-        });
         layout->addWidget(editor);
         m_audioClipEditorDialog->resize(640, 240);
     }
 
     auto *editor = m_audioClipEditorDialog->findChild<AudioClipEditor *>(QStringLiteral("audioClipEditor"));
     if (editor) {
-        const QSignalBlocker blocker(editor);
-        editor->setClipDuration(selectedDurationMs);
-        editor->setVolume(selectedVolume);
-        editor->setPan(selectedPan);
+        {
+            const QSignalBlocker blocker(editor);
+            editor->setClipDuration(durationMs);
+            editor->setVolume(volume);
+            editor->setPan(pan);
+        }
+        // Rebind every handler per open so an earlier (track, clip) target cannot leak through.
+        editor->disconnect(this);
+        editor->setVolumePanVisible(volumePanEditable);
+        editor->setEnvelopeEditable(volumePanEditable);
+        if (volumePanEditable) {
+            connect(editor, &AudioClipEditor::volumeChanged, this, [this](double v) {
+                if (m_timeline && m_timeline->hasSelection())
+                    m_timeline->setClipVolume(v);
+            });
+            connect(editor, &AudioClipEditor::panChanged, this, [this](double p) {
+                if (m_timeline && m_timeline->hasSelection())
+                    m_timeline->setClipPan(p);
+            });
+        }
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+        const auto *eqTrack = eqTrackIdx >= 0 ? m_timeline->audioTracks().value(eqTrackIdx, nullptr) : nullptr;
+        if (eqTrack && clipIdx >= 0 && clipIdx < eqTrack->clips().size()
+            && !eqTrack->clips().at(clipIdx).uid.isEmpty()) {
+            // Target the clip by its uid, not the (track, index) pair: a delete before it or a
+            // track reorder moves the index while the editor stays open. audioTracks() holds
+            // only the active sequence and a sequence copy keeps the uid, so the target is also
+            // pinned to the sequence the panel was opened on.
+            m_clipEqTargetUid = eqTrack->clips().at(clipIdx).uid;
+            m_clipEqTargetSeqId = m_timeline->activeSequenceId();
+            if (m_clipEqTargetSeqId.isEmpty())
+                m_clipEqTargetSeqId = QStringLiteral("main");
+            connect(editor, &AudioClipEditor::clipEqChanged, this,
+                    [this](bool enabled, const trackfx::EqSettings &eq) {
+                        int track = -1;
+                        int clip = -1;
+                        if (resolveClipEqTarget(track, clip))
+                            m_timeline->setClipEq(track, clip, enabled, eq);
+                        else
+                            syncAudioClipEditorEq();
+                    });
+            // Every Timeline path that replaces or re-indexes clips while the dialog is open
+            // lands in syncAudioClipEditorEq: undo / redo (trackStateRestored), sequence create /
+            // delete / switch and parent entries (sequencesChanged), every clip edit, delete,
+            // move, split and restoreFromProject (audioSequenceChanged, debounced) and track
+            // remove / move (trackIndicesRemapped). Project load / new project call it directly.
+            const auto sync = [this]() { syncAudioClipEditorEq(); };
+            connect(m_timeline, &Timeline::trackStateRestored, editor, sync);
+            connect(m_timeline, &Timeline::sequencesChanged, editor, sync);
+            connect(m_timeline, &Timeline::audioSequenceChanged, editor, sync);
+            connect(m_timeline, &Timeline::trackIndicesRemapped, editor, sync);
+            syncAudioClipEditorEq();
+        } else {
+            editor->setClipEqVisible(false);
+        }
+        m_audioClipEditorDialog->setWindowTitle(volumePanEditable
+            ? QStringLiteral("クリップボリュームエンベロープ")
+            : QStringLiteral("クリップ EQ"));
     }
 
     m_audioClipEditorDialog->show();
     m_audioClipEditorDialog->raise();
     m_audioClipEditorDialog->activateWindow();
+}
+
+// US-1111: finds the EQ target (m_clipEqTargetUid on m_clipEqTargetSeqId) in the active sequence.
+bool MainWindow::resolveClipEqTarget(int &track, int &clip, bool *foreignSequence) const
+{
+    QString seqId = m_timeline ? m_timeline->activeSequenceId() : QString();
+    if (seqId.isEmpty())
+        seqId = QStringLiteral("main");
+    if (foreignSequence)
+        *foreignSequence = seqId != m_clipEqTargetSeqId;
+    if (!m_timeline || m_clipEqTargetUid.isEmpty() || seqId != m_clipEqTargetSeqId)
+        return false;
+    const auto &tracks = m_timeline->audioTracks();
+    for (int ti = 0; ti < tracks.size(); ++ti) {
+        const auto *t = tracks.at(ti);
+        if (!t) continue;
+        for (int ci = 0; ci < t->clips().size(); ++ci) {
+            if (t->clips().at(ci).uid == m_clipEqTargetUid) {
+                track = ti;
+                clip = ci;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// US-1111: the single catch-all that keeps the open editor's EQ equal to the clip it writes to.
+// Found -> reload the widgets from that clip (no clipEqChanged: setClipEq is guarded). Foreign
+// sequence -> hide the panel, stay bound (reloaded on return). Uid gone -> unbind the EQ and hide
+// the panel. projectReplaced (project load / new project) -> unbind every handler and hide the
+// dialog; the next "クリップ EQ…" request or menu open rebinds through showAudioClipEditorDialog.
+void MainWindow::syncAudioClipEditorEq(bool projectReplaced)
+{
+    auto *editor = m_audioClipEditorDialog
+        ? m_audioClipEditorDialog->findChild<AudioClipEditor *>(QStringLiteral("audioClipEditor"))
+        : nullptr;
+    if (!editor)
+        return;
+    if (projectReplaced) {
+        editor->disconnect(this);
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+        editor->setClipEqVisible(false);
+        m_audioClipEditorDialog->hide();
+        return;
+    }
+    if (m_clipEqTargetUid.isEmpty())
+        return;
+    int track = -1;
+    int clip = -1;
+    bool foreignSequence = false;
+    if (resolveClipEqTarget(track, clip, &foreignSequence)) {
+        const ClipInfo &c = m_timeline->audioTracks().at(track)->clips().at(clip);
+        editor->setClipEq(c.clipEqEnabled, c.clipEq);
+        editor->setClipEqVisible(true);
+        return;
+    }
+    if (!foreignSequence) {
+        disconnect(editor, &AudioClipEditor::clipEqChanged, this, nullptr);
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+    }
+    editor->setClipEqVisible(false);
 }
 
 void MainWindow::runMagneticTimelineDemo()

@@ -261,6 +261,7 @@ class MainWindow : public QMainWindow
     friend int runRotoSelftest();
     friend int runMatteSsotSelftest();
     friend int runRenderNotifySelftest();
+    friend int runClipEqSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -550,6 +551,8 @@ private slots:
     // US-WF-D: Sprint 11 workflow — 3 new menu actions
     void openAIMaskDialog();
     void openAudioClipEditorDialog();
+    // US-1111: edits the EQ of audio clip (audioTrackIdx, clipIdx) itself; volume / pan hidden.
+    void openAudioClipEditorDialog(int audioTrackIdx, int clipIdx);
     void runMagneticTimelineDemo();
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
@@ -1170,6 +1173,13 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+    void showAudioClipEditorDialog(int eqTrackIdx, int clipIdx, bool volumePanEditable,
+                                   qint64 durationMs, double volume, double pan);
+    // US-1111: the clip the editor's EQ panel writes to (uid on the sequence it was opened on).
+    QString m_clipEqTargetUid;
+    QString m_clipEqTargetSeqId;
+    bool resolveClipEqTarget(int &track, int &clip, bool *foreignSequence = nullptr) const;
+    void syncAudioClipEditorEq(bool projectReplaced = false);
     QPointer<CredentialDialog> m_credentialDialog = nullptr;
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
