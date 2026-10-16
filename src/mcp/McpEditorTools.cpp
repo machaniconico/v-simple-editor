@@ -2844,7 +2844,27 @@ void McpEditorTools::registerWriteTools()
                     // Same exclusion as the GUI: auto loudness builds its own AAC intermediate (or the
                     // silent track for an empty audio sequence), so the ordinary mix is not made. Any
                     // mix failure sets loudnessAutoError and addJob rejects the job (status failed).
-                    loudnessauto::prepareJob(job);
+                    // The mix and measurement run on a worker (prepareJobAsync) so the GUI thread keeps
+                    // answering get_export_status, which reports "queued" until addJob. Edits made while
+                    // preparing are not rejected: audio is the plan snapshot, video is the live Timeline.
+                    loudnessauto::prepareJobAsync(std::move(job),
+                        [this, queueGuard, windowGuard](RenderJob prepared, const QString &) {
+                            if (!queueGuard || !windowGuard || windowGuard->m_mcpTools != this) {
+                                // The owner went away while the worker ran: delete the audio
+                                // intermediates it registered (ownedTempFiles is process-wide).
+                                if (queueGuard) {
+                                    queueGuard->removeTempFiles(&prepared);
+                                } else {
+                                    RenderQueue orphan;
+                                    orphan.removeTempFiles(&prepared);
+                                }
+                                return;
+                            }
+                            queueGuard->addJob(prepared);
+                            queueGuard->start();
+                        },
+                        [] { return false; });
+                    return;
                 } else {
                     QString audioMixError;
                     const QString audioMixPath = windowGuard->prepareExportAudioMix(&audioMixError, audioBitrate);
