@@ -7724,6 +7724,7 @@ void MainWindow::setupMenuBar()
     viewMenu->addAction(m_audioMixerDock->toggleViewAction());
 
     m_spectrumAnalyzerDock = new SpectrumAnalyzerDock(m_player->audioMixer(), this);
+    m_spectrumAnalyzerDock->setTimeline(m_timeline);
     addDockWidget(Qt::RightDockWidgetArea, m_spectrumAnalyzerDock);
     m_spectrumAnalyzerDock->hide();
     viewMenu->addAction(m_spectrumAnalyzerDock->toggleViewAction());

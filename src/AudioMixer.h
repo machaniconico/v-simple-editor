@@ -360,6 +360,16 @@ public:
     // Moves the oldest min(buffered, maxFrames) frames into *interleaved
     // (L, R, ...) and returns that frame count.
     int takeMasterTap(QVector<float> *interleaved, int maxFrames);
+    // What the tap carries (US-1116): the master block, or one track's entries
+    // after their FX and before the fader (so a muted / unsoloed track still
+    // shows). readData reads the source once per callback; remapTrackIndices
+    // moves it with its track and a removed track falls back to the master.
+    struct TapSource {
+        int track = -1; // -1 = master, otherwise the sourceTrack index
+        bool isMaster() const { return track < 0; }
+    };
+    void setTapSource(TapSource source);
+    TapSource tapSource() const;
     // Runs the same tap write as readData.
     void publishMasterBlockForTest(const int16_t *interleaved, int frames);
     quint64 tapCopyCountForTest() const;
@@ -628,6 +638,14 @@ private:
     std::atomic<int> m_tapSubscribers{0};
     std::atomic<bool> m_tapNotifyPending{false};
     std::atomic<quint64> m_tapCopyCount{0};
+    // Track tap source (TapSource::track) and its per-callback buffers: the
+    // int32 sum of the tapped track's entries and its s16 copy for
+    // writeMasterTap. Allocated once by subscribeMasterTap under
+    // m_controlMutex, never freed, written only by readData.
+    std::atomic<int> m_tapSource{-1};
+    quint64 m_tapIdentity = 0; // 0 = master, guarded by m_controlMutex
+    QVector<int32_t> m_tapAccum;
+    QVector<int16_t> m_tapBlock;
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
 };

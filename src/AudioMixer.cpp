@@ -752,6 +752,20 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     QVarLengthArray<int32_t, 16384> accum(sampleCount);
     std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
 
+    // US-1116 tap source, read once per callback. A track source sums that
+    // track's entries after their FX and before the fader into m_tapAccum
+    // (the newest kMasterTapFrames frames of this block); the master source
+    // and an unsubscribed tap leave every step of the mix unchanged.
+    const int tapTrack = m_mixer->m_tapSubscribers.load(std::memory_order_acquire) > 0
+        ? m_mixer->m_tapSource.load(std::memory_order_acquire) : -1;
+    const int tapFrames = qMin(frameCount, AudioMixer::kMasterTapFrames);
+    const int tapSkip = (frameCount - tapFrames) * AudioMixer::kChannels;
+    int32_t *tapAccum = nullptr;
+    if (tapTrack >= 0 && !m_mixer->m_tapAccum.isEmpty()) {
+        tapAccum = m_mixer->m_tapAccum.data();
+        std::fill(tapAccum, tapAccum + tapFrames * AudioMixer::kChannels, 0);
+    }
+
     auto bytesToUs = [](qint64 bytes) -> int64_t {
         return bytes * 1'000'000LL
                / (AudioMixer::kSampleRateHz * AudioMixer::kBytesPerFrame);
@@ -939,6 +953,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                                               envT, e->entry.volume);
         }
         double gain = qBound(0.0, clipGain, 4.0);
+        // Clip-level gain for a track tap: everything in `gain` except the
+        // timeline mute (audioMuted) and the track factor (fader, mute / solo,
+        // bus routing) applied below.
+        double tapGain = gain;
         if (e->entry.audioMuted) gain = 0.0;
         const int trackIdx = e->entry.sourceTrack;
         // AB-4 / US-1122: bus / submix / aux-send routing. route.post is the
@@ -990,11 +1008,18 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // perceived loudness is constant.
             const double t = qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
             gain *= std::sqrt(t);
+            tapGain *= std::sqrt(t);
         } else if (trailOutFade) {
             const double t = qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
             gain *= std::sqrt(t);
+            tapGain *= std::sqrt(t);
         }
-        if (gain <= 0.0) {
+        // A tapped entry that is silent in the mix (track mute / solo, fader
+        // or bus at 0) still runs the FX below for the tap, adding only zeros
+        // to the mix; every other silent entry is drained as before.
+        int32_t *tapDst = tapAccum && trackIdx == tapTrack && tapGain > 0.0
+            ? tapAccum : nullptr;
+        if (gain <= 0.0 && !tapDst) {
             // Drain the ring so this muted entry stays in time with the
             // cursor; otherwise unmuting mid-playback would resume from a
             // stale position.
@@ -1112,8 +1137,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             if (outputFrames <= 0) {
                 // Atempo wants more source than the ring holds — flag stalled
                 // so the cursor freezes for a few callbacks while the decoder
-                // catches up (mirrors the empty-ring stall above).
-                entryActiveButStalled = true;
+                // catches up (mirrors the empty-ring stall above). An entry
+                // kept only for the tap never holds the clock.
+                if (gain > 0.0) entryActiveButStalled = true;
                 continue;
             }
             copyBytes = outputFrames * AudioMixer::kBytesPerFrame;
@@ -1147,6 +1173,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             const auto trackGains = audiopan::balanceGains(trackPan);
             panGains = {clipGains.left * trackGains.left, clipGains.right * trackGains.right};
         }
+        // A tap-only entry ramps 0 -> 0 like the drain above, so it adds nothing.
+        if (gain <= 0.0) e->prevGain = 0.0;
         const int rampLen = qMin(copySamples, 240);
         const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
 
@@ -1162,7 +1190,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // Ensure per-track level accum vector is sized
             if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
                 m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
-            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            auto *tla = (trackIdx >= 0 && gain > 0.0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
             for (int i = 0; i < rampLen; ++i) {
                 const double g = e->prevGain + gainStep * static_cast<double>(i);
                 double s = static_cast<double>(src[i]);
@@ -1176,6 +1204,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(s * tapGain);
                 double sampleVal = s * g;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1205,6 +1235,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(s * tapGain);
                 double sampleVal = s * gain;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1226,10 +1258,12 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // Ensure per-track level accum vector is sized
             if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
                 m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
-            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            auto *tla = (trackIdx >= 0 && gain > 0.0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
             for (int i = 0; i < rampLen; ++i) {
                 const double g = e->prevGain + gainStep * static_cast<double>(i);
                 const int ch = i & 1;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(src[i] * tapGain);
                 double sampleVal = static_cast<double>(src[i]) * g;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1249,6 +1283,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             }
             for (int i = rampLen; i < copySamples; ++i) {
                 const int ch = i & 1;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(src[i] * tapGain);
                 double sampleVal = static_cast<double>(src[i]) * gain;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1276,7 +1312,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // so the existing path is unchanged.
         e->ringHead += sourceBytesConsumed;
         e->ringStartTlUs += bytesToUs(copyBytes);
-        anyMixed = true;
+        if (gain > 0.0) anyMixed = true;
     }
 
     // Compact rings whose consumed prefix has grown past the threshold.
@@ -1436,6 +1472,25 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
+    // tapEpilogue (US-1116): the one tap write of a non-paused callback. The
+    // sink block is final here for both the decoder-stall return (zeroed) and
+    // the normal path, which only differ below in moving the clock; a paused
+    // callback returned above and writes 0 tap frames. A track source hands its own
+    // sum instead of the master block. No copy without subscribers; never
+    // blocks this thread.
+    {
+        const int16_t *tapBlock = reinterpret_cast<const int16_t *>(data);
+        int tapBlockFrames = frameCount;
+        if (tapAccum) {
+            int16_t *tapS16 = m_mixer->m_tapBlock.data();
+            for (int i = 0; i < tapFrames * AudioMixer::kChannels; ++i)
+                tapS16[i] = static_cast<int16_t>(qBound<int32_t>(-32768, tapAccum[i], 32767));
+            tapBlock = tapS16;
+            tapBlockFrames = tapFrames;
+        }
+        m_mixer->writeMasterTap(tapBlock, tapBlockFrames);
+    }
+
     const int64_t deltaUs = static_cast<int64_t>(frameCount) * 1'000'000
                             / AudioMixer::kSampleRateHz;
 
@@ -1454,9 +1509,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // chance to refill before this stall budget runs out.
         if (m_mixer->m_decodeRunner) m_mixer->m_decodeRunner->wake();
         if (stalls < kMaxStallCallbacks) {
-            // The sink still receives this zeroed block; feed it to the master tap
-            // like the final write below so tap readers see the silence.
-            m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
+            // The tap epilogue above already fed this zeroed block to the tap.
             return maxlen;
         }
         // Fall through and advance the cursor so video can keep moving.
@@ -1525,10 +1578,6 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
-    // Master tap: fed with the final s16 block the sink receives (the stall
-    // return above feeds its zeroed block the same way). No copy without
-    // subscribers; never blocks this thread.
-    m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
     return maxlen;
 }
 
@@ -2965,6 +3014,14 @@ AudioMixer::AutoDuckParams AudioMixer::autoDuckParams() const {
 
 void AudioMixer::subscribeMasterTap()
 {
+    {
+        // readData only touches the track-tap buffers under m_controlMutex.
+        QMutexLocker controlLock(&m_controlMutex);
+        if (m_tapAccum.isEmpty()) {
+            m_tapAccum.resize(kMasterTapFrames * kChannels);
+            m_tapBlock.resize(kMasterTapFrames * kChannels);
+        }
+    }
     QMutexLocker lock(&m_tapMutex);
     if (m_tapRing.isEmpty()) m_tapRing.resize(kMasterTapFrames * kChannels);
     m_tapSubscribers.fetch_add(1, std::memory_order_acq_rel);
@@ -3026,6 +3083,19 @@ void AudioMixer::writeMasterTap(const int16_t *interleaved, int frames)
             emit masterTapAvailable();
         }, Qt::QueuedConnection);
     }
+}
+
+void AudioMixer::setTapSource(TapSource source)
+{
+    const int track = source.track >= 0 && source.track < kMaxAudioTracks ? source.track : -1;
+    QMutexLocker lock(&m_controlMutex);
+    m_tapIdentity = track >= 0 ? m_trackIdentities[track] : 0;
+    m_tapSource.store(track, std::memory_order_release);
+}
+
+AudioMixer::TapSource AudioMixer::tapSource() const
+{
+    return TapSource{m_tapSource.load(std::memory_order_acquire)};
 }
 
 void AudioMixer::publishMasterBlockForTest(const int16_t *interleaved, int frames)
@@ -4281,6 +4351,14 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
         // was undone away and may come back with a redo.
         for (int index = activeTracks; index < kMaxAudioTracks; ++index)
             restoredIdentities[index] = newTrackIdentity();
+        // The tap follows its track identity across undo / redo; a track the
+        // snapshot does not have falls back to the master. The identity stays
+        // selected, so a later undo / redo that restores the track brings it back.
+        if (m_tapIdentity != 0) {
+            const auto found = std::find(restoredIdentities.cbegin(), activeEnd, m_tapIdentity);
+            m_tapSource.store(found != activeEnd ? int(found - restoredIdentities.cbegin()) : -1,
+                              std::memory_order_release);
+        }
         m_trackIdentities = restoredIdentities;
     } else {
         for (auto &chain : restoredChains) chain.deesser.listen = false;
@@ -4350,5 +4428,13 @@ void AudioMixer::remapTrackIndices(const QVector<int> &oldToNew)
     remap(m_trackReverbState);
     remap(m_trackNoiseReduction);
     remap(m_trackNoiseReductionState);
+    // The tap follows its track identity; a removed track falls back to the
+    // master but keeps its identity, so a redo that first removes the last row
+    // (Timeline::restoreState) and then restores the track finds it again.
+    if (m_tapIdentity != 0) {
+        const auto found = std::find(m_trackIdentities.cbegin(), m_trackIdentities.cend(), m_tapIdentity);
+        m_tapSource.store(found != m_trackIdentities.cend() ? int(found - m_trackIdentities.cbegin()) : -1,
+                          std::memory_order_release);
+    }
     recomputeEffectiveGainsLocked();
 }
