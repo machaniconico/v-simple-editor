@@ -78,9 +78,14 @@ MixPlan buildMixPlan(Timeline *timeline, AudioMixer *mixer, const MixOptions &op
 // Touches no Timeline / QObject / MainWindow. Returns plan.outputPath, or empty on failure
 // (a partly written output is removed). cancelled is polled before each ffmpeg run.
 QString executeMixPlan(const MixPlan &plan, const std::function<bool()> &cancelled, QString *error);
+// Selftest: executeMixPlan sleeps ms (on its own thread) before anything else. 0 (default) = none.
+void setPrepareDelayForTest(int ms);
 // Measures the PCM mix (mixPath; empty = no mix) over the plan's measure range, then converts it
 // to the AAC intermediate the queue muxes. Registers temp files on the job; returns the status.
-QString measureAndConvert(const MixPlan &plan, const QString &mixPath, RenderJob &job, QString *error);
+// cancelled is polled before each ffmpeg run: once true it returns at once, with mixPath left in
+// the job's temp files and job.projectFilePath unchanged.
+QString measureAndConvert(const MixPlan &plan, const QString &mixPath, RenderJob &job, QString *error,
+                          const std::function<bool()> &cancelled = {});
 
 // Selftest: buildMixPlan calls on the GUI thread / on any other thread since process start.
 int buildMixPlanGuiThreadCallsForTest();

@@ -132,7 +132,8 @@ QVector<AudioGainPoint> audioexport::sortedDedupedEnvelope(QVector<AudioGainPoin
 
 QString audioexport::nextExportAudioMixPath()
 {
-    static int serial = 0;
+    // Called from the GUI thread (buildMixPlan) and prepareJobAsync's worker (measureAndConvert).
+    static std::atomic<int> serial{0};
     const QString dirPath = QDir::tempPath()
         + QStringLiteral("/v-simple-editor-audio-mix");
     QDir().mkpath(dirPath);
@@ -258,9 +259,17 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
     return plan;
 }
 
+namespace {
+std::atomic<int> s_prepareDelayMs{0};
+}
+
+void audioexport::setPrepareDelayForTest(int ms) { s_prepareDelayMs.store(ms); }
+
 QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<bool()> &cancelled,
                                     QString *error)
 {
+    if (const int delayMs = s_prepareDelayMs.load(); delayMs > 0)
+        QThread::msleep(static_cast<unsigned long>(delayMs));
     if (plan.passthrough)
         return {};
     const QVector<PlaybackEntry> &validEntries = plan.entries;
@@ -497,7 +506,7 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
 }
 
 QString audioexport::measureAndConvert(const MixPlan &plan, const QString &mixPath, RenderJob &job,
-                                       QString *error)
+                                       QString *error, const std::function<bool()> &cancelled)
 {
     QString localError;
     if (!error) error = &localError;
@@ -506,6 +515,7 @@ QString audioexport::measureAndConvert(const MixPlan &plan, const QString &mixPa
     QString measurementPath = mixPath;
     QTemporaryDir rangeTemporary;
     if (!mixPath.isEmpty() && plan.trimMeasurement) {
+        if (cancelled && cancelled()) return {};
         measurementPath = rangeTemporary.filePath(QStringLiteral("range.wav"));
         const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mixPath,
             QStringLiteral("-ss"), ffmpegNumber(plan.measureStartSec), QStringLiteral("-t"),
@@ -520,6 +530,7 @@ QString audioexport::measureAndConvert(const MixPlan &plan, const QString &mixPa
         qWarning().noquote() << message;
     }
     if (!mixPath.isEmpty()) {
+        if (cancelled && cancelled()) return message;
         // The existing queue muxes compressed audio by stream copy. Use the
         // same AAC intermediate as the ordinary timeline mix after measuring PCM.
         const QString muxPath = nextExportAudioMixPath();

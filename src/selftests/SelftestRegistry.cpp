@@ -659,7 +659,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "legacy-kf", nullptr, runLegacyKfSelftest, true,
       "Legacy colorCorrection.* keyframe tracks migrate to grade.* on project load + dialog initial values + nested sequences (8 gates)" },
     { "loudness-auto", nullptr, runLoudnessAutoSelftest, true,
-      "Automatic export loudness normalization (13 gates)" },
+      "Automatic export loudness normalization (15 gates)" },
     { "loudness-persist", nullptr, runLoudnessPersistSelftest, true,
       "Project loudness gain and playback normalizer persistence (4 gates)" },
     { "loudness-export-wire", "VEDITOR_LOUDNESS_EXPORT_WIRE_SELFTEST", runLoudnessExportWireSelftest, false,

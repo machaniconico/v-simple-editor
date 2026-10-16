@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <optional>
 #include <QObject>
 #include <QString>
@@ -303,7 +304,16 @@ private:
 // MainWindow export submission seam, shared by normal and batch/mobile export.
 namespace loudnessauto {
 QString prepareJob(RenderJob &job);
-// Number of prepareJob calls that ran with autoLoudness ON (selftest counter).
+// GUI normal / mobile entry (call on the GUI thread): plans on the calling thread, runs the mix,
+// measurement and silent track (executeMixPlan + measureAndConvert) on a worker that gets a value
+// copy of the job with job.timeline cleared, then finishes on the GUI thread and calls
+// done(prepared job, status). cancelled is polled from the worker before each ffmpeg run (a running
+// ffmpeg is not stopped); once it returns true the remaining steps are skipped, the worker removes
+// the job's temp files and done still runs: the caller drops the job. autoLoudness OFF calls done
+// at once with the job untouched.
+void prepareJobAsync(RenderJob job, std::function<void(RenderJob, QString)> done,
+                     std::function<bool()> cancelled);
+// Number of prepareJob / prepareJobAsync calls that ran with autoLoudness ON (selftest counter).
 int prepareJobCallCountForTest();
 // Selftest: makes one prepareJob step report failure (after it ran). None (default) = production.
 enum class ForcedFailure { None, PcmMix, SilentMix, AacConvert };

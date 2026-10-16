@@ -699,11 +699,20 @@ protected:
 
 private:
     enum class ExportEntry { Normal, MobileBatch };
-    // Also runs loudnessauto::prepareJob (the single normal / mobile call site). When
-    // projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
+    // Returns the job unprepared: the normal / mobile callers run prepareExportJobAsync next.
+    // When projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
     // measurement (what RenderQueue::setLoudnessGainDb must keep receiving).
     RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry,
                                    double *projectLoudnessGainDb = nullptr);
+    // Normal / mobile export: runs loudnessauto::prepareJobAsync behind an indeterminate
+    // progress dialog (objectName "loudnessPrepareProgress", Cancel) and then calls next with
+    // the prepared job. A cancelled preparation removes the job's temp files and never calls
+    // next. autoLoudness OFF calls next at once without a dialog.
+    void prepareExportJobAsync(RenderJob job, std::function<void(RenderJob)> next);
+    // exportVideo after its dialog: builds the job, prepares it (prepareExportJobAsync) and
+    // hands it to queueNormalExport, which finalizes the audio and adds it to the shared queue.
+    void submitNormalExport(const ExportConfig &exportCfg);
+    void queueNormalExport(RenderJob job, const ExportConfig &exportCfg, double projectLoudnessGainDb);
     noiseprint::NoisePrint m_noisePrint;
     QPointer<TimelineTrack> m_noisePrintMenuTrack;
     int m_noisePrintMenuClip = -1;

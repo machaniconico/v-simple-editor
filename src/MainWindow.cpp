@@ -2490,36 +2490,40 @@ bool loudnessauto::timelineAudioMatchesPassthrough(Timeline *timeline)
 }
 void loudnessauto::setForcedFailureForTest(ForcedFailure failure) { s_forcedFailure = failure; }
 
-// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here, so a
-// failed mix never falls back to the unnormalized V1 source audio: it sets loudnessAutoError
-// and RenderQueue::addJob rejects the job.
-QString loudnessauto::prepareJob(RenderJob &job)
+namespace {
+// prepareJob in three steps so prepareJobAsync can run the middle one on a worker: begin (GUI
+// thread: reads the Timeline / mixer into the plan), run (value fields of the job only, never
+// job.timeline: executeMixPlan + measureAndConvert, and the silent track's executeMixPlan), finish
+// (GUI thread: registers the silent track).
+struct PrepareJobState {
+    loudnessauto::ForcedFailure forced = loudnessauto::ForcedFailure::None;
+    bool hasIntermediate = false;
+    bool hasDuration = false;
+    bool hasSequence = false;
+    bool hasSilentPlan = false;
+    bool cancelled = false;
+    audioexport::MixPlan plan;
+    audioexport::MixPlan silentPlan;
+    QString mix;
+    QString message;
+    QString silent;
+    QString silentError;
+};
+
+PrepareJobState beginPrepareJob(RenderJob &job)
 {
-    if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    PrepareJobState state;
     ++s_prepareJobCalls;
     job.exportConfig.remove("loudnessAutoError");
-    const ForcedFailure forced = s_forcedFailure.load();
-    const bool hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
-    const bool hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
-    const bool hasSequence = hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
-    QString error;
-    QString mix;
-    audioexport::MixPlan plan;
-    if (hasSequence) {
+    state.forced = s_forcedFailure.load();
+    state.hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+    state.hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
+    state.hasSequence = state.hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
+    if (state.hasSequence) {
         // Force the existing mixer to produce PCM even for passthrough clips.
-        plan = audioexport::buildMixPlan(job.timeline, job.timeline->audioMixer(),
+        state.plan = audioexport::buildMixPlan(job.timeline, job.timeline->audioMixer(),
             {nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration()});
-        mix = audioexport::executeMixPlan(plan, [] { return false; }, &error);
-        if (forced == ForcedFailure::PcmMix) {
-            QFile::remove(mix); // a failed mix leaves no output behind (finishMix)
-            mix.clear();
-            error = QStringLiteral("test: forced PCM mix failure");
-        }
-        if (mix.isEmpty() && !hasIntermediate)
-            job.exportConfig["loudnessAutoError"] = error.isEmpty()
-                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
-    }
-    if (!mix.isEmpty() && job.timeline) {
+        // The measure range is read only when the mix exists (measureAndConvert).
         double start = qMax(0.0, job.startUs / 1000000.0);
         double end = job.endUs > 0 ? job.endUs / 1000000.0 : job.timeline->totalDuration();
         if (job.exportConfig.value("exportMarkedRangeOnly").toBool()
@@ -2527,27 +2531,66 @@ QString loudnessauto::prepareJob(RenderJob &job)
             start = qBound(0.0, job.timeline->markedIn(), job.timeline->totalDuration());
             end = qBound(start, job.timeline->markedOut(), job.timeline->totalDuration());
         }
-        plan.trimMeasurement = start > 0.0 || end < job.timeline->totalDuration();
-        plan.measureStartSec = start;
-        plan.measureEndSec = end;
+        state.plan.trimMeasurement = start > 0.0 || end < job.timeline->totalDuration();
+        state.plan.measureStartSec = start;
+        state.plan.measureEndSec = end;
     }
-    plan.failAacConvertForTest = forced == ForcedFailure::AacConvert;
-    QString message = audioexport::measureAndConvert(plan, mix, job, &error);
-    if (mix.isEmpty() && hasDuration && !hasSequence && !hasIntermediate
-        && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath)) {
-        // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
-        // removed. Make the silent track the ordinary export makes (nothing to measure: 0 dB).
+    state.plan.failAacConvertForTest = state.forced == loudnessauto::ForcedFailure::AacConvert;
+    // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
+    // removed. Plan the silent track the ordinary export makes (nothing to measure: 0 dB).
+    state.hasSilentPlan = state.hasDuration && !state.hasSequence && !state.hasIntermediate
+        && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath);
+    if (state.hasSilentPlan) {
         const int audioKbps = job.exportConfig.value("audioBitrate").toInt();
-        QString silentError;
-        const QString silent = prepareTimelineAudioMixForExport(job.timeline, &silentError,
-            {}, 0.0, audioKbps > 0 ? audioKbps : 192);
+        state.silentPlan = audioexport::buildMixPlan(job.timeline, job.timeline->audioMixer(),
+            {QString(), 0.0, audioKbps > 0 ? audioKbps : 192});
+    }
+    return state;
+}
+
+void runPrepareJob(PrepareJobState &state, RenderJob &job, const std::function<bool()> &cancelled)
+{
+    QString error;
+    if (state.hasSequence) {
+        state.mix = audioexport::executeMixPlan(state.plan, cancelled, &error);
+        if (state.forced == loudnessauto::ForcedFailure::PcmMix) {
+            QFile::remove(state.mix); // a failed mix leaves no output behind (finishMix)
+            state.mix.clear();
+            error = QStringLiteral("test: forced PCM mix failure");
+        }
+        if (state.mix.isEmpty() && !state.hasIntermediate)
+            job.exportConfig["loudnessAutoError"] = error.isEmpty()
+                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
+    }
+    if (cancelled()) {
+        // The caller drops the job: register the mix so its removeTempFiles deletes it.
+        state.cancelled = true;
+        RenderQueue::addTempFile(job.exportConfig, state.mix);
+        return;
+    }
+    state.message = audioexport::measureAndConvert(state.plan, state.mix, job, &error, cancelled);
+    if (state.hasSilentPlan)
+        state.silent = audioexport::executeMixPlan(state.silentPlan, cancelled, &state.silentError);
+    if (cancelled()) {
+        // Cancelled during the measurement or the silent track: the caller drops the job.
+        state.cancelled = true;
+        RenderQueue::addTempFile(job.exportConfig, state.silent);
+    }
+}
+
+QString finishPrepareJob(PrepareJobState &state, RenderJob &job)
+{
+    QString message = state.message;
+    if (state.hasSilentPlan) {
+        const QString &silent = state.silent;
+        QString silentError = state.silentError;
         // Passthrough (no clip on any video track): nothing to export, so leave the job as is.
         const bool passthrough = silent.isEmpty() && silentError.isEmpty()
-            && timelineAudioMatchesPassthrough(job.timeline);
+            && (!job.timeline || timelineAudioMatchesPassthrough(job.timeline));
         if (!passthrough) {
             ++s_silentMixCalls;
             RenderQueue::addTempFile(job.exportConfig, silent);
-            if (forced == ForcedFailure::SilentMix && silentError.isEmpty())
+            if (state.forced == loudnessauto::ForcedFailure::SilentMix && silentError.isEmpty())
                 silentError = QStringLiteral("test: forced silent mix failure");
             if (!silent.isEmpty() && silentError.isEmpty()) RenderQueue::setIntermediateProjectFile(job, silent);
             else {
@@ -2562,6 +2605,47 @@ QString loudnessauto::prepareJob(RenderJob &job)
     job.loudnessGainDb = job.exportConfig.value("loudnessGainDb").toDouble();
     qInfo().noquote() << job.name << message;
     return message;
+}
+} // namespace
+
+// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here or
+// prepareJobAsync, so a failed mix never falls back to the unnormalized V1 source audio: it sets
+// loudnessAutoError and RenderQueue::addJob rejects the job.
+QString loudnessauto::prepareJob(RenderJob &job)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    PrepareJobState state = beginPrepareJob(job);
+    runPrepareJob(state, job, [] { return false; });
+    return finishPrepareJob(state, job);
+}
+
+void loudnessauto::prepareJobAsync(RenderJob job, std::function<void(RenderJob, QString)> done,
+                                   std::function<bool()> cancelled)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) {
+        done(std::move(job), {});
+        return;
+    }
+    auto state = std::make_shared<PrepareJobState>(beginPrepareJob(job));
+    // Timeline is a QWidget: the worker's copy never carries it; the GUI side restores it.
+    QPointer<Timeline> timeline = job.timeline;
+    job.timeline = nullptr;
+    (void)QtConcurrent::run([state, job = std::move(job), done = std::move(done),
+                             cancelled = std::move(cancelled), timeline = std::move(timeline)]() mutable {
+        runPrepareJob(*state, job, cancelled);
+        RenderQueue orphan; // local queue: the GUI side may never run (the app quits after a cancel)
+        if (state->cancelled) orphan.removeTempFiles(&job);
+        RenderJob leftover;
+        leftover.exportConfig[QStringLiteral("tempFiles")] = job.exportConfig.value(QStringLiteral("tempFiles"));
+        QCoreApplication *app = QCoreApplication::instance();
+        const bool posted = app && QMetaObject::invokeMethod(app,
+            [state, job = std::move(job), done = std::move(done), timeline = std::move(timeline)]() mutable {
+                job.timeline = timeline.data();
+                const QString message = state->cancelled ? QString() : finishPrepareJob(*state, job);
+                done(std::move(job), message);
+            }, Qt::QueuedConnection);
+        if (!posted) orphan.removeTempFiles(&leftover);
+    });
 }
 
 void syncTimeRemapEntriesToTimeline(
@@ -10491,11 +10575,11 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
     job.loudnessGainDb = exporter_loudnessGainDb();
     job.exportConfig["loudnessGainDb"] = job.loudnessGainDb;
     RenderQueue::appendSubtitleTrack(job.exportConfig, m_subtitleSegments, m_subtitleStyle, this);
-    // prepareJob overwrites job.loudnessGainDb with the measured value. Callers hand the
-    // pre-measurement project gain to RenderQueue::setLoudnessGainDb (its fallback), so
-    // report it before preparing. Its status text stays in exportConfig["loudnessAutoStatus"].
+    // The callers run loudnessauto::prepareJobAsync next, which overwrites job.loudnessGainDb
+    // with the measured value. They hand the pre-measurement project gain to
+    // RenderQueue::setLoudnessGainDb (its fallback), so report it here. The status text of the
+    // preparation stays in exportConfig["loudnessAutoStatus"].
     if (projectLoudnessGainDb) *projectLoudnessGainDb = job.loudnessGainDb;
-    loudnessauto::prepareJob(job);
     return job;
 }
 
@@ -10547,7 +10631,7 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
             : prepareTimelineAudioMixForExport(m_timeline, &mixError, {}, 0.0, config.audioBitrate));
     if (mixError.isEmpty()) mixError = m_exportAudioMixErrorForTest;
     // Register before judging the result so an intermediate left by a failed mix is
-    // removed together with whatever buildExportRenderJob (prepareJob) already queued.
+    // removed together with whatever prepareJobAsync already queued.
     if (!preparedAudioMixPath.isEmpty())
         RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
     if (!mixError.isEmpty()) {
@@ -10562,6 +10646,44 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
     if (!preparedAudioMixPath.isEmpty()) RenderQueue::setIntermediateProjectFile(job, preparedAudioMixPath);
     return true;
+}
+
+void MainWindow::prepareExportJobAsync(RenderJob job, std::function<void(RenderJob)> next)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) {
+        next(std::move(job));
+        return;
+    }
+    auto *progress = new QProgressDialog(QStringLiteral("音声を準備しています…"),
+                                         QStringLiteral("キャンセル"), 0, 0, this);
+    progress->setObjectName(QStringLiteral("loudnessPrepareProgress"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    connect(progress, &QProgressDialog::canceled, progress, [cancelled]() { cancelled->store(true); });
+    progress->show();
+    QPointer<MainWindow> self(this);
+    QPointer<QProgressDialog> dialog(progress);
+    loudnessauto::prepareJobAsync(std::move(job),
+        [self, dialog, cancelled, next = std::move(next)](RenderJob prepared, const QString &) {
+            const bool wasCancelled = cancelled->load();
+            if (dialog) { // hide, not close: QProgressDialog::closeEvent emits canceled
+                dialog->hide();
+                dialog->deleteLater();
+            }
+            if (!self) {
+                RenderQueue orphan; // the window (and its queue) is gone: a local queue cleans up
+                orphan.removeTempFiles(&prepared);
+                return;
+            }
+            if (wasCancelled) {
+                self->ensureRenderQueue()->removeTempFiles(&prepared);
+                self->statusBar()->showMessage(QStringLiteral("音声の準備をキャンセルしました"), 10000);
+                return;
+            }
+            next(std::move(prepared));
+        },
+        [cancelled]() { return cancelled->load(); });
 }
 
 void MainWindow::showExportProgressDialog(const QString &jobUuid, const QString &label,
@@ -10623,13 +10745,15 @@ void MainWindow::exportVideo()
         else statusBar()->showMessage(tr("音声の書き出しが完了しました: %1").arg(exportCfg.outputPath), 10000);
         return;
     }
-    const auto &clips = m_timeline->videoClips();
-
     if (!timelineHasExportableVideo(m_timeline)) {
         QMessageBox::warning(this, "Export", "No clips in timeline to export.");
         return;
     }
+    submitNormalExport(exportCfg);
+}
 
+void MainWindow::submitNormalExport(const ExportConfig &exportCfg)
+{
     // S12 single-path: the File->Export action now routes through RenderQueue,
     // which renders the FULL live edit graph via tlrender::renderFrameAt (S8)
     // — pixel-identical to the GLPreview composite. The legacy CPU-only
@@ -10640,6 +10764,15 @@ void MainWindow::exportVideo()
 
     double projectLoudnessGainDb = 0.0;
     RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal, &projectLoudnessGainDb);
+    prepareExportJobAsync(std::move(job), [this, exportCfg, projectLoudnessGainDb](RenderJob prepared) {
+        queueNormalExport(std::move(prepared), exportCfg, projectLoudnessGainDb);
+    });
+}
+
+void MainWindow::queueNormalExport(RenderJob job, const ExportConfig &exportCfg,
+                                   double projectLoudnessGainDb)
+{
+    const auto &clips = m_timeline->videoClips();
     QString audioMixError;
     if (!finalizeExportJobAudio(job, exportCfg, &audioMixError)) {
         QMessageBox::warning(this, QStringLiteral("Export"),
@@ -17007,44 +17140,47 @@ void MainWindow::onMobileExport()
                     double projectLoudnessGainDb = 0.0;
                     RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,
                                                          &projectLoudnessGainDb);
-                    // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
-                    // 作る。OFF 時だけここで無音 / 混合トラックを作る。
-                    if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
-                        QString audioMixError;
-                        if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
-                            QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
-                                                 audioMixError);
-                            return;
+                    prepareExportJobAsync(std::move(job),
+                        [this, cfg, projectLoudnessGainDb](RenderJob job) {
+                        // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
+                        // 作る。OFF 時だけここで無音 / 混合トラックを作る。
+                        if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
+                            QString audioMixError;
+                            if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
+                                QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
+                                                     audioMixError);
+                                return;
+                            }
                         }
-                    }
 
-                    showExportProgressDialog(job.uuid,
-                        QStringLiteral("モバイル向けエクスポート中..."),
-                        QStringLiteral("キャンセル"),
-                            [this](bool ok, const QString &err) {
-                                if (ok)
-                                    statusBar()->showMessage(QStringLiteral(
-                                        "モバイル書き出し完了 (timeline SSOT)"));
-                                else
-                                    QMessageBox::critical(this,
-                                        QStringLiteral("モバイル書き出し失敗"),
-                                        err.isEmpty()
-                                            ? QStringLiteral("Export failed")
-                                            : err);
-                            });
-                    // RM-1.3: job.timeline != nullptr path — exports the
-                    // live matte carrier, as File→Export above.
-                    syncProjectLightingToTimeline();
-                    // AC: production export 経路に ACES SSOT を push (start()
-                    // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
-                    m_renderQueue->setAcesPipeline(m_acesPipeline);
-                    m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
-                    statusBar()->showMessage(
-                        QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
-                    const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
-                    if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
-                    m_renderQueue->addJob(job);
-                    m_renderQueue->start();
+                        showExportProgressDialog(job.uuid,
+                            QStringLiteral("モバイル向けエクスポート中..."),
+                            QStringLiteral("キャンセル"),
+                                [this](bool ok, const QString &err) {
+                                    if (ok)
+                                        statusBar()->showMessage(QStringLiteral(
+                                            "モバイル書き出し完了 (timeline SSOT)"));
+                                    else
+                                        QMessageBox::critical(this,
+                                            QStringLiteral("モバイル書き出し失敗"),
+                                            err.isEmpty()
+                                                ? QStringLiteral("Export failed")
+                                                : err);
+                                });
+                        // RM-1.3: job.timeline != nullptr path — exports the
+                        // live matte carrier, as File→Export above.
+                        syncProjectLightingToTimeline();
+                        // AC: production export 経路に ACES SSOT を push (start()
+                        // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
+                        m_renderQueue->setAcesPipeline(m_acesPipeline);
+                        m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
+                        statusBar()->showMessage(
+                            QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
+                        const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
+                        if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
+                        m_renderQueue->addJob(job);
+                        m_renderQueue->start();
+                    });
                 });
     }
     m_mobileExportDialog->show();

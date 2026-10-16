@@ -226,28 +226,34 @@ int runExportCfgSelftest()
     tally.gate(3, containsMapped && selectedDimensions && subtitles && dynamic
         && equalSelected && projectOverride);
 
-    // G4: loudnessauto::prepareJob runs inside buildExportRenderJob for BOTH entries.
-    // Detects a regression where either route (or the shared builder) stops preparing:
-    // the call counter then rises by less than 2 and loudnessAutoStatus is missing.
+    // G4: since US-1105 buildExportRenderJob returns BOTH entries' jobs unprepared (the entries
+    // run prepareJobAsync next, loudness-auto G14) and preparing each job prepares it. Detects
+    // the builder preparing again (unprepared fails) or a job it builds that prepareJob cannot
+    // prepare (the counter rises by less than 2, loudnessAutoStatus missing).
     // (buildExportRenderJob always writes exportConfig["loudnessGainDb"], so that key
     // alone cannot prove preparation; loudnessAutoStatus is written only by prepareJob.)
     ExportConfig on = config;
     on.autoLoudness = true;
     const int countBeforeOn = loudnessauto::prepareJobCallCountForTest();
-    const RenderJob onNormal = window.buildExportRenderJob(on, MainWindow::ExportEntry::Normal);
-    const RenderJob onMobile = window.buildExportRenderJob(on, MainWindow::ExportEntry::MobileBatch);
+    RenderJob onNormal = window.buildExportRenderJob(on, MainWindow::ExportEntry::Normal);
+    RenderJob onMobile = window.buildExportRenderJob(on, MainWindow::ExportEntry::MobileBatch);
+    const bool unprepared = loudnessauto::prepareJobCallCountForTest() == countBeforeOn
+        && !onNormal.exportConfig.contains("loudnessAutoStatus")
+        && !onMobile.exportConfig.contains("loudnessAutoStatus");
+    loudnessauto::prepareJob(onNormal);
+    loudnessauto::prepareJob(onMobile);
     const int onDelta = loudnessauto::prepareJobCallCountForTest() - countBeforeOn;
     const bool normalPrepared = onNormal.exportConfig.contains("loudnessAutoStatus")
         && (onNormal.exportConfig.contains("loudnessGainDb") || onNormal.exportConfig.contains("loudnessAutoError"));
     const bool mobilePrepared = onMobile.exportConfig.contains("loudnessAutoStatus")
         && (onMobile.exportConfig.contains("loudnessGainDb") || onMobile.exportConfig.contains("loudnessAutoError"));
-    std::fprintf(stderr, "export-cfg G4 countDelta=%d normal[status=%d gain=%d error=%d] "
-        "mobile[status=%d gain=%d error=%d]\n", onDelta,
+    std::fprintf(stderr, "export-cfg G4 unprepared=%d countDelta=%d normal[status=%d gain=%d error=%d] "
+        "mobile[status=%d gain=%d error=%d]\n", unprepared, onDelta,
         onNormal.exportConfig.contains("loudnessAutoStatus"), onNormal.exportConfig.contains("loudnessGainDb"),
         onNormal.exportConfig.contains("loudnessAutoError"),
         onMobile.exportConfig.contains("loudnessAutoStatus"), onMobile.exportConfig.contains("loudnessGainDb"),
         onMobile.exportConfig.contains("loudnessAutoError"));
-    tally.gate(4, onDelta == 2 && normalPrepared && mobilePrepared);
+    tally.gate(4, unprepared && onDelta == 2 && normalPrepared && mobilePrepared);
 
     // G5: the out parameter returns the PRE-measurement project gain (what
     // RenderQueue::setLoudnessGainDb must keep receiving); job.loudnessGainDb holds the
@@ -258,8 +264,10 @@ int runExportCfgSelftest()
     gainSetter.setLoudnessGainDb(-6.0);
     double normalProjectGain = 99.0;
     double mobileProjectGain = 99.0;
-    const RenderJob gainNormal = window.buildExportRenderJob(on, MainWindow::ExportEntry::Normal, &normalProjectGain);
-    const RenderJob gainMobile = window.buildExportRenderJob(on, MainWindow::ExportEntry::MobileBatch, &mobileProjectGain);
+    RenderJob gainNormal = window.buildExportRenderJob(on, MainWindow::ExportEntry::Normal, &normalProjectGain);
+    RenderJob gainMobile = window.buildExportRenderJob(on, MainWindow::ExportEntry::MobileBatch, &mobileProjectGain);
+    loudnessauto::prepareJob(gainNormal);
+    loudnessauto::prepareJob(gainMobile);
     gainSetter.setLoudnessGainDb(previousProjectGain);
     const bool projectGainReturned = normalProjectGain == -6.0 && mobileProjectGain == -6.0;
     const bool measuredInJob = gainNormal.loudnessGainDb == 0.0 && gainMobile.loudnessGainDb == 0.0
@@ -332,6 +340,7 @@ int runExportCfgSelftest()
         g8Config.autoLoudness = true;
         g8Config.audioBitrate = 128;
         RenderJob g8 = g8Window.buildExportRenderJob(g8Config, MainWindow::ExportEntry::Normal);
+        loudnessauto::prepareJob(g8);
         QStringList created;
         for (const QJsonValue &value : g8.exportConfig.value("tempFiles").toArray())
             created << value.toString();
