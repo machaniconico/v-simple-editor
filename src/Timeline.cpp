@@ -7120,6 +7120,32 @@ bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
     TrackClipSnapshot before = snapshotTrackClips(this);
     auto clips = track->clips();
     clips[clipIndex] = clip;
+    if (decomposing) {
+        // The restored nested originals are shared with every clone of the
+        // baked clip, so a restored uid can collide across tracks (setClips
+        // only repairs within one track). Re-mint any that collides.
+        QSet<QString> taken;
+        for (const auto *videoTrack : m_videoTracks) {
+            const auto trackClips = videoTrack->clips();
+            for (int i = 0; i < trackClips.size(); ++i)
+                if (videoTrack != track || i != clipIndex) taken.insert(trackClips[i].uid);
+        }
+        for (const auto *audioTrack : m_audioTracks)
+            for (const ClipInfo &audioClip : audioTrack->clips())
+                if (previous.linkGroup == 0 || audioClip.linkGroup != previous.linkGroup)
+                    taken.insert(audioClip.uid);
+        const auto claim = [&taken](ClipInfo &restored) {
+            if (taken.contains(restored.uid)) restored.uid.clear();
+            else taken.insert(restored.uid);
+        };
+        claim(clips[clipIndex]);
+        for (int t = 0; t < m_audioTracks.size(); ++t) {
+            const auto currentClips = m_audioTracks[t]->clips();
+            for (int i = 0; i < audioReplacements[t].size(); ++i)
+                if (previous.linkGroup != 0 && currentClips[i].linkGroup == previous.linkGroup)
+                    claim(audioReplacements[t][i]);
+        }
+    }
     track->setClips(clips);
     for (int i = 0; i < m_audioTracks.size(); ++i)
         m_audioTracks[i]->setClips(audioReplacements[i]);

@@ -3,6 +3,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "SelftestGate.h"
+#include "../RenderInPlace.h"
 
 #include <QSet>
 #include <QString>
@@ -24,6 +25,7 @@
 //   G3: setClips with two clips sharing a uid keeps it on the first, re-mints
 //       the second and counts one repair; distinct uids are kept and counted 0.
 //   G4: undo / redo of a paste restore the exact uids of each state.
+//   G5: decomposing two baked clones on different audio tracks yields distinct uids
 namespace {
 ClipInfo clipFor(const QString &path, double duration = 2.0)
 {
@@ -278,6 +280,60 @@ int runClipUidSelftest()
             qPrintable(joined(beforeEdit)), qPrintable(joined(afterEdit)),
             qPrintable(joined(undone)), qPrintable(joined(redone))).toStdString();
         tally.gate(4, ok, detail);
+    }
+
+    // G5: decomposing two baked clones on different audio tracks yields distinct uids.
+    {
+        const auto bakedPair = [](int group, const QString &bakedPath, QVector<ClipInfo> &video,
+                                  QVector<ClipInfo> &audio) {
+            ClipInfo originalVideo = clipFor(QStringLiteral("/selftests/uid-src.mp4"));
+            originalVideo.uid = QStringLiteral("orig-v");
+            originalVideo.linkGroup = group;
+            ClipInfo originalAudio = clipFor(QStringLiteral("/selftests/uid-src.mp4"));
+            originalAudio.uid = QStringLiteral("orig-a");
+            originalAudio.linkGroup = group;
+            ClipInfo bakedVideo = clipFor(bakedPath);
+            bakedVideo.linkGroup = group;
+            bakedVideo.renderInPlaceOriginal = std::make_shared<ClipInfo>(originalVideo);
+            ClipInfo bakedAudio = clipFor(bakedPath);
+            bakedAudio.linkGroup = group;
+            bakedAudio.renderInPlaceOriginal = std::make_shared<ClipInfo>(originalAudio);
+            video.append(bakedVideo);
+            audio.append(bakedAudio);
+        };
+        Timeline timeline;
+        QVector<ClipInfo> v1, a1, v2, a2;
+        bakedPair(1, QStringLiteral("/selftests/uid-baked1.mp4"), v1, a1);
+        bakedPair(2, QStringLiteral("/selftests/uid-baked2.mp4"), v2, a2);
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{v1, v2},
+                                    QVector<QVector<ClipInfo>>{a1, a2}, 0.0, -1.0, -1.0, 100);
+        const bool d1 = renderinplace::decomposeRenderInPlace(timeline, 0, 0);
+        const bool d2 = renderinplace::decomposeRenderInPlace(timeline, 1, 0);
+        const QString audio1 = timeline.trackAt(true, 0)->clips()[0].uid;
+        const QString audio2 = timeline.trackAt(true, 1)->clips()[0].uid;
+        const QString video1 = timeline.trackAt(false, 0)->clips()[0].uid;
+        const QString video2 = timeline.trackAt(false, 1)->clips()[0].uid;
+        fprintf(stderr, "[clip-uid] G5 uids a1=%s a2=%s v1=%s v2=%s\n", qPrintable(audio1),
+                qPrintable(audio2), qPrintable(video1), qPrintable(video2));
+        const bool distinct = d1 && d2 && allNonEmptyDistinct({audio1, audio2, video1, video2});
+
+        // Control: a single baked clip without a collision keeps its original uids.
+        Timeline single;
+        QVector<ClipInfo> sv, sa;
+        bakedPair(3, QStringLiteral("/selftests/uid-baked3.mp4"), sv, sa);
+        single.restoreFromProject(QVector<QVector<ClipInfo>>{sv}, QVector<QVector<ClipInfo>>{sa},
+                                  0.0, -1.0, -1.0, 100);
+        const bool ds = renderinplace::decomposeRenderInPlace(single, 0, 0);
+        const QString keptAudio = single.trackAt(true, 0)->clips()[0].uid;
+        const QString keptVideo = single.trackAt(false, 0)->clips()[0].uid;
+        fprintf(stderr, "[clip-uid] G5 control uids a=%s v=%s\n", qPrintable(keptAudio),
+                qPrintable(keptVideo));
+        const bool kept = ds && keptAudio == QLatin1String("orig-a")
+            && keptVideo == QLatin1String("orig-v");
+        const std::string detail = QString::asprintf(
+            "decomposed=%d,%d distinct=%d control decomposed=%d kept=%d", int(d1), int(d2),
+            int(distinct), int(ds), int(kept)).toStdString();
+        tally.gate(5, distinct && kept, detail);
     }
 
     return tally.finish("clip-uid");
