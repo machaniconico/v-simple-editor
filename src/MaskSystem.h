@@ -87,6 +87,7 @@ class MaskSystem
 {
 public:
     MaskSystem() = default;
+    bool isDefault() const { return m_masks.isEmpty(); }
 
     // --- Mask management ---
 

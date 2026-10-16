@@ -4,6 +4,8 @@
 #include "SpeechRecognizer.h"
 #include "WhisperTranscriber.h"
 
+#include <algorithm>
+
 #include <QApplication>
 #include <QBrush>
 #include <QCheckBox>
@@ -17,6 +19,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPainter>
@@ -92,11 +95,12 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // ===================== 左パネル =====================
     // クリップテーブル
     m_clipTable = new QTableWidget(this);
+    m_clipTable->setObjectName(QStringLiteral("captionClipTable"));
     m_clipTable->setColumnCount(kClipColumnCount);
     m_clipTable->setHorizontalHeaderLabels(
         {tr("開始(ms)"), tr("終了(ms)"), tr("テキスト"), tr("CPS"), tr("話者")});
     m_clipTable->setSelectionBehavior(QAbstractItemView::SelectRows);
-    m_clipTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_clipTable->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_clipTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_clipTable->setAlternatingRowColors(true);
     m_clipTable->horizontalHeader()->setStretchLastSection(true);
@@ -107,6 +111,21 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     m_removeClipButton = new QPushButton(tr("削除"), this);
     m_importButton     = new QPushButton(tr("SRT/VTT 取り込み…"), this);
     m_exportButton     = new QPushButton(tr("SRT エクスポート…"), this);
+
+    m_splitMsSpin = new QSpinBox(this);
+    m_splitMsSpin->setObjectName(QStringLiteral("captionSplitMsSpin"));
+    m_splitMsSpin->setRange(0, 3600000);
+    m_splitMsSpin->setSuffix(QStringLiteral(" ms"));
+    m_splitButton = new QPushButton(tr("分割"), this);
+    m_splitButton->setObjectName(QStringLiteral("captionSplitButton"));
+    m_mergeButton = new QPushButton(tr("結合"), this);
+    m_mergeButton->setObjectName(QStringLiteral("captionMergeButton"));
+
+    auto* splitMergeBar = new QHBoxLayout;
+    splitMergeBar->addWidget(new QLabel(tr("分割位置 (ms):"), this));
+    splitMergeBar->addWidget(m_splitMsSpin, 1);
+    splitMergeBar->addWidget(m_splitButton);
+    splitMergeBar->addWidget(m_mergeButton);
 
     auto* clipButtonBar = new QHBoxLayout;
     clipButtonBar->addWidget(m_addClipButton);
@@ -134,6 +153,7 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     auto* leftLayout = new QVBoxLayout;
     leftLayout->addWidget(m_clipTable, 1);
     leftLayout->addLayout(clipButtonBar);
+    leftLayout->addLayout(splitMergeBar);
     leftLayout->addLayout(asrRow);
 
     auto* leftWidget = new QWidget(this);
@@ -292,6 +312,13 @@ CaptionEditorDialog::CaptionEditorDialog(QWidget* parent)
     // ===================== シグナル接続 =====================
     connect(m_clipTable, &QTableWidget::currentCellChanged,
             this, [this](int row, int, int, int) { onClipRowChanged(row); });
+
+    connect(m_clipTable, &QTableWidget::itemSelectionChanged,
+            this, &CaptionEditorDialog::updateSplitMergeState);
+    connect(m_splitMsSpin, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, [this](int) { updateSplitMergeState(); });
+    connect(m_splitButton, &QPushButton::clicked, this, &CaptionEditorDialog::onSplitClicked);
+    connect(m_mergeButton, &QPushButton::clicked, this, &CaptionEditorDialog::onMergeClicked);
 
     connect(m_textEdit, &QTextEdit::textChanged, this, &CaptionEditorDialog::onClipTextEdited);
     connect(m_startMsSpin, QOverload<int>::of(&QSpinBox::valueChanged),
@@ -480,6 +507,7 @@ void CaptionEditorDialog::onClipRowChanged(int row)
         m_startMsSpin->setEnabled(false);
         m_endMsSpin->setEnabled(false);
         m_removeClipButton->setEnabled(false);
+        updateSplitMergeState();
         updatePreview();
         return;
     }
@@ -498,7 +526,9 @@ void CaptionEditorDialog::onClipRowChanged(int row)
     m_textEdit->setPlainText(clip.text);
     m_startMsSpin->setValue(static_cast<int>(clip.startMs));
     m_endMsSpin->setValue(static_cast<int>(clip.endMs));
+    m_splitMsSpin->setValue(static_cast<int>(clip.startMs + (clip.endMs - clip.startMs) / 2));
 
+    updateSplitMergeState();
     updatePreview();
 }
 
@@ -542,6 +572,7 @@ void CaptionEditorDialog::onClipTimeEdited()
     setApplyError(QString());
     m_track.updateClip(m_currentRow, clip);
     refreshClipRow(m_currentRow);
+    updateSplitMergeState();
     emit trackChanged(m_track);
 }
 
@@ -578,6 +609,71 @@ void CaptionEditorDialog::onRemoveClipClicked()
     setApplyError(QString());
     m_track.removeClipAt(m_currentRow);
     rebuildClipTable();
+    emit trackChanged(m_track);
+}
+
+// ---------------------------------------------------------------------------
+// selectedRows / updateSplitMergeState / onSplitClicked / onMergeClicked
+// ---------------------------------------------------------------------------
+QList<int> CaptionEditorDialog::selectedRows() const
+{
+    QList<int> rows;
+    const QModelIndexList indexes = m_clipTable->selectionModel()->selectedRows();
+    for (const QModelIndex& index : indexes)
+        rows.append(index.row());
+    std::sort(rows.begin(), rows.end());
+    return rows;
+}
+
+void CaptionEditorDialog::updateSplitMergeState()
+{
+    const QList<int> rows = selectedRows();
+    const int count = m_track.clipCount();
+
+    bool canSplit = false;
+    if (rows.size() == 1 && rows.first() < count)
+        canSplit = caption::splitClip(m_track.clipAt(rows.first()), m_splitMsSpin->value()).has_value();
+
+    bool canMerge = false;
+    if (rows.size() == 2 && rows.at(1) == rows.at(0) + 1 && rows.at(1) < count)
+        canMerge = caption::mergeClips(m_track.clipAt(rows.at(0)), m_track.clipAt(rows.at(1))).has_value();
+
+    m_splitButton->setEnabled(canSplit);
+    m_mergeButton->setEnabled(canMerge);
+}
+
+void CaptionEditorDialog::onSplitClicked()
+{
+    const QList<int> rows = selectedRows();
+    if (rows.size() != 1 || rows.first() >= m_track.clipCount())
+        return;
+    const int row = rows.first();
+    const auto parts = caption::splitClip(m_track.clipAt(row), m_splitMsSpin->value());
+    if (!parts)
+        return;
+
+    setApplyError(QString());
+    m_track.updateClip(row, parts->first);
+    m_track.insertClipAt(row + 1, parts->second);
+    rebuildClipTable();
+    m_clipTable->selectRow(row);
+    emit trackChanged(m_track);
+}
+
+void CaptionEditorDialog::onMergeClicked()
+{
+    const QList<int> rows = selectedRows();
+    if (rows.size() != 2 || rows.at(1) != rows.at(0) + 1 || rows.at(1) >= m_track.clipCount())
+        return;
+    const auto merged = caption::mergeClips(m_track.clipAt(rows.at(0)), m_track.clipAt(rows.at(1)));
+    if (!merged)
+        return;
+
+    setApplyError(QString());
+    m_track.updateClip(rows.at(0), *merged);
+    m_track.removeClipAt(rows.at(1));
+    rebuildClipTable();
+    m_clipTable->selectRow(rows.at(0));
     emit trackChanged(m_track);
 }
 

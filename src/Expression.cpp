@@ -377,6 +377,11 @@ private:
 
     ExpressionResult callFunction(const QString &name, const QVector<MathStringArg> &args)
     {
+        if (name == "audioLevel") {
+            if (args.size() > 1) return argError(name, 1);
+            const double t = m_ctx.time + (args.isEmpty() ? 0.0 : double(args[0]));
+            return ExpressionResult::ok(m_ctx.audioLevelAtTime ? m_ctx.audioLevelAtTime(t) : 0.0);
+        }
         // Math functions (1 arg)
         if (name == "sin")   { if (args.size() != 1) return argError(name, 1); return ExpressionResult::ok(std::sin(args[0])); }
         if (name == "cos")   { if (args.size() != 1) return argError(name, 1); return ExpressionResult::ok(std::cos(args[0])); }
@@ -747,7 +752,7 @@ QStringList Expression::availableFunctions()
         // Noise
         "noise(t)", "noise2(x,y)", "fbm(t,octaves)",
         // Sampling / smoothing
-        "smooth(width[,samples])",
+        "smooth(width[,samples])", "audioLevel([offsetSec])",
         // Geometry
         "length(x,y)", "dist(x1,y1,x2,y2)",
         // Angle conversion

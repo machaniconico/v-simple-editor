@@ -9,6 +9,8 @@
 #include <QThread>
 #include <QVarLengthArray>
 #include <QSet>
+#include <QJsonArray>
+#include <type_traits>
 #include <QStringList>
 #include <QWaitCondition>
 #include <QMediaDevices>
@@ -18,6 +20,8 @@
 #include <chrono>
 #include <cmath>
 #include <limits>
+#include <memory>
+#include <vector>
 #include <utility>
 
 extern "C" {
@@ -95,6 +99,9 @@ struct AudioDecoderEntry {
     bool postSeekFullDrop = false;
     AVPacket *pkt = nullptr;
     AVFrame *frame = nullptr;
+    // US-1110: per-clip EQ for entry.clipEqEnabled, null otherwise. Built by
+    // setSequence outside m_controlMutex and swapped in under it.
+    std::unique_ptr<trackfx::Processor> clipEq;
 
     AudioDecoderEntry() = default;
     AudioDecoderEntry(const AudioDecoderEntry &) = delete;
@@ -696,6 +703,17 @@ private:
     std::atomic<bool> m_workPending{false};
 };
 
+namespace {
+// Track mute / solo rule shared by effectiveGain and the route mix (US-1122):
+// with any track soloed only soloed tracks sound, otherwise every unmuted one.
+bool trackAudible(const QVector<AudioMixer::TrackState> &tracks, int trackIdx)
+{
+    bool anySolo = false;
+    for (const auto &t : tracks) if (t.solo) { anySolo = true; break; }
+    return anySolo ? tracks[trackIdx].solo : !tracks[trackIdx].muted;
+}
+} // namespace
+
 // =====================================================================
 // MixerIODevice — sums samples across every active entry into an int32
 // accumulator, then clamps to s16 stereo. Per-clip volume + per-track
@@ -733,6 +751,20 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
     // holds even if PlaybackEntry::volume bypassed the Timeline 0..2 clamp.
     QVarLengthArray<int32_t, 16384> accum(sampleCount);
     std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
+
+    // US-1116 tap source, read once per callback. A track source sums that
+    // track's entries after their FX and before the fader into m_tapAccum
+    // (the newest kMasterTapFrames frames of this block); the master source
+    // and an unsubscribed tap leave every step of the mix unchanged.
+    const int tapTrack = m_mixer->m_tapSubscribers.load(std::memory_order_acquire) > 0
+        ? m_mixer->m_tapSource.load(std::memory_order_acquire) : -1;
+    const int tapFrames = qMin(frameCount, AudioMixer::kMasterTapFrames);
+    const int tapSkip = (frameCount - tapFrames) * AudioMixer::kChannels;
+    int32_t *tapAccum = nullptr;
+    if (tapTrack >= 0 && !m_mixer->m_tapAccum.isEmpty()) {
+        tapAccum = m_mixer->m_tapAccum.data();
+        std::fill(tapAccum, tapAccum + tapFrames * AudioMixer::kChannels, 0);
+    }
 
     auto bytesToUs = [](qint64 bytes) -> int64_t {
         return bytes * 1'000'000LL
@@ -921,21 +953,33 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                                               envT, e->entry.volume);
         }
         double gain = qBound(0.0, clipGain, 4.0);
+        // Clip-level gain for a track tap: everything in `gain` except the
+        // timeline mute (audioMuted) and the track factor (fader, mute / solo,
+        // bus routing) applied below.
+        double tapGain = gain;
         if (e->entry.audioMuted) gain = 0.0;
         const int trackIdx = e->entry.sourceTrack;
-        if (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
-            gain *= m_mixer->m_trackStates[trackIdx].effectiveGain;
-        // AB-4: bus / submix / aux-send routing. Multiply the per-track
-        // bus-chain gain (track → assigned bus → outputBus chain → master,
-        // with bus mute/solo/cycle handling) into the effective gain. With
-        // no buses defined and no track assigned, resolveTrackToMasterGain
-        // returns 1.0 (identity), so the default preview/export path is
-        // bit-identical to pre-AB-4. The resolve is a cheap O(bus-count)
-        // double accumulation and runs under m_controlMutex (held for the
-        // whole readData fragment), so the GUI-thread setBusRouting swap is
-        // race-free against this read.
-        if (trackIdx >= 0)
-            gain *= m_mixer->m_busRouting.resolveTrackToMasterGain(trackIdx);
+        // AB-4 / US-1122: bus / submix / aux-send routing. route.post is the
+        // main bus chain (track → assigned bus → outputBus chain → master,
+        // with bus mute/solo/cycle handling) plus the post-fader sends and
+        // rides the track fader; route.pre sums the pre-fader sends, which
+        // skip the fader but still follow the track mute / solo. With no
+        // buses and no sends route = {1, 0}, so the factor is the plain
+        // track gain (bit-identical to pre-AB-4). The resolve is a cheap
+        // O(bus-count + send-count) accumulation under m_controlMutex (held
+        // for the whole readData fragment), so the GUI-thread setBusRouting
+        // swap is race-free against this read.
+        if (trackIdx >= 0) {
+            const audiobus::RouteGains route =
+                m_mixer->m_busRouting.resolveTrackRouteGains(trackIdx);
+            double trackFactor = route.post + route.pre; // no track state: fader 1
+            if (trackIdx < m_mixer->m_trackStates.size()) {
+                trackFactor = trackAudible(m_mixer->m_trackStates, trackIdx)
+                    ? m_mixer->m_trackStates[trackIdx].gain * route.post + route.pre
+                    : 0.0;
+            }
+            gain *= trackFactor;
+        }
 
         // Edge-attached audio fade. Equal-power (sqrt) curve so A.trailOut^2
         // + B.leadIn^2 == 1 at the midpoint of an overlap crossfade — linear
@@ -964,11 +1008,18 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // perceived loudness is constant.
             const double t = qBound(0.0, elapsed / e->entry.leadInDuration, 1.0);
             gain *= std::sqrt(t);
+            tapGain *= std::sqrt(t);
         } else if (trailOutFade) {
             const double t = qBound(0.0, remaining / e->entry.trailOutDuration, 1.0);
             gain *= std::sqrt(t);
+            tapGain *= std::sqrt(t);
         }
-        if (gain <= 0.0) {
+        // A tapped entry that is silent in the mix (track mute / solo, fader
+        // or bus at 0) still runs the FX below for the tap, adding only zeros
+        // to the mix; every other silent entry is drained as before.
+        int32_t *tapDst = tapAccum && trackIdx == tapTrack && tapGain > 0.0
+            ? tapAccum : nullptr;
+        if (gain <= 0.0 && !tapDst) {
             // Drain the ring so this muted entry stays in time with the
             // cursor; otherwise unmuting mid-playback would resume from a
             // stale position.
@@ -1086,8 +1137,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             if (outputFrames <= 0) {
                 // Atempo wants more source than the ring holds — flag stalled
                 // so the cursor freezes for a few callbacks while the decoder
-                // catches up (mirrors the empty-ring stall above).
-                entryActiveButStalled = true;
+                // catches up (mirrors the empty-ring stall above). An entry
+                // kept only for the tap never holds the clock.
+                if (gain > 0.0) entryActiveButStalled = true;
                 continue;
             }
             copyBytes = outputFrames * AudioMixer::kBytesPerFrame;
@@ -1097,425 +1149,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
         const int copySamples = copyBytes / static_cast<int>(sizeof(int16_t));
 
-        // Per-track noise reduction (Audition Voice Isolation / Resolve
-        // Fairlight noise gate parity, simplified expander). Runs FIRST in
-        // the per-track chain so downstream EQ / compressor / reverb
-        // amplify the de-noised signal rather than the noise. Stereo-link
-        // detector with attack / release envelope; static curve compares
-        // the envelope (in dBFS) to a noise floor (auto-estimated as the
-        // 5th-percentile of a rolling window OR user-set manual floor) and
-        // applies a smooth ramp between full pass-through and reductionDb
-        // of attenuation across the user-configured threshold band.
-        // Disabled = bit-exact bypass (skip the entire DSP path; do not
-        // touch state).
-        QVarLengthArray<int16_t, 8192> scratchNr;
-        auto nrIt = (trackIdx >= 0)
-            ? m_mixer->m_trackNoiseReduction.constFind(trackIdx)
-            : m_mixer->m_trackNoiseReduction.constEnd();
-        if (nrIt != m_mixer->m_trackNoiseReduction.constEnd()
-            && nrIt.value().enabled
-            && nrIt.value().reductionDb > 1e-6) {
-            const auto &nr = nrIt.value();
-            const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
-            const double atkCoef  = std::exp(-1.0 / (nr.attackMs  * fs * 0.001));
-            const double relCoef  = std::exp(-1.0 / (nr.releaseMs * fs * 0.001));
-
-            auto stateIt = m_mixer->m_trackNoiseReductionState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackNoiseReductionState.end()) {
-                stateIt = m_mixer->m_trackNoiseReductionState.insert(
-                    trackIdx, AudioMixer::NRState{});
-            }
-            AudioMixer::NRState &nrState = stateIt.value();
-            double env = nrState.env;
-
-            // Determine the active noise floor for this fragment. Auto
-            // mode pulls the 5th-percentile of the rolling envelope-dBFS
-            // history; manual mode uses the user-set value directly.
-            double floorDb = nr.manualFloorDb;
-            if (nr.autoFloor && !nrState.recentEnvs.isEmpty()) {
-                QVector<double> sorted = nrState.recentEnvs;
-                std::sort(sorted.begin(), sorted.end());
-                const int idx = qBound(0,
-                    static_cast<int>(sorted.size() * 0.05),
-                    sorted.size() - 1);
-                floorDb = sorted[idx];
-            }
-            nrState.estimatedFloorDb = floorDb;
-
-            // Threshold sets the band where we transition from full
-            // attenuation to full pass-through. We center the smooth
-            // ramp around (floorDb + thresholdDb) with a fixed 12 dB
-            // wide ramp width (perceived smoothness target — narrower
-            // pumps audibly, wider weakens the gating action).
-            const double thresholdAbsDb = floorDb + nr.thresholdDb;
-            constexpr double kRampWidthDb = 12.0;
-            const double rampLo = thresholdAbsDb - 0.5 * kRampWidthDb;
-            const double rampHi = thresholdAbsDb + 0.5 * kRampWidthDb;
-            const double minGainLin = std::pow(10.0, -nr.reductionDb / 20.0);
-
-            scratchNr.resize(copySamples);
-            // Per stereo frame: linked level → envelope → static curve.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                const double xL = static_cast<double>(src[i]);
-                const double xR = static_cast<double>(src[i + 1]);
-                const double level = std::max(std::abs(xL), std::abs(xR));
-                if (level > env) {
-                    env = level + (env - level) * atkCoef;
-                } else {
-                    env = level + (env - level) * relCoef;
-                }
-
-                // dBFS reference 32768 = 0 dBFS.
-                const double envDb = 20.0
-                    * std::log10(std::max(env, 1e-9) / 32768.0);
-
-                double nrGain;
-                if (envDb >= rampHi) {
-                    nrGain = 1.0;            // signal loud enough — no NR
-                } else if (envDb <= rampLo) {
-                    nrGain = minGainLin;     // signal at/below floor — full NR
-                } else {
-                    // Smooth linear ramp in dB domain → exponential in linear.
-                    const double t = (envDb - rampLo) / kRampWidthDb;
-                    const double curveDb = -nr.reductionDb * (1.0 - t);
-                    nrGain = std::pow(10.0, curveDb / 20.0);
-                }
-
-                double yL = xL * nrGain;
-                double yR = xR * nrGain;
-                if (yL > 32767.0) yL = 32767.0;
-                else if (yL < -32768.0) yL = -32768.0;
-                if (yR > 32767.0) yR = 32767.0;
-                else if (yR < -32768.0) yR = -32768.0;
-                scratchNr[i]     = static_cast<int16_t>(yL);
-                scratchNr[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — pass through unchanged.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchNr[i] = src[i];
-            }
-            nrState.env = env;
-
-            // Append the post-fragment envelope-in-dBFS into the rolling
-            // window (used next fragment for auto-floor estimation). One
-            // entry per fragment keeps the percentile sort cheap; with
-            // kAutoFloorWindowSize=256 entries that's ~85 s of history
-            // worst case, ~5 s typical.
-            const double tailEnvDb = 20.0
-                * std::log10(std::max(env, 1e-9) / 32768.0);
-            if (nrState.recentEnvs.size() < AudioMixer::kAutoFloorWindowSize) {
-                nrState.recentEnvs.append(tailEnvDb);
-            } else {
-                if (nrState.recentEnvsHead < 0
-                    || nrState.recentEnvsHead >= AudioMixer::kAutoFloorWindowSize) {
-                    nrState.recentEnvsHead = 0;
-                }
-                nrState.recentEnvs[nrState.recentEnvsHead] = tailEnvDb;
-                nrState.recentEnvsHead =
-                    (nrState.recentEnvsHead + 1) % AudioMixer::kAutoFloorWindowSize;
-            }
-            src = scratchNr.data();
-        }
-
-        // Per-track 4-band parametric EQ cascade (Premiere/Audition parity).
-        // Runs BEFORE the legacy 3-band path and gain/preamp stages; signal
-        // flow: 4-band → 3-band → preamp → gain. When all 4 bands are flat
-        // or disabled, src points at the ring buffer unchanged (bit-exact
-        // bypass). When any band is active, scratchEq holds the filtered
-        // samples and src is rebound to it. Disabled bands skip math
-        // entirely AND skip history updates so re-enabling has no transient.
-        QVarLengthArray<int16_t, 8192> scratchEq;
-        auto coefsIt = (trackIdx >= 0)
-            ? m_mixer->m_trackEqCoefs.constFind(trackIdx)
-            : m_mixer->m_trackEqCoefs.constEnd();
-        if (coefsIt != m_mixer->m_trackEqCoefs.constEnd()) {
-            const auto &coefs = coefsIt.value();
-            const bool anyActive = coefs[0].active || coefs[1].active
-                                || coefs[2].active || coefs[3].active;
-            if (anyActive) {
-                auto histIt = m_mixer->m_trackEqHist.find(trackIdx);
-                if (histIt == m_mixer->m_trackEqHist.end()) {
-                    histIt = m_mixer->m_trackEqHist.insert(
-                        trackIdx, std::array<double, 16>{});
-                }
-                auto &hist = histIt.value();
-                scratchEq.resize(copySamples);
-                // hist layout per band b, channel ch: x1=hist[b*4+ch],
-                // x2=hist[b*4+2+ch], y1=hist[b*4+ch] ... actually we use
-                // 4 doubles per band (2 channels x x1/x2 OR y1/y2)? We need
-                // 4 doubles per band per channel for a direct-form-I biquad
-                // (x1, x2, y1, y2). But we only allocated 16 = 4 bands x
-                // 2 channels x 2 history samples — encode x1/y1 in pairs by
-                // using a transposed direct-form-II (z1, z2 per channel).
-                // hist[b*4 + ch*2 + 0] = z1[ch], hist[b*4 + ch*2 + 1] = z2[ch].
-                for (int i = 0; i < copySamples; ++i) {
-                    const int ch = i & 1;
-                    double s = static_cast<double>(src[i]);
-                    for (int b = 0; b < 4; ++b) {
-                        const auto &c = coefs[b];
-                        if (!c.active) continue; // skip math + history
-                        const int base = b * 4 + ch * 2;
-                        double &z1 = hist[base];
-                        double &z2 = hist[base + 1];
-                        // Transposed direct-form-II:
-                        //   y = b0*x + z1
-                        //   z1 = b1*x - a1*y + z2
-                        //   z2 = b2*x - a2*y
-                        const double y = c.b0 * s + z1;
-                        z1 = c.b1 * s - c.a1 * y + z2;
-                        z2 = c.b2 * s - c.a2 * y;
-                        s = y;
-                    }
-                    // Soft saturation to s16 range — high gain peak boost on
-                    // a band can exceed s16 momentarily. Clamp before re-cast
-                    // so the existing 3-band path receives a valid s16.
-                    if (s > 32767.0) s = 32767.0;
-                    else if (s < -32768.0) s = -32768.0;
-                    scratchEq[i] = static_cast<int16_t>(s);
-                }
-                src = scratchEq.data();
-            }
-        }
-
-        // Per-track feed-forward compressor / limiter (Audition / Resolve
-        // Fairlight parity). Runs AFTER the 4-band EQ stage and BEFORE the
-        // 3-band / preamp / gain stages so per-track meters and the master
-        // bus see post-compression peaks. Stereo-link detector,
-        // transposed envelope follower, Cherny-style soft knee.
-        // Disabled or 1:1 ratio = bit-exact bypass (skip envelope + curve).
-        QVarLengthArray<int16_t, 8192> scratchComp;
-        auto compIt = (trackIdx >= 0)
-            ? m_mixer->m_trackComp.constFind(trackIdx)
-            : m_mixer->m_trackComp.constEnd();
-        if (compIt != m_mixer->m_trackComp.constEnd()
-            && compIt.value().enabled
-            && compIt.value().ratio > 1.0001) {
-            const auto &comp = compIt.value();
-            // Limiter mode collapses to 1000:1 with a fixed 0.5 ms attack.
-            const bool limiter   = comp.ratio >= 20.0;
-            const double effRatio = limiter ? 1000.0 : comp.ratio;
-            const double effAttackMs = limiter ? 0.5 : comp.attackMs;
-
-            const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
-            const double atkCoef  = std::exp(-1.0 / (effAttackMs * fs * 0.001));
-            const double relCoef  = std::exp(-1.0 / (comp.releaseMs * fs * 0.001));
-            const double slope    = 1.0 - 1.0 / effRatio; // dB-per-dB above thresh
-            const double makeupLin = std::pow(10.0, comp.makeupDb / 20.0);
-            const double thresh   = comp.thresholdDb;
-            const double kneeHalf = 0.5 * comp.kneeDb;
-
-            auto stateIt = m_mixer->m_trackCompState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackCompState.end()) {
-                stateIt = m_mixer->m_trackCompState.insert(
-                    trackIdx, AudioMixer::CompressorState{});
-            }
-            double env = stateIt.value().env;
-            double lastGrDb = stateIt.value().currentGrDb;
-
-            scratchComp.resize(copySamples);
-            // copySamples is interleaved L/R (stereo), so iterate by frame.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                const double xL = static_cast<double>(src[i]);
-                const double xR = static_cast<double>(src[i + 1]);
-                const double level = std::max(std::abs(xL), std::abs(xR));
-                // Envelope follower: attack on rising, release on falling.
-                if (level > env) {
-                    env = level + (env - level) * atkCoef;
-                } else {
-                    env = level + (env - level) * relCoef;
-                }
-
-                // Static gain curve in dB. Reference 0 dBFS at 32768.
-                const double envDb = 20.0 * std::log10(std::max(env, 1e-9) / 32768.0);
-                double grDb = 0.0;
-                if (kneeHalf > 1e-6 && envDb > thresh - kneeHalf
-                    && envDb < thresh + kneeHalf) {
-                    // Soft knee: quadratic spline between (thresh - knee/2, 0)
-                    // and (thresh + knee/2, knee/2 * slope).
-                    const double x = envDb - (thresh - kneeHalf);
-                    grDb = slope * (x * x) / (2.0 * comp.kneeDb);
-                } else if (envDb > thresh + kneeHalf) {
-                    grDb = slope * (envDb - thresh);
-                }
-                lastGrDb = grDb;
-
-                const double gainLin = std::pow(10.0, (comp.makeupDb - grDb) / 20.0);
-                // Skip the makeup multiply collapse — combine into one mul.
-                (void)makeupLin;
-                double yL = xL * gainLin;
-                double yR = xR * gainLin;
-                if (yL > 32767.0) yL = 32767.0;
-                else if (yL < -32768.0) yL = -32768.0;
-                if (yR > 32767.0) yR = 32767.0;
-                else if (yR < -32768.0) yR = -32768.0;
-                scratchComp[i]     = static_cast<int16_t>(yL);
-                scratchComp[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — extremely unlikely with stereo
-            // s16 fragments but guarded for safety.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchComp[i] = src[i];
-            }
-            stateIt.value().env = env;
-            stateIt.value().currentGrDb = lastGrDb;
-            src = scratchComp.data();
-        }
-
-        // Per-track reverb (Audition / Fairlight Multitap parity, simplified
-        // Schroeder topology). Cascaded AFTER the compressor stage and BEFORE
-        // the legacy 3-band / preamp / gain stages so meters and the master
-        // bus see the post-reverb signal. Disabled or mixRatio=0 = bit-exact
-        // bypass (skip the entire DSP path; do not touch state).
-        //
-        // Signal flow per channel:
-        //   in → preDelay buffer → sum(comb1..4 with damped feedback)
-        //      → allpass1 → allpass2 → wet
-        //   out = dry * (1 - mix) + wet * mix
-        // Width is applied as a stereo cross-feed between the two channel
-        // wet outputs (0=mono, 100=fully decorrelated).
-        QVarLengthArray<int16_t, 8192> scratchRev;
-        auto revIt = (trackIdx >= 0)
-            ? m_mixer->m_trackReverb.constFind(trackIdx)
-            : m_mixer->m_trackReverb.constEnd();
-        if (revIt != m_mixer->m_trackReverb.constEnd()
-            && revIt.value().enabled
-            && revIt.value().mixRatio > 1e-6) {
-            const auto &rev = revIt.value();
-            // Comb / allpass delays: Freeverb defaults @ 44.1 kHz, scaled to
-            // current sample rate so reverb character is consistent across
-            // hardware. Stereo offset (~23 samples) decorrelates L/R combs.
-            constexpr int kCombDelays44k1[AudioMixer::kReverbCombCount]    = {1116, 1188, 1277, 1356};
-            constexpr int kCombStereoOffset44k1                = 23;
-            constexpr int kAllpassDelays44k1[AudioMixer::kReverbAllpassCount] = {556, 441};
-            const double srScale = static_cast<double>(AudioMixer::kSampleRateHz) / 44100.0;
-            auto scaleDelay = [srScale](int n) {
-                return std::max(1, static_cast<int>(std::lround(n * srScale)));
-            };
-
-            auto stateIt = m_mixer->m_trackReverbState.find(trackIdx);
-            if (stateIt == m_mixer->m_trackReverbState.end()) {
-                stateIt = m_mixer->m_trackReverbState.insert(
-                    trackIdx, AudioMixer::ReverbState{});
-            }
-            AudioMixer::ReverbState &st = stateIt.value();
-            // Lazy buffer initialization on first activation. Subsequent
-            // calls preserve buffer contents so live tweaks don't pop.
-            if (!st.initialized) {
-                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
-                    for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
-                        const int sz = scaleDelay(kCombDelays44k1[b]
-                            + (ch == 1 ? kCombStereoOffset44k1 : 0));
-                        st.comb[ch][b].assign(sz, 0.0f);
-                        st.combIdx[ch][b] = 0;
-                        st.combLP[ch][b]  = 0.0f;
-                    }
-                    for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
-                        const int sz = scaleDelay(kAllpassDelays44k1[a]
-                            + (ch == 1 ? kCombStereoOffset44k1 / 2 : 0));
-                        st.ap[ch][a].assign(sz, 0.0f);
-                        st.apIdx[ch][a] = 0;
-                    }
-                    std::fill(st.preDelay[ch].begin(),
-                              st.preDelay[ch].end(), 0.0f);
-                    st.preDelayIdx[ch] = 0;
-                }
-                st.initialized = true;
-            }
-
-            // Pre-delay length in samples (clamped to buffer size).
-            const int preDelaySamples = std::clamp(
-                static_cast<int>(std::lround(rev.preDelayMs * AudioMixer::kSampleRateHz / 1000.0)),
-                0, AudioMixer::kReverbPreDelayMaxSamples - 1);
-            // Comb feedback gain: g = 0.7 * decay / standardDecay (1.0 sec).
-            // Clamped to <0.98 for unconditional stability across the comb
-            // bank (each comb's pole magnitude must stay inside the unit
-            // circle even with HF damping subtracting energy).
-            const float fbGain = static_cast<float>(
-                std::clamp(0.7 * rev.decaySeconds / 1.0, 0.0, 0.97));
-            // HF damping coefficient: 0 = no LP (bright tail), ~1 = heavy
-            // LP (dark tail). Implemented as one-pole LP inside the comb
-            // feedback path: y = (1-d)*x + d*y_prev.
-            const float damp = static_cast<float>(
-                std::clamp(rev.dampingHF / 100.0, 0.0, 0.95));
-            const float dampInv = 1.0f - damp;
-            constexpr float kAllpassGain = 0.5f;
-            const float mix = static_cast<float>(std::clamp(rev.mixRatio, 0.0, 1.0));
-            const float dry = 1.0f - mix;
-            // Width: 0 = mono sum (collapse), 100 = pass-through.
-            // We blend each channel's wet with the cross-channel wet.
-            const float width = static_cast<float>(
-                std::clamp(rev.widthPercent / 100.0, 0.0, 1.0));
-            const float crossFeed = 0.5f * (1.0f - width); // 0 at width=100, 0.5 at width=0
-            const float selfFeed  = 1.0f - crossFeed;
-
-            scratchRev.resize(copySamples);
-            // Process per stereo frame so we can apply width cross-feed.
-            for (int i = 0; i + 1 < copySamples; i += 2) {
-                float wet[AudioMixer::kChannels];
-                for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
-                    const float xin = static_cast<float>(src[i + ch]);
-                    // Pre-delay: write input, read N samples back.
-                    auto &pd = st.preDelay[ch];
-                    int &pdIdx = st.preDelayIdx[ch];
-                    pd[pdIdx] = xin;
-                    int readIdx = pdIdx - preDelaySamples;
-                    if (readIdx < 0) readIdx += AudioMixer::kReverbPreDelayMaxSamples;
-                    const float xPre = pd[readIdx];
-                    pdIdx = (pdIdx + 1) % AudioMixer::kReverbPreDelayMaxSamples;
-
-                    // Sum 4 parallel comb filters with damped feedback.
-                    float combSum = 0.0f;
-                    for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
-                        auto &buf = st.comb[ch][b];
-                        const int sz = buf.size();
-                        if (sz <= 0) continue;
-                        int &idx = st.combIdx[ch][b];
-                        const float yDelayed = buf[idx];
-                        // One-pole LP on the feedback tap.
-                        float &lp = st.combLP[ch][b];
-                        lp = dampInv * yDelayed + damp * lp;
-                        buf[idx] = xPre + lp * fbGain;
-                        idx = (idx + 1) % sz;
-                        combSum += yDelayed;
-                    }
-                    // Normalise comb output (4 parallel paths).
-                    combSum *= 0.25f;
-
-                    // Series allpass filters (decorrelation).
-                    float ap = combSum;
-                    for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
-                        auto &buf = st.ap[ch][a];
-                        const int sz = buf.size();
-                        if (sz <= 0) continue;
-                        int &idx = st.apIdx[ch][a];
-                        const float bufIn = ap + buf[idx] * kAllpassGain;
-                        const float yOut  = buf[idx] - bufIn * kAllpassGain;
-                        buf[idx] = bufIn;
-                        idx = (idx + 1) % sz;
-                        ap = yOut;
-                    }
-                    wet[ch] = ap;
-                }
-
-                // Stereo width cross-feed: collapse toward mono as width→0.
-                const float wetL = selfFeed * wet[0] + crossFeed * wet[1];
-                const float wetR = selfFeed * wet[1] + crossFeed * wet[0];
-
-                float yL = dry * static_cast<float>(src[i])     + mix * wetL;
-                float yR = dry * static_cast<float>(src[i + 1]) + mix * wetR;
-                if (yL > 32767.0f) yL = 32767.0f;
-                else if (yL < -32768.0f) yL = -32768.0f;
-                if (yR > 32767.0f) yR = 32767.0f;
-                else if (yR < -32768.0f) yR = -32768.0f;
-                scratchRev[i]     = static_cast<int16_t>(yL);
-                scratchRev[i + 1] = static_cast<int16_t>(yR);
-            }
-            // Odd-sample tail (mono runt) — pass through unchanged.
-            for (int i = copySamples & ~1; i < copySamples; ++i) {
-                scratchRev[i] = src[i];
-            }
-            src = scratchRev.data();
-        }
+        QVarLengthArray<int16_t, 8192> scratchTrackFx(copySamples);
+        m_mixer->processTrackFxLocked(trackIdx, src, scratchTrackFx.data(), copySamples,
+                                      e->clipEq.get());
+        src = scratchTrackFx.constData();
 
         // Per-sample 5ms gain ramp at fragment seam to suppress click at entry
         // transitions (volume / fade / mute step). Ramps from prevGain → gain over
@@ -1525,10 +1162,19 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // prevGain is intentionally NOT reset on seek/setSequence — the click is
         // between two fragments of the OS sink callback, not within the entry's
         // data lifecycle.
-        const bool panActive = e->entry.pan != 0.0;
-        const audiopan::BalanceGains panGains = panActive
-            ? audiopan::balanceGains(e->entry.pan)
-            : audiopan::BalanceGains{};
+        // Playback pan = balanceGains(clip pan) x balanceGains(track pan); the
+        // export plan multiplies the same two factors (audioexport pan=).
+        const double trackPan = (trackIdx >= 0 && trackIdx < m_mixer->m_trackStates.size())
+            ? m_mixer->m_trackStates[trackIdx].pan : 0.0;
+        const bool panActive = e->entry.pan != 0.0 || trackPan != 0.0;
+        audiopan::BalanceGains panGains;
+        if (panActive) {
+            const auto clipGains = audiopan::balanceGains(e->entry.pan);
+            const auto trackGains = audiopan::balanceGains(trackPan);
+            panGains = {clipGains.left * trackGains.left, clipGains.right * trackGains.right};
+        }
+        // A tap-only entry ramps 0 -> 0 like the drain above, so it adds nothing.
+        if (gain <= 0.0) e->prevGain = 0.0;
         const int rampLen = qMin(copySamples, 240);
         const double gainStep = (rampLen > 0) ? (gain - e->prevGain) / static_cast<double>(rampLen) : 0.0;
 
@@ -1544,7 +1190,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // Ensure per-track level accum vector is sized
             if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
                 m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
-            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            auto *tla = (trackIdx >= 0 && gain > 0.0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
             for (int i = 0; i < rampLen; ++i) {
                 const double g = e->prevGain + gainStep * static_cast<double>(i);
                 double s = static_cast<double>(src[i]);
@@ -1558,6 +1204,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(s * tapGain);
                 double sampleVal = s * g;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1587,6 +1235,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     z[ch] = w;
                 }
                 s *= preampLin;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(s * tapGain);
                 double sampleVal = s * gain;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1608,10 +1258,12 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             // Ensure per-track level accum vector is sized
             if (trackIdx >= 0 && m_mixer->m_trackLevelAccum.size() <= trackIdx)
                 m_mixer->m_trackLevelAccum.resize(trackIdx + 1);
-            auto *tla = (trackIdx >= 0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
+            auto *tla = (trackIdx >= 0 && gain > 0.0) ? &m_mixer->m_trackLevelAccum[trackIdx] : nullptr;
             for (int i = 0; i < rampLen; ++i) {
                 const double g = e->prevGain + gainStep * static_cast<double>(i);
                 const int ch = i & 1;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(src[i] * tapGain);
                 double sampleVal = static_cast<double>(src[i]) * g;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1631,6 +1283,8 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             }
             for (int i = rampLen; i < copySamples; ++i) {
                 const int ch = i & 1;
+                if (tapDst && i >= tapSkip)
+                    tapDst[i - tapSkip] += static_cast<int32_t>(src[i] * tapGain);
                 double sampleVal = static_cast<double>(src[i]) * gain;
                 if (panActive)
                     sampleVal *= audiopan::gainForChannel(panGains, ch);
@@ -1658,7 +1312,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // so the existing path is unchanged.
         e->ringHead += sourceBytesConsumed;
         e->ringStartTlUs += bytesToUs(copyBytes);
-        anyMixed = true;
+        if (gain > 0.0) anyMixed = true;
     }
 
     // Compact rings whose consumed prefix has grown past the threshold.
@@ -1672,6 +1326,10 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             e->ringHead = 0;
         }
     }
+
+    // Master EQ sees the sum of all tracks, before normalization/compression.
+    if (anyMixed)
+        m_mixer->processMasterEqLocked(accum.data(), frameCount);
 
     // Master loudness normalizer (FCP-style). Applies after sum-mix, before
     // s16 clamp. amount=0 bypasses entirely; amount=1 fully follows the
@@ -1814,6 +1472,25 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         }
     }
 
+    // tapEpilogue (US-1116): the one tap write of a non-paused callback. The
+    // sink block is final here for both the decoder-stall return (zeroed) and
+    // the normal path, which only differ below in moving the clock; a paused
+    // callback returned above and writes 0 tap frames. A track source hands its own
+    // sum instead of the master block. No copy without subscribers; never
+    // blocks this thread.
+    {
+        const int16_t *tapBlock = reinterpret_cast<const int16_t *>(data);
+        int tapBlockFrames = frameCount;
+        if (tapAccum) {
+            int16_t *tapS16 = m_mixer->m_tapBlock.data();
+            for (int i = 0; i < tapFrames * AudioMixer::kChannels; ++i)
+                tapS16[i] = static_cast<int16_t>(qBound<int32_t>(-32768, tapAccum[i], 32767));
+            tapBlock = tapS16;
+            tapBlockFrames = tapFrames;
+        }
+        m_mixer->writeMasterTap(tapBlock, tapBlockFrames);
+    }
+
     const int64_t deltaUs = static_cast<int64_t>(frameCount) * 1'000'000
                             / AudioMixer::kSampleRateHz;
 
@@ -1832,6 +1509,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // chance to refill before this stall budget runs out.
         if (m_mixer->m_decodeRunner) m_mixer->m_decodeRunner->wake();
         if (stalls < kMaxStallCallbacks) {
+            // The tap epilogue above already fed this zeroed block to the tap.
             return maxlen;
         }
         // Fall through and advance the cursor so video can keep moving.
@@ -1897,7 +1575,6 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     Q_ARG(float, masterSnapshot.peakL), Q_ARG(float, masterSnapshot.peakR),
                     Q_ARG(float, rmsL), Q_ARG(float, rmsR));
             }
-            return maxlen;
         }
     }
 
@@ -1907,7 +1584,18 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
 // =====================================================================
 // AudioMixer
 // =====================================================================
+namespace {
+// Track identities are unique in the process, so a snapshot of one mixer
+// never names a track of another.
+quint64 newTrackIdentity()
+{
+    static std::atomic<quint64> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
 AudioMixer::AudioMixer(QObject *parent) : QObject(parent) {
+    for (auto &identity : m_trackIdentities) identity = newTrackIdentity();
     m_format.setSampleRate(kSampleRateHz);
     m_format.setChannelCount(kChannels);
     m_format.setSampleFormat(QAudioFormat::Int16);
@@ -1958,6 +1646,28 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
     qInfo() << "AudioMixer::setSequence in=" << entries.size()
             << "existing=" << m_entries.size();
     QStringList pendingErrors;
+    // US-1110: build the clip EQ processors before taking the lock. A retained
+    // entry whose clip EQ did not change keeps its own processor (and filter
+    // history); replaced processors are destroyed after the lock is released.
+    std::vector<std::unique_ptr<trackfx::Processor>> clipEqProcessors(entries.size());
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        if (!entries[entryIndex].clipEqEnabled) continue;
+        trackfx::Chain chain;
+        chain.eq = entries[entryIndex].clipEq;
+        chain.eqEnabled = true;
+        clipEqProcessors[entryIndex] =
+            std::make_unique<trackfx::Processor>(chain, kSampleRateHz, kChannels);
+    }
+    const auto sameEqBand = [](const trackfx::EqBand &a, const trackfx::EqBand &b) {
+        return a.freq == b.freq && a.gainDb == b.gainDb && a.q == b.q && a.enabled == b.enabled;
+    };
+    const auto sameClipEq = [&sameEqBand](const PlaybackEntry &a, const PlaybackEntry &b) {
+        return a.clipEqEnabled == b.clipEqEnabled
+            && sameEqBand(a.clipEq.low, b.clipEq.low)
+            && sameEqBand(a.clipEq.lowMid, b.clipEq.lowMid)
+            && sameEqBand(a.clipEq.highMid, b.clipEq.highMid)
+            && sameEqBand(a.clipEq.high, b.clipEq.high);
+    };
     {
         QMutexLocker lock(&m_controlMutex);
 
@@ -2039,6 +1749,8 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
                     && (!qFuzzyCompare(oldClipIn, e.clipIn)
                         || !qFuzzyCompare(oldClipOut, e.clipOut)
                         || !qFuzzyCompare(oldSpeed, e.speed));
+                if (!sameClipEq(de->entry, e))
+                    std::swap(de->clipEq, clipEqProcessors[entryIndex]);
                 de->entry = e;
                 de->trackKey = key;
                 de->channelMode = channelMode;
@@ -2071,6 +1783,7 @@ void AudioMixer::setSequence(const QVector<PlaybackEntry> &entries,
             } else {
                 de = new AudioDecoderEntry;
                 de->entry = e;
+                std::swap(de->clipEq, clipEqProcessors[entryIndex]);
                 de->trackKey = key;
                 de->channelMode = channelMode;
                 de->reversed = reversed;
@@ -2574,6 +2287,11 @@ void AudioMixer::seekTo(int64_t timelineUs) {
         // clamp bypass. Both fixes are required for a clean post-seek start.
         {
             QMutexLocker lock(&m_controlMutex);
+            for (auto it = m_trackFxProcessors.begin(); it != m_trackFxProcessors.end(); ++it)
+                it.value().resetFeedback();
+            for (AudioDecoderEntry *de : qAsConst(m_entries))
+                if (de->clipEq) de->clipEq->resetFeedback();
+            m_masterEqFilter.reset();
             for (auto it = m_trackReverbState.begin();
                  it != m_trackReverbState.end(); ++it) {
                 ReverbState &st = it.value();
@@ -2699,12 +2417,89 @@ void AudioMixer::setTrackGain(int trackIdx, double gain) {
     recomputeEffectiveGainsLocked();
 }
 
+void AudioMixer::setTrackPan(int trackIdx, double pan) {
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return;
+    if (m_trackStates.size() < trackIdx + 1)
+        m_trackStates.resize(trackIdx + 1);
+    m_trackStates[trackIdx].pan = audiopan::clampPan(pan);
+}
+
+double AudioMixer::trackPan(int trackIdx) const
+{
+    QMutexLocker lock(&m_controlMutex);
+    if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return 0.0;
+    if (trackIdx >= m_trackStates.size()) return 0.0;
+    return m_trackStates[trackIdx].pan;
+}
+
 double AudioMixer::trackGain(int trackIdx) const
 {
     QMutexLocker lock(&m_controlMutex);
     if (trackIdx < 0 || trackIdx >= kMaxAudioTracks) return 1.0;
     if (trackIdx >= m_trackStates.size()) return 1.0;
     return m_trackStates[trackIdx].gain;
+}
+
+QByteArray AudioMixer::renderPcmForTest(int frames)
+{
+    if (frames <= 0 || frames > kSampleRateHz * 60 || isPlaying()
+        || (m_sink && m_sink->state() != QAudio::StoppedState))
+        return {};
+    // setSequence creates a stopped sink even for headless callers. Its
+    // existence must not reject the probe; only an active transport may.
+    if (m_decodeRunner) {
+        m_decodeRunner->requestStop();
+        m_decodeRunner->wait();
+        delete m_decodeRunner;
+        m_decodeRunner = nullptr;
+    }
+    seekTo(0);
+    MixerIODevice io(this);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QByteArray result(frames * kBytesPerFrame, '\0');
+    m_playing.store(true, std::memory_order_release);
+    // Match audio-xfade's mixerWindowRms: prime the production decoders,
+    // then refill before each 10 ms pull without starting the hardware sink.
+    for (int pass = 0; pass < 16; ++pass) refillRings();
+    for (int offset = 0; offset < frames; offset += 480) {
+        // Fill through the existing decoder, then pull the actual playback
+        // mixer. No duplicate DSP, gain arithmetic, or platform audio sink.
+        refillRings();
+        const int bytes = qMin(480, frames - offset) * kBytesPerFrame;
+        if (io.read(result.data() + offset * kBytesPerFrame, bytes) != bytes
+            || masterClockUs() != static_cast<qint64>(offset + bytes / kBytesPerFrame)
+                * 1'000'000 / kSampleRateHz) {
+            result.clear();
+            break;
+        }
+    }
+    m_playing.store(false, std::memory_order_release);
+    return result;
+}
+
+QByteArray AudioMixer::pullStalledBlockForTest(int frames)
+{
+    if (frames <= 0 || frames > kSampleRateHz || isPlaying()
+        || (m_sink && m_sink->state() != QAudio::StoppedState))
+        return {};
+    // Same set-up as renderPcmForTest, but no refillRings(): an entry active
+    // at zero keeps an empty ring, so this one pull takes the stall return.
+    if (m_decodeRunner) {
+        m_decodeRunner->requestStop();
+        m_decodeRunner->wait();
+        delete m_decodeRunner;
+        m_decodeRunner = nullptr;
+    }
+    seekTo(0);
+    MixerIODevice io(this);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QByteArray result(frames * kBytesPerFrame, '\0');
+    m_playing.store(true, std::memory_order_release);
+    if (io.read(result.data(), result.size()) != result.size()) result.clear();
+    m_playing.store(false, std::memory_order_release);
+    m_consecutiveStallCallbacks.store(0, std::memory_order_release);
+    return result;
 }
 
 void AudioMixer::setBusRouting(const audiobus::AudioBusRouting &r)
@@ -2801,6 +2596,215 @@ AudioMixer::EqBandCoefsParam computeEqBand(const AudioMixer::EqBand &band,
 }
 } // namespace
 
+void AudioMixer::MasterEqFilter::setEq(const EqSettings &eq)
+{
+    m_coefs[0] = computeEqBand(eq.low, 0, kSampleRateHz);
+    m_coefs[1] = computeEqBand(eq.lowMid, 1, kSampleRateHz);
+    m_coefs[2] = computeEqBand(eq.highMid, 2, kSampleRateHz);
+    m_coefs[3] = computeEqBand(eq.high, 3, kSampleRateHz);
+}
+
+void AudioMixer::MasterEqFilter::setDeEsser(const trackfx::DeEsserSettings &settings)
+{
+    m_deesserEnabled = settings.enabled;
+    m_deesser.setSettings(settings, kSampleRateHz);
+}
+
+void AudioMixer::MasterEqFilter::reset()
+{
+    m_history.fill(0.0);
+    m_deesser.reset();
+}
+
+double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
+{
+    for (int band = 0; band < 4; ++band) {
+        const auto &c = m_coefs[band];
+        if (!c.active) continue;
+        const int base = band * 4 + channel * 2;
+        double &z1 = m_history[base];
+        double &z2 = m_history[base + 1];
+        const double output = c.b0 * sample + z1;
+        z1 = c.b1 * sample - c.a1 * output + z2;
+        z2 = c.b2 * sample - c.a2 * output;
+        sample = output;
+    }
+    return sample;
+}
+
+void AudioMixer::MasterEqFilter::process(float *samples, int frames)
+{
+    if (m_deesserEnabled) {
+        for (int frame = 0; frame < frames; ++frame) {
+            const int i = frame * kChannels;
+            double left = processSample(samples[i], 0) * 32768.0;
+            double right = processSample(samples[i + 1], 1) * 32768.0;
+            m_deesser.processFrame(left, right);
+            samples[i] = static_cast<float>(left / 32768.0);
+            samples[i + 1] = static_cast<float>(right / 32768.0);
+        }
+        return;
+    }
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<float>(processSample(samples[i], ch));
+        }
+}
+
+void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
+{
+    if (m_deesserEnabled) {
+        for (int frame = 0; frame < frames; ++frame) {
+            const int i = frame * kChannels;
+            double left = processSample(samples[i], 0);
+            double right = processSample(samples[i + 1], 1);
+            m_deesser.processFrame(left, right);
+            samples[i] = static_cast<int32_t>(left);
+            samples[i + 1] = static_cast<int32_t>(right);
+        }
+        return;
+    }
+    for (int frame = 0; frame < frames; ++frame)
+        for (int ch = 0; ch < kChannels; ++ch) {
+            const int i = frame * kChannels + ch;
+            samples[i] = static_cast<int32_t>(processSample(samples[i], ch));
+        }
+}
+
+void AudioMixer::clearTrackFx()
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains.clear();
+    m_trackFxProcessors.clear();
+    m_listenOfRemovedTracks.clear();
+    m_masterFxChain = trackfx::Chain{};
+    applyMasterChainLocked(trackfx::Chain{});
+    m_masterEqFilter.reset();
+    m_trackEq.clear();
+    m_trackEqCoefs.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto &state : m_trackStates) {
+        state.eq = AudioEQConfig{};
+        state.eqEnabled = false;
+        state.eqCoeffs = {};
+        state.z = {};
+        state.eqCache = {};
+    }
+}
+
+void AudioMixer::setTrackChain(int trackId, const trackfx::Chain &chain)
+{
+    if (trackId < 0 || trackId >= kMaxAudioTracks) return;
+    // Restore both independent enable layers atomically. Panel setters infer
+    // gates from settings and would lose disabled-but-configured stages.
+    const auto restored = trackfx::Chain::fromJson(chain.toJson());
+    std::array<EqBandCoefsParam, 4> coefs{};
+    coefs[0] = computeEqBand(restored.eq.low, 0, kSampleRateHz);
+    coefs[1] = computeEqBand(restored.eq.lowMid, 1, kSampleRateHz);
+    coefs[2] = computeEqBand(restored.eq.highMid, 2, kSampleRateHz);
+    coefs[3] = computeEqBand(restored.eq.high, 3, kSampleRateHz);
+    QMutexLocker lock(&m_controlMutex);
+    m_trackFxChains[trackId] = restored;
+    m_trackFxProcessors[trackId].setChain(restored);
+    m_trackEq[trackId] = restored.eq;
+    m_trackEqCoefs[trackId] = coefs;
+    m_trackComp[trackId] = restored.comp;
+    m_trackReverb[trackId] = restored.reverb;
+    m_trackNoiseReduction[trackId] = restored.nr;
+}
+
+trackfx::Chain AudioMixer::masterChain() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterFxChain;
+}
+
+void AudioMixer::setMasterEq(const EqSettings &eq, bool enabled)
+{
+    QMutexLocker lock(&m_controlMutex);
+    trackfx::Chain chain = m_masterFxChain;
+    chain.eq = eq;
+    chain.eqEnabled = enabled;
+    applyMasterChainLocked(chain);
+}
+
+void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
+{
+    trackfx::Chain chain;
+    chain.deesser = settings;
+    const auto restored = trackfx::Chain::fromJson(chain.toJson()).deesser;
+    QMutexLocker lock(&m_controlMutex);
+    trackfx::Chain master = m_masterFxChain;
+    master.deesser = restored;
+    applyMasterChainLocked(master);
+}
+
+void AudioMixer::setMasterChain(const EqSettings &eq, bool eqEnabled,
+                                const trackfx::DeEsserSettings &deesser)
+{
+    trackfx::Chain settings;
+    settings.deesser = deesser;
+    const auto restored = trackfx::Chain::fromJson(settings.toJson()).deesser;
+    QMutexLocker lock(&m_controlMutex);
+    trackfx::Chain master = m_masterFxChain;
+    master.eq = eq;
+    master.eqEnabled = eqEnabled;
+    master.deesser = restored;
+    applyMasterChainLocked(master);
+}
+
+quint64 AudioMixer::applyMasterChainLockedCallCountForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_applyMasterChainLockedCalls;
+}
+
+void AudioMixer::applyMasterChainLocked(const trackfx::Chain &chain)
+{
+    ++m_applyMasterChainLockedCalls;
+    m_masterFxChain.eq = chain.eq;
+    m_masterFxChain.eqEnabled = chain.eqEnabled;
+    m_masterFxChain.deesser = chain.deesser;
+    m_masterEqFilter.setEq(chain.eqEnabled ? chain.eq : EqSettings{});
+    m_masterEqFilter.setDeEsser(chain.deesser);
+}
+
+void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
+{
+    if (m_masterEqBypassForTest
+        || (!m_masterFxChain.eqEnabled && !m_masterFxChain.deesser.enabled)) return;
+    ++m_masterEqProcessCalls;
+    m_masterEqFilter.process(samples, frames);
+}
+
+void AudioMixer::setMasterEqBypassForTest(bool bypass)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_masterEqBypassForTest = bypass;
+    m_masterEqProcessCalls = 0;
+    m_masterEqFilter.reset();
+}
+
+quint64 AudioMixer::masterEqProcessCallsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_masterEqProcessCalls;
+}
+
+void AudioMixer::processMasterEqForTest(int32_t *samples, int frames)
+{
+    if (!samples || frames <= 0 || frames > std::numeric_limits<int>::max() / kChannels) return;
+    QMutexLocker lock(&m_controlMutex);
+    processMasterEqLocked(samples, frames);
+}
+
 void AudioMixer::setEqForTrack(int trackId, const EqSettings &eq) {
     if (trackId < 0 || trackId > kMaxAudioTracks) return;
     constexpr double fs = kSampleRateHz;
@@ -2814,6 +2818,10 @@ void AudioMixer::setEqForTrack(int trackId, const EqSettings &eq) {
 
     QMutexLocker lock(&m_controlMutex);
     m_trackEq[trackId] = eq;
+    auto &chain = m_trackFxChains[trackId];
+    chain.eq = eq;
+    chain.eqEnabled = true;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Atomic replace: insert overwrites the previous EqSettings/coefs in a
     // single hash slot under the mutex held by readData, so in-flight audio
     // sees either the old or new coefs but never a torn struct. History is
@@ -2847,6 +2855,10 @@ void AudioMixer::setCompressorForTrack(int trackId, const CompressorSettings &c)
 
     QMutexLocker lock(&m_controlMutex);
     m_trackComp[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.comp = clamped;
+    chain.compEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setCompressorForTrack
     // calls leave envelope untouched so live tweaking is glitch-free.
     if (!m_trackCompState.contains(trackId))
@@ -2860,6 +2872,10 @@ AudioMixer::CompressorSettings AudioMixer::compressorForTrack(int trackId) const
 
 double AudioMixer::currentGainReductionDb(int trackId) const {
     QMutexLocker lock(&m_controlMutex);
+    if (!m_legacyTrackFxPath) {
+        const auto p = m_trackFxProcessors.constFind(trackId);
+        return p == m_trackFxProcessors.constEnd() ? 0.0 : p.value().currentGainReductionDb();
+    }
     auto it = m_trackCompState.constFind(trackId);
     if (it == m_trackCompState.constEnd()) return 0.0;
     return it.value().currentGrDb;
@@ -2885,6 +2901,10 @@ void AudioMixer::setReverbForTrack(int trackId, const ReverbSettings &r) {
 
     QMutexLocker lock(&m_controlMutex);
     m_trackReverb[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.reverb = clamped;
+    chain.reverbEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setReverbForTrack calls
     // leave buffers untouched so live tweaking is glitch-free.
     if (!m_trackReverbState.contains(trackId))
@@ -2918,6 +2938,10 @@ void AudioMixer::setNoiseReductionForTrack(int trackId,
 
     QMutexLocker lock(&m_controlMutex);
     m_trackNoiseReduction[trackId] = clamped;
+    auto &chain = m_trackFxChains[trackId];
+    chain.nr = clamped;
+    chain.nrEnabled = clamped.enabled;
+    m_trackFxProcessors[trackId].setChain(chain);
     // Initialise state on first touch; subsequent setNoiseReductionForTrack
     // calls leave envelope + history untouched so live tweaking is
     // glitch-free.
@@ -2933,6 +2957,10 @@ AudioMixer::noiseReductionForTrack(int trackId) const {
 
 double AudioMixer::estimatedNoiseFloorDb(int trackId) const {
     QMutexLocker lock(&m_controlMutex);
+    if (!m_legacyTrackFxPath) {
+        const auto p = m_trackFxProcessors.constFind(trackId);
+        return p == m_trackFxProcessors.constEnd() ? -60.0 : p.value().estimatedNoiseFloorDb();
+    }
     auto it = m_trackNoiseReductionState.constFind(trackId);
     if (it == m_trackNoiseReductionState.constEnd()) return -60.0;
     return it.value().estimatedFloorDb;
@@ -2982,6 +3010,107 @@ void AudioMixer::setAutoDuckParams(const AutoDuckParams &params) {
 AudioMixer::AutoDuckParams AudioMixer::autoDuckParams() const {
     QMutexLocker lock(&m_controlMutex);
     return m_autoDuckParams;
+}
+
+void AudioMixer::subscribeMasterTap()
+{
+    {
+        // readData only touches the track-tap buffers under m_controlMutex.
+        QMutexLocker controlLock(&m_controlMutex);
+        if (m_tapAccum.isEmpty()) {
+            m_tapAccum.resize(kMasterTapFrames * kChannels);
+            m_tapBlock.resize(kMasterTapFrames * kChannels);
+        }
+    }
+    QMutexLocker lock(&m_tapMutex);
+    if (m_tapRing.isEmpty()) m_tapRing.resize(kMasterTapFrames * kChannels);
+    m_tapSubscribers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void AudioMixer::unsubscribeMasterTap()
+{
+    QMutexLocker lock(&m_tapMutex);
+    const int subscribers = m_tapSubscribers.load(std::memory_order_acquire);
+    if (subscribers <= 0) return;
+    m_tapSubscribers.store(subscribers - 1, std::memory_order_release);
+    if (subscribers == 1) m_tapWrite = m_tapFill = 0;
+}
+
+int AudioMixer::takeMasterTap(QVector<float> *interleaved, int maxFrames)
+{
+    if (!interleaved) return 0;
+    interleaved->clear();
+    if (maxFrames <= 0) return 0;
+    QMutexLocker lock(&m_tapMutex);
+    const int frames = qMin(m_tapFill, maxFrames);
+    interleaved->resize(frames * kChannels);
+    // m_tapWrite is the slot after the newest frame; the oldest sits m_tapFill
+    // frames behind it.
+    int read = (m_tapWrite - m_tapFill + kMasterTapFrames) % kMasterTapFrames;
+    for (int f = 0; f < frames; ++f) {
+        (*interleaved)[f * kChannels] = m_tapRing[read * kChannels];
+        (*interleaved)[f * kChannels + 1] = m_tapRing[read * kChannels + 1];
+        read = (read + 1) % kMasterTapFrames;
+    }
+    m_tapFill -= frames;
+    return frames;
+}
+
+void AudioMixer::writeMasterTap(const int16_t *interleaved, int frames)
+{
+    // Audio thread: never wait for the GUI reader; a contended block is dropped.
+    if (!interleaved || frames <= 0
+        || m_tapSubscribers.load(std::memory_order_acquire) <= 0
+        || !m_tapMutex.tryLock())
+        return;
+    if (m_tapSubscribers.load(std::memory_order_acquire) <= 0 || m_tapRing.isEmpty()) {
+        m_tapMutex.unlock();
+        return;
+    }
+    // Only the newest kMasterTapFrames of a larger block can survive.
+    const int first = qMax(0, frames - kMasterTapFrames);
+    for (int f = first; f < frames; ++f) {
+        m_tapRing[m_tapWrite * kChannels] = interleaved[f * kChannels] / 32768.0f;
+        m_tapRing[m_tapWrite * kChannels + 1] = interleaved[f * kChannels + 1] / 32768.0f;
+        m_tapWrite = (m_tapWrite + 1) % kMasterTapFrames;
+    }
+    m_tapFill = qMin(kMasterTapFrames, m_tapFill + frames - first);
+    m_tapCopyCount.fetch_add(1, std::memory_order_relaxed);
+    m_tapMutex.unlock();
+    if (!m_tapNotifyPending.exchange(true, std::memory_order_acq_rel)) {
+        QMetaObject::invokeMethod(this, [this] {
+            m_tapNotifyPending.store(false, std::memory_order_release);
+            emit masterTapAvailable();
+        }, Qt::QueuedConnection);
+    }
+}
+
+void AudioMixer::setTapSource(TapSource source)
+{
+    const int track = source.track >= 0 && source.track < kMaxAudioTracks ? source.track : -1;
+    QMutexLocker lock(&m_controlMutex);
+    m_tapIdentity = track >= 0 ? m_trackIdentities[track] : 0;
+    m_tapSource.store(track, std::memory_order_release);
+}
+
+AudioMixer::TapSource AudioMixer::tapSource() const
+{
+    return TapSource{m_tapSource.load(std::memory_order_acquire)};
+}
+
+void AudioMixer::publishMasterBlockForTest(const int16_t *interleaved, int frames)
+{
+    writeMasterTap(interleaved, frames);
+}
+
+quint64 AudioMixer::tapCopyCountForTest() const
+{
+    return m_tapCopyCount.load(std::memory_order_relaxed);
+}
+
+int AudioMixer::tapSubscriberCountForTest() const
+{
+    return m_tapSubscribers.load(std::memory_order_acquire);
 }
 
 bool AudioMixer::ensureSinkLocked() {
@@ -3067,11 +3196,9 @@ bool AudioMixer::ensureSinkLocked() {
 }
 
 void AudioMixer::recomputeEffectiveGainsLocked() {
-    bool anySolo = false;
-    for (const auto &t : m_trackStates) if (t.solo) { anySolo = true; break; }
-    for (auto &t : m_trackStates) {
-        const bool audible = anySolo ? t.solo : !t.muted;
-        t.effectiveGain = audible ? t.gain : 0.0;
+    for (int i = 0; i < m_trackStates.size(); ++i) {
+        auto &t = m_trackStates[i];
+        t.effectiveGain = trackAudible(m_trackStates, i) ? t.gain : 0.0;
     }
 }
 
@@ -3605,4 +3732,709 @@ int64_t AudioMixer::audibleClockUs() const {
     const int64_t cursor = m_writeCursorUs.load(std::memory_order_acquire);
     const int64_t lag = m_audibleLagUs.load(std::memory_order_acquire);
     return qMax<int64_t>(0, cursor - lag);
+}
+
+// Retained legacy DSP arithmetic for the Wave 5 same-binary playback oracle.
+// Called under m_controlMutex by readData and the headless selftest entry.
+void AudioMixer::processTrackFxLocked(int trackIdx, const int16_t *src,
+                                     int16_t *output, int copySamples,
+                                     trackfx::Processor *clipEq)
+{
+    // US-1110 float 1 pass: clip EQ -> track chain -> one saturating PCM16
+    // conversion. Entries without a clip EQ keep the paths below unchanged.
+    QVarLengthArray<int16_t, 8192> clipEqPcm;
+    if (clipEq) {
+        QVarLengthArray<float, 8192> samples(copySamples);
+        for (int i = 0; i < copySamples; ++i) samples[i] = src[i] / 32768.0f;
+        clipEq->process(samples.data(), copySamples / kChannels);
+        auto it = m_trackFxProcessors.find(trackIdx);
+        if (!m_legacyTrackFxPath && trackIdx >= 0 && it != m_trackFxProcessors.end()) {
+            ++m_trackFxProcessCalls;
+            it.value().process(samples.data(), copySamples / kChannels);
+        }
+        int16_t *dst = output;
+        if (m_legacyTrackFxPath) {
+            clipEqPcm.resize(copySamples);
+            dst = clipEqPcm.data();
+        }
+        for (int i = 0; i < copySamples; ++i)
+            dst[i] = static_cast<int16_t>(qBound(-32768L, lrintf(samples[i] * 32768.0f), 32767L));
+        if (!m_legacyTrackFxPath) return;
+        // The legacy oracle keeps its own track arithmetic after the clip EQ.
+        src = clipEqPcm.constData();
+    }
+    if (!m_legacyTrackFxPath) {
+        auto it = m_trackFxProcessors.find(trackIdx);
+        if (trackIdx >= 0 && it != m_trackFxProcessors.end()) {
+            QVarLengthArray<float, 8192> samples(copySamples);
+            for (int i = 0; i < copySamples; ++i) samples[i] = src[i] / 32768.0f;
+            ++m_trackFxProcessCalls;
+            it.value().process(samples.data(), copySamples / kChannels);
+            for (int i = 0; i < copySamples; ++i)
+                output[i] = static_cast<int16_t>(samples[i] * 32768.0f);
+        } else {
+            if (src != output) std::copy_n(src, copySamples, output);
+        }
+        return;
+    }
+    // Per-track noise reduction (Audition Voice Isolation / Resolve
+    // Fairlight noise gate parity, simplified expander). Runs FIRST in
+    // the per-track chain so downstream EQ / compressor / reverb
+    // amplify the de-noised signal rather than the noise. Stereo-link
+    // detector with attack / release envelope; static curve compares
+    // the envelope (in dBFS) to a noise floor (auto-estimated as the
+    // 5th-percentile of a rolling window OR user-set manual floor) and
+    // applies a smooth ramp between full pass-through and reductionDb
+    // of attenuation across the user-configured threshold band.
+    // Disabled = bit-exact bypass (skip the entire DSP path; do not
+    // touch state).
+    QVarLengthArray<int16_t, 8192> scratchNr;
+    auto nrIt = (trackIdx >= 0)
+        ? m_trackNoiseReduction.constFind(trackIdx)
+        : m_trackNoiseReduction.constEnd();
+    if (nrIt != m_trackNoiseReduction.constEnd()
+        && nrIt.value().enabled
+        && nrIt.value().reductionDb > 1e-6) {
+        const auto &nr = nrIt.value();
+        const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
+        const double atkCoef  = std::exp(-1.0 / (nr.attackMs  * fs * 0.001));
+        const double relCoef  = std::exp(-1.0 / (nr.releaseMs * fs * 0.001));
+
+        auto stateIt = m_trackNoiseReductionState.find(trackIdx);
+        if (stateIt == m_trackNoiseReductionState.end()) {
+            stateIt = m_trackNoiseReductionState.insert(
+                trackIdx, AudioMixer::NRState{});
+        }
+        AudioMixer::NRState &nrState = stateIt.value();
+        double env = nrState.env;
+
+        // Determine the active noise floor for this fragment. Auto
+        // mode pulls the 5th-percentile of the rolling envelope-dBFS
+        // history; manual mode uses the user-set value directly.
+        double floorDb = nr.manualFloorDb;
+        if (nr.autoFloor && !nrState.recentEnvs.isEmpty()) {
+            QVector<double> sorted = nrState.recentEnvs;
+            std::sort(sorted.begin(), sorted.end());
+            const int idx = qBound(0,
+                static_cast<int>(sorted.size() * 0.05),
+                sorted.size() - 1);
+            floorDb = sorted[idx];
+        }
+        nrState.estimatedFloorDb = floorDb;
+
+        // Threshold sets the band where we transition from full
+        // attenuation to full pass-through. We center the smooth
+        // ramp around (floorDb + thresholdDb) with a fixed 12 dB
+        // wide ramp width (perceived smoothness target — narrower
+        // pumps audibly, wider weakens the gating action).
+        const double thresholdAbsDb = floorDb + nr.thresholdDb;
+        constexpr double kRampWidthDb = 12.0;
+        const double rampLo = thresholdAbsDb - 0.5 * kRampWidthDb;
+        const double rampHi = thresholdAbsDb + 0.5 * kRampWidthDb;
+        const double minGainLin = std::pow(10.0, -nr.reductionDb / 20.0);
+
+        scratchNr.resize(copySamples);
+        // Per stereo frame: linked level → envelope → static curve.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            const double xL = static_cast<double>(src[i]);
+            const double xR = static_cast<double>(src[i + 1]);
+            const double level = std::max(std::abs(xL), std::abs(xR));
+            if (level > env) {
+                env = level + (env - level) * atkCoef;
+            } else {
+                env = level + (env - level) * relCoef;
+            }
+
+            // dBFS reference 32768 = 0 dBFS.
+            const double envDb = 20.0
+                * std::log10(std::max(env, 1e-9) / 32768.0);
+
+            double nrGain;
+            if (envDb >= rampHi) {
+                nrGain = 1.0;            // signal loud enough — no NR
+            } else if (envDb <= rampLo) {
+                nrGain = minGainLin;     // signal at/below floor — full NR
+            } else {
+                // Smooth linear ramp in dB domain → exponential in linear.
+                const double t = (envDb - rampLo) / kRampWidthDb;
+                const double curveDb = -nr.reductionDb * (1.0 - t);
+                nrGain = std::pow(10.0, curveDb / 20.0);
+            }
+
+            double yL = xL * nrGain;
+            double yR = xR * nrGain;
+            if (yL > 32767.0) yL = 32767.0;
+            else if (yL < -32768.0) yL = -32768.0;
+            if (yR > 32767.0) yR = 32767.0;
+            else if (yR < -32768.0) yR = -32768.0;
+            scratchNr[i]     = static_cast<int16_t>(yL);
+            scratchNr[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — pass through unchanged.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchNr[i] = src[i];
+        }
+        nrState.env = env;
+
+        // Append the post-fragment envelope-in-dBFS into the rolling
+        // window (used next fragment for auto-floor estimation). One
+        // entry per fragment keeps the percentile sort cheap; with
+        // kAutoFloorWindowSize=256 entries that's ~85 s of history
+        // worst case, ~5 s typical.
+        const double tailEnvDb = 20.0
+            * std::log10(std::max(env, 1e-9) / 32768.0);
+        if (nrState.recentEnvs.size() < AudioMixer::kAutoFloorWindowSize) {
+            nrState.recentEnvs.append(tailEnvDb);
+        } else {
+            if (nrState.recentEnvsHead < 0
+                || nrState.recentEnvsHead >= AudioMixer::kAutoFloorWindowSize) {
+                nrState.recentEnvsHead = 0;
+            }
+            nrState.recentEnvs[nrState.recentEnvsHead] = tailEnvDb;
+            nrState.recentEnvsHead =
+                (nrState.recentEnvsHead + 1) % AudioMixer::kAutoFloorWindowSize;
+        }
+        src = scratchNr.data();
+    }
+
+    // Per-track 4-band parametric EQ cascade (Premiere/Audition parity).
+    // Runs BEFORE the legacy 3-band path and gain/preamp stages; signal
+    // flow: 4-band → 3-band → preamp → gain. When all 4 bands are flat
+    // or disabled, src points at the ring buffer unchanged (bit-exact
+    // bypass). When any band is active, scratchEq holds the filtered
+    // samples and src is rebound to it. Disabled bands skip math
+    // entirely AND skip history updates so re-enabling has no transient.
+    QVarLengthArray<int16_t, 8192> scratchEq;
+    auto coefsIt = (trackIdx >= 0)
+        ? m_trackEqCoefs.constFind(trackIdx)
+        : m_trackEqCoefs.constEnd();
+    if (coefsIt != m_trackEqCoefs.constEnd()) {
+        const auto &coefs = coefsIt.value();
+        const bool anyActive = coefs[0].active || coefs[1].active
+                            || coefs[2].active || coefs[3].active;
+        if (anyActive) {
+            auto histIt = m_trackEqHist.find(trackIdx);
+            if (histIt == m_trackEqHist.end()) {
+                histIt = m_trackEqHist.insert(
+                    trackIdx, std::array<double, 16>{});
+            }
+            auto &hist = histIt.value();
+            scratchEq.resize(copySamples);
+            // hist layout per band b, channel ch: x1=hist[b*4+ch],
+            // x2=hist[b*4+2+ch], y1=hist[b*4+ch] ... actually we use
+            // 4 doubles per band (2 channels x x1/x2 OR y1/y2)? We need
+            // 4 doubles per band per channel for a direct-form-I biquad
+            // (x1, x2, y1, y2). But we only allocated 16 = 4 bands x
+            // 2 channels x 2 history samples — encode x1/y1 in pairs by
+            // using a transposed direct-form-II (z1, z2 per channel).
+            // hist[b*4 + ch*2 + 0] = z1[ch], hist[b*4 + ch*2 + 1] = z2[ch].
+            for (int i = 0; i < copySamples; ++i) {
+                const int ch = i & 1;
+                double s = static_cast<double>(src[i]);
+                for (int b = 0; b < 4; ++b) {
+                    const auto &c = coefs[b];
+                    if (!c.active) continue; // skip math + history
+                    const int base = b * 4 + ch * 2;
+                    double &z1 = hist[base];
+                    double &z2 = hist[base + 1];
+                    // Transposed direct-form-II:
+                    //   y = b0*x + z1
+                    //   z1 = b1*x - a1*y + z2
+                    //   z2 = b2*x - a2*y
+                    const double y = c.b0 * s + z1;
+                    z1 = c.b1 * s - c.a1 * y + z2;
+                    z2 = c.b2 * s - c.a2 * y;
+                    s = y;
+                }
+                // Soft saturation to s16 range — high gain peak boost on
+                // a band can exceed s16 momentarily. Clamp before re-cast
+                // so the existing 3-band path receives a valid s16.
+                if (s > 32767.0) s = 32767.0;
+                else if (s < -32768.0) s = -32768.0;
+                scratchEq[i] = static_cast<int16_t>(s);
+            }
+            src = scratchEq.data();
+        }
+    }
+
+    // Per-track feed-forward compressor / limiter (Audition / Resolve
+    // Fairlight parity). Runs AFTER the 4-band EQ stage and BEFORE the
+    // 3-band / preamp / gain stages so per-track meters and the master
+    // bus see post-compression peaks. Stereo-link detector,
+    // transposed envelope follower, Cherny-style soft knee.
+    // Disabled or 1:1 ratio = bit-exact bypass (skip envelope + curve).
+    QVarLengthArray<int16_t, 8192> scratchComp;
+    auto compIt = (trackIdx >= 0)
+        ? m_trackComp.constFind(trackIdx)
+        : m_trackComp.constEnd();
+    if (compIt != m_trackComp.constEnd()
+        && compIt.value().enabled
+        && compIt.value().ratio > 1.0001) {
+        const auto &comp = compIt.value();
+        // Limiter mode collapses to 1000:1 with a fixed 0.5 ms attack.
+        const bool limiter   = comp.ratio >= 20.0;
+        const double effRatio = limiter ? 1000.0 : comp.ratio;
+        const double effAttackMs = limiter ? 0.5 : comp.attackMs;
+
+        const double fs       = static_cast<double>(AudioMixer::kSampleRateHz);
+        const double atkCoef  = std::exp(-1.0 / (effAttackMs * fs * 0.001));
+        const double relCoef  = std::exp(-1.0 / (comp.releaseMs * fs * 0.001));
+        const double slope    = 1.0 - 1.0 / effRatio; // dB-per-dB above thresh
+        const double makeupLin = std::pow(10.0, comp.makeupDb / 20.0);
+        const double thresh   = comp.thresholdDb;
+        const double kneeHalf = 0.5 * comp.kneeDb;
+
+        auto stateIt = m_trackCompState.find(trackIdx);
+        if (stateIt == m_trackCompState.end()) {
+            stateIt = m_trackCompState.insert(
+                trackIdx, AudioMixer::CompressorState{});
+        }
+        double env = stateIt.value().env;
+        double lastGrDb = stateIt.value().currentGrDb;
+
+        scratchComp.resize(copySamples);
+        // copySamples is interleaved L/R (stereo), so iterate by frame.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            const double xL = static_cast<double>(src[i]);
+            const double xR = static_cast<double>(src[i + 1]);
+            const double level = std::max(std::abs(xL), std::abs(xR));
+            // Envelope follower: attack on rising, release on falling.
+            if (level > env) {
+                env = level + (env - level) * atkCoef;
+            } else {
+                env = level + (env - level) * relCoef;
+            }
+
+            // Static gain curve in dB. Reference 0 dBFS at 32768.
+            const double envDb = 20.0 * std::log10(std::max(env, 1e-9) / 32768.0);
+            double grDb = 0.0;
+            if (kneeHalf > 1e-6 && envDb > thresh - kneeHalf
+                && envDb < thresh + kneeHalf) {
+                // Soft knee: quadratic spline between (thresh - knee/2, 0)
+                // and (thresh + knee/2, knee/2 * slope).
+                const double x = envDb - (thresh - kneeHalf);
+                grDb = slope * (x * x) / (2.0 * comp.kneeDb);
+            } else if (envDb > thresh + kneeHalf) {
+                grDb = slope * (envDb - thresh);
+            }
+            lastGrDb = grDb;
+
+            const double gainLin = std::pow(10.0, (comp.makeupDb - grDb) / 20.0);
+            // Skip the makeup multiply collapse — combine into one mul.
+            (void)makeupLin;
+            double yL = xL * gainLin;
+            double yR = xR * gainLin;
+            if (yL > 32767.0) yL = 32767.0;
+            else if (yL < -32768.0) yL = -32768.0;
+            if (yR > 32767.0) yR = 32767.0;
+            else if (yR < -32768.0) yR = -32768.0;
+            scratchComp[i]     = static_cast<int16_t>(yL);
+            scratchComp[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — extremely unlikely with stereo
+        // s16 fragments but guarded for safety.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchComp[i] = src[i];
+        }
+        stateIt.value().env = env;
+        stateIt.value().currentGrDb = lastGrDb;
+        src = scratchComp.data();
+    }
+
+    // Per-track reverb (Audition / Fairlight Multitap parity, simplified
+    // Schroeder topology). Cascaded AFTER the compressor stage and BEFORE
+    // the legacy 3-band / preamp / gain stages so meters and the master
+    // bus see the post-reverb signal. Disabled or mixRatio=0 = bit-exact
+    // bypass (skip the entire DSP path; do not touch state).
+    //
+    // Signal flow per channel:
+    //   in → preDelay buffer → sum(comb1..4 with damped feedback)
+    //      → allpass1 → allpass2 → wet
+    //   out = dry * (1 - mix) + wet * mix
+    // Width is applied as a stereo cross-feed between the two channel
+    // wet outputs (0=mono, 100=fully decorrelated).
+    QVarLengthArray<int16_t, 8192> scratchRev;
+    auto revIt = (trackIdx >= 0)
+        ? m_trackReverb.constFind(trackIdx)
+        : m_trackReverb.constEnd();
+    if (revIt != m_trackReverb.constEnd()
+        && revIt.value().enabled
+        && revIt.value().mixRatio > 1e-6) {
+        const auto &rev = revIt.value();
+        // Comb / allpass delays: Freeverb defaults @ 44.1 kHz, scaled to
+        // current sample rate so reverb character is consistent across
+        // hardware. Stereo offset (~23 samples) decorrelates L/R combs.
+        constexpr int kCombDelays44k1[AudioMixer::kReverbCombCount]    = {1116, 1188, 1277, 1356};
+        constexpr int kCombStereoOffset44k1                = 23;
+        constexpr int kAllpassDelays44k1[AudioMixer::kReverbAllpassCount] = {556, 441};
+        const double srScale = static_cast<double>(AudioMixer::kSampleRateHz) / 44100.0;
+        auto scaleDelay = [srScale](int n) {
+            return std::max(1, static_cast<int>(std::lround(n * srScale)));
+        };
+
+        auto stateIt = m_trackReverbState.find(trackIdx);
+        if (stateIt == m_trackReverbState.end()) {
+            stateIt = m_trackReverbState.insert(
+                trackIdx, AudioMixer::ReverbState{});
+        }
+        AudioMixer::ReverbState &st = stateIt.value();
+        // Lazy buffer initialization on first activation. Subsequent
+        // calls preserve buffer contents so live tweaks don't pop.
+        if (!st.initialized) {
+            for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
+                for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
+                    const int sz = scaleDelay(kCombDelays44k1[b]
+                        + (ch == 1 ? kCombStereoOffset44k1 : 0));
+                    st.comb[ch][b].assign(sz, 0.0f);
+                    st.combIdx[ch][b] = 0;
+                    st.combLP[ch][b]  = 0.0f;
+                }
+                for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
+                    const int sz = scaleDelay(kAllpassDelays44k1[a]
+                        + (ch == 1 ? kCombStereoOffset44k1 / 2 : 0));
+                    st.ap[ch][a].assign(sz, 0.0f);
+                    st.apIdx[ch][a] = 0;
+                }
+                std::fill(st.preDelay[ch].begin(),
+                          st.preDelay[ch].end(), 0.0f);
+                st.preDelayIdx[ch] = 0;
+            }
+            st.initialized = true;
+        }
+
+        // Pre-delay length in samples (clamped to buffer size).
+        const int preDelaySamples = std::clamp(
+            static_cast<int>(std::lround(rev.preDelayMs * AudioMixer::kSampleRateHz / 1000.0)),
+            0, AudioMixer::kReverbPreDelayMaxSamples - 1);
+        // Comb feedback gain: g = 0.7 * decay / standardDecay (1.0 sec).
+        // Clamped to <0.98 for unconditional stability across the comb
+        // bank (each comb's pole magnitude must stay inside the unit
+        // circle even with HF damping subtracting energy).
+        const float fbGain = static_cast<float>(
+            std::clamp(0.7 * rev.decaySeconds / 1.0, 0.0, 0.97));
+        // HF damping coefficient: 0 = no LP (bright tail), ~1 = heavy
+        // LP (dark tail). Implemented as one-pole LP inside the comb
+        // feedback path: y = (1-d)*x + d*y_prev.
+        const float damp = static_cast<float>(
+            std::clamp(rev.dampingHF / 100.0, 0.0, 0.95));
+        const float dampInv = 1.0f - damp;
+        constexpr float kAllpassGain = 0.5f;
+        const float mix = static_cast<float>(std::clamp(rev.mixRatio, 0.0, 1.0));
+        const float dry = 1.0f - mix;
+        // Width: 0 = mono sum (collapse), 100 = pass-through.
+        // We blend each channel's wet with the cross-channel wet.
+        const float width = static_cast<float>(
+            std::clamp(rev.widthPercent / 100.0, 0.0, 1.0));
+        const float crossFeed = 0.5f * (1.0f - width); // 0 at width=100, 0.5 at width=0
+        const float selfFeed  = 1.0f - crossFeed;
+
+        scratchRev.resize(copySamples);
+        // Process per stereo frame so we can apply width cross-feed.
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            float wet[AudioMixer::kChannels];
+            for (int ch = 0; ch < AudioMixer::kChannels; ++ch) {
+                const float xin = static_cast<float>(src[i + ch]);
+                // Pre-delay: write input, read N samples back.
+                auto &pd = st.preDelay[ch];
+                int &pdIdx = st.preDelayIdx[ch];
+                pd[pdIdx] = xin;
+                int readIdx = pdIdx - preDelaySamples;
+                if (readIdx < 0) readIdx += AudioMixer::kReverbPreDelayMaxSamples;
+                const float xPre = pd[readIdx];
+                pdIdx = (pdIdx + 1) % AudioMixer::kReverbPreDelayMaxSamples;
+
+                // Sum 4 parallel comb filters with damped feedback.
+                float combSum = 0.0f;
+                for (int b = 0; b < AudioMixer::kReverbCombCount; ++b) {
+                    auto &buf = st.comb[ch][b];
+                    const int sz = buf.size();
+                    if (sz <= 0) continue;
+                    int &idx = st.combIdx[ch][b];
+                    const float yDelayed = buf[idx];
+                    // One-pole LP on the feedback tap.
+                    float &lp = st.combLP[ch][b];
+                    lp = dampInv * yDelayed + damp * lp;
+                    buf[idx] = xPre + lp * fbGain;
+                    idx = (idx + 1) % sz;
+                    combSum += yDelayed;
+                }
+                // Normalise comb output (4 parallel paths).
+                combSum *= 0.25f;
+
+                // Series allpass filters (decorrelation).
+                float ap = combSum;
+                for (int a = 0; a < AudioMixer::kReverbAllpassCount; ++a) {
+                    auto &buf = st.ap[ch][a];
+                    const int sz = buf.size();
+                    if (sz <= 0) continue;
+                    int &idx = st.apIdx[ch][a];
+                    const float bufIn = ap + buf[idx] * kAllpassGain;
+                    const float yOut  = buf[idx] - bufIn * kAllpassGain;
+                    buf[idx] = bufIn;
+                    idx = (idx + 1) % sz;
+                    ap = yOut;
+                }
+                wet[ch] = ap;
+            }
+
+            // Stereo width cross-feed: collapse toward mono as width→0.
+            const float wetL = selfFeed * wet[0] + crossFeed * wet[1];
+            const float wetR = selfFeed * wet[1] + crossFeed * wet[0];
+
+            float yL = dry * static_cast<float>(src[i])     + mix * wetL;
+            float yR = dry * static_cast<float>(src[i + 1]) + mix * wetR;
+            if (yL > 32767.0f) yL = 32767.0f;
+            else if (yL < -32768.0f) yL = -32768.0f;
+            if (yR > 32767.0f) yR = 32767.0f;
+            else if (yR < -32768.0f) yR = -32768.0f;
+            scratchRev[i]     = static_cast<int16_t>(yL);
+            scratchRev[i + 1] = static_cast<int16_t>(yR);
+        }
+        // Odd-sample tail (mono runt) — pass through unchanged.
+        for (int i = copySamples & ~1; i < copySamples; ++i) {
+            scratchRev[i] = src[i];
+        }
+        src = scratchRev.data();
+    }
+
+    if (src != output) std::copy_n(src, copySamples, output);
+}
+
+void AudioMixer::setLegacyTrackFxPathForTest(bool legacy)
+{
+    QMutexLocker lock(&m_controlMutex);
+    m_legacyTrackFxPath = legacy;
+    m_trackFxProcessCalls = 0;
+}
+
+quint64 AudioMixer::trackFxProcessCallsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_trackFxProcessCalls;
+}
+
+void AudioMixer::processTrackFxForTest(int trackId, int16_t *samples, int frames)
+{
+    if (!samples || frames <= 0 || frames > std::numeric_limits<int>::max() / kChannels) return;
+    QMutexLocker lock(&m_controlMutex);
+    processTrackFxLocked(trackId, samples, samples, frames * kChannels);
+}
+
+const trackfx::Chain &AudioMixer::trackChain(int trackId) const
+{
+    // Return a per-thread snapshot: no reference into a QHash that setters can
+    // invalidate after unlocking. Copy before requesting another track on this thread.
+    thread_local trackfx::Chain snapshot;
+    QMutexLocker lock(&m_controlMutex);
+    snapshot = m_trackFxChains.value(trackId);
+    return snapshot;
+}
+
+QJsonObject AudioMixer::collectTrackState() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    QJsonArray states;
+    for (const auto &state : m_trackStates) {
+        QJsonArray bands;
+        for (const auto &band : state.eq.bands)
+            bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
+        states.append(QJsonObject{{"gain", state.gain}, {"pan", state.pan}, {"mute", state.muted},
+            {"solo", state.solo}, {"eqEnabled", state.eqEnabled},
+            {"preamp", state.eq.preamp}, {"bands", bands}});
+    }
+    QJsonObject chains;
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it)
+        chains.insert(QString::number(it.key()), it.value().toJson());
+    QJsonArray identities;
+    for (quint64 identity : m_trackIdentities) identities.append(static_cast<qint64>(identity));
+    // Master EQ / DeEsser (the only master stages the docks edit) ride along so
+    // undo restores them; applyTrackState applies the key only when present.
+    return QJsonObject{{"states", states}, {"chains", chains},
+                       {"masterChain", m_masterFxChain.toJson()}, {"trackIds", identities}};
+}
+
+void AudioMixer::rememberListenLocked(quint64 identity, int liveIndex)
+{
+    if (m_trackFxChains.value(liveIndex).deesser.listen)
+        m_listenOfRemovedTracks.insert(identity);
+    else
+        m_listenOfRemovedTracks.remove(identity);
+}
+
+void AudioMixer::applyTrackState(const QJsonObject &snapshot)
+{
+    QVector<TrackState> restoredStates;
+    const auto states = snapshot.value("states").toArray();
+    for (int i = 0; i < states.size() && i < kMaxAudioTracks; ++i) {
+        const auto obj = states[i].toObject();
+        TrackState state;
+        state.gain = qBound(0.0, obj.value("gain").toDouble(1.0), 4.0);
+        state.pan = audiopan::clampPan(obj.value("pan").toDouble(0.0));
+        state.muted = obj.value("mute").toBool();
+        state.solo = obj.value("solo").toBool();
+        state.eqEnabled = obj.value("eqEnabled").toBool();
+        state.eq.preamp = obj.value("preamp").toDouble();
+        for (const auto &value : obj.value("bands").toArray()) {
+            const auto band = value.toObject();
+            state.eq.bands.append(EQBand{band.value("frequency").toDouble(1000.0),
+                band.value("gain").toDouble(), band.value("q").toDouble(1.0)});
+        }
+        recomputeEqCoefficients(state);
+        restoredStates.append(state);
+    }
+    QHash<int, trackfx::Chain> restoredChains;
+    QHash<int, std::array<EqBandCoefsParam, 4>> restoredCoefs;
+    const auto insertChain = [&restoredChains, &restoredCoefs](int index, const trackfx::Chain &chain) {
+        restoredChains.insert(index, chain);
+        restoredCoefs.insert(index, {computeEqBand(chain.eq.low, 0, kSampleRateHz),
+            computeEqBand(chain.eq.lowMid, 1, kSampleRateHz),
+            computeEqBand(chain.eq.highMid, 2, kSampleRateHz),
+            computeEqBand(chain.eq.high, 3, kSampleRateHz)});
+    };
+    const auto chains = snapshot.value("chains").toObject();
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        bool valid = false;
+        const int index = it.key().toInt(&valid);
+        if (!valid || index < 0 || index >= kMaxAudioTracks) continue;
+        insertChain(index, trackfx::Chain::fromJson(it.value().toObject()));
+    }
+    const bool hasMaster = snapshot.contains("masterChain");
+    const auto master = trackfx::Chain::fromJson(snapshot.value("masterChain").toObject());
+    const auto identities = snapshot.value("trackIds").toArray();
+    const bool hasIdentities = identities.size() == kMaxAudioTracks;
+    std::array<quint64, kMaxAudioTracks> restoredIdentities{};
+    for (int i = 0; hasIdentities && i < kMaxAudioTracks; ++i)
+        restoredIdentities[i] = static_cast<quint64>(identities[i].toInteger());
+    // Only the identities of the snapshot's audio tracks name a track; a
+    // snapshot without the count treats every index as a track.
+    const int activeTracks = snapshot.contains("trackCount")
+        ? qBound(0, snapshot.value("trackCount").toInt(), int(kMaxAudioTracks))
+        : int(kMaxAudioTracks);
+    // Publish one complete snapshot to the audio callback. The master EQ /
+    // DeEsser change only when the snapshot carries them (chain + processor).
+    QMutexLocker lock(&m_controlMutex);
+    if (hasMaster) {
+        // The DeEsser listen monitor is not undo state: keep the live toggle.
+        auto restoredMaster = master;
+        restoredMaster.deesser.listen = m_masterFxChain.deesser.listen;
+        applyMasterChainLocked(restoredMaster);
+    }
+    // Track listen is not undo state either. Indices move across structural
+    // edits, so each restored chain takes the live listen of the same track
+    // identity (or the listen it had when it left the live tracks); a track
+    // without a snapshot chain gets a default chain to carry it. Without
+    // identities the restored listen is off: never another track's monitor.
+    if (hasIdentities) {
+        const auto activeEnd = restoredIdentities.cbegin() + activeTracks;
+        for (int live = 0; live < kMaxAudioTracks; ++live)
+            if (std::find(restoredIdentities.cbegin(), activeEnd, m_trackIdentities[live]) == activeEnd)
+                rememberListenLocked(m_trackIdentities[live], live);
+        for (auto it = restoredChains.begin(); it != restoredChains.end(); ++it)
+            if (it.key() >= activeTracks) it->deesser.listen = false;
+        for (int index = 0; index < activeTracks; ++index) {
+            const quint64 identity = restoredIdentities[index];
+            const auto live = std::find(m_trackIdentities.cbegin(), m_trackIdentities.cend(), identity);
+            const bool listen = live != m_trackIdentities.cend()
+                ? m_trackFxChains.value(int(live - m_trackIdentities.cbegin())).deesser.listen
+                : m_listenOfRemovedTracks.contains(identity);
+            const auto chain = restoredChains.find(index);
+            if (chain != restoredChains.end()) {
+                chain->deesser.listen = listen;
+            } else if (listen) {
+                trackfx::Chain listenOnly;
+                listenOnly.deesser.listen = true;
+                insertChain(index, listenOnly);
+            }
+            m_listenOfRemovedTracks.remove(identity);
+        }
+        // An index past the tracks never shares the identity of a track that
+        // was undone away and may come back with a redo.
+        for (int index = activeTracks; index < kMaxAudioTracks; ++index)
+            restoredIdentities[index] = newTrackIdentity();
+        // The tap follows its track identity across undo / redo; a track the
+        // snapshot does not have falls back to the master. The identity stays
+        // selected, so a later undo / redo that restores the track brings it back.
+        if (m_tapIdentity != 0) {
+            const auto found = std::find(restoredIdentities.cbegin(), activeEnd, m_tapIdentity);
+            m_tapSource.store(found != activeEnd ? int(found - restoredIdentities.cbegin()) : -1,
+                              std::memory_order_release);
+        }
+        m_trackIdentities = restoredIdentities;
+    } else {
+        for (auto &chain : restoredChains) chain.deesser.listen = false;
+    }
+    m_trackStates = std::move(restoredStates);
+    m_trackFxChains = std::move(restoredChains);
+    m_trackEqCoefs = std::move(restoredCoefs);
+    m_trackFxProcessors.clear();
+    m_trackEq.clear();
+    m_trackEqHist.clear();
+    m_trackComp.clear();
+    m_trackCompState.clear();
+    m_trackReverb.clear();
+    m_trackReverbState.clear();
+    m_trackNoiseReduction.clear();
+    m_trackNoiseReductionState.clear();
+    for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it) {
+        const int index = it.key();
+        const auto &chain = it.value();
+        m_trackFxProcessors[index].setChain(chain);
+        m_trackEq.insert(index, chain.eq);
+        m_trackComp.insert(index, chain.comp);
+        m_trackReverb.insert(index, chain.reverb);
+        m_trackNoiseReduction.insert(index, chain.nr);
+    }
+    recomputeEffectiveGainsLocked();
+}
+
+void AudioMixer::remapTrackIndices(const QVector<int> &oldToNew)
+{
+    QMutexLocker lock(&m_controlMutex);
+    // Identities move with their tracks; a removed one keeps its listen, a
+    // vacated index gets a new identity.
+    auto identities = m_trackIdentities;
+    const int mapped = std::min(int(oldToNew.size()), int(kMaxAudioTracks));
+    for (int i = 0; i < mapped; ++i) {
+        identities[i] = 0;
+        if (oldToNew[i] < 0) rememberListenLocked(m_trackIdentities[i], i);
+    }
+    for (int i = 0; i < mapped; ++i)
+        if (oldToNew[i] >= 0 && oldToNew[i] < kMaxAudioTracks)
+            identities[oldToNew[i]] = m_trackIdentities[i];
+    for (int i = 0; i < mapped; ++i)
+        if (!identities[i]) identities[i] = newTrackIdentity();
+    m_trackIdentities = identities;
+    QVector<TrackState> states;
+    for (int index : oldToNew) if (index >= states.size()) states.resize(index + 1);
+    for (int i = 0; i < oldToNew.size(); ++i)
+        if (oldToNew[i] >= 0 && i < m_trackStates.size()) states[oldToNew[i]] = m_trackStates[i];
+    m_trackStates = std::move(states);
+    auto remap = [&oldToNew](auto &map) {
+        std::decay_t<decltype(map)> result;
+        for (auto it = map.cbegin(); it != map.cend(); ++it) {
+            const int index = oldToNew.value(it.key(), -1);
+            if (index >= 0) result.insert(index, it.value());
+        }
+        map = std::move(result);
+    };
+    remap(m_trackFxChains);
+    remap(m_trackFxProcessors);
+    remap(m_trackEq);
+    remap(m_trackEqCoefs);
+    remap(m_trackEqHist);
+    remap(m_trackComp);
+    remap(m_trackCompState);
+    remap(m_trackReverb);
+    remap(m_trackReverbState);
+    remap(m_trackNoiseReduction);
+    remap(m_trackNoiseReductionState);
+    // The tap follows its track identity; a removed track falls back to the
+    // master but keeps its identity, so a redo that first removes the last row
+    // (Timeline::restoreState) and then restores the track finds it again.
+    if (m_tapIdentity != 0) {
+        const auto found = std::find(m_trackIdentities.cbegin(), m_trackIdentities.cend(), m_tapIdentity);
+        m_tapSource.store(found != m_trackIdentities.cend() ? int(found - m_trackIdentities.cbegin()) : -1,
+                          std::memory_order_release);
+    }
+    recomputeEffectiveGainsLocked();
 }

@@ -11,6 +11,9 @@
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QTableWidget>
+#include <QHeaderView>
+#include <QShowEvent>
 #include <QWidget>
 #include <QSignalBlocker>
 #include <QJsonObject>
@@ -46,6 +49,7 @@ AudioBusPanel::AudioBusPanel(QWidget *parent)
 
     // --- バス一覧 ---------------------------------------------------------
     m_busList = new QListWidget(root);
+    m_busList->setObjectName(QStringLiteral("audioBusList"));
     m_busList->setSelectionMode(QAbstractItemView::SingleSelection);
     rootLayout->addWidget(m_busList, /*stretch*/ 1);
     connect(m_busList, &QListWidget::itemSelectionChanged,
@@ -105,6 +109,23 @@ AudioBusPanel::AudioBusPanel(QWidget *parent)
 
     rootLayout->addWidget(m_stripWidget);
 
+    // --- センド表 (選択中バスへの AUX センド。行 = 音声トラック) -----------
+    auto *sendBox = new QGroupBox(QStringLiteral("センド"), root);
+    auto *sendLayout = new QVBoxLayout(sendBox);
+    sendLayout->setContentsMargins(8, 8, 8, 8);
+    m_sendTable = new QTableWidget(0, 3, sendBox);
+    m_sendTable->setObjectName(QStringLiteral("auxSendTable"));
+    m_sendTable->setHorizontalHeaderLabels({QStringLiteral("トラック"),
+        QStringLiteral("レベル (dB)"), QStringLiteral("プリフェーダー")});
+    m_sendTable->verticalHeader()->setVisible(false);
+    m_sendTable->horizontalHeader()->setStretchLastSection(true);
+    m_sendTable->setSelectionMode(QAbstractItemView::NoSelection);
+    m_sendTable->setMinimumHeight(90);
+    connect(m_sendTable, &QTableWidget::itemChanged,
+            this, &AudioBusPanel::onSendItemChanged);
+    sendLayout->addWidget(m_sendTable);
+    rootLayout->addWidget(sendBox);
+
     // --- 追加 / 削除 ------------------------------------------------------
     auto *buttonRow = new QWidget(root);
     auto *buttonLayout = new QHBoxLayout(buttonRow);
@@ -127,6 +148,18 @@ void AudioBusPanel::setRouting(audiobus::AudioBusRouting *routing)
 {
     m_routing = routing;
     refresh();
+}
+
+void AudioBusPanel::setTrackCountProvider(std::function<int()> provider)
+{
+    m_trackCountProvider = std::move(provider);
+    refresh();
+}
+
+void AudioBusPanel::showEvent(QShowEvent *event)
+{
+    QDockWidget::showEvent(event);
+    refresh();  // 非表示中に増減したトラックをセンド表へ反映する
 }
 
 int AudioBusPanel::selectedBusId() const
@@ -236,6 +269,104 @@ void AudioBusPanel::updateStrip()
         m_soloButton->setChecked(false);
     }
     rebuildOutputCombo(bus);
+    rebuildSendTable();
+}
+
+namespace {
+// センド表の level 列: -60 dB 以下は「センド無し」(removeAuxSend)。
+constexpr double kSendMinDb = -60.0;
+constexpr double kSendMaxDb = 12.0;
+}
+
+void AudioBusPanel::rebuildSendTable()
+{
+    if (!m_sendTable)
+        return;
+    const int busId = selectedBusId();
+    const bool active = m_routing && busId >= 0 && m_routing->bus(busId);
+    const int tracks = (active && m_trackCountProvider) ? m_trackCountProvider() : 0;
+
+    QSignalBlocker blocker(m_sendTable);
+    const bool wasUpdating = m_updating;
+    m_updating = true;
+    m_sendTable->setRowCount(tracks);
+    m_sendTable->setEnabled(active);
+    for (int t = 0; t < tracks; ++t) {
+        const audiobus::AuxSend *found = nullptr;
+        for (const audiobus::AuxSend &s : m_routing->auxSends()) {
+            if (s.trackIndex == t && s.busId == busId) { found = &s; break; }
+        }
+        // 編集中のセルを削除しないよう、既存 item は作り直さず値だけ更新する。
+        auto cell = [this, t](int col) {
+            QTableWidgetItem *c = m_sendTable->item(t, col);
+            if (!c) {
+                c = new QTableWidgetItem();
+                m_sendTable->setItem(t, col, c);
+            }
+            return c;
+        };
+        QTableWidgetItem *name = cell(0);
+        name->setText(QStringLiteral("A%1").arg(t + 1));
+        name->setFlags(Qt::ItemIsEnabled);
+        const double db = (found && found->sendLevel > 0.0)
+            ? qBound(kSendMinDb, 20.0 * std::log10(found->sendLevel), kSendMaxDb) : kSendMinDb;
+        cell(1)->setText(QString::number(db, 'f', 1));
+        QTableWidgetItem *pre = cell(2);
+        pre->setFlags(found ? (Qt::ItemIsEnabled | Qt::ItemIsUserCheckable) : Qt::NoItemFlags);
+        pre->setCheckState(found && found->preFader ? Qt::Checked : Qt::Unchecked);
+    }
+    m_updating = wasUpdating;
+}
+
+void AudioBusPanel::onSendItemChanged(QTableWidgetItem *item)
+{
+    if (m_updating || !m_routing || !item)
+        return;
+    const int busId = selectedBusId();
+    if (busId < 0 || !m_routing->bus(busId))
+        return;
+    const int track = item->row();
+    if (item->column() != 1 && item->column() != 2)
+        return;
+    const audiobus::AuxSend *existing = nullptr;
+    for (const audiobus::AuxSend &s : m_routing->auxSends()) {
+        if (s.trackIndex == track && s.busId == busId) { existing = &s; break; }
+    }
+    bool changed = false;
+    if (item->column() == 2) {
+        // pre-fader toggle: never re-parse the rounded level text.
+        if (!existing) {
+            rebuildSendTable();
+            return;
+        }
+        audiobus::AuxSend send = *existing;
+        send.preFader = (item->checkState() == Qt::Checked);
+        if (send.preFader != existing->preFader) {
+            m_routing->addAuxSend(send);
+            changed = true;
+        }
+    } else {
+        bool ok = false;
+        const double db = qBound(kSendMinDb, item->text().toDouble(&ok), kSendMaxDb);
+        if (ok && db <= kSendMinDb) {
+            changed = m_routing->removeAuxSend(track, busId);
+        } else if (ok) {
+            audiobus::AuxSend send;
+            send.trackIndex = track;
+            send.busId = busId;
+            send.sendLevel = std::pow(10.0, db / 20.0);
+            send.preFader = existing ? existing->preFader : false;
+            if (!existing || std::fabs(existing->sendLevel - send.sendLevel) > 1e-6) {
+                m_routing->addAuxSend(send);
+                changed = true;
+            }
+        }
+    }
+    rebuildSendTable();  // 不正入力の巻き戻しと pre-fader 列の有効状態を反映
+    if (!changed)
+        return;
+    emit sendEdited();
+    emit routingChanged();
 }
 
 void AudioBusPanel::onBusSelectionChanged()

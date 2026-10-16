@@ -14,7 +14,10 @@
 #include <QSpinBox>
 #include <QTableWidget>
 #include <QTableWidgetItem>
+#include <QUuid>
 #include <QVBoxLayout>
+
+#include <cmath>
 
 namespace {
 
@@ -87,6 +90,7 @@ public:
 
         // Output path picker.
         m_outputEdit = new QLineEdit(this);
+        m_outputEdit->setObjectName(QStringLiteral("addJobOutputEdit"));
         m_outputEdit->setPlaceholderText(QStringLiteral("output.mp4"));
         auto *outputBrowse = new QPushButton(QStringLiteral("..."), this);
         outputBrowse->setMaximumWidth(40);
@@ -244,7 +248,9 @@ void RenderQueueDialog::buildUi()
     // Top: action toolbar.
     auto *toolbar = new QHBoxLayout;
     m_addBtn    = new QPushButton(QStringLiteral("ジョブ追加"), this);
+    m_addBtn->setObjectName(QStringLiteral("renderQueueAddJobButton"));
     m_removeBtn = new QPushButton(QStringLiteral("削除"), this);
+    m_removeBtn->setObjectName(QStringLiteral("renderQueueRemoveJobButton"));
     m_startBtn  = new QPushButton(QStringLiteral("開始"), this);
     m_stopBtn   = new QPushButton(QStringLiteral("停止"), this);
     toolbar->addWidget(m_addBtn);
@@ -256,6 +262,7 @@ void RenderQueueDialog::buildUi()
 
     // Table — id is hidden (uuid stored in row's first item user data).
     m_table = new QTableWidget(this);
+    m_table->setObjectName(QStringLiteral("renderQueueJobTable"));
     m_table->setColumnCount(5);
     m_table->setHorizontalHeaderLabels(
         QStringList{ QStringLiteral("ID"),
@@ -358,7 +365,10 @@ void RenderQueueDialog::updateButtons()
     m_addBtn   ->setEnabled(true);
     m_startBtn ->setEnabled(!running && hasPending);
     m_stopBtn  ->setEnabled(running);
-    m_removeBtn->setEnabled(hasSelect && !running);
+    // Jobs added elsewhere (GUI / MCP) on the shared queue are not removable here:
+    // removeJob emits no terminal status, so an MCP observation would stay 'queued'.
+    const bool ownSelected = hasSelect && m_ownJobUuids.contains(uuidForRow(m_table->currentRow()));
+    m_removeBtn->setEnabled(ownSelected && !running);
 }
 
 int RenderQueueDialog::rowForUuid(const QString &uuid) const
@@ -411,6 +421,20 @@ void RenderQueueDialog::onAddJobClicked()
         j.timeline = m_liveTimeline;
     }
 
+    // US-1125: the shared queue's defaults are not this dialog's, so state them.
+    if (m_acesProvider)
+        j.acesPipeline = m_acesProvider();
+    if (m_loudnessGainProvider) {
+        const double gainDb = m_loudnessGainProvider();
+        if (std::isfinite(gainDb) && gainDb != 0.0) {
+            j.loudnessGainDb = gainDb;
+            j.exportConfig[QStringLiteral("loudnessGainDb")] = gainDb;
+        }
+    }
+
+    if (j.uuid.isEmpty())
+        j.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    m_ownJobUuids.insert(j.uuid);
     m_queue->addJob(j);
 }
 
@@ -418,8 +442,9 @@ void RenderQueueDialog::onRemoveJobClicked()
 {
     const int row = m_table->currentRow();
     const QString uuid = uuidForRow(row);
-    if (uuid.isEmpty())
+    if (uuid.isEmpty() || !m_ownJobUuids.contains(uuid))
         return;
+    m_ownJobUuids.remove(uuid);
     m_queue->removeJob(uuid);
 }
 

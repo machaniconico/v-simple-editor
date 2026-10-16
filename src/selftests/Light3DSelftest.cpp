@@ -6,6 +6,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../TrackMatteBake.h"
 #include "../libavcore/Encode.h"
+#include "SelftestGate.h"
 
 #include <QCoreApplication>
 #include <QDoubleSpinBox>
@@ -82,19 +83,6 @@ bool sameMaterial(const LayerMaterial &a, const LayerMaterial &b)
         && closeTo(a.diffuseCoeff, b.diffuseCoeff)
         && closeTo(a.specularCoeff, b.specularCoeff)
         && closeTo(a.shininess, b.shininess);
-}
-
-bool gate(bool condition, const char *label, const char *detail,
-          int &passed, int &failed)
-{
-    if (condition) {
-        ++passed;
-        std::cout << "[light3d] PASS " << label << '\n';
-        return true;
-    }
-    ++failed;
-    std::cerr << "[light3d] FAIL " << label << ": " << detail << '\n';
-    return false;
 }
 
 QImage makeTestImage()
@@ -230,8 +218,7 @@ QVector3D pointAtAngle(double degrees, double distance)
 
 int runLight3DSelftest()
 {
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
 
     const QImage input = makeTestImage();
     Layer3DTransform identity;
@@ -241,16 +228,18 @@ int runLight3DSelftest()
     const QImage noLights = light3d::applyLighting(
         input, {}, identity, QVector3D(), QSizeF(input.size()), viewPos,
         defaultMaterial);
-    gate(sameImage(input, noLights), "G1", "empty light list changed pixels",
-         passed, failed);
+    tally.gate(1,
+        sameImage(input, noLights),
+        "empty light list changed pixels");
 
     Light3DState disabledState;
     disabledState.enabled = false;
     const QImage disabled = light3d::applyLighting(
         input, {disabledState}, identity, QVector3D(), QSizeF(input.size()),
         viewPos, defaultMaterial);
-    gate(sameImage(input, disabled), "G2", "disabled light changed pixels",
-         passed, failed);
+    tally.gate(2,
+        sameImage(input, disabled),
+        "disabled light changed pixels");
 
     Light3DState ambient;
     ambient.type = LightType::Ambient;
@@ -272,8 +261,9 @@ int runLight3DSelftest()
         minGain = qMin(minGain, gain);
         maxGain = qMax(maxGain, gain);
     }
-    gate(maxGain - minGain < 1.0 / 255.0,
-         "G3", "ambient gain was not spatially uniform", passed, failed);
+    tally.gate(3,
+        maxGain - minGain < 1.0 / 255.0,
+        "ambient gain was not spatially uniform");
 
     Light3DState parallel;
     parallel.type = LightType::Parallel;
@@ -292,8 +282,11 @@ int runLight3DSelftest()
     const light3d::LightingResult side = light3d::computeLighting(
         {parallel}, QVector3D(), light3d::layerNormal(sideTransform), viewPos,
         diffuseMaterial);
-    gate(front.r > 1.9 && closeTo(side.r, 1.0),
-         "G4", "parallel light did not follow the layer normal", passed, failed);
+    std::cerr << "light3d G4 front.r=" << front.r
+              << " side.r=" << side.r << '\n';
+    tally.gate(4,
+        front.r > 1.9 && closeTo(side.r, 1.0),
+        "parallel light did not follow the layer normal");
 
     Light3DState point;
     point.type = LightType::Point;
@@ -308,9 +301,11 @@ int runLight3DSelftest()
     const light3d::LightingResult farFalloff = light3d::computeLighting(
         {point}, QVector3D(), QVector3D(0.0f, 0.0f, 1.0f), viewPos,
         diffuseMaterial);
-    gate(closeTo(nearFalloff.r, 2.0) && closeTo(farFalloff.r, 1.0),
-         "G5", "point falloff radius/distance boundaries were wrong",
-         passed, failed);
+    std::cerr << "light3d G5 nearFalloff.r=" << nearFalloff.r
+              << " farFalloff.r=" << farFalloff.r << '\n';
+    tally.gate(5,
+        closeTo(nearFalloff.r, 2.0) && closeTo(farFalloff.r, 1.0),
+        "point falloff radius/distance boundaries were wrong");
 
     Light3DState spot;
     spot.type = LightType::Spot;
@@ -330,21 +325,28 @@ int runLight3DSelftest()
     const light3d::LightingResult spotOutside = light3d::computeLighting(
         {spot}, pointAtAngle(31.0, 100.0), QVector3D(0.0f, 0.0f, 1.0f),
         viewPos, diffuseMaterial);
-    gate(spotInner.r > 1.9
-             && spotFeatherNear.r > spotFeatherFar.r
-             && spotFeatherFar.r > 1.0
-             && closeTo(spotOutside.r, 1.0),
-         "G6", "spot cone feather was not bounded and monotonic",
-         passed, failed);
+    std::cerr << "light3d G6 spotInner.r=" << spotInner.r
+              << " spotFeatherNear.r=" << spotFeatherNear.r
+              << " spotFeatherFar.r=" << spotFeatherFar.r
+              << " spotOutside.r=" << spotOutside.r << '\n';
+    tally.gate(6,
+        spotInner.r > 1.9
+                 && spotFeatherNear.r > spotFeatherFar.r
+                 && spotFeatherFar.r > 1.0
+                 && closeTo(spotOutside.r, 1.0),
+        "spot cone feather was not bounded and monotonic");
 
     Light3DState red = parallel;
     red.color = QColor(255, 0, 0);
     const light3d::LightingResult redResult = light3d::computeLighting(
         {red}, QVector3D(), QVector3D(0.0f, 0.0f, 1.0f), viewPos,
         diffuseMaterial);
-    gate(redResult.r > 1.0 && closeTo(redResult.g, 1.0)
-             && closeTo(redResult.b, 1.0),
-         "G7", "colored light altered an unlit channel", passed, failed);
+    std::cerr << "light3d G7 redResult.r=" << redResult.r
+              << " g=" << redResult.g << " b=" << redResult.b << '\n';
+    tally.gate(7,
+        redResult.r > 1.0 && closeTo(redResult.g, 1.0)
+                 && closeTo(redResult.b, 1.0),
+        "colored light altered an unlit channel");
 
     Light3DState custom;
     custom.type = LightType::Spot;
@@ -377,13 +379,20 @@ int runLight3DSelftest()
     const Light3D restoredAnimated = Light3D::fromJson(animated.toJson());
     const bool defaultFieldsOmitted = Light3DState{}.toJson().isEmpty()
         && LayerMaterial{}.toJson().isEmpty();
-    gate(sameState(custom, customRoundTrip)
-             && sameMaterial(customMaterial, materialRoundTrip)
-             && defaultFieldsOmitted
-             && closeTo(restoredAnimated.stateAt(0.5).intensity,
-                        animated.stateAt(0.5).intensity),
-         "G8", "light/material JSON or keyframe round-trip failed",
-         passed, failed);
+    const bool sameStateRoundTrip = sameState(custom, customRoundTrip);
+    const bool sameMaterialRoundTrip =
+        sameMaterial(customMaterial, materialRoundTrip);
+    const bool animatedIntensityEq =
+        closeTo(restoredAnimated.stateAt(0.5).intensity,
+                animated.stateAt(0.5).intensity);
+    std::cerr << "light3d G8 sameState=" << sameStateRoundTrip
+              << " sameMaterial=" << sameMaterialRoundTrip
+              << " defaultFieldsOmitted=" << defaultFieldsOmitted
+              << " animatedIntensityEq=" << animatedIntensityEq << '\n';
+    tally.gate(8,
+        sameStateRoundTrip && sameMaterialRoundTrip && defaultFieldsOmitted
+                 && animatedIntensityEq,
+        "light/material JSON or keyframe round-trip failed");
 
     LayerMaterial specularMaterial;
     specularMaterial.ambientCoeff = 0.0;
@@ -396,8 +405,9 @@ int runLight3DSelftest()
     const light3d::LightingResult spec = light3d::computeLighting(
         {parallel}, QVector3D(), QVector3D(0.0f, 0.0f, 1.0f),
         QVector3D(0.0f, 0.0f, 500.0f), specularMaterial);
-    gate(spec.r > noSpec.r, "G9", "Blinn-Phong highlight did not add energy",
-         passed, failed);
+    tally.gate(9,
+        spec.r > noSpec.r,
+        "Blinn-Phong highlight did not add energy");
 
     const QVector<Light3DState> deterministicLights{ambient, parallel, spot};
     const QImage first = light3d::applyLighting(
@@ -406,8 +416,9 @@ int runLight3DSelftest()
     const QImage second = light3d::applyLighting(
         input, deterministicLights, identity, QVector3D(), QSizeF(input.size()),
         viewPos, defaultMaterial);
-    gate(sameImage(first, second), "G10", "repeated lighting was not bit deterministic",
-         passed, failed);
+    tally.gate(10,
+        sameImage(first, second),
+        "repeated lighting was not bit deterministic");
 
     const QSize exportCanvas(kExportClipWidth, kExportClipHeight);
     QTemporaryDir exportTempDir;
@@ -427,7 +438,7 @@ int runLight3DSelftest()
     exportLayer.zOrder = 0;
     const QVector<CompositeLayer> exportLayers{exportLayer};
     const QVector<QPointF> exportOffsets{QPointF()};
-    qputenv("VEDITOR_LIGHT3D_SELFTEST", QByteArrayLiteral("1"));
+    tlrender::detail::setLightingSelftestObservation(true);
     const QImage preWiring = trackmatte::composite(
         exportLayers, QVector<QImage>{decodedExportFrame}, exportCanvas);
     const QImage postWiring = exportComposite(
@@ -450,17 +461,54 @@ int runLight3DSelftest()
         : QImage();
     const bool noLightExportSeamCalled =
         tlrender::detail::lightingSelftestSeamWasCalled();
-    qunsetenv("VEDITOR_LIGHT3D_SELFTEST");
-    gate(sameImage(preWiring, postWiring)
-             && sameImage(preWiring, postDisabledWiring)
-             && exportMediaReady
-             && !decodedExportFrame.isNull()
-             && noLightTimelineReady
-             && noLightExportSeamCalled
-             && sameRgbaBytes(noLightExportFrame, observedNoLightExportFrame)
-             && sameRgbaBytes(preWiring, observedNoLightExportFrame),
-         "G11", "zero-light export changed the decoded frame",
-         passed, failed);
+    tlrender::detail::setLightingSelftestObservation(false);
+    const bool g11PreEqPost = sameImage(preWiring, postWiring);
+    const bool g11PreEqDisabled = sameImage(preWiring, postDisabledWiring);
+    const bool g11OffEqObserved =
+        sameRgbaBytes(noLightExportFrame, observedNoLightExportFrame);
+    const bool g11PreEqObserved =
+        sameRgbaBytes(preWiring, observedNoLightExportFrame);
+    std::cerr << "light3d G11 preEqPost=" << g11PreEqPost
+              << " preEqDisabled=" << g11PreEqDisabled
+              << " mediaReady=" << exportMediaReady
+              << " decodedNonNull=" << !decodedExportFrame.isNull()
+              << " timelineReady=" << noLightTimelineReady
+              << " seamCalled=" << noLightExportSeamCalled
+              << " offEqObserved=" << g11OffEqObserved
+              << " preEqObserved=" << g11PreEqObserved << '\n';
+    tally.gate(11,
+        g11PreEqPost && g11PreEqDisabled && exportMediaReady
+                 && !decodedExportFrame.isNull()
+                 && noLightTimelineReady
+                 && noLightExportSeamCalled
+                 && g11OffEqObserved && g11PreEqObserved,
+        "zero-light export changed the decoded frame");
+
+    // G17: observation is an explicit setter, not an env latch fixed by the
+    // first renderFrameAt call of the process. Detects a regression to a
+    // latched flag: the OFF render below (the "earlier sweep entry") must not
+    // pin the observation OFF for the later ON render.
+    tlrender::detail::setLightingSelftestObservation(false);
+    tlrender::detail::resetLightingSelftestObservation();
+    const QImage offFrame = noLightTimelineReady
+        ? tlrender::renderFrameAt(&noLightTimeline, 0, exportCanvas)
+        : QImage();
+    const bool offSeamCalled = tlrender::detail::lightingSelftestSeamWasCalled();
+    tlrender::detail::setLightingSelftestObservation(true);
+    tlrender::detail::resetLightingSelftestObservation();
+    const QImage onFrame = noLightTimelineReady
+        ? tlrender::renderFrameAt(&noLightTimeline, 0, exportCanvas)
+        : QImage();
+    const bool onSeamCalled = tlrender::detail::lightingSelftestSeamWasCalled();
+    tlrender::detail::setLightingSelftestObservation(false);
+    std::cerr << "light3d G17 ready=" << noLightTimelineReady
+              << " offSeamCalled=" << offSeamCalled
+              << " onSeamCalled=" << onSeamCalled
+              << " framesEqual=" << sameRgbaBytes(offFrame, onFrame) << '\n';
+    tally.gate(17,
+        noLightTimelineReady && !offSeamCalled && onSeamCalled
+            && sameRgbaBytes(offFrame, onFrame),
+        "lighting seam observation did not follow the setter after an earlier render");
 
     Light3DState ambientExport;
     ambientExport.type = LightType::Ambient;
@@ -488,12 +536,20 @@ int runLight3DSelftest()
     // This deliberately uses the production renderFrameAt seam rather than
     // only the helper: the pre-wiring implementation returned the unlit
     // decoded frame here, so the gate would fail before the export hookup.
-    gate(ambientTimelineReady
-             && !previewAmbient.isNull()
-             && !exportAmbient.isNull()
-             && closeTo(meanLuma(previewAmbient), meanLuma(exportAmbient)),
-         "G12", "ambient export brightness diverged from preview brightness",
-         passed, failed);
+    std::cerr << "light3d G12 ambientTimelineReady=" << ambientTimelineReady
+              << " previewNull=" << previewAmbient.isNull()
+              << " exportNull=" << exportAmbient.isNull()
+              << " previewLuma="
+              << (previewAmbient.isNull() ? -1.0 : meanLuma(previewAmbient))
+              << " exportLuma="
+              << (exportAmbient.isNull() ? -1.0 : meanLuma(exportAmbient))
+              << '\n';
+    tally.gate(12,
+        ambientTimelineReady
+                 && !previewAmbient.isNull()
+                 && !exportAmbient.isNull()
+                 && closeTo(meanLuma(previewAmbient), meanLuma(exportAmbient)),
+        "ambient export brightness diverged from preview brightness");
 
     Light3DState pointExport;
     pointExport.type = LightType::Point;
@@ -525,12 +581,19 @@ int runLight3DSelftest()
     const QImage pointRight = pointTimelinesReady
         ? tlrender::renderFrameAt(&pointRightTimeline, 0, exportCanvas)
         : QImage();
-    gate(pointTimelinesReady
-             && !pointLeft.isNull()
-             && !pointRight.isNull()
-             && std::abs(meanLuma(pointLeft) - meanLuma(pointRight)) > 0.5,
-         "G13", "point-light export brightness ignored layer position",
-         passed, failed);
+    std::cerr << "light3d G13 pointTimelinesReady=" << pointTimelinesReady
+              << " leftNull=" << pointLeft.isNull()
+              << " rightNull=" << pointRight.isNull()
+              << " leftLuma="
+              << (pointLeft.isNull() ? -1.0 : meanLuma(pointLeft))
+              << " rightLuma="
+              << (pointRight.isNull() ? -1.0 : meanLuma(pointRight)) << '\n';
+    tally.gate(13,
+        pointTimelinesReady
+                 && !pointLeft.isNull()
+                 && !pointRight.isNull()
+                 && std::abs(meanLuma(pointLeft) - meanLuma(pointRight)) > 0.5,
+        "point-light export brightness ignored layer position");
 
     Light3D keyedLight;
     Light3DState keyedStart = keyedLight.state();
@@ -541,10 +604,13 @@ int runLight3DSelftest()
     keyedEdit.position.setX(20.0f);
     keyedEdit.intensity = 3.0;
     keyedLight.setStateAt(0.0, keyedEdit);
-    gate(closeTo(keyedLight.stateAt(0.0).intensity, 3.0)
-             && closeTo(keyedLight.stateAt(0.0).position.x(), 20.0),
-         "G14", "editing a keyed light did not update the current key",
-         passed, failed);
+    std::cerr << "light3d G14 intensity=" << keyedLight.stateAt(0.0).intensity
+              << " position.x=" << keyedLight.stateAt(0.0).position.x()
+              << '\n';
+    tally.gate(14,
+        closeTo(keyedLight.stateAt(0.0).intensity, 3.0)
+                 && closeTo(keyedLight.stateAt(0.0).position.x(), 20.0),
+        "editing a keyed light did not update the current key");
 
     Light3D dialogLight;
     int dialogChanges = 0;
@@ -558,11 +624,18 @@ int runLight3DSelftest()
     threeLights.append(Light3D());
     threeLights.append(Light3D());
     dialog.setLights(threeLights);
-    gate(dialogChanges == 0,
-         "G15", "rebuilding the light list emitted settingsChanged",
-         passed, failed);
+    tally.gate(15,
+        dialogChanges == 0,
+        std::string("dialogChanges=") + std::to_string(dialogChanges)
+            + " (rebuilding the light list must not emit settingsChanged)");
 
     bool selectionGate = false;
+    bool opened = false;
+    bool dialogFound = false;
+    bool diffuseFound = false;
+    int selectedClipCount = -1;
+    double firstDiffuseCoeff = -1.0;
+    double secondDiffuseCoeff = -1.0;
     {
         MainWindow window;
         Timeline *timeline = window.findChild<Timeline *>();
@@ -582,19 +655,25 @@ int runLight3DSelftest()
             track->setSelectedClip(0);
             QCoreApplication::processEvents();
 
-            const bool opened = QMetaObject::invokeMethod(
+            opened = QMetaObject::invokeMethod(
                 &window, "openLight3DDialog", Qt::DirectConnection);
             auto *lightDialog = window.findChild<Light3DDialog *>();
+            dialogFound = lightDialog != nullptr;
             track->setSelectedClip(1);
             QCoreApplication::processEvents();
             auto *diffuse = lightDialog
                 ? lightDialog->findChild<QDoubleSpinBox *>(
                       QStringLiteral("light3dDiffuseCoeff"))
                 : nullptr;
-            if (opened && lightDialog && diffuse) {
+            diffuseFound = diffuse != nullptr;
+            const bool editorReady = opened && lightDialog && diffuse;
+            if (editorReady) {
                 diffuse->setValue(0.75);
                 QCoreApplication::processEvents();
                 const auto clips = track->clips();
+                selectedClipCount = static_cast<int>(clips.size());
+                if (selectedClipCount > 0) firstDiffuseCoeff = clips[0].material.diffuseCoeff;
+                if (selectedClipCount > 1) secondDiffuseCoeff = clips[1].material.diffuseCoeff;
                 selectionGate = clips.size() == 2
                     && closeTo(clips[0].material.diffuseCoeff, 0.10)
                     && closeTo(clips[1].material.diffuseCoeff, 0.75);
@@ -603,11 +682,15 @@ int runLight3DSelftest()
             }
         }
     }
-    gate(selectionGate,
-         "G16", "material edit followed the dialog-open clip instead of the current selection",
-         passed, failed);
+    tally.gate(16,
+        selectionGate,
+        QStringLiteral("opened=%1 dialog=%2 diffuse=%3 clips.size()=%4 diffuseCoeff[0]=%5 "
+                       "diffuseCoeff[1]=%6 (material edit followed the dialog-open clip instead "
+                       "of the current selection)")
+            .arg(opened).arg(dialogFound).arg(diffuseFound).arg(selectedClipCount)
+            .arg(firstDiffuseCoeff, 0, 'g', 17)
+            .arg(secondDiffuseCoeff, 0, 'g', 17)
+            .toStdString());
 
-    std::cout << "[light3d] " << passed << " passed, " << failed
-              << " failed (16 gates)\n";
-    return failed == 0 ? 0 : 1;
+    return tally.finish("light3d");
 }

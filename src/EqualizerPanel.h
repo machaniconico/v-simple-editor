@@ -1,6 +1,9 @@
 #pragma once
 
+#include <QSignalBlocker>
 #include <QWidget>
+
+#include <vector>
 
 #include "AudioMixer.h"
 
@@ -21,6 +24,7 @@ class QGroupBox;
 // deferred — this widget is self-contained and can be hosted anywhere.
 class EqualizerPanel : public QWidget {
     Q_OBJECT
+    friend int runAudioTrackFxSelftest(); // selftest reads/sets the suppress state
 public:
     explicit EqualizerPanel(QWidget *parent = nullptr);
     ~EqualizerPanel() override = default;
@@ -38,8 +42,14 @@ public:
     int currentTrackId() const;
     AudioMixer::EqSettings currentSettings() const;
 
+    // Number of eqChanged emissions so far (selftests prove reseeds stay silent).
+    int changedEmitCountForTest() const { return m_emitCount; }
+
 signals:
     void eqChanged(int trackId, AudioMixer::EqSettings eq);
+    // One finished user gesture (drag release, wheel / keyboard step) that
+    // emitted eqChanged; the host records it as one undo step.
+    void gestureFinished(int trackId);
 
 private slots:
     void onTrackSelectionChanged(int index);
@@ -58,10 +68,12 @@ private:
 
     void buildUi();
     BandWidgets buildBand(const QString &title,
+                          const QString &key,
                           double freqDefault,
                           bool peaking); // false = shelf, no Q control
     void emitChange();
-    void blockBandSignals(bool block);
+    void finishGesture();
+    std::vector<QSignalBlocker> blockBandSignals();
     void applyBandToWidgets(const BandWidgets &w,
                             const AudioMixer::EqBand &band,
                             bool peaking);
@@ -88,4 +100,6 @@ private:
     QHash<int, AudioMixer::EqSettings> m_perTrackSettings;
     int m_currentTrackId = 0;
     bool m_suppressSignals = false;
+    int m_emitCount = 0;
+    bool m_gestureDirty = false; // eqChanged emitted since the last gestureFinished
 };

@@ -251,6 +251,9 @@ double KeyframeTrack::valueAt(double time) const
         const auto &a = m_keyframes[i];
         const auto &b = m_keyframes[i + 1];
         if (time >= a.time && time <= b.time) {
+            // Exactly on a key: that key's value (a Hold segment [a, b) must
+            // not keep returning a.value at b).
+            if (time == b.time) return b.value;
             double t = (time - a.time) / (b.time - a.time);
             return interpolate(a.value, b.value, t, a.interpolation,
                                a.bezX1, a.bezY1, a.bezX2, a.bezY2);

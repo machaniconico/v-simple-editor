@@ -22,6 +22,8 @@ struct ExpressionContext {
     // Optional: returns underlying animated-property value at time t.
     // Default empty.  When set, smooth() / loopIn() / loopOut() can sample it.
     std::function<double(double)> sampleValueAtTime;
+    // Clip-local seconds; empty means silence.
+    std::function<double(double)> audioLevelAtTime;
 };
 
 // --- Expression evaluation result ---

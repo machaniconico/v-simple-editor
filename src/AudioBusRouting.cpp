@@ -2,6 +2,7 @@
 // ルーティング & ゲイン解決エンジン。詳細仕様は AudioBusRouting.h を参照。
 
 #include "AudioBusRouting.h"
+#include <utility>
 
 #include <QJsonArray>
 #include <QJsonValue>
@@ -251,6 +252,22 @@ double AudioBusRouting::resolveAuxSendGain(int trackIndex, int busId) const
     return found->sendLevel * chain;
 }
 
+RouteGains AudioBusRouting::resolveTrackRouteGains(int trackIndex) const
+{
+    RouteGains gains;
+    gains.post = resolveTrackToMasterGain(trackIndex);
+    for (const AuxSend& s : m_auxSends) {
+        if (s.trackIndex != trackIndex)
+            continue;
+        const double g = resolveAuxSendGain(trackIndex, s.busId);
+        if (s.preFader)
+            gains.pre += g;
+        else
+            gains.post += g;
+    }
+    return gains;
+}
+
 bool AudioBusRouting::hasCycle() const
 {
     // 各バスを起点に outputBusId 連鎖をたどり、訪問済みに再到達したら閉路。
@@ -370,3 +387,19 @@ void AudioBusRouting::clear()
 }
 
 } // namespace audiobus
+
+void audiobus::AudioBusRouting::remapTrackIndices(const QVector<int> &oldToNew)
+{
+    QHash<int, int> buses;
+    for (auto it = m_trackBus.cbegin(); it != m_trackBus.cend(); ++it) {
+        const int index = oldToNew.value(it.key(), -1);
+        if (index >= 0) buses.insert(index, it.value());
+    }
+    m_trackBus = std::move(buses);
+    QVector<AuxSend> sends;
+    for (auto send : m_auxSends) {
+        send.trackIndex = oldToNew.value(send.trackIndex, -1);
+        if (send.trackIndex >= 0) sends.append(send);
+    }
+    m_auxSends = std::move(sends);
+}

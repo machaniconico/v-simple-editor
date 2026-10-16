@@ -4,6 +4,8 @@
 #include <QJsonObject>
 #include <QJsonArray>
 #include <QImage>
+#include <QMap>
+#include "AudioTrackFx.h"
 #include "ProjectSettings.h"
 #include "Timeline.h"
 #include "VideoEffect.h"
@@ -12,7 +14,7 @@
 #include "MaskSystem.h"
 #include "PlanarTracker.h"
 #include "ParticleSystem.h"
-#include "Rotoscope.h"
+#include "RotoClipEntry.h"
 #include "TimeRemap.h"
 #include "ClipExpressionBindings.h"
 #include "WiggleTransform.h"
@@ -26,6 +28,13 @@
 #include "BroadcastCaption.h"       // PRD-PHASE3-BROADCAST-CC: broadcastcc::BroadcastCaptionDoc
 
 // --- Audio mixer serialization sub-types ---
+
+// Fader gain and balance of one audio track (saved as audioMixer.trackMix[track]).
+struct TrackMixState {
+    double gain = 1.0;
+    double pan = 0.0;
+    bool isDefault() const { return gain == 1.0 && pan == 0.0; }
+};
 
 struct TrackEqState {
     int trackIdx = -1;
@@ -123,13 +132,6 @@ struct ClipNodeGraph {
     QString clipId;
     QJsonObject graph;
     QString compositingMode = QStringLiteral("layer");
-};
-
-struct RotoClipEntry {
-    QString clipId;
-    RotoPath path;
-    QVector<RotoKeyframe> keyframes;
-    QImage brushMask;
 };
 
 struct TimeRemapClipEntry {
@@ -236,6 +238,9 @@ struct ProjectData {
 
     // Audio mixer state
     QVector<TrackEqState> trackEqStates;
+    QMap<int, trackfx::Chain> trackFx; // Engine audio track indices (A1 = 0).
+    QVector<TrackMixState> trackMix; // Indexed by audio track; empty = all default.
+    trackfx::Chain masterFx;
     CompressorState masterCompressor;
     AutoDuckState autoDuck;
     bool audioMetersDockVisible = true;

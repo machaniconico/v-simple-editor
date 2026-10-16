@@ -33,9 +33,23 @@ struct TimelineState {
     int selectedVideoClipIndex = -1;
     int selectedAudioTrackIndex = -1;
     int selectedAudioClipIndex = -1;
+    int activeVideoTrackIndex = -1;
+    int activeAudioTrackIndex = -1;
     double playheadPos = 0.0;
+    QVector<QString> videoTrackNames, audioTrackNames;
+    QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
+    QVector<double> audioTrackPans;
+    QJsonObject externalTrackState;
+    // Bus routing snapshot (MainWindow::m_audioBusRouting stays the SSOT) taken
+    // through Timeline::setBusRoutingBridge. Empty = not captured: restore skips it.
+    QJsonObject audioBusRouting;
+    // Identity of the track structure, shared by ordinary edits. A new
+    // add/remove/move gets a fresh revision, including compound operations.
+    quint64 trackStructureRevision = 0;
     QHash<QString, QString> clipParentEntries;
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
+    QHash<QString, RotoClipEntry> rotoEntries;
     // スナップショット時のプロジェクト出力ジオメトリ。SNS プリセット(プロジェクトを
     // 9:16 にリサイズする)適用後の Ctrl+Z が、クリップの fit だけでなく**元の
     // プロジェクトサイズも**復元できるよう捕捉する。これが無いと undo は fit を戻すが
@@ -76,6 +90,11 @@ public:
     bool jumpTo(int index);
 
     void clear();
+    void updateCurrentExternalTrackState(const QJsonObject &state);
+    // Replaces the current entry's state (description kept) for an edit that
+    // records no undo point of its own. Drops the redo stack, leaves saveSerial
+    // unchanged and signals only when redo entries were dropped. No-op when empty.
+    void updateCurrentState(const TimelineState &state);
 
 signals:
     void stateChanged();

@@ -50,6 +50,14 @@ ImportHubDialog::ImportHubDialog(QWidget* parent)
 
     auto* root = new QVBoxLayout(this);
     root->addWidget(tabs);
+    auto *edlButton = new QPushButton(tr("EDL を読み込み…"), this);
+    edlButton->setToolTip(tr("CMX3600 の V / A、カット / ディゾルブをプロジェクトの FPS で読み込みます。未対応行は警告として報告します。"));
+    connect(edlButton, &QPushButton::clicked, this, &ImportHubDialog::onEdlBrowseClicked);
+    root->addWidget(edlButton);
+    auto *fcpxmlButton = new QPushButton(tr("FCPXML を読み込み…"), this);
+    fcpxmlButton->setToolTip(tr("素材クリップを最大 2 トラックの新規シーケンスに読み込みます。未対応要素は警告として報告します。"));
+    connect(fcpxmlButton, &QPushButton::clicked, this, &ImportHubDialog::onFcpxmlBrowseClicked);
+    root->addWidget(fcpxmlButton);
     setLayout(root);
 }
 
@@ -455,4 +463,18 @@ void ImportHubDialog::onExrImportClicked()
     if (folder.isEmpty() || pattern.isEmpty())
         return;
     emit exrSequenceImportRequested(folder, pattern);
+}
+
+void ImportHubDialog::onEdlBrowseClicked()
+{
+    const QString path = QFileDialog::getOpenFileName(this, tr("EDL を読み込み…"),
+        QString(), tr("EDL ファイル (*.edl);;すべてのファイル (*)"));
+    if (!path.isEmpty()) emit edlImportRequested(path);
+}
+
+void ImportHubDialog::onFcpxmlBrowseClicked()
+{
+    const QString path = QFileDialog::getOpenFileName(this, tr("FCPXML を読み込み"),
+        QString(), tr("FCPXML ファイル (*.fcpxml);;すべてのファイル (*)"));
+    if (!path.isEmpty()) emit fcpxmlImportRequested(path);
 }

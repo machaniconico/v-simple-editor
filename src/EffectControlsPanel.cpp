@@ -494,6 +494,15 @@ EffectControlsPanel::EffectControlsPanel(QWidget *parent)
     connect(presetMenu, &QMenu::aboutToShow, this,
             [this, presetMenu, saveCurrentPreset, applyPreset, renamePreset, deletePreset]() {
         presetMenu->clear();
+        QAction *audioAction = presetMenu->addAction(QStringLiteral("オーディオをキーフレームに変換…"));
+        audioAction->setEnabled(m_mainWindow && m_currentClipKey.valid());
+        connect(audioAction, &QAction::triggered, this, [this] {
+            if (m_mainWindow && m_currentClipKey.valid()) {
+                m_mainWindow->convertAudioToKeyframes(m_currentClipKey.trackIdx, m_currentClipKey.clipIdx);
+                refreshFromCurrentClip();
+            }
+        });
+        presetMenu->addSeparator();
 
         QAction *saveAction = presetMenu->addAction(QStringLiteral("Save Current..."));
         connect(saveAction, &QAction::triggered, this, saveCurrentPreset);

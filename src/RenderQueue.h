@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <functional>
+#include <optional>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -8,6 +11,8 @@
 #include <QJsonObject>
 #include <QMutex>
 
+#include "SubtitleTrackRenderer.h"
+#include "libavcore/Encode.h"
 #include "AcesColor.h"  // AC: ACES カラーマネジメント パイプライン (production export 配線)
 
 class QThread;
@@ -51,6 +56,9 @@ struct RenderJob {
     // Legacy fields (still populated for backwards compatibility).
     QJsonObject exportConfig;
     double loudnessGainDb = 0.0;
+    // ACES pipeline this job renders with. Unset: addJob copies the queue's
+    // setAcesPipeline value, so a later setAcesPipeline does not reach queued jobs.
+    std::optional<aces::AcesPipeline> acesPipeline;
     QString dolbyVisionXml;
     int progress = 0;
     QDateTime startTime;
@@ -104,6 +112,9 @@ public:
     // Spec API — preferred for new code (uuid-keyed).
     void addJob(const RenderJob &job);
     void removeJob(const QString &uuid);
+    // Cancels only this job: a pending one is removed, the running one is cancelled,
+    // anything else (unknown / finished uuid) is left alone. The queue keeps running.
+    void cancelJob(const QString &uuid);
     void clear();
     QVector<RenderJob> jobs() const { return m_jobs; }
     bool isRunning() const { return m_running; }
@@ -114,14 +125,42 @@ public:
     // ACES カラーマネジメント パイプラインを設定する。MainWindow の SSOT
     // m_acesPipeline を start() 前に push する想定 (UI スレッドから呼ばれる)。
     // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
+    // 以後 addJob されるジョブの既定値になる (投入済みのジョブは addJob 時の値を保つ)。
     void setAcesPipeline(const aces::AcesPipeline &p);
     void setLoudnessGainDb(double gainDb);
 
+    static void appendSubtitleTrack(QJsonObject &config,
+        const QVector<SubtitleSegment> &segments, const SubtitleStyle &style,
+        const QObject *rendererOwner);
+    static std::vector<libavcore::SubtitleCue> subtitleCues(
+        const QJsonObject &config, qint64 startUs, qint64 durationUs);
+    static void paintSubtitles(QImage &frame, const QJsonObject &config, qint64 timeUs);
+
+    static QString alphaExportError(const QJsonObject &config);
+    static void resetBlackCompositeCountForTest();
+    static int blackCompositeCountForTest();
+
     static QStringList buildLoudnessAudioFilterArgs(double gainDb);
+    // Called before submission by MainWindow; OFF does not access the file.
+    static QString measureAutoLoudness(QJsonObject &config, const QString &mixPath);
+    static void resetAutoLoudnessMeasurementCountForTest();
+    static int autoLoudnessMeasurementCountForTest();
 
     // RenderJob::projectFilePath は音声 mux 元 (メディア or 事前ミックス) を兼ねる。
     // プロジェクト JSON (.veditor / .vsep / .json) を音声ソースとして開かないための判定。
     static bool isProjectFilePath(const QString &path);
+
+    // Export temporaries (audio-mix intermediates) live in exportConfig["tempFiles"]
+    // (string array). Creators only append; the queue consumes them once per job end
+    // (jobCompletedUuid: success / failure / cancel / rejection) or job removal.
+    static void addTempFile(QJsonObject &config, const QString &path);
+    // Points job.projectFilePath at an audio intermediate (a temp file). The previous
+    // path is kept once in exportConfig["sourceProjectFilePath"] so saveQueue can
+    // persist it instead of the temp path. Every such replacement goes through here.
+    static void setIntermediateProjectFile(RenderJob &job, const QString &path);
+    // Consumes job->exportConfig["tempFiles"] and deletes them (see the private notes
+    // below); public so a caller that abandons a prepared job before addJob can clean up.
+    void removeTempFiles(RenderJob *job);
 
     static QVector<RenderPreset> availablePresets();
     static RenderJob jobFromPreset(const RenderPreset &preset,
@@ -196,6 +235,7 @@ private:
     //      with a libx265-enabled build flips HDR jobs to the in-process
     //      path automatically — no recompile needed.
     void startRenderPipe(int jobIndex);
+    void startSequenceExport(int jobIndex);
     // US-MF-6 / US-B3-7: ffmpeg.exe subprocess encode for 10-bit HDR
     // (HDR10 / HLG) jobs — reached only when no 10-bit HEVC encoder is
     // available in the loaded avcodec DLL. A worker QThread renders every
@@ -232,7 +272,7 @@ private:
     // frame-render + in-process encode loop; m_cancelRequested is the cross-thread
     // cancellation flag (mirrors VideoStabilizer::m_cancelled).
     QThread *m_renderThread = nullptr;
-    bool m_cancelRequested = false;
+    std::atomic<bool> m_cancelRequested{false};
 
     // US-MF-6: ffmpeg.exe subprocess handle for the 10-bit HDR (HDR10/HLG)
     // render branch. Only the HDR subprocess path sets this; the in-process
@@ -250,4 +290,36 @@ private:
     aces::AcesPipeline m_acesPipeline;
 
     double m_loudnessGainDb = 0.0;
+
+    // removeTempFiles (public above) is the single temp-file cleanup: it moves
+    // job->exportConfig["tempFiles"] (if job) into m_pendingTempFiles, clears the key so
+    // a path is consumed once, then deletes every pending path. Paths whose delete fails
+    // (still open by a worker) stay pending and are retried at the next call (any job
+    // end, finishCurrentJob, destructor).
+    // Every removal of a job from m_jobs goes through here (removeTempFiles first).
+    void discardJob(int idx);
+    QStringList m_pendingTempFiles;
 };
+
+// MainWindow export submission seam, shared by normal and batch/mobile export.
+namespace loudnessauto {
+QString prepareJob(RenderJob &job);
+// GUI normal / mobile entry (call on the GUI thread): plans on the calling thread, runs the mix,
+// measurement and silent track (executeMixPlan + measureAndConvert) on a worker that gets a value
+// copy of the job with job.timeline cleared, then finishes on the GUI thread and calls
+// done(prepared job, status). cancelled is polled from the worker before each ffmpeg run (a running
+// ffmpeg is not stopped); once it returns true the remaining steps are skipped, the worker removes
+// the job's temp files and done still runs: the caller drops the job. autoLoudness OFF calls done
+// at once with the job untouched.
+void prepareJobAsync(RenderJob job, std::function<void(RenderJob, QString)> done,
+                     std::function<bool()> cancelled);
+// Number of prepareJob / prepareJobAsync calls that ran with autoLoudness ON (selftest counter).
+int prepareJobCallCountForTest();
+// Selftest: makes one prepareJob step report failure (after it ran). None (default) = production.
+enum class ForcedFailure { None, PcmMix, SilentMix, AacConvert };
+void setForcedFailureForTest(ForcedFailure failure);
+// Number of silent tracks prepareJob made for an empty audio playback sequence (selftest counter).
+int silentMixCallCountForTest();
+// True when the ordinary export needs no audio mix (RenderQueue muxes the V1 source audio as is).
+bool timelineAudioMatchesPassthrough(Timeline *timeline);
+}

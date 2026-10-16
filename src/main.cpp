@@ -55,7 +55,7 @@
 #include "ProjectFile.h"
 #include "MaskSystem.h"
 #include "TrackMatteBake.h"  // TM-6 parity: shared trackmatte::composite SSOT under test
-#include "TrackMatteKey.h"   // RM-4: hoisted snapshotTrackClips / remapTrackMatteEntriesAfterMutation
+#include "TrackMatteKey.h"   // RM-4: clip-key remap helpers (their selftests moved to selftests/parity_matte_selftests.cpp)
 #include "TrackerPreset.h"         // US-TP-7: tracker preset selftest
 #include "TrackerPresetRegistry.h" // US-TP-7: Registry CRUD gate
 #include "MotionTracker.h"         // US-TP-7: applyToMotionTracker target
@@ -563,7 +563,9 @@ int runAllSelftestsWithCredentialStore()
             "INFO",
             QString("[--selftest=all] running --selftest=%1")
                 .arg(QString::fromLatin1(name)));
+        selftests::armWatchdog(name);
         const int rc = fn();
+        selftests::disarmWatchdog();
         if (rc == 0) {
             ++passed;
             writeLogLine(
@@ -607,7 +609,10 @@ std::optional<int> dispatchCredentialStoreCompatPreQApplication(int argc, char* 
         }
         if (arg == QStringLiteral("--selftest=credential-store")) {
             writeLogLine("INFO", "argv-switch: --selftest=credential-store");
-            return runCredentialStoreSelftest();
+            selftests::armWatchdog(kCredentialStoreSelftestName);
+            const int rc = runCredentialStoreSelftest();
+            selftests::disarmWatchdog();
+            return rc;
         }
     }
     return std::nullopt;
@@ -627,8 +632,14 @@ std::optional<int> dispatchHdrProbePreQApplication(int argc, char* argv[])
 
 std::optional<int> dispatchCredentialStoreCompatPostQApplication(const QStringList& args)
 {
+    // US-700: a filtered sweep (nonempty VEDITOR_ALL_SELFTEST_FILTER) is owned
+    // by selftests::dispatchPostQApplication, which validates the names against
+    // kArgvSelftests; defer before any other check here. The unfiltered sweep
+    // keeps the credential-store slot.
     if (args.contains(QStringLiteral("--selftest=all"))
         || qEnvironmentVariableIntValue("VEDITOR_ALL_SELFTEST") != 0) {
+        if (!qEnvironmentVariableIsEmpty("VEDITOR_ALL_SELFTEST_FILTER"))
+            return std::nullopt;
         return runAllSelftestsWithCredentialStore();
     }
 
@@ -636,7 +647,10 @@ std::optional<int> dispatchCredentialStoreCompatPostQApplication(const QStringLi
         writeLogLine("INFO",
                      QString("running %1")
                          .arg(QString::fromLatin1(kCredentialStoreSelftestEnv)));
-        return runCredentialStoreSelftest();
+        selftests::armWatchdog(kCredentialStoreSelftestName);
+        const int rc = runCredentialStoreSelftest();
+        selftests::disarmWatchdog();
+        return rc;
     }
 
     return std::nullopt;

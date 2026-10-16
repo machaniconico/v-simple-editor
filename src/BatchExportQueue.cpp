@@ -1,6 +1,17 @@
 #include "BatchExportQueue.h"
 
+#include "ExportUserPresets.h"
+#include "RenderInPlace.h"
+#include "Timeline.h"
+#include <QDebug>
+#include <QDir>
+#include <QFile>
+#include <QFileInfo>
 #include <QJsonObject>
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
 
 namespace batchexport {
 
@@ -43,6 +54,35 @@ ExportPresetDefaults presetDefaults(const QString &preset)
              QStringLiteral("aac"), 192 };
 }
 
+// Batch built-ins always resolve as built-ins (case-insensitive); a same-named user
+// preset is neither offered nor consulted for loudness. Single source for both sites.
+static bool samePresetName(const QString &a, const QString &b)
+{
+    return a.trimmed().compare(b.trimmed(), Qt::CaseSensitive) == 0;
+}
+
+static bool isBatchBuiltinName(const QString &name)
+{
+    const QString n = name.trimmed();
+    return n.compare(QStringLiteral("1080p"), Qt::CaseInsensitive) == 0
+        || n.compare(QStringLiteral("720p"), Qt::CaseInsensitive) == 0
+        || n.compare(QStringLiteral("4K"), Qt::CaseInsensitive) == 0;
+}
+
+// Saved names are stored untrimmed, but the batch dialog trims the selected text. Names are
+// therefore compared trimmed everywhere (choices de-duplication and loudness lookup).
+QStringList presetChoices()
+{
+    QStringList names{QStringLiteral("1080p"), QStringLiteral("720p"), QStringLiteral("4K")};
+    for (const auto &p : ExportUserPresets::load()) {
+        if (p.name.trimmed().isEmpty() || isBatchBuiltinName(p.name)) continue;
+        const bool dup = std::any_of(names.begin(), names.end(), [&](const QString &n) {
+            return samePresetName(n, p.name); });
+        if (!dup) names << p.name;
+    }
+    return names;
+}
+
 Queue::Queue(QObject *parent)
     : QObject(parent)
 {
@@ -57,6 +97,30 @@ Queue::Queue(QObject *parent)
             this, &Queue::onJobProgress);
     connect(m_render, &RenderQueue::jobCompletedUuid,
             this, &Queue::onJobCompleted);
+}
+
+// Resolve the task's saved user preset into the auto-loudness fields. Built-in
+// preset names never resolve to a user preset.
+static void captureLoudness(ExportTask &task)
+{
+    task.loudnessResolved = true;
+    task.autoLoudness = false;
+    if (isBatchBuiltinName(task.preset)) return;
+    // Same rule as presetChoices(): look the saved user preset up by name directly, so a user
+    // preset sharing a name with an ExportDialog built-in still resolves.
+    ExportConfig presetConfig;
+    bool found = false;
+    for (const auto &p : ExportUserPresets::load()) {
+        if (!samePresetName(p.name, task.preset)) continue;
+        presetConfig = p.config;
+        found = true;
+        break;
+    }
+    if (!found || !presetConfig.autoLoudness) return;
+    QJsonObject loudness;
+    presetConfig.appendLoudnessSettings(loudness);
+    task.autoLoudness = true;
+    task.targetLufs = loudness.value("targetLufs").toDouble(-14.0);
 }
 
 QString Queue::addTask(const QString &projectPath,
@@ -100,7 +164,9 @@ QString Queue::addTask(const ExportTask &input)
     t.message.clear();
     t.renderUuid.clear();
     t.exportConfig = QJsonObject();
+    t.dispatchedProjectFilePath.clear();
     fillPresetDefaults(t);
+    captureLoudness(t);
     m_tasks.append(t);
     return t.id;
 }
@@ -138,6 +204,16 @@ RenderJob Queue::buildRenderJob(const ExportTask &input)
     cfg["videoBitrate"] = task.videoBitrateKbps;
     cfg["audioCodec"]   = task.audioCodec;
     cfg["audioBitrate"] = task.audioBitrateKbps;
+    // Intentional exception to rule 17b (exportcfg::toJobJson): a saved user preset
+    // with auto loudness adds ONLY these two keys. Mapping the whole ExportConfig
+    // would also pull HDR / subtitle / metadata / sequence settings into queued
+    // jobs, a behaviour change beyond US-711.
+    if (!task.loudnessResolved)
+        captureLoudness(task);
+    if (task.autoLoudness) {
+        cfg["autoLoudness"] = true;
+        cfg["targetLufs"]   = task.targetLufs;
+    }
     job.exportConfig     = cfg;
     return job;
 }
@@ -216,7 +292,61 @@ void Queue::processNext()
             task.progress = 0;
 
             RenderJob job = buildRenderJob(task);
+            if (job.exportConfig.value(QStringLiteral("autoLoudness")).toBool(false)) {
+                // Same measure -> gain -> AAC swap as the normal export path. Without a
+                // live timeline there is nothing to measure: reject rather than 0 dB.
+                if (!job.timeline) {
+                    job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                        "自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません");
+                } else {
+                    loudnessauto::prepareJob(job);
+                    // measureAutoLoudness only records "skipped, 0 dB" for silent /
+                    // audio-less / unmeasurable audio; never export that unnormalized.
+                    const double measured = job.exportConfig.value(QStringLiteral("measuredLufs"))
+                        .toDouble(std::numeric_limits<double>::quiet_NaN());
+                    if (!std::isfinite(measured) || measured <= -70.0)
+                        job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                            "自動ラウドネス: 無音・音声なし・測定失敗のため正規化できません");
+                }
+            } else if (job.timeline && job.timeline->totalDuration() > 0.0
+                       && (!job.timeline->computeAudioPlaybackSequence().isEmpty()
+                           || (job.timeline->videoClips().isEmpty()
+                               && !loudnessauto::timelineAudioMatchesPassthrough(job.timeline)))) {
+                // Empty V1 with video on an upper track: also a silent / mixed track, as
+                // the normal export (the V1 source-audio fallback has no clip to read).
+                // Same AAC timeline-mix intermediate as the normal export: the queue
+                // muxes audio by stream copy, so this must not be a .wav. Built from
+                // the timeline as it is now (task dispatch), like the video frames.
+                const QString mixPath = QDir::tempPath()
+                    + QStringLiteral("/v-simple-editor-audio-mix/batch_mix_%1.m4a").arg(job.uuid);
+                QDir().mkpath(QFileInfo(mixPath).absolutePath());
+                RenderQueue::addTempFile(job.exportConfig, mixPath);
+                QString mixError;
+                const QString mixed = renderinplace::prepareAudioMix(
+                    job.timeline, mixPath, job.timeline->totalDuration(), &mixError,
+                    task.audioBitrateKbps);
+                if (mixed == mixPath && QFileInfo::exists(mixPath)) {
+                    RenderQueue::setIntermediateProjectFile(job, mixPath);
+                } else if (job.timeline->videoClips().isEmpty()) {
+                    // Empty V1: there is no source audio to fall back to (the render would
+                    // be video-only), so reject like the other entry points.
+                    job.exportConfig[QStringLiteral("loudnessAutoError")] = QStringLiteral(
+                        "タイムライン音声ミックスの作成に失敗しました: %1").arg(mixError);
+                    qWarning().noquote() << job.exportConfig.value(
+                        QStringLiteral("loudnessAutoError")).toString();
+                } else {
+                    // Fall back to the previous audio source, but keep the reason.
+                    job.exportConfig[QStringLiteral("audioMixWarning")] = QStringLiteral(
+                        "タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: %1")
+                        .arg(mixError);
+                    qWarning().noquote() << job.exportConfig.value(
+                        QStringLiteral("audioMixWarning")).toString();
+                }
+            }
+            // A rejected job (loudnessAutoError) is never rendered; RenderQueue::addJob
+            // deletes its exportConfig["tempFiles"] when it emits the failure.
             task.exportConfig = job.exportConfig;
+            task.dispatchedProjectFilePath = job.projectFilePath;
 
             task.renderUuid = job.uuid;
 
@@ -256,7 +386,11 @@ void Queue::onJobCompleted(QString uuid, bool success, QString error)
     if (success) {
         task.progress = 100;
         task.state    = TaskState::Done;
-        task.message  = QStringLiteral("Export complete");
+        const QString audioMixWarning =
+            task.exportConfig.value(QStringLiteral("audioMixWarning")).toString();
+        task.message  = audioMixWarning.isEmpty()
+            ? QStringLiteral("Export complete")
+            : QStringLiteral("Export complete (%1)").arg(audioMixWarning);
         emit taskProgress(task.id, 100);
         emit taskStateChanged(task.id, TaskState::Done);
     } else {

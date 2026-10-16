@@ -238,6 +238,14 @@ QJsonObject projection(const ProjectData &data)
                         {"startSec", fx.startSec}, {"endSec", fx.endSec}});
                 obj.insert("effects", effects);
                 obj.remove("leadInSec"); // compared as resolved timeline start
+                // The clip uid is identity, not a property; persistence nests
+                // one renderInPlaceOriginal level, so strip it there too.
+                obj.remove("uid");
+                if (obj.contains("renderInPlaceOriginal")) {
+                    auto original = obj.value("renderInPlaceOriginal").toObject();
+                    original.remove("uid");
+                    obj.insert("renderInPlaceOriginal", original);
+                }
                 clips[c] = obj;
             }
             jsonTracks[t] = clips;

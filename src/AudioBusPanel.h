@@ -16,6 +16,7 @@
 // routing == nullptr のときは全操作が安全に no-op (refresh は一覧を空にする)。
 
 #include <QDockWidget>
+#include <functional>
 #include "AudioBusRouting.h"
 
 class QListWidget;
@@ -26,6 +27,8 @@ class QToolButton;
 class QComboBox;
 class QPushButton;
 class QLabel;
+class QTableWidget;
+class QTableWidgetItem;
 
 class AudioBusPanel : public QDockWidget {
     Q_OBJECT
@@ -39,10 +42,20 @@ public:
     // ときに MainWindow から呼ぶ。
     void refresh();
 
+    // センド表の行数 (= 音声トラック数) を返す関数を差し込む。refresh() のたびに
+    // 呼ぶ。未設定なら表は空。
+    void setTrackCountProvider(std::function<int()> provider);
+
 signals:
     // ユーザ操作で routing を更新したときに発火。MainWindow が AudioMixer へ
     // 反映 + 必要なら再描画する。
     void routingChanged();
+    // センド表の編集 1 操作ごとに routingChanged() より先に発火 (undo 点を積む
+    // 契機。routingChanged は直前の undo 点へ吸収されるため順序が重要)。
+    void sendEdited();
+
+protected:
+    void showEvent(QShowEvent *event) override;
 
 private slots:
     void onBusSelectionChanged();
@@ -53,6 +66,7 @@ private slots:
     void onMuteToggled(bool checked);
     void onSoloToggled(bool checked);
     void onOutputBusChanged(int comboIndex);
+    void onSendItemChanged(QTableWidgetItem *item);
 
 private:
     // 現在選択中のバス id (-1 = 未選択)。
@@ -61,6 +75,8 @@ private:
     void rebuildOutputCombo(const audiobus::AudioBus *current);
     // 選択ストリップ (右下) を選択バスの値で更新する。
     void updateStrip();
+    // 選択中バスへのセンド表 (行 = 音声トラック) を再構築する。
+    void rebuildSendTable();
     // gain スライダ値 (0..200, 100=1.0) と線形ゲインの相互変換。
     static double sliderToGain(int value);
     static int gainToSlider(double gain);
@@ -79,4 +95,6 @@ private:
     QPushButton *m_addButton = nullptr;
     QPushButton *m_removeButton = nullptr;
     QWidget *m_stripWidget = nullptr;
+    QTableWidget *m_sendTable = nullptr;
+    std::function<int()> m_trackCountProvider;
 };

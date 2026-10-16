@@ -7,6 +7,7 @@
 #include "Timeline.h"
 #include "UndoManager.h"
 #include <QApplication>
+#include <QDoubleSpinBox>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>
@@ -858,10 +859,39 @@ ColorGradingPanel::ColorGradingPanel(QWidget *parent)
     m_liftWheel = new ColorWheelWidget(tr("Lift"));
     m_gammaWheel = new ColorWheelWidget(tr("Gamma"));
     m_gainWheel = new ColorWheelWidget(tr("Gain"));
+    m_offsetWheel = new ColorWheelWidget(tr("オフセット"));
+    m_offsetWheel->setObjectName(QStringLiteral("offsetWheel"));
+    connect(m_offsetWheel, &ColorWheelWidget::colorChanged, this, [this](double r, double g, double b) {
+        if (m_updating) return;
+        m_cc.offsetR = r; m_cc.offsetG = g; m_cc.offsetB = b;
+        setWheels(wheelsFromColorCorrection(m_cc));
+        m_wheelDebounce->start();
+    });
 
     wheelsLayout->addWidget(m_liftWheel);
     wheelsLayout->addWidget(m_gammaWheel);
     wheelsLayout->addWidget(m_gainWheel);
+    auto *offsetLayout = new QVBoxLayout;
+    offsetLayout->addWidget(m_offsetWheel);
+    const QString offsetLabels[] = {tr("赤"), tr("緑"), tr("青")};
+    for (int ch = 0; ch < 3; ++ch) {
+        auto *value = new QDoubleSpinBox(wheelsGroup);
+        m_offsetValues[ch] = value;
+        value->setRange(-2.0, 2.0);
+        value->setDecimals(3);
+        value->setSingleStep(0.01);
+        value->setPrefix(offsetLabels[ch] + QStringLiteral(" "));
+        value->setKeyboardTracking(false);
+        offsetLayout->addWidget(value);
+        connect(value, &QDoubleSpinBox::valueChanged, this, [this, ch](double v) {
+            if (m_updating) return;
+            auto cw = m_wheels;
+            cw.offset[ch] = static_cast<float>(v);
+            setWheels(cw);
+            m_wheelDebounce->start();
+        });
+    }
+    wheelsLayout->addLayout(offsetLayout);
     auto *lggKeyframe = new QPushButton(tr("キーフレーム追加"), wheelsGroup);
     lggKeyframe->setObjectName(QStringLiteral("lggGradeAddKeyframe"));
     wheelsLayout->addWidget(lggKeyframe);
@@ -1240,6 +1270,7 @@ double ColorGradingPanel::correctionGammaToWheel(double g)
 ColorWheels ColorGradingPanel::wheelsFromColorCorrection(const ColorCorrection &cc)
 {
     ColorWheels cw;
+    cw.offset = QVector3D(float(cc.offsetR), float(cc.offsetG), float(cc.offsetB));
     cw.lift = QVector3D(static_cast<float>(cc.liftR),
                         static_cast<float>(cc.liftG),
                         static_cast<float>(cc.liftB));
@@ -1266,6 +1297,9 @@ ColorWheels ColorGradingPanel::wheelsFromColorCorrection(const ColorCorrection &
 
 void ColorGradingPanel::syncColorCorrectionFromWheels(const ColorWheels &cw)
 {
+    m_cc.offsetR = cw.offset.x();
+    m_cc.offsetG = cw.offset.y();
+    m_cc.offsetB = cw.offset.z();
     m_cc.liftR = static_cast<double>(cw.lift.x()) + cw.liftLuma;
     m_cc.liftG = static_cast<double>(cw.lift.y()) + cw.liftLuma;
     m_cc.liftB = static_cast<double>(cw.lift.z()) + cw.liftLuma;
@@ -1322,6 +1356,14 @@ void ColorGradingPanel::updateWhiteBalanceControlsFromCC()
 void ColorGradingPanel::updateGraphicalWheelsFromCC()
 {
     if (m_hueSatWarp) m_hueSatWarp->setValue(m_cc.hueSatWarp);
+    if (m_offsetWheel)
+        m_offsetWheel->setColor(m_cc.offsetR, m_cc.offsetG, m_cc.offsetB);
+    const double offset[] = {m_cc.offsetR, m_cc.offsetG, m_cc.offsetB};
+    for (int ch = 0; ch < 3; ++ch) {
+        if (!m_offsetValues[ch]) continue;
+        QSignalBlocker block(m_offsetValues[ch]);
+        m_offsetValues[ch]->setValue(offset[ch]);
+    }
     if (m_liftWheel)
         m_liftWheel->setColor(m_cc.liftR, m_cc.liftG, m_cc.liftB);
     if (m_gammaWheel)
@@ -1681,6 +1723,7 @@ void ColorGradingPanel::onResetClicked()
     m_cc.reset();
     m_updating = true;
 
+    m_offsetWheel->setColor(0, 0, 0);
     m_liftWheel->setColor(0, 0, 0);
     m_gammaWheel->setColor(0, 0, 0);
     m_gainWheel->setColor(0, 0, 0);

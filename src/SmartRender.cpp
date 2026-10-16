@@ -594,6 +594,8 @@ PassThroughEligibility timelinePassThrough(
         return passReject(QStringLiteral("timeline has track matte entries"));
     if (!request.clipParentEntries.isEmpty())
         return passReject(QStringLiteral("timeline has parented clip entries"));
+    if (request.hasRotoEntries)
+        return passReject(QStringLiteral("timeline has roto entries"));
 
     for (int trackIdx = 0; trackIdx < request.audioTracks.size(); ++trackIdx) {
         const QVector<ClipInfo>& clips = request.audioTracks[trackIdx];
@@ -734,6 +736,7 @@ PassThroughEligibility timelinePassThrough(const Timeline* timeline,
     }
     request.trackMatteEntries = timeline->trackMatteEntries();
     request.clipParentEntries = timeline->clipParentEntries();
+    request.hasRotoEntries = !timeline->rotoEntries().isEmpty();
     request.hasAdjustmentLayers = !timeline->adjustmentLayers().isEmpty();
     request.hasTimelineTextOverlays =
         !timeline->generatedCaptionOverlays().isEmpty();

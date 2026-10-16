@@ -11,6 +11,7 @@
 #include <QHBoxLayout>
 #include <QVBoxLayout>
 #include "AudioMixer.h"
+#include "ClipGeometry.h"  // US-910: clipgeom::ClipTransform in ParentAdmissionRecord
 #include "SpeedRampData.h"
 #include <QVector>
 #include <QHash>
@@ -185,6 +186,16 @@ public:
     QImage applyStillCompareForDisplay(const QImage &image,
                                        qint64 displayTimelineUsec,
                                        bool externalPreview = false);
+    // US-1106: special composites (roto / matte / time-remap / mesh warp ...)
+    // already carry every clip grade and alpha, so GL must not grade them
+    // again (baked mode + GL effects bypass). Both entries below go through
+    // the same presentation stage as displayFrame. The paused displayFrame
+    // pulls the composite from the provider; displaySpecialComposite pushes
+    // one (refreshSpecialClipPreview / applyStillCompareConfig). The baked
+    // state ends at the next ordinary displayFrame.
+    using SpecialCompositeProvider = std::function<QImage(qint64 timelineUsec)>;
+    void setSpecialCompositeProvider(SpecialCompositeProvider provider);
+    void displaySpecialComposite(const QImage &frame);
     void setPreviewEffectsPack(float sharpen, float blur, float lens);
     void setPreviewGlow(bool enabled, float threshold, float radius, float intensity);
     void setPreviewBloom(bool enabled, float threshold, float intensity, float spread);
@@ -216,6 +227,10 @@ public:
     // an active playback.
     bool isPlaying() const { return m_playing; }
 
+    // Temporary thumbnail display; the playhead frame and decoder stay untouched.
+    void showTimelineSkim(const QImage &image);
+    void clearTimelineSkim();
+
     // Iteration 15 — preview-maximize state. MainWindow listens for
     // previewMaximizeChanged and hides/shows the timeline accordingly.
     bool isPreviewMaximized() const { return m_previewMaximized; }
@@ -226,6 +241,7 @@ public:
     // on setSequence's clamped restoration which drifts back to the head
     // when the new entries trigger a fresh decoder open.
     int64_t timelinePositionUs() const { return m_timelinePositionUs; }
+    bool hasActiveSequence() const { return sequenceActive(); }
 
     // Proxy preview divisor (1 = full, 2 = half, 4 = quarter, 8 = eighth)
     // exposed so the proxy settings dialog (opened from the seekbar-left
@@ -326,6 +342,33 @@ public:
         int activeEntry, qint64 timelineUsec, bool transitionsAlreadyApplied = false);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
+
+    // US-910 PARENT-OBS test seam (video-player-parent selftest). While ON,
+    // each resolveDecodedLayerParentSources call in the two real layer
+    // admission paths ("cpu-composite" = refreshPreviewClipCpuComposite,
+    // "multi-track" = handlePlaybackTick compositor) appends one record per
+    // admitted layer. OFF (default) records nothing; turning it ON or OFF
+    // clears the records. Observation only: the composite is not changed.
+    struct ParentAdmissionRecord {
+        QString path;              // "cpu-composite" / "multi-track"
+        quint64 resolveSerial = 0; // groups the layers of one resolve call
+        qint64 timelineUs = 0;
+        QSize canvas;              // canvas the effective transforms use
+        int adaptiveCanvasDivisor = 1; // m_adaptiveCanvasDivisor at record time
+        int layerIndex = -1;       // index in the resolved layer vector
+        int sourceTrack = -1;
+        int sourceClipIndex = -1;
+        QString parentClipId;
+        int parentSourceIndex = -1;
+        bool parentHit = false;        // US-1005: parentLayerAt result used
+        bool parentHitDecodable = false;
+        double parentLocalSeconds = 0.0;
+        double parentSourceSeconds = 0.0;
+        clipgeom::ClipTransform localTransform;
+        clipgeom::ClipTransform effectiveTransform;
+    };
+    void setParentAdmissionObservationForTest(bool enabled);
+    QVector<ParentAdmissionRecord> parentAdmissionRecordsForTest() const;
 
     // NOTE: the genuine text baker is now the free function
     // textbake::bakeOverlays (src/TextOverlayBake.h), extracted verbatim from
@@ -560,9 +603,22 @@ public:
         int matteSourceIndex = -1;
         QString parentClipId;
         int parentSourceIndex = -1;
+        // US-1005: tlrender::parentLayerAt(parent candidate) that decided the
+        // adoption in resolveDecodedLayerParentSources (parentHit false =
+        // nullopt / not evaluated). Adopted only when hit && decodable.
+        bool parentHit = false;
+        bool parentHitDecodable = false;
+        double parentLocalSeconds = 0.0;
+        double parentSourceSeconds = 0.0;
     };
 
 private:
+    void recordParentAdmissionForTest(const char *path,
+                                      const QVector<DecodedLayer> &layers,
+                                      QSize canvas);
+    bool m_parentAdmissionObservation = false;
+    quint64 m_parentAdmissionSerial = 0;
+    QVector<ParentAdmissionRecord> m_parentAdmissionRecords;
 
     QImage composeMultiTrackFrame(const QImage &v1Frame,
                                   const QVector<DecodedLayer> &overlayLayers) const;
@@ -609,6 +665,8 @@ private:
     void closeTrackDecoder(TrackDecoder *d);
     static enum AVPixelFormat poolGetHwFormatCallback(AVCodecContext *ctx, const enum AVPixelFormat *pixFmts);
 
+    QLabel *m_timelineSkimDisplay = nullptr;
+    QImage m_timelineSkimImage;
     QLabel *m_videoDisplay;
     GLPreview *m_glPreview = nullptr;
     bool m_useGL = true;
@@ -780,6 +838,11 @@ private:
     bool m_previewEffectsLive = false;
     bool m_gpuEffectsEnabled = true;
     bool m_clipCpuDisabledGlGrade = false;
+    // US-1106: set only by presentDisplay (true when the last GL upload was a
+    // special composite), cleared by setCompositeBakedModeForDisplay.
+    bool m_lastDisplayWasSpecial = false;
+    SpecialCompositeProvider m_specialCompositeProvider;
+    bool m_inSpecialCompositeProvider = false;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
@@ -928,7 +991,12 @@ private:
     QImage stillCompareDisplaySource(const QImage &fallback,
                                      qint64 displayTimelineUsec) const;
     QImage compositeStillCompare(const QImage &display) const;
+    QImage finalizeDisplayLocalCopy(QImage display) const;
+    QImage bakeTextOverlaysForDisplay(const QImage &source, qint64 timelineUsec) const;
+    QImage finishSpecialComposite(const QImage &frame, qint64 timelineUsec) const;
+    void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special);
     void setCompositeBakedModeForDisplay(bool baked);
+    void endSpecialDisplayLatch();
     void beginStillCompareGlBypass();
     void applyStillCompareGlBypass();
     void restoreStillCompareGlState();

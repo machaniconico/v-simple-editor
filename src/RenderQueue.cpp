@@ -1,4 +1,11 @@
+#include "LoudnessMaster.h"
 #include "RenderQueue.h"
+#include "SequenceExport.h"
+#include "SubtitleIO.h"
+#include <algorithm>
+#include <memory>
+#include <QTemporaryDir>
+#include <atomic>
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
@@ -33,6 +40,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QMutexLocker>
+#include <QSet>
 #include <QStandardPaths>
 #include <cmath>  // std::round for the HDR10 master-display luminance scaling
 #include <cstddef>
@@ -42,6 +50,109 @@
 #include <limits>
 #include <optional>
 #include <string>
+
+void RenderQueue::appendSubtitleTrack(QJsonObject &config,
+    const QVector<SubtitleSegment> &segments, const SubtitleStyle &style,
+    const QObject *rendererOwner)
+{
+    Q_UNUSED(rendererOwner);
+    // RenderQueue historically had no subtitle burn-in. Never discover legacy
+    // Exporter renderers here: they can outlive the current project's subtitles.
+    // Preserve only an explicit burn-in request, refreshing it from current data.
+    const bool burnInRequested = config.contains("subtitleBurnInTrack");
+    // An explicit empty track also prevents startRenderPipe() from reloading subtitles
+    // from an older on-disk project after the user has deleted all current cues.
+    config["subtitleTrack"] = QJsonObject{};
+    config.remove("subtitleBurnInTrack");
+    if (segments.isEmpty()) return;
+    SubtitleTrackRenderer track;
+    track.setSegments(segments);
+    track.setStyle(style);
+    config["subtitleTrack"] = track.toJson();
+    if (burnInRequested) config["subtitleBurnInTrack"] = track.toJson();
+}
+
+std::vector<libavcore::SubtitleCue> RenderQueue::subtitleCues(
+    const QJsonObject &config, qint64 startUs, qint64 durationUs)
+{
+    const auto mode = static_cast<subtitle::ExportMode>(config.value("subtitleMode").toInt(1));
+    if (!subtitle::embeds(mode) || durationUs <= 0) return {};
+    SubtitleTrackRenderer track;
+    track.fromJson(config.value("subtitleTrack").toObject());
+    std::vector<libavcore::SubtitleCue> clips;
+    std::vector<int64_t> boundaries;
+    for (const auto &segment : track.segments()) {
+        if (!std::isfinite(segment.startTime) || !std::isfinite(segment.endTime)
+            || segment.startTime < 0 || segment.endTime > 1e9 || segment.text.isEmpty()) continue;
+        const int64_t begin = std::max<int64_t>(0, std::llround(segment.startTime * 1e6) - startUs);
+        const int64_t end = std::min<int64_t>(durationUs, std::llround(segment.endTime * 1e6) - startUs);
+        if (end <= begin) continue;
+        clips.push_back({begin, end, segment.text.toUtf8().toStdString()});
+        boundaries.push_back(begin);
+        boundaries.push_back(end);
+    }
+    // tx3g has one active sample per track. Split overlaps and join their
+    // text so simultaneous captions remain visible without invalid DTS.
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end()), boundaries.end());
+    std::vector<libavcore::SubtitleCue> result;
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        std::string text;
+        for (const auto &clip : clips) {
+            if (clip.startUs <= boundaries[i-1] && clip.endUs >= boundaries[i]) {
+                if (!text.empty()) text += '\n';
+                text += clip.text;
+            }
+        }
+        if (text.empty()) continue;
+        if (!result.empty() && result.back().endUs == boundaries[i-1] && result.back().text == text)
+            result.back().endUs = boundaries[i];
+        else result.push_back({boundaries[i-1], boundaries[i], text});
+    }
+    return result;
+}
+
+void RenderQueue::paintSubtitles(QImage &frame, const QJsonObject &config, qint64 timeUs)
+{
+    const auto mode = static_cast<subtitle::ExportMode>(config.value("subtitleMode").toInt(1));
+    if (!subtitle::burns(mode)) return;
+    QJsonObject data = config.value("subtitleBurnInTrack").toObject();
+    if (data.isEmpty() && mode == subtitle::ExportMode::Both)
+        data = config.value("subtitleTrack").toObject();
+    if (data.isEmpty()) return;
+    SubtitleTrackRenderer renderer;
+    renderer.fromJson(data);
+    QPainter painter(&frame);
+    renderer.paintOnto(painter, QRectF(frame.rect()), timeUs / 1e6);
+}
+
+// Shared by the render paths and the export-meta selftest.
+namespace renderqueue_metadata {
+bool hasMetadata(const QJsonObject &cfg)
+{
+    return !cfg.value("title").toString().isEmpty()
+        || !cfg.value("author").toString().isEmpty()
+        || !cfg.value("copyright").toString().isEmpty()
+        || !cfg.value("comment").toString().isEmpty();
+}
+
+void appendSubprocessArgs(QStringList &args, const QJsonObject &cfg,
+                          const QString &outputPath)
+{
+    if (!hasMetadata(cfg))
+        return;
+    for (const char *key : {"title", "author", "copyright", "comment"}) {
+        const QString name = QString::fromLatin1(key);
+        const QString value = cfg.value(name).toString();
+        if (!value.isEmpty())
+            args << QStringLiteral("-metadata") << (name + QLatin1Char('=') + value);
+    }
+    // Match FrameEncoder: legacy MOV/MP4 atoms discard the author tag.
+    const QString suffix = QFileInfo(outputPath).suffix().toLower();
+    if (suffix == QLatin1String("mp4") || suffix == QLatin1String("mov"))
+        args << QStringLiteral("-movflags") << QStringLiteral("use_metadata_tags");
+}
+} // namespace renderqueue_metadata
 
 namespace {
 QString makeUuid() {
@@ -211,6 +322,7 @@ bool runLoudnessAudioPostprocess(const QString &ffmpegBin,
                                  double gainDb,
                                  const QString &audioCodec,
                                  int audioBitrateKbps,
+                                 bool copySubtitles,
                                  QString *error)
 {
     const QStringList filterArgs =
@@ -243,6 +355,9 @@ bool runLoudnessAudioPostprocess(const QString &ffmpegBin,
          << QStringLiteral("-c:a") << codec
          << QStringLiteral("-b:a")
          << QStringLiteral("%1k").arg(audioBitrateKbps);
+    if (copySubtitles)
+        args << QStringLiteral("-map") << QStringLiteral("0:s?")
+             << QStringLiteral("-c:s") << QStringLiteral("copy");
     args << filterArgs;
     args << tempPath;
 
@@ -399,6 +514,7 @@ int runRenderQueueFpsRationalSelftest()
 RenderQueue::RenderQueue(QObject *parent)
     : QObject(parent)
 {
+    setObjectName(QStringLiteral("mainRenderQueue"));
 }
 
 RenderQueue::~RenderQueue()
@@ -425,12 +541,14 @@ RenderQueue::~RenderQueue()
         delete m_renderThread;
         m_renderThread = nullptr;
     }
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
+    removeTempFiles(nullptr);
 }
 
-// AC: production export 経路の ACES パイプラインを設定する。UI スレッドから
-// start() 前に呼ばれる想定。レンダーワーカーはフレームループ開始前に 1 度だけ
-// m_acesMutex 越しにスナップショットを取るので、この代入とスナップショット取得
-// が同一 mutex で直列化される (mid-flight の競合は無い)。
+// AC: production export 経路の ACES パイプラインの既定値を設定する。UI スレッドから
+// addJob 前に呼ばれる想定。addJob が m_acesMutex 越しにジョブへ写す (投入済みの
+// ジョブには届かない) ので、この代入と写しが同一 mutex で直列化される。
 void RenderQueue::setAcesPipeline(const aces::AcesPipeline &p)
 {
     QMutexLocker locker(&m_acesMutex);
@@ -450,6 +568,112 @@ bool RenderQueue::isProjectFilePath(const QString &path)
         || suffix == QLatin1String("json");
 }
 
+namespace {
+// Paths registered through addTempFile in this process: the only ones removeTempFiles
+// may delete (a stray tempFiles entry from elsewhere is ignored).
+QMutex ownedTempFilesMutex;
+QSet<QString> ownedTempFiles;
+}
+
+void RenderQueue::setIntermediateProjectFile(RenderJob &job, const QString &path)
+{
+    const QString key = QStringLiteral("sourceProjectFilePath");
+    if (!job.exportConfig.contains(key))
+        job.exportConfig[key] = job.projectFilePath;
+    job.projectFilePath = path;
+}
+
+void RenderQueue::addTempFile(QJsonObject &config, const QString &path)
+{
+    if (path.isEmpty())
+        return;
+    {
+        QMutexLocker locker(&ownedTempFilesMutex);
+        ownedTempFiles.insert(path);
+    }
+    QJsonArray files = config.value(QStringLiteral("tempFiles")).toArray();
+    files.append(path);
+    config[QStringLiteral("tempFiles")] = files;
+}
+
+void RenderQueue::removeTempFiles(RenderJob *job)
+{
+    if (job) {
+        const QJsonArray files = job->exportConfig.value(QStringLiteral("tempFiles")).toArray();
+        QMutexLocker locker(&ownedTempFilesMutex);
+        for (const QJsonValue &file : files) {
+            const QString path = file.toString();
+            if (path.isEmpty() || m_pendingTempFiles.contains(path))
+                continue;
+            if (ownedTempFiles.contains(path))
+                m_pendingTempFiles.append(path);
+            else
+                qWarning().noquote() << "[render-queue] ignoring unregistered temp file" << path;
+        }
+        job->exportConfig.remove(QStringLiteral("tempFiles"));
+    }
+    QStringList stillPending;
+    for (const QString &path : std::as_const(m_pendingTempFiles)) {
+        if (QFile::exists(path) && !QFile::remove(path)) {
+            qWarning().noquote() << "[render-queue] temp file busy, retrying at next job end" << path;
+            stillPending.append(path);
+        } else {
+            QMutexLocker locker(&ownedTempFilesMutex);
+            ownedTempFiles.remove(path);
+        }
+    }
+    m_pendingTempFiles = stillPending;
+}
+
+void RenderQueue::discardJob(int idx)
+{
+    removeTempFiles(&m_jobs[idx]);
+    m_jobs.removeAt(idx);
+    if (m_currentJobIndex > idx)
+        m_currentJobIndex--;
+    else if (m_currentJobIndex == idx)
+        m_currentJobIndex = -1;
+}
+
+namespace {
+std::atomic<int> autoLoudnessMeasurements{0};
+}
+
+void RenderQueue::resetAutoLoudnessMeasurementCountForTest()
+{
+    autoLoudnessMeasurements.store(0);
+}
+
+int RenderQueue::autoLoudnessMeasurementCountForTest()
+{
+    return autoLoudnessMeasurements.load();
+}
+
+QString RenderQueue::measureAutoLoudness(QJsonObject &config, const QString &mixPath)
+{
+    if (!config.value("autoLoudness").toBool(false)) return {};
+    double measured = std::numeric_limits<double>::quiet_NaN();
+    if (!mixPath.isEmpty()) {
+        ++autoLoudnessMeasurements;
+        measured = loudness::measureIntegratedLufs(mixPath);
+    }
+    const double target = config.value("targetLufs").toDouble(-14.0);
+    const bool skip = std::isnan(measured) || !std::isfinite(measured)
+        || measured <= -70.0 || !std::isfinite(target);
+    const double gain = skip ? 0.0 : loudness::computeGainDb(measured, target);
+    config["loudnessGainDb"] = gain;
+    config.remove("measuredLufs");
+    if (std::isfinite(measured)) config["measuredLufs"] = measured;
+    const QString message = skip
+        ? QStringLiteral("自動ラウドネス: 無音・音声なし・測定失敗のためスキップ（適用ゲイン 0 dB）")
+        : QStringLiteral("自動ラウドネス: 測定 %1 LUFS / 目標 %2 LUFS / 適用ゲイン %3 dB")
+            .arg(measured, 0, 'f', 2).arg(target, 0, 'f', 1).arg(gain, 0, 'f', 2);
+    config["loudnessAutoStatus"] = message;
+    if (skip) qWarning().noquote() << message;
+    else qInfo().noquote() << message;
+    return message;
+}
+
 QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
 {
     if (!hasLoudnessGain(gainDb))
@@ -462,9 +686,35 @@ QStringList RenderQueue::buildLoudnessAudioFilterArgs(double gainDb)
     };
 }
 
+namespace {
+std::atomic<int> s_blackCompositeCount{0};
+}
+void RenderQueue::resetBlackCompositeCountForTest() { s_blackCompositeCount.store(0); }
+int RenderQueue::blackCompositeCountForTest() { return s_blackCompositeCount.load(); }
+
+QString RenderQueue::alphaExportError(const QJsonObject &config)
+{
+    const auto alpha = config.value("keepAlpha");
+    if (!alpha.isUndefined() && !alpha.isBool())
+        return QStringLiteral("keepAlpha は真偽値で指定してください");
+    if (!alpha.toBool()) return {};
+    if (config.value("imageSequence").toBool()) return {};
+    const QString codec = config.value("videoCodec").toString();
+    const auto profile = config.value("proresProfile");
+    if (libavcore::alphaExportPixelFormat(codec.toStdString(), profile.toInt(-1)) == AV_PIX_FMT_NONE
+        || config.value("audioOnly").toBool())
+        return QStringLiteral("このコーデックはアルファを保持できません");
+    return {};
+}
+
 int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
                         const QString &outputPath, const QJsonObject &exportConfig)
 {
+    const QString alphaError = alphaExportError(exportConfig);
+    if (!alphaError.isEmpty()) {
+        emit jobFailed(-1, alphaError);
+        return -1;
+    }
     RenderJob job;
     job.id = m_nextId++;
     job.uuid = makeUuid();
@@ -476,6 +726,10 @@ int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
         job.exportConfig, m_loudnessGainDb);
     if (hasLoudnessGain(job.loudnessGainDb))
         job.exportConfig[QStringLiteral("loudnessGainDb")] = job.loudnessGainDb;
+    {
+        QMutexLocker locker(&m_acesMutex);
+        job.acesPipeline = m_acesPipeline;
+    }
     job.status = RenderJobStatus::Pending;
     job.progress = 0;
     job.progressPercent = 0;
@@ -500,6 +754,12 @@ void RenderQueue::addJob(const RenderJob &job)
         copy.uuid = makeUuid();
     if (copy.id == 0)
         copy.id = m_nextId++;
+    // The job keeps the pipeline current at submission; setAcesPipeline only sets
+    // the default for later jobs. A caller-set pipeline is kept as is.
+    if (!copy.acesPipeline) {
+        QMutexLocker locker(&m_acesMutex);
+        copy.acesPipeline = m_acesPipeline;
+    }
     if (copy.status == RenderJobStatus::Pending && copy.progress == 0)
         copy.progress = copy.progressPercent;
     if (copy.errorMessage.isEmpty())
@@ -524,6 +784,20 @@ void RenderQueue::addJob(const RenderJob &job)
     if (hadLoudnessGain || hasLoudnessGain(copy.loudnessGainDb))
         cfg[QStringLiteral("loudnessGainDb")] = copy.loudnessGainDb;
     copy.exportConfig = cfg;
+    // Keep the two rejection causes on separate channels: piggybacking the loudness
+    // failure on alphaExportError() hid the alpha message whenever both applied.
+    const QString alphaError = alphaExportError(cfg);
+    const QString loudnessError = cfg.value("loudnessAutoError").toString();
+    QString rejection = alphaError;
+    if (!loudnessError.isEmpty())
+        rejection = rejection.isEmpty() ? loudnessError
+                                        : rejection + QLatin1Char('\n') + loudnessError;
+    if (!rejection.isEmpty()) {
+        removeTempFiles(&copy);
+        emit jobFailed(copy.id, rejection);
+        emit jobCompletedUuid(copy.uuid, false, rejection);
+        return;
+    }
 
     m_jobs.append(copy);
     emit jobsChanged();
@@ -539,14 +813,7 @@ void RenderQueue::removeJob(int id)
     if (m_jobs[idx].status == RenderJobStatus::Rendering)
         return;
 
-    m_jobs.removeAt(idx);
-
-    // Adjust current index if needed
-    if (m_currentJobIndex > idx)
-        m_currentJobIndex--;
-    else if (m_currentJobIndex == idx)
-        m_currentJobIndex = -1;
-
+    discardJob(idx);
     emit jobsChanged();
 }
 
@@ -558,13 +825,19 @@ void RenderQueue::removeJob(const QString &uuid)
     if (m_jobs[idx].status == RenderJobStatus::Rendering)
         return;
 
-    m_jobs.removeAt(idx);
-    if (m_currentJobIndex > idx)
-        m_currentJobIndex--;
-    else if (m_currentJobIndex == idx)
-        m_currentJobIndex = -1;
-
+    discardJob(idx);
     emit jobsChanged();
+}
+
+void RenderQueue::cancelJob(const QString &uuid)
+{
+    const int idx = findJobIndexByUuid(uuid);
+    if (idx < 0)
+        return;
+    if (m_jobs[idx].status == RenderJobStatus::Pending)
+        removeJob(uuid);
+    else if (m_jobs[idx].status == RenderJobStatus::Rendering && idx == m_currentJobIndex)
+        cancelCurrent();
 }
 
 void RenderQueue::clear()
@@ -590,9 +863,8 @@ void RenderQueue::clearCompleted()
         if (m_jobs[i].status == RenderJobStatus::Completed ||
             m_jobs[i].status == RenderJobStatus::Failed ||
             m_jobs[i].status == RenderJobStatus::Cancelled) {
-            m_jobs.removeAt(i);
-            if (m_currentJobIndex > i)
-                m_currentJobIndex--;
+            // A job cancelled mid-render is Cancelled before its worker ends.
+            discardJob(i);
         }
     }
     emit jobsChanged();
@@ -606,7 +878,8 @@ void RenderQueue::clearAll()
     if (hadRunningJob)
         cancelCurrent();
 
-    m_jobs.clear();
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
     m_currentJobIndex = -1;
     emit jobsChanged();
 }
@@ -783,7 +1056,20 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["id"] = job.id;                 // legacy int id
         obj["uuid"] = job.uuid;             // spec QString uuid
         obj["name"] = job.name;
-        obj["projectFilePath"] = job.projectFilePath;
+        // An audio intermediate is process-local: persist the project path it replaced.
+        // Without a recorded source (callers outside setIntermediateProjectFile) keep the
+        // previous behavior of saving the path as is, and say so.
+        const QString sourceKey = QStringLiteral("sourceProjectFilePath");
+        if (job.exportConfig.contains(sourceKey)) {
+            obj["projectFilePath"] = job.exportConfig.value(sourceKey).toString();
+        } else {
+            if (job.exportConfig.value(QStringLiteral("tempFiles")).toArray()
+                    .contains(job.projectFilePath))
+                qWarning().noquote() << "RenderQueue::saveQueue: job" << job.uuid
+                                     << "uses a temporary input with no recorded source:"
+                                     << job.projectFilePath;
+            obj["projectFilePath"] = job.projectFilePath;
+        }
         obj["outputPath"] = job.outputPath;
         obj["preset"] = job.preset;
         obj["width"] = job.width;
@@ -793,7 +1079,16 @@ bool RenderQueue::saveQueue(const QString &filePath) const
         obj["startUs"] = static_cast<qint64>(job.startUs);
         obj["endUs"] = static_cast<qint64>(job.endUs);
         obj["passes"] = job.passes;
-        obj["exportConfig"] = job.exportConfig;
+        QJsonObject exportConfig = job.exportConfig;
+        if (!exportConfig.value("audioOnly").toBool(false))
+            exportConfig.remove("audioOnly");
+        if (exportConfig.value("rateControl").toString("bitrate") == "bitrate")
+            exportConfig.remove("rateControl");
+        if (exportConfig.value("crf").toInt(-1) == -1)
+            exportConfig.remove("crf");
+        exportConfig.remove(QStringLiteral("tempFiles")); // process-local, never persisted
+        exportConfig.remove(sourceKey); // folded into projectFilePath above
+        obj["exportConfig"] = exportConfig;
         obj["loudnessGainDb"] = job.loudnessGainDb;
         obj["status"] = static_cast<int>(job.status);
         obj["statusString"] = job.statusString();
@@ -836,7 +1131,8 @@ bool RenderQueue::loadQueue(const QString &filePath)
     QJsonObject root = doc.object();
     m_nextId = root["nextId"].toInt(1);
 
-    m_jobs.clear();
+    while (!m_jobs.isEmpty())
+        discardJob(m_jobs.size() - 1);
     QJsonArray jobsArray = root["jobs"].toArray();
     for (const QJsonValue &val : jobsArray) {
         QJsonObject obj = val.toObject();
@@ -855,6 +1151,8 @@ bool RenderQueue::loadQueue(const QString &filePath)
         job.endUs = static_cast<qint64>(obj["endUs"].toDouble(0));
         job.passes = obj["passes"].toInt(1);
         job.exportConfig = obj["exportConfig"].toObject();
+        // Trust boundary: temp files belong to the process that created them.
+        job.exportConfig.remove(QStringLiteral("tempFiles"));
         job.loudnessGainDb = configuredLoudnessGainDb(
             job.exportConfig,
             obj.value(QStringLiteral("loudnessGainDb")).toDouble(0.0));
@@ -868,6 +1166,10 @@ bool RenderQueue::loadQueue(const QString &filePath)
             job.startTime = QDateTime::fromString(obj["startTime"].toString(), Qt::ISODate);
         if (obj.contains("endTime"))
             job.endTime = QDateTime::fromString(obj["endTime"].toString(), Qt::ISODate);
+        {
+            QMutexLocker locker(&m_acesMutex);
+            job.acesPipeline = m_acesPipeline;
+        }
 
         m_jobs.append(job);
     }
@@ -949,9 +1251,118 @@ void RenderQueue::startNextJob()
 // tenBitHevcEncoderAvailable; an 8-bit job never visits the subprocess
 // fallback. Drop-in replacing the bundled DLL with a libx265-enabled build
 // flips HDR jobs to the in-process path automatically — no recompile needed.
+void RenderQueue::startSequenceExport(int jobIndex)
+{
+    const RenderJob job = m_jobs[jobIndex];
+    const auto &cfg = job.exportConfig;
+    const auto settings = sequenceexport::Settings::fromJson(cfg, job.outputPath);
+    QString error = alphaExportError(cfg);
+    if (error.isEmpty()) error = sequenceexport::validate(settings);
+    if (!error.isEmpty()) {
+        QMetaObject::invokeMethod(this, [this, error]() { finishCurrentJob(false, error); }, Qt::QueuedConnection);
+        return;
+    }
+    if (m_renderThread) {
+        m_renderThread->wait();
+        delete m_renderThread;
+        m_renderThread = nullptr;
+    }
+    Timeline *owned = nullptr;
+    Timeline *timeline = resolveTimeline(job, &owned);
+    const double fps = cfg.value("fps").toDouble(30.0);
+    const QSize size(cfg.value("width").toInt(job.width), cfg.value("height").toInt(job.height));
+    if (!timeline || !std::isfinite(fps) || fps <= 0 || size.isEmpty()) {
+        delete owned;
+        QMetaObject::invokeMethod(this, [this]() {
+            finishCurrentJob(false, QStringLiteral("連番のタイムラインまたは出力設定が無効です"));
+        }, Qt::QueuedConnection);
+        return;
+    }
+    const qint64 total = static_cast<qint64>(timeline->totalDuration() * fps + 0.5);
+    qint64 startUs = qMax(qint64(0), job.startUs);
+    qint64 frames = qMax(qint64(0), total - static_cast<qint64>(startUs * fps / 1000000.0));
+    if (cfg.value("exportMarkedRangeOnly").toBool()) {
+        const auto range = computeExportRange(timeline->markedIn(), timeline->markedOut(),
+            fps, total, true, timeline->hasMarkedRange());
+        frames = range.frameCount();
+        startUs = range.usedMarkedRange ? static_cast<qint64>(timeline->markedIn() * 1000000.0)
+                                      : static_cast<qint64>(range.startFrame * 1000000.0 / fps);
+    } else if (job.endUs > startUs) {
+        frames = qMin(frames, static_cast<qint64>((job.endUs - startUs) * fps / 1000000.0 + 0.5));
+    }
+    const auto timecode = timecodeBurnInForRender(cfg, timeline);
+    m_renderThread = QThread::create([this, job, settings, timeline, owned, size, fps, startUs, frames, timecode]() {
+        const QString error = sequenceexport::write(timeline, settings, size, fps, startUs, frames,
+            [this]() { return m_cancelRequested.load(); },
+            [this, job](int percent) {
+                emit jobProgress(job.id, qMin(percent, 99));
+                emit jobProgressUuid(job.uuid, qMin(percent, 99));
+            },
+            [timeline, timecode, fps, size](QImage &frame, qint64 usec) {
+                if (!timecode.has_value()) return;
+                QPainter painter(&frame);
+                const double sec = usec / 1000000.0;
+                timecode->paintOnto(painter, QRectF(QPointF(0, 0), QSizeF(size)), sec, fps,
+                                   timecodeBurnInClipNameAt(timeline, sec));
+            });
+        QMetaObject::invokeMethod(this, [this, owned, error]() {
+            delete owned;
+            finishCurrentJob(error.isEmpty(), error);
+        }, Qt::QueuedConnection);
+    });
+    m_renderThread->start();
+}
+
 void RenderQueue::startRenderPipe(int jobIndex)
 {
+    auto &subtitleJob = m_jobs[jobIndex];
+    const auto subtitleMode = static_cast<subtitle::ExportMode>(subtitleJob.exportConfig.value("subtitleMode").toInt(1));
+    if (subtitle::embeds(subtitleMode)
+        && (!subtitle::supportsMovText(QFileInfo(subtitleJob.outputPath).suffix())
+            || subtitleJob.exportConfig.value("imageSequence").toBool(false))) {
+        QMetaObject::invokeMethod(this, [this]() {
+            finishCurrentJob(false, QStringLiteral("mov_text 字幕は MP4 / MOV 動画のみ対応しています"));
+        }, Qt::QueuedConnection);
+        return;
+    }
+
+    if (m_jobs[jobIndex].exportConfig.value("imageSequence").toBool()
+        && sequenceexport::enabledForTest()) {
+        startSequenceExport(jobIndex);
+        return;
+    }
+    if (subtitle::embeds(subtitleMode)
+        && !subtitleJob.exportConfig.contains("subtitleTrack")
+        && isProjectFilePath(subtitleJob.projectFilePath)) {
+        ProjectData data;
+        if (ProjectFile::load(subtitleJob.projectFilePath, data)) {
+            QVector<SubtitleSegment> segments;
+            for (const auto &entry : data.subtitleSegments) {
+                SubtitleSegment segment;
+                segment.startTime = entry.start;
+                segment.endTime = entry.end;
+                segment.text = entry.text;
+                segments.append(segment);
+            }
+            SubtitleStyle style;
+            if (!data.subtitleStyle.isEmpty()) {
+                style.font.setFamily(data.subtitleStyle.value("fontName").toString());
+                style.font.setPointSize(data.subtitleStyle.value("fontSize").toInt(28));
+                style.font.setBold(data.subtitleStyle.value("fontBold").toBool(true));
+                style.color = QColor(data.subtitleStyle.value("color").toString("#ffffffff"));
+                style.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString("#ff000000"));
+                style.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble(2.0);
+                style.verticalPos = data.subtitleStyle.value("verticalPos").toDouble(0.85);
+            }
+            appendSubtitleTrack(subtitleJob.exportConfig, segments, style, nullptr);
+        }
+    }
     const RenderJob jobCopy = m_jobs[jobIndex];
+    const QString alphaError = alphaExportError(jobCopy.exportConfig);
+    if (!alphaError.isEmpty()) {
+        finishCurrentJob(false, alphaError);
+        return;
+    }
 
     // US-MF-6 / US-B3-7 dispatch: decide HDR10/HLG from the SAME job-config
     // values the in-process branch uses for request.isHdr10 / request.isHlg,
@@ -1016,6 +1427,16 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 "no in-memory timeline supplied): ") + jobCopy.projectFilePath);
         }, Qt::QueuedConnection);
         return;
+    }
+
+    // The file-backed carrier selftest observes the Timeline actually used by
+    // the queue. Keep this opt-in so ordinary exports do no extra copying.
+    if (property("captureResolvedRotoClipIdsForTest").toBool()) {
+        QJsonObject ids;
+        const auto entries = tl->rotoEntries();
+        for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+            ids.insert(it.key(), it.value().clipId);
+        setProperty("resolvedRotoClipIdsForTest", QVariant::fromValue(ids));
     }
 
     const QJsonObject &cfg = jobCopy.exportConfig;
@@ -1089,6 +1510,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
 
     libavcore::EncodeRequest request;
+    request.subtitles = subtitleCues(cfg, startUsec, static_cast<qint64>(totalFrames * usecPerFrame));
     request.width = outW;
     request.height = outH;
     const FpsRational fpsRational = deriveFpsRational(fps);
@@ -1105,6 +1527,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
             ? QStringLiteral("h264") : jobCopy.codec);
     }
 
+    if (cfg.value("keepAlpha").toBool(false) && videoCodec == QLatin1String("prores"))
+        videoCodec = QStringLiteral("prores_ks");
+
     const bool isProRes = (videoCodec == QLatin1String("prores_ks")
                            || videoCodec == QLatin1String("prores"));
     const QString hdrMode = cfg.value("hdrMode").toString().toLower();
@@ -1115,13 +1540,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
         ? cfg.value("proresProfile").toInt(1) : -1;
 
     // AC: ACES は 8bit RGBA 出力。10bit/HDR (HDR10/HLG/ProRes) 経路では適用
-    // しない。ここでスナップショットを取り (m_acesMutex で直列化)、適用可否を
-    // 1 つの bool に畳む。フレームループ内ではこの不変値だけ参照するので競合
-    // しない。enabled=false のときは applyAces=false となり一切呼ばれない。
+    // しない。ジョブが addJob 時に写した値を使い、適用可否を 1 つの bool に畳む。
+    // フレームループ内ではこの不変値だけ参照するので競合しない。
+    // enabled=false のときは applyAces=false となり一切呼ばれない。
     aces::AcesPipeline acesPipe;
     {
         QMutexLocker locker(&m_acesMutex);
-        acesPipe = m_acesPipeline;
+        acesPipe = jobCopy.acesPipeline.value_or(m_acesPipeline);
     }
     // When VEDITOR_HDR_ODT is ON with a 16-bit renderFrameAt path, that ODT
     // owns tonemap; otherwise the 8-bit ACES export pass must still run.
@@ -1156,10 +1581,16 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const bool blockSmartRenderForSequences =
         timelineHasSequenceRenderModel(tl);
     const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
+    const bool hasExportMetadata = renderqueue_metadata::hasMetadata(cfg);
     if (smartrender::enabledFromEnv()
+        && !cfg.value("keepAlpha").toBool(false)
         && !applyLoudnessFilter
         && !timecodeRenderer.has_value()
         && !blockSmartRenderForSequences
+        && !hasExportMetadata
+        && request.subtitles.empty()
+        && !cfg.contains("subtitleBurnInTrack")
+        && cfg.value("subtitleMode").toInt(1) != 3
         && !blockSmartRenderForLighting) {
         if (m_cancelRequested) {
             delete owned;
@@ -1217,6 +1648,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 << "[smart-render] whole timeline not stream-copy eligible:"
                 << passThrough.reason;
         }
+    } else if (smartrender::enabledFromEnv() && hasExportMetadata) {
+        qInfo().noquote()
+            << "[smart-render] whole timeline not stream-copy eligible:"
+            << "export metadata requires encoding";
     } else if (smartrender::enabledFromEnv()
                && !applyLoudnessFilter
                && (blockSmartRenderForSequences || blockSmartRenderForLighting)) {
@@ -1229,6 +1664,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     : "timeline contains project lighting");
     }
 
+    request.rateControl = cfg.value("rateControl").toString() == "crf"
+        ? libavcore::EncodeRequest::RateControl::Crf
+        : libavcore::EncodeRequest::RateControl::Bitrate;
+    request.crf = cfg.value("crf").toInt(-1);
     request.videoBitrateBits = jobCopy.bitrateBps;
     if (request.videoBitrateBits <= 0) {
         int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
@@ -1241,6 +1680,12 @@ void RenderQueue::startRenderPipe(int jobIndex)
     request.isHdr10 = isHdr10;
     request.isHlg = isHlg;
     request.proresProfile = proresProfile;
+    request.keepAlpha = cfg.value("keepAlpha").toBool(false);
+    request.title = cfg.value("title").toString().toUtf8().toStdString();
+    request.author = cfg.value("author").toString().toUtf8().toStdString();
+    request.copyright = cfg.value("copyright").toString().toUtf8().toStdString();
+    request.comment = cfg.value("comment").toString().toUtf8().toStdString();
+
     request.hdrMasterMaxNits =
         cfg.value("hdrMasterMaxLum").toDouble(1000.0);
     request.hdrMasterMinNits =
@@ -1275,7 +1720,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
         // posted to it), so deleteLater on the owning thread is the safe
         // disposal. We schedule that back on the queue thread at the end.
         const bool ok = [&]() -> bool {
-            libavcore::FrameEncoder encoder;
+            auto encoderOwner = std::make_unique<libavcore::FrameEncoder>();
+            libavcore::FrameEncoder &encoder = *encoderOwner;
             if (auto err = encoder.open(request)) {
                 failMsg = QStringLiteral("failed to open encoder: ")
                     + QString::fromStdString(*err);
@@ -1324,6 +1770,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 if (applyAces)
                     frame = aces::applyPipelineToImage(frame, acesPipe);
 
+                paintSubtitles(frame, jobCopy.exportConfig, usec);
+
+                if (!request.keepAlpha) {
+                ++s_blackCompositeCount;
                 // A video file is OPAQUE — it has no alpha channel. The SSOT
                 // frame can be partially transparent (a per-clip mask with no
                 // lower track leaves alpha=0 regions). The genuine preview
@@ -1370,6 +1820,22 @@ void RenderQueue::startRenderPipe(int jobIndex)
                     break;
                 }
 
+                } else {
+                    frame = frame.convertToFormat(QImage::Format_RGBA8888);
+                    if (timecodeRenderer.has_value()) {
+                        QPainter pp(&frame);
+                        const double timelineSec = static_cast<double>(usec) / 1'000'000.0;
+                        timecodeRenderer->paintOnto(
+                            pp, QRectF(0, 0, outW, outH), timelineSec, fps,
+                            timecodeBurnInClipNameAt(tl, timelineSec));
+                    }
+                    if (!encoder.pushFrameRgba32(frame.constBits(), frame.bytesPerLine(), pts++)) {
+                        failMsg = QStringLiteral("アルファ付きフレームの書き出しに失敗しました");
+                        encodeOk = false;
+                        break;
+                    }
+                }
+
                 const int pct = qBound(0, static_cast<int>(
                     (static_cast<double>(f + 1)
                         / static_cast<double>(totalFrames)) * 100.0), 99);
@@ -1389,6 +1855,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
             }
 
             if (encodeOk && haveAudio && hasLoudnessGain(loudnessGainDb)) {
+                // finalize() writes the trailer but keeps the output handle
+                // open. Close it before ffmpeg reads/replaces the file: Windows
+                // otherwise rejects the rename of the unnormalized export.
+                encoderOwner.reset();
                 QString loudnessError;
                 if (!runLoudnessAudioPostprocess(
                         findFFmpegBinary(),
@@ -1396,6 +1866,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
                         loudnessGainDb,
                         loudnessAudioCodec,
                         loudnessAudioBitrateKbps,
+                        !request.subtitles.empty(),
                         &loudnessError)) {
                     failMsg = loudnessError;
                     encodeOk = false;
@@ -1444,6 +1915,10 @@ void RenderQueue::startRenderPipe(int jobIndex)
 void RenderQueue::startRenderPipeSubprocess(int jobIndex)
 {
     const RenderJob jobCopy = m_jobs[jobIndex];
+    if (jobCopy.exportConfig.value("keepAlpha").toBool()) {
+        finishCurrentJob(false, QStringLiteral("HDR 代替経路ではアルファを保持できません"));
+        return;
+    }
 
     // AC: ACES は 8bit RGBA 出力。この経路は定義上 10bit HDR (HDR10/HLG) 専用
     // (startRenderPipe が 10bit HEVC encoder 不在のときだけ委譲する) なので
@@ -1620,13 +2095,43 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         args << QStringLiteral("-i") << audioInputPath;
     }
 
+    std::shared_ptr<QTemporaryDir> subtitleTemp;
+    const auto cues = subtitleCues(cfg, startUsec, static_cast<qint64>(totalFrames * usecPerFrame));
+    if (!cues.empty()) {
+        subtitleTemp = std::make_shared<QTemporaryDir>();
+        QList<caption::Clip> captions;
+        for (const auto &cue : cues) {
+            caption::Clip clip;
+            clip.startMs = cue.startUs / 1000;
+            clip.endMs = cue.endUs / 1000;
+            clip.text = QString::fromUtf8(cue.text.data(), static_cast<qsizetype>(cue.text.size()));
+            captions.append(clip);
+        }
+        const QString path = subtitleTemp->filePath("captions.srt");
+        if (!subtitleTemp->isValid() || !subtitle::exportSrt(path, captions)) {
+            delete owned;
+            QMetaObject::invokeMethod(this, [this]() {
+                finishCurrentJob(false, QStringLiteral("字幕の一時ファイルを作成できません"));
+            }, Qt::QueuedConnection);
+            return;
+        }
+        args << "-i" << path;
+    }
     args << QStringLiteral("-map") << QStringLiteral("0:v:0");
     if (haveAudio)
         args << QStringLiteral("-map") << QStringLiteral("1:a?");
+    if (subtitleTemp)
+        args << "-map" << (haveAudio ? "2:s:0" : "1:s:0") << "-c:s" << "mov_text";
 
-    // Video codec + bitrate.
+    // Video codec + rate control.
     args << QStringLiteral("-c:v") << videoCodec;
-    {
+    if (cfg.value("rateControl").toString() == "crf") {
+        libavcore::EncodeRequest qualityRequest;
+        qualityRequest.rateControl = libavcore::EncodeRequest::RateControl::Crf;
+        qualityRequest.crf = cfg.value("crf").toInt(-1);
+        for (const auto& option : libavcore::codecOptionsFor(qualityRequest, videoCodec))
+            args << (QStringLiteral("-") + option.first) << option.second;
+    } else {
         int videoBitrateKbps = cfg.value("videoBitrate").toInt(0);
         if (videoBitrateKbps <= 0)
             videoBitrateKbps = jobCopy.bitrateBps > 0
@@ -1699,12 +2204,13 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
         args << QStringLiteral("-shortest");
     }
 
+    renderqueue_metadata::appendSubprocessArgs(args, cfg, jobCopy.outputPath);
     args << QStringLiteral("-progress") << QStringLiteral("pipe:2");
     args << jobCopy.outputPath;
 
     m_renderThread = QThread::create(
         [this, jobCopy, tl, owned, ffmpegBin, args, outW, outH,
-         totalFrames, startUsec, usecPerFrame, timecodeRenderer, fps]() {
+         totalFrames, startUsec, usecPerFrame, timecodeRenderer, fps, subtitleTemp]() {
         QString failMsg;
         const bool ok = [&]() -> bool {
             QProcess *proc = new QProcess();
@@ -1763,6 +2269,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
                 // A video file is OPAQUE — flatten the (possibly partially
                 // transparent) SSOT composite onto opaque black and feed
                 // rgb24, identical to the in-process branch.
+                paintSubtitles(frame, jobCopy.exportConfig, usec);
                 QImage rgb(outW, outH, QImage::Format_RGB888);
                 rgb.fill(Qt::black);
                 {
@@ -1894,11 +2401,16 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
         m_renderThread = nullptr;
     }
 
-    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size())
+    if (m_currentJobIndex < 0 || m_currentJobIndex >= m_jobs.size()) {
+        removeTempFiles(nullptr); // worker has stopped: retry paths it held open
         return;
+    }
 
     RenderJob &job = m_jobs[m_currentJobIndex];
     job.endTime = QDateTime::currentDateTime();
+    // Single job-end cleanup for every jobCompletedUuid below (cancel / failure /
+    // success), done before the emits because a slot may enqueue and reallocate m_jobs.
+    removeTempFiles(&job);
 
     if (job.status == RenderJobStatus::Cancelled || m_cancelRequested) {
         job.status = RenderJobStatus::Cancelled;
@@ -1963,8 +2475,8 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
 // Resolve the Timeline a job renders. Priority:
 //   1. job.timeline (the additive in-memory seam) — used as-is, not owned.
 //      RM-1.5: track-matte wiring for THIS branch is NOT populated here —
-//      the producer must have synced the live Timeline's matte carrier
-//      (syncTrackMatteEntriesToTimeline) before submitting the job.
+//      the live Timeline's trackMatteEntries() is the matte SSOT (US-1016),
+//      so the render reads it directly and nothing is synced before submitting.
 //   2. ProjectFile::load(job.projectFilePath) into a fresh heap Timeline via
 //      the genuine Timeline::restoreFromProject path (the same call
 //      MainWindow::applyLoadedProjectData uses, MainWindow.cpp:3982). The
@@ -2010,10 +2522,9 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths
     // (File→Export MainWindow.cpp, mobile export, the live-Timeline batch
-    // overload) early-return above at `if (job.timeline)` and therefore
-    // DEPEND on the producer having synced the live Timeline's matte
-    // carrier before submitting the job (RM-1.3 — MainWindow calls
-    // syncTrackMatteEntriesToTimeline right before addJob). This block
+    // overload) early-return above at `if (job.timeline)` and render the
+    // live Timeline's own matte entries (the matte SSOT since US-1016, so
+    // there is nothing to sync before addJob). This block
     // does NOT cover those paths. Here we populate the freshly-rebuilt
     // Timeline's intrinsic matte carrier straight from the persisted
     // ProjectData so a file-path export applies the EXACT same track
@@ -2045,6 +2556,13 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         matteEntries.insert(canonicalKey(entry.clipId), e);
     }
     tl->setTrackMatteEntries(matteEntries);
+    QHash<QString, RotoClipEntry> rotoEntries;
+    rotoEntries.reserve(data.rotoClipEntries.size());
+    for (const RotoClipEntry &entry : data.rotoClipEntries) {
+        if (!entry.clipId.isEmpty())
+            rotoEntries.insert(canonicalKey(entry.clipId), entry);
+    }
+    tl->setRotoEntries(rotoEntries);
     QHash<QString, QString> parentEntries;
     parentEntries.reserve(data.clipParentEntries.size());
     for (const ClipParentEntry &entry : data.clipParentEntries) {

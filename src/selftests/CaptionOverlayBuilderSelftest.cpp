@@ -901,7 +901,19 @@ int runCaptionOverlayBuilderSelftest()
         editor.findChild<QTextEdit *>(QStringLiteral("captionClipTextEdit"));
     QSpinBox *clipStartSpin =
         editor.findChild<QSpinBox *>(QStringLiteral("captionClipStartMsSpinBox"));
-    QTableWidget *clipTable = editor.findChild<QTableWidget *>();
+    QTableWidget *clipTable =
+        editor.findChild<QTableWidget *>(QStringLiteral("captionClipTable"));
+    const auto clipTablesByType = editor.findChildren<QTableWidget *>();
+    const bool clipTableIsClipList = clipTable && clipTable->columnCount() == 5
+        && clipTable->horizontalHeaderItem(0)
+        && clipTable->horizontalHeaderItem(0)->text() == QStringLiteral("開始(ms)");
+    qInfo().noquote() << QStringLiteral("[caption-overlay-builder] G15 found=%1 typeOnlyFirst=%2 columns=%3 header0=%4 isClipList=%5")
+        .arg(clipTable ? clipTable->objectName() : QStringLiteral("(null)"),
+             clipTablesByType.isEmpty() ? QStringLiteral("(none)") : clipTablesByType.first()->objectName(),
+             QString::number(clipTable ? clipTable->columnCount() : -1),
+             clipTable && clipTable->horizontalHeaderItem(0) ? clipTable->horizontalHeaderItem(0)->text()
+                                                             : QStringLiteral("(null)"),
+             QString::number(int(clipTableIsClipList)));
     int applySignalCount = 0;
     QObject::connect(&editor, &CaptionEditorDialog::applyToTimelineRequested,
                      [&applySignalCount]() { ++applySignalCount; });
@@ -955,7 +967,7 @@ int runCaptionOverlayBuilderSelftest()
               && applyButton
               && clipTextEdit
               && clipStartSpin
-              && clipTable
+              && clipTableIsClipList
               && clipTable->editTriggers() == QAbstractItemView::NoEditTriggers
               && !singleWordControl->accessibleName().isEmpty()
               && !applyButton->accessibleName().isEmpty()

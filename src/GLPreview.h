@@ -44,6 +44,12 @@ public:
     // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
     ColorCorrection colorCorrectionForTest() const { return m_cc; }
     int colorCorrectionSetCountForTest() const { return m_colorCorrectionSetCountForTest; }
+    // US-1106: format the last displayFrame() stored for upload.
+    QImage::Format lastUploadFormatForTest() const { return m_currentFrame.format(); }
+    // US-1106: test-only. Samples the frame texture (m_texture only) with
+    // Nearest instead of Linear so a device-pixel grab maps 1:1 to frame
+    // pixels. Default off; applied to an allocated texture on the next paint.
+    void setFrameTextureNearestForTest(bool nearest);
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
     void setHdrTransfer(int transfer);
     int hdrTransfer() const { return m_hdrTransfer; }
@@ -57,6 +63,7 @@ public:
     void setLutIntensity(double intensity);
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
+    void setOffset(const std::array<double,3> &values);
     void setLiftGammaGain(const std::array<std::array<double,4>,3> &values);
     // Log range wheels: Shadow / Midtone / Highlight RGB adjustments.
     void setLogWheels(const std::array<std::array<double,3>,3> &values);
@@ -334,6 +341,8 @@ private:
     double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
     int m_colorCorrectionSetCountForTest = 0;
+    bool m_frameTextureNearestForTest = false;
+    bool m_frameTextureFilterDirty = false;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
     double m_displayAspectRatio = 0.0;
@@ -444,6 +453,8 @@ private:
     QImage::Format m_textureFormat = QImage::Format_Invalid;
 
     // Lift/Gamma/Gain uniform locations (vec4: xyz=RGB, w=Luma)
+    int m_locOffset = -1;
+    std::array<double,3> m_offset = {{0.0, 0.0, 0.0}};
     int m_locLift = -1, m_locLggGamma = -1, m_locGain = -1;
     // Identity: lift=(0,0,0,0), gamma=(1,1,1,1), gain=(1,1,1,1)
     std::array<std::array<double,4>,3> m_liftGammaGain = {{
