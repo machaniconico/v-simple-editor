@@ -343,6 +343,8 @@ private slots:
     void splitClip();
     void deleteClip();
     void rippleDelete();
+    void connectSelectionToStoryline();
+    void disconnectSelectionFromStoryline();
     void copyClip();
     void pasteClip();
     void undoAction();
@@ -964,6 +966,8 @@ private:
     QAction *m_splitAction;
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;
+    QAction *m_connectToStorylineAction = nullptr;
+    QAction *m_disconnectFromStorylineAction = nullptr;
     QAction *m_copyAction;
     QAction *m_copyCurrentFrameAction = nullptr;
     QAction *m_pasteAction;

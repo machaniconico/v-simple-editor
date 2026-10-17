@@ -119,6 +119,7 @@ class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
 class QDropEvent;
+class QPainter;
 class QMimeData;
 class QTimer;
 
@@ -647,6 +648,12 @@ public:
     // with nothing changed when the payload, the source or the slot is invalid.
     bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
                         bool toNewTrack = false);
+    // US-1202: the clip being moved by an in-track MoveClip drag and how far its
+    // start has travelled from the press (seconds). False when no such drag.
+    bool moveDragInfo(int *clipIndex, double *deltaSec) const;
+    // US-1202: whether a media-file (text/uri-list) drop may land here, i.e.
+    // storyline mode is on and this is an unlocked V2+ / audio track.
+    bool acceptsMediaDrop() const;
     // Whether an in-track MoveClip drag at y (this track's coordinates) turns
     // into a cross-track QDrag: CROSS_TRACK_DRAG_THRESHOLD px outside the row,
     // or, on the last track of its kind, anywhere over that kind's new-track
@@ -822,7 +829,8 @@ public:
                      double requestedStartSec = -1.0,
                      MediaImportResult *result = nullptr,
                      QString *err = nullptr,
-                     ImportMediaKind kind = ImportMediaKind::LinkedPair);
+                     ImportMediaKind kind = ImportMediaKind::LinkedPair,
+                     const QString &anchorUid = QString());
     void addClip(const QString &filePath);
     void splitAtPlayhead();
     void moveSelectedClipToPlayhead(bool tail);
@@ -940,6 +948,31 @@ public:
                      const QString &anchorUid, QString *err = nullptr);
     bool disconnectClip(TrackKind kind, int trackIndex, int clipIndex,
                         QString *err = nullptr);
+    // US-1202: connect the clip (and its link group) to the V1 clip overlapping
+    // its start, else the V1 clip just before it; rejected with *err when
+    // there is none. One undo point, 「主ストーリーラインに接続」.
+    bool connectToStoryline(TrackKind kind, int trackIndex, int clipIndex,
+                            QString *err = nullptr);
+    // US-1202: holds the flag only (no UI, save or undo here; US-1203 adds
+    // those). While true, a media file or a clip dropped on V2+ / A tracks is
+    // connected to the V1 clip under the drop. Default false.
+    void setStorylineMode(bool on) { m_storylineMode = on; }
+    bool storylineMode() const { return m_storylineMode; }
+    // US-1202 media drop entry: TimelineTrack::dropEvent hands a text/uri-list
+    // drop on a V2+ / A track here while storylineMode() is on. Imports the file
+    // at dropTimeSec on that track, connected to the V1 clip under the drop
+    // (V1 tracks, locked tracks and mode-off drops are refused with *err; a drop
+    // with no V1 clip under it is imported unconnected).
+    bool dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
+                          double dropTimeSec, QString *err = nullptr);
+    // Connect a clip a cross-track drop just placed (storyline mode, V2+ / A);
+    // no undo point of its own (the drop's interactionCompleted takes it).
+    void autoConnectDroppedClip(TimelineTrack *track, int clipIndex);
+    // US-1202 overlay: connection lines and badges for every connected clip,
+    // plus the follow preview while a V1 clip is dragged. Draws nothing when no
+    // clip is connected. `painter` is in m_tracksWidget coordinates.
+    void paintConnections(QPainter &painter) const;
+    void updateConnectionOverlay();
     // Non-modal connection warnings (detached connections). MainWindow shows the
     // newest in the status bar on connectionWarningsChanged; selftests and MCP
     // drain them with takeConnectionWarnings.
@@ -1609,6 +1642,14 @@ private:
     bool m_rederiveDisabledForTest = false;
     QStringList m_connectionWarnings;
     bool m_reconcilingConnections = false;
+    bool m_storylineMode = false;
+    QWidget *m_connectionOverlay = nullptr;
+    // Applies the connection without an undo point (connectClip adds it).
+    bool applyConnection(TrackKind kind, int trackIndex, int clipIndex,
+                         const QString &anchorUid, QString *err);
+    // The V1 clip overlapping startSec; with allowPreceding, else the last V1 clip before it.
+    QString storylineAnchorAt(double startSec, double *anchorStartSec,
+                             bool allowPreceding) const;
     QString reconcileSequenceKey() const;
     bool hasConnectedClips() const;
     void renameAnchorReferences(const QString &fromUid, const QString &toUid);

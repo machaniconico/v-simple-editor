@@ -3181,6 +3181,10 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("クリップを削除"),      QStringLiteral("編集"));
     reg(m_rippleDeleteAction,    "timeline.ripple_delete",
         QStringLiteral("リップル削除"),        QStringLiteral("編集"));
+    reg(m_connectToStorylineAction, "timeline.connect_to_storyline",
+        QStringLiteral("主ストーリーラインに接続"), QStringLiteral("編集"));
+    reg(m_disconnectFromStorylineAction, "timeline.disconnect",
+        QStringLiteral("接続を解除"),          QStringLiteral("編集"));
     reg(m_copyEffectsAction,     "edit.copy_effects",
         QStringLiteral("エフェクトをコピー"),  QStringLiteral("編集"));
     reg(m_pasteEffectsAction,    "edit.paste_effects",
@@ -4552,6 +4556,20 @@ void MainWindow::setupMenuBar()
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
     m_menuHelpEntries.append({m_rippleDeleteAction,
         QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
+
+    // US-1202: 主ストーリーライン (V1) への接続。ショートカットは付けない。
+    m_connectToStorylineAction = editMenu->addAction(tr("主ストーリーラインに接続"));
+    m_connectToStorylineAction->setObjectName(QStringLiteral("action_connect_to_storyline"));
+    connect(m_connectToStorylineAction, &QAction::triggered, this,
+            &MainWindow::connectSelectionToStoryline);
+    m_menuHelpEntries.append({m_connectToStorylineAction,
+        QStringLiteral("選んだクリップを、その位置にある V1 のクリップへ接続します。V1 を動かすと一緒に動きます。")});
+    m_disconnectFromStorylineAction = editMenu->addAction(tr("接続を解除"));
+    m_disconnectFromStorylineAction->setObjectName(QStringLiteral("action_disconnect_from_storyline"));
+    connect(m_disconnectFromStorylineAction, &QAction::triggered, this,
+            &MainWindow::disconnectSelectionFromStoryline);
+    m_menuHelpEntries.append({m_disconnectFromStorylineAction,
+        QStringLiteral("選んだクリップの V1 への接続を外します。クリップの位置は変わりません。")});
 
     auto *matchFrameAction = editMenu->addAction(QStringLiteral("マッチフレーム"));
     matchFrameAction->setObjectName(QStringLiteral("action_match_frame"));
@@ -10900,6 +10918,40 @@ void MainWindow::rippleDelete()
     // Same as deleteClip: Timeline reindexes and remaps the matte keys.
     m_timeline->rippleDeleteSelectedClip();
     statusBar()->showMessage("Ripple deleted clip");
+    updateEditActions();
+}
+
+void MainWindow::connectSelectionToStoryline()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!m_timeline || !selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(tr("接続するクリップを選択してください。"), 3000);
+        return;
+    }
+    QString err;
+    if (m_timeline->connectToStoryline(kind, trackIndex, clipIndex, &err))
+        statusBar()->showMessage(tr("クリップを主ストーリーラインに接続しました。"), 3000);
+    else
+        statusBar()->showMessage(err, 5000);
+    updateEditActions();
+}
+
+void MainWindow::disconnectSelectionFromStoryline()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!m_timeline || !selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(tr("接続を解除するクリップを選択してください。"), 3000);
+        return;
+    }
+    QString err;
+    if (m_timeline->disconnectClip(kind, trackIndex, clipIndex, &err))
+        statusBar()->showMessage(tr("クリップの接続を解除しました。"), 3000);
+    else
+        statusBar()->showMessage(err, 5000);
     updateEditActions();
 }
 

@@ -6,23 +6,34 @@
 #include "../Timeline.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
+#include "../libavcore/Encode.h"
 #include "../libavcore/Probe.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpToolRegistry.h"
 #include "SelftestGate.h"
 
 #include <QAbstractButton>
+#include <QAction>
 #include <QApplication>
 #include <QDataStream>
 #include <QDir>
+#include <QColor>
+#include <QDropEvent>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QMessageBox>
+#include <QMimeData>
+#include <QMouseEvent>
+#include <QStatusBar>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
+#include <QUrl>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -85,6 +96,18 @@
 //       (c) linear anchor: ripple head trim d -> -d, non-ripple head trim -> 0,
 //       speed 2x -> same source frame, (d) reversed anchor ripple head trim ->
 //       no move and no warning.
+// US-1202 (connect UI): the actions timeline.connect_to_storyline / timeline.disconnect
+// (Edit menu actions action_connect_to_storyline / action_disconnect_from_storyline, no
+// shortcut) and the storyline-mode drop connection.
+//   G23: the connect action connects a V2 clip to the V1 clip it overlaps (and, past
+//        the V1 end, to the preceding V1 clip), one undo point named by the action text.
+//   G24: the disconnect action detaches it in one undo point; undo reconnects, redo
+//        detaches again; disconnecting an unconnected clip is rejected.
+//   G25: negative controls: a V1 clip and a V2 clip with no V1 clip under or before it
+//        are rejected with the reason in the status bar and nothing changes.
+//   G26: with setStorylineMode(true) a media file dropped on V2 / A2 and a clip dropped
+//        from V3 onto V2 connect to the V1 clip under the drop; with the mode off, or on
+//        V1, the media drop is refused and the clip drop leaves no connection.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -302,6 +325,80 @@ QStringList answeringMessageBoxes(QObject *context, const std::function<void()> 
     run();
     timer.stop();
     return seen;
+}
+
+// 40x24 10 fps mpeg4 clip of `frames` frames (the media a drop imports).
+bool writeVideoFile(const QString &path, int frames)
+{
+    libavcore::EncodeRequest req;
+    req.width = 40;
+    req.height = 24;
+    req.fps = 10;
+    req.fpsNum = 10;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req)) return false;
+    for (int i = 0; i < frames; ++i) {
+        QImage frame(40, 24, QImage::Format_RGB888);
+        frame.fill(QColor((i * 23) & 255, 90, 160));
+        if (!encoder.pushFrame(frame, i)) return false;
+    }
+    return !encoder.finalize();
+}
+
+void selectOnly(Timeline &timeline, bool audio, int track, int index)
+{
+    for (const bool a : {false, true})
+        for (TimelineTrack *t : a ? timeline.audioTracks() : timeline.videoTracks())
+            if (t) t->clearClipSelection();
+    timeline.trackAt(audio, track)->setSelectedClip(index);
+}
+
+// Dispatches a text/uri-list drop at timeSec through QObject::event (QApplication::notify
+// does not deliver a Drop outside an active QDrag); returns whether it was accepted.
+bool sendMediaDrop(TimelineTrack *dest, const QString &path, double timeSec)
+{
+    QMimeData mime;
+    mime.setUrls({QUrl::fromLocalFile(path)});
+    QDropEvent event(QPointF(timeSec * dest->pixelsPerSecond(), 4.0), Qt::CopyAction, &mime,
+                     Qt::LeftButton, Qt::NoModifier);
+    event.ignore();
+    static_cast<QObject *>(dest)->event(&event);
+    return event.isAccepted();
+}
+
+// Same as sendMediaDrop with several URLs in one drop.
+bool sendMediaDropUrls(TimelineTrack *dest, const QStringList &paths, double timeSec)
+{
+    QMimeData mime;
+    QList<QUrl> urls;
+    for (const QString &path : paths) urls.append(QUrl::fromLocalFile(path));
+    mime.setUrls(urls);
+    QDropEvent event(QPointF(timeSec * dest->pixelsPerSecond(), 4.0), Qt::CopyAction, &mime,
+                     Qt::LeftButton, Qt::NoModifier);
+    event.ignore();
+    static_cast<QObject *>(dest)->event(&event);
+    return event.isAccepted();
+}
+
+// Moves src's clip srcIdx onto dest at timeSec through the cross-track drop path.
+bool sendClipDropOnTrack(TimelineTrack *src, int srcIdx, TimelineTrack *dest, double timeSec)
+{
+    QMimeData mime;
+    mime.setData(QStringLiteral("application/x-vse-clip"),
+                 QByteArray::number(srcIdx) + QByteArray(":0"));
+    QDropEvent event(QPointF(timeSec * dest->pixelsPerSecond(), 4.0), Qt::MoveAction, &mime,
+                     Qt::LeftButton, Qt::NoModifier);
+    event.ignore();
+    TimelineTrack::setSelftestDropSource(src);
+    static_cast<QObject *>(dest)->event(&event);
+    TimelineTrack::setSelftestDropSource(nullptr);
+    return event.isAccepted();
 }
 
 } // namespace
@@ -2049,6 +2146,276 @@ int runConnectedClipSelftest()
         tally.gate(18, parentOk && nestedOk,
                    "pre-compose moved / detached the connection after the range, warned in the "
                    "parent, or the nested range piece was not connected to the nested V1 piece");
+    }
+
+    // G23-G25: the connect / disconnect actions on the MainWindow timeline.
+    QAction *connectAction = window.findChild<QAction *>(QStringLiteral("action_connect_to_storyline"));
+    QAction *disconnectAction = window.findChild<QAction *>(QStringLiteral("action_disconnect_from_storyline"));
+    const QString connectText = QStringLiteral("主ストーリーラインに接続");
+    const QString disconnectText = QStringLiteral("接続を解除");
+    if (!mainTimeline || !connectAction || !disconnectAction) {
+        std::fprintf(stderr, "connected-clip G23-G25 missing: timeline=%d connect=%d disconnect=%d\n",
+                     mainTimeline != nullptr, connectAction != nullptr, disconnectAction != nullptr);
+        tally.gate(23, false, "the connect action is not registered on the MainWindow");
+        tally.gate(24, false, "the disconnect action is not registered on the MainWindow");
+        tally.gate(25, false, "the connect action is not registered on the MainWindow");
+    } else {
+        UndoManager *undo = mainTimeline->undoManager();
+        // G23
+        load(*mainTimeline, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("x", 2.0, 7.0)}});
+        const QString bUid = uidAt(*mainTimeline, 0, 1);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        selectOnly(*mainTimeline, false, 1, 0);
+        const quint64 serial0 = undo->saveSerial();
+        connectAction->trigger();
+        const Located x1 = locate(*mainTimeline, false, xUid);
+        const quint64 serial1 = undo->saveSerial();
+        const QString undoText = undo->undoDescription();
+        // Past the V1 end (15 s): the preceding V1 clip b is the anchor.
+        load(*mainTimeline, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("y", 2.0, 20.0)}});
+        const QString b2Uid = uidAt(*mainTimeline, 0, 1);
+        const QString yUid = uidAt(*mainTimeline, 1, 0);
+        selectOnly(*mainTimeline, false, 1, 0);
+        connectAction->trigger();
+        const Located y1 = locate(*mainTimeline, false, yUid);
+        const bool overlapOk = x1.found && x1.clip.anchorUid == bUid && near(x1.clip.anchorOffsetSec, 2.0)
+            && near(x1.startSec, 7.0) && serial1 == serial0 + 1;
+        const bool textOk = undoText == connectText && connectAction->text() == connectText
+            && disconnectAction->text() == disconnectText;
+        const bool precedingOk = y1.found && y1.clip.anchorUid == b2Uid
+            && near(y1.clip.anchorOffsetSec, 15.0) && near(y1.startSec, 20.0);
+        std::fprintf(stderr, "connected-clip G23 overlap: %s serial %llu -> %llu (expect +1) undo=[%s] "
+                     "action=[%s] ok=%d textOk=%d | preceding: %s ok=%d\n",
+                     qPrintable(describe(x1, bUid)), static_cast<unsigned long long>(serial0),
+                     static_cast<unsigned long long>(serial1), qPrintable(undoText),
+                     qPrintable(connectAction->text()), overlapOk, textOk,
+                     qPrintable(describe(y1, b2Uid)), precedingOk);
+        tally.gate(23, overlapOk && textOk && precedingOk,
+                   "timeline.connect_to_storyline did not connect the V2 clip to the overlapping (or "
+                   "preceding) V1 clip in one undo point named after the action text");
+
+        // G24: disconnect, undo, redo (back on the first fixture).
+        load(*mainTimeline, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("x", 2.0, 7.0)}});
+        const QString b3Uid = uidAt(*mainTimeline, 0, 1);
+        const QString x3Uid = uidAt(*mainTimeline, 1, 0);
+        selectOnly(*mainTimeline, false, 1, 0);
+        connectAction->trigger();
+        const quint64 serialA = undo->saveSerial();
+        disconnectAction->trigger();
+        const Located detached = locate(*mainTimeline, false, x3Uid);
+        const quint64 serialB = undo->saveSerial();
+        const QString disconnectUndoText = undo->undoDescription();
+        mainTimeline->undo();
+        const Located restored = locate(*mainTimeline, false, x3Uid);
+        mainTimeline->redo();
+        const Located redone = locate(*mainTimeline, false, x3Uid);
+        // Control: disconnecting a clip that is not connected is rejected.
+        selectOnly(*mainTimeline, false, 1, 0);
+        const quint64 serialC = undo->saveSerial();
+        disconnectAction->trigger();
+        const quint64 serialD = undo->saveSerial();
+        const QString rejectMessage = window.statusBar()->currentMessage();
+        const bool g24 = detached.found && detached.clip.anchorUid.isEmpty() && near(detached.startSec, 7.0)
+            && serialB == serialA + 1 && disconnectUndoText == disconnectText
+            && restored.clip.anchorUid == b3Uid && near(restored.clip.anchorOffsetSec, 2.0)
+            && redone.clip.anchorUid.isEmpty() && serialD == serialC
+            && rejectMessage == QStringLiteral("このクリップは接続されていません");
+        std::fprintf(stderr, "connected-clip G24 detached: %s serial %llu -> %llu (expect +1) undo=[%s] | "
+                     "undo: %s (expect anchored, offset 2) | redo: %s (expect detached) | control: serial "
+                     "%llu -> %llu (expect same) status=[%s] ok=%d\n", qPrintable(describe(detached, b3Uid)),
+                     static_cast<unsigned long long>(serialA), static_cast<unsigned long long>(serialB),
+                     qPrintable(disconnectUndoText), qPrintable(describe(restored, b3Uid)),
+                     qPrintable(describe(redone, b3Uid)), static_cast<unsigned long long>(serialC),
+                     static_cast<unsigned long long>(serialD), qPrintable(rejectMessage), g24);
+        tally.gate(24, g24,
+                   "timeline.disconnect did not detach in one undo point, undo / redo did not toggle the "
+                   "connection, or disconnecting an unconnected clip was not rejected");
+
+        // G25: negative controls, each rejected unchanged with the reason in the status bar.
+        auto rejectCase = [&](const QVector<QVector<ClipInfo>> &video, int track, int index,
+                              const QString &reason, QString *detail) {
+            load(*mainTimeline, video);
+            selectOnly(*mainTimeline, false, track, index);
+            const quint64 before = undo->saveSerial();
+            window.statusBar()->clearMessage();
+            connectAction->trigger();
+            const QString message = window.statusBar()->currentMessage();
+            bool anyAnchor = false;
+            for (const TimelineTrack *t : mainTimeline->videoTracks())
+                for (const ClipInfo &c : t->clips()) anyAnchor = anyAnchor || !c.anchorUid.isEmpty();
+            *detail = QStringLiteral("serial %1 -> %2 anchored=%3 status=[%4]")
+                .arg(before).arg(undo->saveSerial()).arg(anyAnchor).arg(message);
+            return undo->saveSerial() == before && !anyAnchor && message == reason;
+        };
+        QString v1Detail, noAnchorDetail;
+        const bool v1Rejected = rejectCase({{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("x", 2.0, 7.0)}},
+                                           0, 1, QStringLiteral("V1 のクリップは接続できません"), &v1Detail);
+        const bool noAnchorRejected = rejectCase({{clipFor("a", 3.0, 5.0)}, {clipFor("x", 2.0, 1.0)}},
+                                                 1, 0, QStringLiteral("接続先の V1 クリップがありません"),
+                                                 &noAnchorDetail);
+        std::fprintf(stderr, "connected-clip G25 V1 clip: %s ok=%d | V2 clip with no V1 clip under or before "
+                     "it: %s ok=%d\n", qPrintable(v1Detail), v1Rejected, qPrintable(noAnchorDetail),
+                     noAnchorRejected);
+        tally.gate(25, v1Rejected && noAnchorRejected,
+                   "connecting a V1 clip, or a clip with no V1 clip under or before it, was not rejected "
+                   "with its reason in the status bar and nothing unchanged");
+    }
+
+    // G26: storyline-mode drops connect (media file entry: a text/uri-list QDropEvent sent to
+    // TimelineTrack::dropEvent; clip entry: the cross-track x-vse-clip drop).
+    {
+        QTemporaryDir dir;
+        const QString wavPath = dir.filePath(QStringLiteral("g26.wav"));
+        const QString videoPath = dir.filePath(QStringLiteral("g26.mp4"));
+        QString whyNot;
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(26, qPrintable(whyNot));
+        } else if (!dir.isValid() || !writeWav(wavPath, {{1.0, true}}) || !writeVideoFile(videoPath, 20)) {
+            std::fprintf(stderr, "connected-clip G26 fixture media could not be written\n");
+            tally.gate(26, false, "the G26 fixture media could not be written");
+        } else {
+            auto build = [&](Timeline &tl) {
+                load(tl, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {}, {clipFor("y", 2.0, 7.0)}}, {{}, {}});
+                tl.takeConnectionWarnings();
+            };
+            const QString videoName = QFileInfo(videoPath).fileName();
+            const QString wavName = QFileInfo(wavPath).fileName();
+            // Mode ON: media drops on V2 (t=7, inside b) and A2 (t=6), clip drop V3 -> V2 at 12.
+            Timeline on;
+            build(on);
+            const QString bUid = uidAt(on, 0, 1);
+            on.setStorylineMode(true);
+            const bool v2Accepted = sendMediaDrop(on.trackAt(false, 1), videoPath, 7.0);
+            const bool a2Accepted = sendMediaDrop(on.trackAt(true, 1), wavPath, 6.0);
+            const bool v1Accepted = sendMediaDrop(on.trackAt(false, 0), videoPath, 20.0);
+            const Located v2Clip = locateByName(on, false, videoName);
+            const Located a2Clip = locateByName(on, true, wavName);
+            const bool clipAccepted = sendClipDropOnTrack(on.trackAt(false, 2), 0, on.trackAt(false, 1), 12.0);
+            const Located movedOn = locateByName(on, false, QStringLiteral("y"));
+            const bool onOk = v2Accepted && a2Accepted && !v1Accepted && v2Clip.found && v2Clip.track == 1
+                && near(v2Clip.startSec, 7.0) && v2Clip.clip.anchorUid == bUid
+                && near(v2Clip.clip.anchorOffsetSec, 2.0) && a2Clip.found && a2Clip.track == 1
+                && near(a2Clip.startSec, 6.0) && a2Clip.clip.anchorUid == bUid
+                && near(a2Clip.clip.anchorOffsetSec, 1.0) && on.trackAt(false, 0)->clipCount() == 2
+                && clipAccepted && movedOn.found && movedOn.track == 1 && near(movedOn.startSec, 12.0)
+                && movedOn.clip.anchorUid == bUid && near(movedOn.clip.anchorOffsetSec, 7.0);
+            // Mode OFF: the media drop is refused (MainWindow handles it as before), the clip
+            // drop moves but connects nothing.
+            Timeline off;
+            build(off);
+            off.setStorylineMode(false);
+            const int v2Before = off.trackAt(false, 1)->clipCount();
+            const int a2Before = off.trackAt(true, 1)->clipCount();
+            const bool offV2Accepted = sendMediaDrop(off.trackAt(false, 1), videoPath, 7.0);
+            const bool offA2Accepted = sendMediaDrop(off.trackAt(true, 1), wavPath, 6.0);
+            const bool offClipAccepted = sendClipDropOnTrack(off.trackAt(false, 2), 0, off.trackAt(false, 1), 12.0);
+            const Located movedOff = locateByName(off, false, QStringLiteral("y"));
+            const bool offOk = !offV2Accepted && !offA2Accepted
+                && off.trackAt(false, 1)->clipCount() == v2Before + 1 && off.trackAt(true, 1)->clipCount() == a2Before
+                && offClipAccepted && movedOff.found && movedOff.track == 1 && near(movedOff.startSec, 12.0)
+                && movedOff.clip.anchorUid.isEmpty();
+            // Sub-checks (review fixes): a two-URL drop and a .veditor drop are refused and leave the
+            // track unchanged; a V2 drop past V1's end (t=20, V1 ends at 15) imports unconnected;
+            // with A2 (the linked audio partner of V2) locked, a video-only drop on V2 is accepted
+            // and leaves A2 untouched, while a drop that carries audio is refused; and the
+            // press-and-hold of a V1 move drag settles its repaints (no overlay repaint loop).
+            Timeline sub;
+            build(sub);
+            sub.setStorylineMode(true);
+            const int subV2Before = sub.trackAt(false, 1)->clipCount();
+            const bool multiAccepted = sendMediaDropUrls(sub.trackAt(false, 1), {videoPath, videoPath}, 7.0);
+            // The .veditor name holds a real decodable file, so only the suffix filter refuses it.
+            const QString projectPath = dir.filePath(QStringLiteral("g26.veditor"));
+            QFile::remove(projectPath);
+            const bool projectCopied = QFile::copy(videoPath, projectPath);
+            const bool projectAccepted = sendMediaDrop(sub.trackAt(false, 1), projectPath, 7.0);
+            const int subV2AfterRefused = sub.trackAt(false, 1)->clipCount();
+            const bool gapAccepted = sendMediaDrop(sub.trackAt(false, 1), videoPath, 20.0);
+            const Located gapClip = locateByName(sub, false, videoName);
+            const bool gapOk = gapAccepted && gapClip.found && gapClip.track == 1 && near(gapClip.startSec, 20.0)
+                && gapClip.clip.anchorUid.isEmpty();
+            Timeline lockedTl;
+            build(lockedTl);
+            lockedTl.setStorylineMode(true);
+            lockedTl.trackAt(true, 1)->setLocked(true);
+            const int lockV2Before = lockedTl.trackAt(false, 1)->clipCount();
+            const int lockA2Before = lockedTl.trackAt(true, 1)->clipCount();
+            const bool lockAccepted = sendMediaDrop(lockedTl.trackAt(false, 1), videoPath, 7.0);
+            const int lockV2After = lockedTl.trackAt(false, 1)->clipCount();
+            const int lockA2After = lockedTl.trackAt(true, 1)->clipCount();
+            // Control: a drop that carries audio (the wav) on V2 is refused while A2 is locked,
+            // and accepted (A2 grows) once A2 is unlocked.
+            const bool lockAudioAccepted = sendMediaDrop(lockedTl.trackAt(false, 1), wavPath, 8.0);
+            const int lockCtlV2 = lockedTl.trackAt(false, 1)->clipCount();
+            const int lockCtlA2 = lockedTl.trackAt(true, 1)->clipCount();
+            lockedTl.trackAt(true, 1)->setLocked(false);
+            const bool unlockedAudioAccepted = sendMediaDrop(lockedTl.trackAt(false, 1), wavPath, 8.0);
+            const int unlockedA2 = lockedTl.trackAt(true, 1)->clipCount();
+            // Repaint settle: hold a V1 move drag (press + small move, no release) on a shown timeline.
+            Timeline paintTl;
+            build(paintTl);
+            paintTl.resize(900, 400);
+            paintTl.show();
+            TimelineTrack *paintV1 = paintTl.trackAt(false, 0);
+            auto idleFor200ms = [] {
+                QElapsedTimer t;
+                t.start();
+                while (t.elapsed() < 200) {
+                    QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                    QThread::msleep(5);
+                }
+            };
+            // Precondition: the shown track has painted at least once before the drag starts.
+            for (int i = 0; i < 10 && paintV1->paintCountForTest() == 0; ++i) idleFor200ms();
+            const quint64 paintBase = paintV1->paintCountForTest();
+            const QPointF pressPos(2.5 * paintV1->pixelsPerSecond(), paintV1->height() / 2.0);
+            QMouseEvent press(QEvent::MouseButtonPress, pressPos, pressPos, Qt::LeftButton, Qt::LeftButton,
+                              Qt::NoModifier);
+            QApplication::sendEvent(paintV1, &press);
+            const QPointF movePos = pressPos + QPointF(6.0, 0.0);
+            QMouseEvent move(QEvent::MouseMove, movePos, movePos, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+            QApplication::sendEvent(paintV1, &move);
+            idleFor200ms();  // settle the press / move repaints
+            idleFor200ms();
+            const quint64 paintAfterFirst = paintV1->paintCountForTest();
+            idleFor200ms();
+            const quint64 paintAfterSecond = paintV1->paintCountForTest();
+            QMouseEvent release(QEvent::MouseButtonRelease, movePos, movePos, Qt::LeftButton, Qt::NoButton,
+                                Qt::NoModifier);
+            QApplication::sendEvent(paintV1, &release);
+            const bool paintOk = paintBase > 0
+                && paintAfterSecond == paintAfterFirst;
+            const bool lockOk = lockAccepted && lockV2After == lockV2Before + 1 && lockA2After == lockA2Before
+                && !lockAudioAccepted && lockCtlV2 == lockV2After && lockCtlA2 == lockA2After
+                && unlockedAudioAccepted && unlockedA2 > lockCtlA2;
+            const bool subOk = projectCopied && !multiAccepted && !projectAccepted
+                && subV2AfterRefused == subV2Before && gapOk && lockOk && paintOk;
+            std::fprintf(stderr, "connected-clip G26 sub: multiUrlDrop=%d veditorDrop=%d (copied=%d; expect 0/0) V2 clips "
+                         "%d -> %d (expect unchanged) gapDrop=%d gap[%s] anchorUid='%s' (expect empty) "
+                         "lockedA2: videoDrop=%d V2 %d -> %d A2 %d -> %d (expect 1, V2 +1, A2 unchanged) "
+                         "audioDrop=%d (expect 0) V2 %d A2 %d (expect unchanged) unlockedAudioDrop=%d A2 %d "
+                         "(expect 1, A2 grows) lockOk=%d | paint counts base=%llu afterIdle1=%llu "
+                         "afterIdle2=%llu (expect idle2 == idle1 > 0) paintOk=%d | ok=%d\n",
+                         multiAccepted, projectAccepted, projectCopied, subV2Before, subV2AfterRefused,
+                         gapAccepted, qPrintable(describe(gapClip, QString())),
+                         qPrintable(gapClip.clip.anchorUid), lockAccepted, lockV2Before, lockV2After,
+                         lockA2Before, lockA2After, lockAudioAccepted, lockCtlV2, lockCtlA2,
+                         unlockedAudioAccepted, unlockedA2, lockOk, static_cast<unsigned long long>(paintBase),
+                         static_cast<unsigned long long>(paintAfterFirst),
+                         static_cast<unsigned long long>(paintAfterSecond), paintOk, subOk);
+            std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/0) v2[%s] "
+                         "a2[%s] clipDrop=%d y[%s] ok=%d | OFF: v2Drop=%d a2Drop=%d (expect 0/0) V2 clips "
+                         "%d -> %d (expect +1 from the clip drop only) A2 clips %d -> %d clipDrop=%d y[%s] "
+                         "ok=%d\n", v2Accepted, a2Accepted, v1Accepted, qPrintable(describe(v2Clip, bUid)),
+                         qPrintable(describe(a2Clip, bUid)), clipAccepted, qPrintable(describe(movedOn, bUid)),
+                         onOk, offV2Accepted, offA2Accepted, v2Before, off.trackAt(false, 1)->clipCount(),
+                         a2Before, off.trackAt(true, 1)->clipCount(), offClipAccepted,
+                         qPrintable(describe(movedOff, bUid)), offOk);
+            tally.gate(26, onOk && offOk && subOk,
+                       "a storyline-mode drop did not connect to the V1 clip under it, or the mode-off "
+                       "media drop was taken / the mode-off clip drop connected / a multi-file or project drop was "
+                       "taken, a gap drop connected, or a drop landed audio on a locked partner track / a video-only drop was refused by it, or a held V1 move drag kept repainting");
+        }
     }
 
     return tally.finish("connected-clip");
