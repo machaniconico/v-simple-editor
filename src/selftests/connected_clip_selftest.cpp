@@ -2,19 +2,27 @@
 #include "../MainWindow.h"
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
+#include "../RenderInPlace.h"
 #include "../Timeline.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
+#include "../libavcore/Probe.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpToolRegistry.h"
 #include "SelftestGate.h"
 
+#include <QAbstractButton>
+#include <QApplication>
+#include <QDataStream>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMessageBox>
 #include <QTemporaryDir>
+#include <QTimer>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -77,6 +85,56 @@
 //       (c) linear anchor: ripple head trim d -> -d, non-ripple head trim -> 0,
 //       speed 2x -> same source frame, (d) reversed anchor ripple head trim ->
 //       no move and no warning.
+// US-1214 (copy paths, explicit delete, track operations):
+//   G12: blading the connected clip leaves the right piece in place, connected,
+//       offset = original + left length; with setRederiveDisabledForTest the
+//       right piece is pulled back onto the left one (control fails); cutting the
+//       anchor and the connected clip together (blade all at 5, all-track ripple
+//       of [4,6)) connects the right piece to the V1 piece starting at its start
+//       at offset 0; one all-track ripple of [2,3) and [5,6) through a linked
+//       V2+A2 pair connected at 0 connects each cut's remnants to the V1 piece
+//       starting with them, and deleting the piece at 2 takes only its remnants.
+//   G13: blading the anchor moves the connections at / after the cut to the
+//       right piece (offset - cut), the left ones stay; a V1-only ripple of
+//       [6,7] on a reversed anchor keeps the timeline-3.5 connection on the left
+//       piece, deletes the one at local [6,7) and moves the one at 8 with the
+//       right piece to 7 (a source-second judge deletes the 3.5 one, no
+//       reconcile keeps the [6,7) one); the [0,4) / [4,8) remnants of a V2-only
+//       ripple of [4,6) through a linked V2 clip go to the left / right piece of
+//       a later blade at 3 by their own points, and deleting the left piece
+//       takes only [0,4) (one point per linked group fails this).
+//   G14: duplicate / paste / createSequenceFromClip results carry no anchorUid
+//       (and no warning) while the original stays connected (a value copy
+//       keeps the anchor).
+//   G15: baking a connected V2+A2 group keeps both uids and connections, and
+//       decompose keeps them; an anchor reconnected after the bake survives the
+//       decompose (restoring the snapshot's anchor fails); baking the V1 anchor
+//       (handles change its source mapping) keeps the connection in place.
+//   G16: delete_clip (MCP) / overwrite cover / V1-only ripple of the anchor
+//       delete the connected V2+A2 group and keep an unconnected clip; R1: a
+//       connection outside the deleted span ([3,6] with offset 8, [0,3] with
+//       offset -1) stays detached with one warning.
+//   G17: a V1 replaced through setClips (simulated MultiCam, no undo point)
+//       detaches the connection on the next unrelated saveUndoState with one
+//       warning (deleting on a baseline difference loses the clip).
+//   G18: pre-compose across the anchor and a connected clip: the connection
+//       after the range stays on the left remainder in place with no warning,
+//       and in the nested sequence the range piece is connected to the nested
+//       V1 piece.
+//   G19: connecting a linked V2+A2 pair connects both; a V1 insert moves both
+//       and leaves an unlinked A2 clip; a V1 split between the members of a
+//       non-overlapping linked pair keeps both on the left piece (the group's
+//       earliest point) in place, and deleting that piece deletes both.
+//   G20: removeTrack(V1) / moveTrack(V1 -> V3) / moveTrack(V2 -> V1) are
+//       rejected unchanged with connections (succeed without: control); a
+//       locked V2 connection detaches with a warning on a V1 insert and on an
+//       explicit anchor delete; a cross-track drop of the anchor detaches the
+//       linked group with one warning.
+//   G21: insertAudioClipAtPlayhead splitting a connected A2 clip keeps both
+//       pieces where the edit put them, connected (control as in G12).
+//   G22: a silence cut of a V1 anchor (3 pieces): the piece-1 connection stays,
+//       the one in a removed span detaches with one warning, the piece-3 one
+//       follows the packed piece 3 at the same local position.
 namespace {
 
 ClipInfo clipFor(const QString &name, double duration, double leadInSec = 0.0)
@@ -169,6 +227,81 @@ QJsonObject callTool(mcp::McpToolRegistry &registry, const QString &name,
     const QJsonObject result = registry.callTool(name, args, &found, err);
     if (!found) *err = QStringLiteral("tool not found: ") + name;
     return result;
+}
+
+// The first clip named `name` whose uid is not `exceptUid` (a split's other piece).
+Located locateOther(const Timeline &timeline, bool audio, const QString &name,
+                    const QString &exceptUid)
+{
+    const auto &tracks = audio ? timeline.audioTracks() : timeline.videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        double cursor = 0.0;
+        const auto &clips = tracks[t]->clips();
+        for (int i = 0; i < clips.size(); ++i) {
+            cursor += clips[i].leadInSec;
+            if (clips[i].displayName == name && clips[i].uid != exceptUid)
+                return {true, t, i, cursor, clips[i]};
+            cursor += clips[i].effectiveDuration();
+        }
+    }
+    return {};
+}
+
+QString describe(const Located &l, const QString &anchorUid)
+{
+    return l.found ? QStringLiteral("track=%1 start=%2 offset=%3 anchored=%4")
+                         .arg(l.track).arg(l.startSec, 0, 'f', 6)
+                         .arg(l.clip.anchorOffsetSec, 0, 'f', 6).arg(int(l.clip.anchorUid == anchorUid))
+                   : QStringLiteral("missing");
+}
+
+// 48 kHz mono 16-bit PCM: each segment is (seconds, 440 Hz tone or silence).
+bool writeWav(const QString &path, const QVector<QPair<double, bool>> &segments)
+{
+    constexpr int kRate = 48000;
+    QVector<qint16> samples;
+    for (const auto &segment : segments) {
+        const int count = qRound(segment.first * kRate);
+        for (int i = 0; i < count; ++i) {
+            const double t = double(samples.size()) / kRate;
+            samples.append(segment.second
+                ? qint16(12000.0 * std::sin(2.0 * 3.14159265358979323846 * 440.0 * t)) : qint16(0));
+        }
+    }
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+    QDataStream out(&file);
+    out.setByteOrder(QDataStream::LittleEndian);
+    const quint32 dataBytes = quint32(samples.size() * 2);
+    out.writeRawData("RIFF", 4);
+    out << quint32(36 + dataBytes);
+    out.writeRawData("WAVEfmt ", 8);
+    out << quint32(16) << quint16(1) << quint16(1) << quint32(kRate) << quint32(kRate * 2)
+        << quint16(2) << quint16(16);
+    out.writeRawData("data", 4);
+    out << dataBytes;
+    for (const qint16 sample : samples) out << sample;
+    return out.status() == QDataStream::Ok;
+}
+
+// Answers every message box that `run` opens: Yes when offered, else closes it.
+QStringList answeringMessageBoxes(QObject *context, const std::function<void()> &run)
+{
+    QStringList seen;
+    QTimer timer;
+    timer.setInterval(20);
+    QObject::connect(&timer, &QTimer::timeout, context, [&seen] {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        if (!box) return;
+        seen.append(box->text());
+        if (QAbstractButton *yes = box->button(QMessageBox::Yes)) yes->click();
+        else box->done(QMessageBox::Ok);
+    });
+    timer.start();
+    run();
+    timer.stop();
+    return seen;
 }
 
 } // namespace
@@ -1074,6 +1207,848 @@ int runConnectedClipSelftest()
                    && reversedWarnings == 0,
                    "a connection did not follow the anchor's source frame (linear) or offset "
                    "(non-linear)");
+    }
+
+    // G12: blade the connected clip (V2 [2,6] connected at offset 2) at 4.
+    {
+        auto blade = [](bool disableRederive, QString *detail) {
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {clipFor("x", 4.0, 2.0)}, {}});
+            const QString anchor = uidAt(tl, 0, 0);
+            const QString xUid = uidAt(tl, 1, 0);
+            tl.connectClip(TrackKind::Video, 1, 0, anchor);
+            tl.setRederiveDisabledForTest(disableRederive);
+            QString err;
+            const bool split = tl.splitClipByIndex(false, 1, 0, 4.0, &err);
+            const Located left = locate(tl, false, xUid);
+            const Located right = locateOther(tl, false, QStringLiteral("x"), xUid);
+            *detail = QStringLiteral("split=%1 [%2] left[%3] right[%4]").arg(int(split)).arg(err,
+                describe(left, anchor), describe(right, anchor));
+            return split && left.track == 1 && near(left.startSec, 2.0) && left.clip.anchorUid == anchor
+                && near(left.clip.anchorOffsetSec, 2.0) && right.found && right.track == 1
+                && near(right.startSec, 4.0) && right.clip.anchorUid == anchor
+                && near(right.clip.anchorOffsetSec, 4.0);
+        };
+        QString detail, controlDetail;
+        const bool ok = blade(false, &detail);
+        const bool control = blade(true, &controlDetail);
+        std::fprintf(stderr, "connected-clip G12 %s (expect left 1/2/offset 2, right 1/4/offset 4, both "
+                     "anchored) ok=%d | control (re-derive disabled) %s ok=%d (expect 0)\n",
+                     qPrintable(detail), ok, qPrintable(controlDetail), control);
+        // Anchor and connected clip cut together (V1 [0,10), V2 [2,8) at offset 2): the
+        // connected right piece goes to the V1 piece that now starts at its start.
+        auto combined = [](bool ripple, QString *detail) {
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {clipFor("x", 6.0, 2.0)}}, {{clipFor("r", 2.0, 4.0)}});
+            const QString anchor = uidAt(tl, 0, 0);
+            const QString xUid = uidAt(tl, 1, 0);
+            tl.connectClip(TrackKind::Video, 1, 0, anchor);
+            double expectStart = 5.0;
+            if (ripple) {
+                // (ii) all-track ripple of [4,6) through the selected A1 clip.
+                tl.trackAt(true, 0)->setSelectedClip(0);
+                tl.rippleDeleteSelectedClip();
+                expectStart = 4.0;
+            } else {
+                // (i) blade every track at 5.
+                tl.setPlayheadPosition(5.0);
+                tl.bladeAllTracksAtPlayhead();
+            }
+            const QString pieceUid = uidAt(tl, 0, 1);
+            const Located right = locateOther(tl, false, QStringLiteral("x"), xUid);
+            *detail = QStringLiteral("%1: v1Clips=%2 v1Piece=%3 right[%4] anchorUid=%5 anchorOffsetSec=%6 "
+                                     "(expect start %7, anchorUid == v1Piece, offset 0)")
+                .arg(ripple ? QStringLiteral("(ii) ripple [4,6)") : QStringLiteral("(i) blade all at 5"))
+                .arg(tl.trackAt(false, 0)->clipCount()).arg(pieceUid, describe(right, pieceUid),
+                     right.clip.anchorUid).arg(right.clip.anchorOffsetSec, 0, 'f', 6).arg(expectStart);
+            return tl.trackAt(false, 0)->clipCount() == 2 && !pieceUid.isEmpty() && pieceUid != anchor
+                && right.found && right.track == 1 && near(right.startSec, expectStart)
+                && right.clip.anchorUid == pieceUid && near(right.clip.anchorOffsetSec, 0.0);
+        };
+        QString bladeDetail, rippleDetail;
+        const bool bladeOk = combined(false, &bladeDetail);
+        const bool rippleOk = combined(true, &rippleDetail);
+        std::fprintf(stderr, "connected-clip G12 combined %s ok=%d | %s ok=%d\n",
+                     qPrintable(bladeDetail), bladeOk, qPrintable(rippleDetail), rippleOk);
+        // One all-track ripple of [2,3) and [5,6) (two selected A clips) through V1 [0,10)
+        // and a linked V2+A2 pair [0,10) connected at 0: each cut's remnants go to the
+        // V1 piece that starts with them, and deleting one piece takes only its own.
+        bool cutsOk = false;
+        QString cutsDetail;
+        {
+            ClipInfo x = clipFor("x", 10.0);
+            ClipInfo xa = clipFor("xa", 10.0);
+            x.linkGroup = xa.linkGroup = 51;
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {x}},
+                 {{clipFor("r1", 1.0, 2.0)}, {xa}, {clipFor("r2", 1.0, 5.0)}});
+            const QString anchor = uidAt(tl, 0, 0);
+            tl.connectClip(TrackKind::Video, 1, 0, anchor);
+            tl.clearSelection();
+            tl.trackAt(true, 0)->toggleClipSelection(0);
+            tl.trackAt(true, 2)->toggleClipSelection(0);
+            tl.rippleDeleteSelectedClip();
+            const int v1Pieces = tl.trackAt(false, 0)->clipCount();
+            const QString piece2 = uidAt(tl, 0, 1);
+            const QString piece4 = uidAt(tl, 0, 2);
+            // The x / xa pieces starting at `startSec`, each anchored to `pieceUid` at 0.
+            auto at = [&](double startSec, const QString &pieceUid, int *count) {
+                bool anchored = true;
+                *count = 0;
+                for (const bool audio : {false, true}) {
+                    const TimelineTrack *track = tl.trackAt(audio, 1);
+                    double cursor = 0.0;
+                    for (const ClipInfo &clip : track->clips()) {
+                        cursor += clip.leadInSec;
+                        if (near(cursor, startSec)) {
+                            ++*count;
+                            anchored = anchored && clip.anchorUid == pieceUid
+                                && near(clip.anchorOffsetSec, 0.0);
+                        }
+                        cursor += clip.effectiveDuration();
+                    }
+                }
+                return anchored && *count == 2;
+            };
+            int n2 = 0, n4 = 0;
+            const bool at2 = at(2.0, piece2, &n2);
+            const bool at4 = at(4.0, piece4, &n4);
+            QString err;
+            const bool deleted = tl.deleteClipByIndex(false, 0, 1, false, &err);
+            int gone2 = 0, kept4 = 0;
+            at(2.0, piece2, &gone2);
+            const bool stay4 = at(4.0, piece4, &kept4);
+            cutsDetail = QStringLiteral("v1Pieces=%1 (expect 3) (i) at2=%2 n=%3 (ii) at4=%4 n=%5 (iii) deleted=%6 [%7] "
+                                        "left at2=%8 (expect 0) at4 connected=%9 n=%10")
+                .arg(v1Pieces).arg(int(at2)).arg(n2).arg(int(at4)).arg(n4)
+                .arg(int(deleted)).arg(err).arg(gone2).arg(int(stay4)).arg(kept4);
+            cutsOk = v1Pieces == 3 && !piece2.isEmpty() && !piece4.isEmpty() && piece2 != piece4 && at2 && at4
+                && deleted && gone2 == 0 && stay4;
+        }
+        std::fprintf(stderr, "connected-clip G12 two-cut ripple %s ok=%d\n", qPrintable(cutsDetail),
+                     cutsOk);
+        // An all-track ripple of [1,2) (selected unconnected A3 clip) through V1 [0,10) and a
+        // linked V2 [3,8) + A2 [0,10) pair connected at 0: the known V2 clip and the A2 right
+        // piece it overlaps go to the right V1 piece together, the A2 left piece stays on the
+        // left one, and deleting the left V1 piece leaves the V2 clip.
+        bool overlapOk = false;
+        QString overlapDetail;
+        {
+            ClipInfo x = clipFor("x", 5.0, 3.0);
+            ClipInfo xa = clipFor("xa", 10.0);
+            x.linkGroup = xa.linkGroup = 52;
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {x}}, {{}, {xa}, {clipFor("r", 1.0, 1.0)}});
+            const QString anchor = uidAt(tl, 0, 0);
+            const QString xUid = uidAt(tl, 1, 0);
+            const QString xaUid = tl.trackAt(true, 1)->clips().value(0).uid;
+            tl.connectClip(TrackKind::Video, 1, 0, anchor);
+            tl.clearSelection();
+            tl.trackAt(true, 2)->toggleClipSelection(0);
+            tl.rippleDeleteSelectedClip();
+            const int v1Pieces = tl.trackAt(false, 0)->clipCount();
+            const QString rightPiece = uidAt(tl, 0, 1);
+            const Located xNow = locate(tl, false, xUid);
+            const Located xaLeft = locate(tl, true, xaUid);
+            const Located xaRight = locateOther(tl, true, QStringLiteral("xa"), xaUid);
+            const bool together = xNow.found && xNow.track == 1 && near(xNow.startSec, 2.0)
+                && xaRight.found && xaRight.track == 1 && near(xaRight.startSec, 1.0)
+                && !rightPiece.isEmpty() && rightPiece != anchor
+                && xNow.clip.anchorUid == rightPiece && xaRight.clip.anchorUid == rightPiece;
+            const bool leftKept = xaLeft.found && xaLeft.track == 1 && near(xaLeft.startSec, 0.0)
+                && xaLeft.clip.anchorUid == anchor;
+            QString err;
+            const bool deleted = tl.deleteClipByIndex(false, 0, 0, false, &err);
+            const Located xAfter = locate(tl, false, xUid);
+            const Located xaRightAfter = locateOther(tl, true, QStringLiteral("xa"), xaUid);
+            const bool xKept = xAfter.found && near(xAfter.startSec, 2.0) && xaRightAfter.found;
+            overlapDetail = QStringLiteral("v1Pieces=%1 (expect 2) rightPiece=%2 (i) x[%3] (expect start 2) "
+                                           "xaRight[%4] (expect start 1) together=%5 (ii) xaLeft[%6] (expect "
+                                           "start 0 on the left piece) kept=%7 (iii) deleted=%8 [%9] x[%10] "
+                                           "xaRight found=%11 (expect x at 2, both found)")
+                .arg(v1Pieces).arg(rightPiece, describe(xNow, rightPiece), describe(xaRight, rightPiece))
+                .arg(int(together)).arg(describe(xaLeft, anchor)).arg(int(leftKept)).arg(int(deleted))
+                .arg(err, describe(xAfter, rightPiece)).arg(int(xaRightAfter.found));
+            overlapOk = v1Pieces == 2 && together && leftKept && deleted && xKept;
+        }
+        std::fprintf(stderr, "connected-clip G12 asymmetric overlap %s ok=%d\n", qPrintable(overlapDetail),
+                     overlapOk);
+        tally.gate(12, ok && !control && bladeOk && rippleOk && cutsOk && overlapOk,
+                   "the right piece of a bladed connected clip moved or did not get offset = "
+                   "original + left length, the re-derive-disabled control still passed, or a "
+                   "connected clip cut together with its anchor left its right piece on the left "
+                   "anchor piece, or the remnants of two cuts in one ripple were judged as one "
+                   "group, or a linked member and the split piece it overlaps went to different "
+                   "anchor pieces");
+    }
+
+    // G13: blade the anchor; V1-only ripple through a reversed anchor.
+    {
+        Timeline tl;
+        load(tl, {{clipFor("a", 10.0)}, {clipFor("p", 1.0, 2.0), clipFor("q", 1.0, 3.0)}});
+        const QString aUid = uidAt(tl, 0, 0);
+        const QString pUid = uidAt(tl, 1, 0);
+        const QString qUid = uidAt(tl, 1, 1);
+        tl.connectClip(TrackKind::Video, 1, 0, aUid);
+        tl.connectClip(TrackKind::Video, 1, 1, aUid);
+        QString err;
+        const bool split = tl.splitClipByIndex(false, 0, 0, 5.0, &err);
+        const QString rightUid = uidAt(tl, 0, 1);
+        const Located p = locate(tl, false, pUid);
+        const Located q = locate(tl, false, qUid);
+        const bool bladeOk = split && !rightUid.isEmpty() && rightUid != aUid
+            && near(p.startSec, 2.0) && p.clip.anchorUid == aUid && near(p.clip.anchorOffsetSec, 2.0)
+            && near(q.startSec, 6.0) && q.clip.anchorUid == rightUid && near(q.clip.anchorOffsetSec, 1.0);
+        std::fprintf(stderr, "connected-clip G13 (1) blade at 5: split=%d [%s] p[%s] (expect left, start 2, "
+                     "offset 2) q[%s] onRight=%d (expect start 6, offset 1 on the right piece) ok=%d\n",
+                     split, qPrintable(err), qPrintable(describe(p, aUid)), qPrintable(describe(q, rightUid)),
+                     q.clip.anchorUid == rightUid, bladeOk);
+
+        // Reversed anchor in 0 / out 10 / speed 1; V2: c35 [3.5,3.8], c65 [6.5,6.8],
+        // c8 [8,8.5] connected, u [9,9.5] unconnected. Ripple [6,7] on V1 only.
+        ClipInfo reversed = clipFor("rev", 10.0);
+        reversed.reversed = true;
+        Timeline rt;
+        load(rt, {{reversed}, {clipFor("c35", 0.3, 3.5), clipFor("c65", 0.3, 2.7),
+                               clipFor("c8", 0.5, 1.2), clipFor("u", 0.5, 0.5)}});
+        const QString revUid = uidAt(rt, 0, 0);
+        for (int i = 0; i < 3; ++i) rt.connectClip(TrackKind::Video, 1, i, revUid);
+        rt.takeConnectionWarnings();
+        rt.rippleDeleteTimeRangeActive(6.0, 7.0);
+        const QStringList warnings = rt.takeConnectionWarnings();
+        const QString revRight = uidAt(rt, 0, 1);
+        const Located c35 = locateByName(rt, false, QStringLiteral("c35"));
+        const Located c65 = locateByName(rt, false, QStringLiteral("c65"));
+        const Located c8 = locateByName(rt, false, QStringLiteral("c8"));
+        const Located u = locateByName(rt, false, QStringLiteral("u"));
+        const bool leftOk = rt.trackAt(false, 0)->clipCount() == 2 && c35.found
+            && near(c35.startSec, 3.5) && c35.clip.anchorUid == revUid && near(c35.clip.anchorOffsetSec, 3.5)
+            && c8.found && near(c8.startSec, 7.0) && c8.clip.anchorUid == revRight
+            && near(c8.clip.anchorOffsetSec, 1.0) && u.found && near(u.startSec, 9.0)
+            && warnings.isEmpty();
+        const bool deletedOk = !c65.found;
+        std::fprintf(stderr, "connected-clip G13 (2) reversed ripple [6,7]: v1Clips=%d (expect 2) c35[%s] "
+                     "(expect start 3.5 offset 3.5 on the left piece) c8[%s] onRight=%d (expect start 7 "
+                     "offset 1 on the right piece) u start=%.6f (expect 9) warnings=%lld (expect 0) ok=%d "
+                     "(3) c65 found=%d (expect 0, local [6,7) deleted)\n",
+                     rt.trackAt(false, 0)->clipCount(), qPrintable(describe(c35, revUid)),
+                     qPrintable(describe(c8, revRight)), c8.clip.anchorUid == revRight, u.startSec,
+                     static_cast<long long>(warnings.size()), leftOk, c65.found);
+
+        // (4) Remnants of an earlier edit: a V2-only ripple of [4,6) through a linked V2 [0,10)
+        // connected at 0 leaves pieces [0,4) / [4,8) that the commit records at offsets 0 / 4.
+        // Blading V1 at 3 then routes each by its own point (the [4,8) piece to the right
+        // piece at 1), and deleting the left V1 piece takes only the [0,4) piece.
+        bool remnantOk = false;
+        QString remnantDetail;
+        {
+            ClipInfo x = clipFor("x", 10.0);
+            x.linkGroup = 53;
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {x}});
+            const QString anchor = uidAt(tl, 0, 0);
+            const QString xUid = uidAt(tl, 1, 0);
+            tl.connectClip(TrackKind::Video, 1, 0, anchor);
+            QString selectErr;
+            const bool selected = tl.selectClipByIndex(false, 1, 0, &selectErr);
+            tl.rippleDeleteTimeRangeActive(4.0, 6.0);
+            tl.clearSelection();
+            const Located left0 = locate(tl, false, xUid);
+            const Located right0 = locateOther(tl, false, QStringLiteral("x"), xUid);
+            const bool rippled = selected && tl.trackAt(false, 0)->clipCount() == 1
+                && left0.found && near(left0.startSec, 0.0) && near(left0.clip.anchorOffsetSec, 0.0)
+                && right0.found && near(right0.startSec, 4.0) && near(right0.clip.anchorOffsetSec, 4.0)
+                && left0.clip.anchorUid == anchor && right0.clip.anchorUid == anchor
+                && left0.clip.linkGroup == 53 && right0.clip.linkGroup == 53;
+            QString err;
+            const bool cut = tl.splitClipByIndex(false, 0, 0, 3.0, &err);
+            const QString rightPiece = uidAt(tl, 0, 1);
+            const Located left1 = locate(tl, false, xUid);
+            const Located right1 = locateOther(tl, false, QStringLiteral("x"), xUid);
+            const bool routed = cut && !rightPiece.isEmpty() && rightPiece != anchor
+                && left1.found && near(left1.startSec, 0.0) && left1.clip.anchorUid == anchor
+                && near(left1.clip.anchorOffsetSec, 0.0)
+                && right1.found && near(right1.startSec, 4.0) && right1.clip.anchorUid == rightPiece
+                && near(right1.clip.anchorOffsetSec, 1.0);
+            QString delErr;
+            const bool deleted = tl.deleteClipByIndex(false, 0, 0, false, &delErr);
+            const Located left2 = locate(tl, false, xUid);
+            const Located right2 = locateOther(tl, false, QStringLiteral("x"), xUid);
+            const bool deleteOk = deleted && !left2.found && right2.found && near(right2.startSec, 4.0)
+                && right2.clip.anchorUid == rightPiece && near(right2.clip.anchorOffsetSec, 1.0);
+            remnantDetail = QStringLiteral("(i) selected=%1 [%2] ripple left[%3] (expect start 0 offset 0) "
+                                           "right[%4] (expect start 4 offset 4) ok=%5 (ii) blade at 3 "
+                                           "split=%6 [%7] left[%8] (expect start 0 offset 0 on the left "
+                                           "piece) right[%9] (expect start 4 offset 1 on the right piece) "
+                                           "ok=%10 (iii) delete left piece=%11 [%12] left found=%13 "
+                                           "(expect 0) right[%14] (expect start 4 offset 1 on the right "
+                                           "piece) ok=%15")
+                .arg(int(selected)).arg(selectErr, describe(left0, anchor), describe(right0, anchor))
+                .arg(int(rippled)).arg(int(cut)).arg(err, describe(left1, anchor),
+                                                     describe(right1, rightPiece))
+                .arg(int(routed)).arg(int(deleted)).arg(delErr).arg(int(left2.found))
+                .arg(describe(right2, rightPiece)).arg(int(deleteOk));
+            remnantOk = rippled && routed && deleteOk;
+        }
+        std::fprintf(stderr, "connected-clip G13 (4) earlier-edit remnants %s ok=%d\n",
+                     qPrintable(remnantDetail), remnantOk);
+        tally.gate(13, bladeOk && leftOk && deletedOk && remnantOk,
+                   "an anchor split did not move the connections at / after the cut to the right "
+                   "piece, or a middle ripple of a reversed anchor dropped a connection outside "
+                   "the span, kept the one inside it or left the one after it behind, or the "
+                   "remnants of an earlier edit of a linked clip were routed or deleted by one "
+                   "shared point");
+    }
+
+    // G14: duplicate / paste / createSequenceFromClip do not copy the connection.
+    {
+        Timeline tl;
+        load(tl, {{clipFor("a", 10.0), clipFor("p", 2.0)}, {clipFor("x", 1.0, 2.0)}});
+        const QString aUid = uidAt(tl, 0, 0);
+        const QString xUid = uidAt(tl, 1, 0);
+        tl.connectClip(TrackKind::Video, 1, 0, aUid);
+        tl.takeConnectionWarnings();
+        // Duplicate the connected V2 clip.
+        for (int t = 0; t < tl.videoTrackCount(); ++t) tl.trackAt(false, t)->setSelectedClip(t == 1 ? 0 : -1);
+        for (int t = 0; t < tl.audioTrackCount(); ++t) tl.trackAt(true, t)->setSelectedClip(-1);
+        tl.duplicateSelectedClips();
+        const Located dup = locateOther(tl, false, QStringLiteral("x"), xUid);
+        const Located original = locate(tl, false, xUid);
+        const bool dupOk = dup.found && dup.clip.anchorUid.isEmpty() && original.clip.anchorUid == aUid;
+        // Paste a clipboard clip that carries a connection (seeded on the V1 source).
+        TimelineTrack *v1 = tl.trackAt(false, 0);
+        QVector<ClipInfo> v1Clips = v1->clips();
+        v1Clips[1].anchorUid = aUid;
+        v1Clips[1].anchorOffsetSec = 10.0;
+        v1->setClips(v1Clips);
+        for (int t = 0; t < tl.videoTrackCount(); ++t) tl.trackAt(false, t)->setSelectedClip(t == 0 ? 1 : -1);
+        tl.copySelectedClip();
+        tl.pasteClip();
+        int pastedVideo = 0, pastedAnchored = 0, pastedAudio = 0;
+        for (const bool audio : {false, true}) {
+            const auto &tracks = audio ? tl.audioTracks() : tl.videoTracks();
+            for (const TimelineTrack *track : tracks) {
+                for (const ClipInfo &clip : track->clips()) {
+                    if (clip.displayName != QStringLiteral("p")) continue;
+                    (audio ? pastedAudio : pastedVideo) += 1;
+                    pastedAnchored += !clip.anchorUid.isEmpty();
+                }
+            }
+        }
+        const Located afterPaste = locate(tl, false, xUid);
+        const bool pasteOk = pastedVideo == 2 && pastedAudio == 1 && pastedAnchored == 0
+            && afterPaste.clip.anchorUid == aUid;
+        const QStringList pasteWarnings = tl.takeConnectionWarnings();
+        // A new sequence from the connected clip (real media for the probe).
+        ClipInfo media = clipFor("media", 1.0, 2.0);
+        media.filePath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        Timeline st;
+        load(st, {{clipFor("a", 10.0)}, {media}});
+        const QString sAnchor = uidAt(st, 0, 0);
+        st.connectClip(TrackKind::Video, 1, 0, sAnchor);
+        st.takeConnectionWarnings();
+        const ClipInfo source = st.trackAt(false, 1)->clips().at(0);
+        const QString mainId = st.activeSequenceId().isEmpty() ? QStringLiteral("main") : st.activeSequenceId();
+        const bool created = st.createSequenceFromClip(source);
+        const QStringList seqWarnings = st.takeConnectionWarnings();
+        int newClips = 0, newAnchored = 0;
+        for (const bool audio : {false, true})
+            for (const TimelineTrack *track : audio ? st.audioTracks() : st.videoTracks())
+                for (const ClipInfo &clip : track->clips()) {
+                    ++newClips;
+                    newAnchored += !clip.anchorUid.isEmpty();
+                }
+        bool sourceKept = false;
+        for (const TimelineSequence &sequence : st.sequences())
+            if (sequence.id != st.activeSequenceId() && sequence.videoTracks.size() > 1
+                && !sequence.videoTracks[1].isEmpty())
+                sourceKept = sequence.videoTracks[1][0].anchorUid == sAnchor;
+        const bool sequenceOk = created && newClips >= 1 && newAnchored == 0 && seqWarnings.isEmpty()
+            && sourceKept;
+        std::fprintf(stderr, "connected-clip G14 duplicate found=%d anchorUid=[%s] (expect empty) original "
+                     "anchored=%d ok=%d | paste video=%d audio=%d anchored=%d (expect 2/1/0) original "
+                     "anchored=%d warnings=%lld ok=%d | createSequenceFromClip created=%d mainId=%s "
+                     "clips=%d anchored=%d (expect 0) warnings=%lld (expect 0) sourceKept=%d ok=%d\n",
+                     dup.found, qPrintable(dup.clip.anchorUid), original.clip.anchorUid == aUid, dupOk,
+                     pastedVideo, pastedAudio, pastedAnchored, afterPaste.clip.anchorUid == aUid,
+                     static_cast<long long>(pasteWarnings.size()), pasteOk, created, qPrintable(mainId),
+                     newClips, newAnchored, static_cast<long long>(seqWarnings.size()), sourceKept,
+                     sequenceOk);
+        tally.gate(14, dupOk && pasteOk && sequenceOk,
+                   "a duplicate / paste / new sequence copied the source's connection, or the "
+                   "original lost it");
+    }
+
+    // G15: bake / decompose a connected V2+A2 group, then the V1 anchor.
+    {
+        QTemporaryDir dir;
+        const QString mediaPath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto mediaUs = libavcore::probeDurationMicroseconds(mediaPath.toStdString());
+        const QString tonePath = dir.filePath(QStringLiteral("g15-tone.wav"));
+        const bool ready = dir.isValid() && mediaUs && *mediaUs >= 3000000
+            && writeWav(tonePath, {{4.0, true}});
+        bool ok = false;
+        if (!ready) {
+            std::fprintf(stderr, "connected-clip G15 setup failed: dir=%d media=%s duration=%lld\n",
+                         dir.isValid(), qPrintable(mediaPath),
+                         static_cast<long long>(mediaUs ? *mediaUs : -1));
+        } else {
+            auto media = [&](const QString &name, double in, double out, double leadIn) {
+                ClipInfo clip = clipFor(name, out - in, leadIn);
+                clip.filePath = mediaPath;
+                clip.duration = double(*mediaUs) / 1000000.0;
+                clip.inPoint = in;
+                clip.outPoint = out;
+                return clip;
+            };
+            ClipInfo x = media(QStringLiteral("x"), 1.0, 2.0, 0.5);
+            x.linkGroup = 71;
+            ClipInfo xa = clipFor(QStringLiteral("xa"), 1.0, 0.5);
+            xa.filePath = tonePath;
+            xa.duration = 4.0;
+            xa.inPoint = 1.0;
+            xa.outPoint = 2.0;
+            xa.linkGroup = 71;
+            Timeline tl;
+            load(tl, {{media(QStringLiteral("a"), 0.0, 1.5, 0.0), media(QStringLiteral("b"), 1.0, 2.0, 0.0)}, {x}},
+                 {{}, {xa}});
+            const QString aUid = uidAt(tl, 0, 0);
+            const QString bUid = uidAt(tl, 0, 1);
+            const QString xUid = uidAt(tl, 1, 0);
+            const QString xaUid = tl.trackAt(true, 1)->clips().at(0).uid;
+            tl.connectClip(TrackKind::Video, 1, 0, aUid);
+            tl.takeConnectionWarnings();
+            auto groupState = [&](const QString &anchor) {
+                const Located v = locate(tl, false, xUid);
+                const Located a = locate(tl, true, xaUid);
+                return std::make_pair(v.found && a.found && near(v.startSec, 0.5) && near(a.startSec, 0.5)
+                                          && v.clip.anchorUid == anchor && a.clip.anchorUid == anchor,
+                                      QStringLiteral("x[%1] baked=%2 xa[%3] baked=%4")
+                                          .arg(describe(v, anchor)).arg(int(bool(v.clip.renderInPlaceOriginal)))
+                                          .arg(describe(a, anchor)).arg(int(bool(a.clip.renderInPlaceOriginal))));
+            };
+            renderinplace::Options options;
+            options.outputDir = dir.path();
+            options.outputSize = QSize(640, 360);
+            options.fps = 30;
+            QString path, error;
+            const bool baked = renderinplace::renderClipInPlace(tl, 1, 0, options, &path, &error);
+            const auto afterBake = groupState(aUid);
+            const bool bakedFlags = locate(tl, false, xUid).clip.renderInPlaceOriginal
+                && locate(tl, true, xaUid).clip.renderInPlaceOriginal;
+            const bool decomposed = renderinplace::decomposeRenderInPlace(tl, 1, 0);
+            const auto afterDecompose = groupState(aUid);
+            // Back to the baked state, reconnect to B, decompose: B must win.
+            tl.undo();
+            const Located bakedAgain = locate(tl, false, xUid);
+            const bool reconnected = tl.disconnectClip(TrackKind::Video, 1, bakedAgain.index)
+                && tl.connectClip(TrackKind::Video, 1, bakedAgain.index, bUid);
+            const bool decomposedAgain = renderinplace::decomposeRenderInPlace(tl, 1, locate(tl, false, xUid).index);
+            const auto afterReconnect = groupState(bUid);
+            const double reconnectOffset = locate(tl, false, xUid).clip.anchorOffsetSec;
+            // Bake the V1 anchor B (in 1.0) with handles: its source mapping changes.
+            renderinplace::Options handles = options;
+            handles.handlesSec = 0.25;
+            QString anchorPath, anchorError;
+            tl.takeConnectionWarnings();
+            const bool anchorBaked = renderinplace::renderClipInPlace(tl, 0, 1, handles, &anchorPath, &anchorError);
+            const ClipInfo bakedB = tl.trackAt(false, 0)->clips().value(1);
+            const auto afterAnchorBake = groupState(bUid);
+            const int anchorWarnings = tl.takeConnectionWarnings().size();
+            ok = baked && bakedFlags && afterBake.first && decomposed && afterDecompose.first
+                && reconnected && decomposedAgain && afterReconnect.first && near(reconnectOffset, -1.0)
+                && anchorBaked && bakedB.uid == bUid && bool(bakedB.renderInPlaceOriginal)
+                && afterAnchorBake.first && anchorWarnings == 0;
+            std::fprintf(stderr, "connected-clip G15 bake=%d [%s] flags=%d %s | decompose=%d %s | undo + "
+                         "reconnect B=%d decompose=%d %s offset=%.6f (expect -1) | anchor bake=%d [%s] "
+                         "uidKept=%d in=%.6f %s warnings=%d (expect 0) ok=%d\n", baked, qPrintable(error),
+                         bakedFlags, qPrintable(afterBake.second), decomposed,
+                         qPrintable(afterDecompose.second), reconnected, decomposedAgain,
+                         qPrintable(afterReconnect.second), reconnectOffset, anchorBaked,
+                         qPrintable(anchorError), bakedB.uid == bUid, bakedB.inPoint,
+                         qPrintable(afterAnchorBake.second), anchorWarnings, ok);
+        }
+        tally.gate(15, ok, "bake / decompose lost a connection or its uid, the decompose restored the "
+                           "bake-time anchor, or baking the anchor moved its connection");
+    }
+
+    // G16: explicit deletes of the anchor delete the connected V2+A2 group.
+    {
+        auto groupFixture = [](Timeline &tl) {
+            ClipInfo x = clipFor("x", 1.0, 2.0);
+            ClipInfo xa = clipFor("xa", 1.0, 2.0);
+            x.linkGroup = xa.linkGroup = 31;
+            load(tl, {{clipFor("a", 10.0)}, {x, clipFor("u", 1.0, 2.0)}}, {{}, {xa}});
+            tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 0));
+            tl.takeConnectionWarnings();
+        };
+        auto groupGone = [](const Timeline &tl, const char *label, bool done) {
+            const Located x = locateByName(tl, false, QStringLiteral("x"));
+            const Located xa = locateByName(tl, true, QStringLiteral("xa"));
+            const Located u = locateByName(tl, false, QStringLiteral("u"));
+            const bool ok = done && !x.found && !xa.found && u.found && near(u.startSec, 5.0)
+                && u.clip.anchorUid.isEmpty() && tl.trackAt(false, 0)->clipCount() <= 1;
+            std::fprintf(stderr, "connected-clip G16 %s done=%d x=%d xa=%d (expect 0 0) u found=%d "
+                         "start=%.6f (expect 5) v1Clips=%d ok=%d\n", label, done, x.found, xa.found,
+                         u.found, u.startSec, tl.trackAt(false, 0)->clipCount(), ok);
+            return ok;
+        };
+        bool mcpOk = false;
+        if (mainTimeline) {
+            groupFixture(*mainTimeline);
+            QString err;
+            const QJsonObject deleted = callTool(registry, QStringLiteral("delete_clip"),
+                QJsonObject{{"trackIndex", 0}, {"clipIndex", 0}}, &err);
+            mcpOk = groupGone(*mainTimeline, "delete_clip", deleted.value("ok").toBool() && err.isEmpty());
+        }
+        Timeline ow;
+        groupFixture(ow);
+        ow.overwriteClip3PointActive(0.0, clipFor("cover", 10.0));
+        const bool overwriteOk = groupGone(ow, "overwrite cover", locateByName(ow, false, QStringLiteral("cover")).found);
+        Timeline rd;
+        groupFixture(rd);
+        rd.rippleDeleteTimeRangeActive(0.0, 10.0);
+        const bool rippleOk = groupGone(rd, "ripple range", rd.trackAt(false, 0)->clipCount() == 0);
+        // R1: connections outside the deleted span stay, detached with one warning.
+        auto outside = [](double anchorLeadIn, double connectionStart, double from, double to,
+                          const char *label) {
+            Timeline tl;
+            ClipInfo w = clipFor("w", 0.5, connectionStart);
+            load(tl, {{clipFor("a", 6.0, anchorLeadIn)}, {w}});
+            tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 0));
+            const double offset = tl.trackAt(false, 1)->clips().at(0).anchorOffsetSec;
+            tl.takeConnectionWarnings();
+            tl.rippleDeleteTimeRangeActive(from, to);
+            const QStringList warnings = tl.takeConnectionWarnings();
+            const Located wl = locateByName(tl, false, QStringLiteral("w"));
+            const bool ok = wl.found && near(wl.startSec, connectionStart) && wl.clip.anchorUid.isEmpty()
+                && warnings.size() == 1;
+            std::fprintf(stderr, "connected-clip G16 R1%s anchor local [%.1f,%.1f] deleted, offset=%.6f: "
+                         "w found=%d start=%.6f anchorUid=[%s] (expect empty) warnings=%lld (expect 1) "
+                         "ok=%d\n", label, from - anchorLeadIn, to - anchorLeadIn, offset, wl.found,
+                         wl.startSec, qPrintable(wl.clip.anchorUid),
+                         static_cast<long long>(warnings.size()), ok);
+            return ok;
+        };
+        const bool r1a = outside(0.0, 8.0, 3.0, 6.0, "(a)");
+        const bool r1b = outside(1.0, 0.0, 1.0, 4.0, "(b)");
+        tally.gate(16, mcpOk && overwriteOk && rippleOk && r1a && r1b,
+                   "an explicit delete of the anchor kept its connected group or deleted an "
+                   "unconnected clip, or a connection outside the deleted span was deleted");
+    }
+
+    // G17: simulated MultiCam (V1 replaced through setClips, no undo point).
+    {
+        Timeline tl;
+        load(tl, {{clipFor("a", 10.0)}, {clipFor("x", 1.0, 2.0)}});
+        const QString aUid = uidAt(tl, 0, 0);
+        const QString xUid = uidAt(tl, 1, 0);
+        tl.connectClip(TrackKind::Video, 1, 0, aUid);
+        tl.takeConnectionWarnings();
+        tl.trackAt(false, 0)->setClips({clipFor("multicam", 10.0)});
+        const bool newUid = uidAt(tl, 0, 0) != aUid;
+        tl.saveUndoState(QStringLiteral("unrelated"));
+        const QStringList warnings = tl.takeConnectionWarnings();
+        const Located x = locate(tl, false, xUid);
+        std::fprintf(stderr, "connected-clip G17 newUid=%d x found=%d start=%.6f (expect 2) anchorUid=[%s] "
+                     "(expect empty) warnings=%lld (expect 1) [%s]\n", newUid, x.found, x.startSec,
+                     qPrintable(x.clip.anchorUid), static_cast<long long>(warnings.size()),
+                     qPrintable(warnings.join('|')));
+        tally.gate(17, newUid && x.found && near(x.startSec, 2.0) && x.clip.anchorUid.isEmpty()
+                       && warnings.size() == 1,
+                   "a V1 replaced without an undo point deleted the connected clip or detached it "
+                   "without exactly one warning");
+    }
+
+    // G19: a linked V2+A2 pair connects and follows as a group.
+    {
+        ClipInfo x = clipFor("x", 1.0, 3.0);
+        ClipInfo xa = clipFor("xa", 1.0, 3.0);
+        x.linkGroup = xa.linkGroup = 41;
+        Timeline tl;
+        load(tl, {{clipFor("a", 10.0)}, {x}}, {{}, {xa, clipFor("n", 1.0, 2.0)}});
+        const QString aUid = uidAt(tl, 0, 0);
+        tl.connectClip(TrackKind::Video, 1, 0, aUid);
+        const Located xc = locateByName(tl, false, QStringLiteral("x"));
+        const Located ac = locateByName(tl, true, QStringLiteral("xa"));
+        const bool bothConnected = xc.clip.anchorUid == aUid && ac.clip.anchorUid == aUid;
+        tl.insertClip3PointActive(0.0, clipFor("ins", 2.0));
+        const Located xl = locateByName(tl, false, QStringLiteral("x"));
+        const Located al = locateByName(tl, true, QStringLiteral("xa"));
+        const Located nl = locateByName(tl, true, QStringLiteral("n"));
+        std::fprintf(stderr, "connected-clip G19 connected x=%d xa=%d | after V1 insert x[%s] xa[%s] (expect "
+                     "start 5) n start=%.6f anchorUid=[%s] (expect 6, empty)\n", xc.clip.anchorUid == aUid,
+                     ac.clip.anchorUid == aUid, qPrintable(describe(xl, aUid)),
+                     qPrintable(describe(al, aUid)), nl.startSec, qPrintable(nl.clip.anchorUid));
+        // A grouped V2 [1.25,2.5) + A2 [3.75,5) pair that does not overlap: a V1 split at
+        // 2.5 lies between the members, and the group still goes to one piece.
+        ClipInfo y = clipFor("y", 1.25, 1.25);
+        ClipInfo ya = clipFor("ya", 1.25, 3.75);
+        y.linkGroup = ya.linkGroup = 42;
+        Timeline gt;
+        load(gt, {{clipFor("a", 5.0)}, {y}}, {{}, {ya}});
+        const QString leftUid = uidAt(gt, 0, 0);
+        gt.connectClip(TrackKind::Video, 1, 0, leftUid);
+        const Located yc = locateByName(gt, false, QStringLiteral("y"));
+        const Located yac = locateByName(gt, true, QStringLiteral("ya"));
+        const bool pairConnected = yc.clip.anchorUid == leftUid && yac.clip.anchorUid == leftUid;
+        QString selectErr;
+        const bool selected = gt.selectClipByIndex(false, 0, 0, &selectErr);
+        gt.setPlayheadPosition(2.5);
+        gt.splitAtPlayhead();
+        gt.clearSelection();
+        const QString rightUid = uidAt(gt, 0, 1);
+        const int v1Clips = gt.trackAt(false, 0)->clipCount();
+        const Located ys = locateByName(gt, false, QStringLiteral("y"));
+        const Located yas = locateByName(gt, true, QStringLiteral("ya"));
+        const bool splitOk = selected && v1Clips == 2 && !rightUid.isEmpty()
+            && rightUid != leftUid && ys.found && yas.found && near(ys.startSec, 1.25)
+            && near(yas.startSec, 3.75) && ys.clip.anchorUid == leftUid && yas.clip.anchorUid == leftUid;
+        QString deleteErr;
+        const bool deleted = gt.deleteClipByIndex(false, 0, 0, false, &deleteErr);
+        const Located yd = locateByName(gt, false, QStringLiteral("y"));
+        const Located yad = locateByName(gt, true, QStringLiteral("ya"));
+        const bool deleteOk = deleted && !yd.found && !yad.found;
+        std::fprintf(stderr, "connected-clip G19 non-overlapping pair: connected y=%d ya=%d | V1 split at 2.5 "
+                     "selected=%d [%s] v1Clips=%d left=%s right=%s y[%s] ya[%s] (expect start 1.25 / 3.75, "
+                     "both on the left piece) ok=%d | delete left piece=%d [%s] y found=%d ya found=%d "
+                     "(expect 0 0) ok=%d\n", yc.clip.anchorUid == leftUid, yac.clip.anchorUid == leftUid,
+                     selected, qPrintable(selectErr), v1Clips, qPrintable(leftUid),
+                     qPrintable(rightUid), qPrintable(describe(ys, leftUid)), qPrintable(describe(yas, leftUid)),
+                     splitOk, deleted, qPrintable(deleteErr), yd.found, yad.found, deleteOk);
+        tally.gate(19, bothConnected && near(xl.startSec, 5.0) && near(al.startSec, 5.0)
+                       && xl.clip.anchorUid == aUid && al.clip.anchorUid == aUid && nl.found
+                       && near(nl.startSec, 6.0) && nl.clip.anchorUid.isEmpty()
+                       && pairConnected && splitOk && deleteOk,
+                   "a linked pair was not connected / moved as a group, an unlinked A2 clip moved, or a "
+                   "V1 split between the members of a linked pair sent them to different pieces");
+    }
+
+    // G20: track operations, locks, anchor cross-track drop.
+    {
+        auto trackOp = [](int op, bool connected, QString *err, bool *unchanged) {
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {clipFor("x", 1.0, 2.0)}, {clipFor("z", 1.0)}});
+            if (connected) tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 0));
+            const quint64 serial = tl.undoManager()->saveSerial();
+            bool ok = false;
+            if (op == 0) ok = tl.removeTrack(false, 0, err);
+            else if (op == 1) ok = tl.moveTrack(false, 0, 2, err);
+            else ok = tl.moveTrack(false, 1, 0, err);
+            *unchanged = tl.videoTrackCount() == 3
+                && tl.trackAt(false, 0)->clips().value(0).displayName == QStringLiteral("a")
+                && tl.trackAt(false, 1)->clips().value(0).displayName == QStringLiteral("x")
+                && tl.undoManager()->saveSerial() == serial;
+            return ok;
+        };
+        bool opsOk = true;
+        const char *names[] = {"removeTrack(V1)", "moveTrack(V1->V3)", "moveTrack(V2->V1)"};
+        for (int op = 0; op < 3; ++op) {
+            QString err, controlErr;
+            bool unchanged = false, controlUnchanged = false;
+            const bool done = trackOp(op, true, &err, &unchanged);
+            const bool controlDone = trackOp(op, false, &controlErr, &controlUnchanged);
+            const bool ok = !done && unchanged && !err.isEmpty() && controlDone;
+            std::fprintf(stderr, "connected-clip G20 %s connected: done=%d (expect 0) unchanged=%d err=[%s] | "
+                         "unconnected control: done=%d (expect 1) ok=%d\n", names[op], done, unchanged,
+                         qPrintable(err), controlDone, ok);
+            opsOk = opsOk && ok;
+        }
+        auto lockedCase = [](bool deleteAnchor) {
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}, {clipFor("x", 1.0, 2.0)}});
+            const QString xUid = uidAt(tl, 1, 0);
+            tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 0));
+            tl.trackAt(false, 1)->setLocked(true);
+            tl.takeConnectionWarnings();
+            QString err;
+            bool done = true;
+            if (deleteAnchor) done = tl.deleteClipByIndex(false, 0, 0, false, &err);
+            else tl.insertClip3PointActive(0.0, clipFor("ins", 2.0));
+            const QStringList warnings = tl.takeConnectionWarnings();
+            const Located x = locate(tl, false, xUid);
+            const bool ok = done && x.found && near(x.startSec, 2.0) && x.clip.anchorUid.isEmpty()
+                && warnings.size() == 1;
+            std::fprintf(stderr, "connected-clip G20 locked V2, %s: done=%d [%s] x found=%d start=%.6f "
+                         "(expect 2) anchorUid=[%s] (expect empty) warnings=%lld (expect 1) ok=%d\n",
+                         deleteAnchor ? "anchor deleted" : "V1 insert", done, qPrintable(err), x.found,
+                         x.startSec, qPrintable(x.clip.anchorUid), static_cast<long long>(warnings.size()), ok);
+            return ok;
+        };
+        const bool lockInsertOk = lockedCase(false);
+        const bool lockDeleteOk = lockedCase(true);
+        // The anchor dropped onto V2 leaves V1: the linked group detaches.
+        ClipInfo x = clipFor("x", 1.0, 2.0);
+        ClipInfo xa = clipFor("xa", 1.0, 2.0);
+        x.linkGroup = xa.linkGroup = 61;
+        Timeline tl;
+        load(tl, {{clipFor("a", 10.0)}, {x}}, {{}, {xa}});
+        const QString aUid = uidAt(tl, 0, 0);
+        tl.connectClip(TrackKind::Video, 1, 0, aUid);
+        tl.takeConnectionWarnings();
+        Timeline::MoveClipResult result;
+        QString err;
+        const bool dropped = tl.moveClipByIndex(false, 0, 0, 20.0, 1, &result, &err);
+        const QStringList warnings = tl.takeConnectionWarnings();
+        const Located al = locate(tl, false, aUid);
+        const Located xl = locateByName(tl, false, QStringLiteral("x"));
+        const Located xal = locateByName(tl, true, QStringLiteral("xa"));
+        const bool dropOk = dropped && al.track == 1 && xl.found && xal.found && near(xl.startSec, 2.0)
+            && near(xal.startSec, 2.0) && xl.clip.anchorUid.isEmpty() && xal.clip.anchorUid.isEmpty()
+            && warnings.size() == 1;
+        std::fprintf(stderr, "connected-clip G20 anchor drop onto V2: done=%d [%s] anchorTrack=%d x[%s] "
+                     "xa[%s] (expect start 2, detached) warnings=%lld (expect 1) ok=%d\n", dropped,
+                     qPrintable(err), al.track, qPrintable(describe(xl, aUid)),
+                     qPrintable(describe(xal, aUid)), static_cast<long long>(warnings.size()), dropOk);
+        tally.gate(20, opsOk && lockInsertOk && lockDeleteOk && dropOk,
+                   "a V1 track removal / move was accepted with connections (or rejected without), "
+                   "a locked connection moved / was deleted, or an anchor leaving V1 kept its group");
+    }
+
+    // G21: insertAudioClipAtPlayhead splits a connected A2 clip.
+    {
+        QTemporaryDir dir;
+        const QString voPath = dir.filePath(QStringLiteral("g21-vo.wav"));
+        const bool ready = dir.isValid() && writeWav(voPath, {{1.0, true}});
+        auto insert = [&](bool disableRederive, QString *detail) {
+            Timeline tl;
+            load(tl, {{clipFor("a", 10.0)}}, {{}, {clipFor("c", 4.0, 1.0)}});
+            const QString aUid = uidAt(tl, 0, 0);
+            const QString cUid = tl.trackAt(true, 1)->clips().at(0).uid;
+            tl.connectClip(TrackKind::Audio, 1, 0, aUid);
+            tl.setRederiveDisabledForTest(disableRederive);
+            tl.setPlayheadPosition(3.0);
+            tl.insertAudioClipAtPlayhead(voPath, 2);
+            const Located left = locate(tl, true, cUid);
+            const Located right = locateOther(tl, true, QStringLiteral("c"), cUid);
+            const Located vo = locateByName(tl, true, QFileInfo(voPath).fileName());
+            const double voLength = vo.clip.effectiveDuration();
+            *detail = QStringLiteral("left[%1] vo start=%2 length=%3 anchored=%4 right[%5]")
+                .arg(describe(left, aUid)).arg(vo.startSec, 0, 'f', 6).arg(voLength, 0, 'f', 6)
+                .arg(int(!vo.clip.anchorUid.isEmpty())).arg(describe(right, aUid));
+            return vo.found && voLength > 0.9 && voLength < 1.1 && vo.clip.anchorUid.isEmpty()
+                && left.track == 1 && near(left.startSec, 1.0) && left.clip.anchorUid == aUid
+                && near(left.clip.anchorOffsetSec, 1.0) && right.found && right.track == 1
+                && near(right.startSec, 3.0 + voLength) && right.clip.anchorUid == aUid
+                && near(right.clip.anchorOffsetSec, 3.0 + voLength);
+        };
+        QString detail, controlDetail;
+        const bool ok = ready && insert(false, &detail);
+        const bool control = ready && insert(true, &controlDetail);
+        std::fprintf(stderr, "connected-clip G21 ready=%d %s (expect left 1/1/offset 1, right on A2 at 3 + vo "
+                     "with offset 3 + vo, both anchored) ok=%d | control (re-derive disabled) %s ok=%d "
+                     "(expect 0)\n", ready, qPrintable(detail), ok, qPrintable(controlDetail), control);
+        tally.gate(21, ok && !control,
+                   "a voice-over insert that split a connected audio clip moved or disconnected a "
+                   "piece, or the re-derive-disabled control still passed");
+    }
+
+    // G22: silence cut of a V1 anchor whose audio splits into 3 pieces.
+    {
+        QTemporaryDir dir;
+        const QString wavPath = dir.filePath(QStringLiteral("g22-silences.wav"));
+        const bool ready = dir.isValid()
+            && writeWav(wavPath, {{1.0, true}, {1.0, false}, {1.0, true}, {1.0, false}, {1.0, true}});
+        bool ok = false;
+        if (!ready) {
+            std::fprintf(stderr, "connected-clip G22 setup failed\n");
+        } else {
+            ClipInfo anchor = clipFor("s", 5.0);
+            anchor.filePath = wavPath;
+            Timeline tl;
+            load(tl, {{anchor}, {clipFor("c1", 0.2, 0.5), clipFor("cg", 0.2, 0.8), clipFor("c3", 0.2, 2.5)}});
+            const QString sUid = uidAt(tl, 0, 0);
+            for (int i = 0; i < 3; ++i) tl.connectClip(TrackKind::Video, 1, i, sUid);
+            tl.takeConnectionWarnings();
+            const QStringList boxes = answeringMessageBoxes(&tl, [&tl] {
+                tl.applySilenceCutToClip(tl.trackAt(false, 0), 0);
+            });
+            const QStringList warnings = tl.takeConnectionWarnings();
+            const TimelineTrack *v1 = tl.trackAt(false, 0);
+            const int pieces = v1->clipCount();
+            const Located piece3 = pieces == 3 ? locate(tl, false, v1->clips().at(2).uid) : Located{};
+            const double piece3Local = piece3.clip.inPoint;   // anchor in 0, speed 1
+            const Located c1 = locateByName(tl, false, QStringLiteral("c1"));
+            const Located cg = locateByName(tl, false, QStringLiteral("cg"));
+            const Located c3 = locateByName(tl, false, QStringLiteral("c3"));
+            const bool sane = pieces == 3 && piece3Local > 3.5 && piece3Local < 4.1
+                && piece3.startSec > 1.9 && piece3.startSec < 2.7 && v1->clips().at(0).uid == sUid;
+            ok = sane && c1.found && near(c1.startSec, 0.5) && c1.clip.anchorUid == sUid
+                && near(c1.clip.anchorOffsetSec, 0.5) && cg.found && near(cg.startSec, 1.5)
+                && cg.clip.anchorUid.isEmpty() && warnings.size() == 1 && c3.found
+                && c3.clip.anchorUid == piece3.clip.uid
+                && near(c3.startSec, piece3.startSec + (4.2 - piece3Local))
+                && near(c3.clip.anchorOffsetSec, 4.2 - piece3Local);
+            std::fprintf(stderr, "connected-clip G22 boxes=%lld [%s] pieces=%d (expect 3) piece3 start=%.6f "
+                         "local=%.6f sane=%d | c1[%s] (expect 0.5 on piece 1) cg start=%.6f anchorUid=[%s] "
+                         "(expect 1.5, empty) warnings=%lld (expect 1) [%s] | c3[%s] (expect start %.6f "
+                         "offset %.6f on piece 3) ok=%d\n", static_cast<long long>(boxes.size()),
+                         qPrintable(boxes.join('|')), pieces, piece3.startSec, piece3Local, sane,
+                         qPrintable(describe(c1, sUid)), cg.startSec, qPrintable(cg.clip.anchorUid),
+                         static_cast<long long>(warnings.size()), qPrintable(warnings.join('|')),
+                         qPrintable(describe(c3, piece3.clip.uid)), piece3.startSec + (4.2 - piece3Local),
+                         4.2 - piece3Local, ok);
+        }
+        tally.gate(22, ok, "a silence cut moved the piece-1 connection, deleted / kept connected the one "
+                           "in a removed span, or left the piece-3 one off the packed piece 3");
+    }
+
+    // G18: pre-compose (MainWindow::precomposeSelectionWithName) across the
+    // anchor and a connected clip.
+    if (!mainTimeline) {
+        tally.gate(18, false, "MainWindow has no mainTimeline");
+    } else {
+        load(*mainTimeline, {{clipFor("a", 10.0)}, {clipFor("x", 6.0, 2.0), clipFor("y", 0.5, 1.0)},
+                             {clipFor("s", 2.0, 4.0)}});
+        const QString aUid = uidAt(*mainTimeline, 0, 0);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aUid);
+        mainTimeline->connectClip(TrackKind::Video, 1, 1, aUid);
+        mainTimeline->takeConnectionWarnings();
+        for (int t = 0; t < mainTimeline->videoTrackCount(); ++t)
+            mainTimeline->trackAt(false, t)->setSelectedClip(t == 2 ? 0 : -1);
+        for (int t = 0; t < mainTimeline->audioTrackCount(); ++t)
+            mainTimeline->trackAt(true, t)->setSelectedClip(-1);
+        const QString parentId = mainTimeline->activeSequenceId();
+        const MainWindow::PrecomposeResult result = window.precomposeSelectionWithName(QStringLiteral("G18"));
+        const QStringList parentWarnings = mainTimeline->takeConnectionWarnings();
+        const Located left = locate(*mainTimeline, false, aUid);
+        const Located y = locateByName(*mainTimeline, false, QStringLiteral("y"));
+        const Located xLeft = locate(*mainTimeline, false, xUid);
+        const bool parentOk = result.success && left.found && left.track == 0 && near(left.startSec, 0.0)
+            && near(left.clip.effectiveDuration(), 4.0) && y.found && near(y.startSec, 9.0)
+            && y.clip.anchorUid == aUid && near(y.clip.anchorOffsetSec, 9.0) && xLeft.found
+            && near(xLeft.startSec, 2.0) && xLeft.clip.anchorUid == aUid && parentWarnings.isEmpty();
+        bool nestedOk = false;
+        QString nestedDetail;
+        const QString activeParent = mainTimeline->activeSequenceId();
+        if (result.success && mainTimeline->setActiveSequence(result.sequenceId)) {
+            mainTimeline->saveUndoState(QStringLiteral("nested edit"));
+            const QStringList nestedWarnings = mainTimeline->takeConnectionWarnings();
+            const TimelineTrack *nv1 = mainTimeline->trackAt(false, 0);
+            const TimelineTrack *nv2 = mainTimeline->trackAt(false, 1);
+            const ClipInfo v1Piece = nv1 && nv1->clipCount() == 1 ? nv1->clips().at(0) : ClipInfo{};
+            const ClipInfo v2Piece = nv2 && nv2->clipCount() == 1 ? nv2->clips().at(0) : ClipInfo{};
+            nestedOk = !v1Piece.uid.isEmpty() && v2Piece.anchorUid == v1Piece.uid
+                && near(v2Piece.leadInSec, 0.0) && near(v2Piece.anchorOffsetSec, 0.0)
+                && nestedWarnings.isEmpty();
+            nestedDetail = QStringLiteral("v1Clips=%1 v2Clips=%2 v2 anchorUid=%3 (expect the nested V1 uid "
+                                          "%4) offset=%5 warnings=%6")
+                .arg(nv1 ? nv1->clipCount() : -1).arg(nv2 ? nv2->clipCount() : -1)
+                .arg(v2Piece.anchorUid, v1Piece.uid).arg(v2Piece.anchorOffsetSec, 0, 'f', 6)
+                .arg(nestedWarnings.size());
+            mainTimeline->setActiveSequence(activeParent);
+        }
+        std::fprintf(stderr, "connected-clip G18 precompose success=%d [%s] parentId=[%s] left remainder "
+                     "start=%.6f length=%.6f (expect 0 / 4) y[%s] (expect start 9 offset 9 on the left "
+                     "remainder) xLeft[%s] parentWarnings=%lld (expect 0) ok=%d | nested %s ok=%d\n",
+                     result.success, qPrintable(result.failureReason), qPrintable(parentId),
+                     left.startSec, left.clip.effectiveDuration(), qPrintable(describe(y, aUid)),
+                     qPrintable(describe(xLeft, aUid)), static_cast<long long>(parentWarnings.size()),
+                     parentOk, qPrintable(nestedDetail), nestedOk);
+        tally.gate(18, parentOk && nestedOk,
+                   "pre-compose moved / detached the connection after the range, warned in the "
+                   "parent, or the nested range piece was not connected to the nested V1 piece");
     }
 
     return tally.finish("connected-clip");

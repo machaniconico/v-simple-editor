@@ -682,6 +682,9 @@ signals:
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
+    // US-1214: splitClipAt split the clip with uid leftUid at its local second
+    // splitLocalSec; the right piece got rightUid.
+    void clipSplit(const QString &leftUid, const QString &rightUid, double splitLocalSec);
     void effectDropped(const QString &entryId, int clipIndex);
 
 protected:
@@ -942,6 +945,10 @@ public:
     // drain them with takeConnectionWarnings.
     QStringList connectionWarnings() const { return m_connectionWarnings; }
     QStringList takeConnectionWarnings();
+    // US-1214 test seam: true stops the reconcile from re-deriving the offset
+    // of a connected clip whose uid is new (design r4 §6-4 (3)); its stored
+    // offset then places it. Selftests only; default false.
+    void setRederiveDisabledForTest(bool disabled) { m_rederiveDisabledForTest = disabled; }
 
     // Snap
     void setSnapEnabled(bool enabled);
@@ -1555,6 +1562,8 @@ private:
         bool reversed = false;
         bool rampIdentity = true;
         bool remapEmpty = true;
+        // US-1214: a new source (bake / decompose) has no common source frame.
+        QString filePath;
         bool linear() const { return !reversed && rampIdentity && remapEmpty && speed > 0.0; }
         bool sameAs(const AnchorSignature &o) const;
         static AnchorSignature of(const ClipInfo &clip, double startSec);
@@ -1575,12 +1584,34 @@ private:
         QHash<QString, ConnectionBaselineEntry> clips;
     };
     ReconcileBaseline m_reconcileBaseline;
-    // uid -> length (timeline seconds) of the deleted piece, recorded only by the
-    // Timeline-level delete functions; taken and cleared by every reconcile.
-    QHash<QString, double> m_pendingDeletedUids;
+    // uid -> the deleted anchor-local spans [start, end) (timeline seconds from
+    // the clip start), recorded only by the Timeline-level delete functions;
+    // taken and cleared by every reconcile.
+    QHash<QString, QVector<QPair<double, double>>> m_pendingDeletedUids;
+    // US-1214: V1 splits in order (TimelineTrack::clipSplit, silence cut).
+    // splitLocalSec is the left piece's local second (before the split).
+    struct SplitRecord {
+        QString leftUid;
+        QString rightUid;
+        double splitLocalSec = 0.0;
+    };
+    QVector<SplitRecord> m_pendingSplits;
+    // US-1214: splits on the other tracks (connected clips), in order, per track:
+    // the lineage of a right piece back to the clip the baseline knew.
+    QHash<const TimelineTrack *, QVector<SplitRecord>> m_pendingClipSplits;
+    // US-1214: anchor-local spans a silence cut removed; their connections detach.
+    struct DetachedSpan {
+        QString anchorUid;
+        double localStart = 0.0;
+        double localEnd = 0.0;
+    };
+    QVector<DetachedSpan> m_pendingDetachedSpans;
+    bool m_rederiveDisabledForTest = false;
     QStringList m_connectionWarnings;
     bool m_reconcilingConnections = false;
     QString reconcileSequenceKey() const;
+    bool hasConnectedClips() const;
+    void renameAnchorReferences(const QString &fromUid, const QString &toUid);
     void reconcileConnectedClips();
     void captureReconcileBaseline();
     void clearReconcileBaseline();

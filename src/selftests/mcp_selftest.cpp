@@ -7033,6 +7033,64 @@ int runMcpSelftest()
             "connect_clip accepted a V2 anchor or changed the timeline / undo serial when rejecting it");
     }
 
+    // G192 (US-1214): delete_clip of the anchor deletes its connected V2+A2
+    // group; get_timeline then lists neither while an unconnected V2 clip stays.
+    {
+        Timeline* deleteTimeline = projectInfoWindow.m_timeline;
+        ClipInfo anchor;
+        anchor.filePath = QStringLiteral("/selftests/mcp-delete-anchor.mp4");
+        anchor.duration = anchor.outPoint = 10.0;
+        ClipInfo connected = anchor;
+        connected.filePath = QStringLiteral("/selftests/mcp-delete-x.mp4");
+        connected.duration = connected.outPoint = 1.0;
+        connected.leadInSec = 2.0;
+        connected.linkGroup = 192;
+        ClipInfo other = connected;
+        other.filePath = QStringLiteral("/selftests/mcp-delete-y.mp4");
+        other.linkGroup = 0;
+        other.leadInSec = 3.0;
+        ClipInfo connectedAudio = connected;
+        connectedAudio.filePath = QStringLiteral("/selftests/mcp-delete-xa.wav");
+        deleteTimeline->restoreFromProject(
+            QVector<QVector<ClipInfo>>{{anchor}, {connected, other}},
+            QVector<QVector<ClipInfo>>{{}, {connectedAudio}}, 0.0, -1.0, -1.0, 100);
+        deleteTimeline->undoManager()->clear();
+        deleteTimeline->saveUndoState(QStringLiteral("mcp G192 initial"));
+        const QString anchorUid = deleteTimeline->trackAt(false, 0)->clips().at(0).uid;
+        const bool connectedBefore = deleteTimeline->connectClip(TrackKind::Video, 1, 0, anchorUid)
+            && deleteTimeline->trackAt(true, 1)->clips().at(0).anchorUid == anchorUid;
+        const QJsonObject deletePayload = toolPayload(callProjectInfoTool(
+            1921, QStringLiteral("delete_clip"), QJsonObject{{"trackIndex", 0}, {"clipIndex", 0}}));
+        const QJsonObject timelinePayload = toolPayload(callProjectInfoTool(
+            1922, QStringLiteral("get_timeline"), QJsonObject{}));
+        const QJsonArray v2Clips = timelinePayload.value(QStringLiteral("video")).toArray()
+            .at(1).toObject().value(QStringLiteral("clips")).toArray();
+        const QJsonArray a2Clips = timelinePayload.value(QStringLiteral("audio")).toArray()
+            .at(1).toObject().value(QStringLiteral("clips")).toArray();
+        QStringList v2Paths;
+        for (const QJsonValue &clip : v2Clips)
+            v2Paths.append(clip.toObject().value(QStringLiteral("filePath")).toString());
+        std::fprintf(stderr, "mcp G192 connectedBefore=%d delete ok=%d remainingClipCount=%d keys=[%s] "
+                     "v2Clips=%lld [%s] (expect only mcp-delete-y) a2Clips=%lld (expect 0)\n",
+                     connectedBefore, deletePayload.value(QStringLiteral("ok")).toBool(),
+                     deletePayload.value(QStringLiteral("remainingClipCount")).toInt(-1),
+                     qPrintable(QStringList(deletePayload.keys()).join(',')),
+                     static_cast<long long>(v2Clips.size()), qPrintable(v2Paths.join(',')),
+                     static_cast<long long>(a2Clips.size()));
+        tallyObserved(192, observeTerm(192, "connected before", connectedBefore)
+            && observeTerm(192, "delete ok", deletePayload.value(QStringLiteral("ok")).toBool())
+            && observeTerm(192, "remainingClipCount 0",
+                           deletePayload.value(QStringLiteral("remainingClipCount")).toInt(-1) == 0)
+            && observeTerm(192, "response keys unchanged",
+                           QStringList(deletePayload.keys()) == QStringList({QStringLiteral("ok"),
+                                                                              QStringLiteral("remainingClipCount")}))
+            && observeTerm(192, "unconnected V2 clip kept", v2Clips.size() == 1
+                && v2Paths.value(0).endsWith(QStringLiteral("mcp-delete-y.mp4")))
+            && observeTerm(192, "connected A2 clip deleted", a2Clips.isEmpty()),
+            "delete_clip of the anchor kept its connected group, deleted the unconnected clip, or "
+            "changed its response");
+    }
+
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end";
     return tally.finish("mcp");
