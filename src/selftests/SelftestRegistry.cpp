@@ -98,6 +98,7 @@ int runColorMatchSelftest();
 int runColorWarperSelftest();
 int runCommandSearchSelftest();
 int runCompositeFrameCacheSelftest();
+int runConnectedClipSelftest();
 int runCredAuditLogSelftest();
 int runCredTtlSelftest();
 int runCredentialVaultSelftest();
@@ -667,7 +668,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "versioned-save",   "VEDITOR_VERSIONED_SAVE_SELFTEST",    runVersionedSaveSelftest,      false,
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
-      "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+      "Structural project comparison: matching, properties, effects, transitions and epsilon (8 gates)" },
     { "img-sequence", "VEDITOR_IMG_SEQUENCE_SELFTEST", runImgSequenceSelftest, true,
       "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
@@ -868,6 +869,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
       "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (5 gates)" },
+    { "connected-clip", "VEDITOR_CONNECTED_CLIP_SELFTEST", runConnectedClipSelftest, true,
+      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (11 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
@@ -1073,7 +1076,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (189 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (191 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,

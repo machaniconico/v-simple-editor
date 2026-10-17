@@ -2015,6 +2015,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["displayName"] = clip.displayName;
     if (!clip.uid.isEmpty())
         obj["uid"] = clip.uid;
+    // US-1201: written only for a connected clip.
+    if (!clip.anchorUid.isEmpty()) {
+        obj["anchorUid"] = clip.anchorUid;
+        obj["anchorOffsetSec"] = clip.anchorOffsetSec;
+    }
     if (!clip.shapes.isEmpty()) {
         QJsonArray shapes;
         for (const Shape &shape : clip.shapes)
@@ -2154,6 +2159,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.displayName = obj["displayName"].toString();
     // Read as saved; a missing uid is minted by TimelineTrack::setClips on load.
     clip.uid = obj["uid"].toString();
+    // A missing anchor uid is detached (with a warning) by the load reconcile.
+    clip.anchorUid = obj.value("anchorUid").toString();
+    clip.anchorOffsetSec = clip.anchorUid.isEmpty()
+        ? 0.0 : obj.value("anchorOffsetSec").toDouble(0.0);
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())
             clip.shapes.append(Shape::fromJson(value.toObject()));

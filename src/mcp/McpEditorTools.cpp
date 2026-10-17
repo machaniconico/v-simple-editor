@@ -1036,7 +1036,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
             {QStringLiteral("keyColor"), effect.keyColor.name()},
             {QStringLiteral("startSec"), effect.startSec}, {QStringLiteral("endSec"), effect.endSec}});
     }
-    return QJsonObject{
+    QJsonObject result{
         {QStringLiteral("colorCorrection"), colorCorrectionToJson(clip.colorCorrection)},
         {QStringLiteral("lut"), lutToJson(clip)},
         {QStringLiteral("effects"), effects},
@@ -1064,6 +1064,12 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         }},
         {QStringLiteral("textOverlayCount"), clip.textManager.count()}
     };
+    // US-1201: only a connected clip carries the two connection keys.
+    if (!clip.anchorUid.isEmpty()) {
+        result.insert(QStringLiteral("anchorUid"), clip.anchorUid);
+        result.insert(QStringLiteral("anchorOffsetSec"), clip.anchorOffsetSec);
+    }
+    return result;
 }
 
 QJsonArray tracksToJson(const Timeline* timeline, TrackKind kind)
@@ -3603,6 +3609,113 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, moveClipOutputSchema));
+
+    // US-1201: primary-storyline connections (one undo point each).
+    const QJsonObject connectionWarningsSchema{
+        {QStringLiteral("type"), QStringLiteral("array")},
+        {QStringLiteral("items"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    };
+    const QJsonObject connectClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("anchorUid"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("anchorOffsetSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("warnings"), connectionWarningsSchema}
+    }, {QStringLiteral("ok"), QStringLiteral("anchorUid"),
+        QStringLiteral("anchorOffsetSec"), QStringLiteral("warnings")});
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("connect_clip"),
+        QStringLiteral("指定クリップを V1 (video トラック 0) のクリップに接続する。接続したクリップは接続先の移動・トリム・速度変更に追従する。linkGroup が同じクリップ (対になる音声など) も同じ接続先に接続される。接続先 (anchorTrackIndex / anchorClipIndex) は V1 のクリップに限られ、V1 のクリップ自身は接続できない。kind/trackIndex 省略時は video トラック 0。clipIndex / anchorClipIndex は get_timeline の index。応答の warnings は接続の解除などの警告。Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("anchorTrackIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0},
+                {QStringLiteral("default"), 0},
+                {QStringLiteral("description"),
+                 QStringLiteral("接続先の video トラック番号。V1 (0) 以外は拒否される。省略時は 0")}
+            }},
+            {QStringLiteral("anchorClipIndex"), QJsonObject{
+                {QStringLiteral("type"), QStringLiteral("integer")},
+                {QStringLiteral("minimum"), 0},
+                {QStringLiteral("description"),
+                 QStringLiteral("接続先クリップの 0-based 番号 (get_timeline の index)。必須")}
+            }}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("anchorClipIndex")}),
+        guardedWrite(QStringLiteral("connect_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("anchorTrackIndex"),
+                                         QStringLiteral("anchorClipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err))
+                return {};
+            if (!args.contains(QStringLiteral("anchorClipIndex")))
+                return setError(err, QStringLiteral("anchorClipIndex is required")), QJsonObject();
+            int anchorTrackIndex = 0;
+            int anchorClipIndex = -1;
+            if (!nonNegativeInteger(args, QStringLiteral("anchorTrackIndex"), 0, &anchorTrackIndex, err)
+                || !nonNegativeInteger(args, QStringLiteral("anchorClipIndex"), -1, &anchorClipIndex, err))
+                return {};
+            if (anchorTrackIndex != 0)
+                return setError(err, QStringLiteral("anchor clip must be on V1 (anchorTrackIndex 0)")), QJsonObject();
+            Timeline* currentTimeline = timeline();
+            const TimelineTrack* anchorTrack = currentTimeline->trackAt(false, anchorTrackIndex);
+            if (!anchorTrack || anchorClipIndex >= anchorTrack->clipCount())
+                return setError(err, QStringLiteral("anchor clip is out of range")), QJsonObject();
+            const QString anchorUid = anchorTrack->clips().at(anchorClipIndex).uid;
+            const QString clipUid = target.track->clips().at(target.clipIndex).uid;
+            currentTimeline->takeConnectionWarnings();
+            if (!currentTimeline->connectClip(target.audio ? TrackKind::Audio : TrackKind::Video,
+                                              target.trackIndex, target.clipIndex, anchorUid, err))
+                return {};
+            m_window->setWindowModified(true);
+            // Report the offset of the same clip by uid (its index may change).
+            double anchorOffsetSec = 0.0;
+            for (const ClipInfo& clip : target.track->clips())
+                if (clip.uid == clipUid) anchorOffsetSec = clip.anchorOffsetSec;
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("anchorUid"), anchorUid},
+                {QStringLiteral("anchorOffsetSec"), anchorOffsetSec},
+                {QStringLiteral("warnings"),
+                 QJsonArray::fromStringList(currentTimeline->takeConnectionWarnings())}
+            };
+        })
+    }, connectClipOutputSchema));
+
+    const QJsonObject disconnectClipOutputSchema = outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("warnings"), connectionWarningsSchema}
+    }, {QStringLiteral("ok"), QStringLiteral("warnings")});
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("disconnect_clip"),
+        QStringLiteral("指定クリップ (と linkGroup が同じクリップ) の V1 への接続を解除する。位置は変わらない。接続されていないクリップはエラー。kind/trackIndex 省略時は video トラック 0。clipIndex は get_timeline の index。Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
+        guardedWrite(QStringLiteral("disconnect_clip"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readClipTarget(args, m_window, timeline(), &target, err))
+                return {};
+            Timeline* currentTimeline = timeline();
+            currentTimeline->takeConnectionWarnings();
+            if (!currentTimeline->disconnectClip(target.audio ? TrackKind::Audio : TrackKind::Video,
+                                                 target.trackIndex, target.clipIndex, err))
+                return {};
+            m_window->setWindowModified(true);
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("warnings"),
+                 QJsonArray::fromStringList(currentTimeline->takeConnectionWarnings())}
+            };
+        })
+    }, disconnectClipOutputSchema));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("match_frame"),

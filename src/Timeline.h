@@ -381,6 +381,12 @@ struct ClipInfo {
     // the right half of a split. Saved as "uid" only when non-empty; never
     // affects rendering, and ProjectDiff ignores it.
     QString uid;
+    // US-1201 primary-storyline connection: uid of the V1 anchor clip (empty =
+    // not connected) and this clip's start minus the anchor's start in timeline
+    // seconds (may be negative). Saved only when anchorUid is non-empty; never
+    // affects rendering, and ProjectDiff ignores both.
+    QString anchorUid;
+    double anchorOffsetSec = 0.0;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
@@ -918,7 +924,24 @@ public:
     // folds currentState() into the current undo entry and drops the redo stack.
     void absorbIntoCurrentUndoPoint();
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
+    // US-1201: every undo point goes through here (or absorbIntoCurrentUndoPoint):
+    // reconcileConnectedClips() runs first, then the post-edit state is saved and
+    // the connection baseline is taken.
     void saveUndoState(const QString &description);
+
+    // US-1201 primary-storyline connections. connectClip gives every member of
+    // the target's link group the same anchorUid (a clip on videoTracks()[0])
+    // and an offset taken from the current positions; V1 clips cannot connect.
+    // One undo point each. False with *err set (state unchanged) on rejection.
+    bool connectClip(TrackKind kind, int trackIndex, int clipIndex,
+                     const QString &anchorUid, QString *err = nullptr);
+    bool disconnectClip(TrackKind kind, int trackIndex, int clipIndex,
+                        QString *err = nullptr);
+    // Non-modal connection warnings (detached connections). MainWindow shows the
+    // newest in the status bar on connectionWarningsChanged; selftests and MCP
+    // drain them with takeConnectionWarnings.
+    QStringList connectionWarnings() const { return m_connectionWarnings; }
+    QStringList takeConnectionWarnings();
 
     // Snap
     void setSnapEnabled(bool enabled);
@@ -1419,6 +1442,8 @@ signals:
     void transitionShortened(QString transitionTypeName,
                              double askedSec, double effectiveSec);
     void statusMessageRequested(const QString &message, int timeoutMs);
+    // US-1201: new entries were appended to connectionWarnings().
+    void connectionWarningsChanged();
     // Spec-conformant marker signals. markersChanged fires on every
     // addMarker/removeMarker/updateMarker/setMarkers mutation; markerClicked
     // fires from MarkerLane when the user clicks the body of a marker
@@ -1519,6 +1544,47 @@ private:
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;
+    // US-1201 connection reconcile. The baseline belongs to the active sequence
+    // and is taken after saveUndoState / absorb / restoreState; clear / load /
+    // sequence switch / create leave it empty (sequenceId empty).
+    struct AnchorSignature {
+        double startSec = 0.0;
+        double inPoint = 0.0;
+        double outPoint = 0.0;
+        double speed = 1.0;
+        bool reversed = false;
+        bool rampIdentity = true;
+        bool remapEmpty = true;
+        bool linear() const { return !reversed && rampIdentity && remapEmpty && speed > 0.0; }
+        bool sameAs(const AnchorSignature &o) const;
+        static AnchorSignature of(const ClipInfo &clip, double startSec);
+    };
+    struct ConnectionBaselineEntry {
+        TrackKind kind = TrackKind::Video;
+        int track = -1;
+        double startSec = 0.0;
+        QString anchorUid;
+        double anchorOffsetSec = 0.0;
+        bool anchorFound = false;
+        AnchorSignature anchorSig;
+    };
+    struct ReconcileBaseline {
+        QString sequenceId;
+        // Key: "v:" / "a:" + track index + ":" + clip uid (linked V/A, and
+        // clips on different tracks, may share a uid).
+        QHash<QString, ConnectionBaselineEntry> clips;
+    };
+    ReconcileBaseline m_reconcileBaseline;
+    // uid -> length (timeline seconds) of the deleted piece, recorded only by the
+    // Timeline-level delete functions; taken and cleared by every reconcile.
+    QHash<QString, double> m_pendingDeletedUids;
+    QStringList m_connectionWarnings;
+    bool m_reconcilingConnections = false;
+    QString reconcileSequenceKey() const;
+    void reconcileConnectedClips();
+    void captureReconcileBaseline();
+    void clearReconcileBaseline();
+    void appendConnectionWarning(const QString &message);
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;

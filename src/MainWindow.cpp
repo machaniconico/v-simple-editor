@@ -782,9 +782,7 @@ bool applyDuckingToTimeline(Timeline *timeline,
         return false;
     }
 
-    timeline->undoManager()->saveState(
-        timeline->currentState(),
-        QStringLiteral("Auto ducking"));
+    timeline->saveUndoState(QStringLiteral("Auto ducking"));
     timeline->refreshPlaybackSequence();
     timeline->repaintAudioTracks();
     if (message) {
@@ -2949,8 +2947,7 @@ MainWindow::MainWindow(QWidget *parent)
     applyProjectConfig(m_projectConfig);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Initial state"));
+        m_timeline->saveUndoState(QStringLiteral("Initial state"));
     }
 
     nodelib::registerBuiltinNodes();
@@ -4506,6 +4503,11 @@ void MainWindow::setupMenuBar()
     m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));
     connect(m_timeline, &Timeline::statusMessageRequested, this,
             [this](const QString &message, int timeout) { statusBar()->showMessage(message, timeout); });
+    // US-1201: detached connections are reported without a modal dialog.
+    connect(m_timeline, &Timeline::connectionWarningsChanged, this, [this]() {
+        const QStringList warnings = m_timeline->connectionWarnings();
+        if (!warnings.isEmpty()) statusBar()->showMessage(warnings.last(), 8000);
+    });
     connect(m_selectAllClipsAction, &QAction::triggered, this, [this]() {
         m_timeline->selectAllClips();
         updateEditActions();
@@ -7473,7 +7475,7 @@ void MainWindow::setupMenuBar()
                                   qMax(0, maskSystem.masks().size() - 1));
 
         if (m_timeline && m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(m_timeline->currentState(), undoLabel);
+            m_timeline->saveUndoState(undoLabel);
         if (m_timeline)
             m_timeline->refreshPlaybackSequence();
         if (m_player)
@@ -9391,8 +9393,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                            data.config.explicitOutputResolution, data.config.fps);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Project loaded"));
+        m_timeline->saveUndoState(QStringLiteral("Project loaded"));
     }
     if (m_timeline && !relinkMapping.isEmpty()) {
         QString relinkError;
@@ -9783,8 +9784,7 @@ void MainWindow::newProject()
         // と同じ clear()+saveState 規律で、サイズ入りのベースラインへ置き換える。
         if (m_timeline && m_timeline->undoManager()) {
             m_timeline->undoManager()->clear();
-            m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                                 QStringLiteral("新規プロジェクト"));
+            m_timeline->saveUndoState(QStringLiteral("新規プロジェクト"));
         }
         hideWelcomeScreen();
         updateStatusInfo();
@@ -9838,9 +9838,7 @@ void MainWindow::editProjectSettings()
         // 35a3dd2 で TimelineState に含まれているので projectOutputConfigRestored
         // 経由で canvas/出力サイズも復元される。サイズ未変更時は積まない(no-op)。
         if (sizeChanged && m_timeline && m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(
-                m_timeline->currentState(),
-                QStringLiteral("プロジェクト設定変更"));
+            m_timeline->saveUndoState(QStringLiteral("プロジェクト設定変更"));
 
         updateStatusInfo();
     }
@@ -9917,9 +9915,16 @@ void MainWindow::openProject()
     if (filePath.isEmpty()) return;
 
     QString errorMessage;
-    if (openProjectFromPath(filePath, &errorMessage))
-        statusBar()->showMessage("Opened: " + filePath);
-    else
+    // US-1201: keep a connection warning raised by the load visible (the list
+    // is capped, so compare it rather than its size).
+    const QStringList warningsBefore = m_timeline->connectionWarnings();
+    if (openProjectFromPath(filePath, &errorMessage)) {
+        if (m_timeline->connectionWarnings() != warningsBefore)
+            statusBar()->showMessage("Opened: " + filePath + " / "
+                                     + m_timeline->connectionWarnings().last(), 8000);
+        else
+            statusBar()->showMessage("Opened: " + filePath);
+    } else
         QMessageBox::critical(this, "Open Failed", errorMessage.isEmpty()
                               ? "Could not load project file." : errorMessage);
 }
@@ -14730,10 +14735,9 @@ void MainWindow::configureClipParent()
     const QString parentId = parentCombo->currentData().toString();
     m_timeline->setClipParent(targetClipId, parentId);
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             parentId.isEmpty()
-                                                 ? QStringLiteral("Clear clip parent")
-                                                 : QStringLiteral("Set clip parent"));
+        m_timeline->saveUndoState(parentId.isEmpty()
+                                      ? QStringLiteral("Clear clip parent")
+                                      : QStringLiteral("Set clip parent"));
     m_timeline->refreshPlaybackSequence();
     refreshSpecialClipPreview();
     statusBar()->showMessage(parentId.isEmpty()
@@ -14788,8 +14792,7 @@ void MainWindow::createNullObjectForSelection()
     const QString parentId = brushClipId(nullTrackIdx, 0);
     m_timeline->setClipParent(childId, parentId);
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Create null object"));
+        m_timeline->saveUndoState(QStringLiteral("Create null object"));
     m_timeline->refreshPlaybackSequence();
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("ヌルオブジェクトを作成し、ペアレントに設定しました"), 4000);
@@ -16001,8 +16004,7 @@ void MainWindow::addMask()
     clips[clipIdx].maskSystem = maskSystemWithAppendedMask(clips[clipIdx].maskSystem, mask);
     track->setClips(clips);
     if (m_timeline && m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Add mask"));
+        m_timeline->saveUndoState(QStringLiteral("Add mask"));
     if (m_timeline)
         m_timeline->refreshPlaybackSequence();
     if (m_player)
@@ -16414,9 +16416,7 @@ MainWindow::PrecomposeResult MainWindow::precomposeSelectionWithName(const QStri
         selectNestedClip(m_timeline->audioTracks().value(selection.firstAudioTrack, nullptr));
 
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(
-            m_timeline->currentState(),
-            QStringLiteral("Pre-compose: %1").arg(name));
+        m_timeline->saveUndoState(QStringLiteral("Pre-compose: %1").arg(name));
 
     m_timeline->refreshPlaybackSequence();
     setWindowModified(true);
@@ -16562,9 +16562,7 @@ void MainWindow::openSocialExportDialog()
                     }
 
                     if (m_timeline)
-                        m_timeline->undoManager()->saveState(
-                            m_timeline->currentState(),
-                            QStringLiteral("Apply SNS preset"));
+                        m_timeline->saveUndoState(QStringLiteral("Apply SNS preset"));
 
                     setWindowModified(true);
                     qInfo().noquote() << QStringLiteral(

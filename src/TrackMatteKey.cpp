@@ -2,6 +2,7 @@
 #include "Timeline.h"
 #include "ProjectFile.h"
 #include <QtGlobal>
+#include <QSet>
 
 bool ClipKeyId::sameAs(const ClipKeyId &o) const
 {
@@ -192,4 +193,129 @@ void remapClipParentEntriesAfterMutation(
         rebuilt.insert(childIt.value(), parentIt.value());
     }
     entries = rebuilt;
+}
+
+void remapCarriersByUid(Timeline *timeline, const TrackClipSnapshot &before,
+                        const QHash<QString, QString> &explicitMoves)
+{
+    if (!timeline)
+        return;
+    const TrackClipSnapshot after = snapshotTrackClips(timeline);
+    QHash<QString, int> beforeCount;
+    QHash<QString, int> afterCount;
+    for (const auto &track : before)
+        for (const ClipKeyId &id : track) ++beforeCount[id.uid];
+    for (const auto &track : after)
+        for (const ClipKeyId &id : track) ++afterCount[id.uid];
+    auto unique = [&](const QString &uid) {
+        return !uid.isEmpty() && beforeCount.value(uid) == 1 && afterCount.value(uid) == 1;
+    };
+    QHash<QString, QString> uidToNewKey;
+    for (int t = 0; t < after.size(); ++t)
+        for (int i = 0; i < after[t].size(); ++i)
+            if (unique(after[t][i].uid))
+                uidToNewKey.insert(after[t][i].uid, trackMatteClipKey(t, i));
+    QSet<QString> oldKeys;
+    QHash<QString, QString> oldToNew;
+    // The caller's own provenance first: a repeated uid cannot tell two moved
+    // clips apart, the caller knows which old key went where.
+    QSet<QString> reached;
+    for (auto it = explicitMoves.cbegin(); it != explicitMoves.cend(); ++it) {
+        oldToNew.insert(it.key(), it.value());
+        reached.insert(it.value());
+    }
+    QHash<QString, QString> aligned;
+    bool alignedBuilt = false;
+    for (int t = 0; t < before.size(); ++t) {
+        for (int i = 0; i < before[t].size(); ++i) {
+            const QString oldKey = trackMatteClipKey(t, i);
+            oldKeys.insert(oldKey);
+            if (oldToNew.contains(oldKey)) continue;
+            const QString &uid = before[t][i].uid;
+            if (unique(uid)) {
+                const auto it = uidToNewKey.constFind(uid);
+                if (it != uidToNewKey.cend()) oldToNew.insert(oldKey, it.value());
+                continue;
+            }
+            if (!alignedBuilt) {
+                aligned = alignedClipKeyMap(timeline, before);
+                alignedBuilt = true;
+            }
+            const auto it = aligned.constFind(oldKey);
+            if (it != aligned.cend() && !reached.contains(it.value()))
+                oldToNew.insert(oldKey, it.value());
+        }
+    }
+    // alignedClipKeyMap pairs old[t] with new[t] only, so a clip that moved to
+    // another track while its uid also sits on a third track is not in
+    // `aligned`. Uids are unique per track: pair the leftover before / after
+    // keys of each repeated uid in ascending track order when the counts match.
+    if (alignedBuilt) {
+        for (auto it = oldToNew.cbegin(); it != oldToNew.cend(); ++it) reached.insert(it.value());
+        QHash<QString, QStringList> leftBefore;
+        QHash<QString, QStringList> leftAfter;
+        for (int t = 0; t < before.size(); ++t)
+            for (int i = 0; i < before[t].size(); ++i) {
+                const QString &uid = before[t][i].uid;
+                const QString key = trackMatteClipKey(t, i);
+                if (!uid.isEmpty() && !unique(uid) && !oldToNew.contains(key))
+                    leftBefore[uid].append(key);
+            }
+        for (int t = 0; t < after.size(); ++t)
+            for (int i = 0; i < after[t].size(); ++i) {
+                const QString &uid = after[t][i].uid;
+                const QString key = trackMatteClipKey(t, i);
+                if (leftBefore.contains(uid) && !reached.contains(key))
+                    leftAfter[uid].append(key);
+            }
+        for (auto it = leftBefore.cbegin(); it != leftBefore.cend(); ++it) {
+            const QStringList newKeys = leftAfter.value(it.key());
+            if (newKeys.size() != it.value().size()) continue;
+            for (int k = 0; k < newKeys.size(); ++k) oldToNew.insert(it.value()[k], newKeys[k]);
+        }
+    }
+    // Empty result = the key named a clip that is gone (drop the entry).
+    auto mapKey = [&](const QString &key) {
+        if (!oldKeys.contains(key)) return key;
+        return oldToNew.value(key);
+    };
+
+    const auto roto = timeline->rotoEntries();
+    if (!roto.isEmpty()) {
+        QHash<QString, RotoClipEntry> rebuilt;
+        rebuilt.reserve(roto.size());
+        for (auto it = roto.cbegin(); it != roto.cend(); ++it) {
+            const QString key = mapKey(it.key());
+            if (!key.isEmpty()) rebuilt.insert(key, it.value());
+        }
+        timeline->setRotoEntries(rebuilt);
+    }
+    const auto mattes = timeline->trackMatteEntries();
+    if (!mattes.isEmpty()) {
+        QHash<QString, TimelineTrackMatteEntry> rebuilt;
+        rebuilt.reserve(mattes.size());
+        for (auto it = mattes.cbegin(); it != mattes.cend(); ++it) {
+            const QString key = mapKey(it.key());
+            TimelineTrackMatteEntry e = it.value();
+            e.matteSourceClipId = mapKey(e.matteSourceClipId);
+            if (!key.isEmpty() && !e.matteSourceClipId.isEmpty()) rebuilt.insert(key, e);
+        }
+        timeline->setTrackMatteEntries(rebuilt);
+    }
+    auto parents = timeline->clipParentEntries();
+    const QString sequenceStoreKey = timeline_nesting::sequenceStoreParentKey();
+    const QString sequenceStore = parents.take(sequenceStoreKey);
+    if (!parents.isEmpty()) {
+        QHash<QString, QString> rebuilt;
+        rebuilt.reserve(parents.size() + 1);
+        for (auto it = parents.cbegin(); it != parents.cend(); ++it) {
+            const QString child = mapKey(it.key());
+            const QString parent = mapKey(it.value());
+            if (!child.isEmpty() && !parent.isEmpty() && child != parent)
+                rebuilt.insert(child, parent);
+        }
+        if (!sequenceStore.isEmpty())
+            rebuilt.insert(sequenceStoreKey, sequenceStore);
+        timeline->setClipParentEntries(rebuilt);
+    }
 }

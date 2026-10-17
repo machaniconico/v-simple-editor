@@ -1266,7 +1266,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -6966,6 +6966,71 @@ int runMcpSelftest()
             for (auto &entry : savedAudioClips)
                 entry.first->setClips(entry.second);
         }
+    }
+
+    // G190 / G191 (US-1201): connect_clip connects a V2 clip to a V1 clip and
+    // get_timeline reports the connection; a V2 anchor is rejected unchanged.
+    {
+        Timeline* connectTimeline = projectInfoWindow.m_timeline;
+        ClipInfo anchor;
+        anchor.filePath = QStringLiteral("/selftests/mcp-connect-anchor.mp4");
+        anchor.duration = anchor.outPoint = 10.0;
+        ClipInfo connected = anchor;
+        connected.filePath = QStringLiteral("/selftests/mcp-connect-x.mp4");
+        connected.duration = connected.outPoint = 2.0;
+        connected.leadInSec = 4.0;
+        ClipInfo other = connected;
+        other.filePath = QStringLiteral("/selftests/mcp-connect-y.mp4");
+        other.leadInSec = 1.0;
+        connectTimeline->restoreFromProject(
+            QVector<QVector<ClipInfo>>{{anchor}, {connected, other}},
+            QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+        const QString anchorUid = connectTimeline->trackAt(false, 0)->clips().at(0).uid;
+        const quint64 serialBefore = connectTimeline->undoManager()->saveSerial();
+        const QJsonObject connectPayload = toolPayload(callProjectInfoTool(
+            1901, QStringLiteral("connect_clip"),
+            QJsonObject{{"trackIndex", 1}, {"clipIndex", 0}, {"anchorClipIndex", 0}}));
+        const quint64 serialAfter = connectTimeline->undoManager()->saveSerial();
+        const QJsonObject timelinePayload = toolPayload(callProjectInfoTool(
+            1902, QStringLiteral("get_timeline"), QJsonObject{{"kind", "video"}}));
+        const QJsonObject reported = timelinePayload.value(QStringLiteral("video")).toArray()
+            .at(1).toObject().value(QStringLiteral("clips")).toArray().at(0).toObject();
+        const QJsonObject unconnected = timelinePayload.value(QStringLiteral("video")).toArray()
+            .at(1).toObject().value(QStringLiteral("clips")).toArray().at(1).toObject();
+        std::fprintf(stderr, "mcp G190 ok=%d anchorUid=[%s] reported=[%s] offset=%.6f "
+                     "unconnectedHasKey=%d serialDelta=%llu warnings=%lld\n",
+                     connectPayload.value(QStringLiteral("ok")).toBool(), qPrintable(anchorUid),
+                     qPrintable(reported.value(QStringLiteral("anchorUid")).toString()),
+                     reported.value(QStringLiteral("anchorOffsetSec")).toDouble(),
+                     unconnected.contains(QStringLiteral("anchorUid")),
+                     static_cast<unsigned long long>(serialAfter - serialBefore),
+                     static_cast<long long>(connectPayload.value(QStringLiteral("warnings")).toArray().size()));
+        tallyObserved(190, observeTerm(190, "connect ok", connectPayload.value(QStringLiteral("ok")).toBool())
+            && observeTerm(190, "reported anchorUid", !anchorUid.isEmpty()
+                && reported.value(QStringLiteral("anchorUid")).toString() == anchorUid)
+            && observeTerm(190, "reported offset 4", std::abs(reported.value(QStringLiteral("anchorOffsetSec")).toDouble() - 4.0) < 1e-6)
+            && observeTerm(190, "unconnected clip omits the keys", !unconnected.contains(QStringLiteral("anchorUid"))
+                && !unconnected.contains(QStringLiteral("anchorOffsetSec")))
+            && observeTerm(190, "serial +1", serialAfter - serialBefore == 1),
+            "connect_clip did not connect the V2 clip, get_timeline did not report anchorUid / "
+            "anchorOffsetSec, or the undo serial did not grow by one");
+
+        const quint64 rejectBefore = connectTimeline->undoManager()->saveSerial();
+        const QJsonObject rejected = toolResult(callProjectInfoTool(
+            1903, QStringLiteral("connect_clip"),
+            QJsonObject{{"trackIndex", 1}, {"clipIndex", 1}, {"anchorTrackIndex", 1},
+                        {"anchorClipIndex", 0}}));
+        const ClipInfo afterReject = connectTimeline->trackAt(false, 1)->clips().at(1);
+        const QString rejectText = rejected.value(QStringLiteral("content")).toArray()
+            .at(0).toObject().value(QStringLiteral("text")).toString();
+        std::fprintf(stderr, "mcp G191 isError=%d text=[%s] anchorUid=[%s] serialDelta=%llu\n",
+                     rejected.value(QStringLiteral("isError")).toBool(), qPrintable(rejectText),
+                     qPrintable(afterReject.anchorUid),
+                     static_cast<unsigned long long>(connectTimeline->undoManager()->saveSerial() - rejectBefore));
+        tallyObserved(191, observeTerm(191, "isError", rejected.value(QStringLiteral("isError")).toBool(false))
+            && observeTerm(191, "unchanged", afterReject.anchorUid.isEmpty())
+            && observeTerm(191, "serial unchanged", connectTimeline->undoManager()->saveSerial() == rejectBefore),
+            "connect_clip accepted a V2 anchor or changed the timeline / undo serial when rejecting it");
     }
 
     server.stop();
