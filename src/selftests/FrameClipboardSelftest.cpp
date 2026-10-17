@@ -308,7 +308,7 @@ int runFrameClipboardSelftest()
           error);
 
     MainWindow window;
-    Timeline *timeline = window.findChild<Timeline *>();
+    Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     QAction *action = window.findChild<QAction *>(
         QStringLiteral("action_copy_current_frame_to_clipboard"));
     auto *shortcutManager =

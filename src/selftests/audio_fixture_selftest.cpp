@@ -737,7 +737,7 @@ int runAudioFixtureSelftest()
         bool menuOk = false, migratedOk = false, undoOk = false, redoOk = false, refusedOk = true;
         {
             MainWindow window;
-            Timeline *timeline = window.findChild<Timeline *>();
+            Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
             AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
             if (timeline && timeline->audioTrackCount() < 1)
                 timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
@@ -871,7 +871,7 @@ int runAudioFixtureSelftest()
         bool twoTrackOk = false;
         {
             MainWindow window;
-            Timeline *timeline = window.findChild<Timeline *>();
+            Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
             AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
             if (timeline)
                 timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
@@ -935,7 +935,7 @@ int runAudioFixtureSelftest()
             MainWindow window;
             mcp::McpEditorTools tools(&window, &registry);
             tools.registerWriteTools();
-            Timeline *timeline = window.findChild<Timeline *>();
+            Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
             AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
             if (timeline)
                 timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
@@ -1172,7 +1172,7 @@ int runAudioFixtureSelftest()
         int trackMixSize = -1;
         {
             MainWindow window;
-            Timeline *timeline = window.findChild<Timeline *>();
+            Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
             AudioMixer *mixer = timeline ? timeline->audioMixer() : nullptr;
             if (timeline && timeline->audioTrackCount() < 1)
                 timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},

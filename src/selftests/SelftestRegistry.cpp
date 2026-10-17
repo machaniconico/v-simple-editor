@@ -977,7 +977,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "parent-gate", "VEDITOR_PARENT_GATE_SELFTEST", runParentGateSelftest, true, "tlrender::parentLayerAt shared parent-layer gate vs renderFrameAt: times, offline parent, overlap pick, Start trail, outside interval, per-layer call count, V1 empty/ended boundary (7 gates)" },
     { "video-player-parent", "VEDITOR_VIDEO_PLAYER_PARENT_SELFTEST", runVideoPlayerParentSelftest, true,
-      "VideoPlayer real parent admission (cpu-composite / multi-track) vs tlrender::parentLayerAt: normal, V1, adjustment, disabled, overlap incoming, Start trail, offline parent, observation OFF, per-path records (9 gates)" },
+      "VideoPlayer real parent admission (cpu-composite / multi-track) vs tlrender::parentLayerAt: normal, V1, adjustment, disabled, overlap incoming, Start trail, offline parent, observation OFF, per-path records (10 gates)" },
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,

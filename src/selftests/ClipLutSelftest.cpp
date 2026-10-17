@@ -276,7 +276,7 @@ int runClipLutSelftest()
 
     // US-500: exercise the same non-dialog entry point as both LUT menus.
     MainWindow window;
-    Timeline *menuTimeline = window.findChild<Timeline *>();
+    Timeline *menuTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     bool menuOk = menuTimeline && menuTimeline->undoManager();
     if (menuOk) {
         setTimelineClips(*menuTimeline, QVector<ClipInfo>{plain});

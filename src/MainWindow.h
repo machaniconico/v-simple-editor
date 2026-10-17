@@ -24,6 +24,7 @@ class PuppetPinTool;
 #include <QRectF>
 #include <QString>
 #include <QStringList>
+#include <QProcessEnvironment>
 #include <QList>
 #include "ProjectSettings.h"
 #include "Exporter.h"
@@ -108,6 +109,7 @@ class PuppetPinTool;
 #include "StillCompare.h"
 
 class VideoPlayer;
+bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env);
 class Timeline;
 class TimelineTrack;
 class SourceMonitorDock;

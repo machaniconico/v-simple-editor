@@ -3,6 +3,8 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include <QCoreApplication>
+#include <cstdio>
 #include "VideoPlayer.h"
 #include "Timeline.h"
 #include "UndoTrace.h"
@@ -2701,6 +2703,21 @@ void commitEffects(Timeline &timeline, int trackIndex, int clipIndex,
 }
 } // namespace effectmaskui
 
+bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env)
+{
+    for (const QString &arg : args) {
+        if (arg == QStringLiteral("--selftest") || arg.startsWith(QStringLiteral("--selftest=")))
+            return true;
+    }
+    for (const QString &key : env.keys()) {
+        if (key.startsWith(QStringLiteral("VEDITOR_"))
+            && key.endsWith(QStringLiteral("_SELFTEST"))
+            && env.value(key).toInt() != 0)
+            return true;
+    }
+    return false;
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_vimeoUploadDialog(nullptr)
@@ -2774,6 +2791,12 @@ MainWindow::MainWindow(QWidget *parent)
             return;
         if (m_autoSave && m_autoSave->property("cleanShutdownBeforeAutoSaveStart").toBool())
             return;
+        if (shouldSkipAutosaveRecovery(QCoreApplication::arguments(),
+                                       QProcessEnvironment::systemEnvironment())) {
+            std::fprintf(stderr, "autosave recovery skipped under selftest: %s\n",
+                         qPrintable(files.constFirst()));
+            return;
+        }
 
         QMessageBox prompt(this);
         prompt.setIcon(QMessageBox::Question);
@@ -19381,7 +19404,11 @@ void MainWindow::showEvent(QShowEvent *event)
 
     if (!m_autoSaveStarted && m_autoSave) {
         m_autoSaveStarted = true;
-        QTimer::singleShot(500, this, [this]() {
+        // Short selftests can finish before the normal startup delay. Start
+        // AutoSave in their first event-loop turn so its recovery check runs.
+        const int startupDelayMs = shouldSkipAutosaveRecovery(
+            QCoreApplication::arguments(), QProcessEnvironment::systemEnvironment()) ? 0 : 500;
+        QTimer::singleShot(startupDelayMs, this, [this]() {
             if (!m_autoSave)
                 return;
             // Default OFF. Interval persisted via QSettings, default 30 min.

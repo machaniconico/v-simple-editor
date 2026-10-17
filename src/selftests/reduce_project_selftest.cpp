@@ -78,8 +78,8 @@ int runReduceProjectSelftest()
     RestoreThumbnailSetting restoreSetting;
     restoreSetting.settings.setValue(restoreSetting.key, false);
     MainWindow window;
-    auto *dock = window.findChild<MediaPoolDock *>();
-    auto *timeline = window.findChild<Timeline *>();
+    auto *dock = window.findChild<MediaPoolDock *>(QStringLiteral("MediaPoolDock"));
+    auto *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     if (!dock || !timeline || !temp.isValid()) {
         for (int g = 1; g <= 4; ++g) gate(g, false);
         std::fprintf(stderr, "[reduce-project] summary: %d PASS, %d FAIL\n", passed, failed);

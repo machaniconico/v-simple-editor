@@ -4348,7 +4348,7 @@ int runMcpSelftest()
              QStringLiteral("V1 track was not available"));
     } else {
         const bool noCaptionEditorBefore =
-            projectInfoWindow.findChild<CaptionEditorDialog*>() == nullptr;
+            projectInfoWindow.findChild<CaptionEditorDialog*>(QStringLiteral("captionEditorDialog")) == nullptr;
         const QJsonObject addCaptionResponse = callProjectInfoTool(
             63, QStringLiteral("add_caption"), QJsonObject{
                 {QStringLiteral("text"), QStringLiteral("hello world")},

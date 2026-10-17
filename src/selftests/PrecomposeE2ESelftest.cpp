@@ -233,7 +233,7 @@ bool resetTimelineForPrecompose(MainWindow &window,
                                 int *baselineSequenceCount,
                                 QString *detail)
 {
-    Timeline *timeline = window.findChild<Timeline *>();
+    Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     if (!timeline) {
         if (detail)
             *detail = QStringLiteral("MainWindow timeline child not found");
@@ -506,7 +506,7 @@ int runPrecomposeE2ESelftest()
     MainWindow window;
     QString detail;
     check(2, "MainWindow timeline is available",
-          window.findChild<Timeline *>() != nullptr);
+          window.findChild<Timeline *>(QStringLiteral("mainTimeline")) != nullptr);
     if (failed)
         return failed;
 
@@ -541,9 +541,9 @@ MainWindowLifecycleResult constructAndDestroyMainWindow()
     MainWindow *window = new MainWindow;
     QPointer<MainWindow> windowGuard(window);
     QPointer<MediaPoolDock> mediaPoolDock =
-        window->findChild<MediaPoolDock *>();
+        window->findChild<MediaPoolDock *>(QStringLiteral("MediaPoolDock"));
     QPointer<AudioBusPanel> audioBusPanel =
-        window->findChild<AudioBusPanel *>();
+        window->findChild<AudioBusPanel *>(QStringLiteral("AudioBusPanel"));
     result.dependentDocksFound = !mediaPoolDock.isNull()
         && !audioBusPanel.isNull();
 
