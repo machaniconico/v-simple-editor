@@ -1,5 +1,10 @@
 #include "RenderQueueDialog.h"
 
+#include "AudioExportMix.h"
+#include "AudioMixer.h"
+#include "ProjectFile.h"
+#include "Timeline.h"
+
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -18,6 +23,7 @@
 #include <QVBoxLayout>
 
 #include <cmath>
+#include <memory>
 
 namespace {
 
@@ -73,6 +79,7 @@ public:
         // Source / project file (optional — if blank, RenderQueue uses the
         // currently-open project path implicitly when MainWindow wires it).
         m_sourceEdit = new QLineEdit(this);
+        m_sourceEdit->setObjectName(QStringLiteral("addJobSourceEdit"));
         m_sourceEdit->setPlaceholderText(QStringLiteral("(現在開いているプロジェクト)"));
         auto *sourceBrowse = new QPushButton(QStringLiteral("..."), this);
         sourceBrowse->setMaximumWidth(40);
@@ -410,6 +417,11 @@ void RenderQueueDialog::onAddJobClicked()
     // RenderQueue::resolveTimeline returned nullptr → the whole render,
     // and every track matte, was silently dropped. Carry the live
     // Timeline instead (its matte carrier is kept synced by the owner).
+    Timeline *mixTimeline = nullptr;
+    AudioMixer *mixMixer = nullptr;
+    ProjectData fileData;
+    std::unique_ptr<Timeline> fileTimeline;
+    std::unique_ptr<AudioMixer> fileMixer;
     if (j.projectFilePath.isEmpty()) {
         if (!m_liveTimeline) {
             QMessageBox::warning(this,
@@ -419,6 +431,64 @@ void RenderQueueDialog::onAddJobClicked()
             return;
         }
         j.timeline = m_liveTimeline;
+        mixTimeline = m_liveTimeline;
+        mixMixer = m_liveTimeline->audioMixer();
+    } else if (RenderQueue::isProjectFilePath(j.projectFilePath)
+               && ProjectFile::load(j.projectFilePath, fileData)) {
+        // A saved project: the Timeline RenderQueue::resolveTimeline rebuilds, plus a headless
+        // AudioMixer with the saved mixer state buildMixPlan reads (the same fields
+        // MainWindow::applyAudioState / the AB-5 bus restore apply to the live mixer).
+        fileTimeline = std::make_unique<Timeline>();
+        fileTimeline->restoreGeneratedCaptionOverlays(fileData.generatedCaptionOverlays);
+        fileTimeline->restoreFromProject(fileData.videoTracks, fileData.audioTracks,
+                                         fileData.playheadPos, fileData.markIn, fileData.markOut,
+                                         fileData.zoomLevel);
+        fileMixer = std::make_unique<AudioMixer>();
+        fileMixer->setBusRouting(fileData.audioBusRouting);
+        for (auto it = fileData.trackFx.cbegin(); it != fileData.trackFx.cend(); ++it)
+            fileMixer->setTrackChain(it.key(), it.value());
+        fileMixer->setMasterChain(fileData.masterFx.eq, fileData.masterFx.eqEnabled,
+                                  fileData.masterFx.deesser);
+        for (int i = 0; i < fileData.trackMix.size() && i < AudioMixer::kMaxAudioTracks; ++i) {
+            fileMixer->setTrackGain(i, fileData.trackMix[i].gain);
+            fileMixer->setTrackPan(i, fileData.trackMix[i].pan);
+        }
+        for (const TrackEqState &s : fileData.trackEqStates) {
+            AudioEQConfig cfg;
+            cfg.bands.resize(3);
+            cfg.bands[0].frequency = s.lowFreqHz;
+            cfg.bands[0].gain = s.low;
+            cfg.bands[0].q = s.qFactor;
+            cfg.bands[1].frequency = s.midFreqHz;
+            cfg.bands[1].gain = s.mid;
+            cfg.bands[1].q = s.qFactor;
+            cfg.bands[2].frequency = s.highFreqHz;
+            cfg.bands[2].gain = s.high;
+            cfg.bands[2].q = s.qFactor;
+            fileMixer->setTrackEqConfig(s.trackIdx, cfg);
+            fileMixer->setTrackEqEnabled(s.trackIdx, s.enabled);
+        }
+        mixTimeline = fileTimeline.get();
+        mixMixer = fileMixer.get();
+    }
+    // US-1210: the job's audio goes through the export mix (buildMixPlan / executeMixPlan) like
+    // File→Export; a passthrough timeline returns no mix and keeps RenderQueue's V1 source mux.
+    // The mix is made now, from the Timeline / project as it is at "追加".
+    if (mixTimeline) {
+        QString mixError;
+        const audioexport::MixPlan plan = audioexport::buildMixPlan(
+            mixTimeline, mixMixer, audioexport::MixOptions{});
+        const QString mixPath = audioexport::executeMixPlan(plan, [] { return false; }, &mixError);
+        if (!mixError.isEmpty()) {
+            if (m_statusLabel)
+                m_statusLabel->setText(
+                    QStringLiteral("音声ミックスに失敗したためジョブを追加しませんでした: %1").arg(mixError));
+            return;
+        }
+        if (!mixPath.isEmpty()) {
+            RenderQueue::addTempFile(j.exportConfig, mixPath);
+            RenderQueue::setIntermediateProjectFile(j, mixPath);
+        }
     }
 
     // US-1125: the shared queue's defaults are not this dialog's, so state them.

@@ -4,30 +4,43 @@
 #include "../AudioMixer.h"
 #include "../AudioTrackFx.h"
 #include "../MainWindow.h"
+#include "../MobileExportDialog.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
+#include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../libavcore/AudioExtract.h"
+#include "../libavcore/Encode.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpToolRegistry.h"
 #include "SelftestGate.h"
 
 #include <QAction>
+#include <QApplication>
 #include <QByteArrayView>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
+#include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLineEdit>
 #include <QMenu>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QStandardPaths>
 #include <QStatusBar>
 #include <QTemporaryDir>
+#include <QTest>
+#include <QTimer>
 
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <utility>
 
 #ifndef M_PI
@@ -36,7 +49,7 @@
 
 namespace {
 
-constexpr int kFixtureCount = 15;
+constexpr int kFixtureCount = 17;
 // Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
 constexpr int kLegacyWrongSlot = 100;
 // G10 (US-1020): g's legacy EQ migrated by trackfx::eqFromLegacy, and the
@@ -75,7 +88,20 @@ constexpr int kSoloNone = 111;
 constexpr int kSoloA2MuteA2 = 112;
 // 1 kHz tone WAV for A2 of the solo variants; written by runAudioFixtureSelftest before any export.
 QString g_soloTonePath;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"};
+// US-1210: variant p (index 15) is V1 = an A/V clip with a 1 kHz tone + A1 = the same file with a clip
+// EQ (1 kHz peaking -12 dB), exported through the mobile entry (auto loudness OFF); q (16) is the same
+// project through a RenderQueueDialog "ジョブ追加" job on the live Timeline. Controls p0 / q0: the same
+// entries without the clip EQ (a passthrough timeline: the V1 source audio is muxed as is). The WAV is
+// the exported file's first audio stream decoded by libavcore::extractAudioToWav (mono 48 kHz).
+constexpr int kMobileEq = 15;
+constexpr int kDialogEq = 16;
+constexpr int kMobilePassthrough = 113;
+constexpr int kDialogPassthrough = 114;
+// The A/V source clip and the scratch directory of the exported files; set by runAudioFixtureSelftest.
+QString g_avSourcePath;
+QString g_exportWorkDir;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
+                                           "p", "q"};
 
 // Explicit-instantiation access keeps MainWindow.h unchanged: the project save / load
 // round trip reads the private audio-state pair.
@@ -87,6 +113,13 @@ struct CollectAudioTag { using Type = void (MainWindow::*)(ProjectData &); frien
 struct ApplyAudioTag { using Type = void (MainWindow::*)(const ProjectData &); friend Type member(ApplyAudioTag); };
 template struct Access<CollectAudioTag, &MainWindow::collectAudioState>;
 template struct Access<ApplyAudioTag, &MainWindow::applyAudioState>;
+// US-1210: the mobile / render-queue entries and the shared queue (private in MainWindow).
+struct MobileExportTag { using Type = void (MainWindow::*)(); friend Type member(MobileExportTag); };
+struct OpenRenderQueueTag { using Type = void (MainWindow::*)(); friend Type member(OpenRenderQueueTag); };
+struct EnsureQueueTag { using Type = RenderQueue *(MainWindow::*)(); friend Type member(EnsureQueueTag); };
+template struct Access<MobileExportTag, &MainWindow::onMobileExport>;
+template struct Access<OpenRenderQueueTag, &MainWindow::openRenderQueueDialog>;
+template struct Access<EnsureQueueTag, &MainWindow::ensureRenderQueue>;
 
 quint16 readLe16(const char *p)
 {
@@ -379,10 +412,204 @@ bool setupVariant(int variant, AudioMixer &mixer, Timeline &timeline, QString *e
     return true;
 }
 
+// US-1210 source clip: 4 s of 64x64 mpeg4 at 30 fps with a stereo 48 kHz PCM16 1 kHz tone (0.25 FS)
+// muxed in by FrameEncoder's audio passthrough (the container is Matroska, which carries PCM).
+bool writeAvToneClip(const QString &path, const QString &toneWav, QString *error)
+{
+    constexpr int rate = 48000;
+    QByteArray pcm(rate * 4 * 2 * 2, Qt::Uninitialized);
+    for (int i = 0; i < rate * 4; ++i) {
+        const qint16 value = qint16(std::lround(0.25 * 32767.0 * std::sin(2.0 * M_PI * 1000.0 * i / rate)));
+        for (int c = 0; c < 2; ++c) {
+            pcm[4 * i + 2 * c] = char(value & 0xff);
+            pcm[4 * i + 2 * c + 1] = char((value >> 8) & 0xff);
+        }
+    }
+    if (!libavcore::writePcm16AsWav(toneWav, pcm, rate, 2, error))
+        return false;
+    libavcore::EncodeRequest request;
+    request.outputPath = path.toStdString();
+    request.audioSourcePath = toneWav.toStdString();
+    request.width = 64;
+    request.height = 64;
+    // 30 fps so the render-queue preset job (timeline fps) finds a decoded frame up to the last one.
+    request.fps = request.fpsNum = 30;
+    request.fpsDen = 1;
+    request.videoCodecName = "mpeg4";
+    request.hwVendorHint = "none";
+    request.useHardwareAccel = false;
+    request.videoBitrateBits = 200000;
+    libavcore::FrameEncoder encoder;
+    if (auto failure = encoder.open(request)) {
+        *error = QString::fromStdString(*failure);
+        return false;
+    }
+    QImage frame(64, 64, QImage::Format_RGB888);
+    frame.fill(Qt::darkGreen);
+    for (int i = 0; i < 120; ++i)
+        if (!encoder.pushFrame(frame, i)) {
+            *error = QStringLiteral("A/V source frame push failed at %1").arg(i);
+            return false;
+        }
+    if (auto failure = encoder.finalize()) {
+        *error = QString::fromStdString(*failure);
+        return false;
+    }
+    return true;
+}
+
+// US-1210: exports the A/V project from a real MainWindow through the mobile entry (p / p0) or a
+// RenderQueueDialog "ジョブ追加" job on the live Timeline (q / q0), then decodes the output's audio.
+// fromProjectFile: the dialog job's source is the project saved to a .veditor file (A1 fader gain
+// savedTrackGain in trackMix) and the live Timeline stays empty.
+bool exportVariant(int variant, const QString &wavPath, QByteArray *pcm, QString *error,
+                   int *channels, int *sampleRate, bool fromProjectFile = false, double savedTrackGain = 1.0)
+{
+    const bool mobile = variant == kMobileEq || variant == kMobilePassthrough;
+    const bool withEq = variant == kMobileEq || variant == kDialogEq;
+    const QString name = QString::fromLatin1(
+        variant == kMobileEq ? "p" : variant == kDialogEq ? "q" : mobile ? "p0" : "q0")
+        + (!fromProjectFile ? QString() : savedTrackGain != 1.0 ? QStringLiteral("-gain-file") : QStringLiteral("-file"));
+    static int serial = 0;
+    const QString outputPath = QDir(g_exportWorkDir).filePath(
+        QStringLiteral("%1-%2.mkv").arg(name).arg(++serial));
+    if (g_exportWorkDir.isEmpty() || !QFile::exists(g_avSourcePath)) {
+        *error = QStringLiteral("A/V source clip unavailable: %1").arg(g_avSourcePath);
+        return false;
+    }
+    ClipInfo picture;
+    picture.filePath = g_avSourcePath;
+    picture.displayName = QStringLiteral("audio-fixture-av");
+    picture.duration = 4.0;
+    picture.inPoint = 0.0;
+    picture.outPoint = 4.0;
+    ClipInfo sound = picture;
+    if (withEq) {
+        sound.clipEq.lowMid = trackfx::EqBand{1000.0, -12.0, 1.0};
+        sound.clipEqEnabled = true;
+    }
+    // A failed export opens a modal QMessageBox from the entries: record and close it.
+    QStringList modalTexts;
+    QTimer modalGuard;
+    QObject::connect(&modalGuard, &QTimer::timeout, &modalGuard, [&modalTexts]() {
+        for (QWidget *widget : QApplication::topLevelWidgets()) {
+            auto *box = qobject_cast<QMessageBox *>(widget);
+            if (!box || !box->isVisible()) continue;
+            modalTexts << box->text();
+            box->done(0);
+        }
+    });
+    modalGuard.start(200);
+    MainWindow window;
+    window.hide();
+    Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+    RenderQueue *queue = (window.*member(EnsureQueueTag{}))();
+    if (!timeline || !queue) {
+        *error = QStringLiteral("mainTimeline or the render queue is missing");
+        return false;
+    }
+    QString projectPath;
+    if (fromProjectFile) {
+        ProjectData data;
+        data.videoTracks = QVector<QVector<ClipInfo>>{{picture}};
+        data.audioTracks = QVector<QVector<ClipInfo>>{{sound}};
+        if (savedTrackGain != 1.0) data.trackMix = {TrackMixState{savedTrackGain, 0.0}};
+        projectPath = QDir(g_exportWorkDir).filePath(name + QStringLiteral(".veditor"));
+        if (mobile || !ProjectFile::save(projectPath, data)) {
+            *error = QStringLiteral("%1: project file not saved: %2").arg(name, projectPath);
+            return false;
+        }
+    } else {
+        timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+            QVector<QVector<ClipInfo>>{{sound}}, 0.0, -1.0, -1.0, 100);
+    }
+    // Job state is read in a jobsChanged slot connected before the entry runs.
+    bool sawJob = false;
+    RenderJobStatus status = RenderJobStatus::Pending;
+    QString audioSource;
+    QString jobError;
+    QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+        for (const RenderJob &job : queue->jobs()) {
+            if (job.outputPath != outputPath) continue;
+            sawJob = true;
+            status = job.status;
+            audioSource = job.projectFilePath;
+            jobError = job.errorMessage.isEmpty() ? job.error : job.errorMessage;
+        }
+    });
+    bool entered = false;
+    if (mobile) {
+        (window.*member(MobileExportTag{}))();
+        auto *dialog = window.findChild<MobileExportDialog *>(QStringLiteral("mobileExportDialog"));
+        if (dialog) {
+            dialog->hide();
+            ExportConfig config;
+            config.autoLoudness = false;
+            config.width = config.height = 64;
+            config.fps = 10;
+            config.videoCodec = QStringLiteral("mpeg4");
+            config.videoBitrate = 200;
+            config.outputPath = outputPath;
+            emit dialog->exportRequested(config);
+            entered = true;
+        }
+    } else {
+        (window.*member(OpenRenderQueueTag{}))();
+        auto *addButton = window.findChild<QPushButton *>(QStringLiteral("renderQueueAddJobButton"));
+        if (addButton) {
+            // Fill the modal AddRenderJobDialog (blank source = the live Timeline, else the
+            // saved project file) and accept it.
+            QTimer driver;
+            int tries = 0;
+            QObject::connect(&driver, &QTimer::timeout, &driver, [&]() {
+                QWidget *modal = QApplication::activeModalWidget();
+                auto *edit = modal ? modal->findChild<QLineEdit *>(QStringLiteral("addJobOutputEdit")) : nullptr;
+                auto *source = modal ? modal->findChild<QLineEdit *>(QStringLiteral("addJobSourceEdit")) : nullptr;
+                if (edit && (projectPath.isEmpty() || source)) {
+                    if (!projectPath.isEmpty()) source->setText(projectPath);
+                    edit->setText(outputPath);
+                    entered = QMetaObject::invokeMethod(modal, "accept");
+                    driver.stop();
+                } else if (++tries > 40) {
+                    if (modal) QMetaObject::invokeMethod(modal, "reject");
+                    driver.stop();
+                }
+            });
+            driver.start(50);
+            addButton->click();
+            driver.stop();
+            if (entered) queue->start();
+        }
+    }
+    const bool finished = entered && QTest::qWaitFor([&]() {
+        return !modalTexts.isEmpty()
+            || (sawJob && (status == RenderJobStatus::Completed || status == RenderJobStatus::Failed));
+    }, 300000);
+    modalGuard.stop();
+    std::fprintf(stderr, "G1 %s export entry=%s source=%s entered=%d finished=%d job=%d status=%d audioSource=%s "
+                         "jobError=%s modal=[%s]\n",
+                 name.toUtf8().constData(), mobile ? "mobile" : "render-queue-dialog",
+                 projectPath.isEmpty() ? "live-timeline" : projectPath.toUtf8().constData(),
+                 entered, finished, sawJob, int(status),
+                 audioSource.toUtf8().constData(), jobError.toUtf8().constData(),
+                 modalTexts.join(QLatin1Char('|')).toUtf8().constData());
+    if (!finished || status != RenderJobStatus::Completed || !QFile::exists(outputPath)) {
+        *error = QStringLiteral("%1 export did not complete: %2 %3").arg(name, jobError,
+                                                                        modalTexts.join(QLatin1Char('|')));
+        return false;
+    }
+    if (!libavcore::extractAudioToWav(outputPath, wavPath, 48000, error))
+        return false;
+    return readPcmData(wavPath, pcm, error, channels, sampleRate);
+}
+
 bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
               int *channels = nullptr, int *sampleRate = nullptr,
               const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
 {
+    if (variant == kMobileEq || variant == kDialogEq || variant == kMobilePassthrough
+        || variant == kDialogPassthrough)
+        return exportVariant(variant, path, pcm, error, channels, sampleRate);
     AudioMixer mixer;
     Timeline timeline;
     if (!setupVariant(variant, mixer, timeline, error, source)) return false;
@@ -451,7 +678,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 20; ++gate)
+        for (int gate = 1; gate <= 22; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -459,13 +686,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 20; ++gate)
+        for (int gate = 2; gate <= 22; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 20; ++gate)
+        for (int gate = 2; gate <= 22; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -485,13 +712,24 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 20; ++gate)
+        for (int gate = 2; gate <= 22; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
     g_soloTonePath = out.filePath(QStringLiteral("solo_tone_1k.wav"));
     if (!writeToneWav(g_soloTonePath, 1000.0, 0.125, 5.0))
         std::fprintf(stderr, "G1 cannot write the solo tone WAV: %s\n", g_soloTonePath.toUtf8().constData());
+    // US-1210: the A/V source and the exported files of p / q / p0 / q0 stay out of the fixture set.
+    QTemporaryDir exportWork(out.filePath(QStringLiteral("export_XXXXXX")));
+    QString avError;
+    if (exportWork.isValid()) {
+        g_exportWorkDir = exportWork.path();
+        g_avSourcePath = QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_1k.mkv"));
+        if (!writeAvToneClip(g_avSourcePath, QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_1k.wav")), &avError))
+            g_avSourcePath.clear();
+    }
+    std::fprintf(stderr, "G1 avSource=%s workDirValid=%d error=%s\n", g_avSourcePath.toUtf8().constData(),
+                 exportWork.isValid(), avError.toUtf8().constData());
     QByteArray pcm[kFixtureCount];
     bool generated[kFixtureCount] = {};
     bool repeatEqual[kFixtureCount] = {};
@@ -523,7 +761,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "fifteen PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "seventeen PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -1474,5 +1712,86 @@ int runAudioFixtureSelftest()
                        && bothMutedOk && mutedRms < 1e-6,
                    "A2 solo + A1 mute must export only A2's tone; A2 solo + A2 mute must export silence (mute drops the entry before the solo rule)");
     }
+    // US-1210 G21: variant p (V1 = the A/V clip with a 1 kHz tone, A1 = the same file with a 1 kHz peaking
+    // -12 dB clip EQ) exported through the mobile entry with auto loudness OFF: its 1 kHz band sits
+    // -12 dB +-0.5 under control p0 (the same entry without the clip EQ, a passthrough timeline), and p0's
+    // audio equals the source clip's audio sample for sample (the V1 source mux, no re-encode). Detects:
+    // the mobile entry muxing the V1 source audio and skipping the timeline mix (the base: p at 0 dB),
+    // and the passthrough branch going away (p0 re-encoded through a mix).
+    // G22: the same through a RenderQueueDialog "ジョブ追加" job on the live Timeline (q / q0), and with
+    // the q / q0 projects saved to .veditor files as the job's source (live Timeline empty): q-file
+    // -12 dB +-0.5 under q0-file, q0-file equal to the source audio, and q0 saved with an A1 fader gain
+    // of 0.5 (trackMix) -6.02 dB +-0.5 under q0-file. Detects: a project-file job muxing the V1 source
+    // audio without the mix (q-file / gain-file at 0 dB), the saved mixer state not reaching the mix
+    // (gain-file at 0 dB), and a mixed file job losing its project (the job fails).
+    QByteArray sourcePcm;
+    QString sourceError;
+    int sourceChannels = 0, sourceRate = 0;
+    const QString sourceWav = QDir(g_exportWorkDir).filePath(QStringLiteral("source_audio.wav"));
+    const bool sourceOk = !g_avSourcePath.isEmpty()
+        && libavcore::extractAudioToWav(g_avSourcePath, sourceWav, 48000, &sourceError)
+        && readPcmData(sourceWav, &sourcePcm, &sourceError, &sourceChannels, &sourceRate);
+    const auto exportGate = [&](int gate, int variant, int control, const char *controlName, bool fileOk,
+                                const char *what) {
+        QByteArray controlPcm;
+        QString controlError;
+        int controlChannels = 0, controlRate = 0;
+        const bool controlOk = generate(control, out.filePath(QString::fromLatin1(controlName) + QStringLiteral(".wav")),
+                                        &controlPcm, &controlError, &controlChannels, &controlRate);
+        const double tone = toneLevel(pcm[variant], channels[variant], sampleRates[variant], kToneHz, 0.5, 3.5);
+        const double controlTone = toneLevel(controlPcm, controlChannels, controlRate, kToneHz, 0.5, 3.5);
+        const double sourceTone = toneLevel(sourcePcm, sourceChannels, sourceRate, kToneHz, 0.5, 3.5);
+        const double deltaDb = bandDb(tone, controlTone);
+        const PcmComparison passthrough = comparePcm16(controlPcm, sourcePcm);
+        const bool controlSane = sourceOk && controlOk && sourceTone > 0.05 && controlTone > 0.05;
+        const bool eqOk = std::abs(deltaDb + 12.0) <= 0.5;
+        std::fprintf(stderr, "G%d %s tone1k=%.12g %s tone1k=%.12g deltaDb=%.4f target=-12+-0.5 eqOk=%d deterministic=%d "
+                             "| source tone1k=%.12g bytes=%lld ok=%d error=%s | %s vs source identical=%d maxDiffLsb=%d "
+                             "lengthDiffSamples=%lld firstDiffSample=%lld bytes=%lld controlSane=%d error=%s\n",
+                     gate, kNames[variant], tone, controlName, controlTone, deltaDb, eqOk, repeatEqual[variant],
+                     sourceTone, static_cast<long long>(sourcePcm.size()), sourceOk, sourceError.toUtf8().constData(),
+                     controlName, passthrough.identical, passthrough.maxDiffLsb,
+                     static_cast<long long>(passthrough.lengthDiffSamples),
+                     static_cast<long long>(passthrough.firstDiffSample), static_cast<long long>(controlPcm.size()),
+                     controlSane, controlError.toUtf8().constData());
+        tally.gate(gate, generated[variant] && repeatEqual[variant] && controlSane && eqOk && passthrough.identical
+                             && fileOk, what);
+    };
+    exportGate(21, kMobileEq, kMobilePassthrough, "p0", true,
+               "mobile export (auto loudness OFF) must apply the A1 clip EQ (-12 dB at 1 kHz vs p0) and keep the passthrough mux for p0");
+    bool dialogFileOk = false;
+    {
+        const QDir work(g_exportWorkDir);
+        QByteArray qPcm, q0Pcm, gainPcm;
+        QString qError, q0Error, gainError;
+        int qChannels = 0, qRate = 0, q0Channels = 0, q0Rate = 0, gainChannels = 0, gainRate = 0;
+        const bool qOk = exportVariant(kDialogEq, work.filePath(QStringLiteral("q-file.wav")), &qPcm, &qError,
+                                       &qChannels, &qRate, true);
+        const bool q0Ok = exportVariant(kDialogPassthrough, work.filePath(QStringLiteral("q0-file.wav")), &q0Pcm,
+                                        &q0Error, &q0Channels, &q0Rate, true);
+        const bool gainOk = exportVariant(kDialogPassthrough, work.filePath(QStringLiteral("q0-gain-file.wav")),
+                                          &gainPcm, &gainError, &gainChannels, &gainRate, true, 0.5);
+        const double qTone = toneLevel(qPcm, qChannels, qRate, kToneHz, 0.5, 3.5);
+        const double q0Tone = toneLevel(q0Pcm, q0Channels, q0Rate, kToneHz, 0.5, 3.5);
+        const double gainTone = toneLevel(gainPcm, gainChannels, gainRate, kToneHz, 0.5, 3.5);
+        const double eqDb = bandDb(qTone, q0Tone);
+        const double gainDb = bandDb(gainTone, q0Tone);
+        const PcmComparison q0VsSource = comparePcm16(q0Pcm, sourcePcm);
+        const bool sane = sourceOk && qOk && q0Ok && gainOk && q0Tone > 0.05;
+        const bool eqOk = std::abs(eqDb + 12.0) <= 0.5;
+        const bool gainDbOk = std::abs(gainDb - 20.0 * std::log10(0.5)) <= 0.5;
+        dialogFileOk = sane && eqOk && gainDbOk && q0VsSource.identical;
+        std::fprintf(stderr, "G22 q-file tone1k=%.12g q0-file tone1k=%.12g deltaDb=%.4f target=-12+-0.5 eqOk=%d "
+                             "| q0-gain-file tone1k=%.12g deltaDb=%.4f target=-6.02+-0.5 gainOk=%d "
+                             "| q0-file vs source identical=%d maxDiffLsb=%d lengthDiffSamples=%lld firstDiffSample=%lld "
+                             "| sane=%d errors=[%s|%s|%s]\n",
+                     qTone, q0Tone, eqDb, eqOk, gainTone, gainDb, gainDbOk, q0VsSource.identical,
+                     q0VsSource.maxDiffLsb, static_cast<long long>(q0VsSource.lengthDiffSamples),
+                     static_cast<long long>(q0VsSource.firstDiffSample), sane, qError.toUtf8().constData(),
+                     q0Error.toUtf8().constData(), gainError.toUtf8().constData());
+    }
+    exportGate(22, kDialogEq, kDialogPassthrough, "q0", dialogFileOk,
+               "render-queue-dialog job (live Timeline and saved project file) must apply the A1 clip EQ (-12 dB at 1 kHz vs q0) "
+               "and the saved fader gain, and keep the passthrough mux for q0");
     return tally.finish();
 }

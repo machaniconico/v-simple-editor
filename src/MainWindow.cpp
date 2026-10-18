@@ -17251,9 +17251,11 @@ void MainWindow::onMobileExport()
                                                          &projectLoudnessGainDb);
                     prepareExportJobAsync(std::move(job),
                         [this, cfg, projectLoudnessGainDb](RenderJob job) {
-                        // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
-                        // 作る。OFF 時だけここで無音 / 混合トラックを作る。
-                        if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
+                        // ON 時は prepareJob が音声を作る。OFF 時は通常書き出しと同じく
+                        // finalizeExportJobAudio (buildMixPlan / executeMixPlan) でタイムラインの
+                        // 音声 (クリップ音量 / パン / EQ、複数トラック、FX) を作る。V1 が空なら
+                        // 無音 / 混合トラック、passthrough 判定が真なら従来どおり V1 の元音声を mux する。
+                        if (!cfg.autoLoudness) {
                             QString audioMixError;
                             if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
                                 QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
