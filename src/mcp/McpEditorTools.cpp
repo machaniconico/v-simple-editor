@@ -1967,7 +1967,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("import_fcpxml"),
-        QStringLiteral("FCPXML の素材クリップを最大 2 トラックの新規シーケンスへ読み込む。未解決素材はオフライン。取り消しは1回。"),
+        QStringLiteral("FCPXML の素材クリップと接続クリップを、lane ごとに 1 トラックで新規シーケンスへ読み込む (トラック数の上限なし)。transition・複合クリップ・マルチカムも取り込む。未解決素材はオフライン。取り消しは1回。"),
         schemaWithRequired(QJsonObject{{"filePath", QJsonObject{{"type", "string"}}}}, {"filePath"}),
         guardedWrite(QStringLiteral("import_fcpxml"),
             [this](const QJsonObject &args, QString *err) -> QJsonObject {

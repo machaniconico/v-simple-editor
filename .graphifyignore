@@ -1,4 +1,6 @@
 build/
+build-*/
+build_*/
 .git/
 .omc/
 .claude/

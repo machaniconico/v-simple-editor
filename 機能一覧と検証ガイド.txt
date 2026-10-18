@@ -2278,7 +2278,7 @@
             終了コードが 1 以上になる。GateTally を使わない旧 selftest は `gate-count: unverified (no GateTally)` が出るだけ。
      LLM:   MCP ツール無し (コマンドライン専用)。
      Undo:  対象外 (コマンドライン)
-     selftest: --selftest=gate-tally (13 ゲート。Wave 8 時点は 4) / gate-count-probe (内部用の 2 ゲート。単独では実行しない)
+     selftest: --selftest=gate-tally (14 ゲート。Wave 8 時点は 4) / gate-count-probe (内部用の 2 ゲート。単独では実行しない)
 
   ▼ (6) FCPXML の gap 子 / J カット / 親不正 / 0 本の spine  (ファイル(F) > 外部ツール取り込みハブ(I)… > FCPXML を読み込み…)
      手動:  spine の gap の子に接続クリップ (asset-clip lane=1) を置いた FCPXML、親より前に始まる接続クリップ (J カットの音声)、
