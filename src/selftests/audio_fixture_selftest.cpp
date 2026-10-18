@@ -36,7 +36,7 @@
 
 namespace {
 
-constexpr int kFixtureCount = 13;
+constexpr int kFixtureCount = 15;
 // Negative-control variant (not part of the fixture set): legacy 1 kHz in the low-shelf slot.
 constexpr int kLegacyWrongSlot = 100;
 // G10 (US-1020): g's legacy EQ migrated by trackfx::eqFromLegacy, and the
@@ -67,7 +67,15 @@ constexpr int kBusMuted = 107;
 constexpr int kRoutingEmpty = 108;
 constexpr int kBusUnused = 109;
 constexpr int kAuxPreTrackMuted = 110;
-const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"};
+// US-1209: variant n (index 13) is A1 = the 50 Hz hum and A2 = a 1 kHz tone with A2 soloed; o (14) is n
+// + A1 muted. Controls: n without the solo (n0), and A2 soloed + A2 muted (mute drops the entry first).
+constexpr int kSoloA2 = 13;
+constexpr int kSoloA2MuteA1 = 14;
+constexpr int kSoloNone = 111;
+constexpr int kSoloA2MuteA2 = 112;
+// 1 kHz tone WAV for A2 of the solo variants; written by runAudioFixtureSelftest before any export.
+QString g_soloTonePath;
+const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o"};
 
 // Explicit-instantiation access keeps MainWindow.h unchanged: the project save / load
 // round trip reads the private audio-state pair.
@@ -269,6 +277,25 @@ double channelRms(const QByteArray &pcm, int channels, int sampleRate, int chann
     return std::sqrt(squares / double(last - first));
 }
 
+// Amplitude of one frequency in channel 0 over [fromSec, toSec) (single-bin DFT; the windows used
+// hold whole cycles of the 50 Hz and 1 kHz fixtures).
+double toneLevel(const QByteArray &pcm, int channels, int sampleRate, double freqHz,
+                 double fromSec = 0.1, double toSec = 0.4)
+{
+    if (channels <= 0 || sampleRate <= 0) return 0.0;
+    const qsizetype first = qsizetype(fromSec * sampleRate);
+    const qsizetype last = qMin(qsizetype(toSec * sampleRate), pcm.size() / (2 * channels));
+    if (last <= first) return 0.0;
+    double re = 0.0, im = 0.0;
+    for (qsizetype frame = first; frame < last; ++frame) {
+        const double x = double(static_cast<qint16>(readLe16(pcm.constData() + 2 * frame * channels))) / 32768.0;
+        const double phase = 2.0 * M_PI * freqHz * double(frame) / sampleRate;
+        re += x * std::cos(phase);
+        im += x * std::sin(phase);
+    }
+    return 2.0 * std::sqrt(re * re + im * im) / double(last - first);
+}
+
 // Interleaved PCM16 bytes of [fromSec, toSec).
 QByteArray pcmRange(const QByteArray &pcm, int channels, int sampleRate, double fromSec, double toSec)
 {
@@ -291,6 +318,16 @@ bool setupVariant(int variant, AudioMixer &mixer, Timeline &timeline, QString *e
     }
     if (variant == kClipPan) first.pan = -1.0;
     timeline.audioTracks().first()->setClips({first, second});
+    if (variant == kSoloA2 || variant == kSoloA2MuteA1 || variant == kSoloNone || variant == kSoloA2MuteA2) {
+        timeline.addAudioTrack(false);
+        timeline.audioTracks().at(1)->setClips({humClip(0.0, 2.0, g_soloTonePath)});
+        if (variant != kSoloNone) {
+            timeline.audioTracks().at(1)->setSolo(true);
+            mixer.setTrackSolo(1, true);
+        }
+        if (variant == kSoloA2MuteA1) timeline.audioTracks().at(0)->setMuted(true);
+        if (variant == kSoloA2MuteA2) timeline.audioTracks().at(1)->setMuted(true);
+    }
     if (variant == kTrackPan) mixer.setTrackPan(0, -1.0);
     if (variant == kTrackPanMid) mixer.setTrackPan(0, -0.3);
     if (variant == kPanZero) {
@@ -414,7 +451,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 18; ++gate)
+        for (int gate = 1; gate <= 20; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -422,13 +459,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 18; ++gate)
+        for (int gate = 2; gate <= 20; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 18; ++gate)
+        for (int gate = 2; gate <= 20; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -448,10 +485,13 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 18; ++gate)
+        for (int gate = 2; gate <= 20; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
+    g_soloTonePath = out.filePath(QStringLiteral("solo_tone_1k.wav"));
+    if (!writeToneWav(g_soloTonePath, 1000.0, 0.125, 5.0))
+        std::fprintf(stderr, "G1 cannot write the solo tone WAV: %s\n", g_soloTonePath.toUtf8().constData());
     QByteArray pcm[kFixtureCount];
     bool generated[kFixtureCount] = {};
     bool repeatEqual[kFixtureCount] = {};
@@ -483,7 +523,7 @@ int runAudioFixtureSelftest()
     for (bool ok : generated) allGenerated &= ok;
     std::fprintf(stderr, "G1 json=%s bytes=%lld written=%d\n",
                  json.fileName().toUtf8().constData(), static_cast<long long>(jsonBytes.size()), jsonWritten);
-    tally.gate(1, allGenerated, "thirteen PCM WAV files and audio_fixture.json required");
+    tally.gate(1, allGenerated, "fifteen PCM WAV files and audio_fixture.json required");
 
     QTemporaryDir repeat(out.filePath(QStringLiteral("repeat_XXXXXX")));
     bool repeated = repeat.isValid();
@@ -1343,7 +1383,8 @@ int runAudioFixtureSelftest()
     // G18: variant m (track gain 0.25 + pre-fader send 0.5) exports at a x (0.25 + 0.5) = a x 0.75
     // within 0.1 dB: the pre-fader send skips the track fader. Playback agrees within 0.5 dB, and a
     // track 0 mute silences playback (the pre-fader send follows the track mute), while the export
-    // of the muted project stays at a x 0.75 (track mute / solo are not exported, decision 3-3).
+    // of the muted project stays at a x 0.75 (the mixer's track mute is not exported, decision 3-3;
+    // the Timeline track mute and solo are, G19 / G20).
     // Detects: a pre-fader send scaled by the fader (a x 0.375), a pre-fader send surviving the
     // playback mute (a x 0.5), or the export applying the track mute (silence).
     {
@@ -1371,6 +1412,67 @@ int runAudioFixtureSelftest()
         tally.gate(18, generated[0] && generated[kAuxPre] && repeatEqual[kAuxPre] && mDb <= 0.1 && mutedOk
                        && mutedDb <= 0.1 && playDb <= 0.5 && playSilent,
                    "a pre-fader send must bypass the track fader (a x 0.75), vanish on a playback track mute and stay in the export of the muted project");
+    }
+    // US-1209 G19: variant n (A1 = 50 Hz hum, A2 = 1 kHz tone, A2 soloed) exports only A2's tone: the
+    // 50 Hz band falls under -60 dB of the n0 control (the same fixture without the solo, where both
+    // bands sound) and the 1 kHz band stays within 0.5 dB of n0. Playback (trackAudible) agrees within
+    // 0.5 dB on both bands. Detects: the export ignoring the solo (the base: A1 stays at n0's level).
+    const auto bandDb = [](double level, double reference) {
+        return (level > 0.0 && reference > 0.0) ? 20.0 * std::log10(level / reference)
+                                                : -std::numeric_limits<double>::infinity();
+    };
+    constexpr double kHumHz = 50.0, kToneHz = 1000.0;
+    QByteArray n0Pcm;
+    QString n0Error;
+    int n0Channels = 0, n0Rate = 0;
+    const bool n0Ok = repeat.isValid()
+        && generate(kSoloNone, out.filePath(QStringLiteral("n0.wav")), &n0Pcm, &n0Error, &n0Channels, &n0Rate);
+    const double n0Hum = toneLevel(n0Pcm, n0Channels, n0Rate, kHumHz);
+    const double n0Tone = toneLevel(n0Pcm, n0Channels, n0Rate, kToneHz);
+    const double nHum = toneLevel(pcm[kSoloA2], channels[kSoloA2], sampleRates[kSoloA2], kHumHz);
+    const double nTone = toneLevel(pcm[kSoloA2], channels[kSoloA2], sampleRates[kSoloA2], kToneHz);
+    const QByteArray playN0 = playbackPcm(kSoloNone);
+    const QByteArray playN = playbackPcm(kSoloA2);
+    const double playN0Hum = toneLevel(playN0, 2, 48000, kHumHz);
+    const double playN0Tone = toneLevel(playN0, 2, 48000, kToneHz);
+    const double playNHum = toneLevel(playN, 2, 48000, kHumHz);
+    const double playNTone = toneLevel(playN, 2, 48000, kToneHz);
+    {
+        const double exportHumDb = bandDb(nHum, n0Hum);
+        const double exportToneDb = bandDb(nTone, n0Tone);
+        const double playHumDb = bandDb(playNHum, playN0Hum);
+        const double playToneDb = bandDb(playNTone, playN0Tone);
+        const bool controlSane = n0Ok && n0Hum > 0.01 && n0Tone > 0.01 && playN0Hum > 0.01 && playN0Tone > 0.01;
+        const bool exportOk = nHum < n0Hum * 0.001 && std::abs(exportToneDb) <= 0.5;
+        const bool playOk = playNHum < playN0Hum * 0.001 && std::abs(playToneDb) <= 0.5;
+        const bool agree = std::abs(exportToneDb - playToneDb) <= 0.5;
+        std::fprintf(stderr, "G19 n0 hum=%.12g tone=%.12g sane=%d error=%s | n export hum=%.12g (%.2f dB) tone=%.12g (%.4f dB) "
+                             "| playback n0 hum=%.12g tone=%.12g n hum=%.12g (%.2f dB) tone=%.12g (%.4f dB) agree=%d deterministic=%d\n",
+                     n0Hum, n0Tone, controlSane, n0Error.toUtf8().constData(), nHum, exportHumDb, nTone, exportToneDb,
+                     playN0Hum, playN0Tone, playNHum, playHumDb, playNTone, playToneDb, agree, repeatEqual[kSoloA2]);
+        tally.gate(19, generated[kSoloA2] && repeatEqual[kSoloA2] && controlSane && exportOk && playOk && agree,
+                   "a soloed A2 must export only A2's tone (A1 band under -60 dB of the no-solo control), matching playback within 0.5 dB");
+    }
+    // US-1209 G20: variant o (A2 solo + A1 mute) exports only A2's tone like n (mute regression);
+    // A2 solo + A2 mute exports silence: the entry's audioMuted drops it before the solo rule, so the
+    // export differs from playback's solo-wins rule on purpose (an expectation change would FAIL).
+    {
+        QByteArray bothMutedPcm;
+        QString bothMutedError;
+        const bool bothMutedOk = repeat.isValid()
+            && generate(kSoloA2MuteA2, out.filePath(QStringLiteral("o_a2_muted.wav")), &bothMutedPcm, &bothMutedError);
+        const double oHum = toneLevel(pcm[kSoloA2MuteA1], channels[kSoloA2MuteA1], sampleRates[kSoloA2MuteA1], kHumHz);
+        const double oTone = toneLevel(pcm[kSoloA2MuteA1], channels[kSoloA2MuteA1], sampleRates[kSoloA2MuteA1], kToneHz);
+        const double oToneDb = bandDb(oTone, n0Tone);
+        const double mutedRms = rms(bothMutedPcm);
+        const bool controlSane = n0Ok && n0Hum > 0.01 && n0Tone > 0.01;
+        std::fprintf(stderr, "G20 o hum=%.12g tone=%.12g toneDb=%.4f deterministic=%d | a2SoloA2Mute rms=%.12g bytes=%lld ok=%d error=%s\n",
+                     oHum, oTone, oToneDb, repeatEqual[kSoloA2MuteA1], mutedRms,
+                     static_cast<long long>(bothMutedPcm.size()), bothMutedOk, bothMutedError.toUtf8().constData());
+        tally.gate(20, generated[kSoloA2MuteA1] && repeatEqual[kSoloA2MuteA1] && controlSane
+                       && oHum < n0Hum * 0.001 && std::abs(oToneDb) <= 0.5
+                       && bothMutedOk && mutedRms < 1e-6,
+                   "A2 solo + A1 mute must export only A2's tone; A2 solo + A2 mute must export silence (mute drops the entry before the solo rule)");
     }
     return tally.finish();
 }

@@ -57,7 +57,8 @@ struct MixPlan {
     QMap<int, double> trackGains;
     QMap<int, double> trackPans;
     // US-1122: bus chain + AUX sends per track (AudioBusRouting::resolveTrackRouteGains).
-    // Track mute / solo stay out of the export (decision 3-3).
+    // Track mute reaches the export as PlaybackEntry::audioMuted (skipped in buildMixPlan);
+    // track solo is applied in buildMixPlan (trackAudible: any solo -> only soloed tracks sound).
     QMap<int, audiobus::RouteGains> routeGains;
     bool useTrackFx = false;
     trackfx::Chain masterChain;

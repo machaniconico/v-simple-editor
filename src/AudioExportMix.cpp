@@ -208,6 +208,17 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
                 || (plan.legacyEqEnabled.value(track) && !plan.legacyEqConfigs.value(track).isDefault());
         }
     }
+    // Track solo (same rule as the live mixer's trackAudible): with any audio track
+    // soloed only soloed tracks sound. Mute is dropped earlier by entry.audioMuted.
+    bool anyTrackSolo = false;
+    for (const TimelineTrack *audioTrack : timeline->audioTracks())
+        anyTrackSolo = anyTrackSolo || (audioTrack && audioTrack->isSolo());
+    const auto trackAudible = [&](int track) {
+        const QVector<TimelineTrack *> &tracks = timeline->audioTracks();
+        return !anyTrackSolo || (track >= 0 && track < tracks.size() && tracks[track] && tracks[track]->isSolo());
+    };
+    // A solo changes which clips sound, so the source audio can not be muxed as is.
+    plan.useTrackFx = plan.useTrackFx || anyTrackSolo;
     const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
     // Any un-muted clip EQ needs the DSP path (and rules out passthrough).
     for (const PlaybackEntry &entry : entries)
@@ -238,6 +249,8 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
     for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
         const PlaybackEntry &entry = entries[entryIndex];
         if (entry.audioMuted)
+            continue;
+        if (!trackAudible(entry.sourceTrack))
             continue;
         if (entry.timelineEnd <= entry.timelineStart)
             continue;
