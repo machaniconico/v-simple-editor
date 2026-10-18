@@ -126,6 +126,7 @@ int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
+int runExrWriterSelftest();
 int runExposureAidsSelftest();
 int runFcpxmlImportSelftest();
 int runFcpxmlSelftest();
@@ -683,6 +684,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
+    { "exr-writer",        "VEDITOR_EXR_WRITER_SELFTEST",          runExrWriterSelftest,         false,
+      "EXR half/float encoding, ZIP/None, alpha channels and linearization (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
       "MotionTracker preset 7 built-in + Registry + JSON round-trip (10 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET
