@@ -68,7 +68,9 @@ struct Entry {
     Time handleEnd; // pre-trim source end (start + duration) of an overlap-trimmed clip
     bool underGap = false;
     bool audioElement = false;
+    bool videoElement = false;
     bool compoundAudioCopy = false; // audio-track reference of a mixed ref-clip
+    bool noAudioCopy = false; // ref-clip cut for a video-only angle: its compound audio belongs to another angle
 };
 // A spine-level transition remembers its neighbouring spine clips (entry
 // indexes, -1 when the neighbour is missing or a gap) until placement is known.
@@ -84,6 +86,9 @@ bool isContainerTag(QStringView tag)
 }
 // A media's <sequence> rewritten as a standalone document for parseDocument.
 struct Compound { QString name, document; };
+// A multicam media: each mc-angle's spine rewritten as a standalone document.
+struct MulticamAngle { QString id, name, document; };
+struct Multicam { QString name; QVector<MulticamAngle> angles; };
 // Shared by the document and its compound clips: resources, the media ids
 // being read (outermost first), the nesting level of the document being read
 // (0 = the root), the deepest level a kept reference reached each media at,
@@ -92,6 +97,7 @@ struct Nesting {
     QMap<QString, Asset> assets;
     QMap<QString, QXmlStreamAttributes> formats;
     QMap<QString, Compound> media;
+    QMap<QString, Multicam> multicams;
     QSet<QString> built, found, missing;
     QStringList chain;
     int level = 0;
@@ -102,8 +108,10 @@ constexpr int kMaxCompoundDepth = 8;
 }
 // originOut / contentEndOut receive the sequence tcStart and the end of its
 // placed clips (relative to tcStart) for a compound clip's asset range.
+// entriesOut: read the document only and hand back its parsed entries (a
+// multicam angle's spine), before any placement.
 static ImportResult parseDocument(const QString &xml, const QString &directory, Nesting &nest,
-                                  Time *originOut, Time *contentEndOut)
+                                  Time *originOut, Time *contentEndOut, QVector<Entry> *entriesOut = nullptr)
 {
     ImportResult result;
     QXmlStreamReader reader(xml);
@@ -235,6 +243,150 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         result.warnings.append(skipped);
         return false;
     };
+    // An mc-clip at spine level is replaced by the spine of its active angles
+    // (mc-source srcEnable; mc-clip has no angle attribute), cut to
+    // [start, start + duration) of the multicam and placed at offset. The video
+    // angle is the first source enabling video, else the first mc-angle. A
+    // different audio angle becomes audio clips connected to the first video clip.
+    auto readMulticamClip = [&]() {
+        const auto a = reader.attributes();
+        if (a.hasAttribute("lane") && a.value("lane").toString() != QLatin1String("0")) { warnSkip(); return; }
+        const QString ref = a.value("ref").toString();
+        const QString clipName = a.value("name").toString().isEmpty() ? ref : a.value("name").toString();
+        Entry frame;
+        QString invalid;
+        if (a.hasAttribute("offset") && !time(a.value("offset").toString(), frame.offset)) invalid = QStringLiteral("offset");
+        if (a.hasAttribute("start") && !time(a.value("start").toString(), frame.start)) invalid = QStringLiteral("start");
+        Time multicamEnd;
+        if (!time(a.value("duration").toString(), frame.duration) || !frame.duration.n
+            || !combine(frame.start, frame.duration, false, multicamEnd)) invalid = QStringLiteral("duration");
+        struct Source { QString angleId, enable; };
+        QVector<Source> sources;
+        while (reader.readNextStartElement()) {
+            if (reader.name() == QLatin1String("mc-source")) {
+                const auto s = reader.attributes();
+                sources.append({s.value("angleID").toString(),
+                    s.hasAttribute("srcEnable") ? s.value("srcEnable").toString() : QStringLiteral("all")});
+                reader.skipCurrentElement();
+            } else warnSkip();
+        }
+        ++assetClipCount;
+        if (!nest.multicams.contains(ref)) {
+            result.warnings.append(QStringLiteral("未定義の素材参照を読み飛ばしました: %1").arg(ref));
+            return;
+        }
+        if (!invalid.isEmpty()) {
+            result.warnings.append(QStringLiteral("クリップの値が不正です (%1): %2 / %3").arg(invalid, clipName, ref));
+            return;
+        }
+        const Multicam multicam = nest.multicams.value(ref);
+        if (multicam.angles.isEmpty()) {
+            result.warnings.append(QStringLiteral("mc-clip %1 にアングルが無いため読み飛ばしました").arg(clipName));
+            return;
+        }
+        if (nest.chain.contains(ref)) {
+            result.warnings.append(QStringLiteral("multicam の循環参照を読み飛ばしました: %1").arg(ref));
+            return;
+        }
+        if (nest.level >= kMaxCompoundDepth) {
+            result.warnings.append(QStringLiteral("multicam の入れ子が深さ %1 を超えたため読み飛ばしました: %2")
+                .arg(kMaxCompoundDepth).arg(ref));
+            return;
+        }
+        auto angleLabel = [&](int index) {
+            return multicam.angles[index].name.isEmpty() ? multicam.angles[index].id : multicam.angles[index].name;
+        };
+        int videoAngle = -1, audioAngle = -1;
+        for (const auto &source : sources) {
+            int index = -1;
+            for (int i = 0; i < multicam.angles.size() && index < 0; ++i)
+                if (multicam.angles[i].id == source.angleId) index = i;
+            if (index < 0) {
+                result.warnings.append(QStringLiteral("mc-clip %1 の未定義のアングルを読み飛ばしました: %2")
+                    .arg(clipName, source.angleId));
+                continue;
+            }
+            if (videoAngle < 0 && (source.enable == QLatin1String("video") || source.enable == QLatin1String("all")))
+                videoAngle = index;
+            if (audioAngle < 0 && (source.enable == QLatin1String("audio") || source.enable == QLatin1String("all")))
+                audioAngle = index;
+        }
+        if (videoAngle < 0) {
+            videoAngle = 0;
+            result.warnings.append(QStringLiteral("mc-clip %1 に有効アングルが無いため最初のアングル %2 を使いました")
+                .arg(clipName, angleLabel(0)));
+        }
+        QStringList unused;
+        for (int i = 0; i < multicam.angles.size(); ++i)
+            if (i != videoAngle && i != audioAngle) unused.append(angleLabel(i));
+        if (!unused.isEmpty())
+            result.warnings.append(QStringLiteral("mc-clip %1 の未使用アングルを読み飛ばしました: %2")
+                .arg(clipName, unused.join(QStringLiteral(", "))));
+        bool overflow = false;
+        // Cut one angle's entries to the mc-clip range and append them to
+        // entries; returns the first appended spine entry that has a uid.
+        // audio: audio-only copy (video elements are skipped, other roots become
+        // audio); videoOnly: audio entries are skipped. A skipped element's
+        // surviving children attach to attachTo (-3), unlike a cut-out parent (-1).
+        auto appendCut = [&](int angleIndex, bool audio, int attachTo, bool videoOnly) {
+            QVector<Entry> angle;
+            nest.chain.append(ref);
+            ++nest.level;
+            const ImportResult inner = parseDocument(multicam.angles[angleIndex].document, directory, nest,
+                                                     nullptr, nullptr, &angle);
+            --nest.level;
+            nest.chain.removeLast();
+            for (const QString &warning : inner.warnings)
+                if (!result.warnings.contains(warning)) result.warnings.append(warning);
+            if (!inner.error.isEmpty()) {
+                result.warnings.append(QStringLiteral("mc-clip %1 のアングル %2 を読み込めないため読み飛ばしました: %3")
+                    .arg(clipName, angleLabel(angleIndex), inner.error));
+                return -1;
+            }
+            QVector<int> placed(angle.size(), -2);
+            int firstRoot = -1;
+            std::function<int(int)> place = [&](int i) -> int {
+                if (placed[i] != -2) return placed[i];
+                placed[i] = -1;
+                Entry e = angle[i];
+                const bool filtered = videoOnly ? isAudioEntry(e) : audio && e.videoElement;
+                if (e.parentIndex >= 0) {
+                    const int parent = place(e.parentIndex);
+                    if (parent == -3 || parent == -4) e.parentIndex = attachTo;
+                    else if (parent < 0) return -1;
+                    else e.parentIndex = parent;
+                } else if (!e.underGap && e.lane != 0) {
+                    return -1;
+                } else {
+                    e.parentIndex = attachTo;
+                }
+                if (attachTo >= 0) e.underGap = false;
+                Time clipEnd, intoClip, intoMulticam;
+                if (!combine(e.offset, e.duration, false, clipEnd)) { overflow = true; return -1; }
+                const Time from = lessTime(e.offset, frame.start) ? frame.start : e.offset;
+                const Time to = lessTime(clipEnd, multicamEnd) ? clipEnd : multicamEnd;
+                if (!lessTime(from, to)) return placed[i] = -4;
+                Time offset, start, duration;
+                if (!combine(from, e.offset, true, intoClip) || !combine(e.start, intoClip, false, start)
+                    || !combine(from, frame.start, true, intoMulticam) || !combine(frame.offset, intoMulticam, false, offset)
+                    || !combine(to, from, true, duration)) { overflow = true; return -1; }
+                e.offset = offset; e.start = start; e.duration = duration;
+                if (filtered) return placed[i] = -3;
+                if (audio) { e.audioElement = true; e.lane = 1; }
+                if (videoOnly && e.refClip) e.noAudioCopy = true;
+                entries.append(e);
+                placed[i] = int(entries.size()) - 1;
+                if (angle[i].parentIndex < 0 && firstRoot < 0 && !e.uid.isEmpty()) firstRoot = placed[i];
+                return placed[i];
+            };
+            for (int i = 0; i < angle.size(); ++i) place(i);
+            return firstRoot;
+        };
+        const int firstVideo = appendCut(videoAngle, false, -1, audioAngle != videoAngle);
+        if (audioAngle >= 0 && audioAngle != videoAngle) appendCut(audioAngle, true, firstVideo, false);
+        if (overflow)
+            result.warnings.append(QStringLiteral("クリップの値が不正です (mc-clip の切り出し): %1 / %2").arg(clipName, ref));
+    };
     std::function<void(const Time *, const Time *, int, int, const QXmlStreamAttributes *)> readSpine;
     readSpine = [&](const Time *parentOffset, const Time *parentStart, int parentIndex,
                     int depth, const QXmlStreamAttributes *fallback) {
@@ -298,6 +450,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             --gapDepth;
             return;
         }
+        if (tag == QLatin1String("mc-clip") && !parentOffset) { readMulticamClip(); return; }
         const bool refClip = tag == QLatin1String("ref-clip");
         if (refClip && !keepCompound(reader.attributes().value("ref").toString())) { warnDescendants(); return; }
         if (!refClip && !isMediaClipTag(tag)) { warnSkip(); return; }
@@ -317,6 +470,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         e.parentIndex = parentIndex;
         e.underGap = gapDepth > 0;
         e.audioElement = tag == QLatin1String("audio");
+        e.videoElement = tag == QLatin1String("video");
         e.refClip = refClip;
         bool laneOk = true;
         if (hasAttribute(QStringLiteral("lane"))) e.lane = attribute(QStringLiteral("lane")).toInt(&laneOk);
@@ -369,7 +523,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             if (!readTime(a, QStringLiteral("start"), asset.start)
                 || !readTime(a, QStringLiteral("duration"), asset.duration)) break;
             const QString id = a.value("id").toString();
-            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
+            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id) || nest.multicams.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
             while (reader.readNextStartElement()) {
                 if (reader.name() == QLatin1String("media-rep") && reader.attributes().value("kind") == QLatin1String("original-media")) {
                     asset.path = reader.attributes().value("src").toString(); reader.skipCurrentElement();
@@ -378,10 +532,35 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             assets.insert(id, asset); continue;
         } else if (tag == "media" && parent == "resources") {
             const QString id = a.value("id").toString();
-            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
+            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id) || nest.multicams.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
             Compound compound;
             compound.name = a.value("name").toString();
+            Multicam multicam;
+            bool isMulticam = false;
             while (reader.readNextStartElement()) {
+                if (reader.name() == QLatin1String("multicam") && !isMulticam) {
+                    isMulticam = true;
+                    multicam.name = compound.name;
+                    while (reader.readNextStartElement()) {
+                        if (reader.name() != QLatin1String("mc-angle")) { warnSkip(); continue; }
+                        MulticamAngle angle;
+                        angle.id = reader.attributes().value("angleID").toString();
+                        angle.name = reader.attributes().value("name").toString();
+                        QXmlStreamWriter writer(&angle.document);
+                        for (const char *element : {"fcpxml", "project", "sequence", "spine"})
+                            writer.writeStartElement(QString::fromLatin1(element));
+                        while (reader.readNextStartElement()) {
+                            for (int depth = 0; !reader.hasError(); reader.readNext()) {
+                                writer.writeCurrentToken(reader);
+                                if (reader.isStartElement()) ++depth;
+                                else if (reader.isEndElement() && --depth == 0) break;
+                            }
+                        }
+                        for (int i = 0; i < 4; ++i) writer.writeEndElement();
+                        multicam.angles.append(angle);
+                    }
+                    continue;
+                }
                 if (reader.name() != QLatin1String("sequence") || !compound.document.isEmpty()) { warnSkip(); continue; }
                 QXmlStreamWriter writer(&compound.document);
                 writer.writeStartElement(QStringLiteral("fcpxml"));
@@ -395,7 +574,9 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 writer.writeEndElement();
                 writer.writeEndElement();
             }
-            nest.media.insert(id, compound); continue;
+            if (isMulticam) nest.multicams.insert(id, multicam);
+            else nest.media.insert(id, compound);
+            continue;
         } else if ((tag == "library" && parent == "fcpxml")
                    || (tag == "event" && (parent == "library" || parent == "fcpxml"))) {
         } else if (tag == "project" && (parent == "event" || parent == "fcpxml")) {
@@ -417,15 +598,22 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             transitions.append(transition);
             awaitingNext = true;
             reader.skipCurrentElement(); continue;
-        } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap" || tag == "ref-clip"
+        } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap" || tag == "ref-clip" || tag == "mc-clip"
                    || isContainerTag(QStringView(tag)))) {
             const int firstEntry = entries.size();
             readSpine(nullptr, nullptr, -1, 0, nullptr);
             int root = -1;
             if (tag != "gap") {
-                for (int i = firstEntry; i < entries.size() && root < 0; ++i)
-                    if (!entries[i].uid.isEmpty()) root = i;
+                const bool multicam = tag == "mc-clip";
+                int lastRoot = -1;
+                for (int i = firstEntry; i < entries.size(); ++i) {
+                    if (entries[i].uid.isEmpty() || (multicam && (entries[i].parentIndex >= 0 || isAudioEntry(entries[i])))) continue;
+                    if (root < 0) root = i;
+                    lastRoot = i;
+                    if (!multicam) break;
+                }
                 if (awaitingNext) transitions.last().next = root;
+                root = lastRoot;
             }
             awaitingNext = false;
             lastSpineRoot = root;
@@ -436,6 +624,12 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     if (reader.hasError()) result.error = QStringLiteral("FCPXML 読み込みエラー (行 %1): %2").arg(reader.lineNumber()).arg(reader.errorString());
     else if (!root || !sequence || !spine) result.error = QStringLiteral("読み込めるシーケンスがありません。");
     if (!result.error.isEmpty()) return result;
+    if (entriesOut) {
+        if (!transitions.isEmpty())
+            result.warnings.append(QStringLiteral("mc-angle 内の transition を読み飛ばしました (%1 件)").arg(transitions.size()));
+        *entriesOut = entries;
+        return result;
+    }
     // Format metadata is interpreted but cannot replace global project settings
     // when importing into a new sequence of an existing project.
     QSet<QString> usedFormats;
@@ -559,7 +753,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         // an audio track, like Timeline::addSequenceClip, so its nested audio
         // plays. The audio copy carries no uid (Timeline assigns its own) and
         // keeps the parent, so a connected copy anchors with its video.
-        if (e.refClip && !isAudioEntry(e) && assets.value(e.ref).hasAudio) {
+        if (e.refClip && !e.noAudioCopy && !isAudioEntry(e) && assets.value(e.ref).hasAudio) {
             Entry audioCopy = e;
             audioCopy.uid.clear();
             audioCopy.compoundAudioCopy = true;

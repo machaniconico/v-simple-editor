@@ -113,8 +113,7 @@ int runFcpxmlImportSelftest()
     bool warnings = unsupported.error.isEmpty() && unsupported.videoTracks[0].size() == 2
         && unsupported.unresolvedFiles == 1 && unsupported.resolvedFiles == 0
         && !QFileInfo::exists(unsupported.videoTracks[0][0].filePath);
-    for (const QString &tag : {
-            QStringLiteral("mc-clip"), QStringLiteral("filter-video"), QStringLiteral("adjust-color")})
+    for (const QString &tag : {QStringLiteral("filter-video"), QStringLiteral("adjust-color")})
         warnings &= unsupported.warnings.join('\n').contains(QStringLiteral(": %1 (").arg(tag));
     // Old pin: "ref-clip" and "media" skip warnings. New: neither; the empty
     // media sequence is reported as an unreadable compound clip instead.
@@ -123,6 +122,12 @@ int runFcpxmlImportSelftest()
     const int compoundWarning = int(unsupported.warnings.count(
         QStringLiteral("compound clip を読み込めないため読み飛ばしました: compound (読み込めるシーケンスがありません。)")));
     warnings &= !refClipSkipWarning && !mediaSkipWarning && compoundWarning == 1 && unsupported.sequences.isEmpty();
+    // Old pin: an "mc-clip" skip warning. New: none; an mc-clip naming an
+    // undefined multicam is reported as an undefined media reference instead.
+    const bool mcClipSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": mc-clip ("));
+    const int undefinedMulticam = int(unsupported.warnings.count(
+        QStringLiteral("未定義の素材参照を読み飛ばしました: multi")));
+    warnings &= !mcClipSkipWarning && undefinedMulticam == 1;
     // Old pin: a "transition" skip warning. New: no skip warning and a head FadeIn on the first clip.
     const bool transitionSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": transition ("));
     const bool headFade = unsupported.videoTracks[0][0].leadIn.type == TransitionType::FadeIn
@@ -135,11 +140,13 @@ int runFcpxmlImportSelftest()
     std::fprintf(stderr, "G4 unsupportedError=%s importedClips=%d resolved=%d unresolved=%d "
         "warningCount=%d transitionSkipWarning=%d(old expected 1, new expected 0) headFade=%d "
         "refClipSkipWarning=%d(old expected 1, new expected 0) mediaSkipWarning=%d(old expected 1, new expected 0) "
-        "compoundWarning=%d(old expected 0, new expected 1) sequences=%d allChecks=%d\n",
+        "compoundWarning=%d(old expected 0, new expected 1) mcClipSkipWarning=%d(old expected 1, new expected 0) "
+        "undefinedMulticam=%d(old expected 0, new expected 1) sequences=%d allChecks=%d\n",
         unsupported.error.toUtf8().constData(),
         int(unsupported.videoTracks[0].size()), unsupported.resolvedFiles, unsupported.unresolvedFiles,
         int(unsupported.warnings.size()), int(transitionSkipWarning), int(headFade),
-        int(refClipSkipWarning), int(mediaSkipWarning), compoundWarning, int(unsupported.sequences.size()),
+        int(refClipSkipWarning), int(mediaSkipWarning), compoundWarning,
+        int(mcClipSkipWarning), undefinedMulticam, int(unsupported.sequences.size()),
         int(warnings));
     gate(4, warnings);
 
@@ -1445,6 +1452,271 @@ int runFcpxmlImportSelftest()
         clipNames(findSequence(afterUndoStore, firstId)).constData(), freshBeforeUndo.constData(),
         freshAfterUndo.constData());
     gate(28, repeatOk);
+
+    // G29-G31: mc-clip reads the spine of its active angle (mc-source srcEnable).
+    const QString multicamAssets = QStringLiteral("<asset id=\"b\" src=\"offline-b.mov\"/>");
+    auto multicamMedia = [&](const QString &angle1, const QString &angle2) {
+        return multicamAssets + QStringLiteral("<media id=\"m\" name=\"MC\"><multicam>"
+            "<mc-angle name=\"アングル1\" angleID=\"a1\">%1</mc-angle>"
+            "<mc-angle name=\"アングル2\" angleID=\"a2\">%2</mc-angle></multicam></media>").arg(angle1, angle2);
+    };
+    const QString singleAngle1 = QStringLiteral("<asset-clip ref=\"a\" name=\"A1clip\" offset=\"0s\" duration=\"10s\"/>");
+    const QString singleAngle2 = QStringLiteral("<asset-clip ref=\"b\" name=\"B2clip\" offset=\"0s\" duration=\"10s\"/>");
+    const QString mcSoundAsset = QStringLiteral("<asset id=\"snd\" src=\"voice.wav\" hasVideo=\"0\" hasAudio=\"1\"/>");
+    const QString mcAngle1Warning = QStringLiteral("mc-clip MCC の未使用アングルを読み飛ばしました: アングル1");
+    const QString mcAngle2Warning = QStringLiteral("mc-clip MCC の未使用アングルを読み飛ばしました: アングル2");
+
+    // G29: srcEnable=all on angle 2 -> V1 holds angle 2's media; angle 1 is reported by name.
+    const auto mcSecond = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" start=\"2s\" duration=\"5s\">"
+        "<mc-source angleID=\"a2\" srcEnable=\"all\"/></mc-clip>"),
+        multicamMedia(singleAngle1, singleAngle2)), dir.path());
+    const ClipInfo *mcSecondClip = mcSecond.videoTracks.size() == 1 && mcSecond.videoTracks[0].size() == 1
+        ? &mcSecond.videoTracks[0][0] : nullptr;
+    const bool mcSecondOk = mcSecond.error.isEmpty() && mcSecondClip
+        && mcSecondClip->displayName == QStringLiteral("B2clip")
+        && mcSecondClip->filePath.endsWith(QStringLiteral("offline-b.mov"))
+        && near(mcSecondClip->inPoint, 2.0) && near(mcSecondClip->outPoint, 7.0) && near(mcSecondClip->leadInSec, 0.0)
+        && mcSecond.warnings.count(mcAngle1Warning) == 1 && !mcSecond.warnings.contains(mcAngle2Warning)
+        && !mcSecond.warnings.join('\n').contains(QStringLiteral(": mc-clip ("));
+    std::fprintf(stderr, "G29 error=%s clips=%d name=%s in=%.9f out=%.9f lead=%.9f unusedAngle1Warning=%d "
+        "unusedAngle2Warning=%d skipWarning=%d\n",
+        mcSecond.error.toUtf8().constData(), mcSecond.videoTracks.isEmpty() ? -1 : int(mcSecond.videoTracks[0].size()),
+        mcSecondClip ? mcSecondClip->displayName.toUtf8().constData() : "",
+        mcSecondClip ? mcSecondClip->inPoint : -1.0, mcSecondClip ? mcSecondClip->outPoint : -1.0,
+        mcSecondClip ? mcSecondClip->leadInSec : -1.0, int(mcSecond.warnings.count(mcAngle1Warning)),
+        int(mcSecond.warnings.count(mcAngle2Warning)),
+        int(mcSecond.warnings.join('\n').contains(QStringLiteral(": mc-clip ("))));
+    // A spine-level lane != 0 is not placed on V1: the mc-clip is skipped with a warning.
+    const QString laneDocument = document(QStringLiteral(
+        "\n\n<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"), multicamMedia(singleAngle1, singleAngle2));
+    const auto mcLane = fcpx::xml::parseXml(laneDocument, dir.path());
+    const int laneLine = laneDocument.left(laneDocument.indexOf(QStringLiteral("<mc-clip"))).count(QLatin1Char('\n')) + 1;
+    const QString laneWarning = QStringLiteral("未対応の要素を読み飛ばしました: mc-clip (行 %1)").arg(laneLine);
+    int laneClips = 0;
+    for (const auto &track : mcLane.videoTracks) laneClips += int(track.size());
+    for (const auto &track : mcLane.audioTracks) laneClips += int(track.size());
+    const bool laneOk = mcLane.error.isEmpty() && laneClips == 0 && mcLane.warnings.count(laneWarning) == 1
+        && mcLane.warnings == QStringList{laneWarning, QStringLiteral("読み込めるクリップがありません。")};
+    std::fprintf(stderr, "G29 lane=1 mc-clip: clips=%d warnings=%d firstWarning=%s expectedLine=%d\n", laneClips,
+        int(mcLane.warnings.size()), mcLane.warnings.join(" | ").toUtf8().constData(), laneLine);
+    gate(29, mcSecondOk && laneOk);
+
+    // G30: the active angle is a spine of two clips and a gap. The range [1s, 7s)
+    // cuts both clips and keeps the gap as lead-in.
+    const auto mcSpine = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"10s\" start=\"1s\" duration=\"6s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"),
+        multicamMedia(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"first\" offset=\"0s\" duration=\"3s\"/><gap offset=\"3s\" duration=\"2s\"/>"
+            "<asset-clip ref=\"a\" name=\"second\" offset=\"5s\" start=\"10s\" duration=\"3s\"/>"), singleAngle2)),
+        dir.path());
+    const bool mcSpineShape = mcSpine.error.isEmpty() && mcSpine.videoTracks.size() == 1 && mcSpine.videoTracks[0].size() == 2;
+    const ClipInfo *mcFirst = mcSpineShape ? &mcSpine.videoTracks[0][0] : nullptr;
+    const ClipInfo *mcSecondSpine = mcSpineShape ? &mcSpine.videoTracks[0][1] : nullptr;
+    const bool mcSpineOk = mcSpineShape
+        && mcFirst->displayName == QStringLiteral("first") && mcSecondSpine->displayName == QStringLiteral("second")
+        && near(mcFirst->leadInSec, 10.0) && near(mcFirst->inPoint, 1.0) && near(mcFirst->outPoint, 3.0)
+        && near(mcSecondSpine->leadInSec, 2.0) && near(mcSecondSpine->inPoint, 10.0) && near(mcSecondSpine->outPoint, 12.0)
+        && mcSpine.warnings.count(mcAngle2Warning) == 1;
+    std::fprintf(stderr, "G30 error=%s clips=%d first(lead=%.9f in=%.9f out=%.9f) second(lead=%.9f in=%.9f out=%.9f) "
+        "expected first(10,1,3) second(2,10,12)\n",
+        mcSpine.error.toUtf8().constData(), mcSpine.videoTracks.isEmpty() ? -1 : int(mcSpine.videoTracks[0].size()),
+        mcFirst ? mcFirst->leadInSec : -1.0, mcFirst ? mcFirst->inPoint : -1.0, mcFirst ? mcFirst->outPoint : -1.0,
+        mcSecondSpine ? mcSecondSpine->leadInSec : -1.0, mcSecondSpine ? mcSecondSpine->inPoint : -1.0,
+        mcSecondSpine ? mcSecondSpine->outPoint : -1.0);
+    // A transition after a two-clip mc-clip belongs to the LAST cut clip (fade-out there, none on the first).
+    const auto mcTail = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"6s\"><mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"
+        "<transition duration=\"1s\"/>"),
+        multicamMedia(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"first\" offset=\"0s\" duration=\"3s\"/>"
+            "<asset-clip ref=\"a\" name=\"second\" offset=\"3s\" duration=\"3s\"/>"), singleAngle2)), dir.path());
+    const bool mcTailShape = mcTail.error.isEmpty() && mcTail.videoTracks.size() == 1 && mcTail.videoTracks[0].size() == 2;
+    const ClipInfo *tailFirst = mcTailShape ? &mcTail.videoTracks[0][0] : nullptr;
+    const ClipInfo *tailSecond = mcTailShape ? &mcTail.videoTracks[0][1] : nullptr;
+    const bool tailOk = tailFirst && tailSecond && tailSecond->trailOut.type == TransitionType::FadeOut
+        && near(tailSecond->trailOut.duration, 1.0) && tailFirst->trailOut.type == TransitionType::None;
+    std::fprintf(stderr, "G30 tail transition: secondTrailOut=%d/%.9f (FadeOut=%d) firstTrailOut=%d (None=%d) warnings=%d\n",
+        tailSecond ? int(tailSecond->trailOut.type) : -1, tailSecond ? tailSecond->trailOut.duration : -1.0,
+        int(TransitionType::FadeOut), tailFirst ? int(tailFirst->trailOut.type) : -1, int(TransitionType::None),
+        int(mcTail.warnings.size()));
+    // A connected clip whose parent lies outside the cut range keeps the part inside it
+    // (video [0,2) with audio [0,6), range [3,5)).
+    const auto mcOutParent = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"20s\" start=\"3s\" duration=\"2s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"),
+        mcSoundAsset + multicamMedia(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"head\" offset=\"0s\" duration=\"2s\">"
+            "<asset-clip ref=\"snd\" name=\"longAudio\" lane=\"-1\" offset=\"0s\" duration=\"6s\"/></asset-clip>"
+            "<asset-clip ref=\"a\" name=\"tail\" offset=\"2s\" duration=\"4s\"/>"), singleAngle2)), dir.path());
+    const ClipInfo *outParentAudio = mcOutParent.audioTracks.size() == 1 && mcOutParent.audioTracks[0].size() == 1
+        ? &mcOutParent.audioTracks[0][0] : nullptr;
+    const bool outParentOk = mcOutParent.error.isEmpty() && outParentAudio
+        && outParentAudio->displayName == QStringLiteral("longAudio")
+        && near(outParentAudio->inPoint, 3.0) && near(outParentAudio->outPoint, 5.0)
+        && near(outParentAudio->leadInSec, 20.0);
+    std::fprintf(stderr, "G30 out-of-range parent: error=%s audioClips=%d in=%.9f out=%.9f lead=%.9f expected (3,5,20)\n",
+        mcOutParent.error.toUtf8().constData(), mcOutParent.audioTracks.isEmpty() ? -1 : int(mcOutParent.audioTracks[0].size()),
+        outParentAudio ? outParentAudio->inPoint : -1.0, outParentAudio ? outParentAudio->outPoint : -1.0,
+        outParentAudio ? outParentAudio->leadInSec : -1.0);
+    // A clip connected to a gap in the angle spine stays, unconnected, like at top level.
+    const auto mcGapChild = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"6s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"),
+        mcSoundAsset + multicamMedia(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"first\" offset=\"0s\" duration=\"3s\"/>"
+            "<gap offset=\"3s\" duration=\"3s\">"
+            "<asset-clip ref=\"snd\" name=\"gapAudio\" lane=\"-1\" offset=\"0s\" duration=\"2s\"/></gap>"), singleAngle2)),
+        dir.path());
+    QStringList gapAudioNames;
+    for (const auto &track : mcGapChild.audioTracks) for (const auto &c : track) gapAudioNames.append(c.displayName);
+    const bool gapChildOk = mcGapChild.error.isEmpty() && gapAudioNames == QStringList{QStringLiteral("gapAudio")};
+    std::fprintf(stderr, "G30 gap child: error=%s audio=[%s]\n", mcGapChild.error.toUtf8().constData(),
+        gapAudioNames.join(',').toUtf8().constData());
+    // A transition inside the angle spine is reported once; the mcTail transition (outside the mc-clip) is not.
+    const QString angleTransitionWarning = QStringLiteral("mc-angle 内の transition を読み飛ばしました (1 件)");
+    const auto mcAngleTransition = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"6s\"><mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"),
+        multicamMedia(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"first\" offset=\"0s\" duration=\"3s\"/>"
+            "<transition duration=\"1s\"/>"
+            "<asset-clip ref=\"a\" name=\"second\" offset=\"3s\" duration=\"3s\"/>"), singleAngle2)), dir.path());
+    const bool angleTransitionOk = mcAngleTransition.error.isEmpty()
+        && mcAngleTransition.warnings.count(angleTransitionWarning) == 1 && !mcTail.warnings.contains(angleTransitionWarning);
+    std::fprintf(stderr, "G30 angle transition warning: count=%d tailCount=%d\n",
+        int(mcAngleTransition.warnings.count(angleTransitionWarning)), int(mcTail.warnings.count(angleTransitionWarning)));
+    gate(30, mcSpineOk && tailOk && outParentOk && gapChildOk && angleTransitionOk);
+
+    // G31: negative controls. (1) an undefined angleID is skipped with a warning
+    // (and the first angle is used); (2) no mc-source -> the first angle with one
+    // warning; (3) different video and audio angles -> V1 plus a connected A1,
+    // and no unused-angle warning because both angles are used.
+    const QString mcUndefinedWarning = QStringLiteral("mc-clip MCC の未定義のアングルを読み飛ばしました: zz");
+    const QString mcFallbackWarning = QStringLiteral("mc-clip MCC に有効アングルが無いため最初のアングル アングル1 を使いました");
+    const auto mcMedia = multicamMedia(singleAngle1, singleAngle2);
+    const auto mcUndefined = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\"><mc-source angleID=\"zz\" srcEnable=\"all\"/></mc-clip>"),
+        mcMedia), dir.path());
+    const auto mcNoSource = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\"/>"), mcMedia), dir.path());
+    const auto mcSplit = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/><mc-source angleID=\"a2\" srcEnable=\"audio\"/></mc-clip>"),
+        mcMedia), dir.path());
+    auto firstVideoName = [](const fcpx::xml::ImportResult &r) {
+        return r.videoTracks.isEmpty() || r.videoTracks[0].isEmpty() ? QString() : r.videoTracks[0][0].displayName;
+    };
+    const bool mcUndefinedOk = mcUndefined.error.isEmpty() && mcUndefined.warnings.count(mcUndefinedWarning) == 1
+        && mcUndefined.warnings.count(mcFallbackWarning) == 1 && firstVideoName(mcUndefined) == QStringLiteral("A1clip");
+    const bool noSourceOk = mcNoSource.error.isEmpty() && mcNoSource.warnings.count(mcFallbackWarning) == 1
+        && !mcNoSource.warnings.contains(mcUndefinedWarning) && firstVideoName(mcNoSource) == QStringLiteral("A1clip")
+        && mcNoSource.audioTracks.size() == 1 && mcNoSource.audioTracks[0].isEmpty();
+    const ClipInfo *splitVideo = mcSplit.videoTracks.size() == 1 && mcSplit.videoTracks[0].size() == 1
+        ? &mcSplit.videoTracks[0][0] : nullptr;
+    const ClipInfo *splitAudio = mcSplit.audioTracks.size() == 1 && mcSplit.audioTracks[0].size() == 1
+        ? &mcSplit.audioTracks[0][0] : nullptr;
+    const bool splitOk = mcSplit.error.isEmpty() && splitVideo && splitAudio
+        && splitVideo->displayName == QStringLiteral("A1clip") && !splitVideo->uid.isEmpty()
+        && splitAudio->displayName == QStringLiteral("B2clip") && splitAudio->filePath.endsWith(QStringLiteral("offline-b.mov"))
+        && splitAudio->anchorUid == splitVideo->uid && near(splitAudio->anchorOffsetSec, 0.0)
+        && near(splitAudio->inPoint, 0.0) && near(splitAudio->outPoint, 4.0)
+        && !mcSplit.warnings.contains(mcAngle1Warning) && !mcSplit.warnings.contains(mcAngle2Warning)
+        && !mcSplit.warnings.contains(mcFallbackWarning);
+    std::fprintf(stderr, "G31 undefined(warn=%d fallbackWarn=%d video=%s) noSource(fallbackWarn=%d video=%s audioClips=%d) "
+        "split(videoClips=%d audioClips=%d audioName=%s anchorMatchesVideoUid=%d anchorOffset=%.9f unusedWarn=%d)\n",
+        int(mcUndefined.warnings.count(mcUndefinedWarning)), int(mcUndefined.warnings.count(mcFallbackWarning)),
+        firstVideoName(mcUndefined).toUtf8().constData(), int(mcNoSource.warnings.count(mcFallbackWarning)),
+        firstVideoName(mcNoSource).toUtf8().constData(),
+        mcNoSource.audioTracks.isEmpty() ? -1 : int(mcNoSource.audioTracks[0].size()),
+        mcSplit.videoTracks.isEmpty() ? -1 : int(mcSplit.videoTracks[0].size()),
+        mcSplit.audioTracks.isEmpty() ? -1 : int(mcSplit.audioTracks[0].size()),
+        splitAudio ? splitAudio->displayName.toUtf8().constData() : "",
+        int(splitAudio && splitVideo && splitAudio->anchorUid == splitVideo->uid && !splitVideo->uid.isEmpty()),
+        splitAudio ? splitAudio->anchorOffsetSec : -1.0,
+        int(mcSplit.warnings.contains(mcAngle1Warning) || mcSplit.warnings.contains(mcAngle2Warning)));
+    // Different video and audio angles where the audio angle is a gap with a lane child at
+    // offset 1s: the audio clip must be connected to the first video clip at offset 1s.
+    const auto mcGapAudio = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/><mc-source angleID=\"a2\" srcEnable=\"audio\"/></mc-clip>"),
+        mcSoundAsset + multicamMedia(singleAngle1, QStringLiteral(
+            "<gap offset=\"0s\" duration=\"4s\"><asset-clip ref=\"snd\" name=\"gapAudioA2\" lane=\"-1\" offset=\"1s\" duration=\"2s\"/></gap>"))),
+        dir.path());
+    int gapAudioCount = 0;
+    const ClipInfo *gapAudio = nullptr;
+    for (const auto &track : mcGapAudio.audioTracks) for (const auto &c : track) { ++gapAudioCount; gapAudio = &c; }
+    const ClipInfo *gapVideo = mcGapAudio.videoTracks.size() == 1 && mcGapAudio.videoTracks[0].size() == 1
+        ? &mcGapAudio.videoTracks[0][0] : nullptr;
+    const bool gapAudioOk = mcGapAudio.error.isEmpty() && gapAudioCount == 1 && gapAudio && gapVideo
+        && gapAudio->displayName == QStringLiteral("gapAudioA2") && !gapVideo->uid.isEmpty()
+        && gapAudio->anchorUid == gapVideo->uid && near(gapAudio->anchorOffsetSec, 1.0);
+    std::fprintf(stderr, "G31 gap audio angle: error=[%s] audioClips=%d name=%s anchorUid=[%s] videoUid=[%s] anchorOffset=%.9f\n",
+        mcGapAudio.error.toUtf8().constData(), gapAudioCount, gapAudio ? gapAudio->displayName.toUtf8().constData() : "",
+        gapAudio ? gapAudio->anchorUid.toUtf8().constData() : "", gapVideo ? gapVideo->uid.toUtf8().constData() : "",
+        gapAudio ? gapAudio->anchorOffsetSec : -1.0);
+    // Split angles shaped as <clip> containers (video + audio children): V1 holds only a1's
+    // video, the A tracks only a2's audio (no a1 audio, no a2 video as audio).
+    auto containerAngle = [](const QString &prefix, const QString &ref) {
+        return QStringLiteral("<clip name=\"%1clip\" offset=\"0s\" duration=\"10s\">"
+            "<video ref=\"%2\" name=\"%1video\" offset=\"0s\" duration=\"10s\"/>"
+            "<audio ref=\"%2\" name=\"%1audio\" lane=\"-1\" offset=\"0s\" duration=\"10s\"/></clip>").arg(prefix, ref);
+    };
+    const auto mcSplitClip = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/><mc-source angleID=\"a2\" srcEnable=\"audio\"/></mc-clip>"),
+        multicamMedia(containerAngle(QStringLiteral("A1"), QStringLiteral("a")),
+                      containerAngle(QStringLiteral("B2"), QStringLiteral("b")))), dir.path());
+    QStringList splitVideoNames, splitAudioNames;
+    QString splitAudioAnchor;
+    for (const auto &track : mcSplitClip.videoTracks) for (const auto &c : track) splitVideoNames.append(c.displayName);
+    const ClipInfo *containerVideo = mcSplitClip.videoTracks.size() == 1 && mcSplitClip.videoTracks[0].size() == 1
+        ? &mcSplitClip.videoTracks[0][0] : nullptr;
+    for (const auto &track : mcSplitClip.audioTracks) for (const auto &c : track) {
+        splitAudioNames.append(c.displayName);
+        splitAudioAnchor = c.anchorUid;
+    }
+    const bool containerOk = mcSplitClip.error.isEmpty() && splitVideoNames == QStringList{QStringLiteral("A1video")}
+        && splitAudioNames == QStringList{QStringLiteral("B2audio")} && containerVideo && !containerVideo->uid.isEmpty()
+        && splitAudioAnchor == containerVideo->uid;
+    std::fprintf(stderr, "G31 container split: v1=[%s] audioTracks=[%s] anchorMatchesVideoUid=%d\n",
+        splitVideoNames.join(',').toUtf8().constData(), splitAudioNames.join(',').toUtf8().constData(),
+        int(containerVideo && splitAudioAnchor == containerVideo->uid));
+    // A video-only angle that is a compound clip with audio must not leak that audio onto an A track.
+    const QString compoundResources = mcSoundAsset + QStringLiteral(
+        "<media id=\"cmpAudio\" name=\"複合\"><sequence><spine>"
+        "<asset-clip ref=\"a\" name=\"cmpVideo\" offset=\"0s\" duration=\"10s\">"
+        "<asset-clip ref=\"snd\" name=\"cmpSound\" lane=\"-1\" offset=\"0s\" duration=\"10s\"/>"
+        "</asset-clip></spine></sequence></media>");
+    const QString compoundAngle = QStringLiteral("<ref-clip ref=\"cmpAudio\" name=\"CMP\" offset=\"0s\" duration=\"10s\"/>");
+    const auto mcCompoundSplit = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/><mc-source angleID=\"a2\" srcEnable=\"audio\"/></mc-clip>"),
+        compoundResources + multicamMedia(compoundAngle, singleAngle2)), dir.path());
+    const auto mcCompoundVideoOnly = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"4s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/></mc-clip>"),
+        compoundResources + multicamMedia(compoundAngle, singleAngle2)), dir.path());
+    int compoundSplitAudio = 0, compoundSplitRefAudio = 0, compoundOnlyAudio = 0;
+    QString compoundSplitName, compoundSplitAnchor;
+    for (const auto &track : mcCompoundSplit.audioTracks) for (const auto &c : track) {
+        ++compoundSplitAudio;
+        if (!c.sequenceRefId.isEmpty()) ++compoundSplitRefAudio;
+        compoundSplitName = c.displayName;
+        compoundSplitAnchor = c.anchorUid;
+    }
+    for (const auto &track : mcCompoundVideoOnly.audioTracks) compoundOnlyAudio += int(track.size());
+    const ClipInfo *compoundVideo = mcCompoundSplit.videoTracks.size() == 1 && mcCompoundSplit.videoTracks[0].size() == 1
+        ? &mcCompoundSplit.videoTracks[0][0] : nullptr;
+    const bool compoundLeakOk = mcCompoundSplit.error.isEmpty() && compoundVideo && !compoundVideo->uid.isEmpty()
+        && compoundSplitAudio == 1 && compoundSplitRefAudio == 0 && compoundSplitName == QStringLiteral("B2clip")
+        && compoundSplitAnchor == compoundVideo->uid
+        && mcCompoundVideoOnly.error.isEmpty() && compoundOnlyAudio == 0;
+    std::fprintf(stderr, "G31 compound video-only angle: split(audioClips=%d refAudio=%d name=%s anchorMatches=%d) videoOnlyAudioClips=%d\n",
+        compoundSplitAudio, compoundSplitRefAudio, compoundSplitName.toUtf8().constData(),
+        int(compoundVideo && compoundSplitAnchor == compoundVideo->uid), compoundOnlyAudio);
+    gate(31, mcUndefinedOk && noSourceOk && splitOk && containerOk && compoundLeakOk && gapAudioOk);
 
     return tally.finish();
 }
