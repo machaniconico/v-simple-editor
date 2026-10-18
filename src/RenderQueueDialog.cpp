@@ -4,6 +4,7 @@
 #include "AudioMixer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
+#include "TrackMatteKey.h"
 
 #include <QComboBox>
 #include <QDialogButtonBox>
@@ -443,6 +444,29 @@ void RenderQueueDialog::onAddJobClicked()
         fileTimeline->restoreFromProject(fileData.videoTracks, fileData.audioTracks,
                                          fileData.playheadPos, fileData.markIn, fileData.markOut,
                                          fileData.zoomLevel);
+        // The parent entries carry the sequence store, which the mix reads for nested-sequence
+        // audio: the same contract as RenderQueue::resolveTimeline (each parseable "track:clip"
+        // id re-keyed through trackMatteClipKey, every other key passed through unchanged).
+        auto canonicalKey = [](const QString &raw) -> QString {
+            const int colon = raw.indexOf(QLatin1Char(':'));
+            if (colon <= 0)
+                return raw;
+            bool okT = false, okC = false;
+            const int t = raw.left(colon).toInt(&okT);
+            const int c = raw.mid(colon + 1).toInt(&okC);
+            if (okT && okC && t >= 0 && c >= 0)
+                return trackMatteClipKey(t, c);
+            return raw;
+        };
+        QHash<QString, QString> parentEntries;
+        parentEntries.reserve(fileData.clipParentEntries.size());
+        for (const ClipParentEntry &entry : fileData.clipParentEntries) {
+            const QString child = canonicalKey(entry.clipId);
+            const QString parent = canonicalKey(entry.parentClipId);
+            if (!child.isEmpty() && !parent.isEmpty() && child != parent)
+                parentEntries.insert(child, parent);
+        }
+        fileTimeline->setClipParentEntries(parentEntries);
         fileMixer = std::make_unique<AudioMixer>();
         fileMixer->setBusRouting(fileData.audioBusRouting);
         for (auto it = fileData.trackFx.cbegin(); it != fileData.trackFx.cend(); ++it)

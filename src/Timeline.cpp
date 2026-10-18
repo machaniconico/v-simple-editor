@@ -6392,6 +6392,7 @@ void Timeline::deleteSelectedClip(bool leaveGap)
     // RM-5: snapshot carrier keys BEFORE the delete so we can remap after.
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     bool anyRemoved = false;
+    bool v1Removed = false;
     // Walk every track and remove its selected clips (descending so indices
     // stay valid). Preserve downstream positions — we want the rest of the
     // sequence to stay put when a linked V/A pair is deleted out of the
@@ -6403,9 +6404,11 @@ void Timeline::deleteSelectedClip(bool leaveGap)
         std::sort(sel.begin(), sel.end(), std::greater<int>());
         for (int idx : sel) {
             // Anchors live only on V1; a linked A clip may share the V1 uid.
-            if (t == m_videoTracks.value(0) && idx >= 0 && idx < t->clipCount())
+            if (t == m_videoTracks.value(0) && idx >= 0 && idx < t->clipCount()) {
                 m_pendingDeletedUids[t->clips().at(idx).uid].append(
                     {0.0, t->clips().at(idx).effectiveDuration()});
+                v1Removed = true;
+            }
             t->removeClipPreservingDownstream(idx);
             anyRemoved = true;
         }
@@ -6413,9 +6416,10 @@ void Timeline::deleteSelectedClip(bool leaveGap)
     for (auto *t : m_videoTracks) deleteFrom(t);
     for (auto *t : m_audioTracks) deleteFrom(t);
     if (anyRemoved) {
-        // US-1203: storyline mode ripples V1 only (the removed clips' linked
-        // audio went with the selection; the rest follows in reconcile).
-        if (m_storylineMode && !leaveGap)
+        // US-1203: storyline mode ripples V1 only, and only when a V1 clip was
+        // removed (the removed clips' linked audio went with the selection; the
+        // rest follows in reconcile).
+        if (m_storylineMode && !leaveGap && v1Removed)
             closeGapsOnTrack(m_videoTracks.value(0, nullptr));
         remapTrackMatteLocked(snapBefore);
         remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
@@ -8875,6 +8879,15 @@ void Timeline::pasteClip()
     // (else at the end); V1 linked audio follows and the pasted audio keeps its
     // offset from the pasted clip, moving to a free audio track on a collision.
     if (m_storylineMode && !m_videoTrack->isLocked()) {
+        // The pasted audio goes to an unlocked audio track; with none, nothing changes.
+        TimelineTrack *firstUnlockedAudio = nullptr;
+        for (TimelineTrack *t : m_audioTracks) {
+            if (t && !t->isLocked()) {
+                firstUnlockedAudio = t;
+                break;
+            }
+        }
+        if (!firstUnlockedAudio) return;
         closeGapsOnTrack(m_videoTrack);
         const int sel = m_videoTrack->selectedClip();
         const auto starts = clipStartSecs(m_videoTrack->clips());
@@ -8895,8 +8908,9 @@ void Timeline::pasteClip()
             TimelineTrack::DropPlan plan;
             TimelineTrack *destination = storylineAudioSlot(0, pastedAudio, startSec, &plan);
             if (!destination) {
-                // No free audio track: the end of A1 (reconcile never adds tracks).
-                destination = m_audioTrack;
+                // No free audio track: the end of the first unlocked audio track
+                // (reconcile never adds tracks).
+                destination = firstUnlockedAudio;
                 double endSec = 0.0;
                 for (const ClipInfo &c : destination->clips())
                     endSec += c.leadInSec + c.effectiveDuration();

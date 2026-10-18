@@ -1354,6 +1354,118 @@ int runTrackOpsSelftest()
         gate(17, aOk && bOk && bOffOk && bV1Ok && cOk && dOk && eOk && fOk && fOffOk && fA1Ok
                  && fA1OffOk && fDragOk && fDragOffOk);
     }
+    // US-1220 G18 / G19: storyline mode ripples V1 only when the delete removes
+    // a V1 clip. V1 holds a gap (B after 2 s, as a Lift or a pre-toggle edit
+    // leaves it). G18 deletes only the V2 clip K, G19 only the unlinked A2 clip M:
+    // every V1 start and every other audio start stays (B@5, Ba@5, N@5). The base
+    // (07c705f) closed V1 on any delete, so B and Ba moved to 3. Control (the
+    // same setup, the V1 clip A deleted): the V1 ripple still runs (B@0, Ba@0).
+    for (const int gateNo : {18, 19}) {
+        bool ok = true;
+        for (const bool deleteV1 : {false, true}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 3.0, 1), storyClip("B", 3.0, 2, 2.0)},
+                {storyClip("K", 2.0, 0, 1.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Aa", 3.0, 1), storyClip("Ba", 3.0, 2, 2.0)},
+                {storyClip("M", 2.0), storyClip("N", 2.0, 0, 3.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            for (int v = 0; v < t.videoTrackCount(); ++v) t.trackAt(false, v)->setSelectedClip(-1);
+            for (int a = 0; a < t.audioTrackCount(); ++a) t.trackAt(true, a)->setSelectedClip(-1);
+            if (deleteV1)
+                t.trackAt(false, 0)->setSelectedClip(0);
+            else if (gateNo == 18)
+                t.trackAt(false, 1)->setSelectedClip(0);
+            else
+                t.trackAt(true, 1)->setSelectedClip(0);
+            const auto serial = t.undoManager()->saveSerial();
+            t.deleteSelectedClip();
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *v2 = t.trackAt(false, 1);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const TimelineTrack *a2 = t.trackAt(true, 1);
+            const bool caseOk = deleteV1
+                ? v1->clipCount() == 1 && storyAt(v1, "B", 0.0) && storyAt(a1, "Ba", 0.0)
+                    && storyStart(a1, "Aa") < 0 && storyAt(v2, "K", 1.0)
+                    && storyAt(a2, "M", 0.0) && storyAt(a2, "N", 5.0)
+                : storyAt(v1, "A", 0.0) && storyAt(v1, "B", 5.0) && v1->clipCount() == 2
+                    && storyAt(a1, "Aa", 0.0) && storyAt(a1, "Ba", 5.0) && a1->clipCount() == 2
+                    && (gateNo == 18
+                            ? v2->clipCount() == 0 && storyAt(a2, "M", 0.0) && storyAt(a2, "N", 5.0)
+                            : storyAt(v2, "K", 1.0) && a2->clipCount() == 1
+                                && storyStart(a2, "M") < 0 && storyAt(a2, "N", 5.0));
+            const bool serialOk = t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G%d %s: V1 [%s] V2 [%s] A1 [%s] A2 [%s] serial +%d (expect %s)\n",
+                         gateNo, deleteV1 ? "control delete A" : gateNo == 18 ? "delete K (V2)" : "delete M (A2)",
+                         storyLayout(v1).c_str(), storyLayout(v2).c_str(), storyLayout(a1).c_str(),
+                         storyLayout(a2).c_str(), int(t.undoManager()->saveSerial() - serial),
+                         deleteV1 ? "B@0, K@1, Ba@0, M@0 N@5, +1"
+                                  : gateNo == 18 ? "A@0 B@5, -, Aa@0 Ba@5, M@0 N@5, +1"
+                                                 : "A@0 B@5, K@1, Aa@0 Ba@5, N@5, +1");
+            ok = ok && caseOk && serialOk;
+        }
+        gate(gateNo, ok);
+    }
+    // US-1220 G20: storyline paste never inserts into a locked audio track.
+    // (a) A1 (holding the linked audio) locked, A2 unlocked but busy at the
+    // landing time (Z covers 0-20): the pasted J audio goes to the end of A2
+    // (20) and A1's clip list is byte-equal (ProjectFile JSON) to before. (b)
+    // the only audio track locked: the paste changes nothing (V1, A1 and the
+    // undo serial stay). The base (07c705f) fell back to A1 (m_audioTrack)
+    // without a lock check in both cases.
+    {
+        const auto clipsJson = [](const TimelineTrack *track) {
+            ProjectData data;
+            data.audioTracks = {track->clips()};
+            return ProjectFile::toJsonString(data);
+        };
+        bool aOk = false, bOk = false;
+        for (const bool onlyLocked : {false, true}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1), storyClip("J", 4.0, 2)}};
+            QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1), storyClip("Ja", 4.0, 2)}};
+            if (!onlyLocked) audio.append({storyClip("Z", 20.0)});
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            t.copySelectedClip();
+            t.trackAt(false, 0)->setSelectedClip(0);
+            t.trackAt(true, 0)->setLocked(true);
+            const QString a1Before = clipsJson(t.trackAt(true, 0));
+            const QString v1Before = clipsJson(t.trackAt(false, 0));
+            const auto serial = t.undoManager()->saveSerial();
+            t.pasteClip();
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const TimelineTrack *a2 = onlyLocked ? nullptr : t.trackAt(true, 1);
+            const bool a1Same = clipsJson(a1) == a1Before;
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            if (onlyLocked) {
+                bOk = a1Same && clipsJson(v1) == v1Before && t.audioTrackCount() == 1 && serialDelta == 0;
+            } else {
+                double pastedA = -1.0;
+                double cursor = 0.0;
+                for (const ClipInfo &c : a2->clips()) {
+                    const double start = cursor + c.leadInSec;
+                    cursor = start + c.effectiveDuration();
+                    if (c.displayName == QLatin1String("Ja")) pastedA = start;
+                }
+                aOk = a1Same && v1->clipCount() == 3 && storyAt(v1, "X", 0.0) && a2->clipCount() == 2
+                    && storyAt(a2, "Z", 0.0) && std::abs(pastedA - 20.0) < 1e-6 && serialDelta == 1;
+            }
+            std::fprintf(stderr, "[track-ops] G20%s: V1 [%s] A1 (locked) [%s] A2 [%s] A1 byte-equal=%d "
+                         "serial +%d (expect %s)\n", onlyLocked ? "b only A1 (locked)" : "a A1 locked, A2 busy",
+                         storyLayout(v1).c_str(), storyLayout(a1).c_str(), a2 ? storyLayout(a2).c_str() : "-",
+                         a1Same, serialDelta,
+                         onlyLocked ? "X@0 J@4 unchanged, Xa@0 Ja@4, -, 1, +0"
+                                    : "X@0 J@4 J@8, Xa@0 Ja@4, Z@0 Ja@20, 1, +1");
+        }
+        gate(20, aOk && bOk);
+    }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

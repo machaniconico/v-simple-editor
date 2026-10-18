@@ -461,15 +461,19 @@ bool writeAvToneClip(const QString &path, const QString &toneWav, QString *error
 // US-1210: exports the A/V project from a real MainWindow through the mobile entry (p / p0) or a
 // RenderQueueDialog "ジョブ追加" job on the live Timeline (q / q0), then decodes the output's audio.
 // fromProjectFile: the dialog job's source is the project saved to a .veditor file (A1 fader gain
-// savedTrackGain in trackMix) and the live Timeline stays empty.
+// savedTrackGain in trackMix) and the live Timeline stays empty. nestedSequence (US-1220, with
+// fromProjectFile): the saved V1 / A1 hold one sequence-reference clip and the picture / sound entries
+// live inside that sequence (the store travels in clipParentEntries), so the only audio is nested.
 bool exportVariant(int variant, const QString &wavPath, QByteArray *pcm, QString *error,
-                   int *channels, int *sampleRate, bool fromProjectFile = false, double savedTrackGain = 1.0)
+                   int *channels, int *sampleRate, bool fromProjectFile = false, double savedTrackGain = 1.0,
+                   bool nestedSequence = false)
 {
     const bool mobile = variant == kMobileEq || variant == kMobilePassthrough;
     const bool withEq = variant == kMobileEq || variant == kDialogEq;
     const QString name = QString::fromLatin1(
         variant == kMobileEq ? "p" : variant == kDialogEq ? "q" : mobile ? "p0" : "q0")
-        + (!fromProjectFile ? QString() : savedTrackGain != 1.0 ? QStringLiteral("-gain-file") : QStringLiteral("-file"));
+        + (!fromProjectFile ? QString() : nestedSequence ? QStringLiteral("-nested-file")
+           : savedTrackGain != 1.0 ? QStringLiteral("-gain-file") : QStringLiteral("-file"));
     static int serial = 0;
     const QString outputPath = QDir(g_exportWorkDir).filePath(
         QStringLiteral("%1-%2.mkv").arg(name).arg(++serial));
@@ -514,6 +518,35 @@ bool exportVariant(int variant, const QString &wavPath, QByteArray *pcm, QString
         data.videoTracks = QVector<QVector<ClipInfo>>{{picture}};
         data.audioTracks = QVector<QVector<ClipInfo>>{{sound}};
         if (savedTrackGain != 1.0) data.trackMix = {TrackMixState{savedTrackGain, 0.0}};
+        if (nestedSequence) {
+            Timeline store;
+            TimelineSequence inner;
+            inner.id = QStringLiteral("audio-fixture-nested");
+            inner.name = inner.id;
+            inner.videoTracks = data.videoTracks;
+            inner.audioTracks = data.audioTracks;
+            const bool added = store.addSequence(inner);
+            const ClipInfo reference = store.makeSequenceClip(inner.id);
+            store.trackAt(false, 0)->setClips({reference});
+            store.trackAt(true, 0)->setClips({reference});
+            data.videoTracks = QVector<QVector<ClipInfo>>{store.trackAt(false, 0)->clips()};
+            data.audioTracks = QVector<QVector<ClipInfo>>{store.trackAt(true, 0)->clips()};
+            const QHash<QString, QString> parents = store.clipParentEntries();
+            for (auto it = parents.cbegin(); it != parents.cend(); ++it) {
+                ClipParentEntry entry;
+                entry.clipId = it.key();
+                entry.parentClipId = it.value();
+                data.clipParentEntries.append(entry);
+            }
+            std::fprintf(stderr, "G1 %s nested sequence added=%d referenceDurationSec=%.12g parentEntries=%d "
+                                 "store=%d\n", name.toUtf8().constData(), added, reference.duration,
+                         int(parents.size()), parents.contains(timeline_nesting::sequenceStoreParentKey()));
+            if (!added || reference.duration <= 0.0
+                || !parents.contains(timeline_nesting::sequenceStoreParentKey())) {
+                *error = QStringLiteral("%1: nested sequence not built").arg(name);
+                return false;
+            }
+        }
         projectPath = QDir(g_exportWorkDir).filePath(name + QStringLiteral(".veditor"));
         if (mobile || !ProjectFile::save(projectPath, data)) {
             *error = QStringLiteral("%1: project file not saved: %2").arg(name, projectPath);
@@ -1793,5 +1826,30 @@ int runAudioFixtureSelftest()
     exportGate(22, kDialogEq, kDialogPassthrough, "q0", dialogFileOk,
                "render-queue-dialog job (live Timeline and saved project file) must apply the A1 clip EQ (-12 dB at 1 kHz vs q0) "
                "and the saved fader gain, and keep the passthrough mux for q0");
+    // US-1220 G23: a saved project whose only audio is inside a nested sequence (V1 / A1 = one
+    // sequence-reference clip; the sequence holds the A/V picture on V1 and its 1 kHz tone on A1) as a
+    // RenderQueueDialog "ジョブ追加" job source (live Timeline empty): the output's 1 kHz tone sits at the
+    // source clip's level (0 dB +-0.5). Detects: the dialog's file Timeline built without
+    // setClipParentEntries (no sequence store, so the mix drops the nested audio: no tone).
+    {
+        QByteArray nestedPcm;
+        QString nestedError;
+        int nestedChannels = 0, nestedRate = 0;
+        const bool nestedOk = exportVariant(kDialogPassthrough,
+                                            QDir(g_exportWorkDir).filePath(QStringLiteral("q0-nested-file.wav")),
+                                            &nestedPcm, &nestedError, &nestedChannels, &nestedRate, true, 1.0, true);
+        const double nestedTone = toneLevel(nestedPcm, nestedChannels, nestedRate, kToneHz, 0.5, 3.5);
+        const double sourceTone = toneLevel(sourcePcm, sourceChannels, sourceRate, kToneHz, 0.5, 3.5);
+        const double deltaDb = bandDb(nestedTone, sourceTone);
+        const bool sane = sourceOk && sourceTone > 0.05;
+        const bool levelOk = std::abs(deltaDb) <= 0.5;
+        std::fprintf(stderr, "G23 q0-nested-file tone1k=%.12g source tone1k=%.12g deltaDb=%.4f target=0+-0.5 levelOk=%d "
+                             "| exported=%d bytes=%lld channels=%d rate=%d sane=%d error=%s\n",
+                     nestedTone, sourceTone, deltaDb, levelOk, nestedOk, static_cast<long long>(nestedPcm.size()),
+                     nestedChannels, nestedRate, sane, nestedError.toUtf8().constData());
+        tally.gate(23, nestedOk && sane && levelOk,
+                   "render-queue-dialog job from a saved project must mix the audio inside a nested sequence "
+                   "(1 kHz at the source level)");
+    }
     return tally.finish();
 }
