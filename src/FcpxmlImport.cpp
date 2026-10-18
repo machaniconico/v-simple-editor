@@ -4,7 +4,9 @@
 #include <QFileInfo>
 #include <QMap>
 #include <QSet>
+#include <QStringView>
 #include <QUrl>
+#include <QUuid>
 #include <QXmlStreamReader>
 #include <algorithm>
 #include <functional>
@@ -56,13 +58,29 @@ bool lessTime(Time a, Time b)
     }
 }
 struct Asset { QString path, name, format; Time start, duration; bool audioOnly = false; };
-struct Entry { QString ref, name; int lane = 0, parentIndex = -1; Time offset, duration, start; };
+struct Entry {
+    QString ref, name, uid;
+    int lane = 0, parentIndex = -1;
+    Time offset, duration, start;
+    bool underGap = false;
+    bool audioElement = false;
+};
+bool isMediaClipTag(QStringView tag)
+{
+    return tag == QLatin1String("asset-clip") || tag == QLatin1String("video")
+        || tag == QLatin1String("audio");
+}
+bool isContainerTag(QStringView tag)
+{
+    return tag == QLatin1String("clip") || tag == QLatin1String("sync-clip");
+}
 }
 ImportResult parseXml(const QString &xml, const QString &directory)
 {
     ImportResult result;
     QXmlStreamReader reader(xml);
     QMap<QString, Asset> assets;
+    auto isAudioEntry = [&](const Entry &e) { return e.audioElement || assets.value(e.ref).audioOnly; };
     QMap<QString, QXmlStreamAttributes> formats;
     QVector<Entry> entries;
     int assetClipCount = 0;
@@ -70,6 +88,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     Time origin;
     QString sequenceFormat;
     bool root = false, sequence = false, spine = false;
+    int gapDepth = 0;
     auto warnSkip = [&] {
         result.warnings.append(QStringLiteral("未対応の要素を読み飛ばしました: %1 (行 %2)")
             .arg(reader.name().toString()).arg(reader.lineNumber()));
@@ -120,7 +139,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     std::function<void()> warnDescendants;
     warnDescendants = [&] {
         while (reader.readNextStartElement()) {
-            if (reader.name() == QLatin1String("asset-clip")) {
+            if (isMediaClipTag(reader.name())) {
                 const auto a = reader.attributes();
                 ++assetClipCount;
                 result.warnings.append(QStringLiteral("親クリップが不正なため接続クリップを読み飛ばしました: %1 / %2")
@@ -129,23 +148,98 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             warnDescendants();
         }
     };
-    std::function<void(const Time *, const Time *, int)> readAssetClip, readGap;
-    readAssetClip = [&](const Time *parentOffset, const Time *parentStart, int parentIndex) {
+    std::function<void(const Time *, const Time *, int, int, const QXmlStreamAttributes *)> readSpine;
+    readSpine = [&](const Time *parentOffset, const Time *parentStart, int parentIndex,
+                    int depth, const QXmlStreamAttributes *fallback) {
+        const QStringView tag = reader.name();
+        if (isContainerTag(tag)) {
+            const auto container = reader.attributes();
+            Entry frame;
+            bool valid = true;
+            if (container.hasAttribute("offset"))
+                valid = time(container.value("offset").toString(), frame.offset);
+            if (container.hasAttribute("start"))
+                valid &= time(container.value("start").toString(), frame.start);
+            if (parentOffset && valid)
+                valid = placeConnected(frame, *parentOffset, *parentStart);
+            if (!valid) {
+                result.warnings.append(QStringLiteral("クリップの値が不正です (接続位置): %1 / %2")
+                    .arg(container.value("name").toString(), container.value("ref").toString()));
+                warnDescendants();
+                return;
+            }
+            QVector<int> directChildren;
+            while (reader.readNextStartElement()) {
+                const QStringView childTag = reader.name();
+                if (isMediaClipTag(childTag)) {
+                    const int index = entries.size();
+                    readSpine(&frame.offset, &frame.start, parentIndex, depth + 1, &container);
+                    if (entries.size() > index) directChildren.append(index);
+                } else warnSkip();
+            }
+            if (directChildren.isEmpty()) return;
+            int primary = directChildren.first();
+            for (int index : directChildren) {
+                if (assets.contains(entries[index].ref) && !isAudioEntry(entries[index])) {
+                    primary = index;
+                    break;
+                }
+            }
+            if (parentIndex < 0 && depth == 0)
+                entries[primary].uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            for (int index : directChildren) {
+                if (index != primary) entries[index].parentIndex = primary;
+            }
+            return;
+        }
+        if (tag == QLatin1String("gap")) {
+            const auto a = reader.attributes();
+            Entry anchor;
+            bool valid = true;
+            if (a.hasAttribute("offset")) valid = time(a.value("offset").toString(), anchor.offset);
+            if (a.hasAttribute("start")) valid &= time(a.value("start").toString(), anchor.start);
+            if (parentOffset && valid) valid = placeConnected(anchor, *parentOffset, *parentStart);
+            if (!valid) {
+                result.warnings.append(QStringLiteral("gap の接続位置が不正です: %1")
+                    .arg(a.value("name").toString()));
+                warnDescendants();
+                return;
+            }
+            ++gapDepth;
+            while (reader.readNextStartElement())
+                readSpine(&anchor.offset, &anchor.start, parentIndex, depth + 1, nullptr);
+            --gapDepth;
+            return;
+        }
+        if (!isMediaClipTag(tag)) { warnSkip(); return; }
         ++assetClipCount;
         const auto a = reader.attributes();
-        Entry e; e.ref = a.value("ref").toString(); e.name = a.value("name").toString();
+        const bool explicitOffset = a.hasAttribute("offset");
+        auto attribute = [&](const QString &key) {
+            return a.hasAttribute(key) ? a.value(key).toString()
+                : fallback && !(explicitOffset && key == QLatin1String("start"))
+                    ? fallback->value(key).toString() : QString();
+        };
+        auto hasAttribute = [&](const QString &key) {
+            return a.hasAttribute(key) || (fallback && !(explicitOffset && key == QLatin1String("start"))
+                && fallback->hasAttribute(key));
+        };
+        Entry e; e.ref = attribute(QStringLiteral("ref")); e.name = attribute(QStringLiteral("name"));
         e.parentIndex = parentIndex;
+        e.underGap = gapDepth > 0;
+        e.audioElement = tag == QLatin1String("audio");
         bool laneOk = true;
-        if (a.hasAttribute("lane")) e.lane = a.value("lane").toInt(&laneOk);
+        if (hasAttribute(QStringLiteral("lane"))) e.lane = attribute(QStringLiteral("lane")).toInt(&laneOk);
         QString invalid;
         if (!laneOk) invalid = QStringLiteral("lane");
         for (const auto &key : {QStringLiteral("offset"), QStringLiteral("duration"), QStringLiteral("start")}) {
             Time *value = key == QStringLiteral("offset") ? &e.offset
                 : key == QStringLiteral("duration") ? &e.duration : &e.start;
-            if ((a.hasAttribute(key) || key == QStringLiteral("duration"))
-                && !time(a.value(key).toString(), *value)) invalid = key;
+            if ((hasAttribute(key) || key == QStringLiteral("duration"))
+                && !time(attribute(key), *value)) invalid = key;
         }
-        if (parentOffset && invalid.isEmpty()) {
+        if (fallback && !explicitOffset) e.offset = *parentOffset;
+        if (parentOffset && !(fallback && !explicitOffset) && invalid.isEmpty()) {
             if (!placeConnected(e, *parentOffset, *parentStart))
                 invalid = QStringLiteral("接続位置");
         }
@@ -156,30 +250,11 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             return;
         }
         const int entryIndex = entries.size();
+        if (parentIndex < 0 && depth == 0)
+            e.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
         entries.append(e);
         while (reader.readNextStartElement()) {
-            if (reader.name() == QLatin1String("asset-clip")) readAssetClip(&e.offset, &e.start, entryIndex);
-            else if (reader.name() == QLatin1String("gap")) readGap(&e.offset, &e.start, entryIndex);
-            else warnSkip();
-        }
-    };
-    readGap = [&](const Time *parentOffset, const Time *parentStart, int parentIndex) {
-        const auto a = reader.attributes();
-        Entry anchor;
-        bool valid = true;
-        if (a.hasAttribute("offset")) valid = time(a.value("offset").toString(), anchor.offset);
-        if (a.hasAttribute("start")) valid &= time(a.value("start").toString(), anchor.start);
-        if (parentOffset && valid) valid = placeConnected(anchor, *parentOffset, *parentStart);
-        if (!valid) {
-            result.warnings.append(QStringLiteral("gap の接続位置が不正です: %1")
-                .arg(a.value("name").toString()));
-            warnDescendants();
-            return;
-        }
-        while (reader.readNextStartElement()) {
-            if (reader.name() == QLatin1String("asset-clip")) readAssetClip(&anchor.offset, &anchor.start, parentIndex);
-            else if (reader.name() == QLatin1String("gap")) readGap(&anchor.offset, &anchor.start, parentIndex);
-            else warnSkip();
+            readSpine(&e.offset, &e.start, entryIndex, depth + 1, nullptr);
         }
     };
     while (!reader.atEnd()) {
@@ -221,11 +296,9 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             if (!readTime(a, QStringLiteral("tcStart"), origin)) break;
         } else if (tag == "spine" && parent == "sequence" && !spine) {
             spine = true;
-        } else if (tag == "asset-clip" && parent == "spine") {
-            readAssetClip(nullptr, nullptr, -1);
-            continue;
-        } else if (tag == "gap" && parent == "spine") {
-            readGap(nullptr, nullptr, -1);
+        } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap"
+                   || isContainerTag(QStringView(tag)))) {
+            readSpine(nullptr, nullptr, -1, 0, nullptr);
             continue;
         } else { warnSkip(); continue; }
         stack.append(tag);
@@ -247,40 +320,53 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             .arg(id, f.value("width").toString(), f.value("height").toString(), f.value("frameDuration").toString()));
     }
     QMap<int, QVector<Entry>> videoLanes, audioLanes;
-    QVector<bool> invalidEntries(entries.size(), false);
     QVector<bool> hasConnectedChildren(entries.size(), false);
     for (const auto &e : entries)
         if (e.parentIndex >= 0) hasConnectedChildren[e.parentIndex] = true;
-    for (int i = 0; i < entries.size(); ++i) {
-        const auto &e = entries[i];
-        if (e.parentIndex >= 0 && invalidEntries[e.parentIndex]) {
-            invalidEntries[i] = true;
-            result.warnings.append(QStringLiteral("親クリップが不正なため接続クリップを読み飛ばしました: %1 / %2")
-                .arg(e.name, e.ref));
-            continue;
-        }
-        if (!assets.contains(e.ref)) {
-            result.warnings.append(QStringLiteral("未定義の素材参照を読み飛ばしました: %1").arg(e.ref));
-            continue;
-        }
+    // A container may list its audio child before the video chosen as primary.
+    // Validate the parent chain before emitting clips in XML order.
+    enum Rejection { Valid, InvalidParent, MissingAsset, InvalidRange };
+    QVector<int> rejection(entries.size(), -1);
+    std::function<int(int)> checkEntry = [&](int i) -> int {
+        if (rejection[i] >= 0) return rejection[i];
+        const Entry &e = entries[i];
+        const int parentRejection = e.parentIndex >= 0 ? checkEntry(e.parentIndex) : Valid;
+        if (parentRejection == InvalidParent || parentRejection == InvalidRange)
+            return rejection[i] = InvalidParent;
+        if (!assets.contains(e.ref)) return rejection[i] = MissingAsset;
         if (hasConnectedChildren[i]) {
             Time timelineOffset, sourceStart, sourceEnd, timelineEnd;
-            const auto asset = assets.value(e.ref);
+            const Asset asset = assets.value(e.ref);
             if (!e.duration.n || !combine(e.offset, origin, true, timelineOffset)
                 || !combine(e.start, asset.start, true, sourceStart)
                 || !combine(sourceStart, e.duration, false, sourceEnd)
-                || !combine(timelineOffset, e.duration, false, timelineEnd)) {
-                invalidEntries[i] = true;
-                result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
-                    .arg(e.lane).arg(e.name, e.ref));
-                continue;
-            }
+                || !combine(timelineOffset, e.duration, false, timelineEnd))
+                return rejection[i] = InvalidRange;
         }
-        (assets.value(e.ref).audioOnly ? audioLanes : videoLanes)[e.lane].append(e);
+        return rejection[i] = Valid;
+    };
+    for (int i = 0; i < entries.size(); ++i) {
+        const auto &e = entries[i];
+        switch (checkEntry(i)) {
+        case InvalidParent:
+            result.warnings.append(QStringLiteral("親クリップが不正なため接続クリップを読み飛ばしました: %1 / %2")
+                .arg(e.name, e.ref));
+            continue;
+        case MissingAsset:
+            result.warnings.append(QStringLiteral("未定義の素材参照を読み飛ばしました: %1").arg(e.ref));
+            continue;
+        case InvalidRange:
+            result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
+                .arg(e.lane).arg(e.name, e.ref));
+            continue;
+        default:
+            break;
+        }
+        (isAudioEntry(e) ? audioLanes : videoLanes)[e.lane].append(e);
     }
     result.videoTracks.clear();
     result.audioTracks.clear();
-    QSet<QString> found, missing;
+    QSet<QString> found, missing, v1Uids;
     auto importLanes = [&](const QMap<int, QVector<Entry>> &lanes, QVector<QVector<ClipInfo>> &tracks) {
         auto laneKeys = lanes.keys();
         std::sort(laneKeys.begin(), laneKeys.end(), [](int a, int b) {
@@ -291,18 +377,14 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             return a > b;
         });
         for (int lane : laneKeys) {
-            if (tracks.size() == 2) {
-                result.warnings.append(QStringLiteral("2 トラックの上限により lane %1 を読み飛ばしました。").arg(lane));
-                continue;
-            }
             auto clips = lanes.value(lane);
             // Stable ordering via Euclidean continued fractions avoids overflowing
             // cross-products and does not round rational offsets to seconds.
             std::stable_sort(clips.begin(), clips.end(), [](const Entry &a, const Entry &b) {
                 return lessTime(a.offset, b.offset);
             });
-            QVector<ClipInfo> track;
-            Time end;
+            QVector<QVector<ClipInfo>> laneTracks;
+            QVector<Time> laneEnds;
             for (const auto &e : clips) {
                 const auto asset = assets.value(e.ref);
                 Time offset, gap, start, out, nextEnd;
@@ -314,8 +396,16 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                         .arg(lane).arg(e.name, e.ref));
                     continue;
                 }
-                if (!combine(offset, end, true, gap)) {
-                    result.warnings.append(QStringLiteral("lane %1 の重複クリップを読み飛ばしました: %2").arg(lane).arg(e.name));
+                int trackIndex = 0;
+                while (trackIndex < laneEnds.size() && lessTime(offset, laneEnds[trackIndex]))
+                    ++trackIndex;
+                if (trackIndex == laneTracks.size()) {
+                    laneTracks.append(QVector<ClipInfo>{});
+                    laneEnds.append(Time{});
+                }
+                if (!combine(offset, laneEnds[trackIndex], true, gap)) {
+                    result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
+                        .arg(lane).arg(e.name, e.ref));
                     continue;
                 }
                 const QUrl url(asset.path);
@@ -330,9 +420,46 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                 c.duration = asset.duration.n > 0
                     ? qMax(c.outPoint, asset.duration.seconds()) : c.outPoint;
                 c.leadInSec = gap.seconds();
-                track.append(c); end = nextEnd;
+                c.uid = e.uid;
+                const bool childOnV1 = &tracks == &result.videoTracks
+                    && tracks.isEmpty() && trackIndex == 0;
+                if (e.parentIndex >= 0 && !e.underGap) {
+                    int rootIndex = e.parentIndex;
+                    while (entries[rootIndex].parentIndex >= 0)
+                        rootIndex = entries[rootIndex].parentIndex;
+                    const Entry &ancestor = entries[rootIndex];
+                    if (!ancestor.uid.isEmpty() && assets.contains(ancestor.ref)) {
+                        if (isAudioEntry(ancestor)) {
+                            result.warnings.append(QStringLiteral("主ストーリーラインが音声クリップのため接続を解除しました: %1")
+                                .arg(c.displayName));
+                        } else if (!v1Uids.contains(ancestor.uid) || childOnV1 || e.lane == 0) {
+                            result.warnings.append(QStringLiteral("接続先の主ストーリーラインのクリップが V1 に置かれないため接続を解除しました: %1")
+                                .arg(c.displayName));
+                        } else {
+                            c.anchorUid = ancestor.uid;
+                            Time delta;
+                            if (!lessTime(e.offset, ancestor.offset))
+                                c.anchorOffsetSec = combine(e.offset, ancestor.offset, true, delta)
+                                    ? delta.seconds() : e.offset.seconds() - ancestor.offset.seconds();
+                            else
+                                c.anchorOffsetSec = combine(ancestor.offset, e.offset, true, delta)
+                                    ? -delta.seconds() : e.offset.seconds() - ancestor.offset.seconds();
+                        }
+                    }
+                }
+                if (childOnV1 && !c.uid.isEmpty())
+                    v1Uids.insert(c.uid);
+                laneTracks[trackIndex].append(c);
+                laneEnds[trackIndex] = nextEnd;
             }
-            if (!track.isEmpty()) tracks.append(track);
+            for (const auto &track : laneTracks) {
+                if (track.isEmpty()) continue;
+                const int targetTrack = tracks.size() + 1;
+                if (lane < 0 && &tracks == &result.videoTracks)
+                    result.warnings.append(QStringLiteral("lane %1 の映像は FCP では主ストーリーラインの下に合成されます。V%2 に置きました。")
+                        .arg(lane).arg(targetTrack));
+                tracks.append(track);
+            }
         }
     };
     importLanes(videoLanes, result.videoTracks);
