@@ -9,6 +9,7 @@
 #include <QJsonObject>
 #include <QPair>
 #include <QTemporaryDir>
+#include <QXmlStreamReader>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -1717,6 +1718,140 @@ int runFcpxmlImportSelftest()
         compoundSplitAudio, compoundSplitRefAudio, compoundSplitName.toUtf8().constData(),
         int(compoundVideo && compoundSplitAnchor == compoundVideo->uid), compoundOnlyAudio);
     gate(31, mcUndefinedOk && noSourceOk && splitOk && containerOk && compoundLeakOk && gapAudioOk);
+
+    // G32 / G33: timeline -> fcpx::buildExportClips -> buildXml -> readFcpxml. V2 holds a clip
+    // connected to A (anchor offset 1.5) and a J-cut clip connected to B (anchor offset -0.5).
+    auto makeClip = [](const QString &name, double in, double out, double leadIn, const QString &uid,
+                       const QString &anchorUid = QString(), double anchorOffset = 0.0) {
+        ClipInfo c; c.filePath = QStringLiteral("/missing/") + name + QStringLiteral(".mov");
+        c.displayName = name; c.inPoint = in; c.outPoint = out; c.duration = out; c.leadInSec = leadIn;
+        c.uid = uid; c.anchorUid = anchorUid; c.anchorOffsetSec = anchorOffset;
+        return c;
+    };
+    auto exportXml = [&](const QVector<QVector<ClipInfo>> &videoTracks, bool flat) {
+        Timeline exportTimeline;
+        exportTimeline.createSequence(QStringLiteral("往復2"), videoTracks, QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}});
+        auto entries = fcpx::buildExportClips(exportTimeline);
+        if (flat) for (auto &e : entries) { e.lane = 0; e.uid.clear(); e.anchorUid.clear(); }
+        return QPair<QVector<fcpx::xml::ClipEntry>, QString>(entries, fcpx::xml::buildXml(entries, fcpx::xml::ExporterConfig{}));
+    };
+    const QVector<QVector<ClipInfo>> connectedTracks{
+        {makeClip(QStringLiteral("A"), 1.0, 5.0, 0.0, QStringLiteral("ua")),
+         makeClip(QStringLiteral("B"), 1.0, 3.0, 2.0, QStringLiteral("ub"))},
+        {makeClip(QStringLiteral("C"), 0.0, 2.0, 1.5, QString(), QStringLiteral("ua"), 1.5),
+         makeClip(QStringLiteral("D"), 0.0, 1.0, 2.0, QString(), QStringLiteral("ub"), -0.5)}};
+    const auto connectedExport = exportXml(connectedTracks, false);
+    const QString connectedPath = dir.filePath(QStringLiteral("connected.fcpxml"));
+    QFile connectedFile(connectedPath);
+    const bool connectedWritten = connectedFile.open(QIODevice::WriteOnly) && connectedFile.write(connectedExport.second.toUtf8()) > 0;
+    connectedFile.close();
+    const auto connectedBack = fcpx::xml::readFcpxml(connectedPath);
+    auto trackClip = [](const fcpx::xml::ImportResult &r, int track, const QString &name) -> const ClipInfo * {
+        if (track >= r.videoTracks.size()) return nullptr;
+        for (const auto &c : r.videoTracks[track]) if (c.displayName == name) return &c;
+        return nullptr;
+    };
+    const ClipInfo *backA = trackClip(connectedBack, 0, QStringLiteral("A"));
+    const ClipInfo *backB = trackClip(connectedBack, 0, QStringLiteral("B"));
+    const ClipInfo *backC = trackClip(connectedBack, 1, QStringLiteral("C"));
+    const ClipInfo *backD = trackClip(connectedBack, 1, QStringLiteral("D"));
+    const bool roundtripConnectedOk = connectedWritten && connectedBack.error.isEmpty() && connectedBack.videoTracks.size() == 2
+        && backA && backB && backC && backD && !backA->uid.isEmpty() && !backB->uid.isEmpty()
+        && backA->uid != QStringLiteral("ua") && backB->uid != QStringLiteral("ub")
+        && backC->anchorUid == backA->uid && near(backC->anchorOffsetSec, 1.5)
+        && backD->anchorUid == backB->uid && near(backD->anchorOffsetSec, -0.5)
+        && near(backC->leadInSec, 1.5) && near(backD->leadInSec, 2.0);
+    std::fprintf(stderr, "G32 error=[%s] written=%d tracks=%d anchorC=%d offsetC=%.9f anchorD=%d offsetD=%.9f "
+        "newUids=%d leadInC=%.9f leadInD=%.9f\n", connectedBack.error.toUtf8().constData(), int(connectedWritten),
+        int(connectedBack.videoTracks.size()), int(backC && backA && backC->anchorUid == backA->uid),
+        backC ? backC->anchorOffsetSec : -99.0, int(backD && backB && backD->anchorUid == backB->uid),
+        backD ? backD->anchorOffsetSec : -99.0,
+        int(backA && backB && backA->uid != QStringLiteral("ua") && backB->uid != QStringLiteral("ub")),
+        backC ? backC->leadInSec : -99.0, backD ? backD->leadInSec : -99.0);
+    // Control: the legacy flat shape (every clip on the spine, no lanes) loses the connections.
+    const auto flatConnected = fcpx::xml::parseXml(exportXml(connectedTracks, true).second, dir.path());
+    int flatAnchors = 0;
+    for (const auto &track : flatConnected.videoTracks) for (const auto &c : track) if (!c.anchorUid.isEmpty()) ++flatAnchors;
+    std::fprintf(stderr, "G32 flatControl anchors=%d tracks=%d\n", flatAnchors, int(flatConnected.videoTracks.size()));
+    // Variant: anchor B has in-point 0, so D's relative position (0 + -0.5) is negative and the
+    // exporter writes a signed offset; D must stay connected to B, never fall back to A or a gap.
+    const QVector<QVector<ClipInfo>> jcutTracks{
+        {makeClip(QStringLiteral("A"), 1.0, 5.0, 0.0, QStringLiteral("ua")),
+         makeClip(QStringLiteral("B"), 0.0, 2.0, 2.0, QStringLiteral("ub"))},
+        {makeClip(QStringLiteral("C"), 0.0, 2.0, 1.5, QString(), QStringLiteral("ua"), 1.5),
+         makeClip(QStringLiteral("D"), 0.0, 1.0, 2.0, QString(), QStringLiteral("ub"), -0.5)}};
+    const auto jcutBack = fcpx::xml::parseXml(exportXml(jcutTracks, false).second, dir.path());
+    const ClipInfo *jcutB = trackClip(jcutBack, 0, QStringLiteral("B"));
+    const ClipInfo *jcutD = trackClip(jcutBack, 1, QStringLiteral("D"));
+    const bool jcutOk = jcutBack.error.isEmpty() && jcutB && jcutD && !jcutB->uid.isEmpty()
+        && jcutD->anchorUid == jcutB->uid && near(jcutD->anchorOffsetSec, -0.5) && near(jcutD->leadInSec, 2.0);
+    std::fprintf(stderr, "G32 jcut error=[%s] anchorD=%d offsetD=%.9f leadInD=%.9f warnings=%d\n",
+        jcutBack.error.toUtf8().constData(), int(jcutD && jcutB && jcutD->anchorUid == jcutB->uid),
+        jcutD ? jcutD->anchorOffsetSec : -99.0, jcutD ? jcutD->leadInSec : -99.0, int(jcutBack.warnings.size()));
+    gate(32, roundtripConnectedOk && flatAnchors == 0 && jcutOk);
+
+    // Spine children by XML structure: asset-clip / gap offsets and the lane of every gap child.
+    struct SpineScan { QVector<QPair<double, double>> clips; int overlaps = 0; int gapLaneChildren = 0; int spineLaneClips = 0; bool parsed = true; };
+    auto scanSpine = [](const QString &xml) {
+        SpineScan scan;
+        QXmlStreamReader reader(xml);
+        auto seconds = [](const QString &t) {
+            const QStringList parts = QString(t).remove(QLatin1Char('s')).split(QLatin1Char('/'));
+            return parts.size() == 2 && parts[1].toDouble() != 0 ? parts[0].toDouble() / parts[1].toDouble() : parts[0].toDouble();
+        };
+        QStringList stack;
+        while (!reader.atEnd()) {
+            reader.readNext();
+            if (reader.isEndElement()) { stack.removeLast(); continue; }
+            if (!reader.isStartElement()) continue;
+            const QString tag = reader.name().toString();
+            const bool inSpine = stack.size() >= 1 && stack.last() == QLatin1String("spine");
+            const bool inGap = stack.size() >= 1 && stack.last() == QLatin1String("gap")
+                && stack.size() >= 2 && stack[stack.size() - 2] == QLatin1String("spine");
+            if (inSpine && tag == QLatin1String("asset-clip")) {
+                const double off = seconds(reader.attributes().value("offset").toString());
+                scan.clips.append({off, off + seconds(reader.attributes().value("duration").toString())});
+                if (reader.attributes().hasAttribute("lane")) ++scan.spineLaneClips;
+            } else if (inGap && tag == QLatin1String("asset-clip") && reader.attributes().value("lane") == QLatin1String("1")) {
+                ++scan.gapLaneChildren;
+            }
+            stack.append(tag);
+        }
+        scan.parsed = !reader.hasError();
+        std::sort(scan.clips.begin(), scan.clips.end());
+        for (int i = 1; i < scan.clips.size(); ++i)
+            if (scan.clips[i].first < scan.clips[i - 1].second - 1e-9) ++scan.overlaps;
+        return scan;
+    };
+    // V1 clips occupy 0..2 and 6..8; the unconnected V2 clip E spans 4..7 (starts in the hole, overlaps the second V1 clip).
+    const QVector<QVector<ClipInfo>> unconnectedTracks{
+        {makeClip(QStringLiteral("A"), 0.0, 2.0, 0.0, QStringLiteral("ua")),
+         makeClip(QStringLiteral("B"), 0.0, 2.0, 4.0, QStringLiteral("ub"))},
+        {makeClip(QStringLiteral("E"), 0.0, 3.0, 4.0, QString())}};
+    const auto unconnectedExport = exportXml(unconnectedTracks, false);
+    const auto flatExport = exportXml(unconnectedTracks, true);
+    const SpineScan unconnectedScan = scanSpine(unconnectedExport.second);
+    const SpineScan flatScan = scanSpine(flatExport.second);
+    const SpineScan connectedScan = scanSpine(connectedExport.second);
+    const QString unconnectedPath = dir.filePath(QStringLiteral("unconnected.fcpxml"));
+    QFile unconnectedFile(unconnectedPath);
+    const bool unconnectedWritten = unconnectedFile.open(QIODevice::WriteOnly) && unconnectedFile.write(unconnectedExport.second.toUtf8()) > 0;
+    unconnectedFile.close();
+    const auto unconnectedBack = fcpx::xml::readFcpxml(unconnectedPath);
+    const ClipInfo *backE = trackClip(unconnectedBack, 1, QStringLiteral("E"));
+    const bool unconnectedGateOk = unconnectedScan.parsed && connectedScan.parsed && flatScan.parsed
+        && unconnectedScan.clips.size() == 2 && unconnectedScan.overlaps == 0 && connectedScan.overlaps == 0
+        && unconnectedScan.spineLaneClips == 0 && unconnectedScan.gapLaneChildren == 1
+        && flatScan.overlaps > 0 && flatScan.gapLaneChildren == 0
+        && unconnectedWritten && unconnectedBack.error.isEmpty() && unconnectedBack.videoTracks.size() == 2
+        && backE && backE->anchorUid.isEmpty() && near(backE->leadInSec, 4.0);
+    std::fprintf(stderr, "G33 spineClips=%d overlaps=%d connectedOverlaps=%d spineLaneClips=%d gapLaneChildren=%d "
+        "flatControl(overlaps=%d gapLaneChildren=%d) importedTracks=%d importedE(anchor=[%s] leadIn=%.9f)\n",
+        int(unconnectedScan.clips.size()), unconnectedScan.overlaps, connectedScan.overlaps, unconnectedScan.spineLaneClips,
+        unconnectedScan.gapLaneChildren, flatScan.overlaps, flatScan.gapLaneChildren,
+        int(unconnectedBack.videoTracks.size()), backE ? backE->anchorUid.toUtf8().constData() : "?",
+        backE ? backE->leadInSec : -99.0);
+    gate(33, unconnectedGateOk);
 
     return tally.finish();
 }

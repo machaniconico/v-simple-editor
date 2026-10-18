@@ -2099,54 +2099,6 @@ QString fcpxFrameDuration(int fps)
 {
     return QStringLiteral("1/%1s").arg(qMax(1, fps));
 }
-
-QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
-{
-    QVector<fcpx::xml::ClipEntry> entries;
-    if (!timeline)
-        return entries;
-
-    const auto &tracks = timeline->videoTracks();
-    for (const auto *track : tracks) {
-        if (!track)
-            continue;
-
-        double cursorSec = 0.0;
-        const auto &clips = track->clips();
-        for (const ClipInfo &clip : clips) {
-            cursorSec += clip.leadInSec;
-
-            const double durationSec = qMax(0.0, clip.effectiveDuration());
-            if (clip.filePath.isEmpty() || durationSec <= 0.0) {
-                cursorSec += durationSec;
-                continue;
-            }
-
-            fcpx::xml::ClipEntry entry;
-            entry.filePath = clip.filePath;
-            entry.offset = qMax(0.0, cursorSec);
-            entry.duration = durationSec;
-            entry.startInSource = qMax(0.0, clip.inPoint);
-            entry.name = clip.displayName.isEmpty()
-                ? QFileInfo(clip.filePath).completeBaseName()
-                : clip.displayName;
-            entries.append(entry);
-
-            cursorSec += durationSec;
-        }
-    }
-
-    std::stable_sort(entries.begin(), entries.end(),
-                     [](const fcpx::xml::ClipEntry &lhs,
-                        const fcpx::xml::ClipEntry &rhs) {
-                         if (lhs.offset < rhs.offset)
-                             return true;
-                         if (lhs.offset > rhs.offset)
-                             return false;
-                         return lhs.name < rhs.name;
-                     });
-    return entries;
-}
 #endif
 
 void syncTimeRemapEntriesToTimelineImpl(
@@ -17766,8 +17718,9 @@ void MainWindow::openFcpxmlExportDialog()
     config.width = qMax(1, m_projectConfig.width);
     config.height = qMax(1, m_projectConfig.height);
 
-    const QVector<fcpx::xml::ClipEntry> clips =
-        buildFcpxmlExportClips(m_timeline);
+    const QVector<fcpx::xml::ClipEntry> clips = m_timeline
+        ? fcpx::buildExportClips(*m_timeline)
+        : QVector<fcpx::xml::ClipEntry>();
     const QString xml = fcpx::xml::buildXml(clips, config);
 
     QFile file(outPath);

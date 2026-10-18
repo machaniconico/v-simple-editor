@@ -138,18 +138,20 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (time(a.value(key).toString(), v)) return true;
         reader.raiseError(QStringLiteral("不正な時刻: %1").arg(key)); return false;
     };
-    // XML times remain nonnegative. Reorder subtraction for a J cut so its
+    // XML times are nonnegative except a lane child's own offset (J cut). Reorder subtraction so a
     // relative position may be negative without storing a negative rational.
-    auto placeConnected = [&](Entry &e, const Time &parentOffset, const Time &parentStart) {
+    // negativeOffset: a lane child's offset was written as a signed rational (e.offset holds its
+    // magnitude), i.e. it lies before the parent's own time zero.
+    auto placeConnected = [&](Entry &e, const Time &parentOffset, const Time &parentStart, bool negativeOffset = false) {
         Time absoluteTimelineSec, trimTimelineSec;
         bool beforeZero = false;
-        if (!lessTime(e.offset, parentStart)) {
+        if (!negativeOffset && !lessTime(e.offset, parentStart)) {
             Time relativeTimelineSec;
             if (!combine(e.offset, parentStart, true, relativeTimelineSec)
                 || !combine(parentOffset, relativeTimelineSec, false, absoluteTimelineSec)) return false;
         } else {
             Time relativeTimelineSec;
-            if (!combine(parentStart, e.offset, true, relativeTimelineSec)) return false;
+            if (!combine(parentStart, e.offset, !negativeOffset, relativeTimelineSec)) return false;
             if (!combine(parentOffset, relativeTimelineSec, true, absoluteTimelineSec)) {
                 if (!combine(relativeTimelineSec, parentOffset, true, trimTimelineSec)) return false;
                 beforeZero = true;
@@ -476,15 +478,24 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (hasAttribute(QStringLiteral("lane"))) e.lane = attribute(QStringLiteral("lane")).toInt(&laneOk);
         QString invalid;
         if (!laneOk) invalid = QStringLiteral("lane");
+        bool negativeOffset = false;
         for (const auto &key : {QStringLiteral("offset"), QStringLiteral("duration"), QStringLiteral("start")}) {
             Time *value = key == QStringLiteral("offset") ? &e.offset
                 : key == QStringLiteral("duration") ? &e.duration : &e.start;
+            QString text = attribute(key);
+            // Only a lane child's own offset may be signed (a J cut before its anchor's in-point).
+            if (key == QStringLiteral("offset") && parentOffset && !(fallback && !explicitOffset)
+                && text.startsWith(QLatin1Char('-'))) {
+                text.remove(0, 1);
+                negativeOffset = true;
+            }
             if ((hasAttribute(key) || key == QStringLiteral("duration"))
-                && !time(attribute(key), *value)) invalid = key;
+                && !time(text, *value)) invalid = key;
         }
+        if (negativeOffset && !e.offset.n) negativeOffset = false;
         if (fallback && !explicitOffset) e.offset = *parentOffset;
         if (parentOffset && !(fallback && !explicitOffset) && invalid.isEmpty()) {
-            if (!placeConnected(e, *parentOffset, *parentStart))
+            if (!placeConnected(e, *parentOffset, *parentStart, negativeOffset))
                 invalid = QStringLiteral("接続位置");
         }
         if (!invalid.isEmpty()) {
