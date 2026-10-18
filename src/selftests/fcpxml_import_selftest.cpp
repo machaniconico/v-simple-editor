@@ -1,9 +1,12 @@
 #include "../FcpxmlImport.h"
 #include "../FcpxmlExporter.h"
+#include "../ProjectFile.h"
 #include "../UndoManager.h"
 #include "SelftestGate.h"
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QPair>
 #include <QTemporaryDir>
 #include <cmath>
@@ -108,17 +111,23 @@ int runFcpxmlImportSelftest()
     bool warnings = unsupported.error.isEmpty() && unsupported.videoTracks[0].size() == 2
         && unsupported.unresolvedFiles == 1 && unsupported.resolvedFiles == 0
         && !QFileInfo::exists(unsupported.videoTracks[0][0].filePath);
-    for (const QString &tag : {QStringLiteral("transition"), QStringLiteral("ref-clip"),
+    for (const QString &tag : {QStringLiteral("ref-clip"),
             QStringLiteral("mc-clip"), QStringLiteral("filter-video"), QStringLiteral("adjust-color"), QStringLiteral("media")})
         warnings &= unsupported.warnings.join('\n').contains(QStringLiteral(": %1 (").arg(tag));
+    // Old pin: a "transition" skip warning. New: no skip warning and a head FadeIn on the first clip.
+    const bool transitionSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": transition ("));
+    const bool headFade = unsupported.videoTracks[0][0].leadIn.type == TransitionType::FadeIn
+        && near(unsupported.videoTracks[0][0].leadIn.duration, 1.0);
+    warnings &= !transitionSkipWarning && headFade;
     warnings &= !unsupported.warnings.join('\n').contains(QStringLiteral(": clip ("));
     warnings &= !fcpx::xml::parseXml(QStringLiteral("<fcpxml><project>"), dir.path()).error.isEmpty()
         && !fcpx::xml::parseXml(QStringLiteral("<unrelated/>"), dir.path()).error.isEmpty()
         && !fcpx::xml::readFcpxml(dir.filePath(QStringLiteral("absent.fcpxml"))).error.isEmpty();
     std::fprintf(stderr, "G4 unsupportedError=%s importedClips=%d resolved=%d unresolved=%d "
-        "warningCount=%d allChecks=%d\n", unsupported.error.toUtf8().constData(),
+        "warningCount=%d transitionSkipWarning=%d(old expected 1, new expected 0) headFade=%d allChecks=%d\n",
+        unsupported.error.toUtf8().constData(),
         int(unsupported.videoTracks[0].size()), unsupported.resolvedFiles, unsupported.unresolvedFiles,
-        int(unsupported.warnings.size()), int(warnings));
+        int(unsupported.warnings.size()), int(transitionSkipWarning), int(headFade), int(warnings));
     gate(4, warnings);
 
     Timeline timeline;
@@ -693,6 +702,253 @@ int runFcpxmlImportSelftest()
         && laneTwoChildLocation.first == 1 && laneTwoChild && laneTwoChild->anchorUid.isEmpty()
         && near(laneTwoChild->anchorOffsetSec, 0.0) && near(laneTwoChildLocation.second, 4.0)
         && laneTwoMain.warnings.count(laneTwoWarning) == 1);
+
+    // G22-G24: spine transitions become edge transitions on both neighbouring clips.
+    // The placement is the author's own fixture: no real FCP export was available.
+    auto tracksEnd = [](const QVector<ClipInfo> &track) {
+        double end = 0.0;
+        for (const auto &c : track) end += c.leadInSec + c.effectiveDuration();
+        return end;
+    };
+    const QString dissolve = QStringLiteral("<transition name=\"Cross Dissolve\" offset=\"3500/1000s\" duration=\"1s\"/>");
+    const QString continuousClips = QStringLiteral(
+        "<asset-clip ref=\"t\" name=\"A\" offset=\"0s\" duration=\"4s\"/>%1"
+        "<asset-clip ref=\"t\" name=\"B\" offset=\"4s\" start=\"2s\" duration=\"3s\"/>");
+    // The A side needs a known asset duration: its handle is what follows the out point.
+    const QString timedAsset = QStringLiteral("<asset id=\"t\" src=\"offline.mov\" duration=\"10s\"/>");
+    const auto continuous = fcpx::xml::parseXml(document(continuousClips.arg(dissolve), timedAsset), dir.path());
+    const auto continuousPlain = fcpx::xml::parseXml(document(continuousClips.arg(QString()), timedAsset), dir.path());
+    const ClipInfo *ca = namedClip(continuous.videoTracks, QStringLiteral("A"));
+    const ClipInfo *cb = namedClip(continuous.videoTracks, QStringLiteral("B"));
+    const ClipInfo *pa = namedClip(continuousPlain.videoTracks, QStringLiteral("A"));
+    const ClipInfo *pb = namedClip(continuousPlain.videoTracks, QStringLiteral("B"));
+    auto isDissolve = [&](const Transition &t, double d) {
+        return t.type == TransitionType::CrossDissolve && near(t.duration, d)
+            && t.alignment == TransitionAlignment::Center;
+    };
+    bool g22 = continuous.error.isEmpty() && ca && cb && pa && pb
+        && continuous.videoTracks.size() == 1 && continuous.videoTracks[0].size() == 2
+        && isDissolve(ca->trailOut, 1.0) && isDissolve(cb->leadIn, 1.0)
+        && ca->leadIn.type == TransitionType::None && cb->trailOut.type == TransitionType::None
+        && near(ca->inPoint, 0.0) && near(ca->outPoint, 4.0) && near(cb->inPoint, 2.0)
+        && near(cb->outPoint, 5.0) && near(cb->leadInSec, 0.0)
+        && continuous.warnings.filter(QStringLiteral("transition")).isEmpty()
+        && pa->trailOut.type == TransitionType::None && pb->leadIn.type == TransitionType::None;
+    // GUI canonical form: reapplying the same d/Center onto the imported clips (which already
+    // carry the transitions) leaves every ClipInfo unchanged; the plain-clip result must match too.
+    bool canonical = false, plainCanonical = false;
+    QString canonicalLog;
+    if (ca && cb) {
+        auto sameEdge = [&](const Transition &x, const Transition &y) {
+            return x.type == y.type && near(x.duration, y.duration) && x.alignment == y.alignment
+                && x.easing == y.easing && x.softness == y.softness && x.borderWidth == y.borderWidth
+                && x.borderColor == y.borderColor;
+        };
+        // ClipInfo serialisation (ProjectFile::clipToJson is private): one clip per project.
+        auto clipJson = [](const ClipInfo &c) {
+            ProjectData data;
+            data.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{c}};
+            const auto root = QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object();
+            return QString::fromUtf8(QJsonDocument(root.value(QStringLiteral("videoTracks")).toArray())
+                .toJson(QJsonDocument::Compact));
+        };
+        auto sameClip = [&](const ClipInfo &x, const ClipInfo &y) {
+            return clipJson(x) == clipJson(y)
+                && near(x.inPoint, y.inPoint) && near(x.outPoint, y.outPoint)
+                && near(x.leadInSec, y.leadInSec) && near(x.duration, y.duration)
+                && x.uid == y.uid && x.anchorUid == y.anchorUid
+                && near(x.anchorOffsetSec, y.anchorOffsetSec)
+                && sameEdge(x.leadIn, y.leadIn) && sameEdge(x.trailOut, y.trailOut);
+        };
+        Timeline gui;
+        const QVector<ClipInfo> before = continuous.videoTracks[0];
+        gui.trackAt(false, 0)->setClips(before);
+        gui.trackAt(false, 0)->setSelectedClip(0);
+        gui.applyTransitionToSelected(Transition{TransitionType::CrossDissolve, ca->trailOut.duration,
+            TransitionAlignment::Center, ca->trailOut.easing});
+        const auto after = gui.trackAt(false, 0)->clips();
+        canonical = after.size() == before.size() && before.size() == 2;
+        for (int i = 0; canonical && i < before.size(); ++i) canonical = sameClip(before[i], after[i]);
+        for (int i = 0; i < before.size() && i < after.size(); ++i)
+            canonicalLog += QStringLiteral(" clip%1 before=%2 after=%3").arg(i)
+                .arg(clipJson(before[i]), clipJson(after[i]));
+        Timeline plainGui;
+        plainGui.trackAt(false, 0)->setClips(continuousPlain.videoTracks[0]);
+        plainGui.trackAt(false, 0)->setSelectedClip(0);
+        plainGui.applyTransitionToSelected(Transition{TransitionType::CrossDissolve, 1.0,
+            TransitionAlignment::Center, TransitionEasing::Linear});
+        const auto plainAfter = plainGui.trackAt(false, 0)->clips();
+        plainCanonical = plainAfter.size() == 2 && sameEdge(plainAfter[0].trailOut, ca->trailOut)
+            && sameEdge(plainAfter[1].leadIn, cb->leadIn)
+            && sameEdge(plainAfter[0].leadIn, ca->leadIn) && sameEdge(plainAfter[1].trailOut, cb->trailOut);
+    }
+    canonical = canonical && plainCanonical;
+    std::fprintf(stderr, "G22 error=%s tracks=%d A.trailOut=%d/%.9f B.leadIn=%d/%.9f A=[%.9f,%.9f] B=[%.9f,%.9f] "
+        "Blead=%.9f controlA=%d controlB=%d guiCanonical=%d plainCanonical=%d%s\n", continuous.error.toUtf8().constData(),
+        int(continuous.videoTracks.size()), ca ? int(ca->trailOut.type) : -1, ca ? ca->trailOut.duration : -1.0,
+        cb ? int(cb->leadIn.type) : -1, cb ? cb->leadIn.duration : -1.0,
+        ca ? ca->inPoint : -1.0, ca ? ca->outPoint : -1.0, cb ? cb->inPoint : -1.0, cb ? cb->outPoint : -1.0,
+        cb ? cb->leadInSec : -1.0, pa ? int(pa->trailOut.type) : -1, pb ? int(pb->leadIn.type) : -1, int(canonical),
+        int(plainCanonical), canonicalLog.toUtf8().constData());
+    gate(22, g22 && canonical);
+
+    const QString overlappedClips = QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"0s\" duration=\"5s\"/>%1"
+        "<asset-clip ref=\"a\" name=\"B\" offset=\"4s\" start=\"2s\" duration=\"4s\"/>");
+    const auto overlapped = fcpx::xml::parseXml(document(overlappedClips.arg(
+        QStringLiteral("<transition name=\"Cross Dissolve\" offset=\"4s\" duration=\"1s\"/>"))), dir.path());
+    const auto overlappedPlain = fcpx::xml::parseXml(document(overlappedClips.arg(QString())), dir.path());
+    const ClipInfo *oa = namedClip(overlapped.videoTracks, QStringLiteral("A"));
+    const ClipInfo *ob = namedClip(overlapped.videoTracks, QStringLiteral("B"));
+    const auto overlappedMissing = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"0s\" duration=\"5s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"4s\" duration=\"1s\"/>"
+        "<asset-clip ref=\"missing\" name=\"B\" offset=\"4s\" start=\"2s\" duration=\"4s\"/>")), dir.path());
+    const ClipInfo *ma = namedClip(overlappedMissing.videoTracks, QStringLiteral("A"));
+    const QString missingWarning = QStringLiteral("未定義の素材参照を読み飛ばしました: missing");
+    // Asset with a nonzero start: handleEnd is in source coordinates and must be
+    // shifted back by asset.start (old code added it: duration 205 instead of 5).
+    const auto offsetAsset = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"s\" name=\"A\" offset=\"0s\" start=\"100s\" duration=\"5s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"4s\" duration=\"2s\"/>"
+        "<asset-clip ref=\"s\" name=\"B\" offset=\"4s\" start=\"102s\" duration=\"4s\"/>"),
+        QStringLiteral("<asset id=\"s\" src=\"offline.mov\" start=\"100s\" duration=\"5s\"/>")), dir.path());
+    const ClipInfo *sA = namedClip(offsetAsset.videoTracks, QStringLiteral("A"));
+    // Invalid B (clip start before asset start) must leave A untrimmed.
+    const auto invalidB = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"0s\" duration=\"5s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"4s\" duration=\"1s\"/>"
+        "<asset-clip ref=\"t\" name=\"B\" offset=\"4s\" start=\"0s\" duration=\"4s\"/>"),
+        QStringLiteral("<asset id=\"t\" src=\"offline.mov\" start=\"10s\"/>")), dir.path());
+    const ClipInfo *iA = namedClip(invalidB.videoTracks, QStringLiteral("A"));
+    const QString rangeWarning = QStringLiteral("lane 0 の時刻範囲が不正なクリップを読み飛ばしました: B / t");
+    const double iSpan = iA ? iA->outPoint - iA->inPoint : -1.0;
+    // Negative control: P overlaps A, so placement promotes A to V2 while B stays on V1. The
+    // A-B transition is then dropped; the overlap trim must be restored (A and B untrimmed).
+    const auto promoted = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"P\" offset=\"0s\" duration=\"6s\"/>"
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"4s\" duration=\"5s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"8s\" duration=\"1s\"/>"
+        "<asset-clip ref=\"a\" name=\"B\" offset=\"8s\" start=\"2s\" duration=\"4s\"/>")), dir.path());
+    const ClipInfo *promA = namedClip(promoted.videoTracks, QStringLiteral("A"));
+    const ClipInfo *promB = namedClip(promoted.videoTracks, QStringLiteral("B"));
+    const QString promotedWarning = QStringLiteral("未対応の要素を読み飛ばしました: transition (行");
+    const int promotedWarnings = int(promoted.warnings.filter(promotedWarning).size());
+    const double promASpan = promA ? promA->outPoint - promA->inPoint : -1.0;
+    const bool promotedOk = promoted.error.isEmpty() && promA && promB && near(promASpan, 5.0)
+        && near(promB->inPoint, 2.0) && promA->trailOut.type == TransitionType::None
+        && promB->leadIn.type == TransitionType::None && promotedWarnings == 1;
+    // Two adjacent transitions: A is pushed to V2 by P, so only B-C survives. Every retry pass must
+    // start from untrimmed entries (old code left C trimmed from pass 1: cut 11.75, C.in 2.75, d 0.5).
+    const auto chained = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"P\" offset=\"0s\" duration=\"6s\"/>"
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"4s\" duration=\"5s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"8s\" duration=\"1s\"/>"
+        "<asset-clip ref=\"a\" name=\"B\" offset=\"8s\" start=\"2s\" duration=\"4s\"/>"
+        "<transition name=\"Cross Dissolve\" offset=\"11s\" duration=\"1s\"/>"
+        "<asset-clip ref=\"a\" name=\"C\" offset=\"11s\" start=\"2s\" duration=\"4s\"/>")), dir.path());
+    const ClipInfo *chA = namedClip(chained.videoTracks, QStringLiteral("A"));
+    const ClipInfo *chB = namedClip(chained.videoTracks, QStringLiteral("B"));
+    const ClipInfo *chC = namedClip(chained.videoTracks, QStringLiteral("C"));
+    const int chainedShort = int(chained.warnings.filter(QStringLiteral("transition Cross Dissolve のハンドルが不足したため")).size());
+    const int chainedShortAny = int(chained.warnings.filter(QStringLiteral("のハンドルが不足したため")).size());
+    const int chainedSkips = int(chained.warnings.filter(promotedWarning).size());
+    const double chASpan = chA ? chA->outPoint - chA->inPoint : -1.0;
+    const bool chainedOk = chained.error.isEmpty() && chA && chB && chC && near(chASpan, 5.0)
+        && chA->trailOut.type == TransitionType::None && near(chB->inPoint, 2.0)
+        && chB->leadIn.type == TransitionType::None && near(chB->outPoint, 5.5)
+        && near(chC->inPoint, 2.5) && isDissolve(chB->trailOut, 1.0) && isDissolve(chC->leadIn, 1.0)
+        && chB->trailOut.alignment == TransitionAlignment::Center
+        && chainedShort == 0 && chainedShortAny == 0 && chainedSkips == 1;
+    std::fprintf(stderr, "G23 chained Aspan=%.9f AtrailOut=%d Bin=%.9f BleadIn=%d Bout=%.9f (cut=%.9f, old=11.75) "
+        "Cin=%.9f (old=2.75) BtrailOut=%d/%.9f (old d=0.5) ClleadIn=%d/%.9f shortWarnings=%d skipWarnings=%d "
+        "chainedOk=%d\n", chASpan, chA ? int(chA->trailOut.type) : -1, chB ? chB->inPoint : -1.0,
+        chB ? int(chB->leadIn.type) : -1, chB ? chB->outPoint : -1.0, chB ? 8.0 + (chB->outPoint - chB->inPoint) : -1.0,
+        chC ? chC->inPoint : -1.0, chB ? int(chB->trailOut.type) : -1, chB ? chB->trailOut.duration : -1.0,
+        chC ? int(chC->leadIn.type) : -1, chC ? chC->leadIn.duration : -1.0, chainedShortAny, chainedSkips,
+        int(chainedOk));
+    const double overlappedEnd = overlapped.videoTracks.isEmpty() ? -1.0 : tracksEnd(overlapped.videoTracks[0]);
+    std::fprintf(stderr, "G23 tracks=%d length=%.9f expectedLength=8 A=[%.9f,%.9f] B=[%.9f,%.9f] Blead=%.9f "
+        "A.trailOut=%d/%.9f B.leadIn=%d/%.9f controlTracks=%d Aduration=%.9f "
+        "missingB=[%.9f,%.9f] missingTrailOut=%d missingWarnings=%d "
+        "offsetAssetAduration=%.9f (old=205) offsetAssetTrailOut=%.9f (old=2) invalidBspan=%.9f (old=4.5) "
+        "invalidBtrailOut=%d invalidBwarnings=%d "
+        "promotedAspan=%.9f (trimmed=4.5) promotedBin=%.9f (trimmed=2.5) promotedAtrailOut=%d promotedBleadIn=%d "
+        "promotedSkipWarnings=%d promotedOk=%d\n", int(overlapped.videoTracks.size()),
+        overlappedEnd, oa ? oa->inPoint : -1.0, oa ? oa->outPoint : -1.0, ob ? ob->inPoint : -1.0,
+        ob ? ob->outPoint : -1.0, ob ? ob->leadInSec : -1.0, oa ? int(oa->trailOut.type) : -1,
+        oa ? oa->trailOut.duration : -1.0, ob ? int(ob->leadIn.type) : -1, ob ? ob->leadIn.duration : -1.0,
+        int(overlappedPlain.videoTracks.size()), oa ? oa->duration : -1.0,
+        ma ? ma->inPoint : -1.0, ma ? ma->outPoint : -1.0, ma ? int(ma->trailOut.type) : -1,
+        int(overlappedMissing.warnings.count(missingWarning)),
+        sA ? sA->duration : -1.0, sA ? sA->trailOut.duration : -1.0, iSpan,
+        iA ? int(iA->trailOut.type) : -1, int(invalidB.warnings.count(rangeWarning)),
+        promASpan, promB ? promB->inPoint : -1.0, promA ? int(promA->trailOut.type) : -1,
+        promB ? int(promB->leadIn.type) : -1, promotedWarnings, int(promotedOk));
+    gate(23, overlapped.error.isEmpty() && oa && ob && overlapped.videoTracks.size() == 1
+        && near(overlappedEnd, 8.0) && near(oa->inPoint, 0.0) && near(oa->outPoint, 4.5)
+        && near(ob->inPoint, 2.5) && near(ob->outPoint, 6.0) && near(ob->leadInSec, 0.0)
+        && isDissolve(oa->trailOut, 1.0) && isDissolve(ob->leadIn, 1.0)
+        && overlappedPlain.videoTracks.size() == 2 && oa->duration >= 5.0 - 1e-9
+        && overlappedMissing.error.isEmpty() && ma && near(ma->inPoint, 0.0) && near(ma->outPoint, 5.0)
+        && ma->trailOut.type == TransitionType::None
+        && overlappedMissing.warnings.count(missingWarning) == 1
+        && offsetAsset.error.isEmpty() && sA && near(sA->duration, 5.0) && isDissolve(sA->trailOut, 1.0)
+        && invalidB.error.isEmpty() && iA && near(iSpan, 5.0) && iA->trailOut.type == TransitionType::None
+        && invalidB.warnings.count(rangeWarning) == 1 && promotedOk && chainedOk);
+
+    const QString handleAsset = QStringLiteral("<asset id=\"h\" src=\"short.mov\" duration=\"5s\"/>");
+    const QString shortWarning = QStringLiteral("transition Cross Dissolve のハンドルが不足したため長さを 0.2 秒に縮めました");
+    const auto handleShort = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"h\" name=\"A\" offset=\"0s\" duration=\"49/10s\"/>"
+        "<transition name=\"Cross Dissolve\" duration=\"1s\"/>"
+        "<asset-clip ref=\"h\" name=\"B\" offset=\"49/10s\" start=\"3/10s\" duration=\"2s\"/>"), handleAsset), dir.path());
+    const ClipInfo *sa = namedClip(handleShort.videoTracks, QStringLiteral("A"));
+    const ClipInfo *sb = namedClip(handleShort.videoTracks, QStringLiteral("B"));
+    const auto headTail = fcpx::xml::parseXml(document(QStringLiteral(
+        "<transition name=\"Cross Dissolve\" duration=\"1s\"/>"
+        "<asset-clip ref=\"a\" name=\"first\" offset=\"0s\" duration=\"3s\"/>"
+        "<asset-clip ref=\"a\" name=\"last\" offset=\"3s\" duration=\"3s\"/>"
+        "<transition name=\"Cross Dissolve\" duration=\"1s\"/>")), dir.path());
+    const ClipInfo *first = namedClip(headTail.videoTracks, QStringLiteral("first"));
+    const ClipInfo *last = namedClip(headTail.videoTracks, QStringLiteral("last"));
+    const QString slideWarning = QStringLiteral("transition の名前 Slide は未対応のため Cross Dissolve に置き換えました");
+    const auto slide = fcpx::xml::parseXml(document(continuousClips.arg(QStringLiteral(
+        "<transition name=\"Slide\" duration=\"1s\"/>")), timedAsset), dir.path());
+    const ClipInfo *slideA = namedClip(slide.videoTracks, QStringLiteral("A"));
+    const ClipInfo *slideB = namedClip(slide.videoTracks, QStringLiteral("B"));
+    const auto noDuration = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"A\" offset=\"0s\" duration=\"4s\"/>"
+        "<transition name=\"Cross Dissolve\" duration=\"2s\"/>"
+        "<asset-clip ref=\"a\" name=\"B\" offset=\"4s\" start=\"1s\" duration=\"3s\"/>")), dir.path());
+    const ClipInfo *na = namedClip(noDuration.videoTracks, QStringLiteral("A"));
+    const ClipInfo *nb = namedClip(noDuration.videoTracks, QStringLiteral("B"));
+    const QString noDurationWarning = QStringLiteral("transition Cross Dissolve のハンドルが不足したため長さを 0 秒に縮めました");
+    std::fprintf(stderr, "G24 noDuration A.trailOut=%d/%.9f B.leadIn=%d/%.9f warnings=%d\n",
+        na ? int(na->trailOut.type) : -1, na ? na->trailOut.duration : -1.0,
+        nb ? int(nb->leadIn.type) : -1, nb ? nb->leadIn.duration : -1.0,
+        int(noDuration.warnings.count(noDurationWarning)));
+    std::fprintf(stderr, "G24 shortA=%d/%.9f shortB=%d/%.9f shortWarnings=%d headFade=%d/%.9f tailFade=%d/%.9f "
+        "slideA=%d slideB=%d slideWarnings=%d controlWideWarnings=%d\n",
+        sa ? int(sa->trailOut.type) : -1, sa ? sa->trailOut.duration : -1.0,
+        sb ? int(sb->leadIn.type) : -1, sb ? sb->leadIn.duration : -1.0,
+        int(handleShort.warnings.count(shortWarning)),
+        first ? int(first->leadIn.type) : -1, first ? first->leadIn.duration : -1.0,
+        last ? int(last->trailOut.type) : -1, last ? last->trailOut.duration : -1.0,
+        slideA ? int(slideA->trailOut.type) : -1, slideB ? int(slideB->leadIn.type) : -1,
+        int(slide.warnings.count(slideWarning)), int(continuous.warnings.filter(QStringLiteral("縮め")).size()));
+    gate(24, noDuration.error.isEmpty() && na && nb && na->trailOut.type == TransitionType::None
+        && nb->leadIn.type == TransitionType::None && noDuration.warnings.count(noDurationWarning) == 1
+        && handleShort.error.isEmpty() && sa && sb && isDissolve(sa->trailOut, 0.2)
+        && isDissolve(sb->leadIn, 0.2) && handleShort.warnings.count(shortWarning) == 1
+        && headTail.error.isEmpty() && first && last
+        && first->leadIn.type == TransitionType::FadeIn && near(first->leadIn.duration, 1.0)
+        && first->trailOut.type == TransitionType::None
+        && last->trailOut.type == TransitionType::FadeOut && near(last->trailOut.duration, 1.0)
+        && last->leadIn.type == TransitionType::None
+        && slide.error.isEmpty() && slideA && slideB && isDissolve(slideA->trailOut, 1.0)
+        && isDissolve(slideB->leadIn, 1.0) && slide.warnings.count(slideWarning) == 1
+        && continuous.warnings.filter(QStringLiteral("縮め")).isEmpty());
 
     return tally.finish();
 }

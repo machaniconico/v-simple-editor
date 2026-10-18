@@ -62,9 +62,13 @@ struct Entry {
     QString ref, name, uid;
     int lane = 0, parentIndex = -1;
     Time offset, duration, start;
+    Time handleEnd; // pre-trim source end (start + duration) of an overlap-trimmed clip
     bool underGap = false;
     bool audioElement = false;
 };
+// A spine-level transition remembers its neighbouring spine clips (entry
+// indexes, -1 when the neighbour is missing or a gap) until placement is known.
+struct SpineTransition { QString name; Time duration; int prev = -1, next = -1; qint64 line = 0; };
 bool isMediaClipTag(QStringView tag)
 {
     return tag == QLatin1String("asset-clip") || tag == QLatin1String("video")
@@ -89,6 +93,9 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     QString sequenceFormat;
     bool root = false, sequence = false, spine = false;
     int gapDepth = 0;
+    QVector<SpineTransition> transitions;
+    int lastSpineRoot = -1;
+    bool awaitingNext = false;
     auto warnSkip = [&] {
         result.warnings.append(QStringLiteral("未対応の要素を読み飛ばしました: %1 (行 %2)")
             .arg(reader.name().toString()).arg(reader.lineNumber()));
@@ -296,9 +303,29 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             if (!readTime(a, QStringLiteral("tcStart"), origin)) break;
         } else if (tag == "spine" && parent == "sequence" && !spine) {
             spine = true;
+        } else if (parent == "spine" && tag == "transition") {
+            SpineTransition transition;
+            transition.name = a.value("name").toString();
+            transition.line = reader.lineNumber();
+            if (!time(a.value("duration").toString(), transition.duration) || !transition.duration.n) {
+                warnSkip(); continue;
+            }
+            transition.prev = lastSpineRoot;
+            transitions.append(transition);
+            awaitingNext = true;
+            reader.skipCurrentElement(); continue;
         } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap"
                    || isContainerTag(QStringView(tag)))) {
+            const int firstEntry = entries.size();
             readSpine(nullptr, nullptr, -1, 0, nullptr);
+            int root = -1;
+            if (tag != "gap") {
+                for (int i = firstEntry; i < entries.size() && root < 0; ++i)
+                    if (!entries[i].uid.isEmpty()) root = i;
+                if (awaitingNext) transitions.last().next = root;
+            }
+            awaitingNext = false;
+            lastSpineRoot = root;
             continue;
         } else { warnSkip(); continue; }
         stack.append(tag);
@@ -345,6 +372,66 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         }
         return rejection[i] = Valid;
     };
+    // FCP may deliver a transition as clips overlapping by its length. The
+    // sequential model cannot hold an overlap, so both clips are trimmed to the
+    // midpoint of the overlap; the trimmed media stays available as handle.
+    // A pair is trimmed when both clips survive validation, share a kind and a lane.
+    // Placement may still put them on different tracks (the overlap with an earlier
+    // clip promotes one of them); such a pair loses its transition, so its trim is
+    // restored to the untrimmed entries and the import is rebuilt without it.
+    // Same time-range predicate importLanes applies; the trim must not move a clip
+    // that is dropped there, nor let the trim validate a clip that was invalid.
+    auto rangeValid = [&](const Entry &e, Time &offset, Time &start, Time &out, Time &nextEnd) {
+        const Asset asset = assets.value(e.ref);
+        return e.duration.n && combine(e.offset, origin, true, offset)
+            && combine(e.start, asset.start, true, start)
+            && combine(start, e.duration, false, out)
+            && combine(offset, e.duration, false, nextEnd);
+    };
+    const auto untrimmed = entries;
+    QSet<int> rejectedTrims;
+    QSet<QString> found, missing, v1Uids;
+    const int warningsBase = result.warnings.size();
+    auto locate = [&](int entryIndex, const QVector<ClipInfo> *&track) -> ClipInfo * {
+        if (entryIndex < 0 || entries[entryIndex].uid.isEmpty()) return nullptr;
+        for (auto *tracks : {&result.videoTracks, &result.audioTracks})
+            for (auto &candidate : *tracks)
+                for (auto &c : candidate)
+                    if (c.uid == entries[entryIndex].uid) { track = &candidate; return &c; }
+        return nullptr;
+    };
+    for (;;) {
+    entries = untrimmed;
+    QVector<int> trimmedTransitions;
+    rejection.fill(-1);
+    videoLanes.clear();
+    audioLanes.clear();
+    found.clear(); missing.clear(); v1Uids.clear();
+    result.warnings.resize(warningsBase);
+    for (int ti = 0; ti < transitions.size(); ++ti) {
+        const auto &transition = transitions[ti];
+        if (rejectedTrims.contains(ti) || transition.prev < 0 || transition.next < 0) continue;
+        Entry &a = entries[transition.prev], &b = entries[transition.next];
+        if (checkEntry(transition.prev) != Valid || checkEntry(transition.next) != Valid
+            || isAudioEntry(a) != isAudioEntry(b) || a.lane != b.lane) continue;
+        Time r0, r1, r2, r3;
+        if (!rangeValid(a, r0, r1, r2, r3) || !rangeValid(b, r0, r1, r2, r3)) continue;
+        Time endA, overlap, half, aDuration, bOffset, bStart, bDuration, aHandleEnd;
+        if (!combine(a.offset, a.duration, false, endA) || !lessTime(b.offset, endA)
+            || !combine(endA, b.offset, true, overlap)
+            || overlap.d > std::numeric_limits<qint64>::max() / 2) continue;
+        half = {overlap.n, overlap.d * 2};
+        const qint64 g = std::gcd(half.n, half.d);
+        half.n /= g; half.d /= g;
+        if (!combine(a.duration, half, true, aDuration) || !aDuration.n
+            || !combine(b.offset, half, false, bOffset) || !combine(b.start, half, false, bStart)
+            || !combine(b.duration, half, true, bDuration) || !bDuration.n
+            || !combine(a.start, a.duration, false, aHandleEnd)) continue;
+        a.handleEnd = aHandleEnd;
+        a.duration = aDuration;
+        b.offset = bOffset; b.start = bStart; b.duration = bDuration;
+        trimmedTransitions.append(ti);
+    }
     for (int i = 0; i < entries.size(); ++i) {
         const auto &e = entries[i];
         switch (checkEntry(i)) {
@@ -366,7 +453,6 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     }
     result.videoTracks.clear();
     result.audioTracks.clear();
-    QSet<QString> found, missing, v1Uids;
     auto importLanes = [&](const QMap<int, QVector<Entry>> &lanes, QVector<QVector<ClipInfo>> &tracks) {
         auto laneKeys = lanes.keys();
         std::sort(laneKeys.begin(), laneKeys.end(), [](int a, int b) {
@@ -388,10 +474,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             for (const auto &e : clips) {
                 const auto asset = assets.value(e.ref);
                 Time offset, gap, start, out, nextEnd;
-                if (!e.duration.n || !combine(e.offset, origin, true, offset)
-                    || !combine(e.start, asset.start, true, start)
-                    || !combine(start, e.duration, false, out)
-                    || !combine(offset, e.duration, false, nextEnd)) {
+                if (!rangeValid(e, offset, start, out, nextEnd)) {
                     result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
                         .arg(lane).arg(e.name, e.ref));
                     continue;
@@ -419,6 +502,9 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                 c.outPoint = out.seconds();
                 c.duration = asset.duration.n > 0
                     ? qMax(c.outPoint, asset.duration.seconds()) : c.outPoint;
+                Time trimmedEnd;
+                if (e.handleEnd.n > 0 && combine(e.handleEnd, asset.start, true, trimmedEnd))
+                    c.duration = qMax(c.duration, trimmedEnd.seconds());
                 c.leadInSec = gap.seconds();
                 c.uid = e.uid;
                 const bool childOnV1 = &tracks == &result.videoTracks
@@ -464,6 +550,71 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     };
     importLanes(videoLanes, result.videoTracks);
     importLanes(audioLanes, result.audioTracks);
+    bool rebuild = false;
+    for (int ti : trimmedTransitions) {
+        const QVector<ClipInfo> *trackA = nullptr, *trackB = nullptr;
+        const auto &transition = transitions[ti];
+        if (!locate(transition.prev, trackA) || !locate(transition.next, trackB) || trackA == trackB) continue;
+        rejectedTrims.insert(ti);
+        rebuild = true;
+    }
+    if (!rebuild) break;
+    }
+    // Attach spine transitions to the clip edges, like applyTransitionToSelected.
+    auto twice = [](Time t) { Time out; return combine(t, t, false, out) ? out : t; };
+    for (const auto &transition : transitions) {
+        const QVector<ClipInfo> *trackA = nullptr, *trackB = nullptr;
+        ClipInfo *clipA = locate(transition.prev, trackA), *clipB = locate(transition.next, trackB);
+        Time length = transition.duration;
+        Transition applied;
+        if (transition.prev >= 0 && transition.next >= 0) {
+            if (!clipA || !clipB) continue;
+            const Entry &a = entries[transition.prev], &b = entries[transition.next];
+            Time endA;
+            if (trackA != trackB || !combine(a.offset, a.duration, false, endA)
+                || lessTime(endA, b.offset) || lessTime(b.offset, endA)) {
+                result.warnings.append(QStringLiteral("未対応の要素を読み飛ばしました: transition (行 %1)")
+                    .arg(transition.line));
+                continue;
+            }
+            // Center takes half of the length from each clip's handle.
+            const Asset asset = assets.value(a.ref);
+            Time sourceStart, sourceEnd, handleA, handleB;
+            // The A-side handle is what the emitted ClipInfo keeps beyond its out point.
+            Time handleEnd = asset.duration, trimmedEnd;
+            if (a.handleEnd.n > 0 && combine(a.handleEnd, asset.start, true, trimmedEnd)
+                && lessTime(handleEnd, trimmedEnd)) handleEnd = trimmedEnd;
+            if (!combine(a.start, asset.start, true, sourceStart)
+                || !combine(sourceStart, a.duration, false, sourceEnd)
+                || !handleEnd.n || !combine(handleEnd, sourceEnd, true, handleA)) handleA = Time{};
+            if (lessTime(twice(handleA), length)) length = twice(handleA);
+            if (!combine(b.start, assets.value(b.ref).start, true, handleB)) handleB = Time{};
+            if (lessTime(twice(handleB), length)) length = twice(handleB);
+            if (lessTime(length, transition.duration)) {
+                result.warnings.append(QStringLiteral("transition %1 のハンドルが不足したため長さを %2 秒に縮めました")
+                    .arg(transition.name.isEmpty() ? QStringLiteral("Cross Dissolve") : transition.name,
+                         QString::number(length.seconds(), 'g', 6)));
+                if (!length.n) continue;
+            }
+            applied.type = TransitionType::CrossDissolve;
+            applied.duration = length.seconds();
+            clipA->trailOut = applied;
+            clipB->leadIn = applied;
+        } else if (transition.next >= 0 && clipB) {
+            if (lessTime(entries[transition.next].duration, length)) length = entries[transition.next].duration;
+            applied.type = TransitionType::FadeIn;
+            applied.duration = length.seconds();
+            clipB->leadIn = applied;
+        } else if (transition.prev >= 0 && clipA) {
+            if (lessTime(entries[transition.prev].duration, length)) length = entries[transition.prev].duration;
+            applied.type = TransitionType::FadeOut;
+            applied.duration = length.seconds();
+            clipA->trailOut = applied;
+        } else continue;
+        if (!transition.name.isEmpty() && transition.name != QLatin1String("Cross Dissolve"))
+            result.warnings.append(QStringLiteral("transition の名前 %1 は未対応のため Cross Dissolve に置き換えました")
+                .arg(transition.name));
+    }
     result.resolvedFiles = found.size(); result.unresolvedFiles = missing.size();
     if (result.videoTracks.isEmpty() && result.audioTracks.isEmpty()) {
         if (assetClipCount == 0) result.warnings.append(QStringLiteral("読み込めるクリップがありません。"));
