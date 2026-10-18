@@ -732,6 +732,8 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+    if (data.storylineMode)
+        root["storylineMode"] = true;
 
     // Audio mixer
     {
@@ -1080,6 +1082,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
+    data.storylineMode = root.value("storylineMode").toBool(false);
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
@@ -1379,6 +1382,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+    if (data.storylineMode)
+        root["storylineMode"] = true;
 
     // Audio mixer
     {
@@ -1697,6 +1702,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
+    data.storylineMode = root.value("storylineMode").toBool(false);
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();

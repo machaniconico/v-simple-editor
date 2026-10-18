@@ -3185,6 +3185,8 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("主ストーリーラインに接続"), QStringLiteral("編集"));
     reg(m_disconnectFromStorylineAction, "timeline.disconnect",
         QStringLiteral("接続を解除"),          QStringLiteral("編集"));
+    reg(m_storylineModeAction,   "timeline.storyline_mode",
+        QStringLiteral("主ストーリーライン (マグネティック)"), QStringLiteral("編集"));
     reg(m_copyEffectsAction,     "edit.copy_effects",
         QStringLiteral("エフェクトをコピー"),  QStringLiteral("編集"));
     reg(m_pasteEffectsAction,    "edit.paste_effects",
@@ -4533,7 +4535,7 @@ void MainWindow::setupMenuBar()
             statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
             return;
         }
-        m_timeline->deleteSelectedClip();
+        m_timeline->deleteSelectedClip(true);
         statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
         updateEditActions();
     });
@@ -4570,6 +4572,16 @@ void MainWindow::setupMenuBar()
             &MainWindow::disconnectSelectionFromStoryline);
     m_menuHelpEntries.append({m_disconnectFromStorylineAction,
         QStringLiteral("選んだクリップの V1 への接続を外します。クリップの位置は変わりません。")});
+    // US-1203: the magnetic primary storyline (default off, saved with the
+    // project, not an undo step).
+    m_storylineModeAction = editMenu->addAction(tr("主ストーリーライン (マグネティック)"));
+    m_storylineModeAction->setObjectName(QStringLiteral("action_storyline_mode"));
+    m_storylineModeAction->setCheckable(true);
+    connect(m_storylineModeAction, &QAction::toggled, this, [this](bool on) {
+        if (m_timeline) m_timeline->setStorylineMode(on);
+    });
+    m_menuHelpEntries.append({m_storylineModeAction,
+        QStringLiteral("オンの間、V1 への挿入・削除・並べ替え・リップルトリムで V1 だけが詰まり、V1 に隙間ができません。V1 のクリップのリンク音声と接続クリップはついてきます。既定はオフで、プロジェクトに保存されます。")});
 
     auto *matchFrameAction = editMenu->addAction(QStringLiteral("マッチフレーム"));
     matchFrameAction->setObjectName(QStringLiteral("action_match_frame"));
@@ -8936,6 +8948,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
+    data.storylineMode = m_timeline->storylineMode();
     data.brushAnimations = m_brushAnimationEntries;
     data.rotoClipEntries.clear();
     const auto rotoEntries = m_timeline->rotoEntries();
@@ -9290,6 +9303,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                                        data.playheadPos, data.markIn,
                                        data.markOut, data.zoomLevel);
+        // US-1203: the toggle drives Timeline::setStorylineMode.
+        if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
@@ -9793,6 +9808,7 @@ void MainWindow::newProject()
         m_particleClipConfigs.clear();
         syncProjectLightingToTimeline();
         m_tcBurnIn = TimecodeBurnInSettings{};
+        if (m_storylineModeAction) m_storylineModeAction->setChecked(false);
         applyProjectConfig(dialog.config());
         // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
         // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
@@ -10376,7 +10392,16 @@ void MainWindow::rippleTrimInToPlayhead()
         return;
     }
     int trackIdx = -1, clipIdx = -1;
-    if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+    if (m_timeline->storylineMode()) {
+        // US-1203: storyline mode ripples V1 only (applyTrimActive targets V1).
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        trackIdx = 0;
+        clipIdx = v1 ? v1->selectedClip() : -1;
+        if (!v1 || clipIdx < 0 || clipIdx >= v1->clipCount()) {
+            statusBar()->showMessage(tr("V1 のクリップを選択してください"));
+            return;
+        }
+    } else if (!selectedVideoClipRef(trackIdx, clipIdx)) {
         statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
         return;
     }
@@ -10405,7 +10430,17 @@ void MainWindow::rippleTrimOutToPlayhead()
     }
     int trackIdx = -1, clipIdx = -1;
     ClipInfo clip;
-    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+    if (m_timeline->storylineMode()) {
+        // US-1203: storyline mode ripples V1 only (applyTrimActive targets V1).
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        trackIdx = 0;
+        clipIdx = v1 ? v1->selectedClip() : -1;
+        if (!v1 || clipIdx < 0 || clipIdx >= v1->clipCount()) {
+            statusBar()->showMessage(tr("V1 のクリップを選択してください"));
+            return;
+        }
+        clip = v1->clips().at(clipIdx);
+    } else if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
         statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
         return;
     }

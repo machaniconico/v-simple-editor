@@ -542,6 +542,9 @@ public:
     int selectedClip() const { return m_selectedClips.isEmpty() ? -1 : m_selectedClips.last(); }
     const QList<int> &selectedClips() const { return m_selectedClips; }
     bool isClipSelected(int index) const { return m_selectedClips.contains(index); }
+    // US-1203: reassigns the selection without selectionChanged, so no linked
+    // selection sync runs (storyline placement takes clips out and puts them back).
+    void restoreClipSelection(const QList<int> &indices) { m_selectedClips = indices; update(); }
 
     int clipAtX(int x) const;
     double xToSeconds(int x) const;
@@ -735,6 +738,9 @@ private:
     // start. Used to compensate its gap during a MoveClip drag so downstream
     // clips don't slide when the user repositions a single clip. -1 = no next.
     double m_dragOriginalLeadInNext = -1.0;
+    // US-1203: the unclamped (snapped) delta of the current MoveClip drag; a
+    // storyline-mode release on V1 moves the clip by it.
+    double m_dragRawDeltaSec = 0.0;
     // Screen-X of the dragged clip's left edge at drag start, used for snap.
     int m_dragOriginalClipStartX = 0;
     // US-705: Alt held at trim press = trim only the grabbed clip (fixed for
@@ -905,7 +911,9 @@ public:
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
-    void deleteSelectedClip();
+    // US-1203: in storyline mode a delete also closes the V1 gap it leaves (V1
+    // only); leaveGap (the lift action) keeps the HEAD delete in either mode.
+    void deleteSelectedClip(bool leaveGap = false);
     void rippleDeleteSelectedClip();
     bool closeGapAt(TimelineTrack *track, double timeSec);
     bool hasSelection() const;
@@ -956,8 +964,24 @@ public:
     // US-1202: holds the flag only (no UI, save or undo here; US-1203 adds
     // those). While true, a media file or a clip dropped on V2+ / A tracks is
     // connected to the V1 clip under the drop. Default false.
+    // US-1203: the magnetic primary storyline. While true, inserts (a clip
+    // dropped on V1, paste, 3-point insert), deletes, in-V1 moves and ripple
+    // trims change V1 only and keep it gap-free; the linked audio of a V1 clip
+    // follows it (implicit connection, reconcile). Not part of TimelineState.
     void setStorylineMode(bool on) { m_storylineMode = on; }
     bool storylineMode() const { return m_storylineMode; }
+    // US-1203: sets every leadInSec of `track` to 0 (no undo point). False when
+    // nothing changed or the track is locked.
+    bool closeGapsOnTrack(TimelineTrack *track);
+    // US-1203 storyline entries for TimelineTrack (no undo point of their own).
+    // Inserts `clip` into V1 at the insert point for timelineSec (the end of the
+    // clip it falls in), pushing V1 only; returns the index, *landedSec its start.
+    int storylineInsertClip(TimelineTrack *v1, double timelineSec, const ClipInfo &clip,
+                            double *landedSec = nullptr);
+    // Takes V1 clip clipIndex out and inserts it at its start + deltaSec (an
+    // in-V1 drag released in storyline mode); false when the order and the
+    // positions did not change.
+    bool storylineMoveClip(TimelineTrack *v1, int clipIndex, double deltaSec);
     // US-1202 media drop entry: TimelineTrack::dropEvent hands a text/uri-list
     // drop on a V2+ / A track here while storylineMode() is on. Imports the file
     // at dropTimeSec on that track, connected to the V1 clip under the drop
@@ -1615,6 +1639,15 @@ private:
         // Key: "v:" / "a:" + track index + ":" + clip uid (linked V/A, and
         // clips on different tracks, may share a uid).
         QHash<QString, ConnectionBaselineEntry> clips;
+        // US-1203: "a:" + audio track + ":" + uid of the linked audio of a V1
+        // clip -> its implicit anchor (followed only in storyline mode).
+        struct StorylineLink {
+            QString anchorUid;
+            int linkGroup = 0;
+            double startSec = 0.0;
+            double anchorStartSec = 0.0;
+        };
+        QHash<QString, StorylineLink> storylineLinks;
     };
     ReconcileBaseline m_reconcileBaseline;
     // uid -> the deleted anchor-local spans [start, end) (timeline seconds from
@@ -1654,6 +1687,17 @@ private:
     bool hasConnectedClips() const;
     void renameAnchorReferences(const QString &fromUid, const QString &toUid);
     void reconcileConnectedClips();
+    // US-1203: moves the linked audio of V1 clips that moved after the baseline
+    // (storyline mode only); true when a clip moved. Called by reconcile and by
+    // the storyline inserts before they place new linked audio. extraReserved
+    // (audio track -> uid -> count) keeps those uids off those tracks too.
+    bool followStorylineLinks(const QHash<int, QHash<QString, int>> &extraReserved = {});
+    // US-1203: the first unlocked audio track from fromTrack up with room for
+    // `clip` at startSec (not holding its uid, nor reserving it in reservedUids:
+    // audio track -> uid -> pending count); null when none.
+    TimelineTrack *storylineAudioSlot(int fromTrack, const ClipInfo &clip, double startSec,
+                                      TimelineTrack::DropPlan *plan,
+                                      const QHash<int, QHash<QString, int>> *reservedUids = nullptr) const;
     void captureReconcileBaseline();
     void clearReconcileBaseline();
     void appendConnectionWarning(const QString &message);
@@ -1729,6 +1773,9 @@ private:
 
     UndoManager *m_undoManager;
     std::optional<ClipInfo> m_clipboard;
+    // US-1203: the copied clip's linked audio and its offset from the copied
+    // clip's start; only a storyline-mode paste places them.
+    QVector<QPair<ClipInfo, double>> m_clipboardLinkedAudio;
     // Monotonic counter for generating new linkGroup IDs. Zero is reserved
     // for "unlinked" so the next usable id is 1.
     int m_nextLinkGroup = 1;
@@ -1750,6 +1797,9 @@ private:
         double origLeadInNext = -1.0; // -1 = no next clip
     };
     QVector<LinkedDragPartner> m_linkedDragPartners;
+    // US-1203: the current linked drag started on V1. In storyline mode a drag
+    // started elsewhere may not move a V1 partner (V1 changes by reorder only).
+    bool m_linkedDragSourceIsV1 = false;
 
     // US-705: every linkGroup member (source included) captured at the start
     // of a TrimLeft / TrimRight drag. Timeline applies one shared delta.

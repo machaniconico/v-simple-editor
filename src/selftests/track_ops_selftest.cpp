@@ -3,6 +3,7 @@
 #include "../AudioMixer.h"
 #include "../AudioBusRouting.h"
 #include "../ProjectFile.h"
+#include "../TrimOps.h"
 #include "../MainWindow.h"
 #include <QJsonArray>
 #include <memory>
@@ -21,7 +22,14 @@
 #include <QSignalSpy>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QDropEvent>
+#include <QJsonDocument>
+#include <QMimeData>
+#include <QMouseEvent>
+#include "SelftestRegistry.h"
+#include <cmath>
 #include <cstdio>
+#include <string>
 
 namespace {
 ClipInfo clip(int id)
@@ -167,6 +175,97 @@ bool layoutOrder(Timeline &t, bool audio)
         if (!headerFound) return false;
     }
     return true;
+}
+
+// US-1203 storyline-mode helpers. Clips are named; positions are compared by
+// name so a reorder, an evacuation or a missing clip shows in the layout text.
+ClipInfo storyClip(const QString &name, double durationSec, int linkGroup = 0,
+                   double leadInSec = 0.0)
+{
+    ClipInfo c;
+    c.filePath = QStringLiteral("track-ops-story-%1.mov").arg(name);
+    c.displayName = name;
+    c.duration = durationSec;
+    c.outPoint = durationSec;
+    c.linkGroup = linkGroup;
+    c.leadInSec = leadInSec;
+    return c;
+}
+
+const ClipInfo *storyFind(const TimelineTrack *track, const QString &name, double *startSec = nullptr)
+{
+    double cursor = 0.0;
+    for (const ClipInfo &c : track->clips()) {
+        const double start = cursor + c.leadInSec;
+        cursor = start + c.effectiveDuration();
+        if (c.displayName != name) continue;
+        if (startSec) *startSec = start;
+        return &c;
+    }
+    return nullptr;
+}
+
+// Start of the named clip on the track, -1 when it is not there.
+double storyStart(const TimelineTrack *track, const QString &name)
+{
+    double start = -1.0;
+    return storyFind(track, name, &start) ? start : -1.0;
+}
+
+bool storyAt(const TimelineTrack *track, const QString &name, double expectedSec)
+{
+    return std::abs(storyStart(track, name) - expectedSec) < 1e-6;
+}
+
+// "name@start ..." of every clip on the track, in order.
+std::string storyLayout(const TimelineTrack *track)
+{
+    QStringList parts;
+    double cursor = 0.0;
+    for (const ClipInfo &c : track->clips()) {
+        const double start = cursor + c.leadInSec;
+        cursor = start + c.effectiveDuration();
+        parts.append(QStringLiteral("%1@%2").arg(c.displayName).arg(start, 0, 'f', 2));
+    }
+    return parts.join(QLatin1Char(' ')).toStdString();
+}
+
+void storyBaseline(Timeline &t)
+{
+    // saveUndoState (not saveState) so the connection baseline is taken too.
+    t.undoManager()->clear();
+    t.saveUndoState(QStringLiteral("基準"));
+}
+
+// Moves src's clip srcIdx onto dest at timeSec through the cross-track drop path.
+bool storyClipDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest, double timeSec)
+{
+    QMimeData mime;
+    mime.setData(QStringLiteral("application/x-vse-clip"),
+                 QByteArray::number(srcIdx) + QByteArray(":0"));
+    QDropEvent event(QPointF(timeSec * dest->pixelsPerSecond(), 4.0), Qt::MoveAction, &mime,
+                     Qt::LeftButton, Qt::NoModifier);
+    event.ignore();
+    TimelineTrack::setSelftestDropSource(src);
+    static_cast<QObject *>(dest)->event(&event);
+    TimelineTrack::setSelftestDropSource(nullptr);
+    return event.isAccepted();
+}
+
+// Press on the clip body at fromSec, move to toSec and release (an in-track move drag).
+void storyDrag(TimelineTrack *track, double fromSec, double toSec)
+{
+    const double y = 10.0;
+    const QPointF press(fromSec * track->pixelsPerSecond(), y);
+    const QPointF to(toSec * track->pixelsPerSecond(), y);
+    QMouseEvent down(QEvent::MouseButtonPress, press, press, Qt::LeftButton, Qt::LeftButton,
+                     Qt::NoModifier);
+    QApplication::sendEvent(track, &down);
+    QMouseEvent move(QEvent::MouseMove, to, to, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(track, &move);
+    QMouseEvent up(QEvent::MouseButtonRelease, to, to, Qt::LeftButton, Qt::NoButton,
+                   Qt::NoModifier);
+    QApplication::sendEvent(track, &up);
 }
 }
 
@@ -578,6 +677,685 @@ int runTrackOpsSelftest()
             && t.currentState().projectHeight == 1920
             && t.currentState().projectExplicitOutput);
     }
+    // US-1203 G13: storyline mode, a clip dropped in the middle of V1 is an
+    // insert on V1 only: the V1 clips after it are pushed, the unconnected V2
+    // clip and the unlinked A1 clip stay. Control: mode off, the same drop
+    // (onto a V1 clip) is refused and V1 is unchanged. An all-track insert would
+    // move E / BGM; a missing mode branch fails the ON half.
+    {
+        bool ok = true;
+        for (const bool on : {true, false}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 4.0), storyClip("B", 4.0)},
+                {storyClip("D", 3.0), storyClip("E", 3.0, 0, 7.0)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("BGM", 5.0, 0, 9.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 0), 2.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const bool fixedOk = storyAt(t.trackAt(false, 1), "E", 10.0)
+                && storyAt(t.trackAt(true, 0), "BGM", 9.0);
+            const bool caseOk = on
+                ? accepted && v1->clipCount() == 3 && storyAt(v1, "A", 0.0) && storyAt(v1, "D", 4.0)
+                    && storyAt(v1, "B", 7.0) && fixedOk && t.undoManager()->saveSerial() == serial + 1
+                : !accepted && v1->clipCount() == 2 && storyAt(v1, "A", 0.0) && storyAt(v1, "B", 4.0)
+                    && storyAt(t.trackAt(false, 1), "D", 0.0) && fixedOk
+                    && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G13 %s: accepted=%d V1 [%s] V2 [%s] A1 [%s] (expect %s)\n",
+                         on ? "on" : "off", accepted, storyLayout(v1).c_str(),
+                         storyLayout(t.trackAt(false, 1)).c_str(), storyLayout(t.trackAt(true, 0)).c_str(),
+                         on ? "1, A@0 D@4 B@7, E@10, BGM@9" : "0, A@0 B@4, D@0 E@10, BGM@9");
+            ok = ok && caseOk;
+        }
+        gate(13, ok);
+    }
+    // US-1203 G14: storyline mode, Delete of a V1 clip closes V1 only: the
+    // linked A of the deleted clip goes with it, the linked A of the next clip
+    // and the V2 clip connected to it follow, the A1 BGM stays. Control: mode
+    // off, the same Delete leaves the gap (C, Ca and K stay).
+    {
+        bool ok = true;
+        for (const bool on : {true, false}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 3.0, 1), storyClip("B", 3.0, 2), storyClip("C", 4.0, 3)},
+                {storyClip("K", 2.0, 0, 7.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Aa", 3.0, 1), storyClip("Ba", 3.0, 2), storyClip("Ca", 4.0, 3),
+                 storyClip("BGM", 3.0, 0, 2.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            QString err;
+            const QString anchorUid = t.trackAt(false, 0)->clips().at(2).uid;
+            ok = t.connectClip(TrackKind::Video, 1, 0, anchorUid, &err) && ok;
+            t.trackAt(false, 0)->setSelectedClip(1);
+            const bool partnerSelected = t.trackAt(true, 0)->isClipSelected(1);
+            const auto serial = t.undoManager()->saveSerial();
+            t.deleteSelectedClip();
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const ClipInfo *k = storyFind(t.trackAt(false, 1), "K");
+            const double shift = on ? 3.0 : 0.0;
+            const bool caseOk = partnerSelected && v1->clipCount() == 2 && a1->clipCount() == 3
+                && storyStart(v1, "B") < 0 && storyStart(a1, "Ba") < 0
+                && storyAt(v1, "A", 0.0) && storyAt(v1, "C", 6.0 - shift)
+                && storyAt(a1, "Aa", 0.0) && storyAt(a1, "Ca", 6.0 - shift) && storyAt(a1, "BGM", 12.0)
+                && k && k->anchorUid == anchorUid && storyAt(t.trackAt(false, 1), "K", 7.0 - shift)
+                && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G14 %s: partnerSelected=%d V1 [%s] A1 [%s] V2 [%s] "
+                         "K connected=%d (expect %s)\n",
+                         on ? "on" : "off", partnerSelected, storyLayout(v1).c_str(),
+                         storyLayout(a1).c_str(), storyLayout(t.trackAt(false, 1)).c_str(),
+                         k && k->anchorUid == anchorUid,
+                         on ? "A@0 C@3, Aa@0 Ca@3 BGM@12, K@4 connected"
+                            : "A@0 C@6, Aa@0 Ca@6 BGM@12, K@7 connected");
+            ok = ok && caseOk;
+        }
+        gate(14, ok);
+    }
+    // US-1203 G15: storyline mode, dragging the V1 clip B (after a gap) to the
+    // timeline start reorders V1 to B A C with no gap, one undo point. Control:
+    // mode off, the same drag only moves B's leadIn to the clip before it and
+    // the gap stays after B (C does not move). ON, the linked A1 audio follows
+    // the reorder and B's linked Ba stays selected, so Delete removes B with Ba
+    // (a selection dropped by the follow would leave Ba behind).
+    {
+        bool ok = true;
+        for (const bool on : {true, false}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 4.0, 1), storyClip("B", 4.0, 2, 4.0), storyClip("C", 4.0, 3)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Aa", 4.0, 1), storyClip("Ba", 4.0, 2, 4.0), storyClip("Ca", 4.0, 3)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            v1->setSelectedClip(1);
+            const bool baSyncedBefore = a1->isClipSelected(1);
+            storyDrag(v1, 10.0, 1.0);
+            QStringList order;
+            for (const ClipInfo &c : v1->clips()) order.append(c.displayName);
+            const std::string v1Drag = storyLayout(v1), a1Drag = storyLayout(a1);
+            const int baIndex = [&]() {
+                for (int i = 0; i < a1->clipCount(); ++i)
+                    if (a1->clips().at(i).displayName == QStringLiteral("Ba")) return i;
+                return -1;
+            }();
+            const bool baSelected = baIndex >= 0 && a1->isClipSelected(baIndex);
+            const bool caseOk = on
+                ? order == QStringList{"B", "A", "C"} && storyAt(v1, "B", 0.0) && storyAt(v1, "A", 4.0)
+                    && storyAt(v1, "C", 8.0) && t.undoManager()->saveSerial() == serial + 1
+                    && storyAt(a1, "Ba", 0.0) && storyAt(a1, "Aa", 4.0) && storyAt(a1, "Ca", 8.0)
+                    && baSelected
+                : order == QStringList{"A", "B", "C"} && storyAt(v1, "A", 0.0) && storyAt(v1, "B", 4.0)
+                    && storyAt(v1, "C", 12.0) && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G15 %s: V1 [%s] A1 [%s] BaSyncedBefore=%d BaSelected=%d "
+                         "(expect %s)\n", on ? "on" : "off", v1Drag.c_str(), a1Drag.c_str(),
+                         baSyncedBefore, baSelected,
+                         on ? "B@0 A@4 C@8, Ba@0 Aa@4 Ca@8, 1, 1" : "A@0 B@4 C@12 (gap 8-12), 1");
+            bool deleteOk = true;
+            if (on) {
+                t.deleteSelectedClip();
+                deleteOk = storyStart(v1, "B") < 0 && storyStart(a1, "Ba") < 0 && v1->clipCount() == 2
+                    && a1->clipCount() == 2 && storyAt(v1, "A", 0.0) && storyAt(v1, "C", 4.0)
+                    && storyAt(a1, "Aa", 0.0) && storyAt(a1, "Ca", 4.0);
+                std::fprintf(stderr, "[track-ops] G15 on Delete: V1 [%s] A1 [%s] "
+                             "(expect A@0 C@4, Aa@0 Ca@4, no B / Ba)\n",
+                             storyLayout(v1).c_str(), storyLayout(a1).c_str());
+            }
+            ok = ok && caseOk && baSyncedBefore && deleteOk;
+        }
+        gate(15, ok);
+    }
+    // US-1203 G16: the toggle (Edit menu action_storyline_mode, checkable,
+    // default off) is saved as "storylineMode" only when on, restored by a
+    // load (and reset by loading a file without it), and is no undo state: the
+    // toggle adds no undo point and undoing an edit made after it keeps it on
+    // (a TimelineState-carried mode would go back to off).
+    {
+        MainWindow window;
+        auto *t = window.findChild<Timeline *>("mainTimeline");
+        auto *action = window.findChild<QAction *>(QStringLiteral("action_storyline_mode"));
+        bool ok = t && action && action->isCheckable() && !action->isChecked()
+            && action->text() == QStringLiteral("主ストーリーライン (マグネティック)")
+            && action->shortcut().isEmpty();
+        bool offKey = true, onKey = false, restored = false, reset = false, undoKeeps = false;
+        if (ok) {
+            ProjectData off;
+            window.populateProjectData(off);
+            const QString offJson = ProjectFile::toJsonString(off);
+            offKey = QJsonDocument::fromJson(offJson.toUtf8()).object().contains(QStringLiteral("storylineMode"));
+            action->trigger();
+            ProjectData onData;
+            window.populateProjectData(onData);
+            const QString onJson = ProjectFile::toJsonString(onData);
+            onKey = t->storylineMode()
+                && QJsonDocument::fromJson(onJson.toUtf8()).object().value(QStringLiteral("storylineMode")).toBool();
+            // Load into the same window with the mode off: restored; then a file
+            // without the key turns it off again.
+            action->trigger();
+            ProjectData loaded;
+            if (!t->storylineMode() && ProjectFile::fromJsonString(onJson, loaded)) {
+                window.applyLoadedProjectData(loaded, QString());
+                restored = loaded.storylineMode && t->storylineMode() && action->isChecked();
+                ProjectData loadedOff;
+                if (ProjectFile::fromJsonString(offJson, loadedOff)) {
+                    window.applyLoadedProjectData(loadedOff, QString());
+                    reset = !t->storylineMode() && !action->isChecked();
+                }
+            }
+            // Undo: an off baseline, the toggle, an edit, undo / redo.
+            const QVector<QVector<ClipInfo>> video{{storyClip("A", 4.0)}};
+            const QVector<QVector<ClipInfo>> audio{{}};
+            t->restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            storyBaseline(*t);
+            const auto serial = t->undoManager()->saveSerial();
+            action->trigger();
+            const bool toggleNoUndo = t->storylineMode() && t->undoManager()->saveSerial() == serial;
+            QString err;
+            const bool split = t->splitClipByIndex(false, 0, 0, 1.0, &err);
+            t->undo();
+            const bool afterUndo = t->storylineMode() && action->isChecked()
+                && t->trackAt(false, 0)->clipCount() == 1;
+            t->redo();
+            undoKeeps = toggleNoUndo && split && afterUndo && t->storylineMode()
+                && t->trackAt(false, 0)->clipCount() == 2;
+        }
+        std::fprintf(stderr, "[track-ops] G16: action=%d defaultKey=%d (expect 0) onKey=%d restored=%d "
+                     "resetByOffFile=%d undoKeepsMode=%d\n",
+                     ok, offKey, onKey, restored, reset, undoKeeps);
+        gate(16, ok && !offKey && onKey && restored && reset && undoKeeps);
+    }
+    // US-1203 G17 (3 items), storyline mode:
+    //   (a) a clip with linked audio dropped into V1: the audio lands on A1 at
+    //       the clip's start, the A1 BGM stays, the next clip's linked audio
+    //       (Qa) that would hit the BGM moves to A2 at its clip's new start;
+    //       with one audio track, a dropped V2 clip's audio does not block the
+    //       pushed Qa (nor Qa the dropped audio), and undo restores all three;
+    //   (b) Q (ripple trim in, applyTrimActive RippleIn) by d = 1 on V1: V1
+    //       closes, the linked audio keeps its trim and sync, the A1 BGM stays,
+    //       the V2 clip connected to the next clip moves -d. Control: mode off,
+    //       the BGM moves with A1 (the linked trim ripples A1 too); on a V1 with
+    //       a gap the linked audio follows the closed V1 (no sync error);
+    //   (b, V1 only) Q with only a V2 clip selected is refused: V1 and V2 stay
+    //       (a fallback to the selected track would ripple V2);
+    //   (c) a J cut (audio 1 s before its picture) copied and pasted after X:
+    //       the pasted audio starts 1 s before the pasted clip and the pushed J
+    //       pair keeps its -1 s (a re-derived offset of 0 would put either at
+    //       its clip's start);
+    //   (d) W (ripple trim out) on a gap-free V1: +1 moves the next V1 clip by
+    //       exactly +1 (no gap; trimops' own RippleOut moves it +2), -1 moves it
+    //       back by 1 (trimops refuses it with the next leadIn at 0), the A1 BGM
+    //       stays, the next clip's linked audio on A2 follows; +3 is refused
+    //       (it would push the BGM) and changes nothing; with Ya right after Xa
+    //       on A1, W+1 is accepted: Ya ripples with Y, the BGM stays (undo too);
+    //   (e) two linked audio clips sharing a uid on A1 / A2 both follow a V1
+    //       delete: the A1 one, blocked by an A1 clip, may not evacuate onto A2
+    //       while the A2 one is pending, so no track ends up holding the uid twice;
+    //       likewise a drop's audio taken off A2 keeps an A1 follower sharing its uid off A2;
+    //   (f) audio-origin linked drags: Ba dragged A1 -> A2 takes B off V1 and V1
+    //       closes (C@4, Ca follows); Ba dragged A2 -> A1 inserts B into V1 and
+    //       Ba lands at B's start; Ca dragged +2 s on A1 cannot move its V1
+    //       picture C. Each has a mode-off control (gap kept / B appended with Ba
+    //       out of sync / C and Ca moved).
+    {
+        bool aOk = false, bOk = false, bOffOk = false, bV1Ok = false, cOk = false, dOk = false,
+             eOk = false, fOk = false, fOffOk = false, fA1Ok = false, fA1OffOk = false,
+             fDragOk = false, fDragOffOk = false;
+        {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("P", 4.0, 1), storyClip("Q", 4.0, 2)},
+                {storyClip("N", 3.0, 3, 20.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Pa", 4.0, 1), storyClip("Qa", 4.0, 2), storyClip("BGM", 6.0)},
+                {storyClip("Na", 3.0, 3, 20.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 0), 2.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const TimelineTrack *a2 = t.trackAt(true, 1);
+            aOk = accepted && storyAt(v1, "P", 0.0) && storyAt(v1, "N", 4.0) && storyAt(v1, "Q", 7.0)
+                && storyAt(a1, "Pa", 0.0) && storyAt(a1, "Na", 4.0) && storyAt(a1, "BGM", 8.0)
+                && storyAt(a2, "Qa", 7.0) && t.trackAt(false, 1)->clipCount() == 0
+                && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17a: accepted=%d V1 [%s] A1 [%s] A2 [%s] "
+                         "(expect P@0 N@4 Q@7, Pa@0 Na@4 BGM@8, Qa@7)\n", accepted,
+                         storyLayout(v1).c_str(), storyLayout(a1).c_str(), storyLayout(a2).c_str());
+        }
+        {
+            // One audio track: the dropped clip's audio (Na@10) must not block Qa
+            // (7-11), and Qa must not block Na (4-7); both fit on A1.
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("P", 4.0, 1), storyClip("Q", 4.0, 2)},
+                {storyClip("N", 3.0, 3, 10.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Pa", 4.0, 1), storyClip("Qa", 4.0, 2), storyClip("Na", 3.0, 3, 2.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 0), 2.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *v2 = t.trackAt(false, 1);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const auto serialAfter = t.undoManager()->saveSerial();
+            const bool dropOk = accepted && storyAt(v1, "P", 0.0) && storyAt(v1, "N", 4.0)
+                && storyAt(v1, "Q", 7.0) && storyAt(a1, "Pa", 0.0) && storyAt(a1, "Na", 4.0)
+                && storyAt(a1, "Qa", 7.0) && a1->clipCount() == 3 && v2->clipCount() == 0
+                && serialAfter == serial + 1;
+            const std::string v1Drop = storyLayout(v1), v2Drop = storyLayout(v2), a1Drop = storyLayout(a1);
+            const int audioTracks = t.audioTrackCount();
+            t.undo();
+            v1 = t.trackAt(false, 0);
+            v2 = t.trackAt(false, 1);
+            a1 = t.trackAt(true, 0);
+            const bool undoOk = storyAt(v1, "P", 0.0) && storyAt(v1, "Q", 4.0) && v1->clipCount() == 2
+                && storyAt(v2, "N", 10.0) && storyAt(a1, "Pa", 0.0) && storyAt(a1, "Qa", 4.0)
+                && storyAt(a1, "Na", 10.0) && a1->clipCount() == 3;
+            std::fprintf(stderr, "[track-ops] G17a one A track: accepted=%d audioTracks=%d serial +%d "
+                         "V1 [%s] V2 [%s] A1 [%s] (expect P@0 N@4 Q@7, empty, Pa@0 Na@4 Qa@7, +1); "
+                         "undo V1 [%s] V2 [%s] A1 [%s] (expect P@0 Q@4, N@10, Pa@0 Qa@4 Na@10)\n",
+                         accepted, audioTracks, int(serialAfter - serial), v1Drop.c_str(),
+                         v2Drop.c_str(), a1Drop.c_str(), storyLayout(v1).c_str(),
+                         storyLayout(v2).c_str(), storyLayout(a1).c_str());
+            aOk = aOk && dropOk && undoOk;
+        }
+        for (const bool on : {true, false}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("X", 4.0, 1), storyClip("Y", 4.0, 2)},
+                {storyClip("K", 2.0, 0, 5.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Xa", 4.0, 1), storyClip("Ya", 4.0, 2), storyClip("BGM", 3.0, 0, 1.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            QString err;
+            const QString anchorUid = t.trackAt(false, 0)->clips().at(1).uid;
+            bool ok = t.connectClip(TrackKind::Video, 1, 0, anchorUid, &err);
+            t.trackAt(false, 0)->setSelectedClip(0);
+            ok = t.applyTrimActive(trimops::TrimType::RippleIn, 1.0, &err) && ok;
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const ClipInfo *x = storyFind(v1, "X");
+            const ClipInfo *xa = storyFind(a1, "Xa");
+            ok = ok && x && xa && std::abs(x->inPoint - 1.0) < 1e-6 && std::abs(xa->inPoint - 1.0) < 1e-6
+                && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 3.0) && storyAt(a1, "Xa", 0.0)
+                && storyAt(a1, "Ya", 3.0) && storyAt(t.trackAt(false, 1), "K", 4.0)
+                && storyAt(a1, "BGM", on ? 9.0 : 8.0);
+            std::fprintf(stderr, "[track-ops] G17b %s: err='%s' V1 [%s] A1 [%s] V2 [%s] "
+                         "(expect X@0 Y@3, Xa@0 Ya@3 BGM@%s, K@4)\n", on ? "on" : "off",
+                         err.toUtf8().constData(), storyLayout(v1).c_str(), storyLayout(a1).c_str(),
+                         storyLayout(t.trackAt(false, 1)).c_str(), on ? "9" : "8");
+            (on ? bOk : bOffOk) = ok;
+        }
+        {
+            // A V1 that already has a gap (turning the mode on closes none): Q
+            // closes it with the trim, and Ya follows Y to its final start (a
+            // target of its old start + the trim alone would leave Ya at 7).
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("X", 4.0, 1), storyClip("Y", 4.0, 2, 4.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Xa", 4.0, 1), storyClip("Ya", 4.0, 2, 4.0), storyClip("BGM", 3.0, 0, 1.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(0);
+            QString err;
+            const auto serial = t.undoManager()->saveSerial();
+            const bool trimmed = t.applyTrimActive(trimops::TrimType::RippleIn, 1.0, &err);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const bool gapOk = trimmed && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 3.0)
+                && storyAt(a1, "Xa", 0.0) && storyAt(a1, "Ya", 3.0) && storyAt(a1, "BGM", 13.0)
+                && a1->clipCount() == 3 && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17b gapped V1: ok=%d err='%s' V1 [%s] A1 [%s] "
+                         "(expect X@0 Y@3, Xa@0 Ya@3 BGM@13)\n", trimmed, err.toUtf8().constData(),
+                         storyLayout(v1).c_str(), storyLayout(a1).c_str());
+            bOk = bOk && gapOk;
+        }
+        {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("X", 4.0, 1), storyClip("Y", 4.0, 2)},
+                {storyClip("K", 2.0, 0, 5.0)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1), storyClip("Ya", 4.0, 2)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 1)->setSelectedClip(0);
+            t.trackAt(false, 0)->setSelectedClip(-1);
+            const std::string v1Before = storyLayout(t.trackAt(false, 0));
+            const ClipInfo *k = storyFind(t.trackAt(false, 1), "K");
+            const double kInBefore = k ? k->inPoint : -1.0;
+            const auto serial = t.undoManager()->saveSerial();
+            QString err;
+            const bool trimmed = t.applyTrimActive(trimops::TrimType::RippleIn, 1.0, &err);
+            k = storyFind(t.trackAt(false, 1), "K");
+            const ClipInfo *x = storyFind(t.trackAt(false, 0), "X");
+            bV1Ok = !trimmed && !err.isEmpty() && k && std::abs(k->inPoint - kInBefore) < 1e-6
+                && storyAt(t.trackAt(false, 1), "K", 5.0) && x && std::abs(x->inPoint) < 1e-6
+                && storyLayout(t.trackAt(false, 0)) == v1Before
+                && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G17b V1 only: trimmed=%d err='%s' V1 [%s] (before [%s]) "
+                         "V2 [%s] K.in=%.2f (expect 0, error, V1 unchanged, K@5 in 0)\n", trimmed,
+                         err.toUtf8().constData(), storyLayout(t.trackAt(false, 0)).c_str(),
+                         v1Before.c_str(), storyLayout(t.trackAt(false, 1)).c_str(), k ? k->inPoint : -1.0);
+        }
+        {
+            Timeline t;
+            ClipInfo x = storyClip("X", 8.0, 1);
+            x.outPoint = 4.0;
+            ClipInfo xa = storyClip("Xa", 8.0, 1);
+            xa.outPoint = 4.0;
+            const QVector<QVector<ClipInfo>> video{{x, storyClip("Y", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {xa, storyClip("BGM", 3.0, 0, 2.0)}, {storyClip("Ya", 4.0, 2, 4.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const TimelineTrack *a2 = t.trackAt(true, 1);
+            const auto yLeadIn = [&]() {
+                const ClipInfo *y = storyFind(v1, "Y");
+                return y ? y->leadInSec : -1.0;
+            };
+            QString errExtend, errShorten, errPush;
+            t.trackAt(false, 0)->setSelectedClip(0);
+            auto serial = t.undoManager()->saveSerial();
+            const bool extended = t.applyTrimActive(trimops::TrimType::RippleOut, 1.0, &errExtend);
+            const bool extendOk = extended && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 5.0)
+                && std::abs(yLeadIn()) < 1e-6 && storyAt(a1, "Xa", 0.0) && storyAt(a1, "BGM", 6.0)
+                && storyAt(a2, "Ya", 5.0) && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17d W+1: ok=%d err='%s' V1 [%s] Y.leadIn=%.2f A1 [%s] A2 [%s] "
+                         "(expect X@0 Y@5 leadIn 0, Xa@0 BGM@6, Ya@5)\n", extended,
+                         errExtend.toUtf8().constData(), storyLayout(v1).c_str(), yLeadIn(),
+                         storyLayout(a1).c_str(), storyLayout(a2).c_str());
+            t.trackAt(false, 0)->setSelectedClip(0);
+            serial = t.undoManager()->saveSerial();
+            const bool shortened = t.applyTrimActive(trimops::TrimType::RippleOut, -1.0, &errShorten);
+            const bool shortenOk = shortened && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 4.0)
+                && std::abs(yLeadIn()) < 1e-6 && storyAt(a1, "Xa", 0.0) && storyAt(a1, "BGM", 6.0)
+                && storyAt(a2, "Ya", 4.0) && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17d W-1: ok=%d err='%s' V1 [%s] Y.leadIn=%.2f A1 [%s] A2 [%s] "
+                         "(expect X@0 Y@4 leadIn 0, Xa@0 BGM@6, Ya@4)\n", shortened,
+                         errShorten.toUtf8().constData(), storyLayout(v1).c_str(), yLeadIn(),
+                         storyLayout(a1).c_str(), storyLayout(a2).c_str());
+            t.trackAt(false, 0)->setSelectedClip(0);
+            serial = t.undoManager()->saveSerial();
+            const std::string v1Before = storyLayout(v1), a1Before = storyLayout(a1);
+            const bool pushed = t.applyTrimActive(trimops::TrimType::RippleOut, 3.0, &errPush);
+            const ClipInfo *xNow = storyFind(v1, "X");
+            const ClipInfo *xaNow = storyFind(a1, "Xa");
+            const bool pushOk = !pushed && !errPush.isEmpty() && storyLayout(v1) == v1Before
+                && storyLayout(a1) == a1Before && xNow && std::abs(xNow->outPoint - 4.0) < 1e-6
+                && xaNow && std::abs(xaNow->outPoint - 4.0) < 1e-6 && storyAt(a1, "BGM", 6.0)
+                && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G17d W+3: ok=%d err='%s' V1 [%s] A1 [%s] "
+                         "(expect refused, V1 / A1 unchanged)\n", pushed, errPush.toUtf8().constData(),
+                         storyLayout(v1).c_str(), storyLayout(a1).c_str());
+            dOk = extendOk && shortenOk && pushOk;
+        }
+        {
+            // The contiguous linked layout of an imported V+A pair: Ya ripples with
+            // Y (it is not pushed), so W+1 is accepted and only the BGM is held.
+            Timeline t;
+            ClipInfo x = storyClip("X", 8.0, 1);
+            x.outPoint = 4.0;
+            ClipInfo xa = storyClip("Xa", 8.0, 1);
+            xa.outPoint = 4.0;
+            const QVector<QVector<ClipInfo>> video{{x, storyClip("Y", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {xa, storyClip("Ya", 4.0, 2), storyClip("BGM", 3.0, 0, 2.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(0);
+            const auto serial = t.undoManager()->saveSerial();
+            QString err;
+            const bool extended = t.applyTrimActive(trimops::TrimType::RippleOut, 1.0, &err);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const ClipInfo *y = storyFind(v1, "Y");
+            const double yLeadIn = y ? y->leadInSec : -1.0;
+            const auto serialAfter = t.undoManager()->saveSerial();
+            const bool extendOk = extended && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 5.0)
+                && std::abs(yLeadIn) < 1e-6 && storyAt(a1, "Xa", 0.0) && storyAt(a1, "Ya", 5.0)
+                && storyAt(a1, "BGM", 10.0) && a1->clipCount() == 3 && serialAfter == serial + 1;
+            const std::string v1Trim = storyLayout(v1), a1Trim = storyLayout(a1);
+            t.undo();
+            v1 = t.trackAt(false, 0);
+            a1 = t.trackAt(true, 0);
+            const bool undoOk = storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 4.0) && storyAt(a1, "Xa", 0.0)
+                && storyAt(a1, "Ya", 4.0) && storyAt(a1, "BGM", 10.0) && a1->clipCount() == 3;
+            std::fprintf(stderr, "[track-ops] G17d W+1 linked A1: ok=%d err='%s' serial +%d V1 [%s] "
+                         "Y.leadIn=%.2f A1 [%s] (expect X@0 Y@5 leadIn 0, Xa@0 Ya@5 BGM@10, +1); "
+                         "undo V1 [%s] A1 [%s] (expect X@0 Y@4, Xa@0 Ya@4 BGM@10)\n", extended,
+                         err.toUtf8().constData(), int(serialAfter - serial), v1Trim.c_str(), yLeadIn,
+                         a1Trim.c_str(), storyLayout(v1).c_str(), storyLayout(a1).c_str());
+            dOk = dOk && extendOk && undoOk;
+        }
+        {
+            Timeline t;
+            ClipInfo pa = storyClip("Pa", 4.0, 1, 1.0);
+            pa.uid = QStringLiteral("track-ops-shared-uid");
+            ClipInfo qa = storyClip("Qa", 4.0, 2, 6.0);
+            qa.uid = pa.uid;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("Z", 2.0), storyClip("P", 4.0, 1), storyClip("Q", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("BGM", 1.0), pa}, {qa}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(0);
+            t.deleteSelectedClip();
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const TimelineTrack *a2 = t.trackAt(true, 1);
+            const auto uidCount = [&](const TimelineTrack *track) {
+                int n = 0;
+                for (const ClipInfo &c : track->clips())
+                    n += c.uid == pa.uid ? 1 : 0;
+                return n;
+            };
+            eOk = storyAt(v1, "P", 0.0) && storyAt(v1, "Q", 4.0) && storyAt(a1, "BGM", 0.0)
+                && storyAt(a1, "Pa", 2.0) && storyAt(a2, "Qa", 4.0) && uidCount(a1) == 1
+                && uidCount(a2) == 1;
+            std::fprintf(stderr, "[track-ops] G17e: V1 [%s] A1 [%s] A2 [%s] uid on A1=%d A2=%d "
+                         "(expect P@0 Q@4, BGM@0 Pa@2, Qa@4, 1 / 1)\n", storyLayout(v1).c_str(),
+                         storyLayout(a1).c_str(), storyLayout(a2).c_str(), uidCount(a1), uidCount(a2));
+        }
+        {
+            // The same in a storyline drop: N's audio Na (A2) shares its uid with
+            // Qa (A1). Qa, pushed into the BGM, may not evacuate onto A2 while Na
+            // is out, so neither Na's fallback nor Qa ends up doubling the uid.
+            Timeline t;
+            ClipInfo qa = storyClip("Qa", 4.0, 2);
+            qa.uid = QStringLiteral("track-ops-drop-shared-uid");
+            ClipInfo na = storyClip("Na", 5.0, 3, 20.0);
+            na.uid = qa.uid;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("P", 4.0, 1), storyClip("Q", 4.0, 2)},
+                {storyClip("N", 5.0, 3, 20.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Pa", 4.0, 1), qa, storyClip("BGM", 6.0)}, {na}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 0), 2.0);
+            int maxUidPerTrack = 0, audioClips = 0;
+            QStringList layouts;
+            for (int a = 0; a < t.audioTrackCount(); ++a) {
+                const TimelineTrack *track = t.trackAt(true, a);
+                QHash<QString, int> uids;
+                for (const ClipInfo &c : track->clips())
+                    maxUidPerTrack = qMax(maxUidPerTrack, ++uids[c.uid]);
+                audioClips += track->clipCount();
+                layouts.append(QString::fromStdString(storyLayout(track)));
+            }
+            const bool dropUidOk = accepted && storyAt(t.trackAt(false, 0), "N", 4.0)
+                && maxUidPerTrack == 1 && audioClips == 4;
+            std::fprintf(stderr, "[track-ops] G17e drop: accepted=%d V1 [%s] A [%s] maxUidPerTrack=%d "
+                         "audioClips=%d (expect 1, N@4, 1, 4)\n", accepted,
+                         storyLayout(t.trackAt(false, 0)).c_str(),
+                         layouts.join(QStringLiteral(" | ")).toUtf8().constData(), maxUidPerTrack, audioClips);
+            eOk = eOk && dropUidOk;
+        }
+        {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1), storyClip("J", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 3.0, 1), storyClip("Ja", 4.0, 2)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            t.copySelectedClip();
+            t.trackAt(false, 0)->setSelectedClip(0);
+            const auto serial = t.undoManager()->saveSerial();
+            t.pasteClip();
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            // The pasted pair carries a new link group; the pushed J pair keeps group 2.
+            double pastedV = -1.0, pastedA = -1.0, movedJ = -1.0, movedJa = -1.0;
+            int pastedVGroup = -1, pastedAGroup = -2;
+            for (const TimelineTrack *track : {v1, a1}) {
+                double cursor = 0.0;
+                for (const ClipInfo &c : track->clips()) {
+                    const double start = cursor + c.leadInSec;
+                    cursor = start + c.effectiveDuration();
+                    if (!c.displayName.startsWith(QLatin1Char('J'))) continue;
+                    const bool audioTrack = track == a1;
+                    if (c.linkGroup == 2) {
+                        (audioTrack ? movedJa : movedJ) = start;
+                    } else {
+                        (audioTrack ? pastedA : pastedV) = start;
+                        (audioTrack ? pastedAGroup : pastedVGroup) = c.linkGroup;
+                    }
+                }
+            }
+            cOk = v1->clipCount() == 3 && a1->clipCount() == 3 && pastedVGroup > 0
+                && pastedVGroup == pastedAGroup && pastedVGroup != 2
+                && std::abs(pastedV - 4.0) < 1e-6 && std::abs(pastedA - 3.0) < 1e-6
+                && std::abs(movedJ - 8.0) < 1e-6 && std::abs(movedJa - 7.0) < 1e-6
+                && storyAt(a1, "Xa", 0.0) && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17c: V1 [%s] A1 [%s] pasted V@%.2f A@%.2f (expect 4 / 3), "
+                         "pushed J@%.2f Ja@%.2f (expect 8 / 7)\n", storyLayout(v1).c_str(),
+                         storyLayout(a1).c_str(), pastedV, pastedA, movedJ, movedJa);
+        }
+        for (const bool on : {true, false}) {
+            // (f) Ba dragged from A1 to A2 at 4: its picture B leaves V1 for V2.
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 4.0, 1), storyClip("B", 4.0, 2), storyClip("C", 4.0, 3)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Aa", 4.0, 1), storyClip("Ba", 4.0, 2), storyClip("Ca", 4.0, 3)}, {}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(true, 0), 1, t.trackAt(true, 1), 4.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *v2 = t.videoTrackCount() > 1 ? t.trackAt(false, 1) : nullptr;
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            double maxLeadIn = 0.0;
+            for (const ClipInfo &c : v1->clips()) maxLeadIn = qMax(maxLeadIn, c.leadInSec);
+            const double cSec = on ? 4.0 : 8.0;
+            const bool caseOk = accepted && v1->clipCount() == 2 && storyAt(v1, "A", 0.0)
+                && storyAt(v1, "C", cSec) && (on ? maxLeadIn < 1e-6 : maxLeadIn > 1.0)
+                && v2 && storyAt(v2, "B", 4.0) && storyAt(t.trackAt(true, 1), "Ba", 4.0)
+                && storyAt(a1, "Aa", 0.0) && storyAt(a1, "Ca", cSec)
+                && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17f %s: accepted=%d V1 [%s] maxLeadIn=%.2f V2 [%s] A1 [%s] "
+                         "A2 [%s] (expect %s)\n", on ? "on" : "off", accepted, storyLayout(v1).c_str(),
+                         maxLeadIn, v2 ? storyLayout(v2).c_str() : "-", storyLayout(a1).c_str(),
+                         storyLayout(t.trackAt(true, 1)).c_str(),
+                         on ? "A@0 C@4, 0, B@4, Aa@0 Ca@4, Ba@4" : "A@0 C@8 (gap 4-8), 4, B@4, Aa@0 Ca@8, Ba@4");
+            (on ? fOk : fOffOk) = caseOk;
+        }
+        for (const bool on : {true, false}) {
+            // (f, onto A1) Ba dragged from A2 to A1 at 1 (inside A, which has no
+            // audio): B goes into V1 at the insert point after A (4), C and its Ca
+            // move +2, and Ba lands at B's start (OFF: B appended at 8, Ba at 1).
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 4.0), storyClip("C", 4.0, 3)}, {storyClip("B", 2.0, 2, 20.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Ca", 4.0, 3, 4.0)}, {storyClip("Ba", 2.0, 2, 20.0)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(true, 1), 0, t.trackAt(true, 0), 1.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            double maxLeadIn = 0.0;
+            for (const ClipInfo &c : v1->clips()) maxLeadIn = qMax(maxLeadIn, c.leadInSec);
+            const ClipInfo *ba = storyFind(a1, "Ba");
+            const bool layoutOk = on
+                ? storyAt(v1, "A", 0.0) && storyAt(v1, "B", 4.0) && storyAt(v1, "C", 6.0)
+                    && maxLeadIn < 1e-6 && storyAt(a1, "Ba", 4.0) && storyAt(a1, "Ca", 6.0)
+                : storyAt(v1, "A", 0.0) && storyAt(v1, "C", 4.0) && storyAt(v1, "B", 8.0)
+                    && storyAt(a1, "Ba", 1.0) && storyAt(a1, "Ca", 4.0);
+            const bool caseOk = accepted && layoutOk && v1->clipCount() == 3 && a1->clipCount() == 2
+                && t.trackAt(false, 1)->clipCount() == 0 && t.trackAt(true, 1)->clipCount() == 0
+                && ba && ba->anchorUid.isEmpty() && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G17f onto A1 %s: accepted=%d V1 [%s] maxLeadIn=%.2f A1 [%s] "
+                         "Ba connected=%d (expect %s)\n", on ? "on" : "off", accepted,
+                         storyLayout(v1).c_str(), maxLeadIn, storyLayout(a1).c_str(),
+                         ba && !ba->anchorUid.isEmpty(),
+                         on ? "A@0 B@4 C@6, 0, Ba@4 Ca@6, 0" : "A@0 C@4 B@8, Ba@1 Ca@4, 0");
+            (on ? fA1Ok : fA1OffOk) = caseOk;
+        }
+        for (const bool on : {true, false}) {
+            // (f, same track) Ca dragged +2 s on A1: ON its V1 picture C (the last
+            // V1 clip) stays at leadIn 0 and nothing moves; OFF C and Ca move to 10.
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("A", 4.0, 1), storyClip("B", 4.0, 2), storyClip("C", 4.0, 3)}};
+            const QVector<QVector<ClipInfo>> audio{
+                {storyClip("Aa", 4.0, 1), storyClip("Ba", 4.0, 2), storyClip("Ca", 4.0, 3)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            storyDrag(t.trackAt(true, 0), 9.0, 11.0);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const ClipInfo *c = storyFind(v1, "C");
+            const double cSec = on ? 8.0 : 10.0;
+            const bool caseOk = c && std::abs(c->leadInSec - (cSec - 8.0)) < 1e-6
+                && storyAt(v1, "C", cSec) && storyAt(a1, "Ca", cSec)
+                && t.undoManager()->saveSerial() == serial + (on ? 0 : 1);
+            std::fprintf(stderr, "[track-ops] G17f drag Ca %s: V1 [%s] C.leadIn=%.2f A1 [%s] serial +%d "
+                         "(expect %s)\n", on ? "on" : "off", storyLayout(v1).c_str(),
+                         c ? c->leadInSec : -1.0, storyLayout(a1).c_str(),
+                         int(t.undoManager()->saveSerial() - serial),
+                         on ? "C@8 leadIn 0, Ca@8, +0" : "C@10 leadIn 2, Ca@10, +1");
+            (on ? fDragOk : fDragOffOk) = caseOk;
+        }
+        std::fprintf(stderr, "[track-ops] G17 items: a=%d b=%d bOffControl=%d bV1Only=%d c=%d d=%d e=%d "
+                     "f=%d fOffControl=%d fOntoA1=%d fOntoA1OffControl=%d fDrag=%d fDragOffControl=%d\n",
+                     aOk, bOk, bOffOk, bV1Ok, cOk, dOk, eOk, fOk, fOffOk, fA1Ok, fA1OffOk, fDragOk,
+                     fDragOffOk);
+        gate(17, aOk && bOk && bOffOk && bV1Ok && cOk && dOk && eOk && fOk && fOffOk && fA1Ok
+                 && fA1OffOk && fDragOk && fDragOffOk);
+    }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

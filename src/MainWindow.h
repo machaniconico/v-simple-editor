@@ -265,6 +265,7 @@ class MainWindow : public QMainWindow
     friend int runRenderNotifySelftest();
     friend int runClipEqSelftest();
     friend int runMixerDockSelftest();
+    friend int runTrackOpsSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -968,6 +969,7 @@ private:
     QAction *m_rippleDeleteAction;
     QAction *m_connectToStorylineAction = nullptr;
     QAction *m_disconnectFromStorylineAction = nullptr;
+    QAction *m_storylineModeAction = nullptr;  // US-1203: checkable, default off
     QAction *m_copyAction;
     QAction *m_copyCurrentFrameAction = nullptr;
     QAction *m_pasteAction;

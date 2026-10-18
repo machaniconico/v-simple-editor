@@ -235,6 +235,9 @@ struct ProjectData {
     double markIn = -1.0;
     double markOut = -1.0;
     int zoomLevel = 10;
+    // US-1203: magnetic primary-storyline mode; written as "storylineMode"
+    // only when true (older files and builds read it as off).
+    bool storylineMode = false;
 
     // Audio mixer state
     QVector<TrackEqState> trackEqStates;
