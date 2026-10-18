@@ -1466,6 +1466,48 @@ int runTrackOpsSelftest()
         }
         gate(20, aOk && bOk);
     }
+    // C-04-base G21: the non-storyline paste never writes into a locked V1/A1.
+    // Cases: V1 locked (storyline off), A1 locked (storyline off), V1 locked
+    // with storyline on (falls into the same path). The locked track's clips
+    // (ProjectFile JSON) and the other track stay byte-equal; no undo state.
+    {
+        const auto clipsJson = [](const TimelineTrack *track) {
+            ProjectData data;
+            data.audioTracks = {track->clips()};
+            return ProjectFile::toJsonString(data);
+        };
+        bool ok = true;
+        struct Case { const char *name; bool lockV1; bool storyline; };
+        for (const Case c : {Case{"V1 locked, storyline off", true, false},
+                             Case{"A1 locked, storyline off", false, false},
+                             Case{"V1 locked, storyline on", true, true}}) {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1), storyClip("J", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1), storyClip("Ja", 4.0, 2)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(c.storyline);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            t.copySelectedClip();
+            t.trackAt(false, 0)->setSelectedClip(0);
+            t.trackAt(true, 0)->setSelectedClip(0);
+            t.trackAt(false, 0)->setLocked(c.lockV1);
+            t.trackAt(true, 0)->setLocked(!c.lockV1);
+            const QString v1Before = clipsJson(t.trackAt(false, 0));
+            const QString a1Before = clipsJson(t.trackAt(true, 0));
+            const auto serial = t.undoManager()->saveSerial();
+            t.pasteClip();
+            const bool v1Same = clipsJson(t.trackAt(false, 0)) == v1Before;
+            const bool a1Same = clipsJson(t.trackAt(true, 0)) == a1Before;
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            const bool caseOk = v1Same && a1Same && serialDelta == 0;
+            std::fprintf(stderr, "[track-ops] G21 %s: V1 [%s] A1 [%s] V1 byte-equal=%d A1 byte-equal=%d "
+                         "serial +%d (expect unchanged, +0)\n", c.name, storyLayout(t.trackAt(false, 0)).c_str(),
+                         storyLayout(t.trackAt(true, 0)).c_str(), v1Same, a1Same, serialDelta);
+            ok = ok && caseOk;
+        }
+        gate(21, ok);
+    }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

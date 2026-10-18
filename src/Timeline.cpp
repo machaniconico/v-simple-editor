@@ -8925,6 +8925,12 @@ void Timeline::pasteClip()
         updateInfoLabel();
         return;
     }
+    // C-04-base: the pasted V/A pair is written to both V1 and A1, so a locked
+    // either one refuses the whole paste (also reached in storyline mode when V1 is locked).
+    if (m_videoTrack->isLocked() || m_audioTrack->isLocked()) {
+        emit statusMessageRequested(QStringLiteral("ロック中のトラックには貼り付けできません。"), 3000);
+        return;
+    }
     int insertAt = m_videoTrack->selectedClip() + 1;
     if (insertAt <= 0) insertAt = m_videoTrack->clipCount();
     const int maxIndex = qMin(m_videoTrack->clipCount(), m_audioTrack->clipCount());
