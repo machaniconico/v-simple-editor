@@ -9,8 +9,10 @@
 #include <QJsonObject>
 #include <QPair>
 #include <QTemporaryDir>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 
 int runFcpxmlImportSelftest()
 {
@@ -111,9 +113,16 @@ int runFcpxmlImportSelftest()
     bool warnings = unsupported.error.isEmpty() && unsupported.videoTracks[0].size() == 2
         && unsupported.unresolvedFiles == 1 && unsupported.resolvedFiles == 0
         && !QFileInfo::exists(unsupported.videoTracks[0][0].filePath);
-    for (const QString &tag : {QStringLiteral("ref-clip"),
-            QStringLiteral("mc-clip"), QStringLiteral("filter-video"), QStringLiteral("adjust-color"), QStringLiteral("media")})
+    for (const QString &tag : {
+            QStringLiteral("mc-clip"), QStringLiteral("filter-video"), QStringLiteral("adjust-color")})
         warnings &= unsupported.warnings.join('\n').contains(QStringLiteral(": %1 (").arg(tag));
+    // Old pin: "ref-clip" and "media" skip warnings. New: neither; the empty
+    // media sequence is reported as an unreadable compound clip instead.
+    const bool refClipSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": ref-clip ("));
+    const bool mediaSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": media ("));
+    const int compoundWarning = int(unsupported.warnings.count(
+        QStringLiteral("compound clip を読み込めないため読み飛ばしました: compound (読み込めるシーケンスがありません。)")));
+    warnings &= !refClipSkipWarning && !mediaSkipWarning && compoundWarning == 1 && unsupported.sequences.isEmpty();
     // Old pin: a "transition" skip warning. New: no skip warning and a head FadeIn on the first clip.
     const bool transitionSkipWarning = unsupported.warnings.join('\n').contains(QStringLiteral(": transition ("));
     const bool headFade = unsupported.videoTracks[0][0].leadIn.type == TransitionType::FadeIn
@@ -124,10 +133,14 @@ int runFcpxmlImportSelftest()
         && !fcpx::xml::parseXml(QStringLiteral("<unrelated/>"), dir.path()).error.isEmpty()
         && !fcpx::xml::readFcpxml(dir.filePath(QStringLiteral("absent.fcpxml"))).error.isEmpty();
     std::fprintf(stderr, "G4 unsupportedError=%s importedClips=%d resolved=%d unresolved=%d "
-        "warningCount=%d transitionSkipWarning=%d(old expected 1, new expected 0) headFade=%d allChecks=%d\n",
+        "warningCount=%d transitionSkipWarning=%d(old expected 1, new expected 0) headFade=%d "
+        "refClipSkipWarning=%d(old expected 1, new expected 0) mediaSkipWarning=%d(old expected 1, new expected 0) "
+        "compoundWarning=%d(old expected 0, new expected 1) sequences=%d allChecks=%d\n",
         unsupported.error.toUtf8().constData(),
         int(unsupported.videoTracks[0].size()), unsupported.resolvedFiles, unsupported.unresolvedFiles,
-        int(unsupported.warnings.size()), int(transitionSkipWarning), int(headFade), int(warnings));
+        int(unsupported.warnings.size()), int(transitionSkipWarning), int(headFade),
+        int(refClipSkipWarning), int(mediaSkipWarning), compoundWarning, int(unsupported.sequences.size()),
+        int(warnings));
     gate(4, warnings);
 
     Timeline timeline;
@@ -949,6 +962,489 @@ int runFcpxmlImportSelftest()
         && slide.error.isEmpty() && slideA && slideB && isDissolve(slideA->trailOut, 1.0)
         && isDissolve(slideB->leadIn, 1.0) && slide.warnings.count(slideWarning) == 1
         && continuous.warnings.filter(QStringLiteral("縮め")).isEmpty());
+
+    // G25-G28: resources/media + ref-clip become nested sequences, and
+    // applyImport adds them under ids that Timeline::addSequence keeps unique.
+    auto findSequence = [](const QVector<TimelineSequence> &sequences, const QString &id) -> const TimelineSequence * {
+        for (const auto &sequence : sequences)
+            if (sequence.id == id) return &sequence;
+        return nullptr;
+    };
+    auto clipNames = [](const TimelineSequence *sequence) {
+        QStringList names;
+        if (sequence)
+            for (const auto &track : sequence->videoTracks)
+                for (const auto &clip : track) names.append(clip.displayName + QLatin1Char('>') + clip.sequenceRefId);
+        return names.join(QLatin1Char(',')).toUtf8();
+    };
+    const QString compoundMedia = QStringLiteral(
+        "<media id=\"cmp\" name=\"複合 クリップ\"><sequence tcStart=\"0s\"><spine>"
+        "<asset-clip ref=\"a\" name=\"inner1\" duration=\"2s\"/>"
+        "<asset-clip ref=\"a\" name=\"inner2\" offset=\"2s\" duration=\"3s\"/>"
+        "</spine></sequence></media>");
+    const QString compoundSpine = QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"lead\" duration=\"1s\"/>"
+        "<ref-clip ref=\"cmp\" name=\"compound\" offset=\"1s\" start=\"1s\" duration=\"3s\"/>");
+    const auto single = fcpx::xml::parseXml(document(compoundSpine, compoundMedia), dir.path());
+    const ClipInfo *singleRef = namedClip(single.videoTracks, QStringLiteral("compound"));
+    const TimelineSequence *singleNested = single.sequences.size() == 1 ? &single.sequences[0] : nullptr;
+    const bool singleParsed = single.error.isEmpty() && singleNested && singleRef
+        && singleNested->id == QStringLiteral("cmp") && singleNested->name == QStringLiteral("複合 クリップ")
+        && singleNested->videoTracks.size() == 1 && singleNested->videoTracks[0].size() == 2
+        && near(singleNested->duration(), 5.0) && single.videoTracks[0].size() == 2
+        && singleRef->sequenceRefId == singleNested->id
+        && singleRef->filePath == timeline_nesting::sequenceClipFilePath(QStringLiteral("cmp"))
+        && near(singleRef->duration, singleNested->duration())
+        && near(singleRef->inPoint, 1.0) && near(singleRef->outPoint, 4.0)
+        && single.warnings.filter(QStringLiteral("ref-clip")).isEmpty();
+    std::fprintf(stderr, "G25 parse error=%s sequences=%d id=%s name=%s nestedClips=%s nestedDuration=%.9f "
+        "(spine sum 2+3=5) V1=%d ref=%s filePath=%s duration=%.9f in=%.9f out=%.9f refClipWarnings=%d\n",
+        single.error.toUtf8().constData(), int(single.sequences.size()),
+        singleNested ? singleNested->id.toUtf8().constData() : "",
+        singleNested ? singleNested->name.toUtf8().constData() : "", clipNames(singleNested).constData(),
+        singleNested ? singleNested->duration() : -1.0, int(single.videoTracks[0].size()),
+        singleRef ? singleRef->sequenceRefId.toUtf8().constData() : "",
+        singleRef ? singleRef->filePath.toUtf8().constData() : "",
+        singleRef ? singleRef->duration : -1.0, singleRef ? singleRef->inPoint : -1.0,
+        singleRef ? singleRef->outPoint : -1.0, int(single.warnings.filter(QStringLiteral("ref-clip")).size()));
+    // A timeline without a sequence model: the first addSequence also
+    // materializes the default sequence, which must not be taken as the new id.
+    Timeline compoundTimeline;
+    auto singleApplied = single;
+    QStringList singleWarnings;
+    const int modelBefore = compoundTimeline.sequences().size();
+    const bool singleOk = fcpx::xml::applyImport(compoundTimeline, singleApplied, &singleWarnings);
+    const auto singleStore = compoundTimeline.sequences();
+    const QString singleId = singleApplied.sequences.value(0).id;
+    const TimelineSequence *singleStored = findSequence(singleStore, singleId);
+    const TimelineSequence *singleActive = findSequence(singleStore, compoundTimeline.activeSequenceId());
+    const ClipInfo *singleActiveRef = singleActive ? namedClip(singleActive->videoTracks, QStringLiteral("compound")) : nullptr;
+    const bool singleApply = singleOk && modelBefore == 0 && singleStore.size() == 3
+        && singleId == QStringLiteral("cmp") && compoundTimeline.activeSequenceId() != singleId
+        && singleStored && singleStored->name == QStringLiteral("複合 クリップ")
+        && singleStored->videoTracks.value(0).size() == 2 && singleActive && singleActiveRef
+        && singleActiveRef->sequenceRefId == singleId
+        && singleActive->name == QStringLiteral("読み込み");
+    QStringList storeIds;
+    for (const auto &sequence : singleStore) storeIds.append(sequence.id);
+    std::fprintf(stderr, "G25 apply ok=%d sequencesBefore=%d store=%s addedId=%s active=%s activeName=%s "
+        "activeClips=%s storedClips=%s warnings=%d\n",
+        int(singleOk), modelBefore, storeIds.join(QLatin1Char(',')).toUtf8().constData(),
+        singleId.toUtf8().constData(), compoundTimeline.activeSequenceId().toUtf8().constData(),
+        singleActive ? singleActive->name.toUtf8().constData() : "", clipNames(singleActive).constData(),
+        clipNames(singleStored).constData(), int(singleWarnings.size()));
+    gate(25, singleParsed && singleApply);
+
+    // G26: two levels; the outer media is listed first and refers to the inner one.
+    const auto twoLevels = fcpx::xml::parseXml(document(
+        QStringLiteral("<ref-clip ref=\"outer\" name=\"toOuter\" duration=\"3s\"/>"),
+        QStringLiteral("<media id=\"outer\" name=\"外側\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"mid\" duration=\"1s\"/>"
+            "<ref-clip ref=\"inner\" name=\"toInner\" offset=\"1s\" duration=\"2s\"/>"
+            "</spine></sequence></media>"
+            "<media id=\"inner\" name=\"内側\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"deep\" duration=\"2s\"/>"
+            "</spine></sequence></media>")), dir.path());
+    const TimelineSequence *parsedInner = twoLevels.sequences.size() == 2 ? &twoLevels.sequences[0] : nullptr;
+    const TimelineSequence *parsedOuter = twoLevels.sequences.size() == 2 ? &twoLevels.sequences[1] : nullptr;
+    const ClipInfo *toInner = parsedOuter ? namedClip(parsedOuter->videoTracks, QStringLiteral("toInner")) : nullptr;
+    const ClipInfo *toOuter = namedClip(twoLevels.videoTracks, QStringLiteral("toOuter"));
+    const bool twoParsed = twoLevels.error.isEmpty() && parsedInner && parsedOuter && toInner && toOuter
+        && parsedInner->id == QStringLiteral("inner") && parsedOuter->id == QStringLiteral("outer")
+        && toInner->sequenceRefId == parsedInner->id && toOuter->sequenceRefId == parsedOuter->id
+        && near(parsedInner->duration(), 2.0) && near(parsedOuter->duration(), 3.0)
+        && near(toInner->duration, 2.0) && near(toOuter->duration, 3.0);
+    std::fprintf(stderr, "G26 parse error=%s sequences=%d inner=%s(%s, %.9f) outer=%s(%s, %.9f) toOuter=%s\n",
+        twoLevels.error.toUtf8().constData(), int(twoLevels.sequences.size()),
+        parsedInner ? parsedInner->id.toUtf8().constData() : "", clipNames(parsedInner).constData(),
+        parsedInner ? parsedInner->duration() : -1.0,
+        parsedOuter ? parsedOuter->id.toUtf8().constData() : "", clipNames(parsedOuter).constData(),
+        parsedOuter ? parsedOuter->duration() : -1.0,
+        toOuter ? toOuter->sequenceRefId.toUtf8().constData() : "");
+    // A sequence already named "inner" makes addSequence rename the imported one,
+    // so the reference inside the outer nested sequence has to follow.
+    Timeline nestedTimeline;
+    TimelineSequence existingInner;
+    existingInner.id = QStringLiteral("inner");
+    existingInner.name = QStringLiteral("既存");
+    existingInner.videoTracks = {QVector<ClipInfo>{}};
+    existingInner.audioTracks = {QVector<ClipInfo>{}};
+    nestedTimeline.addSequence(existingInner);
+    auto twoApplied = twoLevels;
+    QStringList twoWarnings;
+    const bool twoOk = fcpx::xml::applyImport(nestedTimeline, twoApplied, &twoWarnings);
+    const auto twoStore = nestedTimeline.sequences();
+    const QString innerId = twoApplied.sequences.value(0).id, outerId = twoApplied.sequences.value(1).id;
+    const TimelineSequence *storedInner = findSequence(twoStore, innerId);
+    const TimelineSequence *storedOuter = findSequence(twoStore, outerId);
+    const TimelineSequence *keptInner = findSequence(twoStore, QStringLiteral("inner"));
+    const TimelineSequence *twoActive = findSequence(twoStore, nestedTimeline.activeSequenceId());
+    const ClipInfo *storedToInner = storedOuter ? namedClip(storedOuter->videoTracks, QStringLiteral("toInner")) : nullptr;
+    const ClipInfo *activeToOuter = twoActive ? namedClip(twoActive->videoTracks, QStringLiteral("toOuter")) : nullptr;
+    const bool twoApply = twoOk && innerId == QStringLiteral("inner-2") && outerId == QStringLiteral("outer")
+        && storedInner && storedInner->name == QStringLiteral("内側") && storedOuter && storedToInner
+        && storedToInner->sequenceRefId == innerId
+        && storedToInner->filePath == timeline_nesting::sequenceClipFilePath(innerId)
+        && keptInner && keptInner->name == QStringLiteral("既存") && keptInner->videoTracks.value(0).isEmpty()
+        && activeToOuter && activeToOuter->sequenceRefId == outerId;
+    QStringList twoIds;
+    for (const auto &sequence : twoStore) twoIds.append(sequence.id);
+    std::fprintf(stderr, "G26 apply ok=%d store=%s innerId=%s outerId=%s storedOuter=%s kept inner=%s(%s) "
+        "activeToOuter=%s\n",
+        int(twoOk), twoIds.join(QLatin1Char(',')).toUtf8().constData(), innerId.toUtf8().constData(),
+        outerId.toUtf8().constData(), clipNames(storedOuter).constData(),
+        keptInner ? keptInner->name.toUtf8().constData() : "", clipNames(keptInner).constData(),
+        activeToOuter ? activeToOuter->sequenceRefId.toUtf8().constData() : "");
+    // A compound with a video and an audio clip is referenced from V1 and A1,
+    // so its nested audio plays; a video-only compound stays on V1 only.
+    auto refsOn = [](const QVector<QVector<ClipInfo>> &tracks) {
+        QStringList refs;
+        for (const auto &track : tracks)
+            for (const auto &clip : track)
+                if (!clip.sequenceRefId.isEmpty()) refs.append(clip.sequenceRefId);
+        return refs;
+    };
+    const auto mixed = fcpx::xml::parseXml(document(
+        QStringLiteral("<ref-clip ref=\"mix\" name=\"toMix\" duration=\"2s\"/>"),
+        QStringLiteral("<asset id=\"snd\" src=\"voice.wav\" hasVideo=\"0\" hasAudio=\"1\"/>"
+            "<media id=\"mix\" name=\"混在\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"mixVideo\" duration=\"2s\">"
+            "<asset-clip ref=\"snd\" name=\"mixAudio\" lane=\"-1\" duration=\"2s\"/>"
+            "</asset-clip></spine></sequence></media>")), dir.path());
+    const TimelineSequence *parsedMix = mixed.sequences.size() == 1 ? &mixed.sequences[0] : nullptr;
+    const ClipInfo *mixAudio = parsedMix ? namedClip(parsedMix->audioTracks, QStringLiteral("mixAudio")) : nullptr;
+    const QString voicePath = mixAudio ? mixAudio->filePath : QString();
+    const ClipInfo *mixVideoRef = namedClip(mixed.videoTracks, QStringLiteral("toMix"));
+    const ClipInfo *mixAudioRef = namedClip(mixed.audioTracks, QStringLiteral("toMix"));
+    const bool mixParsed = mixed.error.isEmpty() && parsedMix && mixAudio && voicePath.endsWith(QStringLiteral("/voice.wav"))
+        && mixVideoRef && mixAudioRef && mixVideoRef->sequenceRefId == QStringLiteral("mix")
+        && mixAudioRef->sequenceRefId == QStringLiteral("mix") && mixAudioRef->filePath == mixVideoRef->filePath
+        && near(mixAudioRef->inPoint, mixVideoRef->inPoint) && near(mixAudioRef->outPoint, mixVideoRef->outPoint)
+        && near(mixAudioRef->leadInSec, mixVideoRef->leadInSec)
+        && !mixVideoRef->uid.isEmpty() && mixAudioRef->uid.isEmpty() && mixAudioRef->anchorUid.isEmpty();
+    Timeline mixTimeline;
+    auto mixApplied = mixed;
+    QStringList mixWarnings;
+    const bool mixOk = fcpx::xml::applyImport(mixTimeline, mixApplied, &mixWarnings);
+    const QString mixId = mixApplied.sequences.value(0).id;
+    const auto mixStore = mixTimeline.sequences();
+    const TimelineSequence *mixActive = findSequence(mixStore, mixTimeline.activeSequenceId());
+    const QStringList mixV1 = mixActive ? refsOn(mixActive->videoTracks.mid(0, 1)) : QStringList();
+    const QStringList mixA1 = mixActive ? refsOn(mixActive->audioTracks.mid(0, 1)) : QStringList();
+    auto playsPath = [](const QVector<PlaybackEntry> &entries, const QString &path) {
+        return std::any_of(entries.cbegin(), entries.cend(), [&](const PlaybackEntry &e) { return e.filePath == path; });
+    };
+    const auto mixAudioPlayback = mixTimeline.computeAudioPlaybackSequence();
+    const auto mixVideoPlayback = mixTimeline.computePlaybackSequence();
+    const bool mixPlays = !voicePath.isEmpty() && playsPath(mixAudioPlayback, voicePath);
+    const bool mixApply = mixOk && !mixId.isEmpty() && mixV1 == QStringList{mixId} && mixA1 == QStringList{mixId}
+        && mixPlays;
+    // Negative control: the video-only compounds of G25 / G26 get no audio-track reference.
+    const QStringList singleAudioRefs = refsOn(single.audioTracks), twoAudioRefs = refsOn(twoLevels.audioTracks);
+    const QStringList outerAudioRefs = parsedOuter ? refsOn(parsedOuter->audioTracks) : QStringList{QStringLiteral("?")};
+    const bool videoOnlyOk = singleAudioRefs.isEmpty() && twoAudioRefs.isEmpty() && outerAudioRefs.isEmpty()
+        && refsOn(single.videoTracks) == QStringList{QStringLiteral("cmp")}
+        && refsOn(twoLevels.videoTracks) == QStringList{QStringLiteral("outer")};
+    std::fprintf(stderr, "G26 mixed parse error=%s sequences=%d nestedAudio=%s videoRef=%s audioRef=%s "
+        "videoUid=%d audioUid=%d audioAnchor=%d | apply ok=%d id=%s V1=%s A1=%s audioPlaybackEntries=%d "
+        "audioPlaysNested=%d videoPlaysNested=%d warnings=%d | video-only audioRefs single=%s twoLevels=%s outer=%s\n",
+        mixed.error.toUtf8().constData(), int(mixed.sequences.size()), voicePath.toUtf8().constData(),
+        mixVideoRef ? mixVideoRef->sequenceRefId.toUtf8().constData() : "",
+        mixAudioRef ? mixAudioRef->sequenceRefId.toUtf8().constData() : "",
+        int(mixVideoRef && !mixVideoRef->uid.isEmpty()), int(mixAudioRef && !mixAudioRef->uid.isEmpty()),
+        int(mixAudioRef && !mixAudioRef->anchorUid.isEmpty()), int(mixOk), mixId.toUtf8().constData(),
+        mixV1.join(QLatin1Char(',')).toUtf8().constData(), mixA1.join(QLatin1Char(',')).toUtf8().constData(),
+        int(mixAudioPlayback.size()), int(mixPlays), int(playsPath(mixVideoPlayback, voicePath)), int(mixWarnings.size()),
+        singleAudioRefs.join(QLatin1Char(',')).toUtf8().constData(), twoAudioRefs.join(QLatin1Char(',')).toUtf8().constData(),
+        outerAudioRefs.join(QLatin1Char(',')).toUtf8().constData());
+    // A mixed compound connected to a V1 clip: its V2 video and A1 audio
+    // references share the anchor, so a storyline-mode Delete of an earlier V1
+    // clip moves both with the host (an unanchored audio copy stays at 5 s).
+    const auto connectedMix = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"a\" name=\"lead\" duration=\"2s\"/>"
+            "<asset-clip ref=\"a\" name=\"host\" offset=\"2s\" duration=\"4s\">"
+            "<ref-clip ref=\"mix\" name=\"toMixC\" lane=\"1\" offset=\"3s\" duration=\"2s\"/></asset-clip>"),
+        QStringLiteral("<asset id=\"snd\" src=\"voice.wav\" hasVideo=\"0\" hasAudio=\"1\"/>"
+            "<media id=\"mix\" name=\"混在\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"mixVideo\" duration=\"2s\">"
+            "<asset-clip ref=\"snd\" name=\"mixAudio\" lane=\"-1\" duration=\"2s\"/>"
+            "</asset-clip></spine></sequence></media>")), dir.path());
+    const ClipInfo *hostClip = namedClip(connectedMix.videoTracks, QStringLiteral("host"));
+    const ClipInfo *cVideoRef = namedClip(connectedMix.videoTracks, QStringLiteral("toMixC"));
+    const ClipInfo *cAudioRef = namedClip(connectedMix.audioTracks, QStringLiteral("toMixC"));
+    const QString hostUid = hostClip ? hostClip->uid : QString();
+    const bool connectedParsed = connectedMix.error.isEmpty() && hostClip && !hostUid.isEmpty()
+        && cVideoRef && cAudioRef && cVideoRef->sequenceRefId == QStringLiteral("mix")
+        && cAudioRef->sequenceRefId == QStringLiteral("mix")
+        && cVideoRef->anchorUid == hostUid && cAudioRef->anchorUid == hostUid
+        && near(cVideoRef->anchorOffsetSec, 3.0) && near(cAudioRef->anchorOffsetSec, cVideoRef->anchorOffsetSec)
+        && cAudioRef->uid.isEmpty();
+    // The same compound connected to an audio-only spine clip is detached; the
+    // detach warning comes once per compound, not once per track reference.
+    const auto audioHostMix = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"snd\" name=\"soundHost\" duration=\"4s\">"
+            "<ref-clip ref=\"mix\" name=\"toMixD\" lane=\"1\" offset=\"1s\" duration=\"2s\"/></asset-clip>"),
+        QStringLiteral("<asset id=\"snd\" src=\"voice.wav\" hasVideo=\"0\" hasAudio=\"1\"/>"
+            "<media id=\"mix\" name=\"混在\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"mixVideo\" duration=\"2s\">"
+            "<asset-clip ref=\"snd\" name=\"mixAudio\" lane=\"-1\" duration=\"2s\"/>"
+            "</asset-clip></spine></sequence></media>")), dir.path());
+    const QString audioHostWarning = QStringLiteral("主ストーリーラインが音声クリップのため接続を解除しました: toMixD");
+    const ClipInfo *dVideoRef = namedClip(audioHostMix.videoTracks, QStringLiteral("toMixD"));
+    const ClipInfo *dAudioRef = namedClip(audioHostMix.audioTracks, QStringLiteral("toMixD"));
+    const int audioHostWarnings = int(audioHostMix.warnings.count(audioHostWarning));
+    const bool audioHostOk = audioHostMix.error.isEmpty() && audioHostWarnings == 1 && dVideoRef && dAudioRef
+        && dVideoRef->anchorUid.isEmpty() && dAudioRef->anchorUid.isEmpty();
+    auto liveStart = [](const Timeline &tl, bool audio, const QString &name) {
+        for (int t = 0; t < (audio ? tl.audioTrackCount() : tl.videoTrackCount()); ++t) {
+            double cursor = 0.0;
+            for (const auto &clip : tl.trackAt(audio, t)->clips()) {
+                cursor += clip.leadInSec;
+                if (clip.displayName == name) return cursor;
+                cursor += clip.effectiveDuration();
+            }
+        }
+        return -1.0;
+    };
+    Timeline connectedTimeline;
+    auto connectedApplied = connectedMix;
+    QStringList connectedWarnings;
+    const bool connectedOk = fcpx::xml::applyImport(connectedTimeline, connectedApplied, &connectedWarnings);
+    connectedTimeline.setStorylineMode(true);
+    connectedTimeline.undoManager()->clear();
+    connectedTimeline.saveUndoState(QStringLiteral("基準")); // reconcile baseline
+    const double videoBefore = liveStart(connectedTimeline, false, QStringLiteral("toMixC"));
+    const double audioBefore = liveStart(connectedTimeline, true, QStringLiteral("toMixC"));
+    const double hostBefore = liveStart(connectedTimeline, false, QStringLiteral("host"));
+    connectedTimeline.trackAt(false, 0)->setSelectedClip(0);
+    connectedTimeline.deleteSelectedClip();
+    const double videoAfter = liveStart(connectedTimeline, false, QStringLiteral("toMixC"));
+    const double audioAfter = liveStart(connectedTimeline, true, QStringLiteral("toMixC"));
+    const double hostAfter = liveStart(connectedTimeline, false, QStringLiteral("host"));
+    const bool connectedFollows = connectedOk && near(hostBefore, 2.0) && near(hostAfter, 0.0)
+        && near(videoBefore, 5.0) && near(audioBefore, 5.0) && near(videoAfter, 3.0) && near(audioAfter, videoAfter);
+    std::fprintf(stderr, "G26 connected mixed parse error=%s hostUid=%s videoAnchor=%s audioAnchor=%s "
+        "videoOffset=%.9f audioOffset=%.9f audioUid=%s | apply ok=%d warnings=%d storyline Delete of lead: "
+        "host %.6f->%.6f (expect 2->0) videoRef %.6f->%.6f (expect 5->3) audioRef %.6f->%.6f (expect 5->3) | "
+        "audio host error=%s detachWarnings=%d (expect 1) videoRef=%d audioRef=%d anchors=%s|%s\n",
+        connectedMix.error.toUtf8().constData(), hostUid.toUtf8().constData(),
+        cVideoRef ? cVideoRef->anchorUid.toUtf8().constData() : "",
+        cAudioRef ? cAudioRef->anchorUid.toUtf8().constData() : "",
+        cVideoRef ? cVideoRef->anchorOffsetSec : -99.0, cAudioRef ? cAudioRef->anchorOffsetSec : -99.0,
+        cAudioRef ? cAudioRef->uid.toUtf8().constData() : "", int(connectedOk), int(connectedWarnings.size()),
+        hostBefore, hostAfter, videoBefore, videoAfter, audioBefore, audioAfter,
+        audioHostMix.error.toUtf8().constData(), audioHostWarnings, int(dVideoRef != nullptr), int(dAudioRef != nullptr),
+        dVideoRef ? dVideoRef->anchorUid.toUtf8().constData() : "", dAudioRef ? dAudioRef->anchorUid.toUtf8().constData() : "");
+    gate(26, twoParsed && twoApply && mixParsed && mixApply && videoOnlyOk && connectedParsed && connectedFollows
+        && audioHostOk);
+
+    // G27 (negative controls): a cycle, an undefined media, and depth 9 (depth 8 still reads).
+    const auto cycle = fcpx::xml::parseXml(document(
+        QStringLiteral("<ref-clip ref=\"A\" name=\"top\" duration=\"2s\"/>"),
+        QStringLiteral("<media id=\"A\" name=\"A\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"inA\" duration=\"1s\"/>"
+            "<ref-clip ref=\"B\" name=\"AtoB\" offset=\"1s\" duration=\"1s\"/></spine></sequence></media>"
+            "<media id=\"B\" name=\"B\"><sequence><spine>"
+            "<asset-clip ref=\"a\" name=\"inB\" duration=\"1s\"/>"
+            "<ref-clip ref=\"A\" name=\"BtoA\" offset=\"1s\" duration=\"1s\"/></spine></sequence></media>")), dir.path());
+    const QString cycleWarning = QStringLiteral("compound clip の循環参照を読み飛ばしました: A");
+    const TimelineSequence *cycleB = cycle.sequences.size() == 2 ? &cycle.sequences[0] : nullptr;
+    const TimelineSequence *cycleA = cycle.sequences.size() == 2 ? &cycle.sequences[1] : nullptr;
+    const bool cycleOk = cycle.error.isEmpty() && cycle.warnings.count(cycleWarning) == 1
+        && cycleB && cycleA && cycleB->id == QStringLiteral("B") && cycleA->id == QStringLiteral("A")
+        && clipNames(cycleB) == QByteArray("inB>") && clipNames(cycleA) == QByteArray("inA>,AtoB>B")
+        && namedClip(cycle.videoTracks, QStringLiteral("top"));
+    const auto undefinedRef = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"real\" duration=\"1s\"/>"
+        "<ref-clip ref=\"nothing\" name=\"ghost\" offset=\"1s\" duration=\"1s\"/>")), dir.path());
+    const QString undefinedWarning = QStringLiteral("未定義の素材参照を読み飛ばしました: nothing");
+    const bool undefinedOk = undefinedRef.error.isEmpty() && undefinedRef.warnings.count(undefinedWarning) == 1
+        && undefinedRef.sequences.isEmpty() && !namedClip(undefinedRef.videoTracks, QStringLiteral("ghost"))
+        && namedClip(undefinedRef.videoTracks, QStringLiteral("real"));
+    auto chain = [&](int levels, const QString &spine = QStringLiteral("<ref-clip ref=\"m1\" name=\"top\" duration=\"1s\"/>")) {
+        QString media;
+        for (int i = 1; i <= levels; ++i) {
+            const QString body = i < levels
+                ? QStringLiteral("<ref-clip ref=\"m%1\" name=\"to%1\" duration=\"1s\"/>").arg(i + 1)
+                : QStringLiteral("<asset-clip ref=\"a\" name=\"leaf\" duration=\"1s\"/>");
+            media += QStringLiteral("<media id=\"m%1\" name=\"m%1\"><sequence><spine>%2</spine></sequence></media>")
+                .arg(i).arg(body);
+        }
+        return fcpx::xml::parseXml(document(spine, media), dir.path());
+    };
+    const auto depth8 = chain(8), depth9 = chain(9);
+    const QString depthWarning = QStringLiteral("compound clip の入れ子が深さ 8 を超えたため読み飛ばしました: m9");
+    auto hasId = [](const fcpx::xml::ImportResult &r, const QString &id) {
+        for (const auto &sequence : r.sequences) if (sequence.id == id) return true;
+        return false;
+    };
+    const bool depthOk = depth8.error.isEmpty() && depth8.sequences.size() == 8
+        && depth8.warnings.filter(QStringLiteral("深さ")).isEmpty()
+        && depth8.sequences[0].id == QStringLiteral("m8") && clipNames(&depth8.sequences[0]) == QByteArray("leaf>")
+        && depth9.error.isEmpty() && depth9.sequences.size() == 8 && depth9.warnings.count(depthWarning) == 1
+        && !hasId(depth9, QStringLiteral("m9")) && depth9.sequences[0].id == QStringLiteral("m8")
+        && clipNames(&depth9.sequences[0]).isEmpty();
+    // Document order: m9 read first from the root still skips m8's reference
+    // at depth 9. m8 referenced from the root as well is still at depth 8 on
+    // the chain (the renderer would drop m9 there), so its reference is skipped
+    // and m9, referenced from nowhere else, is not read.
+    const auto m9First = chain(9, QStringLiteral("<ref-clip ref=\"m9\" name=\"top9\" duration=\"1s\"/>"
+        "<ref-clip ref=\"m1\" name=\"top\" offset=\"1s\" duration=\"1s\"/>"));
+    const auto m8Also = chain(9, QStringLiteral("<ref-clip ref=\"m1\" name=\"top\" duration=\"1s\"/>"
+        "<ref-clip ref=\"m8\" name=\"top8\" offset=\"1s\" duration=\"1s\"/>"));
+    auto indexOf = [](const fcpx::xml::ImportResult &r, const QString &id) {
+        for (int i = 0; i < r.sequences.size(); ++i) if (r.sequences[i].id == id) return i;
+        return -1;
+    };
+    auto namesOf = [&](const fcpx::xml::ImportResult &r, const QString &id) {
+        const int i = indexOf(r, id);
+        return i < 0 ? QByteArray("-") : clipNames(&r.sequences[i]);
+    };
+    const bool orderOk = m9First.error.isEmpty() && m9First.warnings.count(depthWarning) == 1
+        && m9First.sequences.size() == 9 && hasId(m9First, QStringLiteral("m9"))
+        && namesOf(m9First, QStringLiteral("m8")).isEmpty()
+        && m8Also.error.isEmpty() && m8Also.sequences.size() == 8 && m8Also.warnings.count(depthWarning) == 1
+        && m8Also.warnings.filter(QStringLiteral("深さ")).size() == 1
+        && namesOf(m8Also, QStringLiteral("m8")).isEmpty() && indexOf(m8Also, QStringLiteral("m9")) < 0
+        && namesOf(m8Also, QStringLiteral("m7")) == QByteArray("to8>m8");
+    // Every media of a 40-chain referenced from the root as well: the chain
+    // from m1 reaches m8 at depth 8 and skips m9, which the root then reads
+    // at depth 1, so the chain restarts there and is cut every 8 media.
+    QString allRoot;
+    for (int i = 1; i <= 40; ++i)
+        allRoot += QStringLiteral("<ref-clip ref=\"m%1\" name=\"top%1\" offset=\"%2s\" duration=\"1s\"/>").arg(i).arg(i - 1);
+    const auto longChain = chain(40, allRoot);
+    QStringList chainWarnings;
+    for (int cut : {9, 17, 25, 33})
+        chainWarnings.append(QStringLiteral("compound clip の入れ子が深さ 8 を超えたため読み飛ばしました: m%1").arg(cut));
+    const bool chainOk = longChain.error.isEmpty() && longChain.sequences.size() == 40
+        && longChain.warnings.filter(QStringLiteral("深さ")) == chainWarnings
+        && namesOf(longChain, QStringLiteral("m7")) == QByteArray("to8>m8")
+        && namesOf(longChain, QStringLiteral("m8")).isEmpty()
+        && namesOf(longChain, QStringLiteral("m15")) == QByteArray("to16>m16")
+        && namesOf(longChain, QStringLiteral("m16")).isEmpty()
+        && namesOf(longChain, QStringLiteral("m31")) == QByteArray("to32>m32")
+        && namesOf(longChain, QStringLiteral("m32")).isEmpty()
+        && namesOf(longChain, QStringLiteral("m40")) == QByteArray("leaf>");
+    // The longest chain of sequence references from the root tracks (a
+    // sequence on the root is 1, a cycle is unbounded) must stay within 8,
+    // the renderer's nesting limit.
+    auto longestRefPath = [&](const fcpx::xml::ImportResult &r) {
+        QMap<QString, int> memo;
+        QSet<QString> visiting;
+        std::function<int(const QString &)> pathFrom;
+        auto deepest = [&](const QVector<QVector<ClipInfo>> &video, const QVector<QVector<ClipInfo>> &audio) {
+            int best = 0;
+            for (const auto *tracks : {&video, &audio})
+                for (const auto &track : *tracks)
+                    for (const auto &clip : track)
+                        if (!clip.sequenceRefId.isEmpty()) best = qMax(best, 1 + pathFrom(clip.sequenceRefId));
+            return best;
+        };
+        pathFrom = [&](const QString &id) -> int {
+            if (memo.contains(id)) return memo.value(id);
+            const int i = indexOf(r, id);
+            if (visiting.contains(id)) return 1000;
+            if (i < 0) return 0;
+            visiting.insert(id);
+            const int depth = deepest(r.sequences[i].videoTracks, r.sequences[i].audioTracks);
+            visiting.remove(id);
+            memo.insert(id, depth);
+            return depth;
+        };
+        return deepest(r.videoTracks, r.audioTracks);
+    };
+    const int depth8Path = longestRefPath(depth8), depth9Path = longestRefPath(depth9);
+    const int m9FirstPath = longestRefPath(m9First), m8AlsoPath = longestRefPath(m8Also);
+    const int longChainPath = longestRefPath(longChain);
+    const bool pathsOk = depth8Path == 8 && depth9Path == 8 && m9FirstPath == 8 && m8AlsoPath == 8
+        && longChainPath == 8;
+    std::fprintf(stderr, "G27 cycle error=%s cycleWarning=%d sequences=%d B=%s A=%s | undefined warning=%d "
+        "sequences=%d ghost=%d real=%d | depth8 sequences=%d depthWarnings=%d innermost=%s(%s) | "
+        "depth9 sequences=%d depthWarning=%d m9=%d innermost=%s(%s) error=%s | "
+        "m9First sequences=%d depthWarning=%d m9=%d m8=%s error=%s | "
+        "m8Also sequences=%d depthWarning=%d m9Index=%d m8Index=%d m7=%s m8=%s error=%s | "
+        "longChain sequences=%d depthWarnings=%s m8=%s m16=%s m31=%s m32=%s m40=%s error=%s | "
+        "longestRefPath depth8=%d depth9=%d m9First=%d m8Also=%d longChain=%d (limit 8)\n",
+        cycle.error.toUtf8().constData(), int(cycle.warnings.count(cycleWarning)), int(cycle.sequences.size()),
+        clipNames(cycleB).constData(), clipNames(cycleA).constData(),
+        int(undefinedRef.warnings.count(undefinedWarning)), int(undefinedRef.sequences.size()),
+        int(namedClip(undefinedRef.videoTracks, QStringLiteral("ghost")) != nullptr),
+        int(namedClip(undefinedRef.videoTracks, QStringLiteral("real")) != nullptr),
+        int(depth8.sequences.size()), int(depth8.warnings.filter(QStringLiteral("深さ")).size()),
+        depth8.sequences.isEmpty() ? "" : depth8.sequences[0].id.toUtf8().constData(),
+        depth8.sequences.isEmpty() ? "" : clipNames(&depth8.sequences[0]).constData(),
+        int(depth9.sequences.size()), int(depth9.warnings.count(depthWarning)), int(hasId(depth9, QStringLiteral("m9"))),
+        depth9.sequences.isEmpty() ? "" : depth9.sequences[0].id.toUtf8().constData(),
+        depth9.sequences.isEmpty() ? "" : clipNames(&depth9.sequences[0]).constData(),
+        depth9.error.toUtf8().constData(),
+        int(m9First.sequences.size()), int(m9First.warnings.count(depthWarning)), int(hasId(m9First, QStringLiteral("m9"))),
+        namesOf(m9First, QStringLiteral("m8")).constData(), m9First.error.toUtf8().constData(),
+        int(m8Also.sequences.size()), int(m8Also.warnings.count(depthWarning)),
+        indexOf(m8Also, QStringLiteral("m9")), indexOf(m8Also, QStringLiteral("m8")),
+        namesOf(m8Also, QStringLiteral("m7")).constData(),
+        namesOf(m8Also, QStringLiteral("m8")).constData(), m8Also.error.toUtf8().constData(),
+        int(longChain.sequences.size()),
+        longChain.warnings.filter(QStringLiteral("深さ")).join(QLatin1Char('|')).toUtf8().constData(),
+        namesOf(longChain, QStringLiteral("m8")).constData(), namesOf(longChain, QStringLiteral("m16")).constData(),
+        namesOf(longChain, QStringLiteral("m31")).constData(), namesOf(longChain, QStringLiteral("m32")).constData(),
+        namesOf(longChain, QStringLiteral("m40")).constData(), longChain.error.toUtf8().constData(),
+        depth8Path, depth9Path, m9FirstPath, m8AlsoPath, longChainPath);
+    gate(27, cycleOk && undefinedOk && depthOk && orderOk && chainOk && pathsOk);
+
+    // G28: the same ImportResult applied twice. The first nested sequence,
+    // edited after the import, must survive; the second gets its own id.
+    Timeline repeatTimeline;
+    auto repeated = single;
+    QStringList repeatWarnings;
+    const bool firstOk = fcpx::xml::applyImport(repeatTimeline, repeated, &repeatWarnings);
+    const QString firstId = repeated.sequences.value(0).id;
+    auto edited = repeatTimeline.sequences();
+    bool editedOk = false;
+    for (auto &sequence : edited) {
+        if (sequence.id != firstId || sequence.videoTracks.isEmpty() || sequence.videoTracks[0].isEmpty()) continue;
+        sequence.videoTracks[0][0].displayName = QStringLiteral("編集済み");
+        editedOk = true;
+    }
+    repeatTimeline.setSequences(edited, repeatTimeline.activeSequenceId());
+    const int beforeSecond = repeatTimeline.sequences().size();
+    const bool secondOk = fcpx::xml::applyImport(repeatTimeline, repeated, &repeatWarnings);
+    const QString secondId = repeated.sequences.value(0).id;
+    const auto repeatStore = repeatTimeline.sequences();
+    const TimelineSequence *firstStored = findSequence(repeatStore, firstId);
+    const TimelineSequence *secondStored = findSequence(repeatStore, secondId);
+    const TimelineSequence *repeatActive = findSequence(repeatStore, repeatTimeline.activeSequenceId());
+    const ClipInfo *repeatRef = repeatActive ? namedClip(repeatActive->videoTracks, QStringLiteral("compound")) : nullptr;
+    const auto playback = repeatTimeline.computePlaybackSequence();
+    const bool repeatOk = firstOk && secondOk && editedOk && firstId == QStringLiteral("cmp")
+        && secondId != firstId && !secondId.isEmpty() && repeatStore.size() == beforeSecond + 2
+        && clipNames(firstStored) == QByteArray("編集済み>,inner2>") && clipNames(secondStored) == QByteArray("inner1>,inner2>")
+        && repeatRef && repeatRef->sequenceRefId == secondId
+        && repeatRef->filePath == timeline_nesting::sequenceClipFilePath(secondId) && !playback.isEmpty();
+    // Recorded, not gated: the store after one undo (measured: back to the
+    // store before the import) is logged.
+    auto idList = [](const QVector<TimelineSequence> &sequences) {
+        QStringList ids;
+        for (const auto &sequence : sequences) ids.append(sequence.id);
+        return ids.join(QLatin1Char(',')).toUtf8();
+    };
+    const int beforeUndo = repeatStore.size();
+    repeatTimeline.undo();
+    const auto afterUndoStore = repeatTimeline.sequences();
+    const QByteArray freshBeforeUndo = idList(compoundTimeline.sequences());
+    compoundTimeline.undo();
+    const QByteArray freshAfterUndo = idList(compoundTimeline.sequences());
+    std::fprintf(stderr, "G28 first=%d id=%s second=%d id=%s storeBeforeSecond=%d storeAfterSecond=%d "
+        "firstClips=%s secondClips=%s activeRef=%s playbackEntries=%d\n",
+        int(firstOk), firstId.toUtf8().constData(), int(secondOk), secondId.toUtf8().constData(), beforeSecond,
+        beforeUndo, clipNames(firstStored).constData(), clipNames(secondStored).constData(),
+        repeatRef ? repeatRef->sequenceRefId.toUtf8().constData() : "", int(playback.size()));
+    std::fprintf(stderr, "G28 undo once after the second import: sequences().size() %d -> %d (%s -> %s), "
+        "first nested clips after undo=%s | undo once after an import into a new Timeline: %s -> %s (pre-import: none)\n",
+        beforeUndo, int(afterUndoStore.size()), idList(repeatStore).constData(), idList(afterUndoStore).constData(),
+        clipNames(findSequence(afterUndoStore, firstId)).constData(), freshBeforeUndo.constData(),
+        freshAfterUndo.constData());
+    gate(28, repeatOk);
 
     return tally.finish();
 }

@@ -8,6 +8,7 @@
 #include <QUrl>
 #include <QUuid>
 #include <QXmlStreamReader>
+#include <QXmlStreamWriter>
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -57,14 +58,17 @@ bool lessTime(Time a, Time b)
         std::swap(a.n, a.d); std::swap(b.n, b.d); reverse = !reverse;
     }
 }
-struct Asset { QString path, name, format; Time start, duration; bool audioOnly = false; };
+// hasAudio: a compound clip whose sequence holds audio clips.
+struct Asset { QString path, name, format; Time start, duration; bool audioOnly = false, hasAudio = false; };
 struct Entry {
     QString ref, name, uid;
     int lane = 0, parentIndex = -1;
+    bool refClip = false; // ref-clip: ref names a media (compound clip)
     Time offset, duration, start;
     Time handleEnd; // pre-trim source end (start + duration) of an overlap-trimmed clip
     bool underGap = false;
     bool audioElement = false;
+    bool compoundAudioCopy = false; // audio-track reference of a mixed ref-clip
 };
 // A spine-level transition remembers its neighbouring spine clips (entry
 // indexes, -1 when the neighbour is missing or a gap) until placement is known.
@@ -78,14 +82,34 @@ bool isContainerTag(QStringView tag)
 {
     return tag == QLatin1String("clip") || tag == QLatin1String("sync-clip");
 }
+// A media's <sequence> rewritten as a standalone document for parseDocument.
+struct Compound { QString name, document; };
+// Shared by the document and its compound clips: resources, the media ids
+// being read (outermost first), the nesting level of the document being read
+// (0 = the root), the deepest level a kept reference reached each media at,
+// and the sequences read so far.
+struct Nesting {
+    QMap<QString, Asset> assets;
+    QMap<QString, QXmlStreamAttributes> formats;
+    QMap<QString, Compound> media;
+    QSet<QString> built, found, missing;
+    QStringList chain;
+    int level = 0;
+    QMap<QString, int> depths;
+    QVector<TimelineSequence> sequences;
+};
+constexpr int kMaxCompoundDepth = 8;
 }
-ImportResult parseXml(const QString &xml, const QString &directory)
+// originOut / contentEndOut receive the sequence tcStart and the end of its
+// placed clips (relative to tcStart) for a compound clip's asset range.
+static ImportResult parseDocument(const QString &xml, const QString &directory, Nesting &nest,
+                                  Time *originOut, Time *contentEndOut)
 {
     ImportResult result;
     QXmlStreamReader reader(xml);
-    QMap<QString, Asset> assets;
+    QMap<QString, Asset> &assets = nest.assets;
     auto isAudioEntry = [&](const Entry &e) { return e.audioElement || assets.value(e.ref).audioOnly; };
-    QMap<QString, QXmlStreamAttributes> formats;
+    QMap<QString, QXmlStreamAttributes> &formats = nest.formats;
     QVector<Entry> entries;
     int assetClipCount = 0;
     QStringList stack;
@@ -155,6 +179,62 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             warnDescendants();
         }
     };
+    // A ref-clip reads its media sequence once (inner sequences first in
+    // nest.sequences), at the deepest level a kept reference reaches the media
+    // at, so no reference path through it passes kMaxCompoundDepth (the
+    // renderer drops a nested sequence beyond it). Every reference is checked
+    // for a cycle and for depth, even to a media already read; only a kept
+    // reference records its level. False: skipped with a warning. An undefined
+    // media falls through to the missing-asset warning.
+    auto keepCompound = [&](const QString &id) {
+        if (!nest.media.contains(id)) return true;
+        QString skipped;
+        if (nest.chain.contains(id)) {
+            skipped = QStringLiteral("compound clip の循環参照を読み飛ばしました: %1").arg(id);
+        } else if (nest.level >= kMaxCompoundDepth) {
+            skipped = QStringLiteral("compound clip の入れ子が深さ %1 を超えたため読み飛ばしました: %2")
+                .arg(kMaxCompoundDepth).arg(id);
+        } else {
+            nest.depths.insert(id, qMax(nest.depths.value(id, nest.level), nest.level));
+            if (nest.built.contains(id)) return true;
+            const Compound compound = nest.media.value(id);
+            Time innerOrigin, innerEnd;
+            const int outerLevel = nest.level;
+            nest.chain.append(id);
+            nest.level = nest.depths.value(id) + 1;
+            const ImportResult inner = parseDocument(compound.document, directory, nest, &innerOrigin, &innerEnd);
+            nest.level = outerLevel;
+            nest.chain.removeLast();
+            const QStringList existing = result.warnings;
+            for (const QString &warning : inner.warnings)
+                if (!existing.contains(warning)) result.warnings.append(warning);
+            if (inner.error.isEmpty()) {
+                auto hasClips = [](const QVector<QVector<ClipInfo>> &tracks) {
+                    return std::any_of(tracks.cbegin(), tracks.cend(), [](const auto &t) { return !t.isEmpty(); });
+                };
+                TimelineSequence sequence;
+                sequence.id = id;
+                sequence.name = compound.name.isEmpty() ? id : compound.name;
+                sequence.videoTracks = inner.videoTracks;
+                sequence.audioTracks = inner.audioTracks;
+                if (sequence.videoTracks.isEmpty()) sequence.videoTracks.append(QVector<ClipInfo>{});
+                if (sequence.audioTracks.isEmpty()) sequence.audioTracks.append(QVector<ClipInfo>{});
+                nest.sequences.append(sequence);
+                Asset asset;
+                asset.name = sequence.name;
+                asset.start = innerOrigin;
+                asset.duration = innerEnd;
+                asset.hasAudio = hasClips(inner.audioTracks);
+                asset.audioOnly = !hasClips(inner.videoTracks) && asset.hasAudio;
+                assets.insert(id, asset);
+                nest.built.insert(id);
+                return true;
+            }
+            skipped = QStringLiteral("compound clip を読み込めないため読み飛ばしました: %1 (%2)").arg(id, inner.error);
+        }
+        result.warnings.append(skipped);
+        return false;
+    };
     std::function<void(const Time *, const Time *, int, int, const QXmlStreamAttributes *)> readSpine;
     readSpine = [&](const Time *parentOffset, const Time *parentStart, int parentIndex,
                     int depth, const QXmlStreamAttributes *fallback) {
@@ -218,7 +298,9 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             --gapDepth;
             return;
         }
-        if (!isMediaClipTag(tag)) { warnSkip(); return; }
+        const bool refClip = tag == QLatin1String("ref-clip");
+        if (refClip && !keepCompound(reader.attributes().value("ref").toString())) { warnDescendants(); return; }
+        if (!refClip && !isMediaClipTag(tag)) { warnSkip(); return; }
         ++assetClipCount;
         const auto a = reader.attributes();
         const bool explicitOffset = a.hasAttribute("offset");
@@ -235,6 +317,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         e.parentIndex = parentIndex;
         e.underGap = gapDepth > 0;
         e.audioElement = tag == QLatin1String("audio");
+        e.refClip = refClip;
         bool laneOk = true;
         if (hasAttribute(QStringLiteral("lane"))) e.lane = attribute(QStringLiteral("lane")).toInt(&laneOk);
         QString invalid;
@@ -286,13 +369,33 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             if (!readTime(a, QStringLiteral("start"), asset.start)
                 || !readTime(a, QStringLiteral("duration"), asset.duration)) break;
             const QString id = a.value("id").toString();
-            if (id.isEmpty() || assets.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
+            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
             while (reader.readNextStartElement()) {
                 if (reader.name() == QLatin1String("media-rep") && reader.attributes().value("kind") == QLatin1String("original-media")) {
                     asset.path = reader.attributes().value("src").toString(); reader.skipCurrentElement();
                 } else warnSkip();
             }
             assets.insert(id, asset); continue;
+        } else if (tag == "media" && parent == "resources") {
+            const QString id = a.value("id").toString();
+            if (id.isEmpty() || assets.contains(id) || nest.media.contains(id)) { reader.raiseError(QStringLiteral("素材 ID が不正です。")); break; }
+            Compound compound;
+            compound.name = a.value("name").toString();
+            while (reader.readNextStartElement()) {
+                if (reader.name() != QLatin1String("sequence") || !compound.document.isEmpty()) { warnSkip(); continue; }
+                QXmlStreamWriter writer(&compound.document);
+                writer.writeStartElement(QStringLiteral("fcpxml"));
+                writer.writeStartElement(QStringLiteral("project"));
+                writer.writeAttribute(QStringLiteral("name"), compound.name);
+                for (int depth = 0; !reader.hasError(); reader.readNext()) {
+                    writer.writeCurrentToken(reader);
+                    if (reader.isStartElement()) ++depth;
+                    else if (reader.isEndElement() && --depth == 0) break;
+                }
+                writer.writeEndElement();
+                writer.writeEndElement();
+            }
+            nest.media.insert(id, compound); continue;
         } else if ((tag == "library" && parent == "fcpxml")
                    || (tag == "event" && (parent == "library" || parent == "fcpxml"))) {
         } else if (tag == "project" && (parent == "event" || parent == "fcpxml")) {
@@ -314,7 +417,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             transitions.append(transition);
             awaitingNext = true;
             reader.skipCurrentElement(); continue;
-        } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap"
+        } else if (parent == "spine" && (tag == "asset-clip" || tag == "gap" || tag == "ref-clip"
                    || isContainerTag(QStringView(tag)))) {
             const int firstEntry = entries.size();
             readSpine(nullptr, nullptr, -1, 0, nullptr);
@@ -360,7 +463,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
         const int parentRejection = e.parentIndex >= 0 ? checkEntry(e.parentIndex) : Valid;
         if (parentRejection == InvalidParent || parentRejection == InvalidRange)
             return rejection[i] = InvalidParent;
-        if (!assets.contains(e.ref)) return rejection[i] = MissingAsset;
+        if (!assets.contains(e.ref) || e.refClip != nest.built.contains(e.ref)) return rejection[i] = MissingAsset;
         if (hasConnectedChildren[i]) {
             Time timelineOffset, sourceStart, sourceEnd, timelineEnd;
             const Asset asset = assets.value(e.ref);
@@ -392,6 +495,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     QSet<int> rejectedTrims;
     QSet<QString> found, missing, v1Uids;
     const int warningsBase = result.warnings.size();
+    Time contentEnd;
     auto locate = [&](int entryIndex, const QVector<ClipInfo> *&track) -> ClipInfo * {
         if (entryIndex < 0 || entries[entryIndex].uid.isEmpty()) return nullptr;
         for (auto *tracks : {&result.videoTracks, &result.audioTracks})
@@ -408,6 +512,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     audioLanes.clear();
     found.clear(); missing.clear(); v1Uids.clear();
     result.warnings.resize(warningsBase);
+    contentEnd = Time{};
     for (int ti = 0; ti < transitions.size(); ++ti) {
         const auto &transition = transitions[ti];
         if (rejectedTrims.contains(ti) || transition.prev < 0 || transition.next < 0) continue;
@@ -450,6 +555,16 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             break;
         }
         (isAudioEntry(e) ? audioLanes : videoLanes)[e.lane].append(e);
+        // A compound with video and audio clips is referenced from a video and
+        // an audio track, like Timeline::addSequenceClip, so its nested audio
+        // plays. The audio copy carries no uid (Timeline assigns its own) and
+        // keeps the parent, so a connected copy anchors with its video.
+        if (e.refClip && !isAudioEntry(e) && assets.value(e.ref).hasAudio) {
+            Entry audioCopy = e;
+            audioCopy.uid.clear();
+            audioCopy.compoundAudioCopy = true;
+            audioLanes[e.lane].append(audioCopy);
+        }
     }
     result.videoTracks.clear();
     result.audioTracks.clear();
@@ -491,13 +606,23 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                         .arg(lane).arg(e.name, e.ref));
                     continue;
                 }
-                const QUrl url(asset.path);
-                QString path = url.isLocalFile() ? url.toLocalFile() : asset.path;
-                if (path.isEmpty()) path = QStringLiteral("offline-%1").arg(e.ref);
-                if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
-                if (QFileInfo(path).isFile()) found.insert(path);
-                else if (!missing.contains(path)) { missing.insert(path); result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path)); }
+                QString path;
+                if (e.refClip) {
+                    path = timeline_nesting::sequenceClipFilePath(e.ref);
+                } else {
+                    const QUrl url(asset.path);
+                    path = url.isLocalFile() ? url.toLocalFile() : asset.path;
+                    if (path.isEmpty()) path = QStringLiteral("offline-%1").arg(e.ref);
+                    if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
+                    if (QFileInfo(path).isFile()) found.insert(path);
+                    else if (!missing.contains(path)) {
+                        missing.insert(path);
+                        if (!nest.missing.contains(path))
+                            result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path));
+                    }
+                }
                 ClipInfo c; c.filePath = path; c.displayName = e.name.isEmpty() ? asset.name : e.name;
+                if (e.refClip) c.sequenceRefId = e.ref;
                 c.inPoint = start.seconds();
                 c.outPoint = out.seconds();
                 c.duration = asset.duration.n > 0
@@ -515,12 +640,15 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                         rootIndex = entries[rootIndex].parentIndex;
                     const Entry &ancestor = entries[rootIndex];
                     if (!ancestor.uid.isEmpty() && assets.contains(ancestor.ref)) {
+                        // The detach warnings come once per compound, from its video reference.
                         if (isAudioEntry(ancestor)) {
-                            result.warnings.append(QStringLiteral("主ストーリーラインが音声クリップのため接続を解除しました: %1")
-                                .arg(c.displayName));
+                            if (!e.compoundAudioCopy)
+                                result.warnings.append(QStringLiteral("主ストーリーラインが音声クリップのため接続を解除しました: %1")
+                                    .arg(c.displayName));
                         } else if (!v1Uids.contains(ancestor.uid) || childOnV1 || e.lane == 0) {
-                            result.warnings.append(QStringLiteral("接続先の主ストーリーラインのクリップが V1 に置かれないため接続を解除しました: %1")
-                                .arg(c.displayName));
+                            if (!e.compoundAudioCopy)
+                                result.warnings.append(QStringLiteral("接続先の主ストーリーラインのクリップが V1 に置かれないため接続を解除しました: %1")
+                                    .arg(c.displayName));
                         } else {
                             c.anchorUid = ancestor.uid;
                             Time delta;
@@ -537,6 +665,7 @@ ImportResult parseXml(const QString &xml, const QString &directory)
                     v1Uids.insert(c.uid);
                 laneTracks[trackIndex].append(c);
                 laneEnds[trackIndex] = nextEnd;
+                if (lessTime(contentEnd, nextEnd)) contentEnd = nextEnd;
             }
             for (const auto &track : laneTracks) {
                 if (track.isEmpty()) continue;
@@ -560,6 +689,8 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     }
     if (!rebuild) break;
     }
+    if (originOut) *originOut = origin;
+    if (contentEndOut) *contentEndOut = contentEnd;
     // Attach spine transitions to the clip edges, like applyTransitionToSelected.
     auto twice = [](Time t) { Time out; return combine(t, t, false, out) ? out : t; };
     for (const auto &transition : transitions) {
@@ -615,7 +746,8 @@ ImportResult parseXml(const QString &xml, const QString &directory)
             result.warnings.append(QStringLiteral("transition の名前 %1 は未対応のため Cross Dissolve に置き換えました")
                 .arg(transition.name));
     }
-    result.resolvedFiles = found.size(); result.unresolvedFiles = missing.size();
+    nest.found += found; nest.missing += missing;
+    result.resolvedFiles = nest.found.size(); result.unresolvedFiles = nest.missing.size();
     if (result.videoTracks.isEmpty() && result.audioTracks.isEmpty()) {
         if (assetClipCount == 0) result.warnings.append(QStringLiteral("読み込めるクリップがありません。"));
         else result.error = QStringLiteral("読み込めるクリップがありません。");
@@ -625,6 +757,27 @@ ImportResult parseXml(const QString &xml, const QString &directory)
     if (result.audioTracks.isEmpty()) result.audioTracks.append(QVector<ClipInfo>{});
     return result;
 }
+ImportResult parseXml(const QString &xml, const QString &directory)
+{
+    // Each pass reads every media at the deepest level the passes so far kept
+    // a reference to it at, so its sequence does not depend on document order
+    // and, once a pass records no deeper level, every reference path stays
+    // within kMaxCompoundDepth. The passes end: a recorded level only grows
+    // (seeded from the previous pass, raised by qMax), it stays below
+    // kMaxCompoundDepth (a reference at that level is skipped, not recorded),
+    // and the media ids are finite.
+    QMap<QString, int> depths;
+    for (;;) {
+        Nesting nest;
+        nest.depths = depths;
+        ImportResult result = parseDocument(xml, directory, nest, nullptr, nullptr);
+        if (nest.depths == depths) {
+            result.sequences = nest.sequences;
+            return result;
+        }
+        depths = nest.depths;
+    }
+}
 ImportResult readFcpxml(const QString &filePath)
 {
     QFile file(filePath);
@@ -632,5 +785,54 @@ ImportResult readFcpxml(const QString &filePath)
     auto result = parseXml(QString::fromUtf8(file.readAll()), QFileInfo(filePath).absolutePath());
     if (result.title.trimmed().isEmpty()) result.title = QFileInfo(filePath).completeBaseName();
     return result;
+}
+bool applyImport(Timeline &timeline, ImportResult &result, QStringList *warnings)
+{
+    if (warnings) warnings->append(result.warnings);
+    if (result.title.trimmed().isEmpty()) return false;
+    // Timeline.cpp's kDefaultSequenceId: the first addSequence on a timeline
+    // without a sequence model also materializes it, so it is not a new id.
+    const QString defaultId = QStringLiteral("main");
+    const QString activeId = timeline.activeSequenceId().isEmpty() ? defaultId : timeline.activeSequenceId();
+    QMap<QString, QString> renamed; // media id -> id given by addSequence
+    QSet<QString> added;
+    // Each clip is rewritten once, from the ids it was parsed with.
+    auto rewrite = [&](QVector<QVector<ClipInfo>> &tracks) {
+        for (auto &track : tracks)
+            for (auto &clip : track)
+                if (renamed.contains(clip.sequenceRefId)) {
+                    clip.sequenceRefId = renamed.value(clip.sequenceRefId);
+                    clip.filePath = timeline_nesting::sequenceClipFilePath(clip.sequenceRefId);
+                }
+    };
+    auto rollback = [&] {
+        if (added.isEmpty()) return false;
+        QVector<TimelineSequence> kept;
+        for (const auto &sequence : timeline.sequences())
+            if (!added.contains(sequence.id)) kept.append(sequence);
+        timeline.setSequences(kept, activeId);
+        return false;
+    };
+    for (auto &sequence : result.sequences) {
+        rewrite(sequence.videoTracks);
+        rewrite(sequence.audioTracks);
+        QSet<QString> before;
+        for (const auto &existing : timeline.sequences()) before.insert(existing.id);
+        timeline.addSequence(sequence);
+        QStringList fresh;
+        for (const auto &existing : timeline.sequences())
+            if (!before.contains(existing.id) && existing.id != defaultId) fresh.append(existing.id);
+        if (fresh.size() != 1) {
+            if (warnings) warnings->append(QStringLiteral("入れ子シーケンスを追加できません: %1").arg(sequence.id));
+            return rollback();
+        }
+        renamed.insert(sequence.id, fresh.first());
+        added.insert(fresh.first());
+        sequence.id = fresh.first();
+    }
+    rewrite(result.videoTracks);
+    rewrite(result.audioTracks);
+    if (!timeline.createSequence(result.title, result.videoTracks, result.audioTracks)) return rollback();
+    return true;
 }
 } // namespace fcpx::xml

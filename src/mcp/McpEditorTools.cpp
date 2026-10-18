@@ -1976,20 +1976,24 @@ void McpEditorTools::registerWriteTools()
                 if (!requiredString(args, QStringLiteral("filePath"), &path, err)) return {};
                 auto *current = timeline();
                 if (!current) return setError(err, QStringLiteral("エディターを利用できません")), QJsonObject{};
-                const auto result = fcpx::xml::readFcpxml(path);
+                auto result = fcpx::xml::readFcpxml(path);
                 if (!result.error.isEmpty()) return setError(err, result.error), QJsonObject{};
-                if (!current->createSequence(result.title, result.videoTracks, result.audioTracks))
+                QStringList warnings;
+                if (!fcpx::xml::applyImport(*current, result, &warnings))
                     return setError(err, QStringLiteral("シーケンスを作成できません")), QJsonObject{};
+                QJsonArray sequences;
+                for (const auto &sequence : result.sequences) sequences.append(sequence.id);
                 return {{"ok", true}, {"activeId", current->activeSequenceId()},
                     {"resolvedFiles", result.resolvedFiles}, {"unresolvedFiles", result.unresolvedFiles},
-                    {"warnings", QJsonArray::fromStringList(result.warnings)}};
+                    {"sequences", sequences}, {"warnings", QJsonArray::fromStringList(warnings)}};
             })
     }, outputSchemaOf(QJsonObject{{"ok", QJsonObject{{"type", "boolean"}}},
         {"activeId", QJsonObject{{"type", "string"}}},
         {"resolvedFiles", QJsonObject{{"type", "integer"}}},
         {"unresolvedFiles", QJsonObject{{"type", "integer"}}},
+        {"sequences", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}},
         {"warnings", QJsonObject{{"type", "array"}, {"items", QJsonObject{{"type", "string"}}}}}},
-        {"ok", "activeId", "resolvedFiles", "unresolvedFiles", "warnings"})));
+        {"ok", "activeId", "resolvedFiles", "unresolvedFiles", "sequences", "warnings"})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_active_sequence"),

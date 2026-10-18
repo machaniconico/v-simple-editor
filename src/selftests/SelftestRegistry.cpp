@@ -1121,7 +1121,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
       "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
     { "fcpxml-import", "VEDITOR_FCPXML_IMPORT_SELFTEST", runFcpxmlImportSelftest, true,
-      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (24 gates)" },
+      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (28 gates)" },
     { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
       "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
     { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,

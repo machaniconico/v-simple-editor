@@ -405,20 +405,21 @@ static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QSt
 static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
 {
     if (!timeline || path.isEmpty()) return;
-    const auto result = fcpx::xml::readFcpxml(path);
+    auto result = fcpx::xml::readFcpxml(path);
     if (!result.error.isEmpty()) {
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), result.error);
         return;
     }
-    if (!timeline->createSequence(result.title, result.videoTracks, result.audioTracks)) {
+    QStringList warnings;
+    if (!fcpx::xml::applyImport(*timeline, result, &warnings)) {
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), QStringLiteral("シーケンスを作成できません。"));
         return;
     }
     QMessageBox report(QMessageBox::Information, QStringLiteral("FCPXML 読み込み"),
         QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
-            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(result.warnings.size())
+            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(warnings.size())
             .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
-    if (!result.warnings.isEmpty()) report.setDetailedText(result.warnings.join(QLatin1Char('\n')));
+    if (!warnings.isEmpty()) report.setDetailedText(warnings.join(QLatin1Char('\n')));
     report.exec();
 }
 
