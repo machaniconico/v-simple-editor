@@ -1,4 +1,5 @@
 #include "SequenceExport.h"
+#include "ExrSequenceWriter.h"
 #include "TimelineFrameRenderer.h"
 #include <QDir>
 #include <QFileInfo>
@@ -25,6 +26,7 @@ Settings Settings::fromJson(const QJsonObject &json, const QString &fallbackFold
     s.digits = json.value("sequenceDigits").toInt(s.digits);
     s.start = json.value("sequenceStart").toInt(s.start);
     s.keepAlpha = json.value("keepAlpha").toBool();
+    s.exrLinear = json.value("exrLinear").toBool();
     return s;
 }
 QString validate(const Settings &s)
@@ -37,8 +39,10 @@ QString validate(const Settings &s)
         || s.pattern.contains('\\') || s.pattern.contains(':'))
         return QStringLiteral("出力フォルダ・番号の桁数・開始番号・パターン (%d または %06d) を確認してください");
     const auto suffix = QFileInfo(s.pattern).suffix().toLower().toLatin1();
-    if (suffix != "png" && suffix != "tiff")
-        return QStringLiteral("連番の形式は PNG または TIFF を指定してください");
+    if (suffix == "exr" && !exrseq::encoderAvailable())
+        return QStringLiteral("この環境では EXR の書き出しに対応していません");
+    if (suffix != "png" && suffix != "tiff" && suffix != "exr")
+        return QStringLiteral("連番の形式は PNG、TIFF または EXR を指定してください");
     if (suffix == "tiff" && !QImageWriter::supportedImageFormats().contains("tiff"))
         return QStringLiteral("この環境では TIFF の書き出しに対応していません");
     return {};
@@ -81,6 +85,14 @@ QString write(Timeline *timeline, const Settings &s, QSize size, double fps,
             frame = opaque;
         }
         const QString path = fileName(s, f);
+        if (QFileInfo(s.pattern).suffix().compare(QLatin1String("exr"), Qt::CaseInsensitive) == 0) {
+            const QString exrError = exrseq::encodeFrame(frame, path,
+                {s.keepAlpha, exrseq::PixelType::Half, exrseq::Compression::Zip, s.exrLinear});
+            if (!exrError.isEmpty()) return QStringLiteral("%1: %2").arg(path, exrError);
+            ++frameCount;
+            if (progress) progress(static_cast<int>(100.0 * (f + 1) / frames));
+            continue;
+        }
         QSaveFile output(path);
         if (!output.open(QIODevice::WriteOnly)) return output.errorString();
         QImageWriter writer(&output, QFileInfo(s.pattern).suffix().toLower().toLatin1());

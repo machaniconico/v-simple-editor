@@ -70,6 +70,7 @@ struct ExportConfig {
     QString sequencePattern = "name_%06d.png";
     int sequenceDigits = 6;
     int sequenceStart = 0;
+    bool exrLinear = false; // sequence only, written to the job when the format is EXR
     void appendSequenceSettings(QJsonObject &json) const;
     HDRSettings hdrSettings; // extended HDR metadata
     bool exportMarkedRangeOnly = false;
@@ -108,6 +109,7 @@ public:
     ExportConfig config() const { return m_config; }
     // selftest: the config the dialog would accept right now (config() is set only on accept).
     ExportConfig currentConfigForTest() const { return currentSettings(); }
+    void applyPresetForTest(const ExportConfig &c) { applyPreset(c); }
     void setSourceIsHdr(bool hdr);
     void setMarkedRangeAvailable(bool hasRange);
 
@@ -151,6 +153,7 @@ private:
     QLineEdit *m_sequencePattern = nullptr;
     QSpinBox *m_sequenceDigits = nullptr;
     QSpinBox *m_sequenceStart = nullptr;
+    QCheckBox *m_exrLinear = nullptr;
     QString m_videoOutputBeforeSequence; // video file path, restored when leaving sequence mode
     QString m_sequenceOutputBeforeVideo; // sequence folder, restored when re-entering sequence mode
     ExportType m_lastExportType = ExportType::Video;

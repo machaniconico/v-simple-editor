@@ -671,7 +671,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
       "Structural project comparison: matching, properties, effects, transitions and epsilon (8 gates)" },
     { "img-sequence", "VEDITOR_IMG_SEQUENCE_SELFTEST", runImgSequenceSelftest, true,
-      "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
+      "PNG/TIFF/EXR sequence export, alpha, configuration and cancellation (10 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
       "ProRes/VP9 alpha export and opaque default path (7 gates)" },
     { "export-cfg", "VEDITOR_EXPORT_CFG_SELFTEST", runExportCfgSelftest, true,
