@@ -19,6 +19,9 @@
 #include <QAction>
 #include <QAbstractButton>
 #include <QPointer>
+#include <QDir>
+#include <QFileInfo>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -190,6 +193,31 @@ ClipInfo storyClip(const QString &name, double durationSec, int linkGroup = 0,
     c.linkGroup = linkGroup;
     c.leadInSec = leadInSec;
     return c;
+}
+
+// US-1306: pins QSettings "VSimpleEditor/Preferences" importPlacement for one fixture and
+// puts the previous value (or absence) back on scope exit.
+struct ImportPlacementPin {
+    QSettings prefs{QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences")};
+    QVariant saved = prefs.value(QStringLiteral("importPlacement"));
+    explicit ImportPlacementPin(ImportPlacement placement)
+    {
+        prefs.setValue(QStringLiteral("importPlacement"), static_cast<int>(placement));
+        prefs.sync();
+    }
+    ~ImportPlacementPin()
+    {
+        if (saved.isValid()) prefs.setValue(QStringLiteral("importPlacement"), saved);
+        else prefs.remove(QStringLiteral("importPlacement"));
+        prefs.sync();
+    }
+};
+
+QString importClipsJson(const TimelineTrack *track)
+{
+    ProjectData data;
+    data.audioTracks = {track->clips()};
+    return ProjectFile::toJsonString(data);
 }
 
 const ClipInfo *storyFind(const TimelineTrack *track, const QString &name, double *startSec = nullptr)
@@ -1507,6 +1535,127 @@ int runTrackOpsSelftest()
             ok = ok && caseOk;
         }
         gate(21, ok);
+    }
+    // US-1306 G22: importMedia honours track locks. Explicit index onto a locked V1 and
+    // AppendToFirstTrack with a locked V1 are refused (same text as dropMediaOnTrack, nothing
+    // changes, no undo point); the automatic ParallelTrack placement skips a locked empty V1/A1.
+    const QString importPath = QDir::current().absoluteFilePath(QStringLiteral("test_assets/e2e_clip.mp4"));
+    const QString lockedText = QStringLiteral("ロック中のトラックには配置できません");
+    if (!QFileInfo::exists(importPath))
+        std::fprintf(stderr, "[track-ops] G22-G24 fixture missing: %s\n", qPrintable(importPath));
+    {
+        const auto refuses = [&](ImportPlacement placement, int trackIndex, QString *line) {
+            ImportPlacementPin pin(placement);
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setLocked(true);
+            const QString v1Before = importClipsJson(t.trackAt(false, 0));
+            const QString a1Before = importClipsJson(t.trackAt(true, 0));
+            const auto serial = t.undoManager()->saveSerial();
+            QString err;
+            const bool imported = t.importMedia(importPath, trackIndex, 10.0, nullptr, &err);
+            const bool v1Same = importClipsJson(t.trackAt(false, 0)) == v1Before;
+            const bool a1Same = importClipsJson(t.trackAt(true, 0)) == a1Before;
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            *line = QStringLiteral("imported=%1 err=[%2] V1 same=%3 A1 same=%4 V=%5 A=%6 serial +%7")
+                        .arg(imported).arg(err).arg(v1Same).arg(a1Same)
+                        .arg(t.videoTrackCount()).arg(t.audioTrackCount()).arg(serialDelta);
+            return !imported && err == lockedText && v1Same && a1Same
+                && t.videoTrackCount() == 1 && t.audioTrackCount() == 1 && serialDelta == 0;
+        };
+        QString explicitLine, appendLine;
+        const bool explicitOk = refuses(ImportPlacement::ParallelTrack, 0, &explicitLine);
+        const bool appendOk = refuses(ImportPlacement::AppendToFirstTrack, -1, &appendLine);
+        bool autoOk = false;
+        QString autoLine;
+        {
+            ImportPlacementPin pin(ImportPlacement::ParallelTrack);
+            Timeline t;
+            const QVector<QVector<ClipInfo>> empty2{{}, {}};
+            t.restoreFromProject(empty2, empty2, 0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setLocked(true);
+            t.trackAt(true, 0)->setLocked(true);
+            QString err;
+            Timeline::MediaImportResult res;
+            const bool imported = t.importMedia(importPath, -1, -1.0, &res, &err);
+            autoOk = imported && t.trackAt(false, 0)->clipCount() == 0 && t.trackAt(true, 0)->clipCount() == 0
+                && t.trackAt(false, 1)->clipCount() == 1 && t.trackAt(true, 1)->clipCount() == 1
+                && res.videoTrackIndex == 1 && res.audioTrackIndex == 1 && t.videoTrackCount() == 2;
+            autoLine = QStringLiteral("imported=%1 V1=%2 V2=%3 A1=%4 A2=%5 resultV=%6 resultA=%7 (expect V1/A1 0, V2/A2 1)")
+                           .arg(imported).arg(t.trackAt(false, 0)->clipCount()).arg(t.trackAt(false, 1)->clipCount())
+                           .arg(t.trackAt(true, 0)->clipCount()).arg(t.trackAt(true, 1)->clipCount())
+                           .arg(res.videoTrackIndex).arg(res.audioTrackIndex);
+        }
+        std::fprintf(stderr, "[track-ops] G22 explicit locked V1: %s\n[track-ops] G22 append locked V1: %s\n"
+                     "[track-ops] G22 auto skips locked V1/A1: %s\n",
+                     qPrintable(explicitLine), qPrintable(appendLine), qPrintable(autoLine));
+        gate(22, explicitOk && appendOk && autoOk);
+    }
+    // US-1306 G23: a refused import (V2 overlap) leaves no partner track behind and no undo point.
+    {
+        ImportPlacementPin pin(ImportPlacement::ParallelTrack);
+        Timeline t;
+        // V2 holds a clip while only A1 exists, so a V2 import would need a new A2.
+        const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1)}, {storyClip("Y", 4.0)}};
+        t.restoreFromProject(video, QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+        storyBaseline(t);
+        const int vBefore = t.videoTrackCount();
+        const int aBefore = t.audioTrackCount();
+        const auto serial = t.undoManager()->saveSerial();
+        QString err;
+        const bool imported = t.importMedia(importPath, 1, 1.0, nullptr, &err);
+        const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+        std::fprintf(stderr, "[track-ops] G23 overlap import: imported=%d err=[%s] V %d->%d A %d->%d serial +%d "
+                     "(expect 0, err set, A stays %d)\n", imported, qPrintable(err), vBefore, t.videoTrackCount(),
+                     aBefore, t.audioTrackCount(), serialDelta, aBefore);
+        gate(23, aBefore == 1 && !imported && err == QStringLiteral("指定位置にクリップを配置できません") && t.videoTrackCount() == vBefore
+                     && t.audioTrackCount() == aBefore && serialDelta == 0);
+    }
+    // US-1306 G24: link groups come from allocateLinkGroup(), which skips numbers in use.
+    // (1) importMedia beside an existing group 1 pair; (2) a separate fixture with groups {1, 2}
+    // and a split that does not import first (m_nextLinkGroup stays 1 after setClips).
+    {
+        bool importOk = false;
+        QString importLine;
+        {
+            ImportPlacementPin pin(ImportPlacement::ParallelTrack);
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            QString err;
+            const bool imported = t.importMedia(importPath, 0, 10.0, nullptr, &err);
+            const int vGroup = t.trackAt(false, 0)->clips().last().linkGroup;
+            const int aGroup = t.trackAt(true, 0)->clips().last().linkGroup;
+            importOk = imported && vGroup > 0 && vGroup == aGroup && vGroup != 1;
+            importLine = QStringLiteral("imported=%1 new V group=%2 A group=%3 (expect equal, not 1)")
+                             .arg(imported).arg(vGroup).arg(aGroup);
+        }
+        bool splitOk = false;
+        QString splitLine;
+        {
+            Timeline t;
+            const QVector<QVector<ClipInfo>> video{{storyClip("X", 4.0, 1), storyClip("Y", 4.0, 2)}};
+            const QVector<QVector<ClipInfo>> audio{{storyClip("Xa", 4.0, 1), storyClip("Ya", 4.0, 2)}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            QString err;
+            const bool split = t.splitClipByIndex(false, 0, 0, 2.0, &err);
+            const QVector<ClipInfo> v = t.trackAt(false, 0)->clips();
+            const QVector<ClipInfo> a = t.trackAt(true, 0)->clips();
+            const int rightV = v.size() == 3 ? v[1].linkGroup : -1;
+            const int rightA = a.size() == 3 ? a[1].linkGroup : -1;
+            splitOk = split && v.size() == 3 && a.size() == 3 && rightV > 0 && rightV == rightA
+                && rightV != 1 && rightV != 2 && v[0].linkGroup == 1 && v[2].linkGroup == 2;
+            splitLine = QStringLiteral("split=%1 V clips=%2 right V group=%3 right A group=%4 (expect equal, not 1/2) err=[%5]")
+                            .arg(split).arg(v.size()).arg(rightV).arg(rightA).arg(err);
+        }
+        std::fprintf(stderr, "[track-ops] G24 (1) import: %s\n[track-ops] G24 (2) split: %s\n",
+                     qPrintable(importLine), qPrintable(splitLine));
+        gate(24, importOk && splitOk);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.

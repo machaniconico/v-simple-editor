@@ -1458,6 +1458,9 @@ public:
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
     // Calls of remapCarriersAfterCrossTrackMove on this Timeline (selftest).
     quint64 crossTrackMoveRemapCountForTest() const { return m_crossTrackMoveRemapCount; }
+    // US-1306: next link-group number that no V / A clip of the current
+    // sequence uses (m_nextLinkGroup is not advanced by load / import).
+    int allocateLinkGroup();
 signals:
     void skimPreviewRequested(const QImage &image);
     void skimPreviewCleared();
@@ -1819,7 +1822,6 @@ private:
     // Owned by Qt object tree; created in the ctor.
     QTimer *m_emitSequenceTimer = nullptr;
 
-    int allocateLinkGroup() { return m_nextLinkGroup++; }
     void onTrackSelectionChanged(int primaryIndex, bool additive);
     void showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos);
     void unlinkClipGroup(int linkGroup);

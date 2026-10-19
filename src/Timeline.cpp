@@ -5388,64 +5388,51 @@ bool Timeline::importMedia(const QString &filePath,
     const ImportPlacement placement = static_cast<ImportPlacement>(
         prefs.value("importPlacement", static_cast<int>(ImportPlacement::ParallelTrack)).toInt());
 
-    // addVideoTrack(false) / addAudioTrack(false) below skip the capture; take
-    // it before any track is created so undoing the import restores live state.
-    captureExternalTrackState();
+    // US-1306: decide the target indices first, validate against the tracks
+    // that already exist (lock + planDrop), and only then create tracks. A
+    // new track is empty and unlocked, so it can never fail validation; every
+    // failing return therefore happens before any track is created.
+    const QString lockedMessage = QStringLiteral("ロック中のトラックには配置できません");
     int videoTrackIdx = -1;
     int audioTrackIdx = -1;
+    bool placementFixed = false;
     if (requestedTrackIndex >= 0) {
         // MCP は指定されたトラック番号をそのまま V/A のペアに使う。
         // 片方だけ増やすとリンク済み素材が孤立するため、必要なら両方を同時に作る
         // (片側だけ置く kind ではその側だけ)。
-        while (placeVideo && m_videoTracks.size() <= requestedTrackIndex)
-            addVideoTrack(false);
-        while (placeAudio && m_audioTracks.size() <= requestedTrackIndex)
-            addAudioTrack(false);
         videoTrackIdx = requestedTrackIndex;
         audioTrackIdx = requestedTrackIndex;
+        placementFixed = true;
     } else if (placement == ImportPlacement::AppendToFirstTrack) {
         // Extend the existing sequence: always V1/A1, appending after
         // whatever clips already live there. Create V1/A1 if the project
         // starts with zero tracks.
-        if (placeVideo && m_videoTracks.isEmpty())
-            addVideoTrack(false);
-        if (placeAudio && m_audioTracks.isEmpty())
-            addAudioTrack(false);
         videoTrackIdx = 0;
         audioTrackIdx = 0;
+        placementFixed = true;
     } else {
-        // Premiere-style stacking: each drop lands on the first EMPTY video
-        // track (creating V<n>/A<n> as needed). First drop fills V1/A1,
-        // second fills V2/A2, and so on.
-        if (placeVideo) {
-            for (int t = 0; t < m_videoTracks.size(); ++t) {
-                if (m_videoTracks[t] && m_videoTracks[t]->clipCount() == 0) {
-                    videoTrackIdx = t;
-                    break;
-                }
+        // Premiere-style stacking: each drop lands on the first EMPTY and
+        // unlocked video track (creating V<n>/A<n> as needed). First drop
+        // fills V1/A1, second fills V2/A2, and so on.
+        const auto firstFreeTrack = [](const QVector<TimelineTrack *> &tracks) {
+            for (int t = 0; t < tracks.size(); ++t) {
+                if (tracks[t] && tracks[t]->clipCount() == 0 && !tracks[t]->isLocked())
+                    return t;
             }
-            if (videoTrackIdx < 0) {
-                addVideoTrack(false);
-                videoTrackIdx = m_videoTracks.size() - 1;
-            }
-        }
-        if (placeAudio) {
-            for (int t = 0; t < m_audioTracks.size(); ++t) {
-                if (m_audioTracks[t] && m_audioTracks[t]->clipCount() == 0) {
-                    audioTrackIdx = t;
-                    break;
-                }
-            }
-            if (audioTrackIdx < 0) {
-                addAudioTrack(false);
-                audioTrackIdx = m_audioTracks.size() - 1;
-            }
-        }
+            return static_cast<int>(tracks.size());
+        };
+        if (placeVideo)
+            videoTrackIdx = firstFreeTrack(m_videoTracks);
+        if (placeAudio)
+            audioTrackIdx = firstFreeTrack(m_audioTracks);
     }
-
-    qInfo() << "Timeline::addClip routing video→V" << (videoTrackIdx + 1)
-            << "audio→A" << (audioTrackIdx + 1)
-            << "file=" << filePath;
+    if (placementFixed) {
+        // 配置先が固定のモード (明示 index / AppendToFirstTrack) はロック中なら拒否する。
+        const TimelineTrack *lockedV = placeVideo ? m_videoTracks.value(videoTrackIdx, nullptr) : nullptr;
+        const TimelineTrack *lockedA = placeAudio ? m_audioTracks.value(audioTrackIdx, nullptr) : nullptr;
+        if ((lockedV && lockedV->isLocked()) || (lockedA && lockedA->isLocked()))
+            return fail(lockedMessage);
+    }
 
     auto trackEnd = [](const TimelineTrack *track) {
         double end = 0.0;
@@ -5455,22 +5442,41 @@ bool Timeline::importMedia(const QString &filePath,
             end += qMax(0.0, existing.leadInSec) + existing.effectiveDuration();
         return end;
     };
-    TimelineTrack *videoTrack = placeVideo ? m_videoTracks.value(videoTrackIdx, nullptr) : nullptr;
-    TimelineTrack *audioTrack = placeAudio ? m_audioTracks.value(audioTrackIdx, nullptr) : nullptr;
-    if ((placeVideo && !videoTrack) || (placeAudio && !audioTrack))
-        return fail(QStringLiteral("取り込み先のトラックを準備できません"));
+    const TimelineTrack *existingVideo = placeVideo ? m_videoTracks.value(videoTrackIdx, nullptr) : nullptr;
+    const TimelineTrack *existingAudio = placeAudio ? m_audioTracks.value(audioTrackIdx, nullptr) : nullptr;
 
     // 指定位置は空きへ正確に入れ、既存クリップと重なる要求は MCP から
     // 黙って丸めない。startSec 省略時だけ対象トラック末尾へ追記する。
     const double videoDropTime = requestedStartSec >= 0.0
-        ? requestedStartSec : trackEnd(videoTrack);
+        ? requestedStartSec : trackEnd(existingVideo);
     // MCP の指定トラックでは V/A を同じ linkGroup の一組として扱うため、
     // startSec 省略時も音声だけ別の末尾へ置かず video の開始時刻を共有する。
     // GUI の従来の自動トラック選択では、元の V/A 各トラック末尾規則を維持する。
     const double audioDropTime = (requestedTrackIndex >= 0 && placeVideo)
         ? videoDropTime
-        : (requestedStartSec >= 0.0 ? requestedStartSec : trackEnd(audioTrack));
+        : (requestedStartSec >= 0.0 ? requestedStartSec : trackEnd(existingAudio));
     const double importDuration = qMax(0.0, clip.effectiveDuration());
+    if (existingVideo && !existingVideo->planDrop(videoDropTime, importDuration).valid)
+        return fail(QStringLiteral("指定位置にクリップを配置できません"));
+    if (existingAudio && !existingAudio->planDrop(audioDropTime, importDuration).valid)
+        return fail(QStringLiteral("指定位置にクリップを配置できません"));
+
+    // addVideoTrack(false) / addAudioTrack(false) below skip the capture; take
+    // it before any track is created so undoing the import restores live state.
+    captureExternalTrackState();
+    while (placeVideo && m_videoTracks.size() <= videoTrackIdx)
+        addVideoTrack(false);
+    while (placeAudio && m_audioTracks.size() <= audioTrackIdx)
+        addAudioTrack(false);
+
+    qInfo() << "Timeline::addClip routing video→V" << (videoTrackIdx + 1)
+            << "audio→A" << (audioTrackIdx + 1)
+            << "file=" << filePath;
+
+    TimelineTrack *videoTrack = placeVideo ? m_videoTracks.value(videoTrackIdx, nullptr) : nullptr;
+    TimelineTrack *audioTrack = placeAudio ? m_audioTracks.value(audioTrackIdx, nullptr) : nullptr;
+    if ((placeVideo && !videoTrack) || (placeAudio && !audioTrack))
+        return fail(QStringLiteral("取り込み先のトラックを準備できません"));
     TimelineTrack::DropPlan videoPlan;
     TimelineTrack::DropPlan audioPlan;
     if (placeVideo) {
@@ -5596,11 +5602,26 @@ bool Timeline::importMedia(const QString &filePath,
     return true;
 }
 
+int Timeline::allocateLinkGroup()
+{
+    QSet<int> used;
+    for (const auto *track : m_videoTracks)
+        for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+    for (const auto *track : m_audioTracks)
+        for (const auto &clip : track->clips()) used.insert(clip.linkGroup);
+    int group = 0;
+    do { group = m_nextLinkGroup++; } while (used.contains(group));
+    return group;
+}
+
 void Timeline::addClip(const QString &filePath)
 {
     // GUI の従来経路も MCP と同じ取り込み実装を使い、配置・リンク・Undo が
-    // 別々に進化しないようにする。GUI 側は失敗理由を表示する契約を持たない。
-    importMedia(filePath);
+    // 別々に進化しないようにする。取り込みに失敗した時は理由をステータスバーに 5 秒
+    // 表示する(ルール (60)、非モーダル)。
+    QString err;
+    if (!importMedia(filePath, -1, -1.0, nullptr, &err) && !err.isEmpty())
+        emit statusMessageRequested(err, 5000);
 }
 
 TimelineTrack *Timeline::primaryErgoTrack() const

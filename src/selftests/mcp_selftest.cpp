@@ -7091,6 +7091,57 @@ int runMcpSelftest()
             "changed its response");
     }
 
+    // G193 (US-1306): import_media honours a locked track. A1 locked + explicit trackIndex 0 is
+    // refused with the drop-path wording and the timeline keeps its clip counts.
+    {
+        Timeline* lockTimeline = projectInfoWindow.m_timeline;
+        ClipInfo lockedV;
+        lockedV.filePath = QStringLiteral("/selftests/mcp-lock-v.mp4");
+        lockedV.duration = lockedV.outPoint = 2.0;
+        ClipInfo lockedA = lockedV;
+        lockedA.filePath = QStringLiteral("/selftests/mcp-lock-a.wav");
+        lockTimeline->restoreFromProject(
+            QVector<QVector<ClipInfo>>{{lockedV}}, QVector<QVector<ClipInfo>>{{lockedA}},
+            0.0, -1.0, -1.0, 100);
+        const QString lockImportPath = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        const QJsonObject lockResponse = callProjectInfoTool(
+            1931, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true}});
+        const bool lockSet = toolPayload(lockResponse).value(QStringLiteral("ok")).toBool(false)
+            && lockTimeline->trackAt(true, 0)->isLocked();
+        const QJsonObject importResponse = callProjectInfoTool(
+            1932, QStringLiteral("import_media"), QJsonObject{
+                {QStringLiteral("filePath"), lockImportPath},
+                {QStringLiteral("trackIndex"), 0}, {QStringLiteral("startSec"), 10.0}});
+        const bool importIsError = toolResult(importResponse).value(QStringLiteral("isError")).toBool(false);
+        const QString importError = toolErrorText(importResponse);
+        const int v1Count = lockTimeline->trackAt(false, 0)->clipCount();
+        const int a1Count = lockTimeline->trackAt(true, 0)->clipCount();
+        const QJsonObject lockedReadback = toolPayload(callProjectInfoTool(
+            1933, QStringLiteral("get_timeline"), {}));
+        const QJsonArray readbackVideo = lockedReadback.value(QStringLiteral("video")).toArray();
+        const QJsonArray readbackAudio = lockedReadback.value(QStringLiteral("audio")).toArray();
+        const int mcpV1Clips = readbackVideo.isEmpty() ? -1
+            : readbackVideo.at(0).toObject().value(QStringLiteral("clips")).toArray().size();
+        const int mcpA1Clips = readbackAudio.isEmpty() ? -1
+            : readbackAudio.at(0).toObject().value(QStringLiteral("clips")).toArray().size();
+        std::fprintf(stderr, "mcp G193 lockSet=%d import isError=%d error=[%s] V1 clips=%d A1 clips=%d "
+                     "get_timeline V1 clips=%d A1 clips=%d "
+                     "(expect isError, locked wording, 1, 1, 1, 1)\n", lockSet, importIsError,
+                     qPrintable(importError), v1Count, a1Count, mcpV1Clips, mcpA1Clips);
+        tallyObserved(193, observeTerm(193, "A1 locked", lockSet)
+            && observeTerm(193, "import refused", importIsError)
+            && observeTerm(193, "locked wording",
+                           importError.contains(QStringLiteral("ロック中のトラックには配置できません")))
+            && observeTerm(193, "V1 clip count unchanged", v1Count == 1)
+            && observeTerm(193, "A1 clip count unchanged", a1Count == 1)
+            && observeTerm(193, "get_timeline video[0].clips unchanged", mcpV1Clips == 1)
+            && observeTerm(193, "get_timeline audio[0].clips unchanged", mcpA1Clips == 1),
+            "import_media placed a clip on a locked track or reported a different error");
+    }
+
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end";
     return tally.finish("mcp");
