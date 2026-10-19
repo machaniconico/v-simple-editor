@@ -34,11 +34,13 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - CMX3600 EDL / FCPXML import into a new sequence (MCP `import_edl` / `import_fcpxml`)
   - Wave 8: FCPXML connected clips (anchored child asset-clips) are placed into lanes (lane 0 first, then by |lane|, up to 2 video and 2 audio tracks); audio-only assets go to audio tracks
   - Wave 9: FCPXML connected clips inside a `<gap>` are imported (anchored on the gap), J-cut connected clips that start before their parent are imported (the part before 0 s is trimmed with the warning 「接続クリップをタイムライン 0 で切り詰めました: <name> / <ref>」; a clip that lies entirely before 0 s is not imported and is skipped with 「クリップの値が不正です (接続位置): <name> / <ref>」), each descendant of a parent whose time range is invalid (duration 0, or an invalid offset / start) is skipped with its own warning, and a spine with no asset-clips yields an empty sequence plus a warning instead of an error. FCPXML clips keep the source length only when the `<asset>` declares a `duration` and its `start` is 0 (an asset with a non-zero `start` may allow the right edge to extend `start` seconds less than the source end; to be confirmed in Wave 10) (otherwise the used range is the limit, as before), and EDL clips only when the media file is found and the probed length is positive; the right edge of an imported EDL clip can be extended only when the probed length is longer than its used range (otherwise the previous value is kept); for an EDL dissolve of positive length, the outgoing clip can always be extended by the dissolve handle (dissolve length x speed) regardless of the media; growth beyond the handle up to the source length is possible only when the file is found and the probed length is positive and longer than the handle-inclusive length.
+  - Wave 13: FCPXML import has no track limit (every lane gets its own track) and reads spine transitions (edge cross-dissolves / fades), compound clips (`ref-clip` as nested sequences), multicam clips (`mc-clip` flattened to the active angle) and `clip` / `sync-clip` containers; connected clips become primary-storyline connections; FCPXML export writes upper video tracks as lanes and connections as connected clips (the transition timing and the `mc-clip` attributes are unconfirmed against a real Final Cut Pro file, see 「FCPXML 読み込みの対応表」)
 - Undo / redo (unlimited history)
 - Wave 11: a cross-track clip drop, including the linked partner and a track created for it, is one undo step ("クリップをトラック間移動"); roto, parent links and track mattes follow clips through cross-track drag, link drops and range ripple (transcript edit)
 - Wave 12: dropping a clip onto the new-track band (a permanent 10 px row after the last video track / the last audio track) creates the track and moves the clip there as one undo step ("クリップを新しいトラックへ移動"; the linked partner follows onto the other kind's track with the same number, created if it does not exist); a clip of the other kind and media-bin drops are ignored (US-1117, `roto` selftest, 44 gates)
 - Wave 12: every clip carries a stable `uid` (minted at insert, load, paste and split; a colliding uid is re-minted, also after decompose) that project diffs ignore, and roto, parent links and track mattes are keyed on it first, so pasted clones keep their own entries and a reorder across a preceding clip no longer drops them (US-1118 / US-1119, `clip-uid` selftest 5 gates, `matte-ssot` 13 gates)
 - Wave 12 (undo): matte settings and the bus panel's bus assignment / gain / mute / solo / name edits push no undo point of their own; they are absorbed into the current undo point (an absorbed edit discards redo), so undoing the next edit no longer loses a matte; assigning a bus from the mixer strip combo is its own undo point ("トラックのバスを変更", 1 Ctrl+Z) (US-1107)
+- Wave 13: a clip can be connected to a V1 clip and follows it (Edit menu / context menu 「主ストーリーラインに接続」 / 「接続を解除」, MCP `connect_clip` / `disconnect_clip`); the opt-in 「主ストーリーライン (マグネティック)」 mode (`timeline.storyline_mode`, default OFF) ripples V1 only and keeps it gap-free
 - Snap to grid & playhead
 - Timeline zoom
 - J/K/L shuttle playback
@@ -97,7 +99,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - De-esser listen follows its own track through track delete / add / move and their undo / redo (Wave 11)
 - Wave 12: per-clip 4-band EQ (right-click an audio clip > "クリップ EQ…" opens the audio clip editor's EQ panel; one widget operation = one undo step, "クリップ EQ を変更"; off by default, nested clips follow child-first-else-parent), applied in playback (float one-pass per entry) and in the export mix (US-1110 / US-1111 / US-1126, `clip-eq` selftest 6 gates, `audio-fixture` variant h)
 - Wave 12: per-track pan and fader gain are saved in the project as `audioMixer.trackMix` (written only when some track has a gain other than 1.0 or a pan other than 0; the array then lists every track) and applied to playback and export; the mixer strips gain a pan slider and a bus-assignment combo ("マスター" + bus names; undo "トラックのパンを変更" / "トラックのバスを変更"); a clip pan other than 0 without track FX now exports through the DSP path so the pan is applied (export exception; a project saved with a fader gain other than 1.0 now keeps that gain after reload, where it used to return to 1) (US-1114 / US-1115, `mixer-dock` selftest 13 gates, `audio-fixture` variants i / j)
-- Wave 12: AUX sends - the audio bus panel's "センド" table sets a level (dB, -60 dB or lower removes it) and pre/post-fader per track and bus (undo "AUX センドを変更"); playback mixes the sends in, and the export mix now applies the bus assignment, bus gain / mute / solo and the sends (export exception; the send is a parallel add without the bus FX; track solo is still not applied to export (track mute is)) (US-1122 / US-1123, `aux-send` selftest 3 gates, `audio-fixture` variants k / l / m)
+- Wave 12: AUX sends - the audio bus panel's "センド" table sets a level (dB, -60 dB or lower removes it) and pre/post-fader per track and bus (undo "AUX センドを変更"); playback mixes the sends in, and the export mix now applies the bus assignment, bus gain / mute / solo and the sends (export exception; the send is a parallel add without the bus FX; track solo was not applied to export until Wave 13 (US-1209 applies it; track mute already was)) (US-1122 / US-1123, `aux-send` selftest 3 gates, `audio-fixture` variants k / l / m)
 - Wave 12 (export audio): an export whose V1 is empty but which has video on an upper track gets an audio track on every entry point (normal / mobile / MCP `export_video` / batch with auto loudness ON or OFF): silent when there is no audio clip, mixed when there is; the one exception is a batch task with auto loudness ON and no audio clip, which is still rejected as silent (the existing limit below; only batch OFF writes the silent track) (export exception; projects with V1 clips and projects without any video are unchanged) (US-1109, `mcp` G188-emptyV1 re-pinned)
 - Wave 12 (auto loudness): the audio mix and the loudness measurement run off the GUI thread for normal / mobile exports (progress dialog "音声を準備しています…" with cancel) and for MCP `export_video` with `autoLoudness=true` (`get_export_status` answers while preparing, G189); the mix is split into a GUI-side plan and a timeline-free executor in `AudioExportMix` (US-1104 / US-1105 / US-1127, `loudness-auto` selftest 15 gates). Batch export stays synchronous
 - Manual loudness-normalization gain and normalizer amount are now saved in the project (defect fix: previously reset on reopen)
@@ -149,7 +151,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Audio-only export (m4a / wav / mp3, PCM intermediate mix)
 - User export presets (save / delete current settings, resolved by name from MCP `export_video`; since Wave 10 a preset with auto loudness ON also normalizes the audio of `export_video` when `autoLoudness` is omitted, behavior change)
 - Alpha export on ProRes 4444 / 4444 XQ or VP9 (yuva420p) (`keepAlpha`, off by default; transparent areas stay transparent in the output)
-- Image-sequence export (PNG / TIFF, GUI export dialog only)
+- Image-sequence export (PNG / TIFF, GUI export dialog only); Wave 13: EXR (display-referred or scene-linear) when the bundled avcodec has the exr encoder
 - Export metadata embedding (title / author / copyright / comment, MCP `export_video` `metadata`)
 - Subtitle export mode: none / burn-in / mov_text embedded stream / both (MP4 / MOV only, GUI export dialog only)
 - Screen recorder (cross-platform)
@@ -237,7 +239,7 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | 名前 | 何をするか | Undo |
 |---|---|---|
 | `get_project_info` | プロジェクト情報を読み取る | なし |
-| `get_timeline` | タイムラインを読み取る。各クリップの `leadIn` / `trailOut` は `{type, durationSec, alignment, easing, softness, borderWidth, borderColor}`、`overlap` は隣接クリップとのトランジションで実際に重なる秒数 `{leadInSec, trailOutSec}` を返す。各クリップに `colorCorrection`（28 項目の色補正値）と `lut`（`{filePath, intensity}`）、各トラックに `name` / `color`（`#rrggbb`、未設定は空文字）も返る（いずれも既存フィールドと `required` は不変） | なし |
+| `get_timeline` | タイムラインを読み取る。各クリップの `leadIn` / `trailOut` は `{type, durationSec, alignment, easing, softness, borderWidth, borderColor}`、`overlap` は隣接クリップとのトランジションで実際に重なる秒数 `{leadInSec, trailOutSec}` を返す。各クリップに `colorCorrection`（28 項目の色補正値）と `lut`（`{filePath, intensity}`）、各トラックに `name` / `color`（`#rrggbb`、未設定は空文字）も返る（いずれも既存フィールドと `required` は不変）。Wave 13 から、接続中のクリップには `anchorUid` / `anchorOffsetSec` も返る (接続の無いクリップは従来どおり) | なし |
 | `get_frame` | 指定時刻の合成フレームを PNG で返す（既定 640px 以下・1MB 以内） | なし |
 | `get_captions` | 字幕を読み取る | なし |
 | `get_export_status` | `export_video` ジョブの状態・進捗を返す | なし |
@@ -250,9 +252,11 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `open_project` | 指定パスのプロジェクトを読み込む（未保存確認なし） | なし |
 | `select_clip` | 指定クリップを選択する（`kind` / `trackIndex` 省略時は video / 0） | なし |
 | `clear_selection` | 選択をすべて解除する | なし |
-| `split_clip` | クリップを分割する | あり |
-| `delete_clip` | クリップを削除する | あり |
-| `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する） | あり |
+| `split_clip` | クリップを分割する。接続先のクリップを分割すると、接続中の各クリップは位置を変えずに左右どちらかの片に付け替えられる (Wave 13) | あり |
+| `delete_clip` | クリップを削除する。主ストーリーラインの接続先 (V1) を削除すると、接続クリップも連動して削除される (Wave 13。ロック中のトラックの接続クリップと、削除される区間の外にはみ出した接続クリップは削除せず接続を解除して警告) | あり |
+| `connect_clip` | 指定クリップ (と linkGroup が同じクリップ) を V1 のクリップ (`anchorClipIndex`。`anchorTrackIndex` は 0 のみ) に接続する。接続したクリップは接続先の移動・トリム・速度変更に追従する。`get_timeline` の各クリップに接続中は `anchorUid` / `anchorOffsetSec` が付く。応答は `{ok, anchorUid, anchorOffsetSec, warnings}` | あり |
+| `disconnect_clip` | 指定クリップ (と linkGroup が同じクリップ) の V1 への接続を解除する (位置は変わらない)。接続されていないクリップはエラー。応答は `{ok, warnings}` | あり |
+| `move_clip` | クリップを移動する（`newTrackIndex` で別トラックへ。既定プロジェクトは V1/A1 の 1 段なので、先に `run_command` の「ビデオトラックを追加」を実行する。存在しないトラックを指定するとエラー文でそのコマンド id を案内する。V1 のクリップに接続クリップがあるときは、接続クリップも一緒に動く (Wave 13)） | あり |
 | `set_clip_property` | クリップのプロパティ（volume / opacity / speed / pan / videoScale / reversed / autoOrient）を変更する。`speed` と `reversed` はリンクした音声クリップにも同時に適用される。`autoOrient`（boolean）はモーションパスの進行方向へクリップを自動回転させる（`get_timeline` の各クリップに `autoOrient` が返る） | あり |
 | `trim_clip` | edge=in は開始位置を保ったまま timeSec 時点の内容を新しい先頭にし、以降が (timeSec−開始) だけ左へ詰まる（RippleIn）。edge=out は末尾を timeSec にし後続が詰まる（RippleOut）。kind は video のみだが、同じ linkGroup の音声クリップも同じ量だけトリムされる（ripple 既定 true） | あり |
 | `set_transition` | `kind` 既定 `video`: V1 のクリップにトランジションを設定する（FadeIn は先頭、その他は末尾、None で解除）。`type` には `MorphCut`（オプティカルフローで A/B を変形しながらつなぐモーフカット）も指定できる。ビデオトランジションはプレビューだけでなく書き出しにも反映される。`kind:"audio"` では指定音声トラック（`trackIndex`）のクリップにコンスタントパワーの音声トランジションを設定する。音声で使える `type` は `CrossDissolve`（隣接クリップとのクロスフェード）/ `FadeIn` / `FadeOut` のみで、None を含む他の type はエラー。`durationSec` は 0.1..5.0（既定 0.5）。音声側の変更は映像へミラーしない。`alignment`（`Center` / `Start` / `End`、既定 Center）と `easing`（`Linear` / `EaseIn` / `EaseOut` / `EaseInOut`、既定 Linear）は映像・音声どちらでも指定できる。`softness`（0..1）/ `borderWidth`（0..50 px）/ `borderColor`（`#RRGGBB`）はワイプ・バーンドア・アイリス・クロックワイプ系だけに効き、他の type では無視して `warning` を返す | あり |
@@ -287,13 +291,13 @@ MCP の変更系ツールは確認ダイアログを出さず、原則として�
 | `group_clips` | 別々のトラックのクリップをグループ化する。`clips`（`{kind, trackIndex, clipIndex}` の配列、2 件以上）を指定する。応答は `{ok, linkGroup, undoRecorded}` | あり |
 | `ungroup_clips` | 指定クリップのグループを解除する。`clips`（配列、1 件以上） | あり |
 | `import_edl` | `filePath` の CMX3600 EDL をプロジェクトの FPS で新規シーケンスへ読み込む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
-| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane 0 を必ず採用し、残りは lane 番号の絶対値が小さい順に、映像・音声とも最大 2 トラックまで（超えた lane は警告）。音声専用 asset-clip は音声トラックに置く。gap の子の接続クリップと親より前に始まる接続クリップ（J カット。0 秒より前に全体が出るものは「クリップの値が不正です (接続位置): …」で読み飛ばし、一部だけ出るものは「接続クリップをタイムライン 0 で切り詰めました: …」の警告で切り詰める）も取り込み、接続クリップを持つ親の時刻範囲が不正（duration が 0、または offset / start の計算が不正）な場合は、その親とその接続クリップを警告付きで読み飛ばす。asset-clip が 0 本の spine は空のシーケンス + 警告。FCPXML では <asset> に duration があれば素材の全長を保持する（asset の start が 0 でなくても同じ。無ければ使用範囲まで）。transition / 複合クリップ / ref-clip / マルチカムは読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, warnings}` | あり（1 回） |
+| `import_fcpxml` | `filePath` の FCPXML の spine 直下 asset-clip と、アンカーの子要素の接続クリップを lane に取り込み、新規シーケンスへ読み込む。lane は 0 を先頭に番号の絶対値が小さい順に並べ、飛び番を詰めて 1 lane 1 トラックで取り込む (トラック数の上限なし。Wave 13)。音声専用 asset-clip は音声トラックに置く。gap の子の接続クリップと親より前に始まる接続クリップ（J カット。0 秒より前に全体が出るものは「クリップの値が不正です (接続位置): …」で読み飛ばし、一部だけ出るものは「接続クリップをタイムライン 0 で切り詰めました: …」の警告で切り詰める）も取り込み、接続クリップを持つ親の時刻範囲が不正（duration が 0、または offset / start の計算が不正）な場合は、その親とその接続クリップを警告付きで読み飛ばす。asset-clip が 0 本の spine は空のシーケンス + 警告。FCPXML では <asset> に duration があれば素材の全長を保持する（asset の start が 0 でなくても同じ。無ければ使用範囲まで）。Wave 13 から transition は前後のクリップの両縁のクロスディゾルブ (先頭・末尾はフェード)、複合クリップ (ref-clip) はネストシーケンス、マルチカム (mc-clip) は有効アングルに平坦化、clip / sync-clip は子を平坦化して取り込み、接続クリップは主ストーリーラインへの接続 (anchorUid / anchorOffsetSec) として取り込む (transition の時刻配置と mc-clip の属性は実機未確認)。それ以外の要素は読み飛ばして警告に積む。未解決素材はオフラインになる。応答は `{ok, activeId, resolvedFiles, unresolvedFiles, sequences, warnings}` (`sequences` は取り込んだ入れ子シーケンスの ID) | あり（1 回） |
 
 `export_video` には書き出しプリセット名を渡す `preset`（組み込み → ユーザープリセットの順に解決。他の引数を併記するとそちらが優先）と、ProRes 4444 / 4444 XQ または VP9（yuva420p）でアルファを保持する `keepAlpha` / `proresProfile` があります（`keepAlpha` は `videoCodec` が `prores` かつ `proresProfile` が 4 または 5、または `videoCodec` が VP9 系のときだけ受理）。`metadata`（`title` / `author` / `copyright` / `comment` の各文字列、いずれも省略可）を指定すると、非空の項目だけが書き出しファイルへメタデータとして埋め込まれます。連番静止画書き出し・字幕の mov_text 埋め込みは書き出しダイアログの機能で、`export_video` の引数には含まれず、MCP 経由の書き出しには適用されません。
 
 Wave 10 から `export_video` は自動ラウドネス正規化の任意引数 `autoLoudness`(boolean)と `targetLufs`(number、-70..-1、LUFS)を受け付けます (ツールの追加はなく、`outputSchema` / `required` も変わりません)。解決順は「明示した引数 > `preset` で指定したプリセットの値 > OFF(`targetLufs` は -14)」です。**挙動変更: `autoLoudness` を省略したときは指定プリセットの `autoLoudness` / `targetLufs` に従います。自動ラウドネスが ON のユーザープリセットを `preset=` で使っている既存の MCP 呼び出しは、引数を足さなくても書き出しの音量が正規化されるようになり、従来と出力音量が変わります。従来どおりにするには `autoLoudness=false` を明示してください。** 引数を省略し、プリセットも無い (または OFF のプリセット)ときは従来と同じです。`targetLufs` だけを指定して解決後の `autoLoudness` が OFF のときは、値の検証だけを行い正規化はしません。`autoLoudness=true` の明示と `audioOnly=true` の併用はエラーです。`audioOnly=true` は、ON のプリセットを指定して引数を省略した場合も自動ラウドネスを行いません (Wave 10 の挙動変更。従来はプリセットの ON に従って測定していました。GUI の音声のみ書き出しは変わりません)。測定は Wave 12 から GUI スレッドの外で実行され、`autoLoudness=true` の準備中も `get_export_status` は応答します (status は `queued`。`autoLoudness=false` の経路は従来どおり同期です)。測定に失敗した (無音・音声なしなど)場合は正規化をスキップして 0 dB のゲインで書き出しを続け、ジョブは完了します。ジョブが `failed` になるのは、音声ミックスを作れない・変換できないときだけです。`audioBitrate`(kbps、既定 192)は、192 以外のとき書き出し前に作る音声ミックス (AAC)のビットレートにも反映されます。なお RenderInPlace とレンダーキューダイアログからの手動追加には、自動ラウドネスは適用しません (設計)。
 
-MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます (実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G189。ツール数は 52)。Wave 12 も MCP ツールの追加はなく (ツール数 52)、`export_video` の入力スキーマ・説明文・引数 (`autoLoudness` / `targetLufs`) と省略時の規則は変わりません。selftest の拡張は G189 (autoLoudness=true の準備中でも get_export_status が応答する) と G188-emptyV1 の期待値の反転 (V1 が空で上位に映像があるとき無音または混ざった音声トラックが付く) だけです。Wave 8 では MCP ツールの追加はありません (ツール数 52 / ゲート G1..G177 のまま)。Wave 10 でも MCP ツールの追加はなく (ツール数 52)、`export_video` の任意引数 `autoLoudness` / `targetLufs` の追加と、selftest の拡張 (G178..G187) だけです。Wave 11 の変更に MCP ツールの追加はなく (ツール数 52)、既存ツールの入力スキーマ・説明文も変わりません。selftest の拡張は G188 (自動ラウドネス ON で音声ミックスの作成に失敗したとき export_video のジョブを拒否する) と、G182 への音声シーケンスが空のプロジェクトのサブケース (無音ミックス 1 回) の追加です。
+MCP サーバの自己テストは `--selftest=mcp` または `VEDITOR_MCP_SELFTEST=1` で実行できます (実装: `src/selftests/mcp_selftest.cpp`、ゲート G1..G192。ツール数は 54)。Wave 13 は MCP ツールを 2 本追加しました (`connect_clip` / `disconnect_clip`、ツール数 54)。selftest の拡張は G190..G192 です。Wave 12 も MCP ツールの追加はなく (ツール数 52)、`export_video` の入力スキーマ・説明文・引数 (`autoLoudness` / `targetLufs`) と省略時の規則は変わりません。selftest の拡張は G189 (autoLoudness=true の準備中でも get_export_status が応答する) と G188-emptyV1 の期待値の反転 (V1 が空で上位に映像があるとき無音または混ざった音声トラックが付く) だけです。Wave 8 では MCP ツールの追加はありません (ツール数 52 / ゲート G1..G177 のまま)。Wave 10 でも MCP ツールの追加はなく (ツール数 52)、`export_video` の任意引数 `autoLoudness` / `targetLufs` の追加と、selftest の拡張 (G178..G187) だけです。Wave 11 の変更に MCP ツールの追加はなく (ツール数 52)、既存ツールの入力スキーマ・説明文も変わりません。selftest の拡張は G188 (自動ラウドネス ON で音声ミックスの作成に失敗したとき export_video のジョブを拒否する) と、G182 への音声シーケンスが空のプロジェクトのサブケース (無音ミックス 1 回) の追加です。
 
 ゲートを持つ selftest（`GateTally` を使うもの）は、最後に `N PASS, M FAIL, K SKIP` の 3 語書式のサマリ行を標準エラー出力へ出します。`SKIP` は環境依存で検証できなかったゲート（エンコーダ無し、Debug ビルドなど）で、未検証を意味します（終了コードは FAIL の数なので、SKIP だけなら 0 になります）。`VEDITOR_SELFTEST_TIMEOUT_SEC`（秒、既定 900、0 で無効）を超えると `summary: TIMEOUT after <N>s (selftest=<name>)` を出して終了コード 124 で打ち切られます。`--selftest=all` の対象は `VEDITOR_ALL_SELFTEST_FILTER`（カンマ区切り）で絞れ、未知または空の項目は終了コード 2 になります。MCP サーバの待受ポートは `VEDITOR_MCP_PORT` で指定でき、使い切ると警告が出ます。
 
@@ -433,7 +437,7 @@ All shortcuts are customizable via Edit > Keyboard Shortcuts.
 ## Testing
 
 Selftests are wired into the executable itself, dispatched via a single
-`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 271 entries; `--selftest=help` prints 272 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
+`kArgvSelftests[]` table in `src/selftests/SelftestRegistry.cpp` (SSOT, 273 entries; `--selftest=help` prints 274 because it also lists `credential-store`, which is handled in `src/main.cpp`). Four entry
 points cover the routing matrix:
 
 ```bash
@@ -522,7 +526,7 @@ byte-equivalent and the selftest dispatch coherent:
 | `trackmatte::composite` | `src/trackmatte/` | Track matte (4 types) compositing, premul ARGB32 + QPainter SourceOver, byte-equivalent to matte-free path |
 | `clipgeom` | `src/clipgeom.h/cpp` | Clip geometry (scale/translate/rotation) anchored at layer center |
 | `libavcore` | `src/libavcore/` | In-process FFmpeg integration (Decode / Encode / Probe / VideoFilterGraph / Concat) replacing per-call ffmpeg.exe subprocess |
-| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (271 entries × 5 fields: name / envVar / fn / needsQApp / description) |
+| `kArgvSelftests` | `src/selftests/SelftestRegistry.cpp` | Selftest dispatch table (273 entries × 5 fields: name / envVar / fn / needsQApp / description) |
 
 Architecture rationale: preview ≠ export was historically the #1 NLE
 parity bug source. The three rendering SSOTs (`tlrender` / `trackmatte` /
@@ -632,7 +636,7 @@ v-simple-editor/
 - [x] NLE Parity SSOT: `tlrender::renderFrameAt` (every export path) + `trackmatte::composite` (4 matte types) + `clipgeom` (transform parity)
 - [x] PRD-B series: `libavcore` in-process FFmpeg migration (h264_mf 8-bit / HDR10 subprocess fallback)
 - [x] Tracker Preset system: Motion / Planar with Registry + Dialog UX + ProjectFile persistence
-- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 271-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
+- [x] Selftest argv-switch SSOT: `kArgvSelftests[]` 273-entry table in `src/selftests/SelftestRegistry.cpp`, `--selftest=<name>` + `VEDITOR_*_SELFTEST` + `--selftest={list,help,all}` + unknown-name guard
 - [x] CI workflow draft (`.github/workflows/selftest.yml`, `workflow_dispatch` only)
 - [x] Wave 6 (17 stories): menu LUT export fix, marquee / zoom / timecode jump, clip-edge & label selection, track FX mapping fix + master EQ, track FX persistence fix, export user presets, ProRes 4444 alpha export, media-pool thumbnails, clip filmstrip, sequence dock, broadcast safe / leave color, mesh warp, track remove / reorder, bundle adjustment
 - [x] Wave 7 (24 stories, US-600..623): clip enable/disable, loudness-gain project persistence, keyword bins, sequence-from-clip, unused-media removal scope extension, clip grouping, align/distribute, keyframe copy/paste, timeline hover skim, per-effect mask, offset wheel, puppet pin, VP9 alpha export, image-sequence export, export metadata, mov_text subtitle embedding, EDL/FCPXML import, de-esser, audio mixer dock (track-gain export fix), automatic loudness normalization on export, multi-frame camera tracking with keyframe application, bundle adjustment Schur-complement solver
@@ -640,13 +644,54 @@ v-simple-editor/
 - [x] Wave 9 (US-800..810): selftest gate-count auto cross-check, auto loudness prepared inside the shared export job builder, batch export queue exports the timeline audio mix, export audio bitrate honored on AAC intermediates and temp-file cleanup unified in `RenderQueue`, shared parent-layer rule (`parentLayerAt`) for the renderer / align-distribute / surface tools, EQ / compressor / reverb / noise-reduction docks follow project changes, FCPXML gap children / J-cuts / empty spines, imported clips keep the source length only under the conditions above (FCPXML: `<asset>` has a `duration`; EDL: media found and probed length longer than the used range), saved queues keep the project path instead of a temporary audio file. No MCP tools added
 - [x] Wave 10 (US-900..915): selftest hygiene (mcp moved to the gate tally, `objectName` lookups, light3d latch, non-flat audio EQ fixture, watchdog minidump + text stack), rotoscope data moved into `Timeline` / `ProjectFile` / undo and reflected in every export path and in RenderInPlace (existing roto projects export differently), roto follows clip edits and the main-clip cross-track drag, MCP `export_video` `autoLoudness` / `targetLufs` (omitted = follow the preset; behavior change for auto-loudness-ON user presets), VideoPlayer parent admission observed against `parentLayerAt` (`video-player-parent` selftest, divergences kept as limitations), audio dock gestures are undoable, the selftest hang root cause (self-deadlock in the Qt message handlers) fixed. No MCP tools added (52 tools, G1..G187)
 - [x] Wave 11 (US-1000..1020): selftest hygiene (gate-tally operand details, light3d, watchdog dump cleanup, mcp compound gate values), GUI auto loudness caught in `prepareJob` (empty audio sequence = silence, mix failure = rejected job), RenderInPlace of reversed clips matches the timeline frame, roto alpha survives the grade stage and non-geometric FX, VideoPlayer parent adoption decided by `parentLayerAt`, cross-track drop is undoable and link partners follow, track-matte data moved into `Timeline` (follows cross-track drag, link drops and range ripple), de-esser listen follows its track, caption split / merge, export-complete notification (off by default), master-bus spectrum analyzer dock, legacy EQ to 4-band migration. No MCP tools added (52 tools, G1..G188)
-- [x] Wave 12 (US-1100..1127; US-1112 / US-1113 EXR image-sequence export were sent to Wave 13 because the bundled avcodec has no exr encoder): selftest hygiene (stale `(N gates)` corrections, matte-export E2E selftest), empty-V1 exports get an audio track, matte and bus-assignment edits absorbed into undo, GPU special composite through one baked-mode entry, export audio mix split into plan / executor with an asynchronous auto-loudness preparation (GUI, mobile, MCP) and cancel, job-uuid queue isolation and a shared render-queue dialog, reversed-bake tail alignment, RenderInPlace roto restored on decompose, per-clip uid keys for roto / parent / matte, per-clip 4-band EQ, new-track drop band, per-track pan and gain (`trackMix`), strip pan / bus controls, AUX sends with bus gain / mute / solo in export, tap-source spectrum analyzer. No MCP tools added (52 tools, G1..G189)
+- [x] Wave 12 (US-1100..1127; US-1112 / US-1113 EXR image-sequence export were sent to Wave 13 because the bundled avcodec had no exr encoder, and shipped there): selftest hygiene (stale `(N gates)` corrections, matte-export E2E selftest), empty-V1 exports get an audio track, matte and bus-assignment edits absorbed into undo, GPU special composite through one baked-mode entry, export audio mix split into plan / executor with an asynchronous auto-loudness preparation (GUI, mobile, MCP) and cancel, job-uuid queue isolation and a shared render-queue dialog, reversed-bake tail alignment, RenderInPlace roto restored on decompose, per-clip uid keys for roto / parent / matte, per-clip 4-band EQ, new-track drop band, per-track pan and gain (`trackMix`), strip pan / bus controls, AUX sends with bus gain / mute / solo in export, tap-source spectrum analyzer. No MCP tools added (52 tools, G1..G189)
+- [x] Wave 13 (US-1200..1221): selftest hygiene (type-only `findChild` lookups named, the autosave recovery dialog suppressed under selftests), connected clips (a clip follows a V1 anchor; Edit menu / context menu / MCP `connect_clip` and `disconnect_clip`) and an opt-in magnetic primary-storyline mode (`timeline.storyline_mode`, default OFF), FCPXML import without a track limit with transition / compound clip / multicam / clip / sync-clip support and FCPXML export of lanes and connected clips, track solo in the export mix, mobile and render-queue-dialog exports through the timeline audio mix, keyer alpha carried through later effects on opaque sources, EXR image-sequence export (display-referred or scene-linear, only when the exr encoder is available). Two MCP tools added (54 tools, G1..G192)
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
 
 ### Wave 10 で据え置いた制限事項
+
+Wave 13 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記):
+
+- 書き出し例外: トラックの solo が書き出しのミックスに反映されます。solo のあるプロジェクトでは solo でないトラックが無音になります (トラックの mute とバスの gain / mute / solo は Wave 12 までと同じ)。solo のないプロジェクトの書き出しは変わりません (US-1209)。
+- 書き出し例外: モバイル書き出し (V1 にクリップがあり、自動ラウドネスが OFF) とレンダーキューダイアログの手動追加が、タイムラインの音声ミックス (クリップ EQ、トラックの pan / gain、複数トラック、バス、AUX) を通ります。音声が「クリップ 1 本・編集無し」と同じ扱い (素通し) になるプロジェクトは、従来どおり V1 素材の音声を使うため変わりません (US-1210)。
+- 書き出し例外 (欠陥修正): 不透明な素材でも、スタックに有効なキーヤー (クロマ / ルマ / カラー) があれば、後段のぼかしなどの FX のあとでも alpha が保たれます。キーヤーのない不透明な素材の書き出しは変わりません (US-1211)。
+- FCPXML の読み込みは、トラック数の上限なしで全 lane を取り込み、transition・複合クリップ・マルチカム・clip / sync-clip を読めるようになりました (従来は読み飛ばして警告)。詳細は下の「FCPXML 読み込みの対応表」 (US-1204 〜 US-1207)。
+- FCPXML の書き出しは、V2 以上の映像クリップを lane の子として書き、主ストーリーラインへの接続を接続クリップとして書きます。負のオフセット (J カット) の接続も書き出して読み戻せます (US-1208)。
+- 連番静止画の書き出しの形式に EXR が加わりました (書き出しダイアログの種類は「連番静止画 (PNG / TIFF / EXR)」)。同梱の avcodec に exr エンコーダがあるときだけ選べ、無い環境では EXR は選択肢に出ません。表示参照 (既定) のほか、チェック「EXR をシーンリニアで書き出す」 (既定 OFF) でシーンリニアで書けます。この設定はユーザープリセットにも保存されます。PNG / TIFF の書き出しは変わりません (US-1212 / US-1213)。
+- 接続クリップの分割・無音カット・貼り付け・bake・precompose・トラック操作の各経路は、接続の規則 (下の「主ストーリーラインと接続クリップ」) に従って接続を引き継ぎます。接続のないプロジェクトの編集結果は変わりません (US-1214)。
+- 累積レビューの修正: ダイアログの手動追加で、保存済みプロジェクトのジョブに入れ子シーケンスの音声が入ります。主ストーリーラインの ON で、V1 以外のクリップを削除したときに V1 が詰まらなくなりました。主ストーリーラインの ON で貼り付けるとき、使える (ロックされていない) 音声トラックが無ければ何も貼り付けず、ロック中の音声トラックにクリップを書き込まなくなりました (US-1220)。
+
+主ストーリーラインと接続クリップ (Wave 13。接続は明示操作、主ストーリーラインのモードは既定 OFF):
+
+- V2 以上の映像クリップと音声クリップを、V1 のクリップに「接続」できます。編集メニューまたはクリップの右クリックの「主ストーリーラインに接続」で接続し、「接続を解除」で外します (新規ショートカットはありません。どちらも 1 操作 = Ctrl+Z 1 回)。接続したクリップは接続先 (アンカー) の移動・トリム・速度変更に追従し、タイムラインに接続線とバッジが描かれます。MCP の `connect_clip` / `disconnect_clip` でも同じ操作ができます (US-1201 / US-1202)。
+- 編集メニューの「主ストーリーライン (マグネティック)」 (チェック式。コマンド ID は `timeline.storyline_mode`) は**既定 OFF** で、プロジェクトに保存されます (undo の対象外)。ON の間は V1 だけが insert / ripple 削除 (リンク相手も一緒に消える) / ripple トリム (Q / W) / 隙間詰めの対象になり、V1 に隙間が残りません。V1 のリンクした音声は V1 に追従します。V2 以上や音声トラックへ素材・クリップを drop すると、開始位置が重なる V1 のクリップにその場で接続されます (重なる V1 クリップが無ければ接続せずに置きます)。OFF のときの動作は Wave 12 までと同じです (US-1203)。
+- 接続はリンクグループ単位です (対になる音声も同じ接続先に付きます)。接続先は V1 のクリップだけで、V1 のクリップ自身は接続できません。
+- 接続先の開始・イン / アウト点・速度・反転・ランプ・リマップが変わったとき、線形な接続先 (速度一定・非反転・ランプとリマップ無し) では、接続クリップは同じ素材フレームに付いたまま動きます。非線形な接続先では、接続先の開始からの位置を保ちます (FCP との既知の差)。接続先の前後にはみ出してもかまいません。追従先に置き場所が無いときは、元の位置 (空いていなければ自トラックの末尾) に置いて接続を解除し、ステータスバーに「「<名前>」の接続を解除しました (退避先のトラックがありません)」を出します。
+- 接続先を消すのは明示的な削除 (Delete / Shift+Delete / MCP の `delete_clip` など Timeline の削除操作) だけで、そのとき接続クリップも連動して削除されます。MultiCam 適用・新規シーケンス化・読込など、それ以外の理由で接続先が消えたときは、接続クリップを残して接続を解除し、ステータスバーに「「<名前>」の接続を解除しました (<理由>)」の警告を出します。ロック中のトラックの接続クリップと、削除される区間の外にはみ出した接続クリップも、削除せず解除 + 警告です。
+- 接続がある間は、V1 トラックの削除と、V1 を起点または終点にするトラックの移動が拒否されます。ロック中のトラックの接続は動かさず、解除 + 警告です。
+- 接続先の分割では、接続クリップが位置を変えずに左右の片へ振り分けられます (接続クリップ自身を分割したときは右片も同じ接続先に付きます)。cut → paste、複製、新規シーケンス化は接続を複製しません。bake (映像・音声) は接続を保ちます。無音カットで除去した区間にある接続クリップは、削除せず解除して残ります。MultiCam を適用すると接続は解除されます。
+- FCPXML から取り込んだ接続クリップは、モードが OFF でも接続として取り込まれ、同じ規則で追従します。
+
+FCPXML 読み込みの対応表 (Wave 13。実際の Final Cut Pro が書き出した .fcpxml での確認は、どの行もまだ行っていません):
+
+| FCPXML の要素 | 取り込み方 | 実機確認 |
+|---|---|---|
+| lane (接続クリップ) | トラック数の上限なし。lane は 0 を先頭に番号の絶対値が小さい順に並べ、飛び番を詰めて 1 lane 1 トラック。音声専用の素材は音声トラック (US-1204) | 自作 fixture で確認 |
+| clip / sync-clip | コンテナを平坦化して、子の映像・音声を取り込む (US-1204) | 自作 fixture で確認 |
+| 接続クリップ | 主ストーリーラインへの接続 (`anchorUid` / `anchorOffsetSec`、負のオフセット = J カット) として取り込む。音声のみの spine クリップに付いた子は接続を解除し、警告「主ストーリーラインが音声クリップのため接続を解除しました: <名前>」 (US-1204) | 自作 fixture で確認 |
+| gap に接続された子 | gap の位置を基準に取り込むが、接続にはしない (FCP では接続になる。既知の差) | 自作 fixture で確認 |
+| 負の lane の映像 | V に置き、警告「lane N の映像は FCP では主ストーリーラインの下に合成されます。V<n> に置きました。」 (合成順が FCP と逆になる。既知の差) | 自作 fixture で確認 |
+| transition | 前後のクリップの両縁に CrossDissolve (Center)。前後が重なる形は重なりの中点で詰める。ハンドル不足は長さを縮めて警告。先頭・末尾は FadeIn / FadeOut。名前が Cross Dissolve 以外のものは CrossDissolve に置き換えて警告 (US-1205)。前後のクリップが取り込み後に同じトラックで接していない場合 (別トラックに置かれた、間が空いている、または重なりを詰めた結果が別トラックに分かれた場合) は transition を付けず、「未対応の要素を読み飛ばしました: transition (行 N)」の警告を出す。 | 実機未確認 (transition の時刻配置は自作 fixture のみ) |
+| 複合クリップ (media/sequence + ref-clip) | ネストシーケンス (`sequenceRefId`) として取り込む。入れ子は深さ 8 まで、循環参照は警告して読み飛ばす。MCP `import_fcpxml` の応答 `sequences` に入れ子の ID が入る。取り込み直後の undo 1 回で取り込み前の状態 (入れ子シーケンスを含む) に戻る (US-1206) | 自作 fixture で確認 |
+| マルチカム (media/multicam + mc-clip) | 有効アングル (`mc-source` の `srcEnable` が video / all。無ければ最初のアングルを使い警告) の spine を、mc-clip の区間で切り出して平坦化する。有効な音声アングルが別なら音声トラックの接続クリップ。使わなかったアングルは警告に列挙 (US-1207)。lane が 0 以外の mc-clip (接続されたマルチカム) は読み飛ばして警告する。mc-angle 内の transition は「mc-angle 内の transition を読み飛ばしました (N 件)」の警告で読み飛ばす。 | 実機未確認 (mc-clip の属性は自作 fixture のみ) |
+| 上記以外の要素 | 従来どおり、警告「未対応の要素を読み飛ばしました: <要素名> (行 N)」で読み飛ばす | - |
+
+Wave 13 の保存形式 (.veditor。`PROJECT_FORMAT_VERSION` は 2 のまま):
+
+- 任意キーが 3 つ加わりました: クリップの `anchorUid` と `anchorOffsetSec` (接続されているときだけ)、プロジェクトの `storylineMode` (ON のときだけ)。旧ファイルはそのまま読め、旧ビルドでも読めますが、旧ビルドで再保存すると接続とモードは失われます。読込時に接続先の uid が見つからない接続は、解除 + 警告です。プロジェクトの比較 (compare) は `anchorUid` / `anchorOffsetSec` を無視します。
 
 Wave 12 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記):
 
@@ -660,7 +705,7 @@ Wave 12 の変更 (既存プロジェクトにも効くもの。書き出しの�
 - クリップを V トラック末尾 / A トラック末尾の「新トラックの帯」 (常時表示の 10 px の行) に drop すると、トラックが新設されクリップがそこへ移ります (1 操作 = Ctrl+Z 1 回、undo の文言は「クリップを新しいトラックへ移動」。リンク相手は同じ番号の相方の種類のトラック (無ければ新設) へ付いて動きます)。書き出し結果は変わりません (US-1117)。
 - roto / 親子付け / マットのキーは、クリップの `uid` を優先して見分けます。リンク番号 0 で同一の貼り付けクローンも、それぞれ自分のエントリを持ち続け、手前のクリップをまたぐ並べ替えでもエントリは外れません。すべてのクリップは `uid` を持ち (挿入 / 読込 / 貼り付け / 分割で採番。分解で衝突したときも新しい uid)、プロジェクトの比較 (compare) では uid は無視されます。書き出し結果は変わりません (US-1118 / US-1119)。
 - トラックのフェーダー gain と pan は `trackMix` として保存され、再生と書き出しに反映されます (書き出し例外。gain 1.0 以外で保存したプロジェクトは、従来は読込で gain が 1 に戻っていたため、再読込後の再生と書き出しが変わります。すべてのトラックが既定値 (gain 1.0 / pan 0) のときは書きません)。クリップ pan が 0 以外でトラック FX の無い書き出しは FX 経路に移り、pan が掛かります (書き出し例外) (US-1114)。
-- バスの割当・gain・mute・solo と AUX センドを持つプロジェクトの書き出しに、それらが反映されます (書き出し例外。AUX センドは再生にも接続されます)。AUX はバス FX を通さない並列加算です (判断どおり、トラックの solo の書き出し反映は Wave 13 候補です) (US-1122)。
+- バスの割当・gain・mute・solo と AUX センドを持つプロジェクトの書き出しに、それらが反映されます (書き出し例外。AUX センドは再生にも接続されます)。AUX はバス FX を通さない並列加算です (トラックの solo の書き出し反映は Wave 13 で入りました (US-1209)) (US-1122)。
 - 音声の PCM タップは `readData` の 1 か所の epilogue で書き込みます (デコーダ停止中の無音と通常のブロックが合流したあとで、一時停止中は書きません)。スペクトラムアナライザはマスターまたはトラック (FX 後・フェーダー前) を選べ、無信号のときは 12 dB/s で床まで減衰します。書き出し結果は変わりません (US-1116)。
 - 自動ラウドネスの音声ミックスと測定は GUI スレッドの外で実行されます。通常 / モバイル書き出しは進捗ダイアログ「音声を準備しています…」 (キャンセル可) を出し、MCP の `export_video` (`autoLoudness=true`) は準備中も `get_export_status` が応答します。ミックスは GUI 側の計画 (`buildMixPlan`) と Timeline に依存しない実行 (`executeMixPlan`) に分かれました。書き出し結果は変わりません (US-1104 / US-1105 / US-1127)。
 
@@ -710,20 +755,25 @@ Wave 10 で変わったこと (既存プロジェクトにも効くもの):
 - 自動ラウドネスが OFF のバッチ書き出しで音声の再生シーケンスが空のタスクは、V1 素材の音声へフォールバックします (V1 が空で上位トラックに映像があるときは無音のミックスになります (US-1109))。GUI の ON では無音になります。
 - 書き出し完了の通知は、バッチ書き出しの専用キューと RenderInPlace のローカルキューの対象外です。レンダーキューダイアログの停止ボタンは、共有キュー全体 (MCP や通常書き出しのジョブを含む) を止めます。
 - 旧 3 バンド EQ の 4 バンド移行は、表現できる設定だけが対象です (プリアンプ 0 dB、スロット 0〜2 のうち平坦でない帯が 2 つ以下、周波数 / ゲイン / Q が 4 バンド EQ の範囲内、そのトラックのディエッサー / コンプレッサー (比率 1 超) / リバーブ (ミックス 0 超) が無効 (有効だと処理順が変わるため))。表現できないときはメッセージを出して何も変えません。プロジェクトの読込では変換せず、メニューの明示操作だけで移行します。移行後の PCM は元の EQ と近似で、フィクスチャでの差は最大 2 LSB です。
-- 2 クリップの AV リンク以外 (3 本以上のリンクグループ) をまたぐクロストラック drop は、Wave 12 の時点でも対象外です (W11-E03、Wave 13 候補)。
+- 2 クリップの AV リンク以外 (3 本以上のリンクグループ) をまたぐクロストラック drop は、Wave 12 の時点でも対象外です (W11-E03、Wave 14 候補)。
 - ディエッサーの試聴 (listen) の復元は「トラック自身に付く」方式です。undo で戻したトラックの試聴を、後から追加したトラックが引き継ぐことはありません。
 - 親付きクリップ: 親素材は存在するがデコードできない場合、整列は親ありとして計算し、描画は親を省きます。V1 上のキーフレーム付きクリップがトランジションの借用区間にあるときは、整列 / サーフェスツール (メッシュワープ / パペットピンの共通の編集ツール) はクランプした時刻で評価します。
 - 自動ラウドネスは RenderInPlace / レンダーキューダイアログの手動追加では適用しません (設計)。
 - Echo / ローリングシャッターの特殊合成は、ソースフレームの取得関数がプレビュー (decodeClipFrameAtSourceTime) と書き出し (renderClipSourceFrame) で別実装です (現状の結果は一致)。
 - 自動ラウドネスの準備 (ミックスと測定) は、バッチ書き出しでは同期実行です (GUI の通常 / モバイル書き出しと MCP の `export_video` (`autoLoudness=true`) は非同期)。非同期の準備のキャンセルは次の ffmpeg 起動前に効き、すでに走っている ffmpeg は終わるまで続きます。音声シーケンスが空のときの無音トラックの計画 (Timeline の読み取り) は GUI スレッドで行い、作成は準備と同じく別スレッドで行います (キャンセルも効きます)。
-- トラックの solo は書き出しに反映されません (トラックの mute は反映されます。バスの gain / mute / solo も反映されます。トラック solo の反映は Wave 13 候補 W13-EXPORT-TRACK-MUTE)。トラックのフェーダー gain と pan は書き出しに反映されます。
 - AUX センドは、バス FX を通さない並列加算です (センド先のバスのエフェクトは掛かりません)。
 - スペクトラムアナライザは、再生を一時停止している間は新しい音を取り込まず、表示が床まで減衰するだけです。表示できるのはマスターまたはトラック (FX 後・フェーダー前) で、バスは選べません。
 - 旧ビルドで Wave 12 のプロジェクトを開いて再保存すると、`uid` / `clipEq` / `renderInPlaceOriginalRoto` / `trackMix` のキーが失われます (旧ビルドでも開けますが、クリップ EQ、トラックの gain / pan、焼き込み前の roto は保存されません)。
 - 新トラックの帯へ drop できるのはタイムライン上のクリップだけです。メディアビンからの drop では新しいトラックは作られず、映像クリップを A の帯へ、音声クリップを V の帯へ drop した場合は無視されます。
 - V1 が空で V1 が表示中のタイムラインのうち、上位トラックが通常映像 (図形クリップ以外) だけのもの、または上位の図形クリップが全フレームを覆わないものは、レンダラの既存の制約で映像フレームを作れず書き出しに失敗します (GUI の通常 / モバイル書き出しは通常映像だけなら事前に拒否し、図形に空きがあるときはキューに入ったあと Failed になります。MCP とバッチは描画時に失敗し、音声だけの部分ファイルが残ることがあります)。V1 を非表示にすると上位トラックの映像だけで書き出せます。
-- モバイル書き出し (V1 にクリップがあり、自動ラウドネスが OFF) とレンダーキューダイアログの手動追加は、V1 素材の音声をそのまま使うため、タイムラインの音声ミックス (クリップ EQ、トラックの pan / gain、複数トラック、バス、AUX) を通りません (Wave 11 から変わらない動作で、経路の修正は Wave 13 候補です)。
-- EXR 連番書き出し (表示参照 / シーンリニアの選択式) は Wave 13 候補です。同梱の avcodec に exr エンコーダが無いため、Wave 12 には含めていません。連番静止画の形式は PNG / TIFF のみです。
+- EXR 連番書き出しは、同梱の avcodec に exr エンコーダがある環境でだけ選べます (Wave 13 で出荷。エンコーダが無いと種類のコンボに EXR は出ません)。
+- 幾何 FX・メッシュワープ・パペット・Echo / ローリングシャッター補正のあとの alpha (A-05) は、Wave 13 でも直っていません (Wave 14 候補)。Wave 13 で直ったのは、不透明な素材にキーヤーがあるときの後段 FX の alpha だけです (US-1211)。
+- キーヤー後の alpha の運搬 (US-1211) は tlrender の描画経路 (書き出しと CPU プレビュー) の変更です。Exporter::doExport が applyEffectStack を直接呼ぶ旧書き出し経路との一致は、Wave 11 の roto の alpha (US-1004) と同じ扱いで、揃えていません。VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:706 と、プレビューの FX スタック VideoPlayer.cpp:4215) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで揃えていません。
+- MainWindow が位置で持つ 6 種のサイドカー (3D テキスト / パーティクルの設定、タイムリマップ、式のバインド、wiggle のパラメータ、ライブブラシのアニメーション) は、接続クリップが接続先に追従して動くときに付け替えられません (通常の編集でも従来から付け替えられません)。
+- MultiCam を適用すると接続が解除される動作は、selftest では適用処理を模擬して確認しています。確認ダイアログ付きの本物の経路を通す gate はありません。
+- `splitClipAt` が reversed / ramp のクリップの内容を分割後の片に保たないのは、Wave 13 以前からの挙動です (接続クリップの分割でも同じで、Wave 13 では変えていません)。
+- FCPXML の書き出しは、他のクリップと重なる接続のない V2 以上のクリップを、重なる spine クリップの lane の子として書きます (FCPXML は接続なしの重なりを表せないため)。書き出した FCPXML を読み戻すと、そのクリップは接続クリップになります。
+- 主ストーリーラインの ON でも、マウスの端ドラッグのトリム・nudge・ブレード・MCP の編集ツールは従来の動作のままです (マウスの非リップルのトリムは V1 に隙間を残すことがあります)。メディアファイルを V1 に drop する操作は ON では受け付けません。
 - バッチ書き出しの音声: 現在のプロジェクト以外のファイルを指すタスク (task.timeline が null) は、自動ラウドネスが OFF のときだけ従来どおり元ファイルの音声で書き出されます。自動ラウドネスが ON のときは測定できないため、Queue::processNext がエラー「自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません」を記録し、RenderQueue がジョブを拒否します (書き出されません)。バッチ設定ダイアログには、組み込み名 (1080p / 720p / 4K) と同名のユーザープリセットは出ません (組み込みが優先)。ミックスはタスク実行時のタイムラインから作られるため、キュー投入後の編集が反映されます (映像と同じ)。タイムラインの長さが 0 より大きく音声の再生シーケンスが空でないときだけミックスを作ります (V1 が空で上位トラックに映像があるタスクは例外で、音声が無くても無音のミックスを作ります。長さ 0、または音声トラックが無い / 音声を持つクリップが無いときは従来どおり元ファイルの音声で、警告は出ません。全トラックがミュートでも音声を持つクリップがあれば、ミュート分を除いた無音のミックスで書き出され、警告は出ません。通常書き出しと同じ)。ミックスの作成に失敗したときは元ファイル音声で書き出し、書き出しが成功した場合だけタスクのメッセージが「Export complete (タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: <原因>)」になります (書き出しが失敗した場合はエラーメッセージが優先され、警告は残りません)。
 - 書き出し設定の音声ビットレートは音声を再エンコードする経路にだけ効きます。素材の音声をそのままコピーする経路では元のビットレートのままです。
 - FCPXML / EDL: 接続クリップを持つ親クリップの時刻範囲が不正 (duration が 0、または offset / start の計算が不正) な場合、その親は「lane N の時刻範囲が不正なクリップを読み飛ばしました: <名前> / <ref>」で、その接続クリップは「親クリップが不正なため接続クリップを読み飛ばしました: <名前> / <ref>」で、警告付きで読み飛ばされます (従来は取り込まれることがありました)。子を持たない spine の gap は警告を出さなくなりました。J カットが 0 秒より前に一部だけ出る分は切り詰めて警告「接続クリップをタイムライン 0 で切り詰めました: <名前> / <ref>」を出し、全体が 0 秒より前に出るクリップは取り込まれず「クリップの値が不正です (接続位置): <名前> / <ref>」で読み飛ばされます。EDL の dissolve は、長さが正のものなら素材の有無に関係なく、少なくともディゾルブ長 × 速度ぶんのハンドルが確保されて trail が常に正になるため (0 フレームのディゾルブはハンドルが 0 になり得て、trail は正になりません)、取り込み直後のトランジション区間の描画が変わります (送り側クリップは、そのハンドル分だけは常に右端を伸ばせます。ハンドルを超えて素材長まで伸びるのは、素材が見つかり probe が正の値でハンドル込みの長さより長いときだけです)。EDL はソース開始タイムコードを差し引きません (既存の制限)。

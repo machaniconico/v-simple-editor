@@ -1,9 +1,11 @@
 #include "../ExportDialog.h"
+#include "../ExrSequenceWriter.h"
 #include "../RenderQueue.h"
 #include "../SequenceExport.h"
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../ExportUserPresets.h"
 #include "SelftestGate.h"
 #include <QDir>
 #include <QEventLoop>
@@ -11,6 +13,8 @@
 #include <QImageWriter>
 #include <QTemporaryDir>
 #include <QTimer>
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -256,5 +260,137 @@ int runImgSequenceSelftest()
         ui &= !sequenceexport::validate(settings).isEmpty();
     }
     gate(6, ui);
+
+    // G7-G10: EXR sequences (display-referred by default, scene-linear on request).
+    const bool exrEncoder = exrseq::encoderAvailable();
+    const auto pngPath = [&](const QString &dir, int f) {
+        return QDir(dir).filePath(QString("shot_%1.png").arg(17 + f, 4, 10, QLatin1Char('0')));
+    };
+    const auto exrPath = [&](const QString &dir, int f) {
+        return QDir(dir).filePath(QString("shot_%1.exr").arg(17 + f, 4, 10, QLatin1Char('0')));
+    };
+    const auto maxRgbDiff = [](const QImage &a, const QImage &b) {
+        if (a.isNull() || b.isNull() || a.size() != b.size()) return 255;
+        int worst = 0;
+        for (int y = 0; y < a.height(); ++y)
+            for (int x = 0; x < a.width(); ++x) {
+                const QColor p = a.pixelColor(x, y), q = b.pixelColor(x, y);
+                worst = std::max({worst, std::abs(p.red() - q.red()),
+                                  std::abs(p.green() - q.green()), std::abs(p.blue() - q.blue())});
+            }
+        return worst;
+    };
+    RenderJob exrJob = opaqueJob;
+    exrJob.outputPath = temp.filePath("exr");
+    exrJob.exportConfig["sequenceFolder"] = exrJob.outputPath;
+    exrJob.exportConfig["sequencePattern"] = "shot_%04d.exr";
+    RenderJob exrAlphaJob = exrJob;
+    exrAlphaJob.outputPath = temp.filePath("exr-alpha");
+    exrAlphaJob.exportConfig["sequenceFolder"] = exrAlphaJob.outputPath;
+    exrAlphaJob.exportConfig["keepAlpha"] = true;
+    if (!exrEncoder) {
+        for (int n : {7, 8, 10}) tally.skip(n, "exrseq::encoderAvailable() is false");
+    } else {
+        const Result exr = ready ? runJob(exrJob) : Result{};
+        bool exrOk = exr.accepted && exr.success && exr.progress == 100
+            && QDir(exrJob.outputPath).entryList(QDir::Files) == QStringList{
+                "shot_0017.exr", "shot_0018.exr", "shot_0019.exr"};
+        int worst = 0, crossWorst = 0;
+        for (int f = 0; exrOk && f < 3; ++f) {
+            QImage decoded;
+            bool hasAlpha = true;
+            QString how;
+            exrOk &= exrseq::decodeForTest(exrPath(exrJob.outputPath, f), &decoded, &hasAlpha, &how);
+            worst = std::max(worst, maxRgbDiff(decoded, QImage(pngPath(opaqueJob.outputPath, f))));
+            // Negative control: a different frame's PNG must NOT match, or the +-1 check proves nothing.
+            crossWorst = std::max(crossWorst, maxRgbDiff(decoded, QImage(pngPath(opaqueJob.outputPath, (f + 1) % 3))));
+        }
+        std::fprintf(stderr, "img-sequence G7 exrRan=%d maxDiffVsPng=%d crossFrameDiff=%d\n",
+            exrOk, worst, crossWorst);
+        gate(7, exrOk && worst <= 1 && crossWorst > 8);
+
+        const Result exrAlpha = ready ? runJob(exrAlphaJob) : Result{};
+        bool withAlpha = false, withoutAlpha = true;
+        const bool headerRead = exrseq::headerHasAlphaForTest(exrPath(exrAlphaJob.outputPath, 0), &withAlpha)
+            && exrseq::headerHasAlphaForTest(exrPath(exrJob.outputPath, 0), &withoutAlpha);
+        std::fprintf(stderr, "img-sequence G8 ran=%d headerRead=%d keepAlpha=%d opaque=%d\n",
+            exrAlpha.success, headerRead, withAlpha, withoutAlpha);
+        gate(8, exrAlpha.success && headerRead && withAlpha && !withoutAlpha);
+
+        // 128 written scene-linear must be the sRGB EOTF value, not 128/255.
+        const auto grayPixel = [&](bool linear, float *r, float *g, float *b) {
+            auto s = sequenceexport::Settings::fromJson(exrJob.exportConfig, temp.filePath(linear ? "lin" : "disp"));
+            s.folder = temp.filePath(linear ? "lin" : "disp");
+            s.exrLinear = linear;
+            const QString err = sequenceexport::write(&timeline, s, QSize(128, 64), 4, 0, 1, {}, {},
+                [](QImage &frame, qint64) { frame.fill(QColor(128, 128, 128)); });
+            QVector<float> rgba;
+            int w = 0, h = 0;
+            bool alpha = false;
+            if (!err.isEmpty() || !exrseq::decodeFloatForTest(sequenceexport::fileName(s, 0), &rgba, &w, &h, &alpha)
+                || rgba.size() < 4) return false;
+            const int i = ((h / 2) * w + w / 2) * 4;
+            *r = rgba[i]; *g = rgba[i + 1]; *b = rgba[i + 2];
+            return true;
+        };
+        float lr = 0, lg = 0, lb = 0, dr = 0, dg = 0, db = 0;
+        const bool readLin = grayPixel(true, &lr, &lg, &lb);
+        const bool readDisp = grayPixel(false, &dr, &dg, &db);
+        const float tol = 1.0f / 1024.0f;
+        const auto within = [&](float v, float e) { return std::fabs(v - e) <= tol; };
+        std::fprintf(stderr, "img-sequence G10 linear=(%.5f %.5f %.5f) display=(%.5f %.5f %.5f)\n",
+            lr, lg, lb, dr, dg, db);
+        gate(10, readLin && readDisp && within(lr, 0.2158f) && within(lg, 0.2158f) && within(lb, 0.2158f)
+            && within(dr, 128.0f / 255.0f) && within(dg, 128.0f / 255.0f) && within(db, 128.0f / 255.0f));
+    }
+
+    // G9: without the encoder neither the combo entry nor an .exr pattern is accepted.
+    bool comboOn = false, comboOff = true, validOn = false, validOff = true, presetOn = false, reloadedExrLinear = false;
+    for (const bool available : {true, false}) {
+        exrseq::setEncoderAvailableOverrideForTest(available);
+        ExportDialog exrDialog(ProjectConfig{});
+        if (auto *t = exrDialog.findChild<QComboBox *>("exportType"))
+            t->setCurrentIndex(t->findData(static_cast<int>(ExportType::ImageSequence)));
+        auto *f = exrDialog.findChild<QComboBox *>("sequenceFormat");
+        auto *linear = exrDialog.findChild<QCheckBox *>("exrLinear");
+        auto probe = sequenceexport::Settings::fromJson(exrJob.exportConfig, temp.filePath("probe"));
+        const bool hasExr = f && f->findData("exr") >= 0;
+        const bool valid = sequenceexport::validate(probe).isEmpty();
+        if (available) {
+            comboOn = hasExr && linear && !linear->isChecked() && !linear->isVisibleTo(&exrDialog);
+            if (hasExr) {
+                f->setCurrentIndex(f->findData("exr"));
+                comboOn &= linear->isVisibleTo(&exrDialog) && exrDialog.findChild<QLineEdit *>("sequencePattern")->text().endsWith(".exr");
+            }
+            validOn = valid;
+            ExportDialog presetDialog(ProjectConfig{});
+            ExportConfig exrPreset;
+            exrPreset.imageSequence = true;
+            exrPreset.sequencePattern = "shot_%04d.exr";
+            exrPreset.exrLinear = true;
+            const ExportConfig reloaded = ExportUserPresets::fromJson(ExportUserPresets::toJson(exrPreset));
+            reloadedExrLinear = reloaded.exrLinear;
+            presetDialog.applyPresetForTest(reloaded);
+            auto *pf = presetDialog.findChild<QComboBox *>("sequenceFormat");
+            auto *pl = presetDialog.findChild<QCheckBox *>("exrLinear");
+            const QJsonObject exrJson = exportcfg::toJobJson(presetDialog.currentConfigForTest());
+            presetOn = pf && pl && pf->currentData() == "exr" && pl->isVisibleTo(&presetDialog) && pl->isChecked() && reloaded.exrLinear
+                && exrJson.value("exrLinear").toBool()
+                && sequenceexport::Settings::fromJson(exrJson, temp.filePath("preset")).exrLinear;
+            ExportDialog pngDialog(ProjectConfig{});
+            ExportConfig pngPreset = exrPreset;
+            pngPreset.sequencePattern = "shot_%04d.png";
+            pngPreset.exrLinear = false;
+            pngDialog.applyPresetForTest(pngPreset);
+            presetOn &= !exportcfg::toJobJson(pngDialog.currentConfigForTest()).contains("exrLinear");
+        } else {
+            comboOff = hasExr;
+            validOff = valid;
+        }
+    }
+    exrseq::setEncoderAvailableOverrideForTest(std::nullopt);
+    std::fprintf(stderr, "img-sequence G9 comboOn=%d validOn=%d comboOffHasExr=%d validOff=%d presetOn=%d reloadedExrLinear=%d\n",
+        comboOn, validOn, comboOff, validOff, presetOn, reloadedExrLinear);
+    gate(9, comboOn && validOn && !comboOff && !validOff && presetOn);
     return tally.finish("img-sequence");
 }

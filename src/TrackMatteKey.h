@@ -84,3 +84,16 @@ void remapClipParentEntriesAfterMutation(
     Timeline *timeline,
     QHash<QString, QString> &entries,
     const TrackClipSnapshot &before);
+
+// US-1201: carrier remap for Timeline::reconcileConnectedClips. Maps every
+// old "t:i" key in `before` to the clip with the same uid in the current
+// video tracks (a clip may change tracks), so a reorder that a monotonic walk
+// cannot follow keeps its roto / matte / parent entries. Keys of clips that no
+// longer exist are dropped; keys that named no clip are kept. `explicitMoves`
+// (old video key -> new video key, from the caller that moved the clips) is
+// applied first and wins. A clip whose uid is empty or repeated across tracks
+// otherwise falls back to alignedClipKeyMap; the leftovers of a repeated uid
+// are then paired by uid in track order. The parent carrier's sequence store
+// key is taken out and put back unchanged.
+void remapCarriersByUid(Timeline *timeline, const TrackClipSnapshot &before,
+                        const QHash<QString, QString> &explicitMoves = {});

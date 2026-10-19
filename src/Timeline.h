@@ -119,6 +119,7 @@ class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
 class QDropEvent;
+class QPainter;
 class QMimeData;
 class QTimer;
 
@@ -381,6 +382,12 @@ struct ClipInfo {
     // the right half of a split. Saved as "uid" only when non-empty; never
     // affects rendering, and ProjectDiff ignores it.
     QString uid;
+    // US-1201 primary-storyline connection: uid of the V1 anchor clip (empty =
+    // not connected) and this clip's start minus the anchor's start in timeline
+    // seconds (may be negative). Saved only when anchorUid is non-empty; never
+    // affects rendering, and ProjectDiff ignores both.
+    QString anchorUid;
+    double anchorOffsetSec = 0.0;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
@@ -535,6 +542,9 @@ public:
     int selectedClip() const { return m_selectedClips.isEmpty() ? -1 : m_selectedClips.last(); }
     const QList<int> &selectedClips() const { return m_selectedClips; }
     bool isClipSelected(int index) const { return m_selectedClips.contains(index); }
+    // US-1203: reassigns the selection without selectionChanged, so no linked
+    // selection sync runs (storyline placement takes clips out and puts them back).
+    void restoreClipSelection(const QList<int> &indices) { m_selectedClips = indices; update(); }
 
     int clipAtX(int x) const;
     double xToSeconds(int x) const;
@@ -641,6 +651,12 @@ public:
     // with nothing changed when the payload, the source or the slot is invalid.
     bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
                         bool toNewTrack = false);
+    // US-1202: the clip being moved by an in-track MoveClip drag and how far its
+    // start has travelled from the press (seconds). False when no such drag.
+    bool moveDragInfo(int *clipIndex, double *deltaSec) const;
+    // US-1202: whether a media-file (text/uri-list) drop may land here, i.e.
+    // storyline mode is on and this is an unlocked V2+ / audio track.
+    bool acceptsMediaDrop() const;
     // Whether an in-track MoveClip drag at y (this track's coordinates) turns
     // into a cross-track QDrag: CROSS_TRACK_DRAG_THRESHOLD px outside the row,
     // or, on the last track of its kind, anywhere over that kind's new-track
@@ -676,6 +692,9 @@ signals:
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
+    // US-1214: splitClipAt split the clip with uid leftUid at its local second
+    // splitLocalSec; the right piece got rightUid.
+    void clipSplit(const QString &leftUid, const QString &rightUid, double splitLocalSec);
     void effectDropped(const QString &entryId, int clipIndex);
 
 protected:
@@ -719,6 +738,9 @@ private:
     // start. Used to compensate its gap during a MoveClip drag so downstream
     // clips don't slide when the user repositions a single clip. -1 = no next.
     double m_dragOriginalLeadInNext = -1.0;
+    // US-1203: the unclamped (snapped) delta of the current MoveClip drag; a
+    // storyline-mode release on V1 moves the clip by it.
+    double m_dragRawDeltaSec = 0.0;
     // Screen-X of the dragged clip's left edge at drag start, used for snap.
     int m_dragOriginalClipStartX = 0;
     // US-705: Alt held at trim press = trim only the grabbed clip (fixed for
@@ -813,7 +835,8 @@ public:
                      double requestedStartSec = -1.0,
                      MediaImportResult *result = nullptr,
                      QString *err = nullptr,
-                     ImportMediaKind kind = ImportMediaKind::LinkedPair);
+                     ImportMediaKind kind = ImportMediaKind::LinkedPair,
+                     const QString &anchorUid = QString());
     void addClip(const QString &filePath);
     void splitAtPlayhead();
     void moveSelectedClipToPlayhead(bool tail);
@@ -888,7 +911,9 @@ public:
     bool selectClipByIndex(bool audio, int trackIndex, int clipIndex, QString *err);
     void clearSelection();
     bool freezeFrameAtPlayhead(TimelineTrack *track = nullptr, int clipIndex = -1);
-    void deleteSelectedClip();
+    // US-1203: in storyline mode a delete also closes the V1 gap it leaves (V1
+    // only); leaveGap (the lift action) keeps the HEAD delete in either mode.
+    void deleteSelectedClip(bool leaveGap = false);
     void rippleDeleteSelectedClip();
     bool closeGapAt(TimelineTrack *track, double timeSec);
     bool hasSelection() const;
@@ -918,7 +943,69 @@ public:
     // folds currentState() into the current undo entry and drops the redo stack.
     void absorbIntoCurrentUndoPoint();
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
+    // US-1201: every undo point goes through here (or absorbIntoCurrentUndoPoint):
+    // reconcileConnectedClips() runs first, then the post-edit state is saved and
+    // the connection baseline is taken.
     void saveUndoState(const QString &description);
+
+    // US-1201 primary-storyline connections. connectClip gives every member of
+    // the target's link group the same anchorUid (a clip on videoTracks()[0])
+    // and an offset taken from the current positions; V1 clips cannot connect.
+    // One undo point each. False with *err set (state unchanged) on rejection.
+    bool connectClip(TrackKind kind, int trackIndex, int clipIndex,
+                     const QString &anchorUid, QString *err = nullptr);
+    bool disconnectClip(TrackKind kind, int trackIndex, int clipIndex,
+                        QString *err = nullptr);
+    // US-1202: connect the clip (and its link group) to the V1 clip overlapping
+    // its start, else the V1 clip just before it; rejected with *err when
+    // there is none. One undo point, 「主ストーリーラインに接続」.
+    bool connectToStoryline(TrackKind kind, int trackIndex, int clipIndex,
+                            QString *err = nullptr);
+    // US-1202: holds the flag only (no UI, save or undo here; US-1203 adds
+    // those). While true, a media file or a clip dropped on V2+ / A tracks is
+    // connected to the V1 clip under the drop. Default false.
+    // US-1203: the magnetic primary storyline. While true, inserts (a clip
+    // dropped on V1, paste, 3-point insert), deletes, in-V1 moves and ripple
+    // trims change V1 only and keep it gap-free; the linked audio of a V1 clip
+    // follows it (implicit connection, reconcile). Not part of TimelineState.
+    void setStorylineMode(bool on) { m_storylineMode = on; }
+    bool storylineMode() const { return m_storylineMode; }
+    // US-1203: sets every leadInSec of `track` to 0 (no undo point). False when
+    // nothing changed or the track is locked.
+    bool closeGapsOnTrack(TimelineTrack *track);
+    // US-1203 storyline entries for TimelineTrack (no undo point of their own).
+    // Inserts `clip` into V1 at the insert point for timelineSec (the end of the
+    // clip it falls in), pushing V1 only; returns the index, *landedSec its start.
+    int storylineInsertClip(TimelineTrack *v1, double timelineSec, const ClipInfo &clip,
+                            double *landedSec = nullptr);
+    // Takes V1 clip clipIndex out and inserts it at its start + deltaSec (an
+    // in-V1 drag released in storyline mode); false when the order and the
+    // positions did not change.
+    bool storylineMoveClip(TimelineTrack *v1, int clipIndex, double deltaSec);
+    // US-1202 media drop entry: TimelineTrack::dropEvent hands a text/uri-list
+    // drop on a V2+ / A track here while storylineMode() is on. Imports the file
+    // at dropTimeSec on that track, connected to the V1 clip under the drop
+    // (V1 tracks, locked tracks and mode-off drops are refused with *err; a drop
+    // with no V1 clip under it is imported unconnected).
+    bool dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
+                          double dropTimeSec, QString *err = nullptr);
+    // Connect a clip a cross-track drop just placed (storyline mode, V2+ / A);
+    // no undo point of its own (the drop's interactionCompleted takes it).
+    void autoConnectDroppedClip(TimelineTrack *track, int clipIndex);
+    // US-1202 overlay: connection lines and badges for every connected clip,
+    // plus the follow preview while a V1 clip is dragged. Draws nothing when no
+    // clip is connected. `painter` is in m_tracksWidget coordinates.
+    void paintConnections(QPainter &painter) const;
+    void updateConnectionOverlay();
+    // Non-modal connection warnings (detached connections). MainWindow shows the
+    // newest in the status bar on connectionWarningsChanged; selftests and MCP
+    // drain them with takeConnectionWarnings.
+    QStringList connectionWarnings() const { return m_connectionWarnings; }
+    QStringList takeConnectionWarnings();
+    // US-1214 test seam: true stops the reconcile from re-deriving the offset
+    // of a connected clip whose uid is new (design r4 §6-4 (3)); its stored
+    // offset then places it. Selftests only; default false.
+    void setRederiveDisabledForTest(bool disabled) { m_rederiveDisabledForTest = disabled; }
 
     // Snap
     void setSnapEnabled(bool enabled);
@@ -1419,6 +1506,8 @@ signals:
     void transitionShortened(QString transitionTypeName,
                              double askedSec, double effectiveSec);
     void statusMessageRequested(const QString &message, int timeoutMs);
+    // US-1201: new entries were appended to connectionWarnings().
+    void connectionWarningsChanged();
     // Spec-conformant marker signals. markersChanged fires on every
     // addMarker/removeMarker/updateMarker/setMarkers mutation; markerClicked
     // fires from MarkerLane when the user clicks the body of a marker
@@ -1519,6 +1608,99 @@ private:
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;
+    // US-1201 connection reconcile. The baseline belongs to the active sequence
+    // and is taken after saveUndoState / absorb / restoreState; clear / load /
+    // sequence switch / create leave it empty (sequenceId empty).
+    struct AnchorSignature {
+        double startSec = 0.0;
+        double inPoint = 0.0;
+        double outPoint = 0.0;
+        double speed = 1.0;
+        bool reversed = false;
+        bool rampIdentity = true;
+        bool remapEmpty = true;
+        // US-1214: a new source (bake / decompose) has no common source frame.
+        QString filePath;
+        bool linear() const { return !reversed && rampIdentity && remapEmpty && speed > 0.0; }
+        bool sameAs(const AnchorSignature &o) const;
+        static AnchorSignature of(const ClipInfo &clip, double startSec);
+    };
+    struct ConnectionBaselineEntry {
+        TrackKind kind = TrackKind::Video;
+        int track = -1;
+        double startSec = 0.0;
+        QString anchorUid;
+        double anchorOffsetSec = 0.0;
+        bool anchorFound = false;
+        AnchorSignature anchorSig;
+    };
+    struct ReconcileBaseline {
+        QString sequenceId;
+        // Key: "v:" / "a:" + track index + ":" + clip uid (linked V/A, and
+        // clips on different tracks, may share a uid).
+        QHash<QString, ConnectionBaselineEntry> clips;
+        // US-1203: "a:" + audio track + ":" + uid of the linked audio of a V1
+        // clip -> its implicit anchor (followed only in storyline mode).
+        struct StorylineLink {
+            QString anchorUid;
+            int linkGroup = 0;
+            double startSec = 0.0;
+            double anchorStartSec = 0.0;
+        };
+        QHash<QString, StorylineLink> storylineLinks;
+    };
+    ReconcileBaseline m_reconcileBaseline;
+    // uid -> the deleted anchor-local spans [start, end) (timeline seconds from
+    // the clip start), recorded only by the Timeline-level delete functions;
+    // taken and cleared by every reconcile.
+    QHash<QString, QVector<QPair<double, double>>> m_pendingDeletedUids;
+    // US-1214: V1 splits in order (TimelineTrack::clipSplit, silence cut).
+    // splitLocalSec is the left piece's local second (before the split).
+    struct SplitRecord {
+        QString leftUid;
+        QString rightUid;
+        double splitLocalSec = 0.0;
+    };
+    QVector<SplitRecord> m_pendingSplits;
+    // US-1214: splits on the other tracks (connected clips), in order, per track:
+    // the lineage of a right piece back to the clip the baseline knew.
+    QHash<const TimelineTrack *, QVector<SplitRecord>> m_pendingClipSplits;
+    // US-1214: anchor-local spans a silence cut removed; their connections detach.
+    struct DetachedSpan {
+        QString anchorUid;
+        double localStart = 0.0;
+        double localEnd = 0.0;
+    };
+    QVector<DetachedSpan> m_pendingDetachedSpans;
+    bool m_rederiveDisabledForTest = false;
+    QStringList m_connectionWarnings;
+    bool m_reconcilingConnections = false;
+    bool m_storylineMode = false;
+    QWidget *m_connectionOverlay = nullptr;
+    // Applies the connection without an undo point (connectClip adds it).
+    bool applyConnection(TrackKind kind, int trackIndex, int clipIndex,
+                         const QString &anchorUid, QString *err);
+    // The V1 clip overlapping startSec; with allowPreceding, else the last V1 clip before it.
+    QString storylineAnchorAt(double startSec, double *anchorStartSec,
+                             bool allowPreceding) const;
+    QString reconcileSequenceKey() const;
+    bool hasConnectedClips() const;
+    void renameAnchorReferences(const QString &fromUid, const QString &toUid);
+    void reconcileConnectedClips();
+    // US-1203: moves the linked audio of V1 clips that moved after the baseline
+    // (storyline mode only); true when a clip moved. Called by reconcile and by
+    // the storyline inserts before they place new linked audio. extraReserved
+    // (audio track -> uid -> count) keeps those uids off those tracks too.
+    bool followStorylineLinks(const QHash<int, QHash<QString, int>> &extraReserved = {});
+    // US-1203: the first unlocked audio track from fromTrack up with room for
+    // `clip` at startSec (not holding its uid, nor reserving it in reservedUids:
+    // audio track -> uid -> pending count); null when none.
+    TimelineTrack *storylineAudioSlot(int fromTrack, const ClipInfo &clip, double startSec,
+                                      TimelineTrack::DropPlan *plan,
+                                      const QHash<int, QHash<QString, int>> *reservedUids = nullptr) const;
+    void captureReconcileBaseline();
+    void clearReconcileBaseline();
+    void appendConnectionWarning(const QString &message);
     QScrollArea *m_scrollArea;
     QWidget *m_tracksWidget;
     QVBoxLayout *m_tracksLayout;
@@ -1591,6 +1773,9 @@ private:
 
     UndoManager *m_undoManager;
     std::optional<ClipInfo> m_clipboard;
+    // US-1203: the copied clip's linked audio and its offset from the copied
+    // clip's start; only a storyline-mode paste places them.
+    QVector<QPair<ClipInfo, double>> m_clipboardLinkedAudio;
     // Monotonic counter for generating new linkGroup IDs. Zero is reserved
     // for "unlinked" so the next usable id is 1.
     int m_nextLinkGroup = 1;
@@ -1612,6 +1797,9 @@ private:
         double origLeadInNext = -1.0; // -1 = no next clip
     };
     QVector<LinkedDragPartner> m_linkedDragPartners;
+    // US-1203: the current linked drag started on V1. In storyline mode a drag
+    // started elsewhere may not move a V1 partner (V1 changes by reorder only).
+    bool m_linkedDragSourceIsV1 = false;
 
     // US-705: every linkGroup member (source included) captured at the start
     // of a TrimLeft / TrimRight drag. Timeline applies one shared delta.

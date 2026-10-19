@@ -546,6 +546,10 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     replacement.outPoint = prefix + length;
     replacement.leadInSec = original.leadInSec;
     replacement.linkGroup = original.linkGroup;
+    // US-1214: the baked clip is the same clip (identity and connection).
+    replacement.uid = original.uid;
+    replacement.anchorUid = original.anchorUid;
+    replacement.anchorOffsetSec = original.anchorOffsetSec;
     replacement.label = original.label;
     replacement.volume = original.volume;
     replacement.pan = original.pan;

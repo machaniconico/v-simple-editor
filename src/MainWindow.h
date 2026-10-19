@@ -24,6 +24,7 @@ class PuppetPinTool;
 #include <QRectF>
 #include <QString>
 #include <QStringList>
+#include <QProcessEnvironment>
 #include <QList>
 #include "ProjectSettings.h"
 #include "Exporter.h"
@@ -108,6 +109,7 @@ class PuppetPinTool;
 #include "StillCompare.h"
 
 class VideoPlayer;
+bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env);
 class Timeline;
 class TimelineTrack;
 class SourceMonitorDock;
@@ -263,6 +265,7 @@ class MainWindow : public QMainWindow
     friend int runRenderNotifySelftest();
     friend int runClipEqSelftest();
     friend int runMixerDockSelftest();
+    friend int runTrackOpsSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -341,6 +344,8 @@ private slots:
     void splitClip();
     void deleteClip();
     void rippleDelete();
+    void connectSelectionToStoryline();
+    void disconnectSelectionFromStoryline();
     void copyClip();
     void pasteClip();
     void undoAction();
@@ -962,6 +967,9 @@ private:
     QAction *m_splitAction;
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;
+    QAction *m_connectToStorylineAction = nullptr;
+    QAction *m_disconnectFromStorylineAction = nullptr;
+    QAction *m_storylineModeAction = nullptr;  // US-1203: checkable, default off
     QAction *m_copyAction;
     QAction *m_copyCurrentFrameAction = nullptr;
     QAction *m_pasteAction;

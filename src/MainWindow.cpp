@@ -3,6 +3,8 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include <QCoreApplication>
+#include <cstdio>
 #include "VideoPlayer.h"
 #include "Timeline.h"
 #include "UndoTrace.h"
@@ -403,20 +405,21 @@ static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QSt
 static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
 {
     if (!timeline || path.isEmpty()) return;
-    const auto result = fcpx::xml::readFcpxml(path);
+    auto result = fcpx::xml::readFcpxml(path);
     if (!result.error.isEmpty()) {
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), result.error);
         return;
     }
-    if (!timeline->createSequence(result.title, result.videoTracks, result.audioTracks)) {
+    QStringList warnings;
+    if (!fcpx::xml::applyImport(*timeline, result, &warnings)) {
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), QStringLiteral("シーケンスを作成できません。"));
         return;
     }
     QMessageBox report(QMessageBox::Information, QStringLiteral("FCPXML 読み込み"),
         QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
-            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(result.warnings.size())
+            .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(warnings.size())
             .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
-    if (!result.warnings.isEmpty()) report.setDetailedText(result.warnings.join(QLatin1Char('\n')));
+    if (!warnings.isEmpty()) report.setDetailedText(warnings.join(QLatin1Char('\n')));
     report.exec();
 }
 
@@ -780,9 +783,7 @@ bool applyDuckingToTimeline(Timeline *timeline,
         return false;
     }
 
-    timeline->undoManager()->saveState(
-        timeline->currentState(),
-        QStringLiteral("Auto ducking"));
+    timeline->saveUndoState(QStringLiteral("Auto ducking"));
     timeline->refreshPlaybackSequence();
     timeline->repaintAudioTracks();
     if (message) {
@@ -2098,54 +2099,6 @@ QString fcpxFrameDuration(int fps)
 {
     return QStringLiteral("1/%1s").arg(qMax(1, fps));
 }
-
-QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
-{
-    QVector<fcpx::xml::ClipEntry> entries;
-    if (!timeline)
-        return entries;
-
-    const auto &tracks = timeline->videoTracks();
-    for (const auto *track : tracks) {
-        if (!track)
-            continue;
-
-        double cursorSec = 0.0;
-        const auto &clips = track->clips();
-        for (const ClipInfo &clip : clips) {
-            cursorSec += clip.leadInSec;
-
-            const double durationSec = qMax(0.0, clip.effectiveDuration());
-            if (clip.filePath.isEmpty() || durationSec <= 0.0) {
-                cursorSec += durationSec;
-                continue;
-            }
-
-            fcpx::xml::ClipEntry entry;
-            entry.filePath = clip.filePath;
-            entry.offset = qMax(0.0, cursorSec);
-            entry.duration = durationSec;
-            entry.startInSource = qMax(0.0, clip.inPoint);
-            entry.name = clip.displayName.isEmpty()
-                ? QFileInfo(clip.filePath).completeBaseName()
-                : clip.displayName;
-            entries.append(entry);
-
-            cursorSec += durationSec;
-        }
-    }
-
-    std::stable_sort(entries.begin(), entries.end(),
-                     [](const fcpx::xml::ClipEntry &lhs,
-                        const fcpx::xml::ClipEntry &rhs) {
-                         if (lhs.offset < rhs.offset)
-                             return true;
-                         if (lhs.offset > rhs.offset)
-                             return false;
-                         return lhs.name < rhs.name;
-                     });
-    return entries;
-}
 #endif
 
 void syncTimeRemapEntriesToTimelineImpl(
@@ -2701,6 +2654,21 @@ void commitEffects(Timeline &timeline, int trackIndex, int clipIndex,
 }
 } // namespace effectmaskui
 
+bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env)
+{
+    for (const QString &arg : args) {
+        if (arg == QStringLiteral("--selftest") || arg.startsWith(QStringLiteral("--selftest=")))
+            return true;
+    }
+    for (const QString &key : env.keys()) {
+        if (key.startsWith(QStringLiteral("VEDITOR_"))
+            && key.endsWith(QStringLiteral("_SELFTEST"))
+            && env.value(key).toInt() != 0)
+            return true;
+    }
+    return false;
+}
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_vimeoUploadDialog(nullptr)
@@ -2774,6 +2742,12 @@ MainWindow::MainWindow(QWidget *parent)
             return;
         if (m_autoSave && m_autoSave->property("cleanShutdownBeforeAutoSaveStart").toBool())
             return;
+        if (shouldSkipAutosaveRecovery(QCoreApplication::arguments(),
+                                       QProcessEnvironment::systemEnvironment())) {
+            std::fprintf(stderr, "autosave recovery skipped under selftest: %s\n",
+                         qPrintable(files.constFirst()));
+            return;
+        }
 
         QMessageBox prompt(this);
         prompt.setIcon(QMessageBox::Question);
@@ -2926,8 +2900,7 @@ MainWindow::MainWindow(QWidget *parent)
     applyProjectConfig(m_projectConfig);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Initial state"));
+        m_timeline->saveUndoState(QStringLiteral("Initial state"));
     }
 
     nodelib::registerBuiltinNodes();
@@ -3161,6 +3134,12 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("クリップを削除"),      QStringLiteral("編集"));
     reg(m_rippleDeleteAction,    "timeline.ripple_delete",
         QStringLiteral("リップル削除"),        QStringLiteral("編集"));
+    reg(m_connectToStorylineAction, "timeline.connect_to_storyline",
+        QStringLiteral("主ストーリーラインに接続"), QStringLiteral("編集"));
+    reg(m_disconnectFromStorylineAction, "timeline.disconnect",
+        QStringLiteral("接続を解除"),          QStringLiteral("編集"));
+    reg(m_storylineModeAction,   "timeline.storyline_mode",
+        QStringLiteral("主ストーリーライン (マグネティック)"), QStringLiteral("編集"));
     reg(m_copyEffectsAction,     "edit.copy_effects",
         QStringLiteral("エフェクトをコピー"),  QStringLiteral("編集"));
     reg(m_pasteEffectsAction,    "edit.paste_effects",
@@ -4483,6 +4462,11 @@ void MainWindow::setupMenuBar()
     m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));
     connect(m_timeline, &Timeline::statusMessageRequested, this,
             [this](const QString &message, int timeout) { statusBar()->showMessage(message, timeout); });
+    // US-1201: detached connections are reported without a modal dialog.
+    connect(m_timeline, &Timeline::connectionWarningsChanged, this, [this]() {
+        const QStringList warnings = m_timeline->connectionWarnings();
+        if (!warnings.isEmpty()) statusBar()->showMessage(warnings.last(), 8000);
+    });
     connect(m_selectAllClipsAction, &QAction::triggered, this, [this]() {
         m_timeline->selectAllClips();
         updateEditActions();
@@ -4504,7 +4488,7 @@ void MainWindow::setupMenuBar()
             statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
             return;
         }
-        m_timeline->deleteSelectedClip();
+        m_timeline->deleteSelectedClip(true);
         statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
         updateEditActions();
     });
@@ -4527,6 +4511,30 @@ void MainWindow::setupMenuBar()
     connect(m_rippleDeleteAction, &QAction::triggered, this, &MainWindow::rippleDelete);
     m_menuHelpEntries.append({m_rippleDeleteAction,
         QStringLiteral("クリップを消して、空いた隙間を後ろのクリップが詰めて埋めます。間を空けたくないときに。")});
+
+    // US-1202: 主ストーリーライン (V1) への接続。ショートカットは付けない。
+    m_connectToStorylineAction = editMenu->addAction(tr("主ストーリーラインに接続"));
+    m_connectToStorylineAction->setObjectName(QStringLiteral("action_connect_to_storyline"));
+    connect(m_connectToStorylineAction, &QAction::triggered, this,
+            &MainWindow::connectSelectionToStoryline);
+    m_menuHelpEntries.append({m_connectToStorylineAction,
+        QStringLiteral("選んだクリップを、その位置にある V1 のクリップへ接続します。V1 を動かすと一緒に動きます。")});
+    m_disconnectFromStorylineAction = editMenu->addAction(tr("接続を解除"));
+    m_disconnectFromStorylineAction->setObjectName(QStringLiteral("action_disconnect_from_storyline"));
+    connect(m_disconnectFromStorylineAction, &QAction::triggered, this,
+            &MainWindow::disconnectSelectionFromStoryline);
+    m_menuHelpEntries.append({m_disconnectFromStorylineAction,
+        QStringLiteral("選んだクリップの V1 への接続を外します。クリップの位置は変わりません。")});
+    // US-1203: the magnetic primary storyline (default off, saved with the
+    // project, not an undo step).
+    m_storylineModeAction = editMenu->addAction(tr("主ストーリーライン (マグネティック)"));
+    m_storylineModeAction->setObjectName(QStringLiteral("action_storyline_mode"));
+    m_storylineModeAction->setCheckable(true);
+    connect(m_storylineModeAction, &QAction::toggled, this, [this](bool on) {
+        if (m_timeline) m_timeline->setStorylineMode(on);
+    });
+    m_menuHelpEntries.append({m_storylineModeAction,
+        QStringLiteral("オンの間、V1 への挿入・削除・並べ替え・リップルトリムで V1 だけが詰まり、V1 に隙間ができません。V1 のクリップのリンク音声と接続クリップはついてきます。既定はオフで、プロジェクトに保存されます。")});
 
     auto *matchFrameAction = editMenu->addAction(QStringLiteral("マッチフレーム"));
     matchFrameAction->setObjectName(QStringLiteral("action_match_frame"));
@@ -7450,7 +7458,7 @@ void MainWindow::setupMenuBar()
                                   qMax(0, maskSystem.masks().size() - 1));
 
         if (m_timeline && m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(m_timeline->currentState(), undoLabel);
+            m_timeline->saveUndoState(undoLabel);
         if (m_timeline)
             m_timeline->refreshPlaybackSequence();
         if (m_player)
@@ -8893,6 +8901,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markIn = m_timeline->markedIn();
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
+    data.storylineMode = m_timeline->storylineMode();
     data.brushAnimations = m_brushAnimationEntries;
     data.rotoClipEntries.clear();
     const auto rotoEntries = m_timeline->rotoEntries();
@@ -9247,6 +9256,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         m_timeline->restoreFromProject(data.videoTracks, data.audioTracks,
                                        data.playheadPos, data.markIn,
                                        data.markOut, data.zoomLevel);
+        // US-1203: the toggle drives Timeline::setStorylineMode.
+        if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
@@ -9368,8 +9379,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                            data.config.explicitOutputResolution, data.config.fps);
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Project loaded"));
+        m_timeline->saveUndoState(QStringLiteral("Project loaded"));
     }
     if (m_timeline && !relinkMapping.isEmpty()) {
         QString relinkError;
@@ -9751,6 +9761,7 @@ void MainWindow::newProject()
         m_particleClipConfigs.clear();
         syncProjectLightingToTimeline();
         m_tcBurnIn = TimecodeBurnInSettings{};
+        if (m_storylineModeAction) m_storylineModeAction->setChecked(false);
         applyProjectConfig(dialog.config());
         // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
         // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
@@ -9760,8 +9771,7 @@ void MainWindow::newProject()
         // と同じ clear()+saveState 規律で、サイズ入りのベースラインへ置き換える。
         if (m_timeline && m_timeline->undoManager()) {
             m_timeline->undoManager()->clear();
-            m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                                 QStringLiteral("新規プロジェクト"));
+            m_timeline->saveUndoState(QStringLiteral("新規プロジェクト"));
         }
         hideWelcomeScreen();
         updateStatusInfo();
@@ -9815,9 +9825,7 @@ void MainWindow::editProjectSettings()
         // 35a3dd2 で TimelineState に含まれているので projectOutputConfigRestored
         // 経由で canvas/出力サイズも復元される。サイズ未変更時は積まない(no-op)。
         if (sizeChanged && m_timeline && m_timeline->undoManager())
-            m_timeline->undoManager()->saveState(
-                m_timeline->currentState(),
-                QStringLiteral("プロジェクト設定変更"));
+            m_timeline->saveUndoState(QStringLiteral("プロジェクト設定変更"));
 
         updateStatusInfo();
     }
@@ -9894,9 +9902,16 @@ void MainWindow::openProject()
     if (filePath.isEmpty()) return;
 
     QString errorMessage;
-    if (openProjectFromPath(filePath, &errorMessage))
-        statusBar()->showMessage("Opened: " + filePath);
-    else
+    // US-1201: keep a connection warning raised by the load visible (the list
+    // is capped, so compare it rather than its size).
+    const QStringList warningsBefore = m_timeline->connectionWarnings();
+    if (openProjectFromPath(filePath, &errorMessage)) {
+        if (m_timeline->connectionWarnings() != warningsBefore)
+            statusBar()->showMessage("Opened: " + filePath + " / "
+                                     + m_timeline->connectionWarnings().last(), 8000);
+        else
+            statusBar()->showMessage("Opened: " + filePath);
+    } else
         QMessageBox::critical(this, "Open Failed", errorMessage.isEmpty()
                               ? "Could not load project file." : errorMessage);
 }
@@ -10330,7 +10345,16 @@ void MainWindow::rippleTrimInToPlayhead()
         return;
     }
     int trackIdx = -1, clipIdx = -1;
-    if (!selectedVideoClipRef(trackIdx, clipIdx)) {
+    if (m_timeline->storylineMode()) {
+        // US-1203: storyline mode ripples V1 only (applyTrimActive targets V1).
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        trackIdx = 0;
+        clipIdx = v1 ? v1->selectedClip() : -1;
+        if (!v1 || clipIdx < 0 || clipIdx >= v1->clipCount()) {
+            statusBar()->showMessage(tr("V1 のクリップを選択してください"));
+            return;
+        }
+    } else if (!selectedVideoClipRef(trackIdx, clipIdx)) {
         statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
         return;
     }
@@ -10359,7 +10383,17 @@ void MainWindow::rippleTrimOutToPlayhead()
     }
     int trackIdx = -1, clipIdx = -1;
     ClipInfo clip;
-    if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
+    if (m_timeline->storylineMode()) {
+        // US-1203: storyline mode ripples V1 only (applyTrimActive targets V1).
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        trackIdx = 0;
+        clipIdx = v1 ? v1->selectedClip() : -1;
+        if (!v1 || clipIdx < 0 || clipIdx >= v1->clipCount()) {
+            statusBar()->showMessage(tr("V1 のクリップを選択してください"));
+            return;
+        }
+        clip = v1->clips().at(clipIdx);
+    } else if (!selectedVideoClipRef(trackIdx, clipIdx, &clip)) {
         statusBar()->showMessage(QStringLiteral("トリムするクリップを選択してください"));
         return;
     }
@@ -10872,6 +10906,40 @@ void MainWindow::rippleDelete()
     // Same as deleteClip: Timeline reindexes and remaps the matte keys.
     m_timeline->rippleDeleteSelectedClip();
     statusBar()->showMessage("Ripple deleted clip");
+    updateEditActions();
+}
+
+void MainWindow::connectSelectionToStoryline()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!m_timeline || !selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(tr("接続するクリップを選択してください。"), 3000);
+        return;
+    }
+    QString err;
+    if (m_timeline->connectToStoryline(kind, trackIndex, clipIndex, &err))
+        statusBar()->showMessage(tr("クリップを主ストーリーラインに接続しました。"), 3000);
+    else
+        statusBar()->showMessage(err, 5000);
+    updateEditActions();
+}
+
+void MainWindow::disconnectSelectionFromStoryline()
+{
+    TrackKind kind = TrackKind::Video;
+    int trackIndex = -1;
+    int clipIndex = -1;
+    if (!m_timeline || !selectedClipRef(kind, trackIndex, clipIndex)) {
+        statusBar()->showMessage(tr("接続を解除するクリップを選択してください。"), 3000);
+        return;
+    }
+    QString err;
+    if (m_timeline->disconnectClip(kind, trackIndex, clipIndex, &err))
+        statusBar()->showMessage(tr("クリップの接続を解除しました。"), 3000);
+    else
+        statusBar()->showMessage(err, 5000);
     updateEditActions();
 }
 
@@ -14707,10 +14775,9 @@ void MainWindow::configureClipParent()
     const QString parentId = parentCombo->currentData().toString();
     m_timeline->setClipParent(targetClipId, parentId);
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             parentId.isEmpty()
-                                                 ? QStringLiteral("Clear clip parent")
-                                                 : QStringLiteral("Set clip parent"));
+        m_timeline->saveUndoState(parentId.isEmpty()
+                                      ? QStringLiteral("Clear clip parent")
+                                      : QStringLiteral("Set clip parent"));
     m_timeline->refreshPlaybackSequence();
     refreshSpecialClipPreview();
     statusBar()->showMessage(parentId.isEmpty()
@@ -14765,8 +14832,7 @@ void MainWindow::createNullObjectForSelection()
     const QString parentId = brushClipId(nullTrackIdx, 0);
     m_timeline->setClipParent(childId, parentId);
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Create null object"));
+        m_timeline->saveUndoState(QStringLiteral("Create null object"));
     m_timeline->refreshPlaybackSequence();
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("ヌルオブジェクトを作成し、ペアレントに設定しました"), 4000);
@@ -15978,8 +16044,7 @@ void MainWindow::addMask()
     clips[clipIdx].maskSystem = maskSystemWithAppendedMask(clips[clipIdx].maskSystem, mask);
     track->setClips(clips);
     if (m_timeline && m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(m_timeline->currentState(),
-                                             QStringLiteral("Add mask"));
+        m_timeline->saveUndoState(QStringLiteral("Add mask"));
     if (m_timeline)
         m_timeline->refreshPlaybackSequence();
     if (m_player)
@@ -16391,9 +16456,7 @@ MainWindow::PrecomposeResult MainWindow::precomposeSelectionWithName(const QStri
         selectNestedClip(m_timeline->audioTracks().value(selection.firstAudioTrack, nullptr));
 
     if (m_timeline->undoManager())
-        m_timeline->undoManager()->saveState(
-            m_timeline->currentState(),
-            QStringLiteral("Pre-compose: %1").arg(name));
+        m_timeline->saveUndoState(QStringLiteral("Pre-compose: %1").arg(name));
 
     m_timeline->refreshPlaybackSequence();
     setWindowModified(true);
@@ -16539,9 +16602,7 @@ void MainWindow::openSocialExportDialog()
                     }
 
                     if (m_timeline)
-                        m_timeline->undoManager()->saveState(
-                            m_timeline->currentState(),
-                            QStringLiteral("Apply SNS preset"));
+                        m_timeline->saveUndoState(QStringLiteral("Apply SNS preset"));
 
                     setWindowModified(true);
                     qInfo().noquote() << QStringLiteral(
@@ -17142,9 +17203,11 @@ void MainWindow::onMobileExport()
                                                          &projectLoudnessGainDb);
                     prepareExportJobAsync(std::move(job),
                         [this, cfg, projectLoudnessGainDb](RenderJob job) {
-                        // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
-                        // 作る。OFF 時だけここで無音 / 混合トラックを作る。
-                        if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
+                        // ON 時は prepareJob が音声を作る。OFF 時は通常書き出しと同じく
+                        // finalizeExportJobAudio (buildMixPlan / executeMixPlan) でタイムラインの
+                        // 音声 (クリップ音量 / パン / EQ、複数トラック、FX) を作る。V1 が空なら
+                        // 無音 / 混合トラック、passthrough 判定が真なら従来どおり V1 の元音声を mux する。
+                        if (!cfg.autoLoudness) {
                             QString audioMixError;
                             if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
                                 QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
@@ -17655,8 +17718,9 @@ void MainWindow::openFcpxmlExportDialog()
     config.width = qMax(1, m_projectConfig.width);
     config.height = qMax(1, m_projectConfig.height);
 
-    const QVector<fcpx::xml::ClipEntry> clips =
-        buildFcpxmlExportClips(m_timeline);
+    const QVector<fcpx::xml::ClipEntry> clips = m_timeline
+        ? fcpx::buildExportClips(*m_timeline)
+        : QVector<fcpx::xml::ClipEntry>();
     const QString xml = fcpx::xml::buildXml(clips, config);
 
     QFile file(outPath);
@@ -19381,7 +19445,11 @@ void MainWindow::showEvent(QShowEvent *event)
 
     if (!m_autoSaveStarted && m_autoSave) {
         m_autoSaveStarted = true;
-        QTimer::singleShot(500, this, [this]() {
+        // Short selftests can finish before the normal startup delay. Start
+        // AutoSave in their first event-loop turn so its recovery check runs.
+        const int startupDelayMs = shouldSkipAutosaveRecovery(
+            QCoreApplication::arguments(), QProcessEnvironment::systemEnvironment()) ? 0 : 500;
+        QTimer::singleShot(startupDelayMs, this, [this]() {
             if (!m_autoSave)
                 return;
             // Default OFF. Interval persisted via QSettings, default 30 min.

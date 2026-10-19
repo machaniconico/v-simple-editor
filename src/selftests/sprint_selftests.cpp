@@ -52,6 +52,7 @@
 #include "BatchExportQueue.h"
 #include "SelftestRegistry.h"
 #include "Timeline.h"
+#include "MainWindow.h"
 
 #include <QApplication>
 #include <QDir>
@@ -235,6 +236,19 @@ using selftests::requireSelftest;
 int runWorkflowSelftest()
 {
     QString error;
+    QProcessEnvironment emptyEnvironment;
+    QProcessEnvironment selftestEnvironment;
+    selftestEnvironment.insert(QStringLiteral("VEDITOR_WORKFLOW_SELFTEST"), QStringLiteral("1"));
+    const bool argSkip = shouldSkipAutosaveRecovery(
+        {QStringLiteral("editor"), QStringLiteral("--selftest=workflow")}, emptyEnvironment);
+    const bool envSkip = shouldSkipAutosaveRecovery({QStringLiteral("editor")}, selftestEnvironment);
+    const bool noneSkip = shouldSkipAutosaveRecovery({QStringLiteral("editor")}, emptyEnvironment);
+    std::fprintf(stderr, "  workflow autosave-skip arg=%d env=%d none=%d\n",
+                 argSkip, envSkip, noneSkip);
+    if (!requireSelftest(argSkip && envSkip && !noneSkip,
+                         QStringLiteral("AutoSave recovery suppression must be limited to selftests"),
+                         &error))
+        return 1;
 
 #ifdef HAVE_AIMASK
     {

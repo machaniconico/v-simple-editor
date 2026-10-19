@@ -638,7 +638,7 @@ int runLight3DSelftest()
     double secondDiffuseCoeff = -1.0;
     {
         MainWindow window;
-        Timeline *timeline = window.findChild<Timeline *>();
+        Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
         if (timeline && !timeline->videoTracks().isEmpty()
             && timeline->videoTracks().first()) {
             TimelineTrack *track = timeline->videoTracks().first();

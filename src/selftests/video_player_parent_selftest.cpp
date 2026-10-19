@@ -41,6 +41,8 @@
 //   Fixture media failure fails all gates; only a missing mpeg4 encoder SKIPs.
 //   G8 observation OFF records nothing while the paths still run.
 //   G9 each admission path produced records.
+//   G10 offline parent does not change displayed child pixels; a decodable
+//       parent on the same timeline does change them.
 
 #include "SelftestGate.h"
 #include "../ClipGeometry.h"
@@ -92,7 +94,8 @@ qint64 usecOf(double sec)
 
 // Same recipe as ClipLutSelftest.cpp writeSyntheticClip (mpeg4 via
 // libavcore::FrameEncoder); each file gets its own base colour.
-bool writeSyntheticClip(const QString &path, const QColor &base, QString *error)
+bool writeSyntheticClip(const QString &path, const QColor &base, QString *error,
+                        bool changingFrames = true)
 {
     libavcore::EncodeRequest req;
     req.width = kCanvas.width();
@@ -113,7 +116,8 @@ bool writeSyntheticClip(const QString &path, const QColor &base, QString *error)
     }
     for (int i = 0; i < kFrameCount; ++i) {
         QImage frame(kCanvas, QImage::Format_RGB888);
-        frame.fill(QColor((base.red() + i * 3) & 255, base.green(), base.blue()));
+        frame.fill(QColor((base.red() + (changingFrames ? i * 3 : 0)) & 255,
+                          base.green(), base.blue()));
         if (!encoder.pushFrame(frame, i)) {
             *error = QStringLiteral("FrameEncoder::pushFrame failed at frame %1").arg(i);
             return false;
@@ -163,6 +167,7 @@ void setTransition(ClipInfo &out, ClipInfo &in, TransitionAlignment alignment)
 struct Drive {
     QVector<Record> cpu;
     QVector<Record> track;
+    QImage cpuFrame;
     int cpuFrames = 0;   // frameComposited emitted by the cpu-composite step(s)
     int cpuAttempt = 0;  // 1 = at the paused seek, 2 = after playback
     int trackFrames = 0; // frameComposited emitted while playing
@@ -188,7 +193,7 @@ struct Drive {
 //      compositor base (m_lastV1RawFrame) empty on a plain timeline; playback
 //      fills it, as in the app.
 Drive drive(Timeline &tl, double seekSec, double windowEndSec, bool observe,
-            QSize outputSize = kCanvas)
+            QSize outputSize = kCanvas, const QString &offlineParentPath = {})
 {
     Drive out;
     tl.refreshPlaybackSequence();
@@ -198,6 +203,17 @@ Drive drive(Timeline &tl, double seekSec, double windowEndSec, bool observe,
     player.setProjectOutputSize(outputSize);
     player.glPreview()->setTimeline(&tl);
     player.setSequence(tl.computePlaybackSequence());
+    if (!offlineParentPath.isEmpty()) {
+        // Retain the valid playback media snapshot while the project's parent
+        // path goes offline. The decoded layer stays present, so the
+        // decodable guard in VideoPlayer is the deciding branch.
+        TimelineTrack *track = tl.videoTracks().value(1, nullptr);
+        if (track && track->clips().size() > 1) {
+            QVector<ClipInfo> clips = track->clips();
+            clips[1].filePath = offlineParentPath;
+            track->setClips(clips);
+        }
+    }
 
     QSignalSpy frames(&player, &VideoPlayer::frameComposited);
     const qint64 target = usecOf(seekSec);
@@ -216,12 +232,14 @@ Drive drive(Timeline &tl, double seekSec, double windowEndSec, bool observe,
                 return true;
         return false;
     };
+    QImage latestCpuFrame;
     auto cpuStep = [&]() {
         player.setParentAdmissionObservationForTest(observe);
         const int before = frames.count();
         player.setPreviewEffects({VideoEffect::createFilmGrain(0.3, 1, 0.0, false)});
         const bool shown = QTest::qWaitFor([&]() { return frames.count() > before; }, 2000);
         out.cpuFrames += shown ? frames.count() - before : 0;
+        latestCpuFrame = shown ? qvariant_cast<QImage>(frames.constLast().at(0)) : QImage();
         const QVector<Record> records = player.parentAdmissionRecordsForTest();
         player.setPreviewEffects({});
         return records;
@@ -252,9 +270,13 @@ Drive drive(Timeline &tl, double seekSec, double windowEndSec, bool observe,
     if (observe && inWindow(cpuAtSeek, kCpuPath)) {
         out.cpu = cpuAtSeek;
         out.cpuAttempt = 1;
+        // The first CPU sample is selected only when it contains the child
+        // in the requested window. Keep its image if a second refresh runs.
+        out.cpuFrame = latestCpuFrame;
     } else {
         out.cpu = cpuAtSeek + cpuStep();
         out.cpuAttempt = 2;
+        out.cpuFrame = latestCpuFrame;
     }
     player.setParentAdmissionObservationForTest(false);
     return out;
@@ -398,6 +420,31 @@ bool sameT(const clipgeom::ClipTransform &a, const clipgeom::ClipTransform &b, d
         && std::fabs(a.rotationDeg - b.rotationDeg) <= eps;
 }
 
+struct PixelDifference {
+    int maxChannel = 0;
+    int changedPixels = 0;
+};
+
+PixelDifference comparePixels(const QImage &left, const QImage &right)
+{
+    PixelDifference result;
+    if (left.isNull() || right.isNull() || left.size() != right.size())
+        return result;
+    for (int y = 0; y < left.height(); ++y) {
+        for (int x = 0; x < left.width(); ++x) {
+            const QColor a = left.pixelColor(x, y);
+            const QColor b = right.pixelColor(x, y);
+            const int difference = qMax(qMax(std::abs(a.red() - b.red()),
+                                               std::abs(a.green() - b.green())),
+                                        std::abs(a.blue() - b.blue()));
+            result.maxChannel = qMax(result.maxChannel, difference);
+            if (difference > 2)
+                ++result.changedPixels;
+        }
+    }
+    return result;
+}
+
 } // namespace
 
 int runVideoPlayerParentSelftest()
@@ -423,7 +470,7 @@ int runVideoPlayerParentSelftest()
     const QString parentPath = tmpDir.filePath(QStringLiteral("parent.mp4"));
     const QString childPath = tmpDir.filePath(QStringLiteral("child.mp4"));
     if (!CodecDetector::isEncoderAvailable(QStringLiteral("mpeg4"))) {
-        for (int g = 1; g <= 9; ++g)
+        for (int g = 1; g <= 10; ++g)
             tally.skip(g, "mpeg4 encoder not registered (CodecDetector::isEncoderAvailable)");
         return tally.finish("[video-player-parent]");
     }
@@ -436,7 +483,7 @@ int runVideoPlayerParentSelftest()
         const std::string reason = tmpDir.isValid()
             ? "mpeg4 fixture media could not be written: " + mediaError.toStdString()
             : std::string("temporary directory invalid");
-        for (int g = 1; g <= 9; ++g)
+        for (int g = 1; g <= 10; ++g)
             tally.gate(g, false, reason.c_str());
         return tally.finish("[video-player-parent]");
     }
@@ -811,7 +858,7 @@ int runVideoPlayerParentSelftest()
         pinnedGate(6, p, pin, pin, check, "Start trail parent", controlOk);
     }
 
-    // ── G7: offline parent (file missing) ──────────────────────────────────
+    // ── G7: offline parent (file missing, with and without cached media) ───
     {
         const QString offlinePath = tmpDir.filePath(QStringLiteral("offline-parent.mp4"));
         Timeline tl;
@@ -826,7 +873,32 @@ int runVideoPlayerParentSelftest()
         // Control: both sides adopt keeps the EQUAL label.
         const bool controlOk = controlRejected(7, p, true, true, true, pin, pin, check,
                                                "both adopt");
-        pinnedGate(7, p, pin, pin, check, "offline parent", controlOk);
+        // The cold missing file above has no decoded parent layer, so it
+        // cannot reach VideoPlayer's decodable guard. Preserve an already
+        // valid sequence snapshot while the Timeline path goes offline and
+        // pin the adoption operands on both live paths as well.
+        Timeline staleTimeline;
+        buildTimeline(staleTimeline,
+                      spacerThen(makeClip(parentPath, QStringLiteral("parent"),
+                                          0.0, 4.0, kParentT)), parentKey);
+        const Drive staleDrive = drive(staleTimeline, 2.0, 4.0, true, kCanvas, offlinePath);
+        const PathResult staleCpu = evaluate(staleTimeline, staleDrive.cpu, kCpuPath,
+                                             2.0, 4.0, 1, 1, -1);
+        const PathResult staleTrack = evaluate(staleTimeline, staleDrive.track, kTrackPath,
+                                               2.0, 4.0, 1, 1, -1);
+        auto staleOfflineRejected = [](const PathResult &r) {
+            return r.recorded && r.parentLayerPresent && r.hit.has_value()
+                && !r.hit->decodable && r.child.parentHit
+                && !r.child.parentHitDecodable && !r.vpAdopts;
+        };
+        const bool staleOk = staleOfflineRejected(staleCpu)
+            && staleOfflineRejected(staleTrack);
+        std::cerr << "  G7 stale offline cpu=" << staleOfflineRejected(staleCpu)
+                  << " track=" << staleOfflineRejected(staleTrack)
+                  << " parentPresent=" << staleCpu.parentLayerPresent
+                  << ',' << staleTrack.parentLayerPresent
+                  << " vpAdopts=" << staleCpu.vpAdopts << ',' << staleTrack.vpAdopts << '\n';
+        pinnedGate(7, p, pin, pin, check, "offline parent", controlOk && staleOk);
     }
 
     // ── G8: observation OFF records nothing ──────────────────────────────────
@@ -856,6 +928,106 @@ int runVideoPlayerParentSelftest()
                   << " records=" << p1.d.track.size() << '\n';
         tally.gate(9, p1.cpu.recorded && p1.track.recorded,
                    "a required admission path produced no record");
+    }
+
+    // ── G10: visible pixels, independent of the G7 admission operands ─────
+    {
+        const QString offlinePath = tmpDir.filePath(QStringLiteral("offline-parent.mp4"));
+        const QString stillBasePath = tmpDir.filePath(QStringLiteral("g10-base.mp4"));
+        const QString stillSpacerPath = tmpDir.filePath(QStringLiteral("g10-spacer.mp4"));
+        const QString stillParentPath = tmpDir.filePath(QStringLiteral("g10-parent.mp4"));
+        const QString stillChildPath = tmpDir.filePath(QStringLiteral("g10-child.mp4"));
+        QString fixtureError;
+        const bool fixtureReady =
+            writeSyntheticClip(stillBasePath, QColor(40, 40, 40), &fixtureError, false)
+            && writeSyntheticClip(stillSpacerPath, QColor(0, 200, 0), &fixtureError, false)
+            && writeSyntheticClip(stillParentPath, QColor(0, 0, 220), &fixtureError, false)
+            && writeSyntheticClip(stillChildPath, QColor(220, 0, 0), &fixtureError, false);
+        auto makeTimeline = [&](Timeline &tl, bool linked) {
+            ClipInfo base = makeClip(stillBasePath, QStringLiteral("base"), 0.0, 6.0);
+            base.opacity = 0.0; // Keep a real V1 decoder, expose V2/V3 pixels.
+            addClip(tl, 0, base);
+            addClip(tl, 1, makeClip(stillSpacerPath, QStringLiteral("spacer"),
+                                    0.0, 1.0, kParentT));
+            addClip(tl, 1, makeClip(stillParentPath, QStringLiteral("parent"),
+                                    0.0, 4.0, kParentT));
+            addClip(tl, kChildTrack, makeClip(stillChildPath, QStringLiteral("child"),
+                                             0.0, 6.0, kChildT));
+            if (linked)
+                tl.setClipParent(childKey, parentKey);
+        };
+        Timeline offlineLinked;
+        Timeline offlineReference;
+        Timeline onlineLinked;
+        Timeline onlineReference;
+        makeTimeline(offlineLinked, true);
+        makeTimeline(offlineReference, false);
+        makeTimeline(onlineLinked, true);
+        makeTimeline(onlineReference, false);
+
+        const Drive offlineDrive = fixtureReady
+            ? drive(offlineLinked, 2.0, 4.0, true, kCanvas, offlinePath) : Drive{};
+        const Drive referenceDrive = fixtureReady
+            ? drive(offlineReference, 2.0, 4.0, true, kCanvas, offlinePath) : Drive{};
+        const Drive onlineDrive = fixtureReady
+            ? drive(onlineLinked, 2.0, 4.0, true) : Drive{};
+        const Drive onlineReferenceDrive = fixtureReady
+            ? drive(onlineReference, 2.0, 4.0, true) : Drive{};
+        const QImage &offline = offlineDrive.cpuFrame;
+        const QImage &reference = referenceDrive.cpuFrame;
+        const QImage &online = onlineDrive.cpuFrame;
+        const QImage &onlineWithoutParent = onlineReferenceDrive.cpuFrame;
+        auto childCpuRecorded = [](const Drive &d) {
+            for (const Record &record : d.cpu) {
+                if (record.path == QLatin1String(kCpuPath)
+                    && record.sourceTrack == kChildTrack
+                    && record.sourceClipIndex == kChildClip)
+                    return true;
+            }
+            return false;
+        };
+        const PixelDifference offlineDiff = comparePixels(offline, reference);
+        const PixelDifference onlineDiff = comparePixels(online, onlineWithoutParent);
+        auto childTransformText = [](const Drive &d) {
+            for (const Record &record : d.cpu)
+                if (record.sourceTrack == kChildTrack && record.sourceClipIndex == kChildClip)
+                    return tText(record.effectiveTransform);
+            return std::string("no child record");
+        };
+        auto centerColor = [](const QImage &image) {
+            return image.isNull() ? QColor() : image.pixelColor(image.width() / 2, image.height() / 2);
+        };
+        std::cerr << "  G10 fixtureReady=" << fixtureReady
+                  << " fixtureError=" << fixtureError.toStdString()
+                  << " cpuRecords=" << childCpuRecorded(offlineDrive)
+                  << ',' << childCpuRecorded(referenceDrive)
+                  << ',' << childCpuRecorded(onlineDrive)
+                  << ',' << childCpuRecorded(onlineReferenceDrive)
+                  << " offlineSize=" << offline.width() << 'x' << offline.height()
+                  << " referenceSize=" << reference.width() << 'x' << reference.height()
+                  << " onlineSize=" << online.width() << 'x' << online.height()
+                  << " onlineReferenceSize=" << onlineWithoutParent.width() << 'x'
+                  << onlineWithoutParent.height() << " offlineMax=" << offlineDiff.maxChannel
+                  << " offlineChanged=" << offlineDiff.changedPixels
+                  << " onlineMax=" << onlineDiff.maxChannel
+                  << " onlineChanged=" << onlineDiff.changedPixels << '\n';
+        std::cerr << "  G10 childTransforms offline=" << childTransformText(offlineDrive)
+                  << " offlineRef=" << childTransformText(referenceDrive)
+                  << " online=" << childTransformText(onlineDrive)
+                  << " onlineRef=" << childTransformText(onlineReferenceDrive)
+                  << " centerColors=" << centerColor(offline).name().toStdString()
+                  << ',' << centerColor(reference).name().toStdString()
+                  << ',' << centerColor(online).name().toStdString()
+                  << ',' << centerColor(onlineWithoutParent).name().toStdString() << '\n';
+        tally.gate(10, fixtureReady && !QFile::exists(offlinePath)
+                       && childCpuRecorded(offlineDrive)
+                       && childCpuRecorded(referenceDrive)
+                       && childCpuRecorded(onlineDrive)
+                       && childCpuRecorded(onlineReferenceDrive)
+                       && !offline.isNull() && offline.size() == reference.size()
+                       && !online.isNull() && online.size() == onlineWithoutParent.size()
+                       && offlineDiff.maxChannel <= 2 && onlineDiff.changedPixels > 0,
+                   "offline display differs from parentless reference or online control has no visible parent effect");
     }
 
     return tally.finish("[video-player-parent]");

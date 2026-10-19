@@ -102,6 +102,7 @@ namespace tlrender {
 namespace {
 thread_local bool transitionStepsEnabled = true;
 thread_local int transitionStepCalls = 0;
+std::atomic<quint64> alphaCarryLoopEntries{0};
 OverlapInterval transitionInterval(const PlaybackEntry &e)
 {
     OverlapInterval iv;
@@ -142,6 +143,10 @@ void setTransitionStepsEnabledForTest(bool enabled)
     transitionStepCalls = 0;
 }
 int transitionStepCallCountForTest() { return transitionStepCalls; }
+quint64 alphaCarryLoopEntryCountForTest()
+{
+    return alphaCarryLoopEntries.load(std::memory_order_relaxed);
+}
 
 QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &e, double T)
 {
@@ -779,7 +784,16 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     // applyEffectStack feeds them, so RGB is unchanged; an enabled pixel-moving
     // effect (roto::effectMovesPixels) restarts the carried alpha from its own
     // output. A disabled effect returns its input (applyEffect), so it clamps.
-    if (roto::hasTranslucentPixel(graded)) {
+    // US-1211: a keyer in the stack also enters the loop on an opaque input, so
+    // the alpha it cuts survives the non-geometric effects after it. Geometric
+    // effects still restart the carry (unchanged).
+    const bool hasKeyer = std::any_of(effects.begin(), effects.end(), [](const VideoEffect &e) {
+        return e.enabled && (e.type == VideoEffectType::ChromaKey
+                             || e.type == VideoEffectType::LumaKey
+                             || e.type == VideoEffectType::ColorKey);
+    });
+    if (hasKeyer || roto::hasTranslucentPixel(graded)) {
+        alphaCarryLoopEntries.fetch_add(1, std::memory_order_relaxed);
         QImage result = graded;
         QImage alphaCarrier = graded;
         for (const VideoEffect &effect : effects) {

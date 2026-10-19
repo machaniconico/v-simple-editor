@@ -66,6 +66,7 @@ QJsonObject toJson(const ExportConfig &c)
     if (c.sequencePattern != defaults.sequencePattern) j.insert("sequencePattern", c.sequencePattern);
     if (c.sequenceDigits != defaults.sequenceDigits) j.insert("sequenceDigits", c.sequenceDigits);
     if (c.sequenceStart != defaults.sequenceStart) j.insert("sequenceStart", c.sequenceStart);
+    if (c.exrLinear) j.insert("exrLinear", true);
     if (c.autoLoudness) j.insert("autoLoudness", true);
     if (c.targetLufs != defaults.targetLufs) j.insert("targetLufs", c.targetLufs);
     return j;
@@ -111,6 +112,7 @@ ExportConfig fromJson(const QJsonObject &j)
     c.sequencePattern = j.value("sequencePattern").toString(c.sequencePattern);
     c.sequenceDigits = j.value("sequenceDigits").toInt(c.sequenceDigits);
     c.sequenceStart = j.value("sequenceStart").toInt(c.sequenceStart);
+    c.exrLinear = j.value("exrLinear").toBool(c.exrLinear);
     c.autoLoudness = j.value("autoLoudness").toBool(c.autoLoudness);
     c.targetLufs = j.value("targetLufs").toDouble(c.targetLufs);
     return c;
