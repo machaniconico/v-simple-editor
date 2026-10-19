@@ -23,6 +23,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -326,6 +327,66 @@ QStringList answeringMessageBoxes(QObject *context, const std::function<void()> 
     timer.stop();
     return seen;
 }
+
+// US-1300: closes the modal prompts a real MainWindow slot opens, on a periodic timer (the
+// slot may open several in a row). A QMessageBox with a Yes button is answered Yes; a
+// QInputDialog gets `inputText` and is accepted when one was given; anything else is
+// rejected and counted in `unexpected`, so a stray dialog fails the gate instead of
+// hanging it. The timer stops with the object.
+struct ModalDriver {
+    explicit ModalDriver(QObject *context, const QString &inputText = QString())
+        : text(inputText)
+    {
+        timer.setInterval(20);
+        QObject::connect(&timer, &QTimer::timeout, context, [this] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            if (auto *box = qobject_cast<QMessageBox *>(modal)) {
+                seen.append(box->text());
+                if (QAbstractButton *yes = box->button(QMessageBox::Yes)) {
+                    ++answered;
+                    yes->click();
+                } else {
+                    ++unexpected;
+                    box->reject();
+                }
+            } else if (auto *input = qobject_cast<QInputDialog *>(modal)) {
+                if (text.isEmpty()) {
+                    ++unexpected;
+                    input->reject();
+                } else {
+                    ++answered;
+                    input->setTextValue(text);
+                    input->accept();
+                }
+            } else {
+                ++unexpected;
+                if (auto *dialog = qobject_cast<QDialog *>(modal)) dialog->reject();
+                else modal->close();
+            }
+        });
+    }
+    ~ModalDriver() { timer.stop(); }
+    void start() { timer.start(); }
+
+    QTimer timer;
+    QString text;
+    QStringList seen;
+    int answered = 0;
+    int unexpected = 0;
+};
+
+// MainWindow::onMultiCamApplyToTimeline is a private slot: reach it by explicit instantiation
+// (audio_fixture_selftest.cpp does the same) so MainWindow.h stays unchanged.
+template<class Tag, typename Tag::Type Member>
+struct Access {
+    friend typename Tag::Type member(Tag) { return Member; }
+};
+struct MultiCamApplyTag {
+    using Type = void (MainWindow::*)(const MultiCamProject &);
+    friend Type member(MultiCamApplyTag);
+};
+template struct Access<MultiCamApplyTag, &MainWindow::onMultiCamApplyToTimeline>;
 
 // 40x24 10 fps mpeg4 clip of `frames` frames (the media a drop imports).
 bool writeVideoFile(const QString &path, int frames)
@@ -2416,6 +2477,157 @@ int runConnectedClipSelftest()
                        "media drop was taken / the mode-off clip drop connected / a multi-file or project drop was "
                        "taken, a gap drop connected, or a drop landed audio on a locked partner track / a video-only drop was refused by it, or a held V1 move drag kept repainting");
         }
+    }
+
+    // G27: the real MultiCam apply path (MainWindow::onMultiCamApplyToTimeline) with its
+    // replace-V1 confirmation closed by a periodic timer (no production seam).
+    if (!mainTimeline) {
+        tally.gate(27, false, "MainWindow has no mainTimeline");
+    } else {
+        QTemporaryDir angleDir;
+        const QString anglePath = angleDir.filePath(QStringLiteral("angle.png"));
+        QImage(8, 8, QImage::Format_RGB888).save(anglePath);
+        MultiCamProject project;
+        project.angles.append({1, anglePath, 0, QStringLiteral("Cam 1")});
+        project.switches.append({0, 1});
+        project.defaultAngleId = 1;
+        const auto apply = [&](const MultiCamProject &p) {
+            (window.*member(MultiCamApplyTag{}))(p);
+        };
+
+        // (a) V1 holds a clip: the question is asked and answered Yes; the connected V2 clip
+        // stays where it was and detaches with one warning on the next commit (as in G17).
+        load(*mainTimeline, {{clipFor("a", 10.0)}, {clipFor("x", 1.0, 2.0)}});
+        const QString aUid = uidAt(*mainTimeline, 0, 0);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aUid);
+        mainTimeline->takeConnectionWarnings();
+        int answered = 0, unexpected = 0;
+        QStringList seen;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            apply(project);
+            answered = driver.answered;
+            unexpected = driver.unexpected;
+            seen = driver.seen;
+        }
+        const bool v1Replaced = mainTimeline->trackAt(false, 0)->clipCount() == 1
+            && uidAt(*mainTimeline, 0, 0) != aUid
+            && mainTimeline->trackAt(false, 0)->clips().at(0).filePath == anglePath;
+        mainTimeline->saveUndoState(QStringLiteral("unrelated"));
+        const QStringList warnings = mainTimeline->takeConnectionWarnings();
+        const Located x = locate(*mainTimeline, false, xUid);
+        const bool noModalA = QApplication::activeModalWidget() == nullptr;
+        const bool mainOk = answered == 1 && unexpected == 0 && seen.size() == 1 && v1Replaced
+            && x.found && near(x.startSec, 2.0) && x.clip.anchorUid.isEmpty() && warnings.size() == 1;
+
+        // (b) V1 empty: no question is asked, the apply still lands.
+        load(*mainTimeline, {{}, {clipFor("x", 1.0, 2.0)}});
+        int askedEmpty = -1;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            apply(project);
+            askedEmpty = driver.seen.size() + driver.unexpected;
+        }
+        const bool emptyOk = askedEmpty == 0 && mainTimeline->trackAt(false, 0)->clipCount() == 1;
+
+        // (c) control: a dialog without a Yes button is rejected and counted, not left open.
+        int strayUnexpected = 0;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            QMessageBox::information(&window, QStringLiteral("G27"), QStringLiteral("no Yes button"));
+            strayUnexpected = driver.unexpected;
+        }
+        const bool strayOk = strayUnexpected == 1;
+        const bool noModal = noModalA && QApplication::activeModalWidget() == nullptr;
+        std::fprintf(stderr, "connected-clip G27 answered=%d unexpected=%d questions=%lld (expect 1/0/1) v1Replaced=%d "
+                     "x found=%d start=%.6f (expect 2) anchorUid=[%s] (expect empty) warnings=%lld (expect 1) | "
+                     "empty V1 asked=%d (expect 0) ok=%d | stray dialog unexpected=%d (expect 1) | noModal=%d\n",
+                     answered, unexpected, static_cast<long long>(seen.size()), v1Replaced, x.found, x.startSec,
+                     qPrintable(x.clip.anchorUid), static_cast<long long>(warnings.size()), askedEmpty, emptyOk,
+                     strayUnexpected, noModal);
+        tally.gate(27, mainOk && emptyOk && strayOk && noModal,
+                   "the real MultiCam apply path did not ask / apply after Yes, kept the connection, "
+                   "asked with an empty V1, left a modal open, or a dialog without a Yes button was not rejected");
+    }
+
+    // G28: the real pre-compose menu action (QInputDialog closed by a periodic timer) with the
+    // G18 fixture and expectations plus the nested sequence name.
+    QAction *precomposeAction = nullptr;
+    for (QAction *action : window.findChildren<QAction *>())
+        if (action->text() == QStringLiteral("選択をプリコンポーズ...")) {
+            precomposeAction = action;
+            break;
+        }
+    if (!mainTimeline || !precomposeAction) {
+        std::fprintf(stderr, "connected-clip G28 missing: timeline=%d action=%d\n", mainTimeline != nullptr,
+                     precomposeAction != nullptr);
+        tally.gate(28, false, "the pre-compose menu action is not registered on the MainWindow");
+    } else {
+        load(*mainTimeline, {{clipFor("a", 10.0)}, {clipFor("x", 6.0, 2.0), clipFor("y", 0.5, 1.0)},
+                             {clipFor("s", 2.0, 4.0)}});
+        const QString aUid = uidAt(*mainTimeline, 0, 0);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aUid);
+        mainTimeline->connectClip(TrackKind::Video, 1, 1, aUid);
+        mainTimeline->takeConnectionWarnings();
+        for (int t = 0; t < mainTimeline->videoTrackCount(); ++t)
+            mainTimeline->trackAt(false, t)->setSelectedClip(t == 2 ? 0 : -1);
+        for (int t = 0; t < mainTimeline->audioTrackCount(); ++t)
+            mainTimeline->trackAt(true, t)->setSelectedClip(-1);
+        int answered = 0, unexpected = 0;
+        {
+            ModalDriver driver(&window, QStringLiteral("Precompose"));
+            driver.start();
+            precomposeAction->trigger();
+            answered = driver.answered;
+            unexpected = driver.unexpected;
+        }
+        const QStringList parentWarnings = mainTimeline->takeConnectionWarnings();
+        const Located left = locate(*mainTimeline, false, aUid);
+        const Located y = locateByName(*mainTimeline, false, QStringLiteral("y"));
+        const Located xLeft = locate(*mainTimeline, false, xUid);
+        const bool parentOk = left.found && left.track == 0 && near(left.startSec, 0.0)
+            && near(left.clip.effectiveDuration(), 4.0) && y.found && near(y.startSec, 9.0)
+            && y.clip.anchorUid == aUid && near(y.clip.anchorOffsetSec, 9.0) && xLeft.found
+            && near(xLeft.startSec, 2.0) && xLeft.clip.anchorUid == aUid && parentWarnings.isEmpty();
+        QString nestedId;
+        for (const TimelineSequence &sequence : mainTimeline->sequences())
+            if (sequence.name == QStringLiteral("Precompose")) nestedId = sequence.id;
+        bool nestedOk = false;
+        QString nestedDetail;
+        const QString activeParent = mainTimeline->activeSequenceId();
+        if (!nestedId.isEmpty() && mainTimeline->setActiveSequence(nestedId)) {
+            mainTimeline->saveUndoState(QStringLiteral("nested edit"));
+            const QStringList nestedWarnings = mainTimeline->takeConnectionWarnings();
+            const TimelineTrack *nv1 = mainTimeline->trackAt(false, 0);
+            const TimelineTrack *nv2 = mainTimeline->trackAt(false, 1);
+            const ClipInfo v1Piece = nv1 && nv1->clipCount() == 1 ? nv1->clips().at(0) : ClipInfo{};
+            const ClipInfo v2Piece = nv2 && nv2->clipCount() == 1 ? nv2->clips().at(0) : ClipInfo{};
+            nestedOk = !v1Piece.uid.isEmpty() && v2Piece.anchorUid == v1Piece.uid
+                && near(v2Piece.leadInSec, 0.0) && near(v2Piece.anchorOffsetSec, 0.0)
+                && nestedWarnings.isEmpty();
+            nestedDetail = QStringLiteral("v1Clips=%1 v2Clips=%2 v2 anchorUid=%3 (expect the nested V1 uid "
+                                          "%4) offset=%5 warnings=%6")
+                .arg(nv1 ? nv1->clipCount() : -1).arg(nv2 ? nv2->clipCount() : -1)
+                .arg(v2Piece.anchorUid, v1Piece.uid).arg(v2Piece.anchorOffsetSec, 0, 'f', 6)
+                .arg(nestedWarnings.size());
+            mainTimeline->setActiveSequence(activeParent);
+        }
+        const bool noModal = QApplication::activeModalWidget() == nullptr;
+        std::fprintf(stderr, "connected-clip G28 answered=%d unexpected=%d (expect 1/0) nested id=[%s] "
+                     "(name Precompose) left start=%.6f length=%.6f (expect 0 / 4) y[%s] xLeft[%s] "
+                     "parentWarnings=%lld (expect 0) parentOk=%d | nested %s ok=%d | noModal=%d\n",
+                     answered, unexpected, qPrintable(nestedId), left.startSec, left.clip.effectiveDuration(),
+                     qPrintable(describe(y, aUid)), qPrintable(describe(xLeft, aUid)),
+                     static_cast<long long>(parentWarnings.size()), parentOk, qPrintable(nestedDetail),
+                     nestedOk, noModal);
+        tally.gate(28, answered == 1 && unexpected == 0 && parentOk && nestedOk && noModal,
+                   "the real pre-compose action did not take the name from its input dialog, moved / "
+                   "detached the connection after the range, did not name the nested sequence, or left a modal open");
     }
 
     return tally.finish("connected-clip");
