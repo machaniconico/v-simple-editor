@@ -70,7 +70,9 @@ struct Entry {
     bool audioElement = false;
     bool videoElement = false;
     bool compoundAudioCopy = false; // audio-track reference of a mixed ref-clip
-    bool noAudioCopy = false; // ref-clip cut for a video-only angle: its compound audio belongs to another angle
+    bool noAudioCopy = false; // no linked audio: a clip cut for a video-only angle (a ref-clip's compound audio belongs
+                              // to another angle), srcEnable="video", or a container with explicit audio children
+    int pairedWith = -1; // index of the video entry a video + audio pair shares (both entries carry it)
 };
 // A spine-level transition remembers its neighbouring spine clips (entry
 // indexes, -1 when the neighbour is missing or a gap) until placement is known.
@@ -375,7 +377,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 e.offset = offset; e.start = start; e.duration = duration;
                 if (filtered) return placed[i] = -3;
                 if (audio) { e.audioElement = true; e.lane = 1; }
-                if (videoOnly && e.refClip) e.noAudioCopy = true;
+                if (videoOnly) e.noAudioCopy = true;
                 entries.append(e);
                 placed[i] = int(entries.size()) - 1;
                 if (angle[i].parentIndex < 0 && firstRoot < 0 && !e.uid.isEmpty()) firstRoot = placed[i];
@@ -419,6 +421,10 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 } else warnSkip();
             }
             if (directChildren.isEmpty()) return;
+            // An explicit <audio> child is the clip's audio: the video child gets no copy.
+            if (std::any_of(directChildren.cbegin(), directChildren.cend(),
+                            [&](int index) { return entries[index].audioElement; }))
+                for (int index : directChildren) entries[index].noAudioCopy = true;
             int primary = directChildren.first();
             for (int index : directChildren) {
                 if (assets.contains(entries[index].ref) && !isAudioEntry(entries[index])) {
@@ -474,6 +480,9 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         e.audioElement = tag == QLatin1String("audio");
         e.videoElement = tag == QLatin1String("video");
         e.refClip = refClip;
+        // srcEnable defaults to "all"; "video" keeps the asset-clip's audio out.
+        if (tag == QLatin1String("asset-clip") && attribute(QStringLiteral("srcEnable")) == QLatin1String("video"))
+            e.noAudioCopy = true;
         bool laneOk = true;
         if (hasAttribute(QStringLiteral("lane"))) e.lane = attribute(QStringLiteral("lane")).toInt(&laneOk);
         QString invalid;
@@ -531,6 +540,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             asset.format = a.value("format").toString();
             asset.audioOnly = a.value("hasVideo") == QLatin1String("0")
                 || (!a.hasAttribute("hasVideo") && a.value("hasAudio") == QLatin1String("1"));
+            asset.hasAudio = a.value("hasAudio") == QLatin1String("1");
             if (!readTime(a, QStringLiteral("start"), asset.start)
                 || !readTime(a, QStringLiteral("duration"), asset.duration)) break;
             const QString id = a.value("id").toString();
@@ -759,7 +769,20 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         default:
             break;
         }
-        (isAudioEntry(e) ? audioLanes : videoLanes)[e.lane].append(e);
+        // An asset-clip whose asset carries audio is a video + audio pair on the
+        // same lane number: the audio copy has no uid (Timeline assigns its own)
+        // and keeps the parent, so a connected copy anchors with its video.
+        const bool pairs = !e.refClip && !e.audioElement && !e.videoElement && !e.noAudioCopy
+            && !isAudioEntry(e) && assets.value(e.ref).hasAudio;
+        Entry video = e;
+        if (pairs) video.pairedWith = i;
+        (isAudioEntry(e) ? audioLanes : videoLanes)[e.lane].append(video);
+        if (pairs) {
+            Entry audioCopy = video;
+            audioCopy.uid.clear();
+            audioCopy.audioElement = true;
+            audioLanes[e.lane].append(audioCopy);
+        }
         // A compound with video and audio clips is referenced from a video and
         // an audio track, like Timeline::addSequenceClip, so its nested audio
         // plays. The audio copy carries no uid (Timeline assigns its own) and
@@ -773,6 +796,8 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     }
     result.videoTracks.clear();
     result.audioTracks.clear();
+    // Provisional linkGroup numbers (1, 2, ...) per pair; applyImport maps them to Timeline's.
+    QMap<int, int> pairGroups;
     auto importLanes = [&](const QMap<int, QVector<Entry>> &lanes, QVector<QVector<ClipInfo>> &tracks) {
         auto laneKeys = lanes.keys();
         std::sort(laneKeys.begin(), laneKeys.end(), [](int a, int b) {
@@ -837,6 +862,11 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                     c.duration = qMax(c.duration, trimmedEnd.seconds());
                 c.leadInSec = gap.seconds();
                 c.uid = e.uid;
+                if (e.pairedWith >= 0) {
+                    auto group = pairGroups.find(e.pairedWith);
+                    if (group == pairGroups.end()) group = pairGroups.insert(e.pairedWith, pairGroups.size() + 1);
+                    c.linkGroup = group.value();
+                }
                 const bool childOnV1 = &tracks == &result.videoTracks
                     && tracks.isEmpty() && trackIndex == 0;
                 if (e.parentIndex >= 0 && !e.underGap) {
@@ -846,12 +876,13 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                     const Entry &ancestor = entries[rootIndex];
                     if (!ancestor.uid.isEmpty() && assets.contains(ancestor.ref)) {
                         // The detach warnings come once per compound, from its video reference.
+                        const bool audioCopy = e.compoundAudioCopy || (e.pairedWith >= 0 && isAudioEntry(e));
                         if (isAudioEntry(ancestor)) {
-                            if (!e.compoundAudioCopy)
+                            if (!audioCopy)
                                 result.warnings.append(QStringLiteral("主ストーリーラインが音声クリップのため接続を解除しました: %1")
                                     .arg(c.displayName));
                         } else if (!v1Uids.contains(ancestor.uid) || childOnV1 || e.lane == 0) {
-                            if (!e.compoundAudioCopy)
+                            if (!audioCopy)
                                 result.warnings.append(QStringLiteral("接続先の主ストーリーラインのクリップが V1 に置かれないため接続を解除しました: %1")
                                     .arg(c.displayName));
                         } else {
@@ -1018,6 +1049,21 @@ bool applyImport(Timeline &timeline, ImportResult &result, QStringList *warnings
         timeline.setSequences(kept, activeId);
         return false;
     };
+    // The parser numbers each video + audio pair 1, 2, ... within its sequence;
+    // the same provisional number becomes one Timeline::allocateLinkGroup() number.
+    auto relink = [&](QVector<QVector<ClipInfo>> &video, QVector<QVector<ClipInfo>> &audio) {
+        QMap<int, int> assigned;
+        for (auto *tracks : {&video, &audio})
+            for (auto &track : *tracks)
+                for (auto &clip : track) {
+                    if (clip.linkGroup <= 0) continue;
+                    auto group = assigned.find(clip.linkGroup);
+                    if (group == assigned.end()) group = assigned.insert(clip.linkGroup, timeline.allocateLinkGroup());
+                    clip.linkGroup = group.value();
+                }
+    };
+    for (auto &sequence : result.sequences) relink(sequence.videoTracks, sequence.audioTracks);
+    relink(result.videoTracks, result.audioTracks);
     for (auto &sequence : result.sequences) {
         rewrite(sequence.videoTracks);
         rewrite(sequence.audioTracks);

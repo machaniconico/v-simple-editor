@@ -1853,5 +1853,104 @@ int runFcpxmlImportSelftest()
         backE ? backE->leadInSec : -99.0);
     gate(33, unconnectedGateOk);
 
+    // G34 / G35: an asset-clip whose asset has audio becomes a V + A pair sharing a linkGroup.
+    // applyImport maps the parser's provisional numbers onto Timeline::allocateLinkGroup().
+    const QString avAsset = QStringLiteral("<asset id=\"av\" src=\"av.mov\" hasVideo=\"1\" hasAudio=\"1\"/>");
+    auto trackClips = [](Timeline &tl, bool audio) {
+        TimelineTrack *track = tl.trackAt(audio, 0);
+        return track ? track->clips() : QVector<ClipInfo>{};
+    };
+    auto groupClip = [&](const QString &name, double leadIn, int group) {
+        ClipInfo c = makeClip(name, 0.0, 1.0, leadIn, QString());
+        c.linkGroup = group;
+        return c;
+    };
+    const auto avPair = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"pair\" offset=\"0s\" start=\"1s\" duration=\"2s\"/>"), avAsset), dir.path());
+    const ClipInfo *pairV = avPair.videoTracks.value(0).size() == 1 ? &avPair.videoTracks[0][0] : nullptr;
+    const ClipInfo *pairA = avPair.audioTracks.value(0).size() == 1 ? &avPair.audioTracks[0][0] : nullptr;
+    const bool parsedPair = avPair.error.isEmpty() && pairV && pairA && pairV->linkGroup > 0
+        && pairA->linkGroup == pairV->linkGroup && pairA->filePath == pairV->filePath
+        && near(pairA->inPoint, pairV->inPoint) && near(pairA->outPoint, pairV->outPoint)
+        && near(pairA->leadInSec, pairV->leadInSec) && near(pairV->inPoint, 1.0) && near(pairV->outPoint, 3.0);
+    // The timeline already holds a pair of group 2 (V1 and A1, 0..1 s); the import is a new sequence.
+    Timeline avTimeline;
+    avTimeline.trackAt(false, 0)->setClips({groupClip(QStringLiteral("old"), 0.0, 2)});
+    avTimeline.trackAt(true, 0)->setClips({groupClip(QStringLiteral("old"), 0.0, 2)});
+    auto avApplied = avPair;
+    QStringList avWarnings;
+    const bool avOk = fcpx::xml::applyImport(avTimeline, avApplied, &avWarnings);
+    const auto appliedV = trackClips(avTimeline, false), appliedA = trackClips(avTimeline, true);
+    const bool appliedPair = avOk && appliedV.size() == 1 && appliedA.size() == 1 && appliedV[0].linkGroup > 0
+        && appliedA[0].linkGroup == appliedV[0].linkGroup && appliedV[0].linkGroup != 2
+        && near(appliedV[0].inPoint, appliedA[0].inPoint) && near(appliedV[0].outPoint, appliedA[0].outPoint);
+    QString deleteError;
+    const bool deletedA = avTimeline.deleteClipByIndex(true, 0, 0, false, &deleteError);
+    const bool linkedDelete = deletedA && trackClips(avTimeline, true).isEmpty() && trackClips(avTimeline, false).isEmpty();
+    std::fprintf(stderr, "G34 parse pair(V group=%d A group=%d in=%.9f out=%.9f lead=%.9f/%.9f) | apply ok=%d V=%d A=%d "
+        "groups=%d/%d (old pair 2) | delete A1: ok=%d err=[%s] V1 left=%d A1 left=%d\n",
+        pairV ? pairV->linkGroup : -1, pairA ? pairA->linkGroup : -1, pairV ? pairV->inPoint : -1.0,
+        pairV ? pairV->outPoint : -1.0, pairV ? pairV->leadInSec : -1.0, pairA ? pairA->leadInSec : -1.0,
+        int(avOk), int(appliedV.size()), int(appliedA.size()),
+        appliedV.isEmpty() ? -1 : appliedV[0].linkGroup, appliedA.isEmpty() ? -1 : appliedA[0].linkGroup,
+        int(deletedA), deleteError.toUtf8().constData(), int(trackClips(avTimeline, false).size()),
+        int(trackClips(avTimeline, true).size()));
+    gate(34, parsedPair && appliedPair && linkedDelete);
+
+    auto audioClipCount = [](const fcpx::xml::ImportResult &r) {
+        int n = 0;
+        for (const auto &track : r.audioTracks) n += int(track.size());
+        return n;
+    };
+    const auto videoOnlySrc = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"v\" duration=\"2s\" srcEnable=\"video\"/>"), avAsset), dir.path());
+    const auto silentAsset = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"quiet\" name=\"q\" duration=\"2s\"/>"),
+        QStringLiteral("<asset id=\"quiet\" src=\"quiet.mov\" hasVideo=\"1\" hasAudio=\"0\"/>")), dir.path());
+    const auto explicitAudio = fcpx::xml::parseXml(document(
+        QStringLiteral("<clip name=\"c\" duration=\"2s\"><asset-clip ref=\"av\" name=\"cv\" duration=\"2s\"/>"
+                       "<audio ref=\"av\" name=\"ca\" duration=\"2s\"/></clip>"), avAsset), dir.path());
+    const ClipInfo *explicitA = audioClipCount(explicitAudio) == 1 ? &explicitAudio.audioTracks[0][0] : nullptr;
+    // A pair of group 1 is already on the timeline (Timeline's next group number is 1): the import
+    // must not reuse it, and each nested pair keeps its own number.
+    const QString nestedMedia = QStringLiteral(
+        "<media id=\"cmp\" name=\"複合\"><sequence><spine>"
+        "<asset-clip ref=\"av\" name=\"n1\" duration=\"1s\"/>"
+        "<asset-clip ref=\"av\" name=\"n2\" offset=\"1s\" duration=\"1s\"/>"
+        "</spine></sequence></media>");
+    const auto nestedPairs = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"m\" duration=\"1s\"/>"
+                       "<ref-clip ref=\"cmp\" name=\"toCmp\" offset=\"1s\" duration=\"2s\"/>"),
+        avAsset + nestedMedia), dir.path());
+    Timeline linkedTimeline;
+    linkedTimeline.trackAt(false, 0)->setClips({groupClip(QStringLiteral("one"), 0.0, 1)});
+    linkedTimeline.trackAt(true, 0)->setClips({groupClip(QStringLiteral("one"), 0.0, 1)});
+    auto nestedApplied = nestedPairs;
+    QStringList nestedWarnings;
+    const bool nestedOk = fcpx::xml::applyImport(linkedTimeline, nestedApplied, &nestedWarnings);
+    const auto linkedStore = linkedTimeline.sequences();
+    const TimelineSequence *nestedSeq = nestedApplied.sequences.size() == 1
+        ? findSequence(linkedStore, nestedApplied.sequences[0].id) : nullptr;
+    auto pairGroup = [&](const QVector<QVector<ClipInfo>> &video, const QVector<QVector<ClipInfo>> &audio,
+                         const QString &name) {
+        const ClipInfo *v = namedClip(video, name), *a = namedClip(audio, name);
+        return v && a && v->linkGroup > 0 && v->linkGroup == a->linkGroup ? v->linkGroup : -1;
+    };
+    const TimelineSequence *mainSeq = findSequence(linkedStore, linkedTimeline.activeSequenceId());
+    const int mainGroup = mainSeq ? pairGroup(mainSeq->videoTracks, mainSeq->audioTracks, QStringLiteral("m")) : -1;
+    const int nestedOne = nestedSeq ? pairGroup(nestedSeq->videoTracks, nestedSeq->audioTracks, QStringLiteral("n1")) : -1;
+    const int nestedTwo = nestedSeq ? pairGroup(nestedSeq->videoTracks, nestedSeq->audioTracks, QStringLiteral("n2")) : -1;
+    const bool nestedDistinct = mainGroup > 0 && nestedOne > 0 && nestedTwo > 0
+        && mainGroup != 1 && nestedOne != 1 && nestedTwo != 1
+        && nestedOne != nestedTwo && mainGroup != nestedOne && mainGroup != nestedTwo;
+    std::fprintf(stderr, "G35 srcEnable=video audio=%d (expect 0) | hasAudio=0 audio=%d (expect 0) | clip + explicit audio: "
+        "audio=%d name=%s (expect 1 ca) | nested apply ok=%d mainGroup=%d nested n1=%d n2=%d (expect >0, all distinct, none 1)\n",
+        audioClipCount(videoOnlySrc), audioClipCount(silentAsset), audioClipCount(explicitAudio),
+        explicitA ? explicitA->displayName.toUtf8().constData() : "", int(nestedOk), mainGroup, nestedOne, nestedTwo);
+    gate(35, videoOnlySrc.error.isEmpty() && audioClipCount(videoOnlySrc) == 0 && videoOnlySrc.videoTracks.value(0).size() == 1
+        && silentAsset.error.isEmpty() && audioClipCount(silentAsset) == 0 && silentAsset.videoTracks.value(0).size() == 1
+        && explicitA && explicitA->displayName == QStringLiteral("ca") && explicitA->linkGroup == 0
+        && nestedOk && nestedSeq && nestedDistinct);
+
     return tally.finish();
 }
