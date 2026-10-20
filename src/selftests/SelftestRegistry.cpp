@@ -976,7 +976,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
-      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (23 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
+      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (24 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
