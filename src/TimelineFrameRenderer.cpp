@@ -777,6 +777,18 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     if (effects.isEmpty())
         return graded;
 
+    // US-1301: LensDistortion's out-of-frame fill follows the clip's media
+    // (alpha media -> transparent, otherwise the opaque black of before), never
+    // the frame content. The media is probed only when the stack has one.
+    const bool hasLensDistortion = std::any_of(effects.begin(), effects.end(), [](const VideoEffect &e) {
+        return e.enabled && e.type == VideoEffectType::LensDistortion;
+    });
+    // The transparent edge also routes every frame of such a clip through the
+    // carry loop below, so an alpha-dropping effect after the lens keeps the
+    // edge transparent on opaque frames too (no per-frame switch).
+    const bool transparentEdge = hasLensDistortion && roto::probeMediaHasAlpha(clip.filePath);
+    const VideoEffectProcessor::TransparentEdgeFillScope edgeFill(transparentEdge);
+
     // US-1004: a layer whose input carries alpha < 255 (roto exterior, alpha
     // media) keeps it through every effect that does not move pixels: each such
     // effect's output alpha is clamped to the alpha carried so far (a keyer
@@ -792,14 +804,23 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
                              || e.type == VideoEffectType::LumaKey
                              || e.type == VideoEffectType::ColorKey);
     });
-    if (hasKeyer || roto::hasTranslucentPixel(graded)) {
+    if (hasKeyer || roto::hasTranslucentPixel(graded) || transparentEdge) {
         alphaCarryLoopEntries.fetch_add(1, std::memory_order_relaxed);
         QImage result = graded;
         QImage alphaCarrier = graded;
         for (const VideoEffect &effect : effects) {
-            result = VideoEffectProcessor::applyEffect(result, effect);
             const bool moves = effect.enabled && effect.type != VideoEffectType::None
                 && roto::effectMovesPixels(effect.type);
+            // US-1301: DisplacementMap / LensDistortion move the alpha carried so
+            // far, not the opaque output of an alpha-dropping effect before it
+            // (Blur -> DisplacementMap). Other pixel-moving effects keep the base
+            // behaviour. clampAlphaToInput returns `result` unchanged when the
+            // carrier is opaque.
+            const bool restoreCarried = moves
+                && (effect.type == VideoEffectType::DisplacementMap
+                    || effect.type == VideoEffectType::LensDistortion);
+            const QImage in = restoreCarried ? roto::clampAlphaToInput(alphaCarrier, result) : result;
+            result = VideoEffectProcessor::applyEffect(in, effect);
             alphaCarrier = moves ? result : roto::clampAlphaToInput(alphaCarrier, result);
         }
         return alphaCarrier.convertToFormat(QImage::Format_RGBA8888);
@@ -1003,6 +1024,14 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
     if (clip.isAdjustment)
         return applyClipFxPack(graded, clip, clipLocalSeconds);
 
+    // US-1301: same per-clip LensDistortion edge fill as applyClipFxPack, held
+    // across the whole prefix so the echo / rolling-shutter recursion sees it.
+    const bool transparentEdge =
+        std::any_of(clip.effects.begin(), clip.effects.end(), [](const VideoEffect &e) {
+            return e.enabled && e.type == VideoEffectType::LensDistortion;
+        })
+        && roto::probeMediaHasAlpha(clip.filePath);
+
     auto stableEffectsAt = [&clip](double localSeconds) {
         // effectiveEffectsAt removes time-inactive effects, which destroys
         // their stack indices. Echo recursion needs stable indices so an
@@ -1133,6 +1162,7 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
         return result;
     };
 
+    const VideoEffectProcessor::TransparentEdgeFillScope edgeFill(transparentEdge);
     return applyPrefix(
         graded, static_cast<int>(clip.effects.size()),
         clipLocalSeconds, sourceSeconds)
@@ -3211,6 +3241,12 @@ QImage applyClipFxStackWithEchoFromSource(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds, const EchoFrameProvider &frameProvider)
 {
+    // US-1301: the CPU preview sends every mesh-warp / puppet clip here. Without
+    // an active Echo / RollingShutter, take the export path (applyClipFxPack has
+    // the US-1004 alpha carry loop; applyClipFxPackWithEcho does not).
+    if (!hasActiveEcho(clip, clipLocalSeconds)
+        && !hasActiveRollingShutter(clip, clipLocalSeconds))
+        return applyClipFxStackFromSource(source, clip, clipLocalSeconds);
     return applyClipMeshWarp(applyClipFxPackWithEcho(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
         clip, clipLocalSeconds, sourceSeconds, frameProvider), clip);
