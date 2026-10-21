@@ -12385,8 +12385,6 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
     //   clips in [to..from-1] (if from>to) shift to [to+1..from]  (up by 1)
     connect(track, &TimelineTrack::clipMoved, this,
         [this, track](int fromIdx, int toIdx) {
-            if (trackMatteEntries().isEmpty() && m_clipParentEntries.isEmpty()
-                && rotoEntries().isEmpty()) return;
             const int t = m_videoTracks.indexOf(track);
             if (t < 0) return;   // audio track — no video clip sidecars
             // Build old→new index map for track t only.
@@ -12402,6 +12400,9 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
                     oldToNew.insert(trackMatteClipKey(t, i),
                                     trackMatteClipKey(t, i + 1));
             }
+            notifyClipKeysRemapped({oldToNew, {}});
+            if (trackMatteEntries().isEmpty() && m_clipParentEntries.isEmpty()
+                && rotoEntries().isEmpty()) return;
             const auto currentMattes = trackMatteEntries();
             if (!currentMattes.isEmpty()) {
                 QHash<QString, TimelineTrackMatteEntry> rebuilt;
@@ -12920,6 +12921,13 @@ void Timeline::remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
         }
         m_clipParentEntries = rebuilt;
     }
+    // US-1303: a key whose clip left the video tracks is dropped, not moved.
+    ClipKeyRemap remap;
+    for (auto it = oldToNew.cbegin(); it != oldToNew.cend(); ++it) {
+        if (it.value().isEmpty()) remap.dropped.insert(it.key());
+        else remap.oldToNew.insert(it.key(), it.value());
+    }
+    notifyClipKeysRemapped(std::move(remap));
 }
 
 void Timeline::clearAllSelections()
@@ -14010,6 +14018,7 @@ QString Timeline::reconcileSequenceKey() const
 void Timeline::clearReconcileBaseline()
 {
     m_reconcileBaseline = ReconcileBaseline{};
+    m_lastKeyRemap.reset();
     m_pendingDeletedUids.clear();
     m_pendingSplits.clear();
     m_pendingClipSplits.clear();
@@ -15678,7 +15687,38 @@ void Timeline::commitRotoEntries(QHash<QString, RotoClipEntry> next, bool clearM
     if (clearMemo) {
         m_rotoRemapMemoAfter.clear();
         m_rotoRemapMemoValid = false;
+        m_lastKeyRemap.reset();
     }
+}
+
+static bool sameClipSnapshot(const TrackClipSnapshot &a, const TrackClipSnapshot &b)
+{
+    if (a.size() != b.size()) return false;
+    for (int track = 0; track < a.size(); ++track) {
+        if (a[track].size() != b[track].size()) return false;
+        for (int clip = 0; clip < a[track].size(); ++clip)
+            if (!a[track][clip].sameAs(b[track][clip])) return false;
+    }
+    return true;
+}
+
+void Timeline::notifyClipKeysRemapped(ClipKeyRemap remap)
+{
+    for (auto it = remap.oldToNew.begin(); it != remap.oldToNew.end();)
+        it = it.key() == it.value() ? remap.oldToNew.erase(it) : std::next(it);
+    if (remap.oldToNew.isEmpty() && remap.dropped.isEmpty()) {
+        // A mutation that moved no key still changes the placement the memo was
+        // taken against; keep it only while the snapshot is unchanged.
+        if (m_lastKeyRemap && !sameClipSnapshot(snapshotTrackClips(this), m_lastKeyRemap->after))
+            m_lastKeyRemap.reset();
+        return;
+    }
+    TrackClipSnapshot after = snapshotTrackClips(this);
+    if (m_lastKeyRemap && m_lastKeyRemap->remap == remap
+        && sameClipSnapshot(after, m_lastKeyRemap->after))
+        return;
+    m_lastKeyRemap = LastKeyRemap{std::move(after), remap};
+    emit clipKeysRemapped(remap);
 }
 
 void Timeline::setRotoEntries(const QHash<QString, RotoClipEntry> &entries)
@@ -15694,29 +15734,24 @@ QHash<QString, RotoClipEntry> Timeline::rotoEntries() const
 
 void Timeline::remapRotoEntriesAfterMutation(const TrackClipSnapshot &before)
 {
+    // US-1303: the key map is announced with or without roto entries; a key of
+    // `before` the walk did not bind belongs to a clip that is gone.
+    const auto oldToNew = alignedClipKeyMap(this, before);
+    ClipKeyRemap remap;
+    remap.oldToNew = oldToNew;
+    for (int t = 0; t < before.size(); ++t)
+        for (int i = 0; i < before[t].size(); ++i)
+            if (!oldToNew.contains(trackMatteClipKey(t, i)))
+                remap.dropped.insert(trackMatteClipKey(t, i));
+    notifyClipKeysRemapped(std::move(remap));
     if (rotoEntries().isEmpty()) return;
     const TrackClipSnapshot after = snapshotTrackClips(this);
     {
         QMutexLocker lock(&m_rotoMutex);
-        if (m_rotoRemapMemoValid && after.size() == m_rotoRemapMemoAfter.size()) {
-            bool same = true;
-            for (int track = 0; same && track < after.size(); ++track) {
-                if (after[track].size() != m_rotoRemapMemoAfter[track].size()) {
-                    same = false;
-                    break;
-                }
-                for (int clip = 0; clip < after[track].size(); ++clip) {
-                    if (!after[track][clip].sameAs(m_rotoRemapMemoAfter[track][clip])) {
-                        same = false;
-                        break;
-                    }
-                }
-            }
-            if (same) return;
-        }
+        if (m_rotoRemapMemoValid && sameClipSnapshot(after, m_rotoRemapMemoAfter))
+            return;
     }
     const auto entries = rotoEntries();
-    const auto oldToNew = alignedClipKeyMap(this, before);
     QHash<QString, RotoClipEntry> rebuilt;
     rebuilt.reserve(entries.size());
     for (auto it = entries.cbegin(); it != entries.cend(); ++it) {

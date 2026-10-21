@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QVector>
 #include <QHash>
+#include <QSet>
 #include <QMutex>
 #include <QMenu>
 #include <QElapsedTimer>
@@ -1467,6 +1468,20 @@ public:
     void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
     QHash<QString, RotoClipEntry> rotoEntries() const;
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
+    // US-1303: the clip keys ("t:i") one mutation changed. A key in oldToNew
+    // moves, a key in dropped is gone, any other key stays. Identity pairs are
+    // removed before the signal.
+    struct ClipKeyRemap {
+        QHash<QString, QString> oldToNew;
+        QSet<QString> dropped;
+        bool operator==(const ClipKeyRemap &o) const
+        { return oldToNew == o.oldToNew && dropped == o.dropped; }
+    };
+    // The one emit point of clipKeysRemapped, called by the aligned roto remap,
+    // remapCarriersByUid, remapCarriersAfterCrossTrackMove and the clipMoved
+    // reorder (never by the TrackMatteKey helpers). A repeat of the last remap
+    // on the same post-mutation clips (the paired helper sites) is not emitted.
+    void notifyClipKeysRemapped(ClipKeyRemap remap);
     // Explicit cross-track carrier remaps on this Timeline (selftest): calls of
     // remapCarriersAfterCrossTrackMove, plus one per linked drop that moves a
     // video member (handleCrossTrackLinkedDrop's by-uid remap).
@@ -1478,6 +1493,9 @@ signals:
     void skimPreviewRequested(const QImage &image);
     void skimPreviewCleared();
     void trackIndicesRemapped(bool audio, QVector<int> oldToNew);
+    // US-1303: once per mutation that changes video clip keys (not for undo /
+    // redo or load, which keep the keys valid for the restored layout).
+    void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
@@ -1618,6 +1636,14 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
+    // US-1303: the last emitted remap with the clips after it. Cleared with the
+    // roto memo, by restoreState and by clearReconcileBaseline (load, sequence
+    // switch), so the same edit after an undo is announced again.
+    struct LastKeyRemap {
+        TrackClipSnapshot after;
+        ClipKeyRemap remap;
+    };
+    std::optional<LastKeyRemap> m_lastKeyRemap;
     // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;

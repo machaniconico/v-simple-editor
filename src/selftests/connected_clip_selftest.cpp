@@ -126,6 +126,14 @@ extern "C" {
 //   G30: a drop on a locked V1 is refused with the lock text and changes nothing; with every
 //        audio track locked, or full at the landing time, it is refused with the free-track
 //        text and V1 is unchanged.
+// US-1303 (clip-key remap signal, no roto / matte / parent on the fixtures):
+//   G31: Timeline::clipKeysRemapped fires once per key-changing mutation with the identity
+//        pairs removed: delete V2 clip 0 ({1:1->1:0}, dropped {1:0}), a V2 reorder, a drop
+//        onto V3, a storyline insert followed by the reconcile of saveUndoState, the external
+//        remap called twice with one snapshot, the same delete after an undo; a track removal
+//        gives trackIndicesRemapped only, key-preserving edits and the undo give nothing.
+//        Detects: the emit removed (0 emits), the memo not cleared by undo (the second delete
+//        silent), identity pairs kept (key-preserving edits emit, the delete map not exact).
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -517,6 +525,191 @@ bool sendClipDropOnTrack(TimelineTrack *src, int srcIdx, TimelineTrack *dest, do
     static_cast<QObject *>(dest)->event(&event);
     TimelineTrack::setSelftestDropSource(nullptr);
     return event.isAccepted();
+}
+
+// G31 (US-1303): clipKeysRemapped once per key-changing mutation, identity pairs removed.
+void keyRemapGate(selftest::GateTally &tally)
+{
+    // No fixture has roto, matte or parent entries, so every emit comes from the key map alone.
+    using Remap = Timeline::ClipKeyRemap;
+    auto show = [](const QVector<Remap> &log) {
+        QStringList parts;
+        for (const Remap &r : log) {
+            QStringList pairs;
+            for (auto it = r.oldToNew.cbegin(); it != r.oldToNew.cend(); ++it)
+                pairs.append(it.key() + QStringLiteral(">") + it.value());
+            pairs.sort();
+            QStringList dropped(r.dropped.cbegin(), r.dropped.cend());
+            dropped.sort();
+            parts.append(QStringLiteral("{%1 | dropped %2}").arg(pairs.join(','), dropped.join(',')));
+        }
+        return QStringLiteral("%1 emit(s) %2").arg(log.size()).arg(parts.join(' '));
+    };
+    auto record = [](Timeline &tl, QVector<Remap> &log) {
+        QObject::connect(&tl, &Timeline::clipKeysRemapped, &tl,
+                         [&log](const Remap &r) { log.append(r); });
+    };
+    auto remapOf = [](const QVector<QPair<QString, QString>> &pairs, const QStringList &dropped) {
+        Remap r;
+        for (const auto &p : pairs) r.oldToNew.insert(p.first, p.second);
+        for (const QString &key : dropped) r.dropped.insert(key);
+        return r;
+    };
+    // V1 [x 0-10], V2 [a 0-2 | b 3-5], V3 [c 10-12].
+    auto fixture = [](Timeline &tl) {
+        load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+                  {clipFor("c", 2.0, 10.0)}});
+    };
+    const Remap deleteA = remapOf({{"1:1", "1:0"}}, {"1:0"});
+
+    // (1) delete V2 clip 0, then (7) undo and the same delete again.
+    Timeline delTl;
+    fixture(delTl);
+    QVector<Remap> delLog;
+    record(delTl, delLog);
+    QString err;
+    const bool deleted1 = delTl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString delShown = show(delLog);
+    const bool ok1 = deleted1 && delLog.size() == 1 && delLog[0] == deleteA;
+    delLog.clear();
+    delTl.undo();
+    const QString undoShown = show(delLog);
+    const bool undoSilent = delLog.isEmpty() && delTl.trackAt(false, 1)->clipCount() == 2;
+    const bool deleted2 = delTl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString redelShown = show(delLog);
+    const bool ok7 = undoSilent && deleted2 && delLog.size() == 1 && delLog[0] == deleteA;
+
+    // (9) delete the V2 tail, append a clip whose key map is identity only, then delete
+    // it: the second delete is a new mutation and announces its drop again.
+    const Remap deleteTail = remapOf({}, {"1:1"});
+    Timeline tailTl;
+    fixture(tailTl);
+    QVector<Remap> tailLog;
+    record(tailTl, tailLog);
+    QString tailErr;
+    const bool tailDeleted1 = tailTl.deleteClipByIndex(false, 1, 1, false, &tailErr);
+    const QString tailDelShown = show(tailLog);
+    const bool tailFirst = tailDeleted1 && tailLog.size() == 1 && tailLog[0] == deleteTail;
+    tailLog.clear();
+    ClipInfo shapeClip = clipFor("s", 1.0);
+    Shape square;
+    square.type = ShapeType::Rectangle;
+    square.properties.size = QSizeF(10.0, 10.0);
+    shapeClip.shapes = {square};
+    tailTl.trackAt(false, 1)->setSelectedClip(0);
+    tailTl.setPlayheadPosition(6.0);
+    const bool appended = tailTl.insertShapeClipAtPlayhead(shapeClip)
+        && tailTl.trackAt(false, 1)->clipCount() == 2;
+    const QString appendShown = show(tailLog);
+    const bool appendSilent = appended && tailLog.isEmpty();
+    const bool tailDeleted2 = tailTl.deleteClipByIndex(false, 1, 1, false, &tailErr);
+    const QString tailRedelShown = show(tailLog);
+    const bool ok9 = tailFirst && appendSilent && tailDeleted2 && tailLog.size() == 1
+        && tailLog[0] == deleteTail;
+
+    // (2) V2 reorder: b to the front.
+    Timeline moveTl;
+    fixture(moveTl);
+    QVector<Remap> moveLog;
+    record(moveTl, moveLog);
+    moveTl.trackAt(false, 1)->moveClip(1, 0);
+    const QString moveShown = show(moveLog);
+    const bool ok2 = moveTl.trackAt(false, 1)->clips().value(0).displayName == QStringLiteral("b")
+        && moveLog.size() == 1 && moveLog[0] == remapOf({{"1:1", "1:0"}, {"1:0", "1:1"}}, {});
+
+    // (3) b dropped from V2 onto V3 at 0 (before c).
+    Timeline dropTl;
+    fixture(dropTl);
+    QVector<Remap> dropLog;
+    record(dropTl, dropLog);
+    const bool dropped = sendClipDropOnTrack(dropTl.trackAt(false, 1), 1, dropTl.trackAt(false, 2), 0.0)
+        && dropTl.trackAt(false, 2)->clips().value(0).displayName == QStringLiteral("b");
+    const QString dropShown = show(dropLog);
+    const bool ok3 = dropped && dropLog.size() == 1
+        && dropLog[0] == remapOf({{"1:1", "2:0"}, {"2:0", "2:1"}}, {});
+
+    // (4) storyline mode: insert 5 s at the V1 head, then saveUndoState (whose reconcile
+    // moves c, connected to y at 2, past the unconnected d: V2 [c | d] -> [d | c]).
+    Timeline insTl;
+    load(insTl, {{clipFor("y", 10.0)}, {clipFor("c", 1.0, 2.0), clipFor("d", 1.0, 1.0)}});
+    const QString yUid = uidAt(insTl, 0, 0);
+    const QString cUid = uidAt(insTl, 1, 0);
+    const bool connected = insTl.connectClip(TrackKind::Video, 1, 0, yUid);
+    insTl.setStorylineMode(true);
+    QVector<Remap> insLog;
+    record(insTl, insLog);
+    insTl.storylineInsertClip(insTl.trackAt(false, 0), 0.0, clipFor("ins", 5.0));
+    const int insertEmits = insLog.size();
+    insTl.saveUndoState(QStringLiteral("G31 storyline insert"));
+    const Located c = locate(insTl, false, cUid);
+    const QString insShown = show(insLog);
+    const bool ok4 = connected && c.track == 1 && c.index == 1 && near(c.startSec, 7.0)
+        && insLog.size() == 1 && insLog[0] == remapOf({{"1:0", "1:1"}, {"1:1", "1:0"}}, {});
+
+    // (5) the external catch-all twice with one snapshot.
+    Timeline extTl;
+    fixture(extTl);
+    QVector<Remap> extLog;
+    record(extTl, extLog);
+    const TrackClipSnapshot snap = snapshotTrackClips(&extTl);
+    TimelineTrack *extV2 = extTl.trackAt(false, 1);
+    extV2->setClips({extV2->clips().at(1)});
+    extTl.remapCarriersAfterExternalMutation(snap);
+    const int extFirst = extLog.size();
+    extTl.remapCarriersAfterExternalMutation(snap);
+    const QString extShown = show(extLog);
+    const bool ok5 = extFirst == 1 && extLog.size() == 1 && extLog[0] == deleteA;
+
+    // (6) removing V2 renumbers tracks only.
+    Timeline trkTl;
+    fixture(trkTl);
+    QVector<Remap> trkLog;
+    record(trkTl, trkLog);
+    int trackRemaps = 0;
+    QObject::connect(&trkTl, &Timeline::trackIndicesRemapped, &trkTl,
+                     [&trackRemaps](bool audio, QVector<int>) { if (!audio) ++trackRemaps; });
+    QString trkErr;
+    const bool removed = trkTl.removeTrack(false, 1, &trkErr);
+    const QString trkShown = show(trkLog);
+    const bool ok6 = removed && trackRemaps == 1 && trkLog.isEmpty();
+
+    // (8) key-preserving edits through the paired remap sites.
+    Timeline keepTl;
+    fixture(keepTl);
+    QVector<Remap> keepLog;
+    record(keepTl, keepLog);
+    const bool disabled = keepTl.setClipEnabled(TrackKind::Video, 1, 0, false);
+    QString keepErr;
+    const bool sped = keepTl.setClipPropertyByIndex(false, 1, 1, QStringLiteral("speed"), 2.0, &keepErr);
+    const QString keepShown = show(keepLog);
+    const bool ok8 = disabled && sped && keepLog.isEmpty();
+
+    std::fprintf(stderr, "connected-clip G31 (1) delete=%d %s (expect 1 {1:1>1:0 | dropped 1:0}) ok=%d\n",
+                 deleted1, qPrintable(delShown), ok1);
+    std::fprintf(stderr, "connected-clip G31 (2) reorder %s (expect 1 {1:0>1:1,1:1>1:0}) ok=%d\n",
+                 qPrintable(moveShown), ok2);
+    std::fprintf(stderr, "connected-clip G31 (3) drop=%d %s (expect 1 {1:1>2:0,2:0>2:1}) ok=%d\n",
+                 dropped, qPrintable(dropShown), ok3);
+    std::fprintf(stderr, "connected-clip G31 (4) connected=%d insertEmits=%d (expect 0) c track=%d index=%d "
+                 "start=%.6f (expect 1/1/7) %s (expect 1 {1:0>1:1,1:1>1:0}) ok=%d\n", connected,
+                 insertEmits, c.track, c.index, c.startSec, qPrintable(insShown), ok4);
+    std::fprintf(stderr, "connected-clip G31 (5) first=%d %s (expect 1 {1:1>1:0 | dropped 1:0}) ok=%d\n",
+                 extFirst, qPrintable(extShown), ok5);
+    std::fprintf(stderr, "connected-clip G31 (6) removed=%d [%s] trackIndicesRemapped=%d (expect 1) %s "
+                 "(expect 0) ok=%d\n", removed, qPrintable(trkErr), trackRemaps, qPrintable(trkShown), ok6);
+    std::fprintf(stderr, "connected-clip G31 (7) undo %s (expect 0) redelete=%d %s (expect 1 {1:1>1:0 | "
+                 "dropped 1:0}) ok=%d\n", qPrintable(undoShown), deleted2, qPrintable(redelShown), ok7);
+    std::fprintf(stderr, "connected-clip G31 (8) enabled=%d speed=%d [%s] %s (expect 0) ok=%d\n", disabled,
+                 sped, qPrintable(keepErr), qPrintable(keepShown), ok8);
+    std::fprintf(stderr, "connected-clip G31 (9) delete-tail=%d %s (expect 1 { | dropped 1:1}) append=%d %s "
+                 "(expect 0) redelete=%d [%s] %s (expect 1 { | dropped 1:1}) ok=%d\n", tailDeleted1,
+                 qPrintable(tailDelShown), appended, qPrintable(appendShown), tailDeleted2,
+                 qPrintable(tailErr), qPrintable(tailRedelShown), ok9);
+    tally.gate(31, ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9,
+               "clipKeysRemapped was not emitted exactly once with the identity-free map for a delete / "
+               "reorder / cross-track drop / storyline insert + reconcile / repeated external remap / "
+               "delete after undo / delete after a key-preserving append, or it fired for a track removal "
+               "or a key-preserving edit");
 }
 
 } // namespace
@@ -3006,6 +3199,9 @@ int runConnectedClipSelftest()
                        "free-track control was refused");
         }
     }
+
+    // G31 (US-1303), in its own function to keep this frame small.
+    keyRemapGate(tally);
 
     return tally.finish("connected-clip");
 }
