@@ -635,7 +635,10 @@ public:
     // Quietly set one member's trimmed edge. Left edge: edgePoint = inPoint,
     // gapLeadIn = this clip's leadInSec. Right edge: edgePoint = outPoint,
     // gapLeadIn = next clip's leadInSec (-1 = no next clip). No modified().
-    void applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn);
+    // US-1305: a left edge may also set the next clip's leadInSec
+    // (nextLeadIn, -1 = leave it).
+    void applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn,
+                         double nextLeadIn = -1.0);
 
     void setTimeline(Timeline *t) { m_timeline = t; }
 
@@ -1820,9 +1823,17 @@ private:
         double origOut = 0.0;
         double origLeadIn = 0.0;
         double origLeadInNext = -1.0; // -1 = no next clip
+        // US-1305: the next clip is linked audio of a later V1 clip (storyline).
+        bool nextFollowsV1 = false;
+        // US-1305: the first clip after those followers (-1 = none). Its
+        // leadInSec is compensated so its absolute start stays.
+        int holdIdx = -1;
+        double holdOrigLeadIn = 0.0;
     };
     QVector<LinkedTrimPartner> m_linkedTrimPartners;
     bool m_linkedTrimLeftEdge = false;
+    // US-1305: storyline mode and the group has a V1 member: V1 ripples.
+    bool m_linkedTrimStoryline = false;
 
     // Single-shot debouncer for sequenceChanged + audioSequenceChanged.
     // Owned by Qt object tree; created in the ctor.

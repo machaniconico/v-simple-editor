@@ -1964,13 +1964,16 @@ void TimelineTrack::rejectLinkedTrim()
     m_linkedTrimActive = false;
 }
 
-void TimelineTrack::applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn)
+void TimelineTrack::applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn,
+                                    double nextLeadIn)
 {
     if (clipIdx < 0 || clipIdx >= m_clips.size()) return;
     ClipInfo &clip = m_clips[clipIdx];
     if (leftEdge) {
         clip.inPoint = edgePoint;
         clip.leadInSec = qMax(0.0, gapLeadIn);
+        if (nextLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
+            m_clips[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
     } else {
         clip.outPoint = edgePoint;
         if (gapLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
@@ -3368,8 +3371,13 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
             // the same timeline amount the inPoint changed. inPoint+ → leadInSec+
             // (clip slides right), inPoint− → leadInSec− (clip slides left,
             // clamped at 0 so it can't cross its neighbor).
+            // US-1305: in storyline mode V1 keeps the clip's start instead (as
+            // RippleIn does), so the length change ripples the clips after it.
             const double timelineDelta = (clip.inPoint - m_dragOriginalValue) / speed;
-            clip.leadInSec = qMax(0.0, m_dragOriginalLeadIn + timelineDelta);
+            const bool storylineV1 = m_timeline && m_timeline->storylineMode()
+                && m_timeline->videoTracks().value(0, nullptr) == this;
+            clip.leadInSec = storylineV1 ? m_dragOriginalLeadIn
+                                         : qMax(0.0, m_dragOriginalLeadIn + timelineDelta);
         } else {
             double newOut = qMin(clip.duration, m_dragOriginalValue + deltaSec * speed);
             clip.outPoint = qMax(newOut, clip.inPoint + 0.1);
@@ -8144,6 +8152,54 @@ void Timeline::nudgeSelectedClips(int frames)
             if (group > 0) groups.insert(group);
         }
     }
+    // US-1305 (decisions 15 / 19): in storyline mode a V1 nudge moves the first
+    // selected V1 clip and every clip after it (its leadInSec ±d; − needs a gap of
+    // d). Selected linked partners of the V1 clips follow through the reconcile;
+    // any other clip in the selection refuses the nudge.
+    TimelineTrack *v1 = m_videoTracks.value(0, nullptr);
+    int firstV1 = -1;
+    QSet<int> v1Groups;
+    for (const auto &selected : selection) {
+        if (!m_storylineMode || selected.track != v1) continue;
+        if (firstV1 < 0 || selected.index < firstV1) firstV1 = selected.index;
+        if (selected.group > 0) v1Groups.insert(selected.group);
+    }
+    if (firstV1 >= 0) {
+        for (const auto &selected : selection) {
+            if (selected.track != v1 && !(selected.group > 0 && v1Groups.contains(selected.group))) {
+                emit statusMessageRequested(
+                    QStringLiteral("ストーリーラインモードでは V1 と他のトラックのクリップを同時にナッジできません"), 3000);
+                return;
+            }
+        }
+        // Same convention as the other linked ops: a locked partner of a
+        // selected V1 clip makes the whole nudge ineligible (the reconcile
+        // would leave it behind and break A/V sync).
+        for (auto *track : timelineTracks(this)) {
+            if (!track || !track->isLocked()) continue;
+            for (const auto &clip : track->clips()) {
+                if (clip.linkGroup > 0 && v1Groups.contains(clip.linkGroup)) {
+                    emit statusMessageRequested(
+                        QStringLiteral("リンクされたクリップがロック中のトラックにあるためナッジできません"), 3000);
+                    return;
+                }
+            }
+        }
+        const double deltaSec = double(frames) / m_nudgeFrameRate;
+        const double leadInSec = v1->clips().at(firstV1).leadInSec;
+        if (leadInSec + deltaSec < -1e-9) {
+            emit statusMessageRequested(QStringLiteral("前に空きが無いためナッジできません"), 3000);
+            return;
+        }
+        const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+        v1->applyDragMove(firstV1, leadInSec + deltaSec, -1.0);
+        remapTrackMatteLocked(snapBefore);
+        remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+        onTrackModified();
+        saveUndoState(QStringLiteral("ナッジ"));
+        updateInfoLabel();
+        return;
+    }
     std::sort(targets.begin(), targets.end(), [frames](const Target &a, const Target &b) {
         return frames > 0 ? a.start > b.start : a.start < b.start;
     });
@@ -11515,22 +11571,7 @@ bool Timeline::applyTrimLinked(TimelineTrack *track, int clipIndex,
     const QVector<ClipInfo> sourceBefore = track->clips();
     const bool storylineRipple = m_storylineMode && track == m_videoTracks.value(0, nullptr)
         && (type == trimops::TrimType::RippleIn || type == trimops::TrimType::RippleOut);
-    // US-1203: trimops' RippleOut also shifts the next clip's leadIn, which on top
-    // of the length change would move it twice. A storyline W trims the outPoint
-    // only (a one-clip copy keeps the bounds checks); the length change ripples.
-    auto trimClip = [&](TimelineTrack *target, int index, QString *error) {
-        if (!storylineRipple || type != trimops::TrimType::RippleOut)
-            return target->applyTrim(index, type, deltaSec, error);
-        QVector<ClipInfo> one{target->clips().at(index)};
-        if (!trimops::applyTrim(one, 0, type, deltaSec, error))
-            return false;
-        QVector<ClipInfo> clips = target->clips();
-        clips[index] = one[0];
-        target->setClips(clips);
-        onTrackModified();
-        return true;
-    };
-    if (!trimClip(track, clipIndex, errorOut))
+    if (!track->applyTrim(clipIndex, type, deltaSec, errorOut))
         return false;
     // US-1203: V1 is gap-free before its linked audio follows, so the followers'
     // targets come from the final V1 layout (a gapped V1 closes here too).
@@ -11555,7 +11596,7 @@ bool Timeline::applyTrimLinked(TimelineTrack *track, int clipIndex,
                 continue;
             const QVector<ClipInfo> partnerBefore = partner->clips();
             QString partnerError;
-            if (!trimClip(partner, i, &partnerError)) {
+            if (!partner->applyTrim(i, type, deltaSec, &partnerError)) {
                 for (int k = touched.size() - 1; k >= 0; --k)
                     touched[k].first->setClips(touched[k].second);
                 track->setClips(sourceBefore);
@@ -12464,6 +12505,7 @@ void Timeline::captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, boo
 {
     m_linkedTrimPartners.clear();
     m_linkedTrimLeftEdge = leftEdge;
+    m_linkedTrimStoryline = false;
     if (!source || clipIdx < 0 || clipIdx >= source->clips().size()) return;
     const int linkGroup = source->clips()[clipIdx].linkGroup;
     if (linkGroup <= 0) return;
@@ -12496,24 +12538,66 @@ void Timeline::captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, boo
     }
     if (m_linkedTrimPartners.isEmpty()) return;
 
+    // US-1305: in storyline mode a group with a V1 member trims with a fixed
+    // start on every member, and V1 ripples (the V1 clips after it follow the
+    // length change). The other members compensate their next clip so it stays,
+    // except linked audio of a later V1 clip, which ripples with that clip.
+    TimelineTrack *v1 = m_videoTracks.value(0, nullptr);
+    int v1ClipIdx = -1;
+    for (const auto &p : m_linkedTrimPartners)
+        if (m_storylineMode && p.track == v1 && v1ClipIdx < 0) v1ClipIdx = p.clipIdx;
+    m_linkedTrimStoryline = v1ClipIdx >= 0;
+    if (m_linkedTrimStoryline) {
+        QSet<int> laterV1Groups;
+        for (int v = v1ClipIdx + 1; v < v1->clipCount(); ++v)
+            if (v1->clips().at(v).linkGroup > 0) laterV1Groups.insert(v1->clips().at(v).linkGroup);
+        for (auto &p : m_linkedTrimPartners) {
+            if (p.track == v1 || !p.track->isAudioTrack() || p.clipIdx + 1 >= p.track->clipCount())
+                continue;
+            const ClipInfo &next = p.track->clips().at(p.clipIdx + 1);
+            p.nextFollowsV1 = next.anchorUid.isEmpty() && laterV1Groups.contains(next.linkGroup);
+            if (!p.nextFollowsV1) continue;
+            // The followers ripple with V1; the first non-follower after them
+            // (BGM) keeps its start, as in applyTrimLinked.
+            for (int h = p.clipIdx + 2; h < p.track->clipCount(); ++h) {
+                const ClipInfo &c = p.track->clips().at(h);
+                if (c.anchorUid.isEmpty() && laterV1Groups.contains(c.linkGroup)) continue;
+                p.holdIdx = h;
+                p.holdOrigLeadIn = c.leadInSec;
+                break;
+            }
+        }
+    }
+
     // Intersect every member's allowed TIMELINE delta. Source limits
     // (inPoint >= 0, outPoint <= duration, 0.1 s minimum length, same as the
     // single-clip trim branch) are converted with /speed per member; the
     // neighbour gaps (own leadInSec / next clip's leadInSec) are already
-    // timeline seconds, so neighbours are never pushed or overlapped.
+    // timeline seconds, so neighbours are never pushed or overlapped (US-1305:
+    // in storyline mode V1 and a next clip that follows V1 are not limits).
     double lo = -1e18;
     double hi = 1e18;
     for (const auto &p : m_linkedTrimPartners) {
         const ClipInfo &c = p.track->clips()[p.clipIdx];
+        const bool nextLimits = p.origLeadInNext >= 0.0 && !p.nextFollowsV1
+            && !(m_linkedTrimStoryline && p.track == v1);
         if (leftEdge) {
             lo = qMax(lo, -p.origIn / p.speed);
-            lo = qMax(lo, -p.origLeadIn);
+            if (!m_linkedTrimStoryline)
+                lo = qMax(lo, -p.origLeadIn);
+            else if (nextLimits)
+                lo = qMax(lo, -p.origLeadInNext);
             hi = qMin(hi, (p.origOut - 0.1 - p.origIn) / p.speed);
         } else {
             hi = qMin(hi, (c.duration - p.origOut) / p.speed);
             lo = qMax(lo, (p.origIn + 0.1 - p.origOut) / p.speed);
-            if (p.origLeadInNext >= 0.0)
+            if (nextLimits)
                 hi = qMin(hi, p.origLeadInNext);
+        }
+        // The followers must not push the held clip (G17(d): refused).
+        if (p.holdIdx >= 0) {
+            if (leftEdge) lo = qMax(lo, -p.holdOrigLeadIn);
+            else hi = qMin(hi, p.holdOrigLeadIn);
         }
     }
     // A member already past a limit must not force movement: 0 stays legal.
@@ -12524,16 +12608,27 @@ void Timeline::captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, boo
 
 void Timeline::applyLinkedTrimDelta(double deltaSec)
 {
+    TimelineTrack *v1 = m_videoTracks.value(0, nullptr);
     for (const auto &p : m_linkedTrimPartners) {
         if (!p.track) continue;
-        if (m_linkedTrimLeftEdge) {
+        // US-1305: the next clip keeps its position unless the trim ripples it
+        // (V1, or linked audio of a later V1 clip).
+        const bool compensateNext = p.origLeadInNext >= 0.0 && !p.nextFollowsV1
+            && !(m_linkedTrimStoryline && p.track == v1);
+        if (m_linkedTrimLeftEdge && m_linkedTrimStoryline) {
+            p.track->applyLinkedTrim(p.clipIdx, true, p.origIn + deltaSec * p.speed, p.origLeadIn,
+                                     compensateNext ? p.origLeadInNext + deltaSec : -1.0);
+        } else if (m_linkedTrimLeftEdge) {
             p.track->applyLinkedTrim(p.clipIdx, true,
                 p.origIn + deltaSec * p.speed, p.origLeadIn + deltaSec);
         } else {
             p.track->applyLinkedTrim(p.clipIdx, false,
                 p.origOut + deltaSec * p.speed,
-                p.origLeadInNext >= 0.0 ? p.origLeadInNext - deltaSec : -1.0);
+                compensateNext ? p.origLeadInNext - deltaSec : -1.0);
         }
+        if (p.holdIdx >= 0)
+            p.track->applyDragMove(p.holdIdx,
+                m_linkedTrimLeftEdge ? p.holdOrigLeadIn + deltaSec : p.holdOrigLeadIn - deltaSec, -1.0);
     }
 }
 

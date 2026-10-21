@@ -29,6 +29,7 @@
 #include <QJsonDocument>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <QtTest/QTest>
 #include "SelftestRegistry.h"
 #include <cmath>
 #include <cstdio>
@@ -278,6 +279,37 @@ bool storyClipDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest, double t
     static_cast<QObject *>(dest)->event(&event);
     TimelineTrack::setSelftestDropSource(nullptr);
     return event.isAccepted();
+}
+
+// US-1305: press on the left / right trim handle of clip clipIdx, move by deltaSec and
+// release (QTest mouse events, as in linked_trim_selftest). Returns the delta in
+// timeline seconds the pixels actually carry.
+double storyTrimEdge(TimelineTrack *track, int clipIdx, bool rightEdge, double deltaSec)
+{
+    const double pps = track->pixelsPerSecond();
+    const ClipInfo &c = track->clips()[clipIdx];
+    const int width = qMax(20, static_cast<int>(c.effectiveDuration() * pps));
+    const int x0 = track->clipStartX(clipIdx) + (rightEdge ? width - 2 : 2);
+    const int y = track->rowHeight() / 2;
+    const int dx = static_cast<int>(std::lround(deltaSec * pps));
+    QTest::mousePress(track, Qt::LeftButton, Qt::NoModifier, QPoint(x0, y));
+    QTest::mouseMove(track, QPoint(x0 + dx, y));
+    QTest::mouseRelease(track, Qt::LeftButton, Qt::NoModifier, QPoint(x0 + dx, y));
+    return dx / pps;
+}
+
+double storyLength(const TimelineTrack *track, const QString &name)
+{
+    const ClipInfo *c = storyFind(track, name);
+    return c ? c->effectiveDuration() : -1.0;
+}
+
+// Every clip on the track starts at or after the end of the one before it.
+bool storyNoOverlap(const TimelineTrack *track)
+{
+    for (const ClipInfo &c : track->clips())
+        if (c.leadInSec < -1e-9) return false;
+    return true;
 }
 
 // Press on the clip body at fromSec, move to toSec and release (an in-track move drag).
@@ -919,8 +951,8 @@ int runTrackOpsSelftest()
     //       pair keeps its -1 s (a re-derived offset of 0 would put either at
     //       its clip's start);
     //   (d) W (ripple trim out) on a gap-free V1: +1 moves the next V1 clip by
-    //       exactly +1 (no gap; trimops' own RippleOut moves it +2), -1 moves it
-    //       back by 1 (trimops refuses it with the next leadIn at 0), the A1 BGM
+    //       exactly +1 (no gap; US-1305: trimops' RippleOut no longer also moves
+    //       the next leadIn), -1 moves it back by 1, the A1 BGM
     //       stays, the next clip's linked audio on A2 follows; +3 is refused
     //       (it would push the BGM) and changes nothing; with Ya right after Xa
     //       on A1, W+1 is accepted: Ya ripples with Y, the BGM stays (undo too);
@@ -1656,6 +1688,307 @@ int runTrackOpsSelftest()
         std::fprintf(stderr, "[track-ops] G24 (1) import: %s\n[track-ops] G24 (2) split: %s\n",
                      qPrintable(importLine), qPrintable(splitLine));
         gate(24, importOk && splitOk);
+    }
+    // US-1305 G25: storyline mode, mouse trims of the linked V1 clip Y in a gap-free
+    // V1 [X|Y|Z] (Y: 8 s source, in 2 / out 6 at 4 s; Ya on A1 under it, then the
+    // unlinked BGM at 10 s; K on V2 connected to Z at 8 s). Each edge keeps Y's and
+    // Ya's start and ripples V1: (1) left +d, (2) right +d, (3) left -d; (4) undo
+    // once restores each; (5) OFF control: left +d moves Y by d and Z stays. The C3
+    // variant puts the linked audio Xa / Ya / Za under all three V1 clips and an
+    // unlinked BGM after Za (gap 2 s, at 14 s): Za follows Z and the BGM stays. The
+    // unlinked variant (Y not linked, no audio) takes the direct trim path: ON left +d
+    // keeps Y's start and Z follows, OFF left +d moves Y by d and Z stays.
+    // HEAD: (1) moves Y.start by +d, (2) / (3) cannot move (next / own leadIn 0).
+    {
+        const double d = 1.0;
+        auto makeStory = [](Timeline &t, bool on, bool allLinked) {
+            ClipInfo y = storyClip("Y", 8.0, 2);
+            y.inPoint = 2.0;
+            y.outPoint = 6.0;
+            ClipInfo ya = y;
+            ya.displayName = QStringLiteral("Ya");
+            ya.filePath = QStringLiteral("track-ops-story-Ya.mov");
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("X", 4.0, allLinked ? 1 : 0), y, storyClip("Z", 4.0, allLinked ? 3 : 0)},
+                allLinked ? QVector<ClipInfo>{} : QVector<ClipInfo>{storyClip("K", 2.0, 0, 8.0)}};
+            QVector<ClipInfo> a1;
+            if (allLinked) {
+                a1 = {storyClip("Xa", 4.0, 1), ya, storyClip("Za", 4.0, 3), storyClip("BGM", 3.0, 0, 2.0)};
+            } else {
+                ya.leadInSec = 4.0;
+                a1 = {ya, storyClip("BGM", 3.0, 0, 2.0)};
+            }
+            t.restoreFromProject(video, QVector<QVector<ClipInfo>>{a1}, 0.0, -1.0, -1.0, 100);
+            t.setSnapEnabled(false);
+            for (auto *track : t.videoTracks()) track->setSnapEnabled(false);
+            for (auto *track : t.audioTracks()) track->setSnapEnabled(false);
+            t.setStorylineMode(on);
+            QString err;
+            bool connected = true;
+            if (!allLinked)
+                connected = t.connectClip(TrackKind::Video, 1, 0, t.trackAt(false, 0)->clips().at(2).uid, &err);
+            storyBaseline(t);
+            return connected;
+        };
+        auto layout = [](Timeline &t) {
+            return "V1 [" + storyLayout(t.trackAt(false, 0)) + "] V2 [" + storyLayout(t.trackAt(false, 1))
+                + "] A1 [" + storyLayout(t.trackAt(true, 0)) + "]";
+        };
+        bool mainOk = true;
+        struct Step { const char *name; bool right; double delta; };
+        const Step steps[] = {{"(1) left +d", false, d}, {"(2) right +d", true, d}, {"(3) left -d", false, -d}};
+        for (const Step &step : steps) {
+            Timeline t;
+            const bool connected = makeStory(t, true, false);
+            const std::string before = layout(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const double moved = storyTrimEdge(t.trackAt(false, 0), 1, step.right, step.delta);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *v2 = t.trackAt(false, 1);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const double yLen = storyLength(v1, "Y");
+            const double yaLen = storyLength(a1, "Ya");
+            // Left +d shortens by d, right +d and left -d lengthen by d.
+            const double lenDelta = step.right ? moved : -moved;
+            const double zSec = 8.0 + lenDelta;
+            const bool editOk = connected && std::abs(moved - step.delta) < 1e-6
+                && storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 4.0) && std::abs(yLen - (4.0 + lenDelta)) < 1e-6
+                && storyAt(v1, "Z", zSec) && storyAt(a1, "Ya", 4.0) && std::abs(yaLen - yLen) < 1e-6
+                && storyAt(a1, "BGM", 10.0) && storyAt(v2, "K", zSec)
+                && t.undoManager()->saveSerial() == serial + 1;
+            const std::string edited = layout(t);
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            t.undo();
+            const bool undoOk = layout(t) == before;
+            std::fprintf(stderr, "[track-ops] G25 %s: connected=%d moved=%.3f %s Y.len=%.2f Ya.len=%.2f serial +%d "
+                         "(expect Y@4 len %.2f, Z@%.2f, Ya@4 same len, BGM@10, K@%.2f, +1); undo %s (expect %s) -> %d/%d\n",
+                         step.name, connected, moved, edited.c_str(), yLen, yaLen,
+                         serialDelta, 4.0 + lenDelta, zSec, zSec,
+                         layout(t).c_str(), before.c_str(), editOk, undoOk);
+            mainOk = mainOk && editOk && undoOk;
+        }
+        bool offOk = false;
+        {
+            Timeline t;
+            makeStory(t, false, false);
+            const double moved = storyTrimEdge(t.trackAt(false, 0), 1, false, d);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            offOk = storyAt(v1, "Y", 4.0 + moved) && storyAt(v1, "Z", 8.0);
+            std::fprintf(stderr, "[track-ops] G25 (5) OFF left +d: %s (expect Y@5, Z@8) -> %d\n",
+                         layout(t).c_str(), offOk);
+        }
+        bool c3Ok = true;
+        for (const Step &step : steps) {
+            Timeline t;
+            makeStory(t, true, true);
+            const std::string before = layout(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const double moved = storyTrimEdge(t.trackAt(false, 0), 1, step.right, step.delta);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            const double lenDelta = step.right ? moved : -moved;
+            const double zSec = 8.0 + lenDelta;
+            const bool editOk = std::abs(moved - step.delta) < 1e-6
+                && storyAt(v1, "Y", 4.0) && storyAt(a1, "Ya", storyStart(v1, "Y"))
+                && std::abs(storyLength(a1, "Ya") - (4.0 + lenDelta)) < 1e-6
+                && storyAt(v1, "Z", zSec) && storyAt(a1, "Za", storyStart(v1, "Z"))
+                && storyAt(a1, "Xa", 0.0) && a1->clipCount() == 4 && storyNoOverlap(a1)
+                && storyAt(a1, "Za", zSec) && storyAt(a1, "BGM", 14.0)
+                && t.undoManager()->saveSerial() == serial + 1;
+            const std::string edited = layout(t);
+            const double yaLen = storyLength(a1, "Ya");
+            const double bgmSec = storyStart(a1, "BGM");
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            t.undo();
+            const bool undoOk = layout(t) == before;
+            std::fprintf(stderr, "[track-ops] G25 C3 %s: %s Ya.len=%.2f BGM@%.2f serial +%d (expect Y@4 Ya@4 len %.2f, "
+                         "Z@%.2f Za@%.2f, BGM@14, no A1 overlap, +1); undo %s -> %d/%d\n", step.name, edited.c_str(),
+                         yaLen, bgmSec, serialDelta,
+                         4.0 + lenDelta, zSec, zSec, layout(t).c_str(), editOk, undoOk);
+            c3Ok = c3Ok && editOk && undoOk;
+        }
+        bool directOnOk = false, directOffOk = false;
+        for (const bool on : {true, false}) {
+            Timeline t;
+            ClipInfo y = storyClip("Y", 8.0);
+            y.inPoint = 2.0;
+            y.outPoint = 6.0;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{storyClip("X", 4.0), y, storyClip("Z", 4.0)}},
+                                 QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            t.setSnapEnabled(false);
+            for (auto *track : t.videoTracks()) track->setSnapEnabled(false);
+            t.setStorylineMode(on);
+            storyBaseline(t);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const std::string before = storyLayout(v1);
+            const auto serial = t.undoManager()->saveSerial();
+            const double moved = storyTrimEdge(t.trackAt(false, 0), 1, false, d);
+            const std::string edited = storyLayout(v1);
+            const double yLen = storyLength(v1, "Y");
+            const int serialDelta = int(t.undoManager()->saveSerial() - serial);
+            if (on) {
+                const bool editOk = std::abs(moved - d) < 1e-6 && storyAt(v1, "Y", 4.0)
+                    && std::abs(yLen - (4.0 - moved)) < 1e-6 && storyAt(v1, "Z", 8.0 - moved) && serialDelta == 1;
+                t.undo();
+                const bool undoOk = storyLayout(v1) == before;
+                directOnOk = editOk && undoOk;
+                std::fprintf(stderr, "[track-ops] G25 unlinked ON left +d: V1 [%s] Y.len=%.2f serial +%d (expect Y@4 "
+                             "len %.2f, Z@%.2f, +1); undo V1 [%s] -> %d/%d\n", edited.c_str(), yLen, serialDelta,
+                             4.0 - moved, 8.0 - moved, storyLayout(v1).c_str(), editOk, undoOk);
+            } else {
+                directOffOk = std::abs(moved - d) < 1e-6 && storyAt(v1, "Y", 4.0 + moved) && storyAt(v1, "Z", 8.0);
+                std::fprintf(stderr, "[track-ops] G25 unlinked OFF left +d: V1 [%s] (expect Y@%.2f, Z@8) -> %d\n",
+                             edited.c_str(), 4.0 + moved, directOffOk);
+            }
+        }
+        std::fprintf(stderr, "[track-ops] G25 items: main=%d off=%d c3=%d directOn=%d directOff=%d\n",
+                     mainOk, offOk, c3Ok, directOnOk, directOffOk);
+        gate(25, mainOk && offOk && c3Ok && directOnOk && directOffOk);
+    }
+    // US-1305 G26: storyline mode nudge of the V1 clip Y (25 fps, 1f = 0.04 s) in a
+    // gap-free V1 [X|Y|Z]: +1f moves Y and Z by 1f, X stays and a 1f gap opens before Y
+    // that the reconcile (saveUndoState) leaves; one undo restores. -1f with Y's leadIn 0
+    // is refused (state unchanged, one status). Y with its linked Ya (taken in by the
+    // linked selection): +1f is accepted and the reconcile puts Ya at Y's start, the A1
+    // BGM stays. Y with an unlinked V2 clip: refused, state unchanged, one status.
+    // Y with its linked Ya on a locked A1: refused, state unchanged, one status.
+    // HEAD: moveClipByIndex moves only Y, Z stays.
+    {
+        const double f = 1.0 / 25.0;
+        auto makeNudge = [](Timeline &t, bool linked) {
+            const QVector<QVector<ClipInfo>> video{
+                {storyClip("X", 4.0), storyClip("Y", 4.0, linked ? 2 : 0), storyClip("Z", 4.0)},
+                {storyClip("K", 2.0, 0, 12.0)}};
+            const QVector<QVector<ClipInfo>> audio{
+                linked ? QVector<ClipInfo>{storyClip("Ya", 4.0, 2, 4.0), storyClip("BGM", 3.0, 0, 2.0)}
+                       : QVector<ClipInfo>{}};
+            t.restoreFromProject(video, audio, 0.0, -1.0, -1.0, 100);
+            t.setNudgeFrameRate(25.0);
+            t.setStorylineMode(true);
+            storyBaseline(t);
+        };
+        auto layout = [](Timeline &t) {
+            return "V1 [" + storyLayout(t.trackAt(false, 0)) + "] V2 [" + storyLayout(t.trackAt(false, 1))
+                + "] A1 [" + storyLayout(t.trackAt(true, 0)) + "]";
+        };
+        bool plusOk = false, minusOk = false, linkedOk = false, mixedOk = false, lockedOk = false;
+        {
+            Timeline t;
+            makeNudge(t, false);
+            const std::string before = layout(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            auto serial = t.undoManager()->saveSerial();
+            t.nudgeSelectedClips(1);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const ClipInfo *y = storyFind(v1, "Y");
+            const double gap = y ? y->leadInSec : -1.0;
+            plusOk = storyAt(v1, "X", 0.0) && storyAt(v1, "Y", 4.0 + f) && storyAt(v1, "Z", 8.0 + f)
+                && std::abs(gap - f) < 1e-9 && t.undoManager()->saveSerial() == serial + 1;
+            const std::string nudged = layout(t);
+            const int nudgeSerialDelta = int(t.undoManager()->saveSerial() - serial);
+            t.undo();
+            const bool undoOk = layout(t) == before;
+            std::fprintf(stderr, "[track-ops] G26 +1f: %s Y gap=%.4f serial +%d (expect X@0 Y@4.04 Z@8.04, gap 0.04 "
+                         "after the reconcile, +1); undo %s -> %d/%d\n", nudged.c_str(), gap,
+                         nudgeSerialDelta, layout(t).c_str(), plusOk, undoOk);
+            plusOk = plusOk && undoOk;
+            t.trackAt(false, 0)->setSelectedClip(1);
+            QSignalSpy status(&t, &Timeline::statusMessageRequested);
+            serial = t.undoManager()->saveSerial();
+            t.nudgeSelectedClips(-1);
+            minusOk = layout(t) == before && status.count() == 1 && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G26 -1f at leadIn 0: %s status=%d serial +%d (expect unchanged, 1, +0) -> %d\n",
+                         layout(t).c_str(), int(status.count()), int(t.undoManager()->saveSerial() - serial), minusOk);
+        }
+        {
+            Timeline t;
+            makeNudge(t, true);
+            const std::string before = layout(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            const bool yaSelected = t.trackAt(true, 0)->isClipSelected(0);
+            QSignalSpy status(&t, &Timeline::statusMessageRequested);
+            const auto serial = t.undoManager()->saveSerial();
+            t.nudgeSelectedClips(1);
+            const TimelineTrack *v1 = t.trackAt(false, 0);
+            const TimelineTrack *a1 = t.trackAt(true, 0);
+            linkedOk = yaSelected && status.count() == 0 && storyAt(v1, "Y", 4.0 + f) && storyAt(v1, "Z", 8.0 + f)
+                && storyAt(a1, "Ya", storyStart(v1, "Y")) && storyAt(a1, "BGM", 10.0)
+                && t.undoManager()->saveSerial() == serial + 1;
+            std::fprintf(stderr, "[track-ops] G26 Y+Ya +1f: YaSelected=%d status=%d %s serial +%d (expect Y@4.04 "
+                         "Ya@4.04 BGM@10, +1; before %s) -> %d\n", yaSelected, int(status.count()), layout(t).c_str(),
+                         int(t.undoManager()->saveSerial() - serial), before.c_str(), linkedOk);
+        }
+        {
+            Timeline t;
+            makeNudge(t, false);
+            const std::string before = layout(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            t.trackAt(false, 1)->toggleClipSelection(0);
+            const bool bothSelected = t.trackAt(false, 0)->isClipSelected(1) && t.trackAt(false, 1)->isClipSelected(0);
+            QSignalSpy status(&t, &Timeline::statusMessageRequested);
+            const auto serial = t.undoManager()->saveSerial();
+            t.nudgeSelectedClips(1);
+            mixedOk = bothSelected && layout(t) == before && status.count() == 1
+                && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G26 Y+V2 K +1f: bothSelected=%d %s status=%d serial +%d "
+                         "(expect unchanged, 1, +0) -> %d\n", bothSelected, layout(t).c_str(), int(status.count()),
+                         int(t.undoManager()->saveSerial() - serial), mixedOk);
+        }
+        {
+            Timeline t;
+            makeNudge(t, true);
+            t.trackAt(true, 0)->setLocked(true);
+            const std::string before = layout(t);
+            t.trackAt(false, 0)->setSelectedClip(1);
+            QSignalSpy status(&t, &Timeline::statusMessageRequested);
+            const auto serial = t.undoManager()->saveSerial();
+            t.nudgeSelectedClips(1);
+            lockedOk = layout(t) == before && status.count() == 1 && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G26 Y+Ya locked A1 +1f: %s status=%d serial +%d "
+                         "(expect unchanged %s, 1, +0) -> %d\n", layout(t).c_str(), int(status.count()),
+                         int(t.undoManager()->saveSerial() - serial), before.c_str(), lockedOk);
+        }
+        std::fprintf(stderr, "[track-ops] G26 items: plus=%d minus=%d linked=%d mixed=%d locked=%d\n",
+                     plusOk, minusOk, linkedOk, mixedOk, lockedOk);
+        gate(26, plusOk && minusOk && linkedOk && mixedOk && lockedOk);
+    }
+    // US-1305 G27: storyline mode OFF, W (applyTrimActive RippleOut +1) on X in
+    // V1 [X|Y] and applyTrimLinked RippleOut +1 on X with its linked Xa (A1 [Xa|N])
+    // move the downstream clip by exactly +1. HEAD: +2 (TrimOps also shifted the
+    // next leadIn).
+    {
+        ClipInfo x = storyClip("X", 8.0, 1);
+        x.outPoint = 4.0;
+        ClipInfo xa = storyClip("Xa", 8.0, 1);
+        xa.outPoint = 4.0;
+        bool activeOk = false, linkedOk = false;
+        {
+            Timeline t;
+            ClipInfo solo = x;
+            solo.linkGroup = 0;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{solo, storyClip("Y", 4.0)}},
+                                 QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            t.trackAt(false, 0)->setSelectedClip(0);
+            QString err;
+            const bool ok = t.applyTrimActive(trimops::TrimType::RippleOut, 1.0, &err);
+            activeOk = ok && storyAt(t.trackAt(false, 0), "Y", 5.0);
+            std::fprintf(stderr, "[track-ops] G27 applyTrimActive: ok=%d err='%s' V1 [%s] (expect Y@5) -> %d\n", ok,
+                         err.toUtf8().constData(), storyLayout(t.trackAt(false, 0)).c_str(), activeOk);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{x, storyClip("Y", 4.0)}},
+                                 QVector<QVector<ClipInfo>>{{xa, storyClip("N", 4.0)}}, 0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            QString err;
+            const bool ok = t.applyTrimLinked(t.trackAt(false, 0), 0, trimops::TrimType::RippleOut, 1.0, &err);
+            linkedOk = ok && storyAt(t.trackAt(false, 0), "Y", 5.0) && storyAt(t.trackAt(true, 0), "N", 5.0);
+            std::fprintf(stderr, "[track-ops] G27 applyTrimLinked: ok=%d err='%s' V1 [%s] A1 [%s] (expect Y@5, N@5) -> %d\n",
+                         ok, err.toUtf8().constData(), storyLayout(t.trackAt(false, 0)).c_str(),
+                         storyLayout(t.trackAt(true, 0)).c_str(), linkedOk);
+        }
+        gate(27, activeOk && linkedOk);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
