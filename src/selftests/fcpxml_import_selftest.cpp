@@ -2127,5 +2127,162 @@ int runFcpxmlImportSelftest()
     std::fprintf(stderr, "G37 same-angle shortage warnings=%d expected 1\n", g37SameShortCount);
     gate(37, g37ShortOk && g37ConnectedOk && g37SignedOk && g37TrimmedOk && g37SignedAudioOk && g37SameShortCount == 1);
 
+    // G38 / G39 share this view: the warnings other than the offline-media notice every fixture raises.
+    auto g38Warnings = [](const fcpx::xml::ImportResult &r) {
+        QStringList out;
+        for (const QString &w : r.warnings) if (!w.startsWith(QStringLiteral("オフライン素材"))) out.append(w);
+        return out;
+    };
+    // G38: a connected clip container whose signed offset lies before its parent's time zero is cut at
+    // timeline zero like any lane child: the container's frame and its inheriting child both start at 0 and
+    // lose the 2s lead (source in 0 -> 2), with the one existing trim warning. HEAD drops it with the child.
+    const auto g38 = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"base\" offset=\"0s\" duration=\"10s\">"
+        "<clip name=\"neg\" lane=\"1\" offset=\"-2s\" start=\"0s\" duration=\"5s\">"
+        "<asset-clip ref=\"a\" name=\"negChild\" duration=\"5s\"/></clip></asset-clip>")), dir.path());
+    const ClipInfo *g38Base = !g38.videoTracks.isEmpty() && g38.videoTracks[0].size() == 1 ? &g38.videoTracks[0][0] : nullptr;
+    const ClipInfo *g38Child = g38.videoTracks.size() == 2 && g38.videoTracks[1].size() == 1 ? &g38.videoTracks[1][0] : nullptr;
+    const QStringList g38Warns = g38Warnings(g38);
+    const bool g38Ok = g38.error.isEmpty() && g38Base && g38Child && !g38Base->uid.isEmpty()
+        && g38Child->displayName == QStringLiteral("negChild") && g38Child->anchorUid == g38Base->uid
+        && near(g38Child->leadInSec, 0.0) && near(g38Child->inPoint, 2.0) && near(g38Child->outPoint, 5.0)
+        && g38Warns == QStringList{QStringLiteral("接続クリップをタイムライン 0 で切り詰めました: neg / ")};
+    std::fprintf(stderr, "G38 error=[%s] child(name=%s lead=%.9f in=%.9f out=%.9f anchorsBase=%d) expected (negChild, 0, 2, 5, 1) warnings=[%s] expected exactly [接続クリップをタイムライン 0 で切り詰めました: neg / ]\n",
+        g38.error.toUtf8().constData(), g38Child ? g38Child->displayName.toUtf8().constData() : "",
+        g38Child ? g38Child->leadInSec : -99.0, g38Child ? g38Child->inPoint : -1.0, g38Child ? g38Child->outPoint : -1.0,
+        int(g38Child && g38Base && g38Child->anchorUid == g38Base->uid), g38Warns.join(QStringLiteral(" | ")).toUtf8().constData());
+    gate(38, g38Ok);
+
+    // G39: a container's duration is its frame end: a 5s child in a 2s container is cut to 2s with one
+    // warning (HEAD keeps 5s); a child that exactly fills its container is left alone without a warning.
+    const auto g39 = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"long\" duration=\"5s\"/></clip>"
+        "<clip name=\"fit\" offset=\"10s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"exact\" duration=\"2s\"/></clip>")), dir.path());
+    const ClipInfo *g39Long = namedClip(g39.videoTracks, QStringLiteral("long"));
+    const ClipInfo *g39Exact = namedClip(g39.videoTracks, QStringLiteral("exact"));
+    const QStringList g39Warns = g38Warnings(g39);
+    const bool g39Ok = g39.error.isEmpty() && g39Long && g39Exact
+        && near(g39Long->inPoint, 0.0) && near(g39Long->outPoint, 2.0)
+        && near(g39Exact->inPoint, 0.0) && near(g39Exact->outPoint, 2.0)
+        && g39Warns == QStringList{QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: long / a")};
+    std::fprintf(stderr, "G39 error=[%s] long(in=%.9f out=%.9f) expected (0, 2) exact(in=%.9f out=%.9f) expected (0, 2) warnings=[%s] expected exactly [コンテナの長さを超えるクリップを切り詰めました: long / a]\n",
+        g39.error.toUtf8().constData(), g39Long ? g39Long->inPoint : -1.0, g39Long ? g39Long->outPoint : -1.0,
+        g39Exact ? g39Exact->inPoint : -1.0, g39Exact ? g39Exact->outPoint : -1.0,
+        g39Warns.join(QStringLiteral(" | ")).toUtf8().constData());
+    // Sub-items: a child at exactly the container end, one entirely past it and a zero-length container are
+    // dropped with the one out-of-range warning (HEAD imports them); a descendant is bounded by the frame too.
+    const QString g39Outside = QStringLiteral("コンテナの範囲外のクリップを読み飛ばしました: ");
+    const auto g39End = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"atEnd\" offset=\"2s\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Past = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"past\" offset=\"3s\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Zero = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"0s\">"
+        "<asset-clip ref=\"a\" name=\"zeroKid\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Desc = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"host\" duration=\"5s\">"
+        "<audio ref=\"av\" name=\"cAudio\" lane=\"-1\" offset=\"1s\" duration=\"4s\"/></asset-clip></clip>"),
+        avAsset), dir.path());
+    const ClipInfo *g39Host = namedClip(g39Desc.videoTracks, QStringLiteral("host"));
+    const ClipInfo *g39Audio = namedClip(g39Desc.audioTracks, QStringLiteral("cAudio"));
+    const QStringList g39EndWarns = g38Warnings(g39End), g39PastWarns = g38Warnings(g39Past),
+        g39ZeroWarns = g38Warnings(g39Zero), g39DescWarns = g38Warnings(g39Desc);
+    const double g39AudioEnd = g39Audio ? g39Audio->leadInSec + g39Audio->outPoint - g39Audio->inPoint : 99.0;
+    const bool g39DescTrimWarned = g39DescWarns.contains(QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: cAudio / av"));
+    std::fprintf(stderr, "G39 atEnd videoClips=%d warnings=[%s] expected 0 and exactly [%satEnd / a]\n",
+        int(g39End.videoTracks.isEmpty() ? 0 : g39End.videoTracks[0].size()),
+        g39EndWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 past videoClips=%d warnings=[%s] expected 0 and exactly [%spast / a]\n",
+        int(g39Past.videoTracks.isEmpty() ? 0 : g39Past.videoTracks[0].size()),
+        g39PastWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 zero-duration container videoClips=%d warnings=[%s] expected 0 and exactly [%szeroKid / a]\n",
+        int(g39Zero.videoTracks.isEmpty() ? 0 : g39Zero.videoTracks[0].size()),
+        g39ZeroWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 descendant error=[%s] host(out=%.9f) audio(lead=%.9f in=%.9f out=%.9f end=%.9f) trimWarned=%d expected (2, end<=2, 1) warnings=[%s]\n",
+        g39Desc.error.toUtf8().constData(), g39Host ? g39Host->outPoint : -1.0, g39Audio ? g39Audio->leadInSec : -1.0,
+        g39Audio ? g39Audio->inPoint : -1.0, g39Audio ? g39Audio->outPoint : -1.0, g39AudioEnd, int(g39DescTrimWarned),
+        g39DescWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    const bool g39SubOk = g39Desc.error.isEmpty()
+        && namedClip(g39End.videoTracks, QStringLiteral("atEnd")) == nullptr
+        && namedClip(g39Past.videoTracks, QStringLiteral("past")) == nullptr
+        && namedClip(g39Zero.videoTracks, QStringLiteral("zeroKid")) == nullptr
+        && g39EndWarns == QStringList{g39Outside + QStringLiteral("atEnd / a")}
+        && g39PastWarns == QStringList{g39Outside + QStringLiteral("past / a")}
+        && g39ZeroWarns == QStringList{g39Outside + QStringLiteral("zeroKid / a")}
+        && g39Host && near(g39Host->outPoint, 2.0) && g39Audio && g39AudioEnd <= 2.0 + 1e-9
+        && g39DescTrimWarned;
+    // Connected mc-clips are bounded by the container frame too: video and the separately cut audio of one
+    // that crosses the 2s frame end stay inside it with one trim warning; one at or past the end is dropped
+    // with the one out-of-range warning (HEAD keeps both, to 5s).
+    auto g39Mc = [&](const QString &mcOffset) {
+        return fcpx::xml::parseXml(document(QStringLiteral(
+            "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+            "<asset-clip ref=\"a\" name=\"host\" duration=\"5s\">"
+            "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"%1\" start=\"0s\" duration=\"4s\">%2</mc-clip>"
+            "</asset-clip></clip>").arg(mcOffset, g36Sources),
+            mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    };
+    auto g39McEnd = [](const fcpx::xml::ImportResult &r, const QString &name, bool audioKind, int *count) {
+        double end = -1.0;
+        const auto &tracks = audioKind ? r.audioTracks : r.videoTracks;
+        for (const auto &track : tracks)
+            for (const ClipInfo &c : track)
+                if (c.displayName != QStringLiteral("host") && c.displayName.contains(name)) {
+                    ++*count;
+                    end = std::max(end, c.leadInSec + c.outPoint - c.inPoint);
+                }
+        return end;
+    };
+    const auto g39McCross = g39Mc(QStringLiteral("1s"));
+    const auto g39McAt = g39Mc(QStringLiteral("2s"));
+    const auto g39McPast = g39Mc(QStringLiteral("3s"));
+    int g39CrossVideoN = 0, g39CrossAudioN = 0, g39AtN = 0, g39PastN = 0;
+    const double g39CrossVideoEnd = g39McEnd(g39McCross, QStringLiteral("A1clip"), false, &g39CrossVideoN);
+    const double g39CrossAudioEnd = g39McEnd(g39McCross, QStringLiteral("voiceclip"), true, &g39CrossAudioN);
+    g39McEnd(g39McAt, QStringLiteral("A1clip"), false, &g39AtN);
+    g39McEnd(g39McAt, QStringLiteral("voiceclip"), true, &g39AtN);
+    g39McEnd(g39McPast, QStringLiteral("A1clip"), false, &g39PastN);
+    g39McEnd(g39McPast, QStringLiteral("voiceclip"), true, &g39PastN);
+    const QStringList g39CrossWarns = g38Warnings(g39McCross), g39AtWarns = g38Warnings(g39McAt), g39PastWarns2 = g38Warnings(g39McPast);
+    // The 5s host is itself cut to the frame (its own warning comes first).
+    const QString g39HostTrim = QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: host / a");
+    const QStringList g39CrossExpected{g39HostTrim, QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: MCC / m")};
+    std::fprintf(stderr, "G39 connected mc crossing: error=[%s] video(n=%d end=%.9f) audio(n=%d end=%.9f) expected (n>=1, end<=2) warnings=[%s] expected exactly [host trim | MCC trim]\n",
+        g39McCross.error.toUtf8().constData(), g39CrossVideoN, g39CrossVideoEnd, g39CrossAudioN, g39CrossAudioEnd,
+        g39CrossWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    std::fprintf(stderr, "G39 connected mc at end: entries=%d warnings=[%s] | past: entries=%d warnings=[%s] expected 0 and exactly [host trim | %sMCC / m] each\n",
+        g39AtN, g39AtWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39PastN,
+        g39PastWarns2.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    // The video fits the frame but audioDuration reaches past it: the separately cut audio is bounded too,
+    // with the one trim warning (HEAD leaves the audio ending at 5s).
+    const auto g39McAudio = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"host\" duration=\"2s\">"
+        "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"1s\" start=\"0s\" duration=\"1s\" audioDuration=\"4s\">%1</mc-clip>"
+        "</asset-clip></clip>").arg(g36Sources),
+        mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    int g39AudVideoN = 0, g39AudAudioN = 0;
+    const double g39AudVideoEnd = g39McEnd(g39McAudio, QStringLiteral("A1clip"), false, &g39AudVideoN);
+    const double g39AudAudioEnd = g39McEnd(g39McAudio, QStringLiteral("voiceclip"), true, &g39AudAudioN);
+    const QStringList g39AudWarns = g38Warnings(g39McAudio);
+    std::fprintf(stderr, "G39 connected mc audio overflow: error=[%s] video(n=%d end=%.9f) audio(n=%d end=%.9f) expected (video end 2, n>=1, audio end<=2) warnings=[%s] expected exactly [MCC trim]\n",
+        g39McAudio.error.toUtf8().constData(), g39AudVideoN, g39AudVideoEnd, g39AudAudioN, g39AudAudioEnd,
+        g39AudWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    const bool g39McAudioOk = g39McAudio.error.isEmpty() && g39AudVideoN >= 1 && std::abs(g39AudVideoEnd - 2.0) < 1e-9
+        && g39AudAudioN >= 1 && g39AudAudioEnd <= 2.0 + 1e-9
+        && g39AudWarns == QStringList{QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: MCC / m")};
+    const bool g39McOk = g39McAudioOk && g39McCross.error.isEmpty() && g39McAt.error.isEmpty() && g39McPast.error.isEmpty()
+        && g39CrossVideoN >= 1 && g39CrossAudioN >= 1 && g39CrossVideoEnd <= 2.0 + 1e-9 && g39CrossAudioEnd <= 2.0 + 1e-9
+        && g39CrossWarns == g39CrossExpected
+        && g39AtN == 0 && g39PastN == 0
+        && g39AtWarns == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")}
+        && g39PastWarns2 == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")};
+    gate(39, g39Ok && g39SubOk && g39McOk);
+
     return tally.finish();
 }

@@ -13,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <optional>
 
 namespace fcpx::xml {
 namespace {
@@ -179,6 +180,8 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         e.offset = absoluteTimelineSec;
         return true;
     };
+    Time inheritedTrimSec; // the lead cut from the container whose children are being read
+    std::optional<Time> inheritedFrameEnd; // the end of the innermost container frame being read
     std::function<void()> warnDescendants;
     warnDescendants = [&] {
         while (reader.readNextStartElement()) {
@@ -293,6 +296,8 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 invalid = QStringLiteral("audioDuration");
         }
         Time multicamEnd;
+        bool outsideFrame = false, frameClamped = false, audioOutside = false;
+        std::optional<Time> srcFrameEnd;  // the container end in the mc-clip's source time
         // placeConnected may trim frame.start / frame.duration at the timeline start; the audio range defaults
         // come from the XML values, and appendCut clamps the audio at the timeline start.
         const Time xmlStart = frame.start;
@@ -302,6 +307,27 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             xmlDuration = frame.duration;
             if (connected && invalid.isEmpty() && !placeConnected(frame, *parentOffset, *parentStart, negativeOffset))
                 invalid = QStringLiteral("接続位置");
+            // A connected mc-clip is bounded by the enclosing container's frame like any other descendant.
+            if (connected && invalid.isEmpty() && inheritedFrameEnd) {
+                Time clipEnd, keptSec;
+                Time ahead, srcEnd;
+                if (combine(*inheritedFrameEnd, frame.offset, true, ahead) && combine(frame.start, ahead, false, srcEnd))
+                    srcFrameEnd = srcEnd;
+                if (!lessTime(frame.offset, *inheritedFrameEnd)) outsideFrame = true;
+                else if (combine(frame.offset, frame.duration, false, clipEnd) && lessTime(*inheritedFrameEnd, clipEnd)
+                         && combine(*inheritedFrameEnd, frame.offset, true, keptSec)) {
+                    frame.duration = keptSec;
+                    frameClamped = true;
+                    result.warnings.append(QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: %1 / %2")
+                        .arg(clipName, ref));
+                }
+            }
+        }
+        if (outsideFrame) {
+            result.warnings.append(QStringLiteral("コンテナの範囲外のクリップを読み飛ばしました: %1 / %2").arg(clipName, ref));
+            ++assetClipCount;
+            reader.skipCurrentElement();
+            return;
         }
         Time xmlEnd;
         if (invalid.isEmpty() && !combine(frame.start, frame.duration, false, multicamEnd)) invalid = QStringLiteral("duration");
@@ -311,6 +337,14 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             && !combine(audioRangeStart, audioDuration, false, audioRangeEnd)) invalid = QStringLiteral("audioDuration");
         else if (invalid.isEmpty() && !hasAudioDuration && hasAudioStart
                  && !combine(audioRangeStart, xmlDuration, false, audioRangeEnd)) invalid = QStringLiteral("audioStart");
+        // The separately cut audio is bounded by the container end on its own, also when the video fits.
+        if (srcFrameEnd && invalid.isEmpty() && lessTime(*srcFrameEnd, audioRangeEnd)) {
+            audioRangeEnd = *srcFrameEnd;
+            if (!frameClamped)
+                result.warnings.append(QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: %1 / %2")
+                    .arg(clipName, ref));
+            if (!lessTime(audioRangeStart, *srcFrameEnd)) audioOutside = true;
+        }
         struct Source { QString angleId, enable; };
         QVector<Source> sources;
         ++assetClipCount;
@@ -460,7 +494,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         const int firstVideo = appendCut(videoAngle, false, connected ? parentIndex : -1,
                                          audioAngle != videoAngle || splitAudio,
                                          frame.start, multicamEnd);
-        if (splitAudio)
+        if (splitAudio && !audioOutside)
             appendCut(audioAngle, true, firstVideo, false, audioRangeStart, audioRangeEnd);
         for (auto it = shortByAngle.cbegin(); it != shortByAngle.cend(); ++it)
             result.warnings.append(QStringLiteral("mc-clip %1 のアングル %2 が範囲より %3 秒短いため末尾を空けました")
@@ -495,13 +529,29 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (isContainerTag(tag)) {
             const auto container = reader.attributes();
             Entry frame;
+            frame.name = container.value("name").toString();
+            frame.ref = container.value("ref").toString();
             bool valid = true;
+            // Like any lane child, a connected container's own offset may be signed (before its parent's time zero).
+            QString offsetText = container.value("offset").toString();
+            bool negativeOffset = false;
+            if (parentOffset && offsetText.startsWith(QLatin1Char('-'))) {
+                offsetText.remove(0, 1);
+                negativeOffset = true;
+            }
             if (container.hasAttribute("offset"))
-                valid = time(container.value("offset").toString(), frame.offset);
+                valid = time(offsetText, frame.offset);
+            if (negativeOffset && !frame.offset.n) negativeOffset = false;
             if (container.hasAttribute("start"))
                 valid &= time(container.value("start").toString(), frame.start);
+            const bool hasDuration = container.hasAttribute("duration");
+            if (hasDuration)
+                valid &= time(container.value("duration").toString(), frame.duration);
+            const Time startBeforeTrim = frame.start;
+            Time trimSec;
             if (parentOffset && valid)
-                valid = placeConnected(frame, *parentOffset, *parentStart);
+                valid = placeConnected(frame, *parentOffset, *parentStart, negativeOffset)
+                    && combine(frame.start, startBeforeTrim, true, trimSec);
             if (!valid) {
                 result.warnings.append(QStringLiteral("クリップの値が不正です (接続位置): %1 / %2")
                     .arg(container.value("name").toString(), container.value("ref").toString()));
@@ -509,6 +559,14 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 return;
             }
             QVector<int> directChildren;
+            const Time outerTrimSec = inheritedTrimSec;
+            const std::optional<Time> outerFrameEnd = inheritedFrameEnd;
+            inheritedTrimSec = trimSec;
+            // The container's duration is its frame: the ordinary media clips and connected mc-clips read below are bounded by its end (intersected with an outer frame).
+            Time containerEnd;
+            if (hasDuration && combine(frame.offset, frame.duration, false, containerEnd)
+                && !(outerFrameEnd && lessTime(*outerFrameEnd, containerEnd)))
+                inheritedFrameEnd = containerEnd;
             while (reader.readNextStartElement()) {
                 const QStringView childTag = reader.name();
                 if (isMediaClipTag(childTag)) {
@@ -517,6 +575,8 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                     if (entries.size() > index) directChildren.append(index);
                 } else warnSkip();
             }
+            inheritedTrimSec = outerTrimSec;
+            inheritedFrameEnd = outerFrameEnd;
             if (directChildren.isEmpty()) return;
             // An explicit <audio> child is the clip's audio: the video child gets no copy.
             if (std::any_of(directChildren.cbegin(), directChildren.cend(),
@@ -598,11 +658,20 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 text.remove(0, 1);
                 negativeOffset = true;
             }
+            // An inheriting child takes the container's placed offset below, not its raw (possibly signed) text.
+            if (key == QStringLiteral("offset") && fallback && !explicitOffset) continue;
             if ((hasAttribute(key) || key == QStringLiteral("duration"))
                 && !time(text, *value)) invalid = key;
         }
         if (negativeOffset && !e.offset.n) negativeOffset = false;
-        if (fallback && !explicitOffset) e.offset = *parentOffset;
+        if (fallback && !explicitOffset) {
+            e.offset = *parentOffset;
+            // The container was cut at timeline zero: its inheriting children lose the same lead.
+            if (inheritedTrimSec.n && invalid.isEmpty()
+                && !(combine(e.start, inheritedTrimSec, false, e.start)
+                     && combine(e.duration, inheritedTrimSec, true, e.duration) && e.duration.n))
+                invalid = QStringLiteral("接続位置");
+        }
         if (parentOffset && !(fallback && !explicitOffset) && invalid.isEmpty()) {
             if (!placeConnected(e, *parentOffset, *parentStart, negativeOffset))
                 invalid = QStringLiteral("接続位置");
@@ -612,6 +681,21 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 .arg(invalid, e.name, e.ref));
             warnDescendants();
             return;
+        }
+        if (inheritedFrameEnd) {
+            Time clipEnd, keptSec;
+            if (!lessTime(e.offset, *inheritedFrameEnd)) {
+                result.warnings.append(QStringLiteral("コンテナの範囲外のクリップを読み飛ばしました: %1 / %2")
+                    .arg(e.name, e.ref));
+                reader.skipCurrentElement();
+                return;
+            }
+            if (combine(e.offset, e.duration, false, clipEnd) && lessTime(*inheritedFrameEnd, clipEnd)
+                && combine(*inheritedFrameEnd, e.offset, true, keptSec)) {
+                e.duration = keptSec;
+                result.warnings.append(QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: %1 / %2")
+                    .arg(e.name, e.ref));
+            }
         }
         const int entryIndex = entries.size();
         if (parentIndex < 0 && depth == 0)
@@ -770,6 +854,19 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (e.parentIndex >= 0) hasConnectedChildren[e.parentIndex] = true;
     // A container may list its audio child before the video chosen as primary.
     // Validate the parent chain before emitting clips in XML order.
+    // The one time-range predicate: checkEntry, the transition trim and importLanes all use it, so the
+    // trim neither moves a clip that is dropped there nor validates a clip that was invalid.
+    auto rangeValid = [&](const Entry &e, Time &offset, Time &start, Time &out, Time &nextEnd) {
+        const Asset asset = assets.value(e.ref);
+        return e.duration.n && combine(e.offset, origin, true, offset)
+            && combine(e.start, asset.start, true, start)
+            && combine(start, e.duration, false, out)
+            && combine(offset, e.duration, false, nextEnd);
+    };
+    auto warnInvalidRange = [&](int lane, const Entry &e) {
+        result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
+            .arg(lane).arg(e.name, e.ref));
+    };
     enum Rejection { Valid, InvalidParent, MissingAsset, InvalidRange };
     QVector<int> rejection(entries.size(), -1);
     std::function<int(int)> checkEntry = [&](int i) -> int {
@@ -781,11 +878,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (!assets.contains(e.ref) || e.refClip != nest.built.contains(e.ref)) return rejection[i] = MissingAsset;
         if (hasConnectedChildren[i]) {
             Time timelineOffset, sourceStart, sourceEnd, timelineEnd;
-            const Asset asset = assets.value(e.ref);
-            if (!e.duration.n || !combine(e.offset, origin, true, timelineOffset)
-                || !combine(e.start, asset.start, true, sourceStart)
-                || !combine(sourceStart, e.duration, false, sourceEnd)
-                || !combine(timelineOffset, e.duration, false, timelineEnd))
+            if (!rangeValid(e, timelineOffset, sourceStart, sourceEnd, timelineEnd))
                 return rejection[i] = InvalidRange;
         }
         return rejection[i] = Valid;
@@ -797,15 +890,6 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     // Placement may still put them on different tracks (the overlap with an earlier
     // clip promotes one of them); such a pair loses its transition, so its trim is
     // restored to the untrimmed entries and the import is rebuilt without it.
-    // Same time-range predicate importLanes applies; the trim must not move a clip
-    // that is dropped there, nor let the trim validate a clip that was invalid.
-    auto rangeValid = [&](const Entry &e, Time &offset, Time &start, Time &out, Time &nextEnd) {
-        const Asset asset = assets.value(e.ref);
-        return e.duration.n && combine(e.offset, origin, true, offset)
-            && combine(e.start, asset.start, true, start)
-            && combine(start, e.duration, false, out)
-            && combine(offset, e.duration, false, nextEnd);
-    };
     const auto untrimmed = entries;
     QSet<int> rejectedTrims;
     QSet<QString> found, missing, v1Uids;
@@ -863,8 +947,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             result.warnings.append(QStringLiteral("未定義の素材参照を読み飛ばしました: %1").arg(e.ref));
             continue;
         case InvalidRange:
-            result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
-                .arg(e.lane).arg(e.name, e.ref));
+            warnInvalidRange(e.lane, e);
             continue;
         default:
             break;
@@ -920,8 +1003,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 const auto asset = assets.value(e.ref);
                 Time offset, gap, start, out, nextEnd;
                 if (!rangeValid(e, offset, start, out, nextEnd)) {
-                    result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
-                        .arg(lane).arg(e.name, e.ref));
+                    warnInvalidRange(lane, e);
                     continue;
                 }
                 int trackIndex = 0;
@@ -932,8 +1014,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                     laneEnds.append(Time{});
                 }
                 if (!combine(offset, laneEnds[trackIndex], true, gap)) {
-                    result.warnings.append(QStringLiteral("lane %1 の時刻範囲が不正なクリップを読み飛ばしました: %2 / %3")
-                        .arg(lane).arg(e.name, e.ref));
+                    warnInvalidRange(lane, e);
                     continue;
                 }
                 QString path;
