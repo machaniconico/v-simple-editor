@@ -39,6 +39,11 @@
 #include <cstdio>
 #include <functional>
 #include <utility>
+extern "C" {
+#include <libavutil/channel_layout.h>
+#include <libavutil/frame.h>
+#include <libavutil/samplefmt.h>
+}
 
 // connected-clip (US-1201): primary-storyline connections (ClipInfo::anchorUid /
 // anchorOffsetSec) reconciled inside Timeline::saveUndoState.
@@ -107,8 +112,20 @@
 //   G25: negative controls: a V1 clip and a V2 clip with no V1 clip under or before it
 //        are rejected with the reason in the status bar and nothing changes.
 //   G26: with setStorylineMode(true) a media file dropped on V2 / A2 and a clip dropped
-//        from V3 onto V2 connect to the V1 clip under the drop; with the mode off, or on
-//        V1, the media drop is refused and the clip drop leaves no connection.
+//        from V3 onto V2 connect to the V1 clip under the drop; with the mode off the media
+//        drop is refused (also on V1) and the clip drop leaves no connection. US-1304: with
+//        the mode on a media drop in the middle of a V1 clip snaps to the next boundary and
+//        pushes the clips after it (it was refused before).
+// US-1304 (media drop on V1 in storyline mode):
+//   G29: a drop with audio on the V1 boundary of [X|Y] gives three V1 clips; Y, the V2 clip
+//        connected to Y and Y's linked audio move by the new length, the unlinked A1 BGM does
+//        not, the new audio is on a free audio track at the new V1 clip's start with no
+//        overlap, one undo restores everything, and a selected Y stays selected. A variant
+//        with a one-frame gap in front of the drop point closes the gap and keeps the new
+//        audio on the new V1 clip's start.
+//   G30: a drop on a locked V1 is refused with the lock text and changes nothing; with every
+//        audio track locked, or full at the landing time, it is refused with the free-track
+//        text and V1 is unchanged.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -410,6 +427,46 @@ bool writeVideoFile(const QString &path, int frames)
         if (!encoder.pushFrame(frame, i)) return false;
     }
     return !encoder.finalize();
+}
+
+// 40x24 10 fps mpeg4 clip of `frames` frames with a silent AAC track of the same length.
+bool writeVideoWithAudioFile(const QString &path, int frames)
+{
+    libavcore::EncodeRequest req;
+    req.width = 40;
+    req.height = 24;
+    req.fps = 10;
+    req.fpsNum = 10;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    req.audioEncode = true;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req)) return false;
+    for (int i = 0; i < frames; ++i) {
+        QImage frame(40, 24, QImage::Format_RGB888);
+        frame.fill(QColor((i * 23) & 255, 90, 160));
+        if (!encoder.pushFrame(frame, i)) return false;
+    }
+    AVFrame *audio = av_frame_alloc();
+    if (!audio) return false;
+    audio->format = AV_SAMPLE_FMT_FLTP;
+    audio->sample_rate = 48000;
+    audio->nb_samples = 1024;
+    av_channel_layout_default(&audio->ch_layout, 2);
+    bool ok = av_frame_get_buffer(audio, 0) >= 0;
+    for (int i = 0; ok && i < frames * 4800; i += 1024) {
+        ok = av_frame_make_writable(audio) >= 0;
+        if (ok) {
+            av_samples_set_silence(audio->extended_data, 0, 1024, 2, AV_SAMPLE_FMT_FLTP);
+            ok = encoder.pushAudioFrame(audio, i);
+        }
+    }
+    av_frame_free(&audio);
+    return ok && !encoder.finalize();
 }
 
 void selectOnly(Timeline &timeline, bool audio, int track, int index)
@@ -2348,17 +2405,25 @@ int runConnectedClipSelftest()
             on.setStorylineMode(true);
             const bool v2Accepted = sendMediaDrop(on.trackAt(false, 1), videoPath, 7.0);
             const bool a2Accepted = sendMediaDrop(on.trackAt(true, 1), wavPath, 6.0);
-            const bool v1Accepted = sendMediaDrop(on.trackAt(false, 0), videoPath, 20.0);
             const Located v2Clip = locateByName(on, false, videoName);
             const Located a2Clip = locateByName(on, true, wavName);
             const bool clipAccepted = sendClipDropOnTrack(on.trackAt(false, 2), 0, on.trackAt(false, 1), 12.0);
             const Located movedOn = locateByName(on, false, QStringLiteral("y"));
-            const bool onOk = v2Accepted && a2Accepted && !v1Accepted && v2Clip.found && v2Clip.track == 1
+            // US-1304: a drop in the middle of V1's first clip (t=3 in a [0,5)) snaps to the
+            // boundary at 5 and pushes b by the new clip's length.
+            const int v1CountBefore = on.trackAt(false, 0)->clipCount();
+            const bool v1Accepted = sendMediaDrop(on.trackAt(false, 0), videoPath, 3.0);
+            const Located v1Clip = locateByName(on, false, videoName);
+            const Located bPushed = locateByName(on, false, QStringLiteral("b"));
+            const bool v1Ok = v1CountBefore == 2 && v1Accepted && v1Clip.found && v1Clip.track == 0
+                && v1Clip.clip.effectiveDuration() > 0.5 && near(v1Clip.startSec, 5.0)
+                && on.trackAt(false, 0)->clipCount() == 3 && bPushed.found && bPushed.track == 0
+                && near(bPushed.startSec, 5.0 + v1Clip.clip.effectiveDuration());
+            const bool onOk = v2Accepted && a2Accepted && v1Ok && v2Clip.found && v2Clip.track == 1
                 && near(v2Clip.startSec, 7.0) && v2Clip.clip.anchorUid == bUid
                 && near(v2Clip.clip.anchorOffsetSec, 2.0) && a2Clip.found && a2Clip.track == 1
                 && near(a2Clip.startSec, 6.0) && a2Clip.clip.anchorUid == bUid
-                && near(a2Clip.clip.anchorOffsetSec, 1.0) && on.trackAt(false, 0)->clipCount() == 2
-                && clipAccepted && movedOn.found && movedOn.track == 1 && near(movedOn.startSec, 12.0)
+                && near(a2Clip.clip.anchorOffsetSec, 1.0) && clipAccepted && movedOn.found && movedOn.track == 1 && near(movedOn.startSec, 12.0)
                 && movedOn.clip.anchorUid == bUid && near(movedOn.clip.anchorOffsetSec, 7.0);
             // Mode OFF: the media drop is refused (MainWindow handles it as before), the clip
             // drop moves but connects nothing.
@@ -2370,8 +2435,10 @@ int runConnectedClipSelftest()
             const bool offV2Accepted = sendMediaDrop(off.trackAt(false, 1), videoPath, 7.0);
             const bool offA2Accepted = sendMediaDrop(off.trackAt(true, 1), wavPath, 6.0);
             const bool offClipAccepted = sendClipDropOnTrack(off.trackAt(false, 2), 0, off.trackAt(false, 1), 12.0);
+            const bool offV1Accepted = sendMediaDrop(off.trackAt(false, 0), videoPath, 3.0);
             const Located movedOff = locateByName(off, false, QStringLiteral("y"));
-            const bool offOk = !offV2Accepted && !offA2Accepted
+            const bool offOk = !offV2Accepted && !offA2Accepted && !offV1Accepted
+                && off.trackAt(false, 0)->clipCount() == 2
                 && off.trackAt(false, 1)->clipCount() == v2Before + 1 && off.trackAt(true, 1)->clipCount() == a2Before
                 && offClipAccepted && movedOff.found && movedOff.track == 1 && near(movedOff.startSec, 12.0)
                 && movedOff.clip.anchorUid.isEmpty();
@@ -2464,17 +2531,20 @@ int runConnectedClipSelftest()
                          unlockedAudioAccepted, unlockedA2, lockOk, static_cast<unsigned long long>(paintBase),
                          static_cast<unsigned long long>(paintAfterFirst),
                          static_cast<unsigned long long>(paintAfterSecond), paintOk, subOk);
-            std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/0) v2[%s] "
-                         "a2[%s] clipDrop=%d y[%s] ok=%d | OFF: v2Drop=%d a2Drop=%d (expect 0/0) V2 clips "
+            std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/1) v2[%s] "
+                         "a2[%s] clipDrop=%d y[%s] v1New[%s] bPushed[%s] v1Ok=%d ok=%d | OFF: v2Drop=%d a2Drop=%d "
+                         "v1Drop=%d (expect 0/0/0) V2 clips "
                          "%d -> %d (expect +1 from the clip drop only) A2 clips %d -> %d clipDrop=%d y[%s] "
                          "ok=%d\n", v2Accepted, a2Accepted, v1Accepted, qPrintable(describe(v2Clip, bUid)),
                          qPrintable(describe(a2Clip, bUid)), clipAccepted, qPrintable(describe(movedOn, bUid)),
-                         onOk, offV2Accepted, offA2Accepted, v2Before, off.trackAt(false, 1)->clipCount(),
+                         qPrintable(describe(v1Clip, bUid)), qPrintable(describe(bPushed, bUid)), v1Ok, onOk,
+                         offV2Accepted, offA2Accepted, offV1Accepted, v2Before, off.trackAt(false, 1)->clipCount(),
                          a2Before, off.trackAt(true, 1)->clipCount(), offClipAccepted,
                          qPrintable(describe(movedOff, bUid)), offOk);
             tally.gate(26, onOk && offOk && subOk,
-                       "a storyline-mode drop did not connect to the V1 clip under it, or the mode-off "
-                       "media drop was taken / the mode-off clip drop connected / a multi-file or project drop was "
+                       "a storyline-mode drop did not connect to the V1 clip under it, or a V1 media drop did not "
+                       "snap to the boundary and push the next clip, or the mode-off "
+                       "media drop (on V2 / A2 / V1) was taken / the mode-off clip drop connected / a multi-file or project drop was "
                        "taken, a gap drop connected, or a drop landed audio on a locked partner track / a video-only drop was refused by it, or a held V1 move drag kept repainting");
         }
     }
@@ -2628,6 +2698,313 @@ int runConnectedClipSelftest()
         tally.gate(28, answered == 1 && unexpected == 0 && parentOk && nestedOk && noModal,
                    "the real pre-compose action did not take the name from its input dialog, moved / "
                    "detached the connection after the range, did not name the nested sequence, or left a modal open");
+    }
+
+    // G29 / G30 (US-1304): a media drop on V1 with storyline mode on is a storyline insert at the
+    // drop point (real TimelineTrack::dropEvent for G29; Timeline::dropMediaOnTrack for the texts of G30).
+    {
+        QTemporaryDir dir;
+        const QString avPath = dir.filePath(QStringLiteral("g29.mp4"));
+        QString whyNot;
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(29, qPrintable(whyNot));
+            tally.skip(30, qPrintable(whyNot));
+        } else if (!dir.isValid() || !writeVideoWithAudioFile(avPath, 20)) {
+            std::fprintf(stderr, "connected-clip G29 fixture media could not be written\n");
+            tally.gate(29, false, "the G29 fixture media could not be written");
+            tally.gate(30, false, "the G30 fixture media could not be written");
+        } else {
+            const QString avName = QFileInfo(avPath).fileName();
+            auto linked = [](ClipInfo c, int group) {
+                c.linkGroup = group;
+                return c;
+            };
+            // Start of the first clip named `name` on a track, -1 when absent.
+            auto startOn = [](const Timeline &tl, bool audio, int track, const QString &name) {
+                double cursor = 0.0;
+                for (const ClipInfo &clip : tl.trackAt(audio, track)->clips()) {
+                    cursor += clip.leadInSec;
+                    if (clip.displayName == name) return cursor;
+                    cursor += clip.effectiveDuration();
+                }
+                return -1.0;
+            };
+            auto layout = [](const Timeline &tl, bool audio, int track) {
+                QStringList parts;
+                double cursor = 0.0;
+                for (const ClipInfo &clip : tl.trackAt(audio, track)->clips()) {
+                    cursor += clip.leadInSec;
+                    parts << QStringLiteral("%1@%2").arg(clip.displayName).arg(cursor, 0, 'f', 4);
+                    cursor += clip.effectiveDuration();
+                }
+                return QStringLiteral("[") + parts.join(QLatin1Char(' ')) + QLatin1Char(']');
+            };
+            auto baseline = [](Timeline &tl) {
+                tl.setStorylineMode(true);
+                tl.undoManager()->clear();
+                tl.saveUndoState(QStringLiteral("baseline"));
+                tl.takeConnectionWarnings();
+            };
+
+            // G29 main: V1 [X 0-5 | Y 5-15], V2 clip c connected to Y at 7, A1 unlinked BGM 0-30,
+            // A2 the linked audio of X / Y, A3 free. Y is selected, then a drop at t=5 (the X|Y boundary).
+            Timeline tl;
+            load(tl, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)}, {clipFor("c", 2.0, 7.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 1));
+            baseline(tl);
+            const QString yUid = uidAt(tl, 0, 1);
+            tl.trackAt(false, 0)->setSelectedClip(1);
+            // A click on Y: sets the timeline's active video row the way the GUI does.
+            emit tl.trackAt(false, 0)->selectionChanged(1, false);
+            const auto serialBefore = tl.undoManager()->saveSerial();
+            int lastTrack = -2;
+            int lastClip = -2;
+            QObject::connect(&tl, &Timeline::clipSelectedOnTrack, &tl, [&](int trackIdx, int clipIdx) {
+                lastTrack = trackIdx;
+                lastClip = clipIdx;
+            });
+            const bool accepted = sendMediaDrop(tl.trackAt(false, 0), avPath, 5.0);
+            bool mainMismatch = false;
+            for (const QString &w : tl.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("landing mismatch"))) mainMismatch = true;
+            const Located fresh = locateByName(tl, false, avName);
+            const Located freshAudio = locateByName(tl, true, avName);
+            const double len = fresh.clip.effectiveDuration();
+            const bool serialOk = tl.undoManager()->saveSerial() == serialBefore + 1;
+            const TimelineTrack *v1 = tl.trackAt(false, 0);
+            const int selectedAfterDrop = v1->selectedClip();
+            const bool mainOk = accepted && v1->clipCount() == 3 && fresh.found && fresh.track == 0 && fresh.index == 1
+                && len > 0.5 && near(fresh.startSec, 5.0)
+                && near(startOn(tl, false, 0, QStringLiteral("y")), 5.0 + len)
+                && near(startOn(tl, false, 1, QStringLiteral("c")), 7.0 + len)
+                && near(startOn(tl, true, 1, QStringLiteral("ya")), 5.0 + len)
+                && near(startOn(tl, true, 1, QStringLiteral("xa")), 0.0)
+                && near(startOn(tl, true, 0, QStringLiteral("bgm")), 0.0) && tl.trackAt(true, 0)->clipCount() == 1
+                && freshAudio.found && freshAudio.track == 2 && near(freshAudio.startSec, fresh.startSec)
+                && v1->clips().value(2).uid == yUid && selectedAfterDrop == 2 && serialOk
+                && !mainMismatch && lastTrack == 0 && lastClip == 2;
+            const int sigTrack = lastTrack;
+            const int sigClip = lastClip;
+            const QString mainV1 = layout(tl, false, 0);
+            const QString mainV2 = layout(tl, false, 1);
+            const QString mainA1 = layout(tl, true, 0);
+            const QString mainA2 = layout(tl, true, 1);
+            const QString mainA3 = layout(tl, true, 2);
+            tl.undo();
+            const bool undoOk = v1->clipCount() == 2 && near(startOn(tl, false, 0, QStringLiteral("y")), 5.0)
+                && near(startOn(tl, false, 1, QStringLiteral("c")), 7.0)
+                && near(startOn(tl, true, 1, QStringLiteral("ya")), 5.0) && tl.trackAt(true, 2)->clipCount() == 0
+                && tl.trackAt(true, 0)->clipCount() == 1;
+
+            // G29 sub-check (US-1304 fix round 3): the same fixture through insertClip3PointActive, a
+            // non-import insertClipPreservingDownstream-style caller. Y keeps its selection (shifted),
+            // the last clipSelectedOnTrack names V1 and Y (not -1,-1, which would clear the edit target).
+            Timeline ins;
+            load(ins, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)}, {clipFor("c", 2.0, 7.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            ins.connectClip(TrackKind::Video, 1, 0, uidAt(ins, 0, 1));
+            baseline(ins);
+            const QString insYUid = uidAt(ins, 0, 1);
+            ins.trackAt(false, 0)->setSelectedClip(1);
+            emit ins.trackAt(false, 0)->selectionChanged(1, false);
+            int insTrack = -2;
+            int insClip = -2;
+            QObject::connect(&ins, &Timeline::clipSelectedOnTrack, &ins, [&](int trackIdx, int clipIdx) {
+                insTrack = trackIdx;
+                insClip = clipIdx;
+            });
+            ins.insertClip3PointActive(5.0, clipFor("n", 3.0));
+            const TimelineTrack *insV1 = ins.trackAt(false, 0);
+            int insYIndex = -1;
+            for (int i = 0; i < insV1->clipCount(); ++i)
+                if (insV1->clips().at(i).uid == insYUid) insYIndex = i;
+            const bool insOk = insYIndex >= 0 && insV1->selectedClip() == insYIndex
+                && insTrack == 0 && insClip == insYIndex;
+            std::fprintf(stderr, "connected-clip G29 insertClip3PointActive: yIndex=%d selected=%d lastTrack=%d (expect 0) "
+                         "lastClip=%d (expect yIndex) insOk=%d\n",
+                         insYIndex, insV1->selectedClip(), insTrack, insClip, insOk);
+
+            // G29 sub-check (US-1304 fix round 4): the selected connected clip C on V2 is pushed past the
+            // unconnected D by a V1 insert before Y. Reconcile moves C (removal + re-insert); its
+            // selection must follow by uid and be reported as (V2, C's new index), never stale (V2, 0)
+            // which now points at D.
+            // Own call frame: one more Timeline local in this long function overflows the stack in
+            // MainWindow's constructor further down.
+            const bool mvOk = [&]() {
+            Timeline mv;
+            load(mv, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)},
+                      {clipFor("c", 2.0, 7.0), clipFor("d", 2.0, 3.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            mv.connectClip(TrackKind::Video, 1, 0, uidAt(mv, 0, 1));
+            baseline(mv);
+            const QString mvCUid = uidAt(mv, 1, 0);
+            mv.trackAt(false, 1)->setSelectedClip(0);
+            emit mv.trackAt(false, 1)->selectionChanged(0, false);
+            int mvTrack = -2;
+            int mvClip = -2;
+            QObject::connect(&mv, &Timeline::clipSelectedOnTrack, &mv, [&](int trackIdx, int clipIdx) {
+                mvTrack = trackIdx;
+                mvClip = clipIdx;
+            });
+            mv.insertClip3PointActive(5.0, clipFor("n", 20.0));
+            const TimelineTrack *mvV2 = mv.trackAt(false, 1);
+            int mvCIndex = -1;
+            for (int i = 0; i < mvV2->clipCount(); ++i)
+                if (mvV2->clips().at(i).uid == mvCUid) mvCIndex = i;
+            const bool mvExplicitDeselect = mvTrack == -1 && mvClip == -1;
+            const bool ok = mvCIndex == 1 && mvV2->selectedClip() == mvCIndex
+                && ((mvTrack == 1 && mvClip == mvCIndex) || mvExplicitDeselect)
+                && !(mvTrack == 1 && mvClip == 0);
+            std::fprintf(stderr, "connected-clip G29 moved-selection: V2 %s cIndex=%d (expect 1) selected=%d "
+                         "lastTrack=%d lastClip=%d (expect 1,cIndex; stale 1,0 points at d) mvOk=%d\n",
+                         qPrintable(layout(mv, false, 1)), mvCIndex, mvV2->selectedClip(), mvTrack, mvClip, ok);
+            return ok;
+            }();
+
+            // G29 sub-check (US-1304 fix round 5): the same push, but C's linked audio partner Ca finds
+            // no slot (an unlinked BGM covers its target on every audio track), so the pass that moved
+            // C past D is rolled back and the group detached where it stands. C (index 0, D at 1) must
+            // stay selected and be the last one announced; the rolled-back pass had it at index 1, which
+            // on the restored V2 [C|D] names D.
+            const bool rbOk = [&]() {
+            Timeline rb;
+            load(rb, {{clipFor("x", 5.0), clipFor("y", 10.0)},
+                      {linked(clipFor("c", 2.0, 7.0), 81), clipFor("d", 2.0, 3.0)}},
+                 {{linked(clipFor("ca", 2.0, 7.0), 81), clipFor("bgm1", 30.0)}, {clipFor("bgm2", 40.0)}});
+            rb.connectClip(TrackKind::Video, 1, 0, uidAt(rb, 0, 1));
+            baseline(rb);
+            const QString rbCUid = uidAt(rb, 1, 0);
+            const QString rbDUid = uidAt(rb, 1, 1);
+            rb.trackAt(false, 1)->setSelectedClip(0);
+            emit rb.trackAt(false, 1)->selectionChanged(0, false);
+            int rbTrack = -2;
+            int rbClip = -2;
+            int rbClipSelected = -2;
+            QObject::connect(&rb, &Timeline::clipSelectedOnTrack, &rb, [&](int trackIdx, int clipIdx) {
+                rbTrack = trackIdx;
+                rbClip = clipIdx;
+            });
+            QObject::connect(&rb, &Timeline::clipSelected, &rb, [&](int clipIdx) { rbClipSelected = clipIdx; });
+            rb.insertClip3PointActive(5.0, clipFor("n", 20.0));
+            bool detachWarned = false;
+            for (const QString &w : rb.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("退避先のトラックがありません"))) detachWarned = true;
+            const TimelineTrack *rbV2 = rb.trackAt(false, 1);
+            int rbCIndex = -1;
+            for (int i = 0; i < rbV2->clipCount(); ++i)
+                if (rbV2->clips().at(i).uid == rbCUid) rbCIndex = i;
+            const QString selectedUid = rbV2->selectedClip() >= 0
+                ? rbV2->clips().value(rbV2->selectedClip()).uid : QString();
+            const bool ok = detachWarned && rbCIndex == 0 && rbV2->clips().value(1).uid == rbDUid
+                && rbV2->clips().at(0).anchorUid.isEmpty() && selectedUid == rbCUid
+                && rbTrack == 1 && rbClip == rbCIndex && rbClipSelected == rbCIndex
+                && rb.activeVideoTrackIndex() == 1;
+            std::fprintf(stderr, "connected-clip G29 rollback-selection: V2 %s A1 %s A2 %s detachWarned=%d cIndex=%d "
+                         "(expect 0) selected=%d selectedIsC=%d selectedIsD=%d lastTrack=%d lastClip=%d "
+                         "lastClipSelected=%d (expect 1,0,0) activeTrack=%d (expect 1) rbOk=%d\n",
+                         qPrintable(layout(rb, false, 1)), qPrintable(layout(rb, true, 0)),
+                         qPrintable(layout(rb, true, 1)), detachWarned, rbCIndex, rbV2->selectedClip(),
+                         int(selectedUid == rbCUid), int(selectedUid == rbDUid), rbTrack, rbClip,
+                         rbClipSelected, rb.activeVideoTrackIndex(), ok);
+            return ok;
+            }();
+
+            // G29 variant (C7): a one-frame gap in front of the drop point. V1 [x 0-5 | gap | y | z],
+            // drop at t=14 (inside y): the landing is after y at 15 once the gap is closed, not at
+            // the stale start of z (15 + gap). The new audio must start on the new V1 clip.
+            const double gap = 1.0 / 30.0;
+            Timeline gp;
+            load(gp, {{linked(clipFor("x", 5.0), 71), linked(clipFor("y", 10.0, gap), 72), linked(clipFor("z", 5.0), 73)}},
+                 {{linked(clipFor("xa", 5.0), 71), linked(clipFor("ya", 10.0, gap), 72), linked(clipFor("za", 5.0), 73)}, {}});
+            baseline(gp);
+            const bool gapAccepted = sendMediaDrop(gp.trackAt(false, 0), avPath, 14.0);
+            const Located gapFresh = locateByName(gp, false, avName);
+            const Located gapAudio = locateByName(gp, true, avName);
+            const double gapLen = gapFresh.clip.effectiveDuration();
+            bool gapMismatch = false;
+            for (const QString &w : gp.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("landing mismatch"))) gapMismatch = true;
+            const bool gapOk = gapAccepted && !gapMismatch && gp.trackAt(false, 0)->clipCount() == 4 && gapFresh.found
+                && gapFresh.index == 2 && near(gapFresh.startSec, 15.0) && gapAudio.found
+                && near(gapAudio.startSec, gapFresh.startSec)
+                && near(startOn(gp, false, 0, QStringLiteral("y")), 5.0)
+                && near(startOn(gp, false, 0, QStringLiteral("z")), 15.0 + gapLen)
+                && near(startOn(gp, true, 0, QStringLiteral("ya")), 5.0)
+                && near(startOn(gp, true, 0, QStringLiteral("za")), 15.0 + gapLen);
+            std::fprintf(stderr, "connected-clip G29 main: accepted=%d len=%.4f serial+1=%d V1 %s V2 %s A1 %s A2 %s A3 %s "
+                         "selected=%d (expect 2) selectionSignal=%d,%d (expect 0,2) mismatch=%d mainOk=%d undoOk=%d | gap variant: accepted=%d len=%.4f V1 %s A1 %s A2 %s "
+                         "(expect new clip and its audio both @15.0000, z/za @15+len) gapMismatch=%d gapOk=%d\n",
+                         accepted, len, serialOk, qPrintable(mainV1), qPrintable(mainV2),
+                         qPrintable(mainA1), qPrintable(mainA2), qPrintable(mainA3),
+                         selectedAfterDrop, sigTrack, sigClip, mainMismatch, mainOk, undoOk, gapAccepted, gapLen, qPrintable(layout(gp, false, 0)),
+                         qPrintable(layout(gp, true, 0)), qPrintable(layout(gp, true, 1)), gapMismatch, gapOk);
+            tally.gate(29, mainOk && undoOk && gapOk && insOk && mvOk && rbOk,
+                       "a V1 media drop in storyline mode did not insert at the boundary with Y, its connection and "
+                       "its linked audio pushed and the BGM fixed, put the new audio off the new V1 clip's start / "
+                       "on top of other audio, took more or fewer than one undo point, lost the selection of Y, left a moved selected connected clip's selection stale or unreported (also after a rolled-back placement pass), or "
+                       "(gap variant) placed the audio from the pre-insert start instead of the closed-gap landing");
+
+            // G30: a locked V1, all audio tracks locked, and an audio track full at the landing time.
+            auto fixture = [&](Timeline &t, bool oneAudioTrackFull) {
+                load(t, {{clipFor("x", 5.0), clipFor("y", 10.0)}},
+                     oneAudioTrackFull ? QVector<QVector<ClipInfo>>{{clipFor("bgm", 30.0)}}
+                                       : QVector<QVector<ClipInfo>>{{clipFor("bgm", 3.0)}, {}});
+                baseline(t);
+            };
+            auto snapshot = [&](const Timeline &t) {
+                return layout(t, false, 0) + layout(t, true, 0) + (t.audioTracks().size() > 1 ? layout(t, true, 1) : QString())
+                    + QString::number(t.videoTracks().size()) + QString::number(t.audioTracks().size());
+            };
+            const QString lockText = QStringLiteral("ロック中のトラックには配置できません");
+            const QString slotText = QStringLiteral("音声を置ける空きトラックがありません");
+            Timeline lockedV1;
+            fixture(lockedV1, false);
+            lockedV1.trackAt(false, 0)->setLocked(true);
+            const QString lockedBefore = snapshot(lockedV1);
+            const auto lockedSerial = lockedV1.undoManager()->saveSerial();
+            QString lockedErr;
+            const bool lockedDrop = lockedV1.dropMediaOnTrack(lockedV1.trackAt(false, 0), avPath, 3.0, &lockedErr);
+            const bool lockedGui = sendMediaDrop(lockedV1.trackAt(false, 0), avPath, 3.0);
+            const bool lockedOk = !lockedDrop && !lockedGui && lockedErr == lockText
+                && snapshot(lockedV1) == lockedBefore && lockedV1.undoManager()->saveSerial() == lockedSerial;
+            Timeline audioLocked;
+            fixture(audioLocked, false);
+            for (TimelineTrack *a : audioLocked.audioTracks()) a->setLocked(true);
+            const QString audioLockedBefore = snapshot(audioLocked);
+            const auto audioLockedSerial = audioLocked.undoManager()->saveSerial();
+            QString audioLockedErr;
+            const bool audioLockedDrop = audioLocked.dropMediaOnTrack(audioLocked.trackAt(false, 0), avPath, 3.0, &audioLockedErr);
+            const bool audioLockedOk = !audioLockedDrop && audioLockedErr == slotText
+                && snapshot(audioLocked) == audioLockedBefore
+                && audioLocked.undoManager()->saveSerial() == audioLockedSerial;
+            Timeline audioFull;
+            fixture(audioFull, true);
+            const QString audioFullBefore = snapshot(audioFull);
+            const auto audioFullSerial = audioFull.undoManager()->saveSerial();
+            QString audioFullErr;
+            const bool audioFullDrop = audioFull.dropMediaOnTrack(audioFull.trackAt(false, 0), avPath, 3.0, &audioFullErr);
+            const bool audioFullOk = !audioFullDrop && audioFullErr == slotText
+                && snapshot(audioFull) == audioFullBefore && audioFull.undoManager()->saveSerial() == audioFullSerial;
+            // Control: the same fixture with one free unlocked audio track accepts the drop.
+            Timeline control;
+            fixture(control, false);
+            QString controlErr;
+            const bool controlDrop = control.dropMediaOnTrack(control.trackAt(false, 0), avPath, 3.0, &controlErr);
+            const bool controlOk = controlDrop && control.trackAt(false, 0)->clipCount() == 3;
+            std::fprintf(stderr, "connected-clip G30 lockedV1: drop=%d gui=%d err='%s' unchanged=%d ok=%d | audioLocked: drop=%d "
+                         "err='%s' unchanged=%d ok=%d | audioFull: drop=%d err='%s' unchanged=%d ok=%d | control (free track): "
+                         "drop=%d V1=%d err='%s' ok=%d (expect refusals with the lock text / the free-track text, control 1)\n",
+                         lockedDrop, lockedGui, qPrintable(lockedErr), snapshot(lockedV1) == lockedBefore, lockedOk,
+                         audioLockedDrop, qPrintable(audioLockedErr), snapshot(audioLocked) == audioLockedBefore,
+                         audioLockedOk, audioFullDrop, qPrintable(audioFullErr), snapshot(audioFull) == audioFullBefore,
+                         audioFullOk, controlDrop, control.trackAt(false, 0)->clipCount(), qPrintable(controlErr),
+                         controlOk);
+            tally.gate(30, lockedOk && audioLockedOk && audioFullOk && controlOk,
+                       "a V1 drop was taken on a locked V1 or refused with another text / changed state, or a drop with "
+                       "every audio track locked or full at the landing time changed V1 / used another text, or the "
+                       "free-track control was refused");
+        }
     }
 
     return tally.finish("connected-clip");

@@ -666,6 +666,9 @@ public:
 signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
+    // Selected indices moved because a clip was inserted in front of them (the
+    // selection stays on the same clips); no linked selection sync follows.
+    void selectionShifted(int primaryIndex);
     void emptyAreaClicked();
     void marqueeDragged(QPoint startGlobal, QPoint endGlobal, bool additive, bool finished);
     void clipMoved(int fromIndex, int toIndex);
@@ -985,8 +988,11 @@ public:
     // US-1202 media drop entry: TimelineTrack::dropEvent hands a text/uri-list
     // drop on a V2+ / A track here while storylineMode() is on. Imports the file
     // at dropTimeSec on that track, connected to the V1 clip under the drop
-    // (V1 tracks, locked tracks and mode-off drops are refused with *err; a drop
-    // with no V1 clip under it is imported unconnected).
+    // (a V1 drop is a storyline insert at the drop point with its audio placed via
+    // storylineAudioSlot; locked tracks are refused with 「ロック中のトラックには配置できません」,
+    // no free audio track with 「音声を置ける空きトラックがありません」, and mode-off
+    // drops are refused, all with *err; a drop with no V1 clip under it is imported
+    // unconnected).
     bool dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
                           double dropTimeSec, QString *err = nullptr);
     // Connect a clip a cross-track drop just placed (storyline mode, V2+ / A);
