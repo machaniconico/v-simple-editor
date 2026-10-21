@@ -5,6 +5,8 @@
 #include "../ProjectFile.h"
 #include "../TrimOps.h"
 #include "../MainWindow.h"
+#include "../RotoClipEntry.h"
+#include "../TrackMatteKey.h"
 #include <QJsonArray>
 #include <memory>
 
@@ -1989,6 +1991,283 @@ int runTrackOpsSelftest()
                          storyLayout(t.trackAt(true, 0)).c_str(), linkedOk);
         }
         gate(27, activeOk && linkedOk);
+    }
+    // US-1313 G28: a cross-track drop moves every member of a link group. (a) V2+A2+A3
+    // (A2 / A3 start at 5) dropped V2 -> V3: A2 -> A3, A3 -> A4 (created), both still
+    // at 5, one link group, one undo point. HEAD: only A2 moves and lands after A3's
+    // clip (appended at the end). (b) V1+A1 dropped V1 -> V2: A1 -> A2 (as HEAD).
+    // (c) V2+V3+A2 with roto / matte / parent on V2 and V3, A2 dropped on A3 so V2 -> V3
+    // and V3 -> V4: each carrier follows its own clip and one undo puts the keys back.
+    // HEAD: V3's member stays; a per-member remapCarriersAfterCrossTrackMove after
+    // all members left their tracks maps both entries onto one key.
+    {
+        auto linkGroupOf = [](const TimelineTrack *track, const QString &name) {
+            const ClipInfo *c = track ? storyFind(track, name) : nullptr;
+            return c ? c->linkGroup : -1;
+        };
+        bool aOk = false, bOk = false, cOk = false;
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{}, {storyClip("V", 4.0, 1, 5.0)}, {}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("A2", 4.0, 1, 5.0)}, {storyClip("A3", 4.0, 1, 5.0)}},
+                0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+            const int audioCount = t.audioTrackCount();
+            const std::string a3 = storyLayout(t.trackAt(true, 2));
+            const std::string a4 = audioCount > 3 ? storyLayout(t.trackAt(true, 3)) : std::string("-");
+            const int group = linkGroupOf(t.trackAt(false, 2), "V");
+            const bool moved = accepted && audioCount == 4 && t.trackAt(false, 1)->clipCount() == 0
+                && storyAt(t.trackAt(false, 2), "V", 5.0) && t.trackAt(true, 1)->clipCount() == 0
+                && t.trackAt(true, 2)->clipCount() == 1 && storyAt(t.trackAt(true, 2), "A2", 5.0)
+                && t.trackAt(true, 3)->clipCount() == 1 && storyAt(t.trackAt(true, 3), "A3", 5.0);
+            const bool grouped = group > 0 && linkGroupOf(t.trackAt(true, 2), "A2") == group
+                && audioCount > 3 && linkGroupOf(t.trackAt(true, 3), "A3") == group;
+            const bool oneUndo = t.undoManager()->saveSerial() == serial + 1;
+            t.undo();
+            const bool undone = t.audioTrackCount() == 3 && storyAt(t.trackAt(false, 1), "V", 5.0)
+                && storyAt(t.trackAt(true, 1), "A2", 5.0) && t.trackAt(true, 2)->clipCount() == 1
+                && storyAt(t.trackAt(true, 2), "A3", 5.0);
+            aOk = moved && grouped && oneUndo && undone;
+            std::fprintf(stderr, "[track-ops] G28a: accepted=%d audioTracks=%d A3 [%s] A4 [%s] (expect A2@5.00 / "
+                         "A3@5.00) group=%d grouped=%d oneUndo=%d undone=%d -> %d\n", accepted, audioCount,
+                         a3.c_str(), a4.c_str(), group, grouped, oneUndo, undone, aOk);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{storyClip("P", 3.0, 2)}, {}},
+                                 QVector<QVector<ClipInfo>>{{storyClip("Pa", 3.0, 2)}, {}}, 0.0, -1.0, -1.0, 100);
+            storyBaseline(t);
+            const bool accepted = storyClipDrop(t.trackAt(false, 0), 0, t.trackAt(false, 1), 3.0);
+            bOk = accepted && t.audioTrackCount() == 2 && t.trackAt(true, 0)->clipCount() == 0
+                && storyAt(t.trackAt(false, 1), "P", 3.0) && storyAt(t.trackAt(true, 1), "Pa", 3.0);
+            std::fprintf(stderr, "[track-ops] G28b: accepted=%d audioTracks=%d A1 [%s] A2 [%s] (expect Pa@3.00 on A2)"
+                         " -> %d\n", accepted, t.audioTrackCount(), storyLayout(t.trackAt(true, 0)).c_str(),
+                         storyLayout(t.trackAt(true, 1)).c_str(), bOk);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Va", 3.0, 3, 10.0)},
+                                           {storyClip("Vb", 3.0, 3), storyClip("K", 2.0, 0, 2.0)}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Aa", 3.0, 3, 10.0)}, {}}, 0.0, -1.0, -1.0, 100);
+            // Roto marker n = n path points: Va 1, Vb 2, K 3.
+            auto roto = [](const QString &key, int marker) {
+                RotoClipEntry e;
+                e.clipId = key;
+                e.path.points.resize(marker);
+                return e;
+            };
+            t.setRotoEntries({{trackMatteClipKey(1, 0), roto(trackMatteClipKey(1, 0), 1)},
+                              {trackMatteClipKey(2, 0), roto(trackMatteClipKey(2, 0), 2)},
+                              {trackMatteClipKey(2, 1), roto(trackMatteClipKey(2, 1), 3)}});
+            TimelineTrackMatteEntry matte;
+            matte.matteType = TrackMatteType::AlphaMatte;
+            matte.matteSourceClipId = trackMatteClipKey(1, 0);   // Vb takes Va as its matte
+            t.setTrackMatteEntries({{trackMatteClipKey(2, 0), matte}});
+            t.setClipParentEntries({{trackMatteClipKey(2, 0), trackMatteClipKey(1, 0)}});   // Vb -> Va
+            storyBaseline(t);
+            auto carriers = [&t]() {
+                QStringList parts;
+                const auto rotos = t.rotoEntries();
+                for (int marker = 1; marker <= 3; ++marker) {
+                    QString at = QStringLiteral("missing");
+                    for (auto it = rotos.cbegin(); it != rotos.cend(); ++it)
+                        if (it.value().path.points.size() == marker) at = it.key();
+                    parts.append(QStringLiteral("roto%1@%2").arg(marker).arg(at));
+                }
+                parts.append(QStringLiteral("rotoCount=%1").arg(rotos.size()));
+                const auto mattes = t.trackMatteEntries();
+                for (auto it = mattes.cbegin(); it != mattes.cend(); ++it)
+                    parts.append(QStringLiteral("matte %1<%2").arg(it.key(), it.value().matteSourceClipId));
+                const auto parents = t.clipParentEntries();
+                for (auto it = parents.cbegin(); it != parents.cend(); ++it)
+                    parts.append(QStringLiteral("parent %1>%2").arg(it.key(), it.value()));
+                return parts.join(QLatin1Char(' ')).toStdString();
+            };
+            const std::string carriersBefore = carriers();
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(true, 1), 0, t.trackAt(true, 2), 10.0);
+            const int videoCount = t.videoTrackCount();
+            const bool moved = accepted && videoCount == 4 && t.trackAt(false, 1)->clipCount() == 0
+                && t.trackAt(false, 2)->clipCount() == 2 && storyAt(t.trackAt(false, 2), "K", 5.0)
+                && storyAt(t.trackAt(false, 2), "Va", 10.0) && t.trackAt(false, 3)->clipCount() == 1
+                && storyAt(t.trackAt(false, 3), "Vb", 10.0) && storyAt(t.trackAt(true, 2), "Aa", 10.0);
+            const std::string carriersAfter = carriers();
+            const std::string v3 = storyLayout(t.trackAt(false, 2));
+            const std::string v4 = videoCount > 3 ? storyLayout(t.trackAt(false, 3)) : std::string("-");
+            // Va V2:0 -> V3:1, Vb V3:0 -> V4:0, K V3:1 -> V3:0.
+            const std::string expectedAfter = "roto1@2:1 roto2@3:0 roto3@2:0 rotoCount=3 matte 3:0<2:1 parent 3:0>2:1";
+            const bool oneUndo = t.undoManager()->saveSerial() == serial + 1;
+            t.undo();
+            const std::string carriersUndone = carriers();
+            const bool undone = t.videoTrackCount() == 3 && storyAt(t.trackAt(false, 1), "Va", 10.0)
+                && storyAt(t.trackAt(false, 2), "Vb", 0.0) && storyAt(t.trackAt(true, 1), "Aa", 10.0)
+                && carriersUndone == carriersBefore;
+            cOk = moved && carriersAfter == expectedAfter && oneUndo && undone;
+            std::fprintf(stderr, "[track-ops] G28c: accepted=%d videoTracks=%d V3 [%s] V4 [%s] moved=%d\n"
+                         "[track-ops] G28c: before  %s\n[track-ops] G28c: after   %s\n"
+                         "[track-ops] G28c: expect  %s\n[track-ops] G28c: undone  %s oneUndo=%d undone=%d -> %d\n",
+                         accepted, videoCount, v3.c_str(), v4.c_str(), moved,
+                         carriersBefore.c_str(), carriersAfter.c_str(), expectedAfter.c_str(),
+                         carriersUndone.c_str(), oneUndo, undone, cOk);
+        }
+        // (d) uid twin: V3 already holds T (same uid as the moving picture W, no roto)
+        // before the drop point; W+Wa dropped A2 -> A3 brings W to V3:1 after T, and
+        // W's roto must follow W, not land on its twin T at V3:0.
+        bool dOk = false;
+        {
+            Timeline t;
+            ClipInfo w = storyClip("W", 3.0, 4, 10.0);
+            w.uid = QStringLiteral("track-ops-g28d-twin");
+            ClipInfo twin = storyClip("T", 2.0);
+            twin.uid = w.uid;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{}, {w}, {twin}},
+                                 QVector<QVector<ClipInfo>>{{}, {storyClip("Wa", 3.0, 4, 10.0)}, {}}, 0.0, -1.0,
+                                 -1.0, 100);
+            RotoClipEntry e;
+            e.clipId = trackMatteClipKey(1, 0);
+            e.path.points.resize(1);
+            t.setRotoEntries({{trackMatteClipKey(1, 0), e}});
+            storyBaseline(t);
+            const QString wUid = storyFind(t.trackAt(false, 1), "W") ? storyFind(t.trackAt(false, 1), "W")->uid : QString();
+            const QString tUid = storyFind(t.trackAt(false, 2), "T") ? storyFind(t.trackAt(false, 2), "T")->uid : QString();
+            const bool twins = !wUid.isEmpty() && wUid == tUid;
+            auto rotoKeys = [&t]() { return QStringList(t.rotoEntries().keys()).join(QLatin1Char(',')).toStdString(); };
+            const std::string keysBefore = rotoKeys();
+            const bool accepted = storyClipDrop(t.trackAt(true, 1), 0, t.trackAt(true, 2), 10.0);
+            const bool moved = accepted && t.trackAt(false, 1)->clipCount() == 0
+                && t.trackAt(false, 2)->clipCount() == 2 && storyAt(t.trackAt(false, 2), "T", 0.0)
+                && storyAt(t.trackAt(false, 2), "W", 10.0) && t.trackAt(false, 2)->clips().at(1).displayName == "W";
+            const std::string keysAfter = rotoKeys();
+            const std::string expectedKeys = trackMatteClipKey(2, 1).toStdString();
+            dOk = twins && moved && keysAfter == expectedKeys;
+            std::fprintf(stderr, "[track-ops] G28d: twins=%d (uid '%s' / '%s') accepted=%d V3 [%s] moved=%d roto before [%s]"
+                         " after [%s] (expect W's new key [%s], twin T at %s) -> %d\n", twins,
+                         wUid.toUtf8().constData(), tUid.toUtf8().constData(), accepted,
+                         storyLayout(t.trackAt(false, 2)).c_str(), moved, keysBefore.c_str(), keysAfter.c_str(),
+                         expectedKeys.c_str(), trackMatteClipKey(2, 0).toUtf8().constData(), dOk);
+        }
+        // (e) a locked track neither gives up nor takes a member: Ea (V2, locked) + Eb
+        // (V3) + Ec (A2), Eb dropped V3 -> V4: Ea stays on V2 (same uid and start), no
+        // clip lands on V2, Ec follows to A4, one undo point. Before the fix Ea moved to V3.
+        bool eOk = false;
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Ea", 3.0, 7, 6.0)}, {storyClip("Eb", 3.0, 7, 6.0)}, {}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Ec", 3.0, 7, 6.0)}}, 0.0, -1.0, -1.0, 100);
+            t.trackAt(false, 1)->setLocked(true);
+            storyBaseline(t);
+            const QString eaUid = storyFind(t.trackAt(false, 1), "Ea") ? storyFind(t.trackAt(false, 1), "Ea")->uid : QString();
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 2), 0, t.trackAt(false, 3), 6.0);
+            const ClipInfo *ea = storyFind(t.trackAt(false, 1), "Ea");
+            const bool lockedKept = t.trackAt(false, 1)->clipCount() == 1 && ea && !eaUid.isEmpty()
+                && ea->uid == eaUid && storyAt(t.trackAt(false, 1), "Ea", 6.0);
+            const bool moved = accepted && t.videoTrackCount() == 4 && t.trackAt(false, 2)->clipCount() == 0
+                && t.trackAt(false, 3)->clipCount() == 1 && storyAt(t.trackAt(false, 3), "Eb", 6.0)
+                && t.audioTrackCount() >= 4 && t.trackAt(true, 1)->clipCount() == 0
+                && t.trackAt(true, 3)->clipCount() == 1 && storyAt(t.trackAt(true, 3), "Ec", 6.0);
+            const bool oneUndo = t.undoManager()->saveSerial() == serial + 1;
+            eOk = lockedKept && moved && oneUndo;
+            std::fprintf(stderr, "[track-ops] G28e: accepted=%d V2(locked) [%s] uid '%s' -> '%s' V3 [%s] V4 [%s] A2 [%s]"
+                         " A4 [%s] (expect Ea@6.00 kept on V2, V3 empty, Eb@6.00 on V4, Ec@6.00 on A4)"
+                         " lockedKept=%d moved=%d oneUndo=%d -> %d\n", accepted,
+                         storyLayout(t.trackAt(false, 1)).c_str(), eaUid.toUtf8().constData(),
+                         ea ? ea->uid.toUtf8().constData() : "-", storyLayout(t.trackAt(false, 2)).c_str(),
+                         t.videoTrackCount() > 3 ? storyLayout(t.trackAt(false, 3)).c_str() : "-",
+                         storyLayout(t.trackAt(true, 1)).c_str(),
+                         t.audioTrackCount() > 3 ? storyLayout(t.trackAt(true, 3)).c_str() : "-",
+                         lockedKept, moved, oneUndo, eOk);
+        }
+        // (f) the same lock rule for a later member of the other track type: Fv (V2) + Fa
+        // (A2) + Fb (A5) at 5, Fv dropped V2 -> V3, so the anchor Fa goes to A3 and Fb maps
+        // to A6. (f1) A5 locked: Fb stays on A5 (same uid and start). (f2) A6 exists and is
+        // locked: Fb stays on A5 and A6 keeps its clip. Both keep the link group and add one
+        // undo point. Before the fix Fb moved to A6 in both cases.
+        bool fOk = true;
+        for (int fCase = 1; fCase <= 2; ++fCase) {
+            Timeline t;
+            QVector<QVector<ClipInfo>> audio{{}, {storyClip("Fa", 3.0, 8, 5.0)}, {}, {}, {storyClip("Fb", 3.0, 8, 5.0)}};
+            if (fCase == 2) audio.push_back(QVector<ClipInfo>{storyClip("Fl", 2.0, 0, 20.0)});
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{}, {storyClip("Fv", 3.0, 8, 5.0)}, {}}, audio,
+                                 0.0, -1.0, -1.0, 100);
+            t.trackAt(true, fCase == 1 ? 4 : 5)->setLocked(true);
+            storyBaseline(t);
+            const QString fbUid = storyFind(t.trackAt(true, 4), "Fb") ? storyFind(t.trackAt(true, 4), "Fb")->uid : QString();
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+            const int audioCount = t.audioTrackCount();
+            const ClipInfo *fb = storyFind(t.trackAt(true, 4), "Fb");
+            const bool lockedKept = t.trackAt(true, 4)->clipCount() == 1 && fb && !fbUid.isEmpty() && fb->uid == fbUid
+                && storyAt(t.trackAt(true, 4), "Fb", 5.0);
+            const bool a6Ok = fCase == 1 ? audioCount == 5
+                                         : audioCount == 6 && t.trackAt(true, 5)->clipCount() == 1
+                                               && storyAt(t.trackAt(true, 5), "Fl", 20.0);
+            const bool moved = accepted && t.trackAt(false, 1)->clipCount() == 0 && storyAt(t.trackAt(false, 2), "Fv", 5.0)
+                && t.trackAt(true, 1)->clipCount() == 0 && t.trackAt(true, 2)->clipCount() == 1
+                && storyAt(t.trackAt(true, 2), "Fa", 5.0);
+            const int group = linkGroupOf(t.trackAt(false, 2), "Fv");
+            const bool grouped = group > 0 && linkGroupOf(t.trackAt(true, 2), "Fa") == group
+                && linkGroupOf(t.trackAt(true, 4), "Fb") == group;
+            const bool oneUndo = t.undoManager()->saveSerial() == serial + 1;
+            const bool caseOk = lockedKept && a6Ok && moved && grouped && oneUndo;
+            fOk = fOk && caseOk;
+            std::fprintf(stderr, "[track-ops] G28f%d: accepted=%d audioTracks=%d A3 [%s] A5(%s) [%s] uid '%s' -> '%s'"
+                         " A6(%s) [%s] (expect Fa@5.00 on A3, Fb@5.00 kept on A5, %s) lockedKept=%d a6Ok=%d"
+                         " moved=%d group=%d grouped=%d oneUndo=%d -> %d\n", fCase, accepted, audioCount,
+                         storyLayout(t.trackAt(true, 2)).c_str(), fCase == 1 ? "locked" : "free",
+                         storyLayout(t.trackAt(true, 4)).c_str(), fbUid.toUtf8().constData(),
+                         fb ? fb->uid.toUtf8().constData() : "-", fCase == 2 ? "locked" : "none",
+                         audioCount > 5 ? storyLayout(t.trackAt(true, 5)).c_str() : "-",
+                         fCase == 1 ? "no A6" : "Fl@20.00 alone on A6", lockedKept, a6Ok, moved, group,
+                         grouped, oneUndo, caseOk);
+        }
+        gate(28, aOk && bOk && cOk && dOk && eOk && fOk);
+    }
+    // US-1313 G29: storyline mode ON, a group of V2's picture G and two audio clips
+    // (A1 / A2 at 10) dropped on V1 at 4 (between P and Q) is a storyline insert: both
+    // audio clips land at 4 on free audio tracks and V1 stays gap-free. HEAD: only
+    // the first audio clip moves, the A2 one stays at 10.
+    {
+        Timeline t;
+        t.restoreFromProject(
+            QVector<QVector<ClipInfo>>{{storyClip("P", 4.0, 5), storyClip("Q", 4.0, 6)},
+                                       {storyClip("G", 3.0, 9, 10.0)}},
+            QVector<QVector<ClipInfo>>{{storyClip("Pa", 4.0, 5), storyClip("Qa", 4.0, 6), storyClip("Ga1", 3.0, 9, 2.0)},
+                                       {storyClip("Ga2", 3.0, 9, 10.0)}},
+            0.0, -1.0, -1.0, 100);
+        t.setStorylineMode(true);
+        storyBaseline(t);
+        const auto serial = t.undoManager()->saveSerial();
+        const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 0), 4.0);
+        bool gapFree = t.trackAt(false, 0)->clipCount() == 3;
+        for (const ClipInfo &c : t.trackAt(false, 0)->clips()) gapFree = gapFree && std::abs(c.leadInSec) < 1e-6;
+        const bool v1Ok = gapFree && storyAt(t.trackAt(false, 0), "P", 0.0) && storyAt(t.trackAt(false, 0), "G", 4.0)
+            && storyAt(t.trackAt(false, 0), "Q", 7.0);
+        double ga1 = -1.0, ga2 = -1.0;
+        int ga1Track = -1, ga2Track = -1, ga1Count = 0, ga2Count = 0;
+        std::string audio;
+        for (int a = 0; a < t.audioTrackCount(); ++a) {
+            const TimelineTrack *track = t.trackAt(true, a);
+            audio += "A" + std::to_string(a + 1) + " [" + storyLayout(track) + "] ";
+            for (const ClipInfo &c : track->clips()) {
+                if (c.displayName == QStringLiteral("Ga1")) { ++ga1Count; ga1Track = a; ga1 = storyStart(track, "Ga1"); }
+                if (c.displayName == QStringLiteral("Ga2")) { ++ga2Count; ga2Track = a; ga2 = storyStart(track, "Ga2"); }
+            }
+        }
+        const bool audioOk = ga1Count == 1 && ga2Count == 1 && ga1Track != ga2Track
+            && std::abs(ga1 - 4.0) < 1e-6 && std::abs(ga2 - 4.0) < 1e-6
+            && storyAt(t.trackAt(true, 0), "Qa", 7.0);
+        const bool oneUndo = t.undoManager()->saveSerial() == serial + 1;
+        std::fprintf(stderr, "[track-ops] G29: accepted=%d V1 [%s] (expect P@0.00 G@4.00 Q@7.00) %s(expect Ga1 / Ga2 "
+                     "@4.00 on two tracks, Qa@7.00) Ga1=A%d@%.2f Ga2=A%d@%.2f v1Ok=%d audioOk=%d oneUndo=%d\n",
+                     accepted, storyLayout(t.trackAt(false, 0)).c_str(), audio.c_str(), ga1Track + 1, ga1,
+                     ga2Track + 1, ga2, v1Ok, audioOk, oneUndo);
+        gate(29, accepted && v1Ok && audioOk && oneUndo);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.

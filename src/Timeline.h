@@ -694,7 +694,9 @@ signals:
     void linkedTrimDelta(int clipIndex, bool leftEdge, double deltaSec);
     void linkedTrimFinished();
     void linkedTrimCancelled();
-    void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
+    // US-1313: src is the track the dropped clip came from (null: unknown, the
+    // dropped clip's own-kind link partners then stay where they are).
+    void crossTrackDropped(int clipIndex, int linkGroup, double dropTime, TimelineTrack *src = nullptr);
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
@@ -1465,7 +1467,9 @@ public:
     void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
     QHash<QString, RotoClipEntry> rotoEntries() const;
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
-    // Calls of remapCarriersAfterCrossTrackMove on this Timeline (selftest).
+    // Explicit cross-track carrier remaps on this Timeline (selftest): calls of
+    // remapCarriersAfterCrossTrackMove, plus one per linked drop that moves a
+    // video member (handleCrossTrackLinkedDrop's by-uid remap).
     quint64 crossTrackMoveRemapCountForTest() const { return m_crossTrackMoveRemapCount; }
     // US-1306: next link-group number that no V / A clip of the current
     // sequence uses (m_nextLinkGroup is not advanced by load / import).
@@ -1614,7 +1618,7 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
-    // Number of remapCarriersAfterCrossTrackMove calls (selftest counter).
+    // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
@@ -1850,15 +1854,19 @@ private:
     void clearLinkedDragState();
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
-    void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+    // US-1313: moves every other member of linkGroup after the clip at
+    // droppedIdx of destTrack (from dragSource) moved; one by-uid carrier remap.
+    void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
+                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr);
     // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
     // moves it there through TimelineTrack::acceptClipDrop (one undo point).
     // Only a timeline clip of the band's kind is accepted.
     friend class TimelineNewTrackDropZone;
     bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
                             TimelineTrack *src);
-    // Explicit index map for one clip moved between tracks by dropEvent, or
-    // for the linked video partner moved by handleCrossTrackLinkedDrop:
+    // Explicit index map for one clip moved between tracks by dropEvent
+    // (the linked members moved by handleCrossTrackLinkedDrop take
+    // remapCarriersByUid instead):
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
     // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
     // -1 for an audio track (not keyed). Applies to the roto, clip-parent and
