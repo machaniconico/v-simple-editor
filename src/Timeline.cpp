@@ -13935,6 +13935,13 @@ void Timeline::setBusRoutingBridge(std::function<QJsonObject()> provider,
     m_busRoutingApplier = std::move(applier);
 }
 
+void Timeline::setSidecarStateHooks(std::function<QJsonObject()> collect,
+                                    std::function<void(const QJsonObject&)> apply)
+{
+    m_sidecarStateCollector = std::move(collect);
+    m_sidecarStateApplier = std::move(apply);
+}
+
 void Timeline::absorbIntoCurrentUndoPoint()
 {
     reconcileConnectedClips();
@@ -15823,6 +15830,7 @@ TimelineState Timeline::currentState() const
 
     if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
     if (m_busRoutingProvider) state.audioBusRouting = m_busRoutingProvider();
+    if (m_sidecarStateCollector) state.sidecarState = m_sidecarStateCollector();
     state.projectWidth = m_projectWidth;
     state.projectHeight = m_projectHeight;
     state.projectExplicitOutput = m_projectExplicitOutput;
@@ -15836,6 +15844,10 @@ void Timeline::restoreState(const TimelineState &state)
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
         || m_videoTracks.size() != state.videoTracks.size()
         || m_audioTracks.size() != state.audioTracks.size();
+    // US-1302: sidecars follow on every restore, structural or not, while the
+    // clips they are keyed on are still the ones being left.
+    if (m_sidecarStateApplier && !state.sidecarState.isEmpty())
+        m_sidecarStateApplier(state.sidecarState);
     // Deferred deletion keeps menu callbacks safe; remap receivers clear retained pointers.
     while (m_videoTracks.size() > qMax(1, int(state.videoTracks.size())))
         removeTrackInternal(false, m_videoTracks.size() - 1);

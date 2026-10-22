@@ -1,4 +1,5 @@
 #include "../AudioMixer.h"
+#include "../BrushAnimation.h"
 #include "../MainWindow.h"
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
@@ -35,6 +36,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -134,6 +136,14 @@ extern "C" {
 //        gives trackIndicesRemapped only, key-preserving edits and the undo give nothing.
 //        Detects: the emit removed (0 emits), the memo not cleared by undo (the second delete
 //        silent), identity pairs kept (key-preserving edits emit, the delete map not exact).
+// US-1302 (position-keyed MainWindow sidecars, no roto / matte on the fixture):
+//   G32: timeRemap / wiggle / text3D / expression / brush entries (and the clipId inside the
+//        timeRemap and brush values) on V2 clip b follow (1) a delete of the clip in front of
+//        b to "1:0", (3) undo / redo to "1:1" / "1:0", (3') the same delete after an undo to
+//        "1:0", (2) a drop of b onto V3 to "2:0", (4) a save / load, (5) the removal of V2 to
+//        "1:0"; (6) a sidecar edit that records no undo point survives the undo of an unrelated
+//        edit. Detects: no rekey slot (HEAD: entries stay on the old key, on a's neighbour),
+//        the sidecar applier only on structural undo (3), the memo kept over an undo (3').
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -710,6 +720,449 @@ void keyRemapGate(selftest::GateTally &tally)
                "reorder / cross-track drop / storyline insert + reconcile / repeated external remap / "
                "delete after undo / delete after a key-preserving append, or it fired for a track removal "
                "or a key-preserving edit");
+}
+
+// G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
+// runConnectedClipSelftest hands over.
+struct SidecarView {
+    QHash<QString, TimeRemapClipEntry> *timeRemap = nullptr;
+    QHash<QString, QJsonObject> *text3D = nullptr;
+    QHash<QString, exprbind::ClipExpressionBindings> *expressions = nullptr;
+    QHash<QString, wiggle::WiggleParams> *wiggle = nullptr;
+    QVector<BrushAnimationEntry> *brush = nullptr;
+    QHash<QString, BrushAnimation *> *liveBrush = nullptr;
+    BrushAnimation *(MainWindow::*materializeBrush)(const QString &) = nullptr;
+    void (MainWindow::*addBrush)() = nullptr;
+    bool (MainWindow::*save)(const QString &, QString *) = nullptr;
+    bool (MainWindow::*open)(const QString &, QString *, bool) = nullptr;
+};
+
+// G32 (US-1302): the position-keyed sidecars follow the clip they were put on.
+void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                      const SidecarView &view)
+{
+    auto clearSidecars = [&] {
+        view.timeRemap->clear();
+        view.text3D->clear();
+        view.expressions->clear();
+        view.wiggle->clear();
+        view.brush->clear();
+        for (BrushAnimation *live : std::as_const(*view.liveBrush))
+            if (live) live->deleteLater();
+        view.liveBrush->clear();
+    };
+    auto sortedKeys = [](QStringList keys) { keys.sort(); return keys.join(','); };
+    // Where each kind sits, the timeRemap value's own clipId in brackets.
+    auto where = [&] {
+        QStringList remaps;
+        for (auto it = view.timeRemap->cbegin(); it != view.timeRemap->cend(); ++it)
+            remaps.append(it.key() + QStringLiteral("(") + it.value().clipId + QStringLiteral(")"));
+        QStringList brushes;
+        for (const BrushAnimationEntry &entry : std::as_const(*view.brush))
+            brushes.append(entry.clipId);
+        return QStringLiteral("tr=%1 wg=%2 t3=%3 ex=%4 br=%5")
+            .arg(sortedKeys(remaps), sortedKeys(view.wiggle->keys()), sortedKeys(view.text3D->keys()),
+                 sortedKeys(view.expressions->keys()), sortedKeys(brushes));
+    };
+    auto at = [](const QString &key) {
+        return QStringLiteral("tr=%1(%1) wg=%1 t3=%1 ex=%1 br=%1").arg(key);
+    };
+    auto owner = [&tl](const QString &key) {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        const TimelineTrack *track = parts.size() == 2 ? tl.trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        return track && index >= 0 && index < track->clipCount()
+            ? track->clips().at(index).displayName : QString();
+    };
+    // b's values: they move with b, so a value found on another key is b's.
+    auto attach = [&](const QString &key) {
+        TimeRemapClipEntry remap;
+        remap.clipId = key;
+        remap.curve.sourceFps = 10.0;
+        remap.curve.addKey(0.0, 0.0);
+        remap.curve.addKey(2.0, 1.0);
+        view.timeRemap->insert(key, remap);
+        wiggle::WiggleParams params;
+        params.enabled = true;
+        params.seed = 32;
+        params.positionAmplitude = QPointF(4.0, 0.0);
+        view.wiggle->insert(key, params);
+        view.text3D->insert(key, QJsonObject{{QStringLiteral("text"), QStringLiteral("G32")}});
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+        view.expressions->insert(key, bindings);
+        BrushAnimationEntry brush;
+        brush.clipId = key;
+        brush.brushData = QJsonObject{{QStringLiteral("text"), QStringLiteral("G32")}};
+        view.brush->append(brush);
+    };
+    auto valuesIntact = [&](const QString &key) {
+        return view.wiggle->value(key).seed == 32u
+            && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32")
+            && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("50")
+            && view.timeRemap->value(key).curve.keys.size() == 2
+            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+                   return entry.clipId == key
+                       && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32");
+               });
+    };
+
+    // V1 [x 0-10], V2 [a 0-2 | b 3-5], V3 [c 10-12]; the sidecars go on b ("1:1").
+    clearSidecars();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+              {clipFor("c", 2.0, 10.0)}});
+    attach(QStringLiteral("1:1"));
+    BrushAnimation *live = (window.*view.materializeBrush)(QStringLiteral("1:1"));
+    // Adding a brush animation records an undo point (its progress keyframes), so the
+    // fixture does the same after attaching.
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+
+    // (1) delete a: b becomes "1:0".
+    QString err;
+    const bool deleted = tl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString after1 = where();
+    const QString owner1 = owner(QStringLiteral("1:0"));
+    const bool liveMoved = live && view.liveBrush->value(QStringLiteral("1:0")) == live
+        && !view.liveBrush->contains(QStringLiteral("1:1"));
+    const bool ok1 = deleted && after1 == at(QStringLiteral("1:0")) && owner1 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0")) && liveMoved;
+
+    // (3) undo / redo.
+    tl.undo();
+    const QString afterUndo = where();
+    const bool undoOk = afterUndo == at(QStringLiteral("1:1")) && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:1"));
+    tl.redo();
+    const QString afterRedo = where();
+    const bool redoOk = afterRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+    const bool ok3 = undoOk && redoOk;
+
+    // (3') undo, then the same delete again.
+    tl.undo();
+    const QString afterUndo2 = where();
+    QString err2;
+    const bool redeleted = tl.deleteClipByIndex(false, 1, 0, false, &err2);
+    const QString afterRedelete = where();
+    const bool ok3b = afterUndo2 == at(QStringLiteral("1:1")) && redeleted
+        && afterRedelete == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+
+    // (2) b dropped from V2 onto V3 at 0 (before c): "2:0".
+    const bool dropped = sendClipDropOnTrack(tl.trackAt(false, 1), 0, tl.trackAt(false, 2), 0.0);
+    const QString after2 = where();
+    const QString owner2 = owner(QStringLiteral("2:0"));
+    const bool ok2 = dropped && after2 == at(QStringLiteral("2:0")) && owner2 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("2:0"));
+
+    // (4) save, then load into the same window.
+    QTemporaryDir dir;
+    const QString projectPath = dir.filePath(QStringLiteral("g32.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*view.save)(projectPath, &saveErr);
+    clearSidecars();
+    const bool opened = saved && (window.*view.open)(projectPath, &openErr, false);
+    const QString after4 = where();
+    const QString owner4 = owner(QStringLiteral("2:0"));
+    const bool ok4 = opened && after4 == at(QStringLiteral("2:0")) && owner4 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("2:0"));
+
+    // (5) remove V2 (empty now): V3 becomes V2, b "1:0".
+    QString removeErr;
+    const bool removed = tl.removeTrack(false, 1, &removeErr);
+    const QString after5 = where();
+    const QString owner5 = owner(QStringLiteral("1:0"));
+    const bool ok5 = removed && after5 == at(QStringLiteral("1:0")) && owner5 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+
+    // (6) an unrelated undoable edit (x at speed 2), then wiggle / text3D / timeRemap /
+    // expression edits that record no undo point, then one undo: the speed goes back, the
+    // sidecar values stay.
+    QString speedErr;
+    const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
+    (*view.wiggle)[QStringLiteral("1:0")].seed = 77;
+    view.text3D->insert(QStringLiteral("1:0"), QJsonObject{{QStringLiteral("text"), QStringLiteral("edited")}});
+    (*view.timeRemap)[QStringLiteral("1:0")].curve.sourceFps = 24.0;
+    (*view.timeRemap)[QStringLiteral("1:0")].curve.addKey(1.0, 0.5);
+    (*view.expressions)[QStringLiteral("1:0")].setExpression(QStringLiteral("transform.opacity"),
+                                                             QStringLiteral("75"));
+    tl.undo();
+    const double speedAfterUndo = tl.trackAt(false, 0)->clips().value(0).speed;
+    const QString after6 = where();
+    const unsigned seedAfterUndo = view.wiggle->value(QStringLiteral("1:0")).seed;
+    const QString textAfterUndo = view.text3D->value(QStringLiteral("1:0")).value(QStringLiteral("text")).toString();
+    const TimeRemapClipEntry remapAfterUndo = view.timeRemap->value(QStringLiteral("1:0"));
+    const int remapKeysAfterUndo = static_cast<int>(remapAfterUndo.curve.keys.size());
+    const double fpsAfterUndo = remapAfterUndo.curve.sourceFps;
+    const QString exprAfterUndo =
+        view.expressions->value(QStringLiteral("1:0")).expression(QStringLiteral("transform.opacity"));
+    const bool ok6 = sped && near(speedAfterUndo, 1.0) && after6 == at(QStringLiteral("1:0"))
+        && seedAfterUndo == 77u && textAfterUndo == QStringLiteral("edited") && remapKeysAfterUndo == 3
+        && near(fpsAfterUndo, 24.0) && exprAfterUndo == QStringLiteral("75");
+
+    // (7) delete b itself, then its track: each undo brings all five back on b, each redo
+    // takes them off again.
+    clearSidecars();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+              {clipFor("c", 2.0, 10.0)}});
+    attach(QStringLiteral("1:1"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+    const QString none = QStringLiteral("tr= wg= t3= ex= br=");
+    auto onB = [&](const QString &shown) {
+        return shown == at(QStringLiteral("1:1")) && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+            && valuesIntact(QStringLiteral("1:1"));
+    };
+    QString errB;
+    const bool bDeleted = tl.deleteClipByIndex(false, 1, 1, false, &errB);
+    const QString afterBDelete = where();
+    tl.undo();
+    const QString afterBUndo = where();
+    const bool bUndoOk = onB(afterBUndo);
+    tl.redo();
+    const QString afterBRedo = where();
+    tl.undo();
+    const QString afterBUndo2 = where();
+    const bool bUndo2Ok = onB(afterBUndo2);
+    const bool ok7 = bDeleted && afterBDelete == none && bUndoOk && afterBRedo == none && bUndo2Ok;
+    QString errT;
+    const bool v2Removed = tl.removeTrack(false, 1, &errT);
+    const QString afterTrackRemove = where();
+    tl.undo();
+    const QString afterTrackUndo = where();
+    const bool trackUndoOk = onB(afterTrackUndo);
+    tl.redo();
+    const QString afterTrackRedo = where();
+    tl.undo();
+    const QString afterTrackUndo2 = where();
+    const bool trackUndo2Ok = onB(afterTrackUndo2);
+    const bool ok8 = v2Removed && afterTrackRemove == none && trackUndoOk && afterTrackRedo == none
+        && trackUndo2Ok;
+
+    // (8) the real brush add with no clip selected (the dialog accepted as it opens): the
+    // brush goes on x ("0:0") and survives an unrelated edit and its undo.
+    tl.clearSelection();
+    const int selectedBefore = tl.selectedVideoClipIndex();
+    int brushDialogs = 0;
+    int otherModals = 0;
+    {
+        QTimer acceptBrush;
+        acceptBrush.setInterval(20);
+        QObject::connect(&acceptBrush, &QTimer::timeout, &window, [&] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            auto *dialog = qobject_cast<QDialog *>(modal);
+            if (dialog && dialog->inherits("BrushAnimationDialog")) {
+                ++brushDialogs;
+                dialog->accept();
+            } else {
+                ++otherModals;
+                if (dialog) dialog->reject();
+                else modal->close();
+            }
+        });
+        acceptBrush.start();
+        (window.*view.addBrush)();
+    }
+    auto brushOnX = [&] {
+        return std::any_of(view.brush->cbegin(), view.brush->cend(), [](const BrushAnimationEntry &entry) {
+            return entry.clipId == QStringLiteral("0:0") && !entry.brushData.isEmpty();
+        });
+    };
+    const bool brushAdded = brushOnX();
+    QString speedErr2;
+    const bool sped2 = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr2);
+    tl.undo();
+    const double speedAfterUndo2 = tl.trackAt(false, 0)->clips().value(0).speed;
+    const QString afterBrushUndo = where();
+    const bool brushKept = brushOnX();
+    const bool ok9 = selectedBefore < 0 && brushDialogs == 1 && otherModals == 0 && brushAdded && sped2
+        && near(speedAfterUndo2, 1.0) && brushKept && QApplication::activeModalWidget() == nullptr;
+
+    // (7b) the only clip s ("0:0") deleted, undone and redone in one sequence: the redo takes
+    // all five off s again, and a new clip put at "0:0" afterwards carries none of them.
+    clearSidecars();
+    load(tl, {{clipFor("s", 2.0)}});
+    attach(QStringLiteral("0:0"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+    QString errS;
+    const bool sDeleted = tl.deleteClipByIndex(false, 0, 0, false, &errS);
+    const QString afterSDelete = where();
+    tl.undo();
+    const QString afterSUndo = where();
+    const bool sUndoOk = afterSUndo == at(QStringLiteral("0:0")) && owner(QStringLiteral("0:0")) == QStringLiteral("s")
+        && valuesIntact(QStringLiteral("0:0"));
+    tl.redo();
+    const QString afterSRedo = where();
+    tl.trackAt(false, 0)->addClip(clipFor("n", 2.0));
+    const QString afterNewClip = where();
+    const QString newOwner = owner(QStringLiteral("0:0"));
+    const bool ok7b = sDeleted && afterSDelete == none && sUndoOk && afterSRedo == none
+        && newOwner == QStringLiteral("n") && afterNewClip == none;
+
+    // (9) uids are unique only per track: V3's c shares b's uid (load fixture). (i) delete a,
+    // undo, redo: the values follow b ("1:1" / "1:0"), never c ("2:0"). (ii) delete b itself,
+    // undo: they come back on b although c keeps the uid live.
+    auto loadShared = [&] {
+        clearSidecars();
+        ClipInfo b = clipFor("b", 2.0, 1.0);
+        ClipInfo c = clipFor("c", 2.0, 10.0);
+        b.uid = c.uid = QStringLiteral("selftest-g32-shared-uid");
+        load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), b}, {c}});
+        attach(QStringLiteral("1:1"));
+        tl.saveUndoState(QStringLiteral("G32 sidecars"));
+        return tl.trackAt(false, 1)->clips().value(1).uid == b.uid
+            && tl.trackAt(false, 2)->clips().value(0).uid == b.uid;
+    };
+    const bool sharedLoaded1 = loadShared();
+    QString errSa;
+    const bool saDeleted = tl.deleteClipByIndex(false, 1, 0, false, &errSa);
+    tl.undo();
+    const QString afterSaUndo = where();
+    const bool saUndoOk = onB(afterSaUndo);
+    tl.redo();
+    const QString afterSaRedo = where();
+    const bool saRedoOk = afterSaRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+    const bool ok9i = sharedLoaded1 && saDeleted && saUndoOk && saRedoOk;
+    const bool sharedLoaded2 = loadShared();
+    QString errSb;
+    const bool sbDeleted = tl.deleteClipByIndex(false, 1, 1, false, &errSb);
+    const QString afterSbDelete = where();
+    tl.undo();
+    const QString afterSbUndo = where();
+    const bool sbUndoOk = onB(afterSbUndo);
+    // The redo takes them off b again (nothing left on "1:1"), a new clip appended to V2
+    // carries none of them, and the next undo brings them back on b.
+    tl.redo();
+    const QString afterSbRedo = where();
+    tl.trackAt(false, 1)->addClip(clipFor("n", 2.0, 1.0));
+    const QString afterSbNewClip = where();
+    const QString sbNewOwner = owner(QStringLiteral("1:1"));
+    tl.undo();
+    const QString afterSbUndo2 = where();
+    const bool sbUndo2Ok = onB(afterSbUndo2);
+    const bool ok9ii = sharedLoaded2 && sbDeleted && afterSbDelete == none && sbUndoOk
+        && afterSbRedo == none && sbNewOwner == QStringLiteral("n") && afterSbNewClip == none
+        && sbUndo2Ok;
+
+    // (9iii) the shared-uid fixture with distinct values on b ("1:1") and c ("2:0"), then V2
+    // removed: c's values follow c to "1:0" and none of b's stay; the undo puts each back on
+    // its own clip (no swap through the shared uid); the redo moves c's to "1:0" again.
+    auto attachC = [&](const QString &key) {
+        TimeRemapClipEntry remap;
+        remap.clipId = key;
+        remap.curve.sourceFps = 10.0;
+        remap.curve.addKey(0.0, 0.0);
+        remap.curve.addKey(1.0, 0.25);
+        remap.curve.addKey(2.0, 1.0);
+        view.timeRemap->insert(key, remap);
+        wiggle::WiggleParams params;
+        params.enabled = true;
+        params.seed = 33;
+        view.wiggle->insert(key, params);
+        view.text3D->insert(key, QJsonObject{{QStringLiteral("text"), QStringLiteral("G32c")}});
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("60"));
+        view.expressions->insert(key, bindings);
+        BrushAnimationEntry brush;
+        brush.clipId = key;
+        brush.brushData = QJsonObject{{QStringLiteral("text"), QStringLiteral("G32c")}};
+        view.brush->append(brush);
+    };
+    auto cIntact = [&](const QString &key) {
+        return view.wiggle->value(key).seed == 33u
+            && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32c")
+            && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("60")
+            && view.timeRemap->value(key).curve.keys.size() == 3
+            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+                   return entry.clipId == key
+                       && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32c");
+               });
+    };
+    const bool sharedLoaded3 = loadShared();
+    attachC(QStringLiteral("2:0"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars on c"));
+    const QString onBAndC = QStringLiteral("tr=1:1(1:1),2:0(2:0) wg=1:1,2:0 t3=1:1,2:0 ex=1:1,2:0 br=1:1,2:0");
+    QString errSt;
+    const bool stRemoved = tl.removeTrack(false, 1, &errSt);
+    const QString afterStRemove = where();
+    const bool stRemoveOk = afterStRemove == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("c")
+        && cIntact(QStringLiteral("1:0"));
+    tl.undo();
+    const QString afterStUndo = where();
+    const bool stUndoOk = afterStUndo == onBAndC && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+        && owner(QStringLiteral("2:0")) == QStringLiteral("c") && valuesIntact(QStringLiteral("1:1"))
+        && cIntact(QStringLiteral("2:0"));
+    tl.redo();
+    const QString afterStRedo = where();
+    const bool stRedoOk = afterStRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("c")
+        && cIntact(QStringLiteral("1:0"));
+    const bool ok9iii = sharedLoaded3 && stRemoved && stRemoveOk && stUndoOk && stRedoOk;
+
+    std::fprintf(stderr, "connected-clip G32 (1) delete=%d %s owner=%s liveMoved=%d (expect %s on b) ok=%d\n",
+                 deleted, qPrintable(after1), qPrintable(owner1), liveMoved,
+                 qPrintable(at(QStringLiteral("1:0"))), ok1);
+    std::fprintf(stderr, "connected-clip G32 (3) undo %s (expect %s) redo %s (expect %s) ok=%d\n",
+                 qPrintable(afterUndo), qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterRedo),
+                 qPrintable(at(QStringLiteral("1:0"))), ok3);
+    std::fprintf(stderr, "connected-clip G32 (3') undo %s redelete=%d [%s] %s (expect %s) ok=%d\n",
+                 qPrintable(afterUndo2), redeleted, qPrintable(err2), qPrintable(afterRedelete),
+                 qPrintable(at(QStringLiteral("1:0"))), ok3b);
+    std::fprintf(stderr, "connected-clip G32 (2) drop=%d %s owner=%s (expect %s on b) ok=%d\n", dropped,
+                 qPrintable(after2), qPrintable(owner2), qPrintable(at(QStringLiteral("2:0"))),
+                 ok2);
+    std::fprintf(stderr, "connected-clip G32 (4) saved=%d [%s] opened=%d [%s] %s owner=%s (expect %s on b) ok=%d\n",
+                 saved, qPrintable(saveErr), opened, qPrintable(openErr), qPrintable(after4),
+                 qPrintable(owner4), qPrintable(at(QStringLiteral("2:0"))), ok4);
+    std::fprintf(stderr, "connected-clip G32 (5) removed=%d [%s] %s owner=%s (expect %s on b) ok=%d\n", removed,
+                 qPrintable(removeErr), qPrintable(after5), qPrintable(owner5),
+                 qPrintable(at(QStringLiteral("1:0"))), ok5);
+    std::fprintf(stderr, "connected-clip G32 (6) sped=%d [%s] speedAfterUndo=%.3f (expect 1) %s seed=%u (expect 77) "
+                 "text3D=%s (expect edited) timeRemapKeys=%d (expect 3) sourceFps=%.3f (expect 24) "
+                 "expression=%s (expect 75) ok=%d\n", sped, qPrintable(speedErr), speedAfterUndo, qPrintable(after6),
+                 seedAfterUndo, qPrintable(textAfterUndo), remapKeysAfterUndo, fpsAfterUndo,
+                 qPrintable(exprAfterUndo), ok6);
+    std::fprintf(stderr, "connected-clip G32 (7) delete b=%d [%s] %s (expect %s) undo %s redo %s undo %s "
+                 "(expect %s on b) | remove V2=%d [%s] %s undo %s redo %s undo %s ok=%d\n", bDeleted,
+                 qPrintable(errB), qPrintable(afterBDelete), qPrintable(none), qPrintable(afterBUndo),
+                 qPrintable(afterBRedo), qPrintable(afterBUndo2), qPrintable(at(QStringLiteral("1:1"))),
+                 v2Removed, qPrintable(errT), qPrintable(afterTrackRemove), qPrintable(afterTrackUndo),
+                 qPrintable(afterTrackRedo), qPrintable(afterTrackUndo2), ok7 && ok8);
+    std::fprintf(stderr, "connected-clip G32 (7b) delete s=%d [%s] %s (expect %s) undo %s (expect %s on s) "
+                 "redo %s (expect %s) new clip %s at 0:0 %s (expect %s) ok=%d\n", sDeleted, qPrintable(errS),
+                 qPrintable(afterSDelete), qPrintable(none), qPrintable(afterSUndo),
+                 qPrintable(at(QStringLiteral("0:0"))), qPrintable(afterSRedo), qPrintable(none),
+                 qPrintable(newOwner), qPrintable(afterNewClip), qPrintable(none), ok7b);
+    std::fprintf(stderr, "connected-clip G32 (8) selected=%d (expect -1) brushDialogs=%d (expect 1) otherModals=%d "
+                 "added=%d sped=%d [%s] speedAfterUndo=%.3f (expect 1) %s brushKept=%d ok=%d\n", selectedBefore,
+                 brushDialogs, otherModals, brushAdded, sped2, qPrintable(speedErr2), speedAfterUndo2,
+                 qPrintable(afterBrushUndo), brushKept, ok9);
+    std::fprintf(stderr, "connected-clip G32 (9i) shared uid b/c loaded=%d delete a=%d [%s] undo %s (expect %s on b) "
+                 "redo %s (expect %s on b) ok=%d\n", sharedLoaded1, saDeleted, qPrintable(errSa),
+                 qPrintable(afterSaUndo), qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterSaRedo),
+                 qPrintable(at(QStringLiteral("1:0"))), ok9i);
+    std::fprintf(stderr, "connected-clip G32 (9ii) shared uid b/c loaded=%d delete b=%d [%s] %s (expect %s) undo %s "
+                 "(expect %s on b) redo %s (expect %s) new clip %s at 1:1 %s (expect %s) undo %s (expect %s on b) "
+                 "ok=%d\n", sharedLoaded2, sbDeleted, qPrintable(errSb),
+                 qPrintable(afterSbDelete), qPrintable(none), qPrintable(afterSbUndo),
+                 qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterSbRedo), qPrintable(none),
+                 qPrintable(sbNewOwner), qPrintable(afterSbNewClip), qPrintable(none), qPrintable(afterSbUndo2),
+                 qPrintable(at(QStringLiteral("1:1"))), ok9ii);
+    std::fprintf(stderr, "connected-clip G32 (9iii) shared uid b/c distinct values loaded=%d remove V2=%d [%s] %s "
+                 "(expect %s on c) undo %s (expect %s, b's on 1:1 and c's on 2:0) redo %s (expect %s on c) ok=%d\n",
+                 sharedLoaded3, stRemoved, qPrintable(errSt), qPrintable(afterStRemove),
+                 qPrintable(at(QStringLiteral("1:0"))), qPrintable(afterStUndo), qPrintable(onBAndC),
+                 qPrintable(afterStRedo), qPrintable(at(QStringLiteral("1:0"))), ok9iii);
+    tally.gate(32, ok1 && ok2 && ok3 && ok3b && ok4 && ok5 && ok6 && ok7 && ok7b && ok8 && ok9 && ok9i && ok9ii
+                   && ok9iii,
+               "a position-keyed sidecar (timeRemap / wiggle / text3D / expression / brush) did not follow b "
+               "through a delete, undo / redo, the delete after an undo, a cross-track drop, a save / load or a "
+               "track removal, an edit without an undo point was rolled back by an unrelated undo, deleting b "
+               "or its track and undoing did not bring them back, redoing the delete of a sequence's only clip "
+               "left them on its key, a brush added with no selection was lost "
+               "to an unrelated undo, or a uid shared with a clip on another track sent them to the wrong "
+               "clip or lost them on undo / redo or a track removal");
+    clearSidecars();
 }
 
 } // namespace
@@ -3202,6 +3655,24 @@ int runConnectedClipSelftest()
 
     // G31 (US-1303), in its own function to keep this frame small.
     keyRemapGate(tally);
+
+    // G32 (US-1302): the friend hands the private sidecars to the gate function.
+    if (!mainTimeline) {
+        tally.gate(32, false, "MainWindow has no mainTimeline");
+    } else {
+        SidecarView view;
+        view.timeRemap = &window.m_timeRemapClipEntries;
+        view.text3D = &window.m_text3DClipConfigs;
+        view.expressions = &window.m_clipExpressionBindings;
+        view.wiggle = &window.m_clipWiggleParams;
+        view.brush = &window.m_brushAnimationEntries;
+        view.liveBrush = &window.m_liveBrushAnimations;
+        view.materializeBrush = &MainWindow::materializeBrushAnimation;
+        view.addBrush = &MainWindow::addBrushAnimation;
+        view.save = &MainWindow::saveProjectToPath;
+        view.open = &MainWindow::openProjectFromPath;
+        sidecarRekeyGate(tally, window, *mainTimeline, view);
+    }
 
     return tally.finish("connected-clip");
 }

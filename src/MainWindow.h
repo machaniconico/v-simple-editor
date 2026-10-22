@@ -46,6 +46,7 @@ class PuppetPinTool;
 #include "ProxyManager.h"
 #include "playback/AutoProxyPolicy.h"  // マルチトラック自動プロキシ判定エンジン (プレビュー専用)
 #include <QSet>
+#include <optional>
 #include "PlaybackTypes.h"
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
@@ -266,6 +267,7 @@ class MainWindow : public QMainWindow
     friend int runClipEqSelftest();
     friend int runMixerDockSelftest();
     friend int runTrackOpsSelftest();
+    friend int runConnectedClipSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -809,6 +811,26 @@ private:
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
+    // US-1302: the position-keyed sidecars ("t:i": timeRemap / text3D / expression /
+    // wiggle / live brush, and the brush entries with the clipId in their values)
+    // follow Timeline::clipKeysRemapped and, through Timeline::setSidecarStateHooks,
+    // every undo / redo.
+    void rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap);
+    QJsonObject collectSidecarState();
+    void applySidecarState(const QJsonObject &state);
+    void parkSidecars(const QString &key, const QString &uid);
+    // US-1302: the four values a dropped key held, kept by the clip's "track|uid"
+    // until a restore brings that clip back (the brush entries go back by value instead).
+    struct ParkedSidecars {
+        std::optional<TimeRemapClipEntry> timeRemap;
+        std::optional<QJsonObject> text3D;
+        std::optional<exprbind::ClipExpressionBindings> expressions;
+        std::optional<wiggle::WiggleParams> wiggle;
+    };
+    QHash<QString, ParkedSidecars> m_parkedSidecarsByUid;
+    // Key -> uid of the placement the last collect / apply saw, rekeyed with the
+    // sidecars; a dropped key's clip is already gone when the remap arrives.
+    QHash<QString, QString> m_sidecarClipUidByKey;
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;

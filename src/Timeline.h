@@ -948,6 +948,15 @@ public:
     // applier() on every undo / redo. MainWindow keeps the routing SSOT.
     void setBusRoutingBridge(std::function<QJsonObject()> provider,
                              std::function<void(const QJsonObject&)> applier);
+    // US-1302: position-keyed sidecar carrier: currentState() stores collect() in
+    // TimelineState::sidecarState and restoreState() hands a non-empty one to
+    // apply() on every undo / redo, before the clips are replaced (apply reads
+    // the clips it leaves). MainWindow keeps the sidecars.
+    void setSidecarStateHooks(std::function<QJsonObject()> collect,
+                              std::function<void(const QJsonObject&)> apply);
+    // US-1302: changes on every track removal / move / add (and is restored with
+    // the state), so equal values mean the track indices name the same tracks.
+    quint64 trackStructureRevision() const { return m_trackStructureRevision; }
     // Catch-all for edits that record no undo point (matte dialog, bus panel):
     // folds currentState() into the current undo entry and drops the redo stack.
     void absorbIntoCurrentUndoPoint();
@@ -1583,6 +1592,8 @@ private:
     std::function<void(const QJsonObject&)> m_applyExternalTrackState;
     std::function<QJsonObject()> m_busRoutingProvider;
     std::function<void(const QJsonObject&)> m_busRoutingApplier;
+    std::function<QJsonObject()> m_sidecarStateCollector;
+    std::function<void(const QJsonObject&)> m_sidecarStateApplier;
     void captureExternalTrackState();
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
