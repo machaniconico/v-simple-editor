@@ -225,6 +225,38 @@ Dump generate(const QDir &out, const QString &media)
         for (int i = 0; i < entries.size(); ++i) audio.append(audioEntry(entries[i], i));
         result.audio = QJsonDocument(audio).toJson(QJsonDocument::Indented);
     }
+    {
+        // US-1312 v1-empty-upper: V1 visible with no clip, an ordinary video
+        // clip on V2. Kept out of frames.bin so the earlier dump stays as is.
+        // The frame must be the V2 picture: the same clip rendered alone on V1.
+        ClipInfo upper = clip(media, 0.0, 2.0);
+        upper.timeRemapCurve.addKey(0.0, 0.0);
+        Timeline timeline;
+        timeline.addVideoTrack(false);
+        timeline.videoTracks().at(1)->setClips({upper});
+        timeline.refreshPlaybackSequence();
+        const QImage frame = tlrender::renderFrameAt(&timeline, 1000000, kSize);
+        Timeline alone;
+        alone.videoTracks().first()->setClips({upper});
+        alone.refreshPlaybackSequence();
+        const QImage reference = tlrender::renderFrameAt(&alone, 1000000, kSize);
+        const QByteArray got = frame.isNull() ? QByteArray() : rgbaBytes(frame);
+        const QByteArray want = reference.isNull() ? QByteArray() : rgbaBytes(reference);
+        int differing = 0;
+        int maxDelta = 0;
+        for (int i = 0; i < qMin(got.size(), want.size()); ++i) {
+            const int delta = qAbs(int(quint8(got[i])) - int(quint8(want[i])));
+            if (delta) ++differing;
+            maxDelta = qMax(maxDelta, delta);
+        }
+        const bool matches = !frame.isNull() && !reference.isNull()
+            && frame.size() == kSize && got == want;
+        std::fprintf(stderr, "fixture v1-empty-upper: null=%d referenceNull=%d size=%dx%d "
+                     "differingBytes=%d maxDelta=%d matchesV2=%d\n", frame.isNull(), reference.isNull(),
+                     frame.width(), frame.height(), differing, maxDelta, matches);
+        result.ok &= matches;
+        saveImage(QStringLiteral("frame_v1-empty-upper_0.png"), frame);
+    }
     result.ok &= result.frameCount == 10;
     result.ok &= writeBytes(out.filePath(QStringLiteral("frames.bin")), result.frames);
     result.ok &= writeBytes(out.filePath(QStringLiteral("audio.json")), result.audio);
@@ -279,15 +311,21 @@ int runRenderFixtureSelftest()
     }
     firstOk &= readBytes(out.filePath(QStringLiteral("frames.bin")), frames);
     firstOk &= readBytes(out.filePath(QStringLiteral("audio.json")), audio);
-    gate(1, firstOk, "all fixtures (a)-(f), ten non-null frames and all files generated");
+    QByteArray emptyUpperFirst;
+    firstOk &= readBytes(out.filePath(QStringLiteral("frame_v1-empty-upper_0.png")), emptyUpperFirst)
+        && !emptyUpperFirst.isEmpty();
+    gate(1, firstOk, "all fixtures (a)-(f), ten non-null frames, v1-empty-upper equal to the V2 image and all files generated");
     // Rebuild every Timeline and regenerate all files, without temporary/random
     // names leaking into the dump. Read back the actual files for G2.
     const Dump second = generate(out, media);
     QByteArray framesAgain, audioAgain;
     const bool framesRead = readBytes(out.filePath(QStringLiteral("frames.bin")), framesAgain);
     const bool audioRead = readBytes(out.filePath(QStringLiteral("audio.json")), audioAgain);
-    gate(2, firstOk && second.ok && framesRead && audioRead
-        && frames == framesAgain && audio == audioAgain, "second full generation is bit-identical");
+    QByteArray emptyUpperAgain;
+    const bool emptyUpperRead = readBytes(out.filePath(QStringLiteral("frame_v1-empty-upper_0.png")), emptyUpperAgain);
+    gate(2, firstOk && second.ok && framesRead && audioRead && emptyUpperRead
+        && frames == framesAgain && audio == audioAgain && emptyUpperFirst == emptyUpperAgain,
+        "second full generation is bit-identical (frames.bin, audio.json, frame_v1-empty-upper_0.png)");
     gate(3, first.solidMatches && second.solidMatches, "fixture (b) at 0.2s equals every RGBA pixel of source_0.png");
     return summary();
 }

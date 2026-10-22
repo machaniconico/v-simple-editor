@@ -1971,8 +1971,8 @@ QMutex g_layerTimeObservationMutex;
 QVector<detail::ObservedLayerTime> g_observedLayerTimes;
 
 // renderFrameFromTracks returns an empty frame BEFORE collecting any upper
-// layer when V1 is visible but has no clip at targetSec (V1 track empty with
-// no active upper shape clip, or no V1 clip selected). Same expressions as
+// layer when V1 is visible, holds clips, but has no clip at targetSec (no V1
+// clip selected). A hidden or clip-less V1 is a transparent base. Same expressions as
 // the "Resolve + decode the V1 base layer" block there; keep both in sync.
 // (A V1 runtime decode failure also returns early there; that is dynamic and
 // not mirrored, like ParentLayerHit::decodable.)
@@ -1985,20 +1985,8 @@ bool upperLayersReachedByRenderer(
     if (tracks.isEmpty())
         return false;
     const RenderTrackSnapshot &v1 = tracks.first();
-    if (v1.hidden)
+    if (v1.hidden || v1.clips.isEmpty())
         return true;
-    if (v1.clips.isEmpty()) {
-        bool activeUpperShape = false;
-        for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
-            double ignoredStart = 0.0;
-            const int idx = activeClipOnTrack(
-                tracks[t].clips, targetSec, /*clampToFirst=*/false,
-                &ignoredStart);
-            activeUpperShape = idx >= 0
-                && !tracks[t].clips[idx].shapes.isEmpty();
-        }
-        return activeUpperShape;
-    }
     double v1Start = 0.0;
     return selectClipOnTrack(tracks, intervals, overlapA, overlapB, 0,
                              targetSec, /*clampToFirst=*/true, &v1Start,
@@ -2214,8 +2202,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     };
 
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
-    // The early returns below (V1 empty without an active upper shape, no V1
-    // clip selected) are mirrored by upperLayersReachedByRenderer for
+    // The early return below (no V1 clip selected) and the transparent base
+    // for a hidden or clip-less V1 are mirrored by upperLayersReachedByRenderer for
     // tlrender::parentLayerAt; change both together.
     // Single-track byte-identity with S2: V1 alone with a default transform
     // must produce the SAME pixels S2 returned (decode native -> scale to
@@ -2239,20 +2227,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     } else {
         const QVector<ClipInfo> &v1Clips = v1.clips;
         if (v1Clips.isEmpty()) {
-            // A shape clip may legitimately live on a selected upper track
-            // while V1 is empty. Keep the legacy no-V1 result for ordinary
-            // projects, but provide a transparent base for this opt-in case.
-            bool activeUpperShape = false;
-            for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
-                double ignoredStart = 0.0;
-                const int idx = activeClipOnTrack(
-                    tracks[t].clips, targetSec, /*clampToFirst=*/false,
-                    &ignoredStart);
-                activeUpperShape = idx >= 0
-                    && !tracks[t].clips[idx].shapes.isEmpty();
-            }
-            if (!activeUpperShape)
-                return QImage();
+            // A visible V1 with no clip at all composites the upper tracks
+            // over a transparent base, like a hidden V1. A timeline with no
+            // video clip anywhere is still refused by the export entry points.
             v1NullObject = true;
             base = QImage(outSize, QImage::Format_RGBA8888);
             base.fill(Qt::transparent);

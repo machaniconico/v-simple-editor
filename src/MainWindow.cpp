@@ -803,27 +803,15 @@ bool timelineHasAnyVideoClip(Timeline *timeline)
     return false;
 }
 
-// GUI 書き出しの入口ガード。V1 に映像があるか、V1 が空でも上位トラックに図形
-// クリップがある(レンダラが描ける)ときだけ書き出せる。V1 が非表示のときは
-// レンダラが透明の下地から上位レイヤーまで描くので、上位の通常映像も書き出せる。
-// V1 が表示のまま空で上位が通常映像だけのプロジェクトは、レンダリング時に null
-// 画像で失敗するため従来どおり拒否する。
+// GUI 書き出しの入口ガード。V1 に映像があれば書き出せる。V1 にクリップが無いとき
+// (表示 / 非表示とも) はレンダラが透明の下地から上位レイヤーまで描くので、上位
+// トラックに映像クリップがあれば書き出せる。映像クリップが 1 本も無いプロジェクトは
+// 従来どおり拒否する。
 bool timelineHasExportableVideo(Timeline *timeline)
 {
     if (!timeline->videoClips().isEmpty())
         return true;
-    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
-    if (!tracks.isEmpty() && tracks.first() && tracks.first()->isHidden())
-        return timelineHasAnyVideoClip(timeline);
-    for (int i = 1; i < tracks.size(); ++i) {
-        if (!tracks[i])
-            continue;
-        for (const ClipInfo &clip : tracks[i]->clips()) {
-            if (!clip.shapes.isEmpty())
-                return true;
-        }
-    }
-    return false;
+    return timelineHasAnyVideoClip(timeline);
 }
 
 // RenderQueue の音声パススルーは「V1 先頭クリップの元ファイルの音声を 0 秒から

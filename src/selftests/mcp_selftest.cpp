@@ -6387,9 +6387,11 @@ int runMcpSelftest()
                 .arg(exportRootReady).arg(presetDir.isValid());
             for (int n = 182; n <= 189; ++n)
                 tally.gate(n, false, why.toUtf8().constData());
+            tally.gate(194, false, why.toUtf8().constData());
         } else if (ffmpegExe.isEmpty()) {
             for (int n = 182; n <= 189; ++n)
                 tally.skip(n, "ffmpeg.exe unavailable");
+            tally.skip(194, "ffmpeg.exe unavailable");
         } else {
             const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
             std::vector<float> toneSamples(48000 * 2 * 4);
@@ -6817,6 +6819,66 @@ int runMcpSelftest()
                     && observeTerm(188, "control.terminal", static_cast<bool>(control.terminal)) && observeTerm(188, "control.finalStatus == RenderJobStatus::Completed", static_cast<bool>(control.finalStatus == RenderJobStatus::Completed)) && observeTerm(188, "emptyV1Ok", static_cast<bool>(emptyV1Ok)),
                     "a forced PCM mix failure under autoLoudness=true did not end as failed (or the control was not "
                     "queued), or an empty V1 export (video on an upper track) did not get its silent audio track");
+            }
+
+            // G194 (US-1312): V1 visible with no clip and an ordinary video clip on V2. export_video
+            // completes and the output has video frames (HEAD: the renderer returned a null frame and the
+            // job failed). Side check: with no video clip on any track export_video is still refused.
+            {
+                const bool addedUpper = projectTimeline->videoTracks().size() < 2;
+                if (addedUpper) projectTimeline->addVideoTrack(false);
+                TimelineTrack *upperTrack = projectTimeline->videoTracks().at(1);
+                const QVector<ClipInfo> savedUpperClips = upperTrack->clips();
+                const bool v1Visible = !videoTrack->isHidden();
+                videoTrack->setClips(QVector<ClipInfo>{});
+                upperTrack->setClips(QVector<ClipInfo>{videoClip});
+                const QString emptyV1UpperOut = exportRoot.filePath(QStringLiteral("us1312-v1-empty-upper.mp4"));
+                const Run upperRun = runExport(QJsonObject{{QStringLiteral("outputPath"), emptyV1UpperOut}});
+                QString upperJobError;
+                for (const RenderJob &job : queue->jobs())
+                    if (job.uuid == upperRun.jobId) upperJobError = job.error.isEmpty() ? job.errorMessage : job.error;
+                int upperVideoFrames = -1;
+                AVFormatContext *upperFormat = nullptr;
+                if (upperRun.terminal
+                    && avformat_open_input(&upperFormat, emptyV1UpperOut.toUtf8().constData(), nullptr, nullptr) >= 0) {
+                    if (avformat_find_stream_info(upperFormat, nullptr) >= 0) {
+                        const int videoStream = av_find_best_stream(upperFormat, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                        if (videoStream >= 0) {
+                            upperVideoFrames = 0;
+                            AVPacket *packet = av_packet_alloc();
+                            while (packet && av_read_frame(upperFormat, packet) >= 0) {
+                                if (packet->stream_index == videoStream) ++upperVideoFrames;
+                                av_packet_unref(packet);
+                            }
+                            av_packet_free(&packet);
+                        }
+                    }
+                    avformat_close_input(&upperFormat);
+                }
+                upperTrack->setClips(QVector<ClipInfo>{});
+                const Run allEmptyRun = runExport(QJsonObject{{QStringLiteral("outputPath"),
+                    exportRoot.filePath(QStringLiteral("us1312-all-empty.mp4"))}}, false);
+                upperTrack->setClips(savedUpperClips);
+                videoTrack->setClips(QVector<ClipInfo>{videoClip});
+                if (addedUpper) projectTimeline->removeTrack(false, projectTimeline->videoTracks().size() - 1);
+                std::fprintf(stderr, "mcp G194 v1Visible=%d isError=%d err=[%s] captured=%d terminal=%d status=%d "
+                    "jobError=[%s] outputVideoFrames=%d | allEmpty isError=%d err=[%s] queueAfter=%lld addedUpper=%d "
+                    "(expect visible, ok, Completed=%d, frames > 0, all-empty refused, queue 0)\n",
+                    v1Visible, upperRun.isError, qPrintable(upperRun.errorText), upperRun.captured, upperRun.terminal,
+                    static_cast<int>(upperRun.finalStatus), qPrintable(upperJobError), upperVideoFrames,
+                    allEmptyRun.isError, qPrintable(allEmptyRun.errorText),
+                    static_cast<long long>(allEmptyRun.queueAfter), addedUpper,
+                    static_cast<int>(RenderJobStatus::Completed));
+                tallyObserved(194, observeTerm(194, "V1 visible", v1Visible)
+                    && observeTerm(194, "export_video ok", !upperRun.isError)
+                    && observeTerm(194, "job captured", upperRun.captured)
+                    && observeTerm(194, "job terminal", upperRun.terminal)
+                    && observeTerm(194, "job Completed", upperRun.finalStatus == RenderJobStatus::Completed)
+                    && observeTerm(194, "output video frames > 0", upperVideoFrames > 0)
+                    && observeTerm(194, "all-empty export refused", allEmptyRun.isError)
+                    && observeTerm(194, "all-empty nothing queued", allEmptyRun.queueAfter == 0),
+                    "export_video of a timeline whose visible V1 holds no clip (ordinary video on V2) did not "
+                    "complete with video frames, or a timeline without any video clip was not refused");
             }
 
             // G189 (US-1127): export_video autoLoudness=true prepares the audio on a worker, so a client on
