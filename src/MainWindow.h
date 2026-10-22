@@ -878,6 +878,9 @@ private:
     void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
     void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
+    // selftest: the clipId syncBrushAnimationPreviewForClip last bound (empty once cleared).
+    QString m_brushPreviewClipIdForTest;
+    QString brushPreviewClipIdForTest() const { return m_brushPreviewClipIdForTest; }
     void applyVfxProjectState(const ProjectVfxState &state);
 
     VideoPlayer *m_player;

@@ -3458,31 +3458,37 @@ void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
     if (!m_player || !m_player->glPreview())
         return;
 
-    if (!m_timeline || trackIdx < 0 || clipIdx < 0) {
+    auto clearPreview = [this]() {
+        m_brushPreviewClipIdForTest.clear();
         m_player->glPreview()->clearBrushAnimation();
+    };
+    if (!m_timeline || trackIdx < 0 || clipIdx < 0) {
+        clearPreview();
         return;
     }
 
     auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
     const auto &clips = track->clips();
     if (clipIdx >= clips.size()) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
-    auto *animation = materializeBrushAnimation(brushClipId(trackIdx, clipIdx));
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    auto *animation = materializeBrushAnimation(clipId);
     if (!animation) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
     const double progress = clips[clipIdx].keyframes.valueAt(
         QStringLiteral("brush_progress"), 0.0, 0.0);
+    m_brushPreviewClipIdForTest = clipId;
     m_player->glPreview()->setBrushAnimation(animation);
     m_player->glPreview()->setBrushAnimationProgress(progress);
 }
@@ -9721,6 +9727,10 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
         brushes.append(entry);
     }
     m_brushAnimationEntries = std::move(brushes);
+    // US-1320: the selection moved mid-mutation and bound the preview through the old
+    // keys; bind it again now that the brush maps carry the new ones.
+    if (!remap.oldToNew.isEmpty() || !remap.dropped.isEmpty())
+        syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
 }
 
 // US-1302 undo rule: adding a brush animation records an undo point (its progress

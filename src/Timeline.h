@@ -1490,6 +1490,7 @@ public:
     // remapCarriersByUid, remapCarriersAfterCrossTrackMove and the clipMoved
     // reorder (never by the TrackMatteKey helpers). A repeat of the last remap
     // on the same post-mutation clips (the paired helper sites) is not emitted.
+    // Inside a ClipKeyRemapBatch it is composed and emitted when the batch closes.
     void notifyClipKeysRemapped(ClipKeyRemap remap);
     // Explicit cross-track carrier remaps on this Timeline (selftest): calls of
     // remapCarriersAfterCrossTrackMove, plus one per linked drop that moves a
@@ -1655,6 +1656,24 @@ private:
         ClipKeyRemap remap;
     };
     std::optional<LastKeyRemap> m_lastKeyRemap;
+    // US-1320: while a batch is open, notifyClipKeysRemapped composes each remap into
+    // the pending one; the outermost batch emits the composition once (one user edit
+    // whose own remap and the reconcile's remap must leave as one emit).
+    class ClipKeyRemapBatch {
+    public:
+        explicit ClipKeyRemapBatch(Timeline *timeline) : m_timeline(timeline)
+        { ++m_timeline->m_keyRemapBatchDepth; }
+        ~ClipKeyRemapBatch();
+        ClipKeyRemapBatch(const ClipKeyRemapBatch &) = delete;
+        ClipKeyRemapBatch &operator=(const ClipKeyRemapBatch &) = delete;
+    private:
+        Timeline *m_timeline;
+    };
+    int m_keyRemapBatchDepth = 0;
+    ClipKeyRemap m_pendingKeyRemap;
+    // Emits the pending batch remap now (saveUndoState, so the undo point's sidecars
+    // carry the new keys); the batch then closes with nothing left to emit.
+    void flushPendingKeyRemap();
     // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;

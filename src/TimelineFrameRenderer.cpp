@@ -1970,9 +1970,20 @@ std::atomic<bool> g_layerTimeObservation{false};
 QMutex g_layerTimeObservationMutex;
 QVector<detail::ObservedLayerTime> g_observedLayerTimes;
 
+// A clip-less V1 is a transparent base only under an upper track with clips:
+// a timeline with no clip at all still renders an empty frame (user decision 3).
+bool anyUpperTrackHoldsClip(const QVector<RenderTrackSnapshot> &tracks)
+{
+    for (int t = 1; t < tracks.size(); ++t)
+        if (!tracks[t].clips.isEmpty())
+            return true;
+    return false;
+}
+
 // renderFrameFromTracks returns an empty frame BEFORE collecting any upper
 // layer when V1 is visible, holds clips, but has no clip at targetSec (no V1
-// clip selected). A hidden or clip-less V1 is a transparent base. Same expressions as
+// clip selected), or when no track holds a clip at all. A hidden V1, or a
+// clip-less V1 under an upper track with clips, is a transparent base. Same expressions as
 // the "Resolve + decode the V1 base layer" block there; keep both in sync.
 // (A V1 runtime decode failure also returns early there; that is dynamic and
 // not mirrored, like ParentLayerHit::decodable.)
@@ -1985,8 +1996,10 @@ bool upperLayersReachedByRenderer(
     if (tracks.isEmpty())
         return false;
     const RenderTrackSnapshot &v1 = tracks.first();
-    if (v1.hidden || v1.clips.isEmpty())
+    if (v1.hidden)
         return true;
+    if (v1.clips.isEmpty())
+        return anyUpperTrackHoldsClip(tracks);
     double v1Start = 0.0;
     return selectClipOnTrack(tracks, intervals, overlapA, overlapB, 0,
                              targetSec, /*clampToFirst=*/true, &v1Start,
@@ -2229,7 +2242,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         if (v1Clips.isEmpty()) {
             // A visible V1 with no clip at all composites the upper tracks
             // over a transparent base, like a hidden V1. A timeline with no
-            // video clip anywhere is still refused by the export entry points.
+            // video clip anywhere renders nothing (user decision 3).
+            if (!anyUpperTrackHoldsClip(tracks))
+                return QImage();
             v1NullObject = true;
             base = QImage(outSize, QImage::Format_RGBA8888);
             base.fill(Qt::transparent);

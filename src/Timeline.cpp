@@ -5612,6 +5612,8 @@ bool Timeline::importMedia(const QString &filePath,
     }
 
     // 取り込みも他の MCP 編集と同じく、snapshot を変更の直前に作る。
+    // US-1320: the import's key remap and the reconcile's (saveUndoState) leave as one emit.
+    std::optional<ClipKeyRemapBatch> keyRemapBatch(std::in_place, this);
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     ClipInfo videoClip = clip;
     ClipInfo audioClip = clip;
@@ -5643,6 +5645,7 @@ bool Timeline::importMedia(const QString &filePath,
     remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
     saveUndoState("Add clip");
+    keyRemapBatch.reset();
     if (result) {
         result->videoTrackIndex = placeVideo ? videoTrackIdx : -1;
         result->videoClipIndex = placeVideo ? videoPlan.insertIdx : -1;
@@ -13956,6 +13959,7 @@ void Timeline::saveUndoState(const QString &description)
     if (m_undoManager->currentIndex() < 0)
         clearReconcileBaseline();
     reconcileConnectedClips();
+    flushPendingKeyRemap();
     m_undoManager->saveState(currentState(), description);
     captureReconcileBaseline();
     updateConnectionOverlay();
@@ -15725,7 +15729,52 @@ void Timeline::notifyClipKeysRemapped(ClipKeyRemap remap)
         && sameClipSnapshot(after, m_lastKeyRemap->after))
         return;
     m_lastKeyRemap = LastKeyRemap{std::move(after), remap};
-    emit clipKeysRemapped(remap);
+    if (m_keyRemapBatchDepth == 0) {
+        emit clipKeysRemapped(remap);
+        return;
+    }
+    // Compose `remap` after the pending one: a pending old -> mid follows mid, and a
+    // key no pending pair or drop touched (an identity key) takes the new pair / drop.
+    ClipKeyRemap composed;
+    QSet<QString> pendingTargets;
+    for (auto it = m_pendingKeyRemap.oldToNew.cbegin(); it != m_pendingKeyRemap.oldToNew.cend(); ++it) {
+        pendingTargets.insert(it.value());
+        const auto to = remap.oldToNew.constFind(it.value());
+        if (to != remap.oldToNew.cend())
+            composed.oldToNew.insert(it.key(), to.value());
+        else if (remap.dropped.contains(it.value()))
+            composed.dropped.insert(it.key());
+        else
+            composed.oldToNew.insert(it.key(), it.value());
+    }
+    composed.dropped.unite(m_pendingKeyRemap.dropped);
+    auto identityKey = [&](const QString &key) {
+        return !pendingTargets.contains(key) && !m_pendingKeyRemap.oldToNew.contains(key)
+            && !m_pendingKeyRemap.dropped.contains(key);
+    };
+    for (auto it = remap.oldToNew.cbegin(); it != remap.oldToNew.cend(); ++it)
+        if (identityKey(it.key())) composed.oldToNew.insert(it.key(), it.value());
+    for (const QString &key : std::as_const(remap.dropped))
+        if (identityKey(key)) composed.dropped.insert(key);
+    for (auto it = composed.oldToNew.begin(); it != composed.oldToNew.end();)
+        it = it.key() == it.value() ? composed.oldToNew.erase(it) : std::next(it);
+    m_pendingKeyRemap = std::move(composed);
+}
+
+void Timeline::flushPendingKeyRemap()
+{
+    if (m_keyRemapBatchDepth == 0) return;
+    ClipKeyRemap remap = std::exchange(m_pendingKeyRemap, ClipKeyRemap{});
+    if (!remap.oldToNew.isEmpty() || !remap.dropped.isEmpty())
+        emit clipKeysRemapped(remap);
+}
+
+Timeline::ClipKeyRemapBatch::~ClipKeyRemapBatch()
+{
+    if (--m_timeline->m_keyRemapBatchDepth > 0) return;
+    ClipKeyRemap remap = std::exchange(m_timeline->m_pendingKeyRemap, ClipKeyRemap{});
+    if (!remap.oldToNew.isEmpty() || !remap.dropped.isEmpty())
+        emit m_timeline->clipKeysRemapped(remap);
 }
 
 void Timeline::setRotoEntries(const QHash<QString, RotoClipEntry> &entries)
