@@ -100,6 +100,8 @@ constexpr int kDialogPassthrough = 114;
 // The A/V source clip and the scratch directory of the exported files; set by runAudioFixtureSelftest.
 QString g_avSourcePath;
 QString g_exportWorkDir;
+// US-1311: variant r (not part of the fixture set) is the same A/V clip with the tone starting at 2 s.
+QString g_lateToneSourcePath;
 const char *const kNames[kFixtureCount] = {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o",
                                            "p", "q"};
 
@@ -414,12 +416,14 @@ bool setupVariant(int variant, AudioMixer &mixer, Timeline &timeline, QString *e
 
 // US-1210 source clip: 4 s of 64x64 mpeg4 at 30 fps with a stereo 48 kHz PCM16 1 kHz tone (0.25 FS)
 // muxed in by FrameEncoder's audio passthrough (the container is Matroska, which carries PCM).
-bool writeAvToneClip(const QString &path, const QString &toneWav, QString *error)
+bool writeAvToneClip(const QString &path, const QString &toneWav, QString *error, double toneStartSec = 0.0)
 {
     constexpr int rate = 48000;
     QByteArray pcm(rate * 4 * 2 * 2, Qt::Uninitialized);
     for (int i = 0; i < rate * 4; ++i) {
-        const qint16 value = qint16(std::lround(0.25 * 32767.0 * std::sin(2.0 * M_PI * 1000.0 * i / rate)));
+        const qint16 value = i < toneStartSec * rate
+            ? qint16(0)
+            : qint16(std::lround(0.25 * 32767.0 * std::sin(2.0 * M_PI * 1000.0 * i / rate)));
         for (int c = 0; c < 2; ++c) {
             pcm[4 * i + 2 * c] = char(value & 0xff);
             pcm[4 * i + 2 * c + 1] = char((value >> 8) & 0xff);
@@ -636,6 +640,63 @@ bool exportVariant(int variant, const QString &wavPath, QByteArray *pcm, QString
     return readPcmData(wavPath, pcm, error, channels, sampleRate);
 }
 
+// US-1311 variant r: a RenderQueue job on the live Timeline (V1 / A1 = the late-tone A/V clip, tone from
+// 2 s on) with startUs = 1 s, endUs = 3 s and no marked range, exported directly through the queue; the
+// output's audio is decoded to a WAV. The tone must start at 1 s of the output (2 s of the source).
+bool exportLateToneRange(const QString &wavPath, QByteArray *pcm, QString *error, int *channels, int *sampleRate)
+{
+    if (g_exportWorkDir.isEmpty() || !QFile::exists(g_lateToneSourcePath)) {
+        *error = QStringLiteral("late-tone A/V source unavailable: %1").arg(g_lateToneSourcePath);
+        return false;
+    }
+    const QString outputPath = QDir(g_exportWorkDir).filePath(QStringLiteral("r-range.mkv"));
+    ClipInfo picture;
+    picture.filePath = g_lateToneSourcePath;
+    picture.displayName = QStringLiteral("audio-fixture-av-late");
+    picture.duration = 4.0;
+    picture.inPoint = 0.0;
+    picture.outPoint = 4.0;
+    Timeline timeline;
+    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+        QVector<QVector<ClipInfo>>{{picture}}, 0.0, -1.0, -1.0, 100);
+    RenderQueue queue;
+    RenderJob job;
+    job.name = QStringLiteral("audio-fixture-r");
+    job.projectFilePath = g_lateToneSourcePath;
+    job.outputPath = outputPath;
+    job.startUs = 1'000'000;
+    job.endUs = 3'000'000;
+    job.timeline = &timeline;
+    job.exportConfig = QJsonObject{{QStringLiteral("width"), 64}, {QStringLiteral("height"), 64},
+                                   {QStringLiteral("fps"), 10}, {QStringLiteral("videoCodec"), QStringLiteral("mpeg4")},
+                                   {QStringLiteral("videoBitrate"), 200}};
+    RenderJobStatus status = RenderJobStatus::Pending;
+    QString jobError;
+    bool sawJob = false;
+    QObject::connect(&queue, &RenderQueue::jobsChanged, &queue, [&]() {
+        for (const RenderJob &entry : queue.jobs()) {
+            if (entry.outputPath != outputPath) continue;
+            sawJob = true;
+            status = entry.status;
+            jobError = entry.errorMessage.isEmpty() ? entry.error : entry.errorMessage;
+        }
+    });
+    queue.addJob(job);
+    queue.start();
+    const bool finished = QTest::qWaitFor([&]() {
+        return sawJob && (status == RenderJobStatus::Completed || status == RenderJobStatus::Failed);
+    }, 300000);
+    std::fprintf(stderr, "G24 r export finished=%d job=%d status=%d jobError=%s\n", finished, sawJob, int(status),
+                 jobError.toUtf8().constData());
+    if (!finished || status != RenderJobStatus::Completed || !QFile::exists(outputPath)) {
+        *error = QStringLiteral("r export did not complete: %1").arg(jobError);
+        return false;
+    }
+    if (!libavcore::extractAudioToWav(outputPath, wavPath, 48000, error))
+        return false;
+    return readPcmData(wavPath, pcm, error, channels, sampleRate);
+}
+
 bool generate(int variant, const QString &path, QByteArray *pcm, QString *error,
               int *channels = nullptr, int *sampleRate = nullptr,
               const QString &source = QStringLiteral("test_assets/e2e_hum.wav"))
@@ -711,7 +772,7 @@ int runAudioFixtureSelftest()
     if (!QFile::exists(source) || ffmpeg.isEmpty()) {
         std::fprintf(stderr, "audio-fixture prerequisites: source=%d ffmpeg=%s (cwd must be repository root)\n",
                      QFile::exists(source), ffmpeg.toUtf8().constData());
-        for (int gate = 1; gate <= 22; ++gate)
+        for (int gate = 1; gate <= 24; ++gate)
             tally.skip(gate, "test_assets/e2e_hum.wav or ffmpeg unavailable");
         return tally.finish();
     }
@@ -719,13 +780,13 @@ int runAudioFixtureSelftest()
     const QString outputPath = qEnvironmentVariable("VEDITOR_AUDIO_FIXTURE_OUT");
     if (outputPath.isEmpty()) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT is required");
-        for (int gate = 2; gate <= 22; ++gate)
+        for (int gate = 2; gate <= 24; ++gate)
             tally.skip(gate, "G1 output directory is unset");
         return tally.finish();
     }
     if (!QDir().mkpath(outputPath)) {
         tally.gate(1, false, "VEDITOR_AUDIO_FIXTURE_OUT cannot be created");
-        for (int gate = 2; gate <= 22; ++gate)
+        for (int gate = 2; gate <= 24; ++gate)
             tally.skip(gate, "G1 output directory unavailable");
         return tally.finish();
     }
@@ -745,7 +806,7 @@ int runAudioFixtureSelftest()
     }
     if (!outputCleared) {
         tally.gate(1, false, "stale audio fixture output cannot be removed");
-        for (int gate = 2; gate <= 22; ++gate)
+        for (int gate = 2; gate <= 24; ++gate)
             tally.skip(gate, "G1 output cleanup failed");
         return tally.finish();
     }
@@ -760,6 +821,10 @@ int runAudioFixtureSelftest()
         g_avSourcePath = QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_1k.mkv"));
         if (!writeAvToneClip(g_avSourcePath, QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_1k.wav")), &avError))
             g_avSourcePath.clear();
+        g_lateToneSourcePath = QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_late.mkv"));
+        if (!writeAvToneClip(g_lateToneSourcePath, QDir(g_exportWorkDir).filePath(QStringLiteral("av_tone_late.wav")),
+                             &avError, 2.0))
+            g_lateToneSourcePath.clear();
     }
     std::fprintf(stderr, "G1 avSource=%s workDirValid=%d error=%s\n", g_avSourcePath.toUtf8().constData(),
                  exportWork.isValid(), avError.toUtf8().constData());
@@ -1850,6 +1915,36 @@ int runAudioFixtureSelftest()
         tally.gate(23, nestedOk && sane && levelOk,
                    "render-queue-dialog job from a saved project must mix the audio inside a nested sequence "
                    "(1 kHz at the source level)");
+    }
+    // US-1311 G24: variant r (a RenderQueue job on the late-tone A/V clip, tone from 2 s on, startUs = 1 s,
+    // endUs = 3 s, no marked range) exports audio from the job start: the 1 kHz tone starts at 1 s of the
+    // output (+-1 audio frame: the stream copy keeps whole 4096-sample source packets, so the tone lands up
+    // to one packet late) and the first 0.9 s is silent. Detects: the audio muxed
+    // from 0 s of the source (HEAD: silence over the first 1 s, the tone only at 2 s of the output).
+    {
+        QByteArray rPcm;
+        QString rError;
+        int rChannels = 0, rRate = 0;
+        const bool rOk = exportLateToneRange(QDir(g_exportWorkDir).filePath(QStringLiteral("r-range.wav")), &rPcm,
+                                              &rError, &rChannels, &rRate);
+        qsizetype onset = -1;
+        const qsizetype frames = rChannels > 0 ? rPcm.size() / (2 * rChannels) : 0;
+        for (qsizetype frame = 0; frame < frames; ++frame)
+            if (std::abs(int(static_cast<qint16>(readLe16(rPcm.constData() + 2 * frame * rChannels)))) > 1000) {
+                onset = frame;
+                break;
+            }
+        const double onsetSec = onset >= 0 && rRate > 0 ? double(onset) / rRate : -1.0;
+        const double earlyTone = toneLevel(rPcm, rChannels, rRate, kToneHz, 0.1, 0.9);
+        const double lateTone = toneLevel(rPcm, rChannels, rRate, kToneHz, 1.2, 1.9);
+        const bool onsetOk = onset >= 0 && rRate > 0 && std::abs(onset - rRate) <= 4096;
+        std::fprintf(stderr, "G24 r onsetSec=%.6f onsetSample=%lld target=1.0+-4096smp onsetOk=%d earlyTone=%.12g "
+                             "lateTone=%.12g bytes=%lld channels=%d rate=%d exported=%d error=%s\n",
+                     onsetSec, static_cast<long long>(onset), onsetOk, earlyTone, lateTone,
+                     static_cast<long long>(rPcm.size()), rChannels, rRate, rOk, rError.toUtf8().constData());
+        tally.gate(24, rOk && onsetOk && earlyTone < 0.01 && lateTone > 0.05,
+                   "render-queue job starting at 1 s without a marked range must mux its audio from the job start "
+                   "(source tone from 2 s starts at 1 s of the output)");
     }
     return tally.finish();
 }

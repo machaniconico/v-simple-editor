@@ -777,6 +777,18 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
     if (effects.isEmpty())
         return graded;
 
+    // US-1301: LensDistortion's out-of-frame fill follows the clip's media
+    // (alpha media -> transparent, otherwise the opaque black of before), never
+    // the frame content. The media is probed only when the stack has one.
+    const bool hasLensDistortion = std::any_of(effects.begin(), effects.end(), [](const VideoEffect &e) {
+        return e.enabled && e.type == VideoEffectType::LensDistortion;
+    });
+    // The transparent edge also routes every frame of such a clip through the
+    // carry loop below, so an alpha-dropping effect after the lens keeps the
+    // edge transparent on opaque frames too (no per-frame switch).
+    const bool transparentEdge = hasLensDistortion && roto::probeMediaHasAlpha(clip.filePath);
+    const VideoEffectProcessor::TransparentEdgeFillScope edgeFill(transparentEdge);
+
     // US-1004: a layer whose input carries alpha < 255 (roto exterior, alpha
     // media) keeps it through every effect that does not move pixels: each such
     // effect's output alpha is clamped to the alpha carried so far (a keyer
@@ -792,14 +804,23 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
                              || e.type == VideoEffectType::LumaKey
                              || e.type == VideoEffectType::ColorKey);
     });
-    if (hasKeyer || roto::hasTranslucentPixel(graded)) {
+    if (hasKeyer || roto::hasTranslucentPixel(graded) || transparentEdge) {
         alphaCarryLoopEntries.fetch_add(1, std::memory_order_relaxed);
         QImage result = graded;
         QImage alphaCarrier = graded;
         for (const VideoEffect &effect : effects) {
-            result = VideoEffectProcessor::applyEffect(result, effect);
             const bool moves = effect.enabled && effect.type != VideoEffectType::None
                 && roto::effectMovesPixels(effect.type);
+            // US-1301: DisplacementMap / LensDistortion move the alpha carried so
+            // far, not the opaque output of an alpha-dropping effect before it
+            // (Blur -> DisplacementMap). Other pixel-moving effects keep the base
+            // behaviour. clampAlphaToInput returns `result` unchanged when the
+            // carrier is opaque.
+            const bool restoreCarried = moves
+                && (effect.type == VideoEffectType::DisplacementMap
+                    || effect.type == VideoEffectType::LensDistortion);
+            const QImage in = restoreCarried ? roto::clampAlphaToInput(alphaCarrier, result) : result;
+            result = VideoEffectProcessor::applyEffect(in, effect);
             alphaCarrier = moves ? result : roto::clampAlphaToInput(alphaCarrier, result);
         }
         return alphaCarrier.convertToFormat(QImage::Format_RGBA8888);
@@ -1003,6 +1024,14 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
     if (clip.isAdjustment)
         return applyClipFxPack(graded, clip, clipLocalSeconds);
 
+    // US-1301: same per-clip LensDistortion edge fill as applyClipFxPack, held
+    // across the whole prefix so the echo / rolling-shutter recursion sees it.
+    const bool transparentEdge =
+        std::any_of(clip.effects.begin(), clip.effects.end(), [](const VideoEffect &e) {
+            return e.enabled && e.type == VideoEffectType::LensDistortion;
+        })
+        && roto::probeMediaHasAlpha(clip.filePath);
+
     auto stableEffectsAt = [&clip](double localSeconds) {
         // effectiveEffectsAt removes time-inactive effects, which destroys
         // their stack indices. Echo recursion needs stable indices so an
@@ -1133,6 +1162,7 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
         return result;
     };
 
+    const VideoEffectProcessor::TransparentEdgeFillScope edgeFill(transparentEdge);
     return applyPrefix(
         graded, static_cast<int>(clip.effects.size()),
         clipLocalSeconds, sourceSeconds)
@@ -1940,9 +1970,20 @@ std::atomic<bool> g_layerTimeObservation{false};
 QMutex g_layerTimeObservationMutex;
 QVector<detail::ObservedLayerTime> g_observedLayerTimes;
 
+// A clip-less V1 is a transparent base only under an upper track with clips:
+// a timeline with no clip at all still renders an empty frame (user decision 3).
+bool anyUpperTrackHoldsClip(const QVector<RenderTrackSnapshot> &tracks)
+{
+    for (int t = 1; t < tracks.size(); ++t)
+        if (!tracks[t].clips.isEmpty())
+            return true;
+    return false;
+}
+
 // renderFrameFromTracks returns an empty frame BEFORE collecting any upper
-// layer when V1 is visible but has no clip at targetSec (V1 track empty with
-// no active upper shape clip, or no V1 clip selected). Same expressions as
+// layer when V1 is visible, holds clips, but has no clip at targetSec (no V1
+// clip selected), or when no track holds a clip at all. A hidden V1, or a
+// clip-less V1 under an upper track with clips, is a transparent base. Same expressions as
 // the "Resolve + decode the V1 base layer" block there; keep both in sync.
 // (A V1 runtime decode failure also returns early there; that is dynamic and
 // not mirrored, like ParentLayerHit::decodable.)
@@ -1957,18 +1998,8 @@ bool upperLayersReachedByRenderer(
     const RenderTrackSnapshot &v1 = tracks.first();
     if (v1.hidden)
         return true;
-    if (v1.clips.isEmpty()) {
-        bool activeUpperShape = false;
-        for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
-            double ignoredStart = 0.0;
-            const int idx = activeClipOnTrack(
-                tracks[t].clips, targetSec, /*clampToFirst=*/false,
-                &ignoredStart);
-            activeUpperShape = idx >= 0
-                && !tracks[t].clips[idx].shapes.isEmpty();
-        }
-        return activeUpperShape;
-    }
+    if (v1.clips.isEmpty())
+        return anyUpperTrackHoldsClip(tracks);
     double v1Start = 0.0;
     return selectClipOnTrack(tracks, intervals, overlapA, overlapB, 0,
                              targetSec, /*clampToFirst=*/true, &v1Start,
@@ -2184,8 +2215,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     };
 
     // ── Resolve + decode the V1 base layer ──────────────────────────────────
-    // The early returns below (V1 empty without an active upper shape, no V1
-    // clip selected) are mirrored by upperLayersReachedByRenderer for
+    // The early return below (no V1 clip selected) and the transparent base
+    // for a hidden or clip-less V1 are mirrored by upperLayersReachedByRenderer for
     // tlrender::parentLayerAt; change both together.
     // Single-track byte-identity with S2: V1 alone with a default transform
     // must produce the SAME pixels S2 returned (decode native -> scale to
@@ -2209,19 +2240,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     } else {
         const QVector<ClipInfo> &v1Clips = v1.clips;
         if (v1Clips.isEmpty()) {
-            // A shape clip may legitimately live on a selected upper track
-            // while V1 is empty. Keep the legacy no-V1 result for ordinary
-            // projects, but provide a transparent base for this opt-in case.
-            bool activeUpperShape = false;
-            for (int t = 1; t < tracks.size() && !activeUpperShape; ++t) {
-                double ignoredStart = 0.0;
-                const int idx = activeClipOnTrack(
-                    tracks[t].clips, targetSec, /*clampToFirst=*/false,
-                    &ignoredStart);
-                activeUpperShape = idx >= 0
-                    && !tracks[t].clips[idx].shapes.isEmpty();
-            }
-            if (!activeUpperShape)
+            // A visible V1 with no clip at all composites the upper tracks
+            // over a transparent base, like a hidden V1. A timeline with no
+            // video clip anywhere renders nothing (user decision 3).
+            if (!anyUpperTrackHoldsClip(tracks))
                 return QImage();
             v1NullObject = true;
             base = QImage(outSize, QImage::Format_RGBA8888);
@@ -3211,6 +3233,12 @@ QImage applyClipFxStackWithEchoFromSource(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds, const EchoFrameProvider &frameProvider)
 {
+    // US-1301: the CPU preview sends every mesh-warp / puppet clip here. Without
+    // an active Echo / RollingShutter, take the export path (applyClipFxPack has
+    // the US-1004 alpha carry loop; applyClipFxPackWithEcho does not).
+    if (!hasActiveEcho(clip, clipLocalSeconds)
+        && !hasActiveRollingShutter(clip, clipLocalSeconds))
+        return applyClipFxStackFromSource(source, clip, clipLocalSeconds);
     return applyClipMeshWarp(applyClipFxPackWithEcho(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
         clip, clipLocalSeconds, sourceSeconds, frameProvider), clip);

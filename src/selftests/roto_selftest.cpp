@@ -16,6 +16,7 @@
 #include "../SmartRender.h"
 #include "../RenderInPlace.h"
 #include "../VideoEffect.h"
+#include "../WarpDistortion.h"
 #include <cmath>
 #include <atomic>
 #include <functional>
@@ -621,7 +622,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 45;
+    constexpr int kRotoGateCount = 48;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -3464,6 +3465,463 @@ int runRotoSelftest()
                    "keyer alpha restored to opaque by a later effect on an opaque source, "
                    "or the alpha-carry loop entered without a keyer");
     }
+
+    // ── G46-G48 (US-1301): alpha through the pixel-moving effects. The
+    // reference for an effect's output alpha is the same effect applied to an
+    // opaque image whose R = G = B = the input alpha ("replica"): a geometric
+    // effect must move the alpha exactly like it moves a colour channel.
+    const auto alphaGap = [](const QImage &out, const QImage &replicaOut, bool green) {
+        if (out.isNull() || replicaOut.isNull() || out.size() != replicaOut.size())
+            return 256;
+        int gap = 0;
+        for (int y = 0; y < out.height(); ++y)
+            for (int x = 0; x < out.width(); ++x) {
+                const QRgb r = replicaOut.pixel(x, y);
+                gap = qMax(gap, qAbs(qAlpha(out.pixel(x, y)) - (green ? qGreen(r) : qRed(r))));
+            }
+        return gap;
+    };
+    const auto alphaChanged = [](const QImage &a, const QImage &b) {
+        int changed = 0;
+        for (int y = 0; y < a.height(); ++y)
+            for (int x = 0; x < a.width(); ++x)
+                changed += qAlpha(a.pixel(x, y)) != qAlpha(b.pixel(x, y));
+        return changed;
+    };
+    const auto replicaOf = [](const QImage &image) {
+        QImage replica(image.size(), QImage::Format_ARGB32);
+        for (int y = 0; y < image.height(); ++y)
+            for (int x = 0; x < image.width(); ++x) {
+                const int a = qAlpha(image.pixel(x, y));
+                replica.setPixel(x, y, qRgb(a, a, a));
+            }
+        return replica;
+    };
+
+    // ── G46: sweep of the effectMovesPixels types on a half-transparent
+    // checker (8 px cells, alpha 30 / 100 / 170 / 240). Non-identity
+    // parameters, Flip / Warp / LensDistortion switches on, LensDistortion with
+    // the alpha-media fill (transparent). |out.alpha - replicaOut.R| <= 1
+    // (RGBSplit / GlitchVHS take alpha from the centre sample = G). Echo / RS:
+    // out.alpha == in.alpha. HEAD: DisplacementMap / LensDistortion work in
+    // RGB888, so their alpha is 255 everywhere and the gap is >= 15.
+    {
+        QImage checker(64, 64, QImage::Format_ARGB32);
+        const int levels[4] = {30, 100, 170, 240};
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 64; ++x)
+                checker.setPixel(x, y, qRgba(200, 120, 40, levels[(x / 8 + 2 * (y / 8)) % 4]));
+        const QImage replica = replicaOf(checker);
+        const auto make = [](VideoEffectType type, double p1, double p2, double p3) {
+            VideoEffect e;
+            e.type = type;
+            e.param1 = p1;
+            e.param2 = p2;
+            e.param3 = p3;
+            return e;
+        };
+        const QVector<std::pair<const char *, VideoEffect>> sweep{
+            {"DisplacementMap", VideoEffect::createDisplacementMap(12.0, 6.0, 0)},
+            {"WaveWarp", VideoEffect::createWaveWarp(6.0, 20.0, 0.0)},
+            {"Ripple", VideoEffect::createRipple(6.0, 20.0, 0.0)},
+            {"Bulge", VideoEffect::createBulge(60.0, 0.6)},
+            {"Twirl", VideoEffect::createTwirl(90.0, 0.6)},
+            {"Mirror", VideoEffect::createMirror(0)},
+            {"PolarCoordinates", VideoEffect::createPolarCoordinates(0, 1.0)},
+            {"MotionTile", VideoEffect::createMotionTile(2, 2, false)},
+            {"CornerPinSimple", VideoEffect::createCornerPinSimple(40.0, 20.0)},
+            {"Echo", VideoEffect::createEcho()},
+            {"LensDistortion", VideoEffect::createLensDistortion(0.3)},
+            {"RollingShutterRepair", VideoEffect::createRollingShutterRepair()},
+            {"Flip", make(VideoEffectType::Flip, 0.0, 0.0, 0.0)},
+            {"RGBSplit", VideoEffect::createRGBSplit(6.0, 0.0)},
+            {"GlitchVHS", VideoEffect::createGlitchVHS(0.5, 12.0, 1.0)},
+            {"WarpWave", make(VideoEffectType::WarpWave, 6.0, 2.0, 0.0)},
+            {"WarpRipple", make(VideoEffectType::WarpRipple, 6.0, 3.0, 0.8)},
+            {"WarpSpherize", make(VideoEffectType::WarpSpherize, 0.6, 0.8, 0.0)},
+            {"WarpFisheye", make(VideoEffectType::WarpFisheye, 0.6, 0.0, 0.0)},
+            {"WarpPinch", make(VideoEffectType::WarpPinch, 0.6, 0.8, 0.0)}};
+        VideoEffectProcessor::setFlipEnabledForTesting(true);
+        VideoEffectProcessor::setWarpEnabledForTesting(true);
+        VideoEffectProcessor::setLensDistortionEnabledForTesting(true);
+        const VideoEffectProcessor::TransparentEdgeFillScope alphaMediaFill(true);
+        bool sweepOk = true;
+        QSet<int> swept;
+        for (const auto &[label, effect] : sweep) {
+            swept.insert(static_cast<int>(effect.type));
+            const QImage out = VideoEffectProcessor::applyEffect(checker, effect);
+            const bool identity = effect.type == VideoEffectType::Echo
+                || effect.type == VideoEffectType::RollingShutterRepair;
+            const bool green = effect.type == VideoEffectType::RGBSplit
+                || effect.type == VideoEffectType::GlitchVHS;
+            // moved: replica pixels whose R / G changed = the effect was not an
+            // identity (RGBSplit keeps alpha and G in place and moves R).
+            int gap = 256, moved = -1;
+            if (!out.isNull() && !identity) {
+                const QImage replicaOut = VideoEffectProcessor::applyEffect(replica, effect);
+                gap = alphaGap(out, replicaOut, green);
+                moved = 0;
+                for (int y = 0; y < 64; ++y)
+                    for (int x = 0; x < 64; ++x)
+                        moved += qRed(replicaOut.pixel(x, y)) != qRed(replica.pixel(x, y))
+                            || qGreen(replicaOut.pixel(x, y)) != qGreen(replica.pixel(x, y));
+            } else if (!out.isNull()) {
+                gap = 0;
+                for (int y = 0; y < 64; ++y)
+                    for (int x = 0; x < 64; ++x)
+                        gap = qMax(gap, qAbs(qAlpha(out.pixel(x, y)) - qAlpha(checker.pixel(x, y))));
+            }
+            const int changed = out.isNull() ? -1 : alphaChanged(out, checker);
+            const bool ok = roto::effectCarriesAlpha(effect.type)
+                && (identity ? gap == 0 && changed == 0 : gap <= 1 && moved > 0);
+            sweepOk &= ok;
+            std::cerr << "G46 " << label << " format=" << (out.isNull() ? -1 : int(out.format()))
+                      << (identity ? " |a-in.a|=" : (green ? " |a-ref.G|=" : " |a-ref.R|="))
+                      << gap << " alphaChanged=" << changed << " replicaMoved=" << moved
+                      << (ok ? " ok" : " MISMATCH") << "\n";
+        }
+        VideoEffect modeOne = VideoEffect::createDisplacementMap(12.0, 6.0, 1);
+        const QImage modeOneOut = VideoEffectProcessor::applyEffect(checker, modeOne);
+        int modeOneMin = 256, modeOneMax = -1;
+        for (int y = 0; y < modeOneOut.height(); ++y)
+            for (int x = 0; x < modeOneOut.width(); ++x) {
+                modeOneMin = qMin(modeOneMin, qAlpha(modeOneOut.pixel(x, y)));
+                modeOneMax = qMax(modeOneMax, qAlpha(modeOneOut.pixel(x, y)));
+            }
+        const bool modeOneOk = modeOneMin >= 30 && modeOneMax <= 240 && modeOneMin < modeOneMax;
+        int movesCount = 0, carriesCount = 0;
+        bool carriesSubset = true;
+        for (const VideoEffectType type : VideoEffect::allTypes()) {
+            movesCount += roto::effectMovesPixels(type);
+            carriesCount += roto::effectCarriesAlpha(type);
+            carriesSubset &= !roto::effectCarriesAlpha(type) || roto::effectMovesPixels(type);
+        }
+        bool sweptAllMoving = swept.size() == movesCount;
+        for (const int type : swept)
+            sweptAllMoving &= roto::effectMovesPixels(static_cast<VideoEffectType>(type));
+        std::cerr << "G46 DisplacementMap mode=1 alpha=" << modeOneMin << ".." << modeOneMax
+                  << " (within 30..240, not constant)" << " table carries=" << carriesCount
+                  << " moves=" << movesCount << " (== 20) subset=" << carriesSubset
+                  << " swept=" << swept.size() << " allMoving=" << sweptAllMoving << "\n";
+        gates.gate(46, sweepOk && modeOneOk && carriesCount == 20 && movesCount == 20
+                       && carriesSubset && sweptAllMoving,
+                   "a pixel-moving effect did not move the alpha like RGB, or the alpha table "
+                   "and effectMovesPixels disagree");
+    }
+
+    // ── G47 (1) keyer + DisplacementMap (mode 0) + blur through the clip FX
+    // stage: the keyed alpha is displaced like the replica (HEAD: the RGB888
+    // displacement restarts the carried alpha at 255); (1b) keyer + blur +
+    // DisplacementMap and (1c) translucent input + blur + LensDistortion move
+    // the carried alpha, not the blur's opaque output; (1d) keyer + blur +
+    // Mirror keeps the base output (alpha 255). (2) LensDistortion on V2
+    // over an opaque red V3 through renderFrameAt (frames arrive as RGBA8888):
+    // (2a) ProRes 4444 alpha media -> the out-of-frame corner shows V3 (HEAD:
+    // black), (2b) opaque mpeg4 media -> the corner stays opaque black (a fill
+    // chosen by the working format would make it transparent), (2c) the same
+    // alpha clip on a translucent frame and on a fully opaque frame keeps the
+    // same corner, (2d) and keeps it when a Blur after the lens drops alpha,
+    // (2f) also with a mesh warp / puppet pin through the CPU preview's entry
+    // (applyClipFxStackWithEchoFromSource == applyClipFxStackFromSource); the
+    // probe calls an RGB PNG opaque and an RGBA PNG alpha media.
+    // (3) roto + a translating mesh warp, and roto + a puppet pin,
+    // move the roto alpha like the replica (regression pin, HEAD passes).
+    {
+        QString proresUnavailable;
+        if (!selftest::requireEncoder(QStringLiteral("prores_ks"), &proresUnavailable)) {
+            gates.skip(47, "prores_ks encoder unavailable (the alpha media fixture is ProRes 4444)");
+        } else {
+            // (1)
+            QImage keySource(64, 64, QImage::Format_ARGB32);
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    keySource.setPixel(x, y, ((x / 8 + y / 8) % 2) ? qRgb(0, 255, 0) : qRgb(32, 80, 160));
+            const VideoEffect colorKey = VideoEffect::createColorKey(QColor(0, 255, 0), 0.3, 0.0);
+            const VideoEffect displace = VideoEffect::createDisplacementMap(12.0, 6.0, 0);
+            ClipInfo keyed;
+            keyed.effects = {colorKey, displace, VideoEffect::createBlur(3.0)};
+            const QImage keyedOut = tlrender::applyClipFxStackFromSource(keySource, keyed, 0.0);
+            const QImage keyAlpha = VideoEffectProcessor::applyEffect(keySource, colorKey);
+            const QImage keyExpected = VideoEffectProcessor::applyEffect(replicaOf(keyAlpha), displace);
+            int keyedTransparent = 0;
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    keyedTransparent += qRed(keyExpected.pixel(x, y)) == 0;
+            const int keyGap = alphaGap(keyedOut, keyExpected, false);
+            const bool keyOk = keyGap <= 1 && keyedTransparent > 0 && keyedTransparent < 64 * 64;
+            // (1b) ColorKey -> Blur -> DisplacementMap: the Blur drops alpha
+            // (RGB888), so the displacement must move the carried key alpha
+            // (HEAD of this fix: it got alpha 255 and restarted the carry opaque).
+            ClipInfo keyedBlurFirst;
+            keyedBlurFirst.effects = {colorKey, VideoEffect::createBlur(3.0), displace};
+            const QImage keyedBlurFirstOut = tlrender::applyClipFxStackFromSource(keySource, keyedBlurFirst, 0.0);
+            const int keyBlurFirstGap = alphaGap(keyedBlurFirstOut, keyExpected, false);
+            int keyBlurFirstTransparent = 0;
+            for (int y = 0; !keyedBlurFirstOut.isNull() && y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    keyBlurFirstTransparent += qAlpha(keyedBlurFirstOut.pixel(x, y)) <= 1;
+            const bool keyBlurFirstOk = keyBlurFirstGap <= 1 && keyBlurFirstTransparent > 0;
+            // (1d) ColorKey -> Blur -> Mirror (neither target effect): the
+            // expected value is the plain applyEffect chain output that a
+            // non-target effect should receive (Mirror fed the opaque Blur
+            // output, not the carried key alpha), plus an independent check
+            // that every pixel has alpha 255.
+            QImage greenSource(64, 64, QImage::Format_ARGB32);
+            greenSource.fill(qRgb(0, 255, 0));
+            const VideoEffect blur3 = VideoEffect::createBlur(3.0);
+            const VideoEffect mirror = VideoEffect::createMirror(0);
+            ClipInfo keyBlurMirror;
+            keyBlurMirror.effects = {colorKey, blur3, mirror};
+            const QImage keyBlurMirrorOut = tlrender::applyClipFxStackFromSource(greenSource, keyBlurMirror, 0.0);
+            const QImage keyBlurMirrorPlainChain = VideoEffectProcessor::applyEffect(
+                VideoEffectProcessor::applyEffect(VideoEffectProcessor::applyEffect(greenSource, colorKey), blur3),
+                mirror).convertToFormat(QImage::Format_RGBA8888);
+            int keyBlurMirrorOpaque = 0;
+            for (int y = 0; !keyBlurMirrorOut.isNull() && y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    keyBlurMirrorOpaque += qAlpha(keyBlurMirrorOut.pixel(x, y)) == 255;
+            const bool keyBlurMirrorSame = keyBlurMirrorOut.format() == keyBlurMirrorPlainChain.format()
+                && keyBlurMirrorOut.size() == keyBlurMirrorPlainChain.size() && keyBlurMirrorOut == keyBlurMirrorPlainChain;
+            const bool keyBlurMirrorOk = keyBlurMirrorSame && keyBlurMirrorOpaque == 64 * 64;
+            // (1c) translucent input -> Blur -> LensDistortion: the interior
+            // (away from the out-of-frame fill) keeps the moved alpha < 255.
+            QImage translucentSource(64, 64, QImage::Format_ARGB32);
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 64; ++x)
+                    translucentSource.setPixel(x, y, qRgba(32, 80, 160, ((x / 8 + y / 8) % 2) ? 96 : 255));
+            const VideoEffect lens = VideoEffect::createLensDistortion(0.3);
+            ClipInfo blurLens;
+            blurLens.effects = {VideoEffect::createBlur(3.0), lens};
+            const QImage blurLensOut = tlrender::applyClipFxStackFromSource(translucentSource, blurLens, 0.0);
+            const QImage blurLensExpected = VideoEffectProcessor::applyEffect(replicaOf(translucentSource), lens);
+            int blurLensGap = blurLensOut.isNull() || blurLensExpected.isNull() ? 256 : 0;
+            int blurLensTranslucent = 0;
+            for (int y = 16; blurLensGap < 256 && y < 48; ++y)
+                for (int x = 16; x < 48; ++x) {
+                    const int a = qAlpha(blurLensOut.pixel(x, y));
+                    blurLensGap = qMax(blurLensGap, qAbs(a - qRed(blurLensExpected.pixel(x, y))));
+                    blurLensTranslucent += a < 255;
+                }
+            const bool blurLensOk = blurLensGap <= 1 && blurLensTranslucent > 0;
+
+            // (2)
+            const QString alphaClipPath = media.filePath(QStringLiteral("roto-alpha-4444.mov"));
+            const QString redBasePath = media.filePath(QStringLiteral("roto-alpha-base-red.mp4"));
+            bool fixtureOk = writeSyntheticClip(redBasePath, QColor(200, 60, 40));
+            {
+                libavcore::EncodeRequest request;
+                request.width = 64;
+                request.height = 64;
+                request.fps = 10;
+                request.fpsNum = 10;
+                request.fpsDen = 1;
+                request.outputPath = alphaClipPath.toStdString();
+                request.videoCodecName = "prores_ks";
+                request.proresProfile = 4;
+                request.keepAlpha = true;
+                request.hwVendorHint = "none";
+                request.useHardwareAccel = false;
+                libavcore::FrameEncoder encoder;
+                fixtureOk &= !encoder.open(request).has_value();
+                // Even frames: left half alpha 128; odd frames: fully opaque.
+                QImage frame(64, 64, QImage::Format_RGBA8888);
+                for (int i = 0; fixtureOk && i < 4; ++i) {
+                    for (int y = 0; y < 64; ++y)
+                        for (int x = 0; x < 64; ++x)
+                            frame.setPixelColor(x, y, QColor(40, 200, 60, (i % 2 == 0 && x < 32) ? 128 : 255));
+                    fixtureOk &= encoder.pushFrameRgba32(frame.constBits(), int(frame.bytesPerLine()), i);
+                }
+                fixtureOk &= fixtureOk && !encoder.finalize().has_value() && QFile::exists(alphaClipPath);
+            }
+            const auto lensOver = [&](const QString &upperPath, double timelineSec,
+                                      const QVector<VideoEffect> &prefix = {}) {
+                ClipInfo base = clip(330);
+                base.filePath = redBasePath;
+                ClipInfo upper = clip(331);
+                upper.filePath = upperPath;
+                upper.duration = 0.4;
+                upper.outPoint = 0.4;
+                upper.effects = prefix;
+                upper.effects.append(VideoEffect::createLensDistortion(0.3));
+                // V1 hidden; V2 (the lens clip) is painted over V3 (V1-wins stacking).
+                Timeline tl;
+                tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip(329)}, {upper}, {base}},
+                                      QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                tl.videoTracks()[0]->setHidden(true);
+                return renderAt(&tl, timelineSec);
+            };
+            const auto rgbAt = [](const QImage &image, int x, int y) {
+                return image.isNull() ? QColor(-1, -1, -1) : image.pixelColor(x, y);
+            };
+            const bool alphaProbe = roto::probeMediaHasAlpha(alphaClipPath);
+            const bool opaqueProbe = roto::probeMediaHasAlpha(gSyntheticClipPath);
+            const QImage alphaEven = fixtureOk ? lensOver(alphaClipPath, 0.0) : QImage();
+            const QImage alphaOdd = fixtureOk ? lensOver(alphaClipPath, 0.1) : QImage();
+            const QImage opaqueLens = fixtureOk ? lensOver(gSyntheticClipPath, 0.0) : QImage();
+            const QColor cornerEven = rgbAt(alphaEven, 1, 1);
+            const QColor cornerOdd = rgbAt(alphaOdd, 1, 1);
+            const QColor cornerOpaque = rgbAt(opaqueLens, 1, 1);
+            const QColor leftEven = rgbAt(alphaEven, 24, 32);
+            const QColor leftOdd = rgbAt(alphaOdd, 24, 32);
+            const auto isRed = [](const QColor &c) {
+                return c.red() > 150 && c.green() < 110 && c.blue() < 100;
+            };
+            const bool a2 = isRed(cornerEven);
+            const bool b2 = cornerOpaque.red() >= 0 && cornerOpaque.red() <= 8
+                && cornerOpaque.green() <= 8 && cornerOpaque.blue() <= 8;
+            // The two frames differ in content (translucent vs opaque left half)
+            // and keep the same corner.
+            const bool c2 = isRed(cornerOdd) && qAbs(cornerEven.red() - cornerOdd.red()) <= 6
+                && qAbs(cornerEven.green() - cornerOdd.green()) <= 6
+                && qAbs(cornerEven.blue() - cornerOdd.blue()) <= 6
+                && qAbs(leftEven.red() - leftOdd.red()) > 40;
+            // (2) probe: a PNG is alpha media only when its pix_fmt has alpha
+            // (an opaque RGB PNG keeps the black edge).
+            const QString rgbPngPath = media.filePath(QStringLiteral("roto-probe-rgb.png"));
+            const QString argbPngPath = media.filePath(QStringLiteral("roto-probe-argb.png"));
+            QImage rgbPng(64, 64, QImage::Format_RGB888);
+            rgbPng.fill(QColor(200, 60, 40));
+            QImage argbPng(64, 64, QImage::Format_ARGB32);
+            argbPng.fill(QColor(200, 60, 40, 255));
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 32; ++x)
+                    argbPng.setPixelColor(x, y, QColor(200, 60, 40, 128));
+            const bool pngSaved = rgbPng.save(rgbPngPath, "PNG") && argbPng.save(argbPngPath, "PNG");
+            const bool rgbPngProbe = roto::probeMediaHasAlpha(rgbPngPath);
+            const bool argbPngProbe = roto::probeMediaHasAlpha(argbPngPath);
+            const bool pngOk = pngSaved && !rgbPngProbe && argbPngProbe;
+            // (2d) alpha media + LensDistortion + Blur (drops alpha) through the
+            // clip FX stage: a fully opaque frame and a translucent frame keep the
+            // same transparent out-of-frame corner (HEAD of this fix: the opaque
+            // frame skips the carry loop and the corner turns black).
+            ClipInfo lensBlur;
+            lensBlur.filePath = alphaClipPath;
+            lensBlur.effects = {VideoEffect::createLensDistortion(0.3), VideoEffect::createBlur(3.0)};
+            QImage opaqueGraded(64, 64, QImage::Format_RGBA8888);
+            opaqueGraded.fill(QColor(40, 200, 60, 255));
+            QImage translucentGraded = opaqueGraded;
+            for (int y = 0; y < 64; ++y)
+                for (int x = 0; x < 32; ++x)
+                    translucentGraded.setPixelColor(x, y, QColor(40, 200, 60, 128));
+            const QImage lensBlurOpaque = fixtureOk
+                ? tlrender::applyClipFxStackFromSource(opaqueGraded, lensBlur, 0.0) : QImage();
+            const QImage lensBlurTranslucent = fixtureOk
+                ? tlrender::applyClipFxStackFromSource(translucentGraded, lensBlur, 0.0) : QImage();
+            const QColor dOpaque = rgbAt(lensBlurOpaque, 1, 1);
+            const QColor dTranslucent = rgbAt(lensBlurTranslucent, 1, 1);
+            const bool d2 = !lensBlurOpaque.isNull() && !lensBlurTranslucent.isNull()
+                && dOpaque.alpha() == 0 && dTranslucent.alpha() == 0
+                && dOpaque.rgba() == dTranslucent.rgba();
+            // (2f) preview/export parity: the CPU preview sends every mesh-warp /
+            // puppet clip to applyClipFxStackWithEchoFromSource. Without Echo /
+            // RS it must equal the export stage (applyClipFxStackFromSource) and
+            // keep the transparent corner. Mesh / pin are centred so the corner
+            // maps to itself.
+            ClipInfo lensBlurMesh = lensBlur;
+            lensBlurMesh.meshWarp = WarpDistortion::createDefaultMesh(QSize(1, 1), 3, 3);
+            lensBlurMesh.meshWarp.controlPoints[1][1] += QPointF(0.05, 0.03);
+            ClipInfo lensBlurPin = lensBlur;
+            WarpPin centrePin;
+            centrePin.originalPos = QPointF(0.5, 0.5);
+            centrePin.deformedPos = QPointF(0.6, 0.55);
+            centrePin.radius = 0.4;
+            centrePin.stiffness = 0.7;
+            lensBlurPin.puppetPins = {centrePin};
+            const tlrender::EchoFrameProvider noSamples = [](double, double) { return QImage(); };
+            bool f2 = fixtureOk && tlrender::hasActiveMeshWarp(lensBlurMesh) && lensBlurPin.hasPuppetPins();
+            std::string fDetail;
+            for (const ClipInfo *warped : {&lensBlurMesh, &lensBlurPin}) {
+                const QImage viaEcho = fixtureOk ? tlrender::applyClipFxStackWithEchoFromSource(
+                    opaqueGraded, *warped, 0.0, 0.0, noSamples) : QImage();
+                const QImage viaExport = fixtureOk
+                    ? tlrender::applyClipFxStackFromSource(opaqueGraded, *warped, 0.0) : QImage();
+                const QColor corner = rgbAt(viaEcho, 1, 1);
+                const bool same = !viaEcho.isNull() && viaEcho == viaExport;
+                f2 = f2 && same && corner.alpha() == 0;
+                fDetail += std::string(warped == &lensBlurMesh ? " mesh" : " pin") + " same="
+                    + std::to_string(same) + " cornerAlpha=" + std::to_string(corner.alpha())
+                    + " exportCornerAlpha=" + std::to_string(rgbAt(viaExport, 1, 1).alpha());
+            }
+            // (2e) the Echo render path (echo before the lens, sampled at
+            // clip-local t=0 so no echo is composed) keeps the per-clip fill:
+            // alpha media shows the lower track, opaque media stays black.
+            const QVector<VideoEffect> echoPrefix = {VideoEffect::createEcho()};
+            const QColor eAlpha = rgbAt(fixtureOk ? lensOver(alphaClipPath, 0.0, echoPrefix) : QImage(), 1, 1);
+            const QColor eOpaque = rgbAt(fixtureOk ? lensOver(gSyntheticClipPath, 0.0, echoPrefix) : QImage(), 1, 1);
+            const bool e2 = isRed(eAlpha) && qAbs(eAlpha.red() - cornerEven.red()) <= 6
+                && qAbs(eAlpha.green() - cornerEven.green()) <= 6
+                && qAbs(eAlpha.blue() - cornerEven.blue()) <= 6
+                && eOpaque.red() == 0 && eOpaque.green() == 0 && eOpaque.blue() == 0;
+
+            // (3)
+            RotoClipEntry rect;
+            rect.path = rectPath(16, 16, 48, 48);
+            QImage opaque(64, 64, QImage::Format_RGBA8888);
+            opaque.fill(QColor(32, 80, 160));
+            const QImage rotoed = roto::applyEntryForRender(rect, opaque, 0);
+            const QImage rotoReplica = replicaOf(rotoed);
+            ClipInfo meshClip;
+            meshClip.meshWarp = WarpDistortion::createDefaultMesh(QSize(1, 1), 3, 3);
+            for (auto &row : meshClip.meshWarp.controlPoints)
+                for (QPointF &point : row)
+                    point.rx() += 0.125;
+            ClipInfo puppetClip;
+            WarpPin pin;
+            pin.originalPos = QPointF(0.5, 0.5);
+            pin.deformedPos = QPointF(0.6, 0.55);
+            pin.radius = 0.4;
+            pin.stiffness = 0.7;
+            puppetClip.puppetPins = {pin};
+            const QImage meshOut = tlrender::applyClipFxStackFromSource(rotoed, meshClip, 0.0);
+            const QImage puppetOut = tlrender::applyClipFxStackFromSource(rotoed, puppetClip, 0.0);
+            const int meshGap = alphaGap(meshOut, tlrender::applyClipFxStackFromSource(rotoReplica, meshClip, 0.0), false);
+            const int puppetGap = alphaGap(puppetOut, tlrender::applyClipFxStackFromSource(rotoReplica, puppetClip, 0.0), false);
+            const int meshMoved = meshOut.isNull() ? -1 : alphaChanged(meshOut, rotoed);
+            const int puppetMoved = puppetOut.isNull() ? -1 : alphaChanged(puppetOut, rotoed);
+            const bool followOk = meshGap <= 1 && puppetGap <= 1 && meshMoved > 0 && puppetMoved > 0;
+
+            std::cerr << "G47 (1) key+displace+blur |a-ref.R|=" << keyGap << " (<= 1) keyedTransparent="
+                      << keyedTransparent << " (0 < n < 4096)\n"
+                      << "G47 (1b) key+blur+displace |a-ref.R|=" << keyBlurFirstGap << " (<= 1) transparent="
+                      << keyBlurFirstTransparent << " (> 0) (1b)=" << keyBlurFirstOk << "\n"
+                      << "G47 (1d) key+blur+mirror plain-chain-identical=" << keyBlurMirrorSame << " alpha255="
+                      << keyBlurMirrorOpaque << " (== 4096) (1d)=" << keyBlurMirrorOk << "\n"
+                      << "G47 (1c) translucent+blur+lens interior |a-ref.R|=" << blurLensGap
+                      << " (<= 1) alpha<255=" << blurLensTranslucent << " (> 0) (1c)=" << blurLensOk << "\n"
+                      << "G47 (2) fixture=" << fixtureOk << " probe alpha=" << alphaProbe
+                      << " opaque=" << opaqueProbe << " cornerEven=" << cornerEven.red() << ","
+                      << cornerEven.green() << "," << cornerEven.blue() << " cornerOdd=" << cornerOdd.red()
+                      << "," << cornerOdd.green() << "," << cornerOdd.blue() << " cornerOpaque="
+                      << cornerOpaque.red() << "," << cornerOpaque.green() << "," << cornerOpaque.blue()
+                      << " leftEven.r=" << leftEven.red() << " leftOdd.r=" << leftOdd.red()
+                      << " (2a)=" << a2 << " (2b)=" << b2 << " (2c)=" << c2 << "\n"
+                      << "G47 (2) png saved=" << pngSaved << " probe rgb=" << rgbPngProbe
+                      << " (want 0) argb=" << argbPngProbe << " (want 1)\n"
+                      << "G47 (2d) lens+blur cornerOpaque=" << dOpaque.red() << "," << dOpaque.green() << ","
+                      << dOpaque.blue() << "," << dOpaque.alpha() << " cornerTranslucent="
+                      << dTranslucent.red() << "," << dTranslucent.green() << "," << dTranslucent.blue()
+                      << "," << dTranslucent.alpha() << " (2d)=" << d2 << "\n"
+                      << "G47 (2f) preview==export" << fDetail << " (want same=1 cornerAlpha=0) (2f)="
+                      << f2 << "\n"
+                      << "G47 (2e) echo+lens cornerAlpha=" << eAlpha.red() << "," << eAlpha.green() << ","
+                      << eAlpha.blue() << " cornerOpaque=" << eOpaque.red() << "," << eOpaque.green() << ","
+                      << eOpaque.blue() << " (want 0,0,0) (2e)=" << e2 << "\n"
+                      << "G47 (3) mesh |a-ref.R|=" << meshGap << " moved=" << meshMoved
+                      << " puppet |a-ref.R|=" << puppetGap << " moved=" << puppetMoved << "\n";
+            gates.gate(47, keyOk && keyBlurFirstOk && keyBlurMirrorOk && blurLensOk && fixtureOk && alphaProbe && !opaqueProbe && a2 && b2 && c2 && pngOk && d2
+                           && f2 && e2 && followOk,
+                       "keyed alpha lost through the displacement, the out-of-frame fill does not "
+                       "follow the media's alpha metadata, or a mesh warp / puppet dropped the roto alpha");
+        }
+    }
+
+    // ── G48 (conditional): roto on a clip with Echo. Echo samples are not
+    // rotoed (rule 34) and composeEcho merges their coverage into the layer,
+    // so the trails refill the roto exterior. Rotoing the samples changes that
+    // contract in the three renderer providers and the VideoPlayer preview
+    // provider (outside this story), beyond the 20-line budget.
+    gates.skip(48, "Echo + roto: Echo samples are not rotoed (rule 34); rotoing them needs the "
+                   "renderer and VideoPlayer Echo providers (> 20 lines), known limitation in DOCS");
 
     return gates.finish("roto");
 }

@@ -2275,7 +2275,10 @@ QImage VideoEffectProcessor::applyDisplacementMap(const QImage &input, double hA
 {
     QImage src = input.convertToFormat(QImage::Format_RGB888);
     int w = src.width(), h = src.height();
-    QImage result(w, h, QImage::Format_RGB888);
+    // US-1301: displace ARGB32 so the source alpha moves with RGB (the map
+    // still comes from the RGB888 copy, as before).
+    const QImage argb = input.convertToFormat(QImage::Format_ARGB32);
+    QImage result(w, h, QImage::Format_ARGB32);
 
     // Build or obtain the displacement map
     QImage mapImg;
@@ -2306,14 +2309,13 @@ QImage VideoEffectProcessor::applyDisplacementMap(const QImage &input, double hA
             mapImg = mapImg.convertToFormat(QImage::Format_RGB888);
     }
 
-    // Identity fast-path
+    // Identity fast-path: the input itself, alpha included.
     if (hAmt == 0.0 && vAmt == 0.0)
-        return src.copy();
+        return input;
 
     for (int y = 0; y < h; ++y) {
-        const uint8_t *srcLine = src.constScanLine(y);
         const uint8_t *mapLine = mapImg.constScanLine(y);
-        uint8_t *dstLine = result.scanLine(y);
+        QRgb *dstLine = reinterpret_cast<QRgb *>(result.scanLine(y));
 
         for (int x = 0; x < w; ++x) {
             // Read map value (use red channel; map is grayscale so all channels equal)
@@ -2325,10 +2327,7 @@ QImage VideoEffectProcessor::applyDisplacementMap(const QImage &input, double hA
             int sy = qBound(0, static_cast<int>(std::round(y + m * vAmt)), h - 1);
 
             // Sample source at displaced position (nearest-neighbor)
-            const uint8_t *srcSy = src.constScanLine(sy);
-            dstLine[x * 3]     = srcSy[sx * 3];
-            dstLine[x * 3 + 1] = srcSy[sx * 3 + 1];
-            dstLine[x * 3 + 2] = srcSy[sx * 3 + 2];
+            dstLine[x] = reinterpret_cast<const QRgb *>(argb.constScanLine(sy))[sx];
         }
     }
 
@@ -3862,6 +3861,18 @@ QImage VideoEffectProcessor::applyCornerPinSimple(const QImage &input,
 namespace {
 thread_local bool lensDistortionEnabled = true;
 thread_local int lensDistortionCalls = 0;
+thread_local bool transparentEdgeFill = false;
+}
+
+VideoEffectProcessor::TransparentEdgeFillScope::TransparentEdgeFillScope(bool transparent)
+    : m_previous(transparentEdgeFill)
+{
+    transparentEdgeFill = transparent;
+}
+
+VideoEffectProcessor::TransparentEdgeFillScope::~TransparentEdgeFillScope()
+{
+    transparentEdgeFill = m_previous;
 }
 
 void VideoEffectProcessor::setLensDistortionEnabledForTesting(bool enabled)
@@ -3897,9 +3908,11 @@ QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
             && centerX == 0.0 && centerY == 0.0))
         return input;
     ++lensDistortionCalls;
-    const QImage src = input.convertToFormat(QImage::Format_RGB888);
-    QImage out(src.size(), QImage::Format_RGB888);
-    out.fill(Qt::black);
+    // US-1301: ARGB32 so the source alpha is resampled with RGB (same bilinear
+    // weights). Outside the source: opaque black, or transparent for alpha media.
+    const QImage src = input.convertToFormat(QImage::Format_ARGB32);
+    QImage out(src.size(), QImage::Format_ARGB32);
+    out.fill(transparentEdgeFill ? Qt::transparent : Qt::black);
     const double shortSide = std::min(src.width(), src.height());
     const double radius = shortSide * 0.5;
     // Integer coordinates denote pixel centers. GLSL uses uv*size - 0.5.
@@ -3916,7 +3929,7 @@ QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
             const double sy = cy + radius * y * factor;
             if (sx < 0.0 || sy < 0.0 || sx > src.width() - 1.0
                 || sy > src.height() - 1.0)
-                continue; // Opaque black, exactly as kFragLensDistortion.
+                continue; // The fill; opaque black matches kFragLensDistortion.
             const int x0 = static_cast<int>(std::floor(sx));
             const int y0 = static_cast<int>(std::floor(sy));
             const int x1 = std::min(x0 + 1, src.width() - 1);
@@ -3924,10 +3937,10 @@ QImage VideoEffectProcessor::applyLensDistortion(const QImage &input,
             const double fx = sx - x0, fy = sy - y0;
             const uchar *a = src.constScanLine(y0);
             const uchar *b = src.constScanLine(y1);
-            for (int ch = 0; ch < 3; ++ch) {
-                const double top = a[x0 * 3 + ch] * (1.0 - fx) + a[x1 * 3 + ch] * fx;
-                const double bottom = b[x0 * 3 + ch] * (1.0 - fx) + b[x1 * 3 + ch] * fx;
-                dst[px * 3 + ch] = static_cast<uchar>(clamp255d(top * (1.0 - fy) + bottom * fy));
+            for (int ch = 0; ch < 4; ++ch) {
+                const double top = a[x0 * 4 + ch] * (1.0 - fx) + a[x1 * 4 + ch] * fx;
+                const double bottom = b[x0 * 4 + ch] * (1.0 - fx) + b[x1 * 4 + ch] * fx;
+                dst[px * 4 + ch] = static_cast<uchar>(clamp255d(top * (1.0 - fy) + bottom * fy));
             }
         }
     }

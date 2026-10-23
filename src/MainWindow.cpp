@@ -803,27 +803,15 @@ bool timelineHasAnyVideoClip(Timeline *timeline)
     return false;
 }
 
-// GUI 書き出しの入口ガード。V1 に映像があるか、V1 が空でも上位トラックに図形
-// クリップがある(レンダラが描ける)ときだけ書き出せる。V1 が非表示のときは
-// レンダラが透明の下地から上位レイヤーまで描くので、上位の通常映像も書き出せる。
-// V1 が表示のまま空で上位が通常映像だけのプロジェクトは、レンダリング時に null
-// 画像で失敗するため従来どおり拒否する。
+// GUI 書き出しの入口ガード。V1 に映像があれば書き出せる。V1 にクリップが無いとき
+// (表示 / 非表示とも) はレンダラが透明の下地から上位レイヤーまで描くので、上位
+// トラックに映像クリップがあれば書き出せる。映像クリップが 1 本も無いプロジェクトは
+// 従来どおり拒否する。
 bool timelineHasExportableVideo(Timeline *timeline)
 {
     if (!timeline->videoClips().isEmpty())
         return true;
-    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
-    if (!tracks.isEmpty() && tracks.first() && tracks.first()->isHidden())
-        return timelineHasAnyVideoClip(timeline);
-    for (int i = 1; i < tracks.size(); ++i) {
-        if (!tracks[i])
-            continue;
-        for (const ClipInfo &clip : tracks[i]->clips()) {
-            if (!clip.shapes.isEmpty())
-                return true;
-        }
-    }
-    return false;
+    return timelineHasAnyVideoClip(timeline);
 }
 
 // RenderQueue の音声パススルーは「V1 先頭クリップの元ファイルの音声を 0 秒から
@@ -2885,6 +2873,11 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QJsonObject &state) { applyExternalTrackState(state); });
     connect(m_timeline, &Timeline::trackIndicesRemapped,
             this, &MainWindow::remapExternalTrackIndices);
+    connect(m_timeline, &Timeline::clipKeysRemapped,
+            this, &MainWindow::rekeyPositionKeyedSidecars);
+    m_timeline->setSidecarStateHooks(
+        [this]() { return collectSidecarState(); },
+        [this](const QJsonObject &state) { applySidecarState(state); });
 
     rebuildAudioMeters();
 
@@ -3465,31 +3458,37 @@ void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
     if (!m_player || !m_player->glPreview())
         return;
 
-    if (!m_timeline || trackIdx < 0 || clipIdx < 0) {
+    auto clearPreview = [this]() {
+        m_brushPreviewClipIdForTest.clear();
         m_player->glPreview()->clearBrushAnimation();
+    };
+    if (!m_timeline || trackIdx < 0 || clipIdx < 0) {
+        clearPreview();
         return;
     }
 
     auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
     const auto &clips = track->clips();
     if (clipIdx >= clips.size()) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
-    auto *animation = materializeBrushAnimation(brushClipId(trackIdx, clipIdx));
+    const QString clipId = brushClipId(trackIdx, clipIdx);
+    auto *animation = materializeBrushAnimation(clipId);
     if (!animation) {
-        m_player->glPreview()->clearBrushAnimation();
+        clearPreview();
         return;
     }
 
     const double progress = clips[clipIdx].keyframes.valueAt(
         QStringLiteral("brush_progress"), 0.0, 0.0);
+    m_brushPreviewClipIdForTest = clipId;
     m_player->glPreview()->setBrushAnimation(animation);
     m_player->glPreview()->setBrushAnimationProgress(progress);
 }
@@ -9214,6 +9213,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
             m_clipExpressionBindings.insert(entry.clipId, entry.bindings);
     }
     m_clipWiggleParams.clear();
+    m_parkedSidecarsByUid.clear();
+    m_sidecarClipUidByKey.clear();
     for (const auto &entry : data.wiggleClipEntries) {
         if (!entry.clipId.isEmpty())
             m_clipWiggleParams.insert(entry.clipId, entry.params);
@@ -9617,6 +9618,291 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
         }
     }
     m_particleClipConfigs = std::move(particles);
+    // US-1302: the position-keyed sidecars take the new track numbers; a key on
+    // the removed track goes.
+    QStringList keys = m_liveBrushAnimations.keys() + m_timeRemapClipEntries.keys()
+        + m_text3DClipConfigs.keys() + m_clipExpressionBindings.keys() + m_clipWiggleParams.keys();
+    for (const auto &entry : std::as_const(m_brushAnimationEntries))
+        keys.append(entry.clipId);
+    Timeline::ClipKeyRemap remap;
+    for (const QString &key : std::as_const(keys)) {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        if (parts.size() != 2) continue;
+        const int track = parts[0].toInt();
+        const int newTrack = oldToNew.value(track, -1);
+        if (newTrack < 0) remap.dropped.insert(key);
+        else if (newTrack != track) remap.oldToNew.insert(key, trackMatteClipKey(newTrack, parts[1].toInt()));
+    }
+    // The whole track is gone, so its clips are parked under their old (track, uid)
+    // here: the indices are already shifted, and the liveness check in
+    // rekeyPositionKeyedSidecars would see a clip now on that index sharing the uid.
+    for (const QString &key : std::as_const(remap.dropped))
+        parkSidecars(key, m_sidecarClipUidByKey.value(key));
+    rekeyPositionKeyedSidecars(remap);
+}
+
+// US-1302: the ClipKeyRemap contract on one sidecar map: a key in oldToNew moves,
+// a key in dropped goes, any other key stays. The moves go through a temporary map
+// so a chain ("1:1" -> "1:0" while "1:0" leaves) never overwrites an entry.
+template <typename T>
+static void rekeySidecarMap(QHash<QString, T> &map, const Timeline::ClipKeyRemap &remap)
+{
+    QHash<QString, T> moved;
+    for (auto it = map.begin(); it != map.end();) {
+        const auto to = remap.oldToNew.constFind(it.key());
+        if (to != remap.oldToNew.cend()) {
+            moved.insert(to.value(), it.value());
+            it = map.erase(it);
+        } else if (remap.dropped.contains(it.key())) {
+            it = map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = moved.cbegin(); it != moved.cend(); ++it)
+        map.insert(it.key(), it.value());
+}
+
+// US-1302: a uid is unique within a track only (TimelineTrack::setClips), so the
+// clip at key "t:i" is identified by "t|uid", which is also what parks its values.
+static QString sidecarClipId(const QString &key, const QString &uid)
+{
+    return key.section(QLatin1Char(':'), 0, 0) + QLatin1Char('|') + uid;
+}
+
+void MainWindow::parkSidecars(const QString &key, const QString &uid)
+{
+    if (uid.isEmpty()) return;
+    ParkedSidecars parked;
+    if (m_timeRemapClipEntries.contains(key)) parked.timeRemap = m_timeRemapClipEntries.value(key);
+    if (m_text3DClipConfigs.contains(key)) parked.text3D = m_text3DClipConfigs.value(key);
+    if (m_clipExpressionBindings.contains(key)) parked.expressions = m_clipExpressionBindings.value(key);
+    if (m_clipWiggleParams.contains(key)) parked.wiggle = m_clipWiggleParams.value(key);
+    if (parked.timeRemap || parked.text3D || parked.expressions || parked.wiggle)
+        m_parkedSidecarsByUid.insert(sidecarClipId(key, uid), parked);
+}
+
+void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
+{
+    // A dropped key's clip is gone by now, so its uid comes from the last placement
+    // seen; that (track, uid) still on the timeline means the placement is stale and
+    // the key is not parked under it.
+    QSet<QString> liveIds;
+    const auto &liveTracks = m_timeline->videoTracks();
+    for (int t = 0; t < liveTracks.size(); ++t) {
+        if (!liveTracks[t]) continue;
+        const auto &clips = liveTracks[t]->clips();
+        for (int c = 0; c < clips.size(); ++c)
+            liveIds.insert(sidecarClipId(trackMatteClipKey(t, c), clips[c].uid));
+    }
+    for (const QString &key : remap.dropped) {
+        const QString uid = m_sidecarClipUidByKey.value(key);
+        if (!remap.oldToNew.contains(key) && !liveIds.contains(sidecarClipId(key, uid)))
+            parkSidecars(key, uid);
+    }
+    rekeySidecarMap(m_sidecarClipUidByKey, remap);
+    bool liveDropped = false;
+    for (auto it = m_liveBrushAnimations.cbegin(); it != m_liveBrushAnimations.cend(); ++it) {
+        if (it.value() && !remap.oldToNew.contains(it.key()) && remap.dropped.contains(it.key())) {
+            it.value()->deleteLater();
+            liveDropped = true;
+        }
+    }
+    if (liveDropped && m_player && m_player->glPreview())
+        m_player->glPreview()->clearBrushAnimation();
+    rekeySidecarMap(m_liveBrushAnimations, remap);
+    rekeySidecarMap(m_timeRemapClipEntries, remap);
+    for (auto it = m_timeRemapClipEntries.begin(); it != m_timeRemapClipEntries.end(); ++it)
+        it.value().clipId = it.key();
+    rekeySidecarMap(m_text3DClipConfigs, remap);
+    rekeySidecarMap(m_clipExpressionBindings, remap);
+    rekeySidecarMap(m_clipWiggleParams, remap);
+    QVector<BrushAnimationEntry> brushes;
+    for (BrushAnimationEntry entry : std::as_const(m_brushAnimationEntries)) {
+        const auto to = remap.oldToNew.constFind(entry.clipId);
+        if (to != remap.oldToNew.cend())
+            entry.clipId = to.value();
+        else if (remap.dropped.contains(entry.clipId))
+            continue;
+        brushes.append(entry);
+    }
+    m_brushAnimationEntries = std::move(brushes);
+    // US-1320: the selection moved mid-mutation and bound the preview through the old
+    // keys; bind it again now that the brush maps carry the new ones.
+    if (!remap.oldToNew.isEmpty() || !remap.dropped.isEmpty())
+        syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
+}
+
+// US-1302 undo rule: adding a brush animation records an undo point (its progress
+// keyframes), so the brush entries are carried by value. timeRemap / text3D /
+// expression / wiggle edits record none, so only the clip each key names is
+// carried (clipUids: key -> uid) and an undo rekeys their live values instead of
+// rolling them back.
+QJsonObject MainWindow::collectSidecarState()
+{
+    QJsonObject clipUids;
+    m_sidecarClipUidByKey.clear();
+    const auto &tracks = m_timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const auto &clips = tracks[t]->clips();
+        for (int c = 0; c < clips.size(); ++c) {
+            if (clips[c].uid.isEmpty()) continue;
+            clipUids.insert(trackMatteClipKey(t, c), clips[c].uid);
+            m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+        }
+    }
+    QJsonArray brushes;
+    for (const auto &entry : m_brushAnimationEntries)
+        brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
+    return QJsonObject{{"clipUids", clipUids},
+                       {"brushAnimations", brushes},
+                       {"sequenceId", m_timeline->activeSequenceId()},
+                       {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
+}
+
+void MainWindow::applySidecarState(const QJsonObject &state)
+{
+    // Called before restoreState replaces the clips: a live key names a clip that is
+    // being left, state's clipUids the restored placement, and the clip identity ties
+    // them. A uid once on each side follows its clip across tracks; a uid duplicated
+    // on either side (unique only within a track) is paired by (track, uid), which
+    // TimelineTrack::setClips keeps unique. An empty uid leaves its key as it is; a
+    // uid with no pair drops its key, whose values are parked under (track, uid).
+    QHash<QString, QString> restoredKeyByUid;
+    QHash<QString, QString> restoredKeyById;
+    QSet<QString> ambiguous;
+    const QJsonObject clipUids = state.value("clipUids").toObject();
+    for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it) {
+        const QString uid = it.value().toString();
+        if (restoredKeyByUid.contains(uid)) ambiguous.insert(uid);
+        restoredKeyByUid.insert(uid, it.key());
+        restoredKeyById.insert(sidecarClipId(it.key(), uid), it.key());
+    }
+    QHash<QString, QString> liveUidByKey;
+    QHash<QString, int> liveUidCount;
+    QVector<QStringList> liveUidLists;
+    const auto &tracks = m_timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const auto &clips = tracks[t]->clips();
+        QStringList list;
+        for (int c = 0; c < clips.size(); ++c) {
+            liveUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+            ++liveUidCount[clips[c].uid];
+            if (!clips[c].uid.isEmpty()) list.append(clips[c].uid);
+        }
+        liveUidLists.append(list);
+    }
+    // (track, uid) pairs live and restored clips only while the track indices name
+    // the same tracks. Across a track removal / move / add they do not, so each live
+    // track is matched to the restored track with the same ordered uids (its own
+    // index first); a track with no single match pairs nothing by (track, uid).
+    QVector<int> liveToRestoredTrack(liveUidLists.size());
+    for (int t = 0; t < liveToRestoredTrack.size(); ++t) liveToRestoredTrack[t] = t;
+    if (state.value("trackStructureRevision").toString()
+        != QString::number(m_timeline->trackStructureRevision())) {
+        QMap<int, QMap<int, QString>> restoredByTrack;
+        for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
+            restoredByTrack[it.key().section(QLatin1Char(':'), 0, 0).toInt()]
+                .insert(it.key().section(QLatin1Char(':'), 1, 1).toInt(), it.value().toString());
+        QHash<int, QStringList> restoredUidLists;
+        for (auto it = restoredByTrack.cbegin(); it != restoredByTrack.cend(); ++it)
+            restoredUidLists.insert(it.key(), it.value().values());
+        QSet<int> claimed;
+        for (int t = 0; t < liveUidLists.size(); ++t) {
+            const bool same = !liveUidLists[t].isEmpty() && restoredUidLists.value(t) == liveUidLists[t];
+            liveToRestoredTrack[t] = same ? t : -1;
+            if (same) claimed.insert(t);
+        }
+        for (int t = 0; t < liveUidLists.size(); ++t) {
+            if (liveToRestoredTrack[t] >= 0 || liveUidLists[t].isEmpty()) continue;
+            QList<int> candidates;
+            for (auto it = restoredUidLists.cbegin(); it != restoredUidLists.cend(); ++it)
+                if (!claimed.contains(it.key()) && it.value() == liveUidLists[t]) candidates.append(it.key());
+            if (candidates.size() != 1) continue;
+            liveToRestoredTrack[t] = candidates.first();
+            claimed.insert(candidates.first());
+        }
+    }
+    Timeline::ClipKeyRemap remap;
+    QSet<QString> pairedRestoredKeys;
+    for (auto it = liveUidByKey.cbegin(); it != liveUidByKey.cend(); ++it) {
+        const QString &uid = it.value();
+        if (uid.isEmpty()) continue;
+        QString to;
+        if (!ambiguous.contains(uid) && liveUidCount.value(uid) == 1) {
+            const auto found = restoredKeyByUid.constFind(uid);
+            if (found == restoredKeyByUid.cend()) {
+                remap.dropped.insert(it.key());
+                continue;
+            }
+            to = found.value();
+        } else {
+            const int restoredTrack = liveToRestoredTrack.value(it.key().section(QLatin1Char(':'), 0, 0).toInt(), -1);
+            const auto found = restoredTrack < 0 ? restoredKeyById.cend()
+                : restoredKeyById.constFind(QString::number(restoredTrack) + QLatin1Char('|') + uid);
+            if (found == restoredKeyById.cend()) {
+                remap.dropped.insert(it.key());
+                continue;
+            }
+            to = found.value();
+        }
+        pairedRestoredKeys.insert(to);
+        if (to != it.key()) remap.oldToNew.insert(it.key(), to);
+    }
+    // A restore recorded in another sequence (the undo stack crosses a sequence
+    // switch) has no correspondence to follow: the keys stay as they are. The live
+    // id is still the sequence being left, since restoreState has not run yet.
+    if (state.value("sequenceId").toString() != m_timeline->activeSequenceId())
+        remap.dropped.clear();
+    // The clips a dropped key names are still live here, so they are parked by the
+    // uid read above; a restored clip no live clip pairs with takes back the values
+    // parked under its (track, uid).
+    for (const QString &key : std::as_const(remap.dropped))
+        parkSidecars(key, liveUidByKey.value(key));
+    rekeyPositionKeyedSidecars(remap);
+    for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it) {
+        const QString &key = it.key();
+        if (pairedRestoredKeys.contains(key)) continue;
+        const auto parked = m_parkedSidecarsByUid.constFind(sidecarClipId(key, it.value().toString()));
+        if (parked == m_parkedSidecarsByUid.cend()) continue;
+        if (parked->timeRemap && !m_timeRemapClipEntries.contains(key)) {
+            TimeRemapClipEntry entry = *parked->timeRemap;
+            entry.clipId = key;
+            m_timeRemapClipEntries.insert(key, entry);
+        }
+        if (parked->text3D && !m_text3DClipConfigs.contains(key))
+            m_text3DClipConfigs.insert(key, *parked->text3D);
+        if (parked->expressions && !m_clipExpressionBindings.contains(key))
+            m_clipExpressionBindings.insert(key, *parked->expressions);
+        if (parked->wiggle && !m_clipWiggleParams.contains(key))
+            m_clipWiggleParams.insert(key, *parked->wiggle);
+        m_parkedSidecarsByUid.erase(parked);
+    }
+    m_sidecarClipUidByKey.clear();
+    for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
+        m_sidecarClipUidByKey.insert(it.key(), it.value().toString());
+
+    QVector<BrushAnimationEntry> brushes;
+    for (const auto &value : state.value("brushAnimations").toArray()) {
+        const QJsonObject obj = value.toObject();
+        BrushAnimationEntry entry;
+        entry.clipId = obj.value("clipId").toString();
+        entry.brushData = obj.value("brushData").toObject();
+        brushes.append(entry);
+    }
+    const auto sameBrushes = [&] {
+        if (brushes.size() != m_brushAnimationEntries.size()) return false;
+        for (int i = 0; i < brushes.size(); ++i)
+            if (brushes[i].clipId != m_brushAnimationEntries[i].clipId
+                || brushes[i].brushData != m_brushAnimationEntries[i].brushData) return false;
+        return true;
+    };
+    if (sameBrushes()) return;
+    // The live animations are rebuilt lazily; the preview drops its pointer first and
+    // takes a new one when restoreState re-selects the clip.
+    if (m_player && m_player->glPreview())
+        m_player->glPreview()->clearBrushAnimation();
+    setBrushAnimationEntries(brushes);
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -14397,9 +14683,11 @@ void MainWindow::addBrushAnimation()
         previous->deleteLater();
     m_liveBrushAnimations.insert(clipId, brushAnim);
 
-    KeyframeManager km = m_timeline->clipKeyframes();
+    // The keyframes go on the clip the brush was put on, so the undo point this
+    // records always carries the new entry (with no selection too).
+    KeyframeManager km = clips[clipIdx].keyframes;
     ensureBrushProgressTrack(km);
-    m_timeline->setClipKeyframes(km);
+    m_timeline->setClipKeyframes(TrackKind::Video, trackIdx, clipIdx, km);
 
     syncBrushAnimationPreviewForClip(trackIdx, clipIdx);
 

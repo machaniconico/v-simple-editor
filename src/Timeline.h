@@ -12,6 +12,7 @@
 #include <QFileInfo>
 #include <QVector>
 #include <QHash>
+#include <QSet>
 #include <QMutex>
 #include <QMenu>
 #include <QElapsedTimer>
@@ -635,7 +636,10 @@ public:
     // Quietly set one member's trimmed edge. Left edge: edgePoint = inPoint,
     // gapLeadIn = this clip's leadInSec. Right edge: edgePoint = outPoint,
     // gapLeadIn = next clip's leadInSec (-1 = no next clip). No modified().
-    void applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn);
+    // US-1305: a left edge may also set the next clip's leadInSec
+    // (nextLeadIn, -1 = leave it).
+    void applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint, double gapLeadIn,
+                         double nextLeadIn = -1.0);
 
     void setTimeline(Timeline *t) { m_timeline = t; }
 
@@ -666,6 +670,9 @@ public:
 signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
+    // Selected indices moved because a clip was inserted in front of them (the
+    // selection stays on the same clips); no linked selection sync follows.
+    void selectionShifted(int primaryIndex);
     void emptyAreaClicked();
     void marqueeDragged(QPoint startGlobal, QPoint endGlobal, bool additive, bool finished);
     void clipMoved(int fromIndex, int toIndex);
@@ -688,7 +695,9 @@ signals:
     void linkedTrimDelta(int clipIndex, bool leftEdge, double deltaSec);
     void linkedTrimFinished();
     void linkedTrimCancelled();
-    void crossTrackDropped(int clipIndex, int linkGroup, double dropTime);
+    // US-1313: src is the track the dropped clip came from (null: unknown, the
+    // dropped clip's own-kind link partners then stay where they are).
+    void crossTrackDropped(int clipIndex, int linkGroup, double dropTime, TimelineTrack *src = nullptr);
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
@@ -939,6 +948,15 @@ public:
     // applier() on every undo / redo. MainWindow keeps the routing SSOT.
     void setBusRoutingBridge(std::function<QJsonObject()> provider,
                              std::function<void(const QJsonObject&)> applier);
+    // US-1302: position-keyed sidecar carrier: currentState() stores collect() in
+    // TimelineState::sidecarState and restoreState() hands a non-empty one to
+    // apply() on every undo / redo, before the clips are replaced (apply reads
+    // the clips it leaves). MainWindow keeps the sidecars.
+    void setSidecarStateHooks(std::function<QJsonObject()> collect,
+                              std::function<void(const QJsonObject&)> apply);
+    // US-1302: changes on every track removal / move / add (and is restored with
+    // the state), so equal values mean the track indices name the same tracks.
+    quint64 trackStructureRevision() const { return m_trackStructureRevision; }
     // Catch-all for edits that record no undo point (matte dialog, bus panel):
     // folds currentState() into the current undo entry and drops the redo stack.
     void absorbIntoCurrentUndoPoint();
@@ -985,8 +1003,11 @@ public:
     // US-1202 media drop entry: TimelineTrack::dropEvent hands a text/uri-list
     // drop on a V2+ / A track here while storylineMode() is on. Imports the file
     // at dropTimeSec on that track, connected to the V1 clip under the drop
-    // (V1 tracks, locked tracks and mode-off drops are refused with *err; a drop
-    // with no V1 clip under it is imported unconnected).
+    // (a V1 drop is a storyline insert at the drop point with its audio placed via
+    // storylineAudioSlot; locked tracks are refused with 「ロック中のトラックには配置できません」,
+    // no free audio track with 「音声を置ける空きトラックがありません」, and mode-off
+    // drops are refused, all with *err; a drop with no V1 clip under it is imported
+    // unconnected).
     bool dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
                           double dropTimeSec, QString *err = nullptr);
     // Connect a clip a cross-track drop just placed (storyline mode, V2+ / A);
@@ -1456,12 +1477,35 @@ public:
     void setRotoEntries(const QHash<QString, RotoClipEntry> &entries);
     QHash<QString, RotoClipEntry> rotoEntries() const;
     void remapRotoEntriesAfterMutation(const TrackClipSnapshot &before);
-    // Calls of remapCarriersAfterCrossTrackMove on this Timeline (selftest).
+    // US-1303: the clip keys ("t:i") one mutation changed. A key in oldToNew
+    // moves, a key in dropped is gone, any other key stays. Identity pairs are
+    // removed before the signal.
+    struct ClipKeyRemap {
+        QHash<QString, QString> oldToNew;
+        QSet<QString> dropped;
+        bool operator==(const ClipKeyRemap &o) const
+        { return oldToNew == o.oldToNew && dropped == o.dropped; }
+    };
+    // The one emit point of clipKeysRemapped, called by the aligned roto remap,
+    // remapCarriersByUid, remapCarriersAfterCrossTrackMove and the clipMoved
+    // reorder (never by the TrackMatteKey helpers). A repeat of the last remap
+    // on the same post-mutation clips (the paired helper sites) is not emitted.
+    // Inside a ClipKeyRemapBatch it is composed and emitted when the batch closes.
+    void notifyClipKeysRemapped(ClipKeyRemap remap);
+    // Explicit cross-track carrier remaps on this Timeline (selftest): calls of
+    // remapCarriersAfterCrossTrackMove, plus one per linked drop that moves a
+    // video member (handleCrossTrackLinkedDrop's by-uid remap).
     quint64 crossTrackMoveRemapCountForTest() const { return m_crossTrackMoveRemapCount; }
+    // US-1306: next link-group number that no V / A clip of the current
+    // sequence uses (m_nextLinkGroup is not advanced by load / import).
+    int allocateLinkGroup();
 signals:
     void skimPreviewRequested(const QImage &image);
     void skimPreviewCleared();
     void trackIndicesRemapped(bool audio, QVector<int> oldToNew);
+    // US-1303: once per mutation that changes video clip keys (not for undo /
+    // redo or load, which keep the keys valid for the restored layout).
+    void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
@@ -1549,6 +1593,8 @@ private:
     std::function<void(const QJsonObject&)> m_applyExternalTrackState;
     std::function<QJsonObject()> m_busRoutingProvider;
     std::function<void(const QJsonObject&)> m_busRoutingApplier;
+    std::function<QJsonObject()> m_sidecarStateCollector;
+    std::function<void(const QJsonObject&)> m_sidecarStateApplier;
     void captureExternalTrackState();
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
@@ -1602,7 +1648,33 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
-    // Number of remapCarriersAfterCrossTrackMove calls (selftest counter).
+    // US-1303: the last emitted remap with the clips after it. Cleared with the
+    // roto memo, by restoreState and by clearReconcileBaseline (load, sequence
+    // switch), so the same edit after an undo is announced again.
+    struct LastKeyRemap {
+        TrackClipSnapshot after;
+        ClipKeyRemap remap;
+    };
+    std::optional<LastKeyRemap> m_lastKeyRemap;
+    // US-1320: while a batch is open, notifyClipKeysRemapped composes each remap into
+    // the pending one; the outermost batch emits the composition once (one user edit
+    // whose own remap and the reconcile's remap must leave as one emit).
+    class ClipKeyRemapBatch {
+    public:
+        explicit ClipKeyRemapBatch(Timeline *timeline) : m_timeline(timeline)
+        { ++m_timeline->m_keyRemapBatchDepth; }
+        ~ClipKeyRemapBatch();
+        ClipKeyRemapBatch(const ClipKeyRemapBatch &) = delete;
+        ClipKeyRemapBatch &operator=(const ClipKeyRemapBatch &) = delete;
+    private:
+        Timeline *m_timeline;
+    };
+    int m_keyRemapBatchDepth = 0;
+    ClipKeyRemap m_pendingKeyRemap;
+    // Emits the pending batch remap now (saveUndoState, so the undo point's sidecars
+    // carry the new keys); the batch then closes with nothing left to emit.
+    void flushPendingKeyRemap();
+    // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
@@ -1811,15 +1883,22 @@ private:
         double origOut = 0.0;
         double origLeadIn = 0.0;
         double origLeadInNext = -1.0; // -1 = no next clip
+        // US-1305: the next clip is linked audio of a later V1 clip (storyline).
+        bool nextFollowsV1 = false;
+        // US-1305: the first clip after those followers (-1 = none). Its
+        // leadInSec is compensated so its absolute start stays.
+        int holdIdx = -1;
+        double holdOrigLeadIn = 0.0;
     };
     QVector<LinkedTrimPartner> m_linkedTrimPartners;
     bool m_linkedTrimLeftEdge = false;
+    // US-1305: storyline mode and the group has a V1 member: V1 ripples.
+    bool m_linkedTrimStoryline = false;
 
     // Single-shot debouncer for sequenceChanged + audioSequenceChanged.
     // Owned by Qt object tree; created in the ctor.
     QTimer *m_emitSequenceTimer = nullptr;
 
-    int allocateLinkGroup() { return m_nextLinkGroup++; }
     void onTrackSelectionChanged(int primaryIndex, bool additive);
     void showClipContextMenu(TimelineTrack *track, int clipIndex, const QPoint &globalPos);
     void unlinkClipGroup(int linkGroup);
@@ -1831,15 +1910,19 @@ private:
     void clearLinkedDragState();
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
-    void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+    // US-1313: moves every other member of linkGroup after the clip at
+    // droppedIdx of destTrack (from dragSource) moved; one by-uid carrier remap.
+    void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
+                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr);
     // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
     // moves it there through TimelineTrack::acceptClipDrop (one undo point).
     // Only a timeline clip of the band's kind is accepted.
     friend class TimelineNewTrackDropZone;
     bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
                             TimelineTrack *src);
-    // Explicit index map for one clip moved between tracks by dropEvent, or
-    // for the linked video partner moved by handleCrossTrackLinkedDrop:
+    // Explicit index map for one clip moved between tracks by dropEvent
+    // (the linked members moved by handleCrossTrackLinkedDrop take
+    // remapCarriersByUid instead):
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
     // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
     // -1 for an audio track (not keyed). Applies to the roto, clip-parent and

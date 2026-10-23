@@ -1500,8 +1500,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
     if (totalFrames <= 0)
         totalFrames = 1;
-    const bool trimAudioToMarkedRange =
-        markedRangeApplied && startUsec > 0;
+    const bool trimAudioToJobStart = startUsec > 0;
 
     // Audio mux input: the original source file's audio stream. FrameEncoder
     // handles this via audioSourcePath, preserving the render-pipe's optional
@@ -1708,7 +1707,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && QFile::exists(audioInputPath);
     if (haveAudio) {
         request.audioSourcePath = audioInputPath.toUtf8().toStdString();
-        if (trimAudioToMarkedRange)
+        if (trimAudioToJobStart)
             request.audioStartUs = startUsec;
     }
     const QString loudnessAudioCodec = cfg.value("audioCodec").toString();
@@ -2038,8 +2037,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     }
     if (totalFrames <= 0)
         totalFrames = 1;
-    const bool trimAudioToMarkedRange =
-        markedRangeApplied && startUsec > 0;
+    const bool trimAudioToJobStart = startUsec > 0;
 
     // Audio mux input — identical resolution to the in-process branch's
     // audioSourcePath: the job's source media, falling back to the V1 clip's
@@ -2096,7 +2094,7 @@ void RenderQueue::startRenderPipeSubprocess(int jobIndex)
     const bool haveAudio = !audioInputPath.isEmpty()
         && QFile::exists(audioInputPath);
     if (haveAudio) {
-        if (trimAudioToMarkedRange) {
+        if (trimAudioToJobStart) {
             args << QStringLiteral("-ss")
                  << QString::number(
                         static_cast<double>(startUsec) / 1'000'000.0,

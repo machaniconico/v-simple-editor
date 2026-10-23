@@ -79,19 +79,24 @@ int runTrimOpsSelftest()
                   .arg(startB1 - startB0).arg(err));
     }
 
-    // G2: RippleOut 正方向 — outPoint↑、実尺↑、下流 leadIn↑ で +delta シフト。
+    // G2: RippleOut 正方向 — outPoint↑、実尺↑、下流 leadIn は不変のまま実尺変化
+    // だけで下流が +delta シフト (RippleIn と同じモデル。leadIn も動かすと 2 倍動く)。
     {
         QVector<ClipInfo> clips;
         clips << makeClip(0.0, 0.0, 6.0, 10.0, 1.0, "a")
               << makeClip(0.0, 0.0, 5.0, 5.0, 1.0, "b");
+        const double startB0 = starts(clips)[1];
         QString err;
         const bool ok = trimops::applyTrim(clips, 0, TrimType::RippleOut, 2.0, &err);
+        const double startB1 = starts(clips)[1];
         const bool good = ok && approx(clips[0].outPoint, 8.0)
                        && approx(clips[0].effectiveDuration(), 8.0)
-                       && approx(clips[1].leadInSec, 2.0);
+                       && approx(clips[1].leadInSec, 0.0)
+                       && approx(startB1 - startB0, 2.0);
         good ? pass("G2 RippleOut+") : fail("G2 RippleOut+",
-              QStringLiteral("ok=%1 out=%2 leadNext=%3 err=%4")
-                  .arg(ok).arg(clips[0].outPoint).arg(clips[1].leadInSec).arg(err));
+              QStringLiteral("ok=%1 out=%2 leadNext=%3 dB=%4 err=%5")
+                  .arg(ok).arg(clips[0].outPoint).arg(clips[1].leadInSec)
+                  .arg(startB1 - startB0).arg(err));
     }
 
     // G3: RippleOut 境界違反 — 素材末尾 (duration) を超える delta は false + 不変。
@@ -207,21 +212,24 @@ int runTrimOpsSelftest()
     }
 
     // G9: speed=2.0 換算 — RippleOut で timeline delta 1.0s は source 2.0s 進む。
-    // 実尺は (outEff-in)/speed なので 1.0s 増える。
+    // 実尺は (outEff-in)/speed なので 1.0s 増え、下流は leadIn 不変のまま +1.0s。
     {
         QVector<ClipInfo> clips;
         clips << makeClip(0.0, 0.0, 4.0, 10.0, 2.0, "a")  // 実尺 (4-0)/2=2.0
               << makeClip(0.0, 0.0, 4.0, 4.0, 1.0, "b");
         const double durBefore = clips[0].effectiveDuration();
+        const double startB0 = starts(clips)[1];
         QString err;
         const bool ok = trimops::applyTrim(clips, 0, TrimType::RippleOut, 1.0, &err);
+        const double startB1 = starts(clips)[1];
         const bool good = ok && approx(clips[0].outPoint, 6.0)         // source +2.0
                        && approx(clips[0].effectiveDuration(), durBefore + 1.0) // timeline +1.0
-                       && approx(clips[1].leadInSec, 1.0);
+                       && approx(clips[1].leadInSec, 0.0)
+                       && approx(startB1 - startB0, 1.0);
         good ? pass("G9 speed conv") : fail("G9 speed conv",
-              QStringLiteral("ok=%1 out=%2 dur=%3 leadNext=%4 err=%5")
+              QStringLiteral("ok=%1 out=%2 dur=%3 leadNext=%4 dB=%5 err=%6")
                   .arg(ok).arg(clips[0].outPoint).arg(clips[0].effectiveDuration())
-                  .arg(clips[1].leadInSec).arg(err));
+                  .arg(clips[1].leadInSec).arg(startB1 - startB0).arg(err));
     }
 
     // G10: maxTrimDelta / minTrimDelta — RippleOut の上下限と境界一致確認。
@@ -230,15 +238,18 @@ int runTrimOpsSelftest()
         clips << makeClip(0.0, 2.0, 6.0, 10.0, 1.0, "a")  // out headroom 4.0, in→out 4.0
               << makeClip(0.0, 0.0, 5.0, 5.0, 1.0, "b");
         const double mx = trimops::maxTrimDelta(clips, 0, TrimType::RippleOut); // duration-out=4.0
-        const double mn = trimops::minTrimDelta(clips, 0, TrimType::RippleOut); // -(out-in)=-4.0 だが
-                                                                                // leadNext=0 → -0 が支配
-        // 下流 leadIn=0 なので負方向は 0 にクランプされる (下流が重なるため)。
-        // 上限は素材 headroom 4.0。max は適用成功、max+ε は失敗を確認。
+        const double mn = trimops::minTrimDelta(clips, 0, TrimType::RippleOut); // -(out-in)=-4.0 に
+                                                                                // 0 長排他の余白
+        // 負方向は下流 leadIn に制約されない (実尺が縮むと下流は左へ追従するだけ)。
+        // 下限は実尺 0 の手前 (-4.0 + 2e-6)。上限は素材 headroom 4.0。
+        // max は適用成功、max+ε は失敗を確認。
+        qInfo().noquote() << QStringLiteral("[trim-ops] G10 mn=%1 mx=%2")
+                                 .arg(mn, 0, 'g', 17).arg(mx, 0, 'g', 17);
         QVector<ClipInfo> c2 = clips; QString e2;
         const bool okMax = trimops::applyTrim(c2, 0, TrimType::RippleOut, mx, &e2);
         QVector<ClipInfo> c3 = clips; QString e3;
         const bool okOver = trimops::applyTrim(c3, 0, TrimType::RippleOut, mx + 0.5, &e3);
-        const bool good = approx(mx, 4.0) && approx(mn, 0.0) && okMax && !okOver;
+        const bool good = approx(mx, 4.0) && approx(mn, -4.0) && mn > -4.0 && okMax && !okOver;
         good ? pass("G10 bounds") : fail("G10 bounds",
               QStringLiteral("mx=%1 mn=%2 okMax=%3 okOver=%4").arg(mx).arg(mn).arg(okMax).arg(okOver));
     }

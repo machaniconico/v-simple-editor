@@ -1853,5 +1853,436 @@ int runFcpxmlImportSelftest()
         backE ? backE->leadInSec : -99.0);
     gate(33, unconnectedGateOk);
 
+    // G34 / G35: an asset-clip whose asset has audio becomes a V + A pair sharing a linkGroup.
+    // applyImport maps the parser's provisional numbers onto Timeline::allocateLinkGroup().
+    const QString avAsset = QStringLiteral("<asset id=\"av\" src=\"av.mov\" hasVideo=\"1\" hasAudio=\"1\"/>");
+    auto trackClips = [](Timeline &tl, bool audio) {
+        TimelineTrack *track = tl.trackAt(audio, 0);
+        return track ? track->clips() : QVector<ClipInfo>{};
+    };
+    auto groupClip = [&](const QString &name, double leadIn, int group) {
+        ClipInfo c = makeClip(name, 0.0, 1.0, leadIn, QString());
+        c.linkGroup = group;
+        return c;
+    };
+    const auto avPair = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"pair\" offset=\"0s\" start=\"1s\" duration=\"2s\"/>"), avAsset), dir.path());
+    const ClipInfo *pairV = avPair.videoTracks.value(0).size() == 1 ? &avPair.videoTracks[0][0] : nullptr;
+    const ClipInfo *pairA = avPair.audioTracks.value(0).size() == 1 ? &avPair.audioTracks[0][0] : nullptr;
+    const bool parsedPair = avPair.error.isEmpty() && pairV && pairA && pairV->linkGroup > 0
+        && pairA->linkGroup == pairV->linkGroup && pairA->filePath == pairV->filePath
+        && near(pairA->inPoint, pairV->inPoint) && near(pairA->outPoint, pairV->outPoint)
+        && near(pairA->leadInSec, pairV->leadInSec) && near(pairV->inPoint, 1.0) && near(pairV->outPoint, 3.0);
+    // The timeline already holds a pair of group 2 (V1 and A1, 0..1 s); the import is a new sequence.
+    Timeline avTimeline;
+    avTimeline.trackAt(false, 0)->setClips({groupClip(QStringLiteral("old"), 0.0, 2)});
+    avTimeline.trackAt(true, 0)->setClips({groupClip(QStringLiteral("old"), 0.0, 2)});
+    auto avApplied = avPair;
+    QStringList avWarnings;
+    const bool avOk = fcpx::xml::applyImport(avTimeline, avApplied, &avWarnings);
+    const auto appliedV = trackClips(avTimeline, false), appliedA = trackClips(avTimeline, true);
+    const bool appliedPair = avOk && appliedV.size() == 1 && appliedA.size() == 1 && appliedV[0].linkGroup > 0
+        && appliedA[0].linkGroup == appliedV[0].linkGroup && appliedV[0].linkGroup != 2
+        && near(appliedV[0].inPoint, appliedA[0].inPoint) && near(appliedV[0].outPoint, appliedA[0].outPoint);
+    QString deleteError;
+    const bool deletedA = avTimeline.deleteClipByIndex(true, 0, 0, false, &deleteError);
+    const bool linkedDelete = deletedA && trackClips(avTimeline, true).isEmpty() && trackClips(avTimeline, false).isEmpty();
+    std::fprintf(stderr, "G34 parse pair(V group=%d A group=%d in=%.9f out=%.9f lead=%.9f/%.9f) | apply ok=%d V=%d A=%d "
+        "groups=%d/%d (old pair 2) | delete A1: ok=%d err=[%s] V1 left=%d A1 left=%d\n",
+        pairV ? pairV->linkGroup : -1, pairA ? pairA->linkGroup : -1, pairV ? pairV->inPoint : -1.0,
+        pairV ? pairV->outPoint : -1.0, pairV ? pairV->leadInSec : -1.0, pairA ? pairA->leadInSec : -1.0,
+        int(avOk), int(appliedV.size()), int(appliedA.size()),
+        appliedV.isEmpty() ? -1 : appliedV[0].linkGroup, appliedA.isEmpty() ? -1 : appliedA[0].linkGroup,
+        int(deletedA), deleteError.toUtf8().constData(), int(trackClips(avTimeline, false).size()),
+        int(trackClips(avTimeline, true).size()));
+    gate(34, parsedPair && appliedPair && linkedDelete);
+
+    auto audioClipCount = [](const fcpx::xml::ImportResult &r) {
+        int n = 0;
+        for (const auto &track : r.audioTracks) n += int(track.size());
+        return n;
+    };
+    const auto videoOnlySrc = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"v\" duration=\"2s\" srcEnable=\"video\"/>"), avAsset), dir.path());
+    const auto silentAsset = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"quiet\" name=\"q\" duration=\"2s\"/>"),
+        QStringLiteral("<asset id=\"quiet\" src=\"quiet.mov\" hasVideo=\"1\" hasAudio=\"0\"/>")), dir.path());
+    const auto explicitAudio = fcpx::xml::parseXml(document(
+        QStringLiteral("<clip name=\"c\" duration=\"2s\"><asset-clip ref=\"av\" name=\"cv\" duration=\"2s\"/>"
+                       "<audio ref=\"av\" name=\"ca\" duration=\"2s\"/></clip>"), avAsset), dir.path());
+    const ClipInfo *explicitA = audioClipCount(explicitAudio) == 1 ? &explicitAudio.audioTracks[0][0] : nullptr;
+    // A pair of group 1 is already on the timeline (Timeline's next group number is 1): the import
+    // must not reuse it, and each nested pair keeps its own number.
+    const QString nestedMedia = QStringLiteral(
+        "<media id=\"cmp\" name=\"複合\"><sequence><spine>"
+        "<asset-clip ref=\"av\" name=\"n1\" duration=\"1s\"/>"
+        "<asset-clip ref=\"av\" name=\"n2\" offset=\"1s\" duration=\"1s\"/>"
+        "</spine></sequence></media>");
+    const auto nestedPairs = fcpx::xml::parseXml(document(
+        QStringLiteral("<asset-clip ref=\"av\" name=\"m\" duration=\"1s\"/>"
+                       "<ref-clip ref=\"cmp\" name=\"toCmp\" offset=\"1s\" duration=\"2s\"/>"),
+        avAsset + nestedMedia), dir.path());
+    Timeline linkedTimeline;
+    linkedTimeline.trackAt(false, 0)->setClips({groupClip(QStringLiteral("one"), 0.0, 1)});
+    linkedTimeline.trackAt(true, 0)->setClips({groupClip(QStringLiteral("one"), 0.0, 1)});
+    auto nestedApplied = nestedPairs;
+    QStringList nestedWarnings;
+    const bool nestedOk = fcpx::xml::applyImport(linkedTimeline, nestedApplied, &nestedWarnings);
+    const auto linkedStore = linkedTimeline.sequences();
+    const TimelineSequence *nestedSeq = nestedApplied.sequences.size() == 1
+        ? findSequence(linkedStore, nestedApplied.sequences[0].id) : nullptr;
+    auto pairGroup = [&](const QVector<QVector<ClipInfo>> &video, const QVector<QVector<ClipInfo>> &audio,
+                         const QString &name) {
+        const ClipInfo *v = namedClip(video, name), *a = namedClip(audio, name);
+        return v && a && v->linkGroup > 0 && v->linkGroup == a->linkGroup ? v->linkGroup : -1;
+    };
+    const TimelineSequence *mainSeq = findSequence(linkedStore, linkedTimeline.activeSequenceId());
+    const int mainGroup = mainSeq ? pairGroup(mainSeq->videoTracks, mainSeq->audioTracks, QStringLiteral("m")) : -1;
+    const int nestedOne = nestedSeq ? pairGroup(nestedSeq->videoTracks, nestedSeq->audioTracks, QStringLiteral("n1")) : -1;
+    const int nestedTwo = nestedSeq ? pairGroup(nestedSeq->videoTracks, nestedSeq->audioTracks, QStringLiteral("n2")) : -1;
+    const bool nestedDistinct = mainGroup > 0 && nestedOne > 0 && nestedTwo > 0
+        && mainGroup != 1 && nestedOne != 1 && nestedTwo != 1
+        && nestedOne != nestedTwo && mainGroup != nestedOne && mainGroup != nestedTwo;
+    std::fprintf(stderr, "G35 srcEnable=video audio=%d (expect 0) | hasAudio=0 audio=%d (expect 0) | clip + explicit audio: "
+        "audio=%d name=%s (expect 1 ca) | nested apply ok=%d mainGroup=%d nested n1=%d n2=%d (expect >0, all distinct, none 1)\n",
+        audioClipCount(videoOnlySrc), audioClipCount(silentAsset), audioClipCount(explicitAudio),
+        explicitA ? explicitA->displayName.toUtf8().constData() : "", int(nestedOk), mainGroup, nestedOne, nestedTwo);
+    gate(35, videoOnlySrc.error.isEmpty() && audioClipCount(videoOnlySrc) == 0 && videoOnlySrc.videoTracks.value(0).size() == 1
+        && silentAsset.error.isEmpty() && audioClipCount(silentAsset) == 0 && silentAsset.videoTracks.value(0).size() == 1
+        && explicitA && explicitA->displayName == QStringLiteral("ca") && explicitA->linkGroup == 0
+        && nestedOk && nestedSeq && nestedDistinct);
+
+    // G36: a video source and a different audio source. audioStart / audioDuration give the audio
+    // copy its own range (HEAD cut both angles to [start, start + duration)).
+    const QString g36AudioAngle = QStringLiteral("<asset-clip ref=\"snd\" name=\"voiceclip\" offset=\"0s\" duration=\"10s\"/>");
+    const QString g36Sources = QStringLiteral(
+        "<mc-source angleID=\"a1\" srcEnable=\"video\"/><mc-source angleID=\"a2\" srcEnable=\"audio\"/>");
+    auto g36SplitMc = [&](const QString &attributes) {
+        return fcpx::xml::parseXml(document(QStringLiteral("<mc-clip ref=\"m\" name=\"MCC\" %1>%2</mc-clip>")
+            .arg(attributes, g36Sources), mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    };
+    const auto g36Range = g36SplitMc(QStringLiteral("offset=\"0s\" start=\"2s\" duration=\"4s\" audioStart=\"5s\" audioDuration=\"3s\""));
+    const auto g36Early = g36SplitMc(QStringLiteral("offset=\"5s\" start=\"2s\" duration=\"4s\" audioStart=\"1s\" audioDuration=\"4s\""));
+    const auto g36Plain = g36SplitMc(QStringLiteral("offset=\"0s\" start=\"2s\" duration=\"4s\""));
+    auto g36FirstAudio = [](const fcpx::xml::ImportResult &r) -> const ClipInfo * {
+        for (const auto &track : r.audioTracks) if (!track.isEmpty()) return &track[0];
+        return nullptr;
+    };
+    auto g36FirstVideo = [](const fcpx::xml::ImportResult &r) -> const ClipInfo * {
+        return r.videoTracks.size() == 1 && r.videoTracks[0].size() == 1 ? &r.videoTracks[0][0] : nullptr;
+    };
+    const ClipInfo *g36RangeVideo = g36FirstVideo(g36Range), *g36RangeAudio = g36FirstAudio(g36Range);
+    const ClipInfo *g36EarlyVideo = g36FirstVideo(g36Early), *g36EarlyAudio = g36FirstAudio(g36Early);
+    const ClipInfo *g36PlainAudio = g36FirstAudio(g36Plain);
+    const bool audioRangeOk = g36Range.error.isEmpty() && g36RangeVideo && g36RangeAudio
+        && g36RangeVideo->displayName == QStringLiteral("A1clip") && near(g36RangeVideo->inPoint, 2.0) && near(g36RangeVideo->outPoint, 6.0)
+        && g36RangeAudio->displayName == QStringLiteral("voiceclip") && near(g36RangeAudio->inPoint, 5.0) && near(g36RangeAudio->outPoint, 8.0)
+        && g36RangeAudio->anchorUid == g36RangeVideo->uid && !g36RangeVideo->uid.isEmpty() && near(g36RangeAudio->anchorOffsetSec, 3.0)
+        && g36Range.audioTracks.size() == 1;
+    const bool audioEarlyOk = g36Early.error.isEmpty() && g36EarlyVideo && g36EarlyAudio
+        && near(g36EarlyVideo->inPoint, 2.0) && near(g36EarlyVideo->outPoint, 6.0)
+        && near(g36EarlyAudio->inPoint, 1.0) && near(g36EarlyAudio->outPoint, 5.0) && near(g36EarlyAudio->anchorOffsetSec, -1.0);
+    const bool audioPlainOk = g36Plain.error.isEmpty() && g36PlainAudio
+        && near(g36PlainAudio->inPoint, 2.0) && near(g36PlainAudio->outPoint, 6.0);
+    // One angle supplying both video and audio (srcEnable="all") still cuts the audio to its own range.
+    const auto g36Same = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" start=\"2s\" duration=\"4s\" audioStart=\"5s\" audioDuration=\"3s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"), multicamMedia(singleAngle1, singleAngle2)), dir.path());
+    const ClipInfo *g36SameVideo = g36FirstVideo(g36Same), *g36SameAudio = g36FirstAudio(g36Same);
+    const bool audioSameOk = g36Same.error.isEmpty() && g36SameVideo && g36SameAudio
+        && g36SameVideo->displayName == QStringLiteral("A1clip") && near(g36SameVideo->inPoint, 2.0) && near(g36SameVideo->outPoint, 6.0)
+        && g36SameAudio->displayName == QStringLiteral("A1clip") && near(g36SameAudio->inPoint, 5.0) && near(g36SameAudio->outPoint, 8.0)
+        && g36SameAudio->anchorUid == g36SameVideo->uid && !g36SameVideo->uid.isEmpty() && g36Same.audioTracks.size() == 1
+        && audioClipCount(g36Same) == 1;
+    // A sequence tcStart of 100s: the audio starting before the mc-clip is trimmed at the timeline origin
+    // (mapped offset >= tcStart) instead of dropped: offset 101s, start 2s, audio [0, 5) -> [1, 5).
+    const auto g36Origin = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"101s\" start=\"2s\" duration=\"4s\" audioStart=\"0s\" audioDuration=\"5s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"), multicamMedia(singleAngle1, singleAngle2),
+        QStringLiteral("tcStart=\"100s\"")), dir.path());
+    const ClipInfo *g36OriginVideo = g36FirstVideo(g36Origin), *g36OriginAudio = g36FirstAudio(g36Origin);
+    const bool audioOriginOk = g36Origin.error.isEmpty() && g36OriginVideo && g36OriginAudio && audioClipCount(g36Origin) == 1
+        && near(g36OriginVideo->inPoint, 2.0) && near(g36OriginVideo->outPoint, 6.0) && near(g36OriginVideo->leadInSec, 1.0)
+        && near(g36OriginAudio->inPoint, 1.0) && near(g36OriginAudio->outPoint, 5.0) && near(g36OriginAudio->anchorOffsetSec, -1.0);
+    std::fprintf(stderr, "G36 tcStart=100s: audioClips=%d audio(in=%.9f out=%.9f anchorOffset=%.9f) expected (1; 1,5,-1)\n",
+        audioClipCount(g36Origin), g36OriginAudio ? g36OriginAudio->inPoint : -1.0, g36OriginAudio ? g36OriginAudio->outPoint : -1.0,
+        g36OriginAudio ? g36OriginAudio->anchorOffsetSec : -99.0);
+    std::fprintf(stderr, "G36 same angle (srcEnable=all): video(in=%.9f out=%.9f) audio(in=%.9f out=%.9f count=%d) expected video(2,6) audio(5,8) count 1\n",
+        g36SameVideo ? g36SameVideo->inPoint : -1.0, g36SameVideo ? g36SameVideo->outPoint : -1.0,
+        g36SameAudio ? g36SameAudio->inPoint : -1.0, g36SameAudio ? g36SameAudio->outPoint : -1.0, audioClipCount(g36Same));
+    std::fprintf(stderr, "G36 range: video(in=%.9f out=%.9f) audio(name=%s in=%.9f out=%.9f anchorOffset=%.9f) expected video(2,6) audio(voiceclip,5,8,3) | "
+        "early: audio(in=%.9f out=%.9f anchorOffset=%.9f) expected (1,5,-1) | plain: audio(in=%.9f out=%.9f) expected (2,6)\n",
+        g36RangeVideo ? g36RangeVideo->inPoint : -1.0, g36RangeVideo ? g36RangeVideo->outPoint : -1.0,
+        g36RangeAudio ? g36RangeAudio->displayName.toUtf8().constData() : "", g36RangeAudio ? g36RangeAudio->inPoint : -1.0,
+        g36RangeAudio ? g36RangeAudio->outPoint : -1.0, g36RangeAudio ? g36RangeAudio->anchorOffsetSec : -99.0,
+        g36EarlyAudio ? g36EarlyAudio->inPoint : -1.0, g36EarlyAudio ? g36EarlyAudio->outPoint : -1.0,
+        g36EarlyAudio ? g36EarlyAudio->anchorOffsetSec : -99.0,
+        g36PlainAudio ? g36PlainAudio->inPoint : -1.0, g36PlainAudio ? g36PlainAudio->outPoint : -1.0);
+    gate(36, audioRangeOk && audioEarlyOk && audioPlainOk && audioSameOk && audioOriginOk);
+
+    // G37: an angle 1s shorter than the mc-clip range leaves the tail empty with exactly one warning
+    // (the following spine clip keeps the mc-clip's end position); a connected mc-clip (lane=1) is
+    // flattened onto V2 and anchored to its spine parent (its own lane child anchors to that parent too).
+    const QString g37ShortWarning = QStringLiteral("mc-clip MCC のアングル アングル1 が範囲より 1 秒短いため末尾を空けました");
+    const auto g37ShortAngle = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"5s\"><mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"
+        "<asset-clip ref=\"a\" name=\"after\" offset=\"5s\" duration=\"2s\"/>"),
+        multicamMedia(QStringLiteral("<asset-clip ref=\"a\" name=\"A1clip\" offset=\"0s\" duration=\"4s\"/>"), singleAngle2)),
+        dir.path());
+    QStringList g37ShortWarnings;
+    for (const QString &w : g37ShortAngle.warnings) if (w.contains(QStringLiteral("短いため"))) g37ShortWarnings.append(w);
+    const bool g37ShortShape = g37ShortAngle.error.isEmpty() && g37ShortAngle.videoTracks.size() == 1 && g37ShortAngle.videoTracks[0].size() == 2;
+    const ClipInfo *g37ShortFirst = g37ShortShape ? &g37ShortAngle.videoTracks[0][0] : nullptr;
+    const ClipInfo *g37ShortAfter = g37ShortShape ? &g37ShortAngle.videoTracks[0][1] : nullptr;
+    const bool g37ShortOk = g37ShortShape && g37ShortWarnings == QStringList{g37ShortWarning}
+        && g37ShortFirst->displayName == QStringLiteral("A1clip") && near(g37ShortFirst->outPoint - g37ShortFirst->inPoint, 4.0)
+        && g37ShortAfter->displayName == QStringLiteral("after") && near(g37ShortAfter->leadInSec, 1.0);
+    const auto g37ConnectedMc = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"base\" offset=\"0s\" duration=\"10s\">"
+        "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"2s\" start=\"1s\" duration=\"3s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/>"
+        "<asset-clip ref=\"b\" name=\"mcChild\" lane=\"1\" offset=\"1s\" duration=\"1s\"/></mc-clip></asset-clip>"),
+        multicamMedia(singleAngle1, singleAngle2)), dir.path());
+    const ClipInfo *g37Base = g37ConnectedMc.videoTracks.size() >= 1 && g37ConnectedMc.videoTracks[0].size() == 1
+        ? &g37ConnectedMc.videoTracks[0][0] : nullptr;
+    const ClipInfo *g37Mc = g37ConnectedMc.videoTracks.size() >= 2 && !g37ConnectedMc.videoTracks[1].isEmpty()
+        ? &g37ConnectedMc.videoTracks[1][0] : nullptr;
+    const ClipInfo *g37Child = g37ConnectedMc.videoTracks.size() >= 3 && !g37ConnectedMc.videoTracks[2].isEmpty()
+        ? &g37ConnectedMc.videoTracks[2][0] : nullptr;
+    const bool g37ConnectedOk = g37ConnectedMc.error.isEmpty() && g37ConnectedMc.videoTracks.size() == 3 && g37Base && g37Mc && g37Child
+        && g37Base->displayName == QStringLiteral("base") && !g37Base->uid.isEmpty()
+        && g37Mc->displayName == QStringLiteral("A1clip") && g37Mc->anchorUid == g37Base->uid
+        && near(g37Mc->anchorOffsetSec, 2.0) && near(g37Mc->inPoint, 1.0) && near(g37Mc->outPoint, 4.0)
+        && g37Child->displayName == QStringLiteral("mcChild") && g37Child->anchorUid == g37Base->uid && near(g37Child->anchorOffsetSec, 2.0);
+    std::fprintf(stderr, "G37 short: warnings=[%s] shapeOk=%d afterLead=%.9f | connected: error=[%s] tracks=%d mc(name=%s anchorOk=%d anchorOffset=%.9f in=%.9f out=%.9f) child(name=%s anchorsSpineParent=%d offset=%.9f expected 2)\n",
+        g37ShortWarnings.join('|').toUtf8().constData(), int(g37ShortShape), g37ShortAfter ? g37ShortAfter->leadInSec : -1.0,
+        g37ConnectedMc.error.toUtf8().constData(), int(g37ConnectedMc.videoTracks.size()),
+        g37Mc ? g37Mc->displayName.toUtf8().constData() : "", int(g37Mc && g37Base && g37Mc->anchorUid == g37Base->uid),
+        g37Mc ? g37Mc->anchorOffsetSec : -99.0, g37Mc ? g37Mc->inPoint : -1.0, g37Mc ? g37Mc->outPoint : -1.0,
+        g37Child ? g37Child->displayName.toUtf8().constData() : "", int(g37Child && g37Base && g37Child->anchorUid == g37Base->uid),
+        g37Child ? g37Child->anchorOffsetSec : -99.0);
+    // A connected mc-clip may carry a signed offset (J cut before its anchor's in-point), like any lane child.
+    auto g37SignedMc = [&](const QString &parentOffset) {
+        return fcpx::xml::parseXml(document(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"base\" offset=\"%1\" duration=\"20s\">"
+            "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"-1s\" start=\"0s\" duration=\"3s\">"
+            "<mc-source angleID=\"a1\" srcEnable=\"video\"/></mc-clip></asset-clip>").arg(parentOffset),
+            multicamMedia(singleAngle1, singleAngle2)), dir.path());
+    };
+    auto g37InvalidWarnings = [](const fcpx::xml::ImportResult &r) {
+        int n = 0;
+        for (const QString &w : r.warnings) if (w.contains(QStringLiteral("クリップの値が不正です"))) ++n;
+        return n;
+    };
+    const auto g37Signed = g37SignedMc(QStringLiteral("10s"));
+    const ClipInfo *g37SignedMcClip = g37Signed.videoTracks.size() == 2 && g37Signed.videoTracks[1].size() == 1
+        ? &g37Signed.videoTracks[1][0] : nullptr;
+    const ClipInfo *g37SignedBase = !g37Signed.videoTracks.isEmpty() && g37Signed.videoTracks[0].size() == 1
+        ? &g37Signed.videoTracks[0][0] : nullptr;
+    const bool g37SignedOk = g37Signed.error.isEmpty() && g37InvalidWarnings(g37Signed) == 0 && g37SignedMcClip && g37SignedBase
+        && g37SignedMcClip->displayName == QStringLiteral("A1clip") && g37SignedMcClip->anchorUid == g37SignedBase->uid
+        && !g37SignedBase->uid.isEmpty() && near(g37SignedMcClip->anchorOffsetSec, -1.0)
+        && near(g37SignedMcClip->leadInSec, 9.0) && near(g37SignedMcClip->inPoint, 0.0) && near(g37SignedMcClip->outPoint, 3.0);
+    const auto g37Trimmed = g37SignedMc(QStringLiteral("0s"));
+    const ClipInfo *g37TrimmedClip = g37Trimmed.videoTracks.size() == 2 && g37Trimmed.videoTracks[1].size() == 1
+        ? &g37Trimmed.videoTracks[1][0] : nullptr;
+    const bool g37TrimmedOk = g37Trimmed.error.isEmpty() && g37InvalidWarnings(g37Trimmed) == 0 && g37TrimmedClip
+        && g37TrimmedClip->displayName == QStringLiteral("A1clip") && near(g37TrimmedClip->leadInSec, 0.0)
+        && near(g37TrimmedClip->inPoint, 1.0) && near(g37TrimmedClip->outPoint, 3.0);
+    std::fprintf(stderr, "G37 signed offset: parent 10s: error=[%s] invalidWarnings=%d mc(anchorOffset=%.9f lead=%.9f in=%.9f out=%.9f) expected (-1, 9, 0, 3) | "
+        "parent 0s trimmed: error=[%s] invalidWarnings=%d mc(lead=%.9f in=%.9f out=%.9f) expected (0, 1, 3)\n",
+        g37Signed.error.toUtf8().constData(), g37InvalidWarnings(g37Signed),
+        g37SignedMcClip ? g37SignedMcClip->anchorOffsetSec : -99.0, g37SignedMcClip ? g37SignedMcClip->leadInSec : -99.0,
+        g37SignedMcClip ? g37SignedMcClip->inPoint : -1.0, g37SignedMcClip ? g37SignedMcClip->outPoint : -1.0,
+        g37Trimmed.error.toUtf8().constData(), g37InvalidWarnings(g37Trimmed),
+        g37TrimmedClip ? g37TrimmedClip->leadInSec : -99.0, g37TrimmedClip ? g37TrimmedClip->inPoint : -1.0,
+        g37TrimmedClip ? g37TrimmedClip->outPoint : -1.0);
+    // The audio defaults come from the XML range, not the range placeConnected trimmed: offset -1s start 0s
+    // duration 3s, audio enabled; audioStart=0s alone and audioDuration=3s alone both mean [0, 3) -> clamped to [1, 3).
+    auto g37SignedAudio = [&](const QString &audioAttribute) {
+        return fcpx::xml::parseXml(document(QStringLiteral(
+            "<asset-clip ref=\"a\" name=\"base\" offset=\"0s\" duration=\"20s\">"
+            "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"-1s\" start=\"0s\" duration=\"3s\" %1>"
+            "%2</mc-clip></asset-clip>").arg(audioAttribute, g36Sources),
+            mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    };
+    const auto g37AudioStart = g37SignedAudio(QStringLiteral("audioStart=\"0s\""));
+    const auto g37AudioDuration = g37SignedAudio(QStringLiteral("audioDuration=\"3s\""));
+    const ClipInfo *g37AudioStartClip = g36FirstAudio(g37AudioStart), *g37AudioDurationClip = g36FirstAudio(g37AudioDuration);
+    const bool g37SignedAudioOk = g37AudioStart.error.isEmpty() && g37AudioDuration.error.isEmpty()
+        && g37AudioStartClip && g37AudioDurationClip && audioClipCount(g37AudioStart) == 1 && audioClipCount(g37AudioDuration) == 1
+        && near(g37AudioStartClip->inPoint, 1.0) && near(g37AudioStartClip->outPoint, 3.0)
+        && near(g37AudioDurationClip->inPoint, 1.0) && near(g37AudioDurationClip->outPoint, 3.0);
+    std::fprintf(stderr, "G37 signed offset audio: audioStart=0s audio(in=%.9f out=%.9f) | audioDuration=3s audio(in=%.9f out=%.9f) expected (1,3) both\n",
+        g37AudioStartClip ? g37AudioStartClip->inPoint : -1.0, g37AudioStartClip ? g37AudioStartClip->outPoint : -1.0,
+        g37AudioDurationClip ? g37AudioDurationClip->inPoint : -1.0, g37AudioDurationClip ? g37AudioDurationClip->outPoint : -1.0);
+    // Two overrunning ranges on the same angle (video and a split audio copy) still yield one warning for that angle.
+    const auto g37SameShort = fcpx::xml::parseXml(document(QStringLiteral(
+        "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" duration=\"5s\" audioStart=\"0s\" audioDuration=\"6s\">"
+        "<mc-source angleID=\"a1\" srcEnable=\"all\"/></mc-clip>"),
+        multicamMedia(QStringLiteral("<asset-clip ref=\"a\" name=\"A1clip\" offset=\"0s\" duration=\"4s\"/>"), singleAngle2)),
+        dir.path());
+    int g37SameShortCount = 0;
+    for (const QString &w : g37SameShort.warnings) if (w.contains(QStringLiteral("短いため"))) ++g37SameShortCount;
+    std::fprintf(stderr, "G37 same-angle shortage warnings=%d expected 1\n", g37SameShortCount);
+    gate(37, g37ShortOk && g37ConnectedOk && g37SignedOk && g37TrimmedOk && g37SignedAudioOk && g37SameShortCount == 1);
+
+    // G38 / G39 share this view: the warnings other than the offline-media notice every fixture raises.
+    auto g38Warnings = [](const fcpx::xml::ImportResult &r) {
+        QStringList out;
+        for (const QString &w : r.warnings) if (!w.startsWith(QStringLiteral("オフライン素材"))) out.append(w);
+        return out;
+    };
+    // G38: a connected clip container whose signed offset lies before its parent's time zero is cut at
+    // timeline zero like any lane child: the container's frame and its inheriting child both start at 0 and
+    // lose the 2s lead (source in 0 -> 2), with the one existing trim warning. HEAD drops it with the child.
+    const auto g38 = fcpx::xml::parseXml(document(QStringLiteral(
+        "<asset-clip ref=\"a\" name=\"base\" offset=\"0s\" duration=\"10s\">"
+        "<clip name=\"neg\" lane=\"1\" offset=\"-2s\" start=\"0s\" duration=\"5s\">"
+        "<asset-clip ref=\"a\" name=\"negChild\" duration=\"5s\"/></clip></asset-clip>")), dir.path());
+    const ClipInfo *g38Base = !g38.videoTracks.isEmpty() && g38.videoTracks[0].size() == 1 ? &g38.videoTracks[0][0] : nullptr;
+    const ClipInfo *g38Child = g38.videoTracks.size() == 2 && g38.videoTracks[1].size() == 1 ? &g38.videoTracks[1][0] : nullptr;
+    const QStringList g38Warns = g38Warnings(g38);
+    const bool g38Ok = g38.error.isEmpty() && g38Base && g38Child && !g38Base->uid.isEmpty()
+        && g38Child->displayName == QStringLiteral("negChild") && g38Child->anchorUid == g38Base->uid
+        && near(g38Child->leadInSec, 0.0) && near(g38Child->inPoint, 2.0) && near(g38Child->outPoint, 5.0)
+        && g38Warns == QStringList{QStringLiteral("接続クリップをタイムライン 0 で切り詰めました: neg / ")};
+    std::fprintf(stderr, "G38 error=[%s] child(name=%s lead=%.9f in=%.9f out=%.9f anchorsBase=%d) expected (negChild, 0, 2, 5, 1) warnings=[%s] expected exactly [接続クリップをタイムライン 0 で切り詰めました: neg / ]\n",
+        g38.error.toUtf8().constData(), g38Child ? g38Child->displayName.toUtf8().constData() : "",
+        g38Child ? g38Child->leadInSec : -99.0, g38Child ? g38Child->inPoint : -1.0, g38Child ? g38Child->outPoint : -1.0,
+        int(g38Child && g38Base && g38Child->anchorUid == g38Base->uid), g38Warns.join(QStringLiteral(" | ")).toUtf8().constData());
+    gate(38, g38Ok);
+
+    // G39: a container's duration is its frame end: a 5s child in a 2s container is cut to 2s with one
+    // warning (HEAD keeps 5s); a child that exactly fills its container is left alone without a warning.
+    const auto g39 = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"long\" duration=\"5s\"/></clip>"
+        "<clip name=\"fit\" offset=\"10s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"exact\" duration=\"2s\"/></clip>")), dir.path());
+    const ClipInfo *g39Long = namedClip(g39.videoTracks, QStringLiteral("long"));
+    const ClipInfo *g39Exact = namedClip(g39.videoTracks, QStringLiteral("exact"));
+    const QStringList g39Warns = g38Warnings(g39);
+    const bool g39Ok = g39.error.isEmpty() && g39Long && g39Exact
+        && near(g39Long->inPoint, 0.0) && near(g39Long->outPoint, 2.0)
+        && near(g39Exact->inPoint, 0.0) && near(g39Exact->outPoint, 2.0)
+        && g39Warns == QStringList{QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: long / a")};
+    std::fprintf(stderr, "G39 error=[%s] long(in=%.9f out=%.9f) expected (0, 2) exact(in=%.9f out=%.9f) expected (0, 2) warnings=[%s] expected exactly [コンテナの長さを超えるクリップを切り詰めました: long / a]\n",
+        g39.error.toUtf8().constData(), g39Long ? g39Long->inPoint : -1.0, g39Long ? g39Long->outPoint : -1.0,
+        g39Exact ? g39Exact->inPoint : -1.0, g39Exact ? g39Exact->outPoint : -1.0,
+        g39Warns.join(QStringLiteral(" | ")).toUtf8().constData());
+    // Sub-items: a child at exactly the container end, one entirely past it and a zero-length container are
+    // dropped with the one out-of-range warning (HEAD imports them); a descendant is bounded by the frame too.
+    const QString g39Outside = QStringLiteral("コンテナの範囲外のクリップを読み飛ばしました: ");
+    const auto g39End = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"atEnd\" offset=\"2s\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Past = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"past\" offset=\"3s\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Zero = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"0s\">"
+        "<asset-clip ref=\"a\" name=\"zeroKid\" duration=\"1s\"/></clip>")), dir.path());
+    const auto g39Desc = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"host\" duration=\"5s\">"
+        "<audio ref=\"av\" name=\"cAudio\" lane=\"-1\" offset=\"1s\" duration=\"4s\"/></asset-clip></clip>"),
+        avAsset), dir.path());
+    const ClipInfo *g39Host = namedClip(g39Desc.videoTracks, QStringLiteral("host"));
+    const ClipInfo *g39Audio = namedClip(g39Desc.audioTracks, QStringLiteral("cAudio"));
+    const QStringList g39EndWarns = g38Warnings(g39End), g39PastWarns = g38Warnings(g39Past),
+        g39ZeroWarns = g38Warnings(g39Zero), g39DescWarns = g38Warnings(g39Desc);
+    const double g39AudioEnd = g39Audio ? g39Audio->leadInSec + g39Audio->outPoint - g39Audio->inPoint : 99.0;
+    const bool g39DescTrimWarned = g39DescWarns.contains(QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: cAudio / av"));
+    std::fprintf(stderr, "G39 atEnd videoClips=%d warnings=[%s] expected 0 and exactly [%satEnd / a]\n",
+        int(g39End.videoTracks.isEmpty() ? 0 : g39End.videoTracks[0].size()),
+        g39EndWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 past videoClips=%d warnings=[%s] expected 0 and exactly [%spast / a]\n",
+        int(g39Past.videoTracks.isEmpty() ? 0 : g39Past.videoTracks[0].size()),
+        g39PastWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 zero-duration container videoClips=%d warnings=[%s] expected 0 and exactly [%szeroKid / a]\n",
+        int(g39Zero.videoTracks.isEmpty() ? 0 : g39Zero.videoTracks[0].size()),
+        g39ZeroWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    std::fprintf(stderr, "G39 descendant error=[%s] host(out=%.9f) audio(lead=%.9f in=%.9f out=%.9f end=%.9f) trimWarned=%d expected (2, end<=2, 1) warnings=[%s]\n",
+        g39Desc.error.toUtf8().constData(), g39Host ? g39Host->outPoint : -1.0, g39Audio ? g39Audio->leadInSec : -1.0,
+        g39Audio ? g39Audio->inPoint : -1.0, g39Audio ? g39Audio->outPoint : -1.0, g39AudioEnd, int(g39DescTrimWarned),
+        g39DescWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    const bool g39SubOk = g39Desc.error.isEmpty()
+        && namedClip(g39End.videoTracks, QStringLiteral("atEnd")) == nullptr
+        && namedClip(g39Past.videoTracks, QStringLiteral("past")) == nullptr
+        && namedClip(g39Zero.videoTracks, QStringLiteral("zeroKid")) == nullptr
+        && g39EndWarns == QStringList{g39Outside + QStringLiteral("atEnd / a")}
+        && g39PastWarns == QStringList{g39Outside + QStringLiteral("past / a")}
+        && g39ZeroWarns == QStringList{g39Outside + QStringLiteral("zeroKid / a")}
+        && g39Host && near(g39Host->outPoint, 2.0) && g39Audio && g39AudioEnd <= 2.0 + 1e-9
+        && g39DescTrimWarned;
+    // Connected mc-clips are bounded by the container frame too: video and the separately cut audio of one
+    // that crosses the 2s frame end stay inside it with one trim warning; one at or past the end is dropped
+    // with the one out-of-range warning (HEAD keeps both, to 5s).
+    auto g39Mc = [&](const QString &mcOffset) {
+        return fcpx::xml::parseXml(document(QStringLiteral(
+            "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+            "<asset-clip ref=\"a\" name=\"host\" duration=\"5s\">"
+            "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"%1\" start=\"0s\" duration=\"4s\">%2</mc-clip>"
+            "</asset-clip></clip>").arg(mcOffset, g36Sources),
+            mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    };
+    auto g39McEnd = [](const fcpx::xml::ImportResult &r, const QString &name, bool audioKind, int *count) {
+        double end = -1.0;
+        const auto &tracks = audioKind ? r.audioTracks : r.videoTracks;
+        for (const auto &track : tracks)
+            for (const ClipInfo &c : track)
+                if (c.displayName != QStringLiteral("host") && c.displayName.contains(name)) {
+                    ++*count;
+                    end = std::max(end, c.leadInSec + c.outPoint - c.inPoint);
+                }
+        return end;
+    };
+    const auto g39McCross = g39Mc(QStringLiteral("1s"));
+    const auto g39McAt = g39Mc(QStringLiteral("2s"));
+    const auto g39McPast = g39Mc(QStringLiteral("3s"));
+    int g39CrossVideoN = 0, g39CrossAudioN = 0, g39AtN = 0, g39PastN = 0;
+    const double g39CrossVideoEnd = g39McEnd(g39McCross, QStringLiteral("A1clip"), false, &g39CrossVideoN);
+    const double g39CrossAudioEnd = g39McEnd(g39McCross, QStringLiteral("voiceclip"), true, &g39CrossAudioN);
+    g39McEnd(g39McAt, QStringLiteral("A1clip"), false, &g39AtN);
+    g39McEnd(g39McAt, QStringLiteral("voiceclip"), true, &g39AtN);
+    g39McEnd(g39McPast, QStringLiteral("A1clip"), false, &g39PastN);
+    g39McEnd(g39McPast, QStringLiteral("voiceclip"), true, &g39PastN);
+    const QStringList g39CrossWarns = g38Warnings(g39McCross), g39AtWarns = g38Warnings(g39McAt), g39PastWarns2 = g38Warnings(g39McPast);
+    // The 5s host is itself cut to the frame (its own warning comes first).
+    const QString g39HostTrim = QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: host / a");
+    const QStringList g39CrossExpected{g39HostTrim, QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: MCC / m")};
+    std::fprintf(stderr, "G39 connected mc crossing: error=[%s] video(n=%d end=%.9f) audio(n=%d end=%.9f) expected (n>=1, end<=2) warnings=[%s] expected exactly [host trim | MCC trim]\n",
+        g39McCross.error.toUtf8().constData(), g39CrossVideoN, g39CrossVideoEnd, g39CrossAudioN, g39CrossAudioEnd,
+        g39CrossWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    std::fprintf(stderr, "G39 connected mc at end: entries=%d warnings=[%s] | past: entries=%d warnings=[%s] expected 0 and exactly [host trim | %sMCC / m] each\n",
+        g39AtN, g39AtWarns.join(QStringLiteral(" | ")).toUtf8().constData(), g39PastN,
+        g39PastWarns2.join(QStringLiteral(" | ")).toUtf8().constData(), g39Outside.toUtf8().constData());
+    // The video fits the frame but audioDuration reaches past it: the separately cut audio is bounded too,
+    // with the one trim warning (HEAD leaves the audio ending at 5s).
+    const auto g39McAudio = fcpx::xml::parseXml(document(QStringLiteral(
+        "<clip name=\"box\" offset=\"0s\" start=\"0s\" duration=\"2s\">"
+        "<asset-clip ref=\"a\" name=\"host\" duration=\"2s\">"
+        "<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"1s\" start=\"0s\" duration=\"1s\" audioDuration=\"4s\">%1</mc-clip>"
+        "</asset-clip></clip>").arg(g36Sources),
+        mcSoundAsset + multicamMedia(singleAngle1, g36AudioAngle)), dir.path());
+    int g39AudVideoN = 0, g39AudAudioN = 0;
+    const double g39AudVideoEnd = g39McEnd(g39McAudio, QStringLiteral("A1clip"), false, &g39AudVideoN);
+    const double g39AudAudioEnd = g39McEnd(g39McAudio, QStringLiteral("voiceclip"), true, &g39AudAudioN);
+    const QStringList g39AudWarns = g38Warnings(g39McAudio);
+    std::fprintf(stderr, "G39 connected mc audio overflow: error=[%s] video(n=%d end=%.9f) audio(n=%d end=%.9f) expected (video end 2, n>=1, audio end<=2) warnings=[%s] expected exactly [MCC trim]\n",
+        g39McAudio.error.toUtf8().constData(), g39AudVideoN, g39AudVideoEnd, g39AudAudioN, g39AudAudioEnd,
+        g39AudWarns.join(QStringLiteral(" | ")).toUtf8().constData());
+    const bool g39McAudioOk = g39McAudio.error.isEmpty() && g39AudVideoN >= 1 && std::abs(g39AudVideoEnd - 2.0) < 1e-9
+        && g39AudAudioN >= 1 && g39AudAudioEnd <= 2.0 + 1e-9
+        && g39AudWarns == QStringList{QStringLiteral("コンテナの長さを超えるクリップを切り詰めました: MCC / m")};
+    const bool g39McOk = g39McAudioOk && g39McCross.error.isEmpty() && g39McAt.error.isEmpty() && g39McPast.error.isEmpty()
+        && g39CrossVideoN >= 1 && g39CrossAudioN >= 1 && g39CrossVideoEnd <= 2.0 + 1e-9 && g39CrossAudioEnd <= 2.0 + 1e-9
+        && g39CrossWarns == g39CrossExpected
+        && g39AtN == 0 && g39PastN == 0
+        && g39AtWarns == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")}
+        && g39PastWarns2 == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")};
+    gate(39, g39Ok && g39SubOk && g39McOk);
+
     return tally.finish();
 }

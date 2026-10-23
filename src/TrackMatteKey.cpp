@@ -318,4 +318,10 @@ void remapCarriersByUid(Timeline *timeline, const TrackClipSnapshot &before,
             rebuilt.insert(sequenceStoreKey, sequenceStore);
         timeline->setClipParentEntries(rebuilt);
     }
+    // US-1303: the same map as mapKey: an old key without a new one is dropped.
+    Timeline::ClipKeyRemap remap;
+    remap.oldToNew = oldToNew;
+    for (const QString &key : std::as_const(oldKeys))
+        if (!oldToNew.contains(key)) remap.dropped.insert(key);
+    timeline->notifyClipKeysRemapped(std::move(remap));
 }

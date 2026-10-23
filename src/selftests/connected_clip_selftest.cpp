@@ -1,4 +1,5 @@
 #include "../AudioMixer.h"
+#include "../BrushAnimation.h"
 #include "../MainWindow.h"
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
@@ -23,6 +24,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
+#include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -34,10 +36,16 @@
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
 #include <utility>
+extern "C" {
+#include <libavutil/channel_layout.h>
+#include <libavutil/frame.h>
+#include <libavutil/samplefmt.h>
+}
 
 // connected-clip (US-1201): primary-storyline connections (ClipInfo::anchorUid /
 // anchorOffsetSec) reconciled inside Timeline::saveUndoState.
@@ -106,8 +114,48 @@
 //   G25: negative controls: a V1 clip and a V2 clip with no V1 clip under or before it
 //        are rejected with the reason in the status bar and nothing changes.
 //   G26: with setStorylineMode(true) a media file dropped on V2 / A2 and a clip dropped
-//        from V3 onto V2 connect to the V1 clip under the drop; with the mode off, or on
-//        V1, the media drop is refused and the clip drop leaves no connection.
+//        from V3 onto V2 connect to the V1 clip under the drop; with the mode off the media
+//        drop is refused (also on V1) and the clip drop leaves no connection. US-1304: with
+//        the mode on a media drop in the middle of a V1 clip snaps to the next boundary and
+//        pushes the clips after it (it was refused before).
+// US-1304 (media drop on V1 in storyline mode):
+//   G29: a drop with audio on the V1 boundary of [X|Y] gives three V1 clips; Y, the V2 clip
+//        connected to Y and Y's linked audio move by the new length, the unlinked A1 BGM does
+//        not, the new audio is on a free audio track at the new V1 clip's start with no
+//        overlap, one undo restores everything, and a selected Y stays selected. A variant
+//        with a one-frame gap in front of the drop point closes the gap and keeps the new
+//        audio on the new V1 clip's start.
+//   G30: a drop on a locked V1 is refused with the lock text and changes nothing; with every
+//        audio track locked, or full at the landing time, it is refused with the free-track
+//        text and V1 is unchanged.
+// US-1303 (clip-key remap signal, no roto / matte / parent on the fixtures):
+//   G31: Timeline::clipKeysRemapped fires once per key-changing mutation with the identity
+//        pairs removed: delete V2 clip 0 ({1:1->1:0}, dropped {1:0}), a V2 reorder, a drop
+//        onto V3, a storyline insert followed by the reconcile of saveUndoState, the external
+//        remap called twice with one snapshot, the same delete after an undo; a track removal
+//        gives trackIndicesRemapped only, key-preserving edits and the undo give nothing.
+//        Detects: the emit removed (0 emits), the memo not cleared by undo (the second delete
+//        silent), identity pairs kept (key-preserving edits emit, the delete map not exact).
+// US-1302 (position-keyed MainWindow sidecars, no roto / matte on the fixture):
+//   G32: timeRemap / wiggle / text3D / expression / brush entries (and the clipId inside the
+//        timeRemap and brush values) on V2 clip b follow (1) a delete of the clip in front of
+//        b to "1:0", (3) undo / redo to "1:1" / "1:0", (3') the same delete after an undo to
+//        "1:0", (2) a drop of b onto V3 to "2:0", (4) a save / load, (5) the removal of V2 to
+//        "1:0"; (6) a sidecar edit that records no undo point survives the undo of an unrelated
+//        edit. Detects: no rekey slot (HEAD: entries stay on the old key, on a's neighbour),
+//        the sidecar applier only on structural undo (3), the memo kept over an undo (3').
+// US-1320 (wave 14 cumulative review C-03 / C-04):
+//   G33: a storyline media drop on the V1 boundary of [X|Y] whose reconcile pushes c (on V2,
+//        connected to Y) past the unconnected d emits clipKeysRemapped once with the composed
+//        map {0:1->0:2, 1:0->1:1, 1:1->1:0} and no identity pair. Detects: no key-remap batch
+//        in importMedia (HEAD: 2 emits, the V1 shift and the V2 reorder).
+//   G34: after a storyline drop at the V1 head moves the selection, the brush preview is bound
+//        through the rekeyed entries: (a) a selected with no brush -> nothing bound, (b) b
+//        selected with the brush -> bound on b's new key "0:2". Detects: no rebind at the end
+//        of rekeyPositionKeyedSidecars (HEAD: (a) binds b's brush via "0:1", (b) stays cleared).
+//        (c) Timeline::undo / redo of each drop keep the brush on b ("0:1" / "0:2"). Detects:
+//        the drop's undo point saved before the batched remap reached the sidecars (redo puts
+//        b's brush on a at "0:1").
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -327,6 +375,66 @@ QStringList answeringMessageBoxes(QObject *context, const std::function<void()> 
     return seen;
 }
 
+// US-1300: closes the modal prompts a real MainWindow slot opens, on a periodic timer (the
+// slot may open several in a row). A QMessageBox with a Yes button is answered Yes; a
+// QInputDialog gets `inputText` and is accepted when one was given; anything else is
+// rejected and counted in `unexpected`, so a stray dialog fails the gate instead of
+// hanging it. The timer stops with the object.
+struct ModalDriver {
+    explicit ModalDriver(QObject *context, const QString &inputText = QString())
+        : text(inputText)
+    {
+        timer.setInterval(20);
+        QObject::connect(&timer, &QTimer::timeout, context, [this] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            if (auto *box = qobject_cast<QMessageBox *>(modal)) {
+                seen.append(box->text());
+                if (QAbstractButton *yes = box->button(QMessageBox::Yes)) {
+                    ++answered;
+                    yes->click();
+                } else {
+                    ++unexpected;
+                    box->reject();
+                }
+            } else if (auto *input = qobject_cast<QInputDialog *>(modal)) {
+                if (text.isEmpty()) {
+                    ++unexpected;
+                    input->reject();
+                } else {
+                    ++answered;
+                    input->setTextValue(text);
+                    input->accept();
+                }
+            } else {
+                ++unexpected;
+                if (auto *dialog = qobject_cast<QDialog *>(modal)) dialog->reject();
+                else modal->close();
+            }
+        });
+    }
+    ~ModalDriver() { timer.stop(); }
+    void start() { timer.start(); }
+
+    QTimer timer;
+    QString text;
+    QStringList seen;
+    int answered = 0;
+    int unexpected = 0;
+};
+
+// MainWindow::onMultiCamApplyToTimeline is a private slot: reach it by explicit instantiation
+// (audio_fixture_selftest.cpp does the same) so MainWindow.h stays unchanged.
+template<class Tag, typename Tag::Type Member>
+struct Access {
+    friend typename Tag::Type member(Tag) { return Member; }
+};
+struct MultiCamApplyTag {
+    using Type = void (MainWindow::*)(const MultiCamProject &);
+    friend Type member(MultiCamApplyTag);
+};
+template struct Access<MultiCamApplyTag, &MainWindow::onMultiCamApplyToTimeline>;
+
 // 40x24 10 fps mpeg4 clip of `frames` frames (the media a drop imports).
 bool writeVideoFile(const QString &path, int frames)
 {
@@ -349,6 +457,46 @@ bool writeVideoFile(const QString &path, int frames)
         if (!encoder.pushFrame(frame, i)) return false;
     }
     return !encoder.finalize();
+}
+
+// 40x24 10 fps mpeg4 clip of `frames` frames with a silent AAC track of the same length.
+bool writeVideoWithAudioFile(const QString &path, int frames)
+{
+    libavcore::EncodeRequest req;
+    req.width = 40;
+    req.height = 24;
+    req.fps = 10;
+    req.fpsNum = 10;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    req.audioEncode = true;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req)) return false;
+    for (int i = 0; i < frames; ++i) {
+        QImage frame(40, 24, QImage::Format_RGB888);
+        frame.fill(QColor((i * 23) & 255, 90, 160));
+        if (!encoder.pushFrame(frame, i)) return false;
+    }
+    AVFrame *audio = av_frame_alloc();
+    if (!audio) return false;
+    audio->format = AV_SAMPLE_FMT_FLTP;
+    audio->sample_rate = 48000;
+    audio->nb_samples = 1024;
+    av_channel_layout_default(&audio->ch_layout, 2);
+    bool ok = av_frame_get_buffer(audio, 0) >= 0;
+    for (int i = 0; ok && i < frames * 4800; i += 1024) {
+        ok = av_frame_make_writable(audio) >= 0;
+        if (ok) {
+            av_samples_set_silence(audio->extended_data, 0, 1024, 2, AV_SAMPLE_FMT_FLTP);
+            ok = encoder.pushAudioFrame(audio, i);
+        }
+    }
+    av_frame_free(&audio);
+    return ok && !encoder.finalize();
 }
 
 void selectOnly(Timeline &timeline, bool audio, int track, int index)
@@ -399,6 +547,798 @@ bool sendClipDropOnTrack(TimelineTrack *src, int srcIdx, TimelineTrack *dest, do
     static_cast<QObject *>(dest)->event(&event);
     TimelineTrack::setSelftestDropSource(nullptr);
     return event.isAccepted();
+}
+
+// G31 (US-1303): clipKeysRemapped once per key-changing mutation, identity pairs removed.
+void keyRemapGate(selftest::GateTally &tally)
+{
+    // No fixture has roto, matte or parent entries, so every emit comes from the key map alone.
+    using Remap = Timeline::ClipKeyRemap;
+    auto show = [](const QVector<Remap> &log) {
+        QStringList parts;
+        for (const Remap &r : log) {
+            QStringList pairs;
+            for (auto it = r.oldToNew.cbegin(); it != r.oldToNew.cend(); ++it)
+                pairs.append(it.key() + QStringLiteral(">") + it.value());
+            pairs.sort();
+            QStringList dropped(r.dropped.cbegin(), r.dropped.cend());
+            dropped.sort();
+            parts.append(QStringLiteral("{%1 | dropped %2}").arg(pairs.join(','), dropped.join(',')));
+        }
+        return QStringLiteral("%1 emit(s) %2").arg(log.size()).arg(parts.join(' '));
+    };
+    auto record = [](Timeline &tl, QVector<Remap> &log) {
+        QObject::connect(&tl, &Timeline::clipKeysRemapped, &tl,
+                         [&log](const Remap &r) { log.append(r); });
+    };
+    auto remapOf = [](const QVector<QPair<QString, QString>> &pairs, const QStringList &dropped) {
+        Remap r;
+        for (const auto &p : pairs) r.oldToNew.insert(p.first, p.second);
+        for (const QString &key : dropped) r.dropped.insert(key);
+        return r;
+    };
+    // V1 [x 0-10], V2 [a 0-2 | b 3-5], V3 [c 10-12].
+    auto fixture = [](Timeline &tl) {
+        load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+                  {clipFor("c", 2.0, 10.0)}});
+    };
+    const Remap deleteA = remapOf({{"1:1", "1:0"}}, {"1:0"});
+
+    // (1) delete V2 clip 0, then (7) undo and the same delete again.
+    Timeline delTl;
+    fixture(delTl);
+    QVector<Remap> delLog;
+    record(delTl, delLog);
+    QString err;
+    const bool deleted1 = delTl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString delShown = show(delLog);
+    const bool ok1 = deleted1 && delLog.size() == 1 && delLog[0] == deleteA;
+    delLog.clear();
+    delTl.undo();
+    const QString undoShown = show(delLog);
+    const bool undoSilent = delLog.isEmpty() && delTl.trackAt(false, 1)->clipCount() == 2;
+    const bool deleted2 = delTl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString redelShown = show(delLog);
+    const bool ok7 = undoSilent && deleted2 && delLog.size() == 1 && delLog[0] == deleteA;
+
+    // (9) delete the V2 tail, append a clip whose key map is identity only, then delete
+    // it: the second delete is a new mutation and announces its drop again.
+    const Remap deleteTail = remapOf({}, {"1:1"});
+    Timeline tailTl;
+    fixture(tailTl);
+    QVector<Remap> tailLog;
+    record(tailTl, tailLog);
+    QString tailErr;
+    const bool tailDeleted1 = tailTl.deleteClipByIndex(false, 1, 1, false, &tailErr);
+    const QString tailDelShown = show(tailLog);
+    const bool tailFirst = tailDeleted1 && tailLog.size() == 1 && tailLog[0] == deleteTail;
+    tailLog.clear();
+    ClipInfo shapeClip = clipFor("s", 1.0);
+    Shape square;
+    square.type = ShapeType::Rectangle;
+    square.properties.size = QSizeF(10.0, 10.0);
+    shapeClip.shapes = {square};
+    tailTl.trackAt(false, 1)->setSelectedClip(0);
+    tailTl.setPlayheadPosition(6.0);
+    const bool appended = tailTl.insertShapeClipAtPlayhead(shapeClip)
+        && tailTl.trackAt(false, 1)->clipCount() == 2;
+    const QString appendShown = show(tailLog);
+    const bool appendSilent = appended && tailLog.isEmpty();
+    const bool tailDeleted2 = tailTl.deleteClipByIndex(false, 1, 1, false, &tailErr);
+    const QString tailRedelShown = show(tailLog);
+    const bool ok9 = tailFirst && appendSilent && tailDeleted2 && tailLog.size() == 1
+        && tailLog[0] == deleteTail;
+
+    // (2) V2 reorder: b to the front.
+    Timeline moveTl;
+    fixture(moveTl);
+    QVector<Remap> moveLog;
+    record(moveTl, moveLog);
+    moveTl.trackAt(false, 1)->moveClip(1, 0);
+    const QString moveShown = show(moveLog);
+    const bool ok2 = moveTl.trackAt(false, 1)->clips().value(0).displayName == QStringLiteral("b")
+        && moveLog.size() == 1 && moveLog[0] == remapOf({{"1:1", "1:0"}, {"1:0", "1:1"}}, {});
+
+    // (3) b dropped from V2 onto V3 at 0 (before c).
+    Timeline dropTl;
+    fixture(dropTl);
+    QVector<Remap> dropLog;
+    record(dropTl, dropLog);
+    const bool dropped = sendClipDropOnTrack(dropTl.trackAt(false, 1), 1, dropTl.trackAt(false, 2), 0.0)
+        && dropTl.trackAt(false, 2)->clips().value(0).displayName == QStringLiteral("b");
+    const QString dropShown = show(dropLog);
+    const bool ok3 = dropped && dropLog.size() == 1
+        && dropLog[0] == remapOf({{"1:1", "2:0"}, {"2:0", "2:1"}}, {});
+
+    // (4) storyline mode: insert 5 s at the V1 head, then saveUndoState (whose reconcile
+    // moves c, connected to y at 2, past the unconnected d: V2 [c | d] -> [d | c]).
+    Timeline insTl;
+    load(insTl, {{clipFor("y", 10.0)}, {clipFor("c", 1.0, 2.0), clipFor("d", 1.0, 1.0)}});
+    const QString yUid = uidAt(insTl, 0, 0);
+    const QString cUid = uidAt(insTl, 1, 0);
+    const bool connected = insTl.connectClip(TrackKind::Video, 1, 0, yUid);
+    insTl.setStorylineMode(true);
+    QVector<Remap> insLog;
+    record(insTl, insLog);
+    insTl.storylineInsertClip(insTl.trackAt(false, 0), 0.0, clipFor("ins", 5.0));
+    const int insertEmits = insLog.size();
+    insTl.saveUndoState(QStringLiteral("G31 storyline insert"));
+    const Located c = locate(insTl, false, cUid);
+    const QString insShown = show(insLog);
+    const bool ok4 = connected && c.track == 1 && c.index == 1 && near(c.startSec, 7.0)
+        && insLog.size() == 1 && insLog[0] == remapOf({{"1:0", "1:1"}, {"1:1", "1:0"}}, {});
+
+    // (5) the external catch-all twice with one snapshot.
+    Timeline extTl;
+    fixture(extTl);
+    QVector<Remap> extLog;
+    record(extTl, extLog);
+    const TrackClipSnapshot snap = snapshotTrackClips(&extTl);
+    TimelineTrack *extV2 = extTl.trackAt(false, 1);
+    extV2->setClips({extV2->clips().at(1)});
+    extTl.remapCarriersAfterExternalMutation(snap);
+    const int extFirst = extLog.size();
+    extTl.remapCarriersAfterExternalMutation(snap);
+    const QString extShown = show(extLog);
+    const bool ok5 = extFirst == 1 && extLog.size() == 1 && extLog[0] == deleteA;
+
+    // (6) removing V2 renumbers tracks only.
+    Timeline trkTl;
+    fixture(trkTl);
+    QVector<Remap> trkLog;
+    record(trkTl, trkLog);
+    int trackRemaps = 0;
+    QObject::connect(&trkTl, &Timeline::trackIndicesRemapped, &trkTl,
+                     [&trackRemaps](bool audio, QVector<int>) { if (!audio) ++trackRemaps; });
+    QString trkErr;
+    const bool removed = trkTl.removeTrack(false, 1, &trkErr);
+    const QString trkShown = show(trkLog);
+    const bool ok6 = removed && trackRemaps == 1 && trkLog.isEmpty();
+
+    // (8) key-preserving edits through the paired remap sites.
+    Timeline keepTl;
+    fixture(keepTl);
+    QVector<Remap> keepLog;
+    record(keepTl, keepLog);
+    const bool disabled = keepTl.setClipEnabled(TrackKind::Video, 1, 0, false);
+    QString keepErr;
+    const bool sped = keepTl.setClipPropertyByIndex(false, 1, 1, QStringLiteral("speed"), 2.0, &keepErr);
+    const QString keepShown = show(keepLog);
+    const bool ok8 = disabled && sped && keepLog.isEmpty();
+
+    std::fprintf(stderr, "connected-clip G31 (1) delete=%d %s (expect 1 {1:1>1:0 | dropped 1:0}) ok=%d\n",
+                 deleted1, qPrintable(delShown), ok1);
+    std::fprintf(stderr, "connected-clip G31 (2) reorder %s (expect 1 {1:0>1:1,1:1>1:0}) ok=%d\n",
+                 qPrintable(moveShown), ok2);
+    std::fprintf(stderr, "connected-clip G31 (3) drop=%d %s (expect 1 {1:1>2:0,2:0>2:1}) ok=%d\n",
+                 dropped, qPrintable(dropShown), ok3);
+    std::fprintf(stderr, "connected-clip G31 (4) connected=%d insertEmits=%d (expect 0) c track=%d index=%d "
+                 "start=%.6f (expect 1/1/7) %s (expect 1 {1:0>1:1,1:1>1:0}) ok=%d\n", connected,
+                 insertEmits, c.track, c.index, c.startSec, qPrintable(insShown), ok4);
+    std::fprintf(stderr, "connected-clip G31 (5) first=%d %s (expect 1 {1:1>1:0 | dropped 1:0}) ok=%d\n",
+                 extFirst, qPrintable(extShown), ok5);
+    std::fprintf(stderr, "connected-clip G31 (6) removed=%d [%s] trackIndicesRemapped=%d (expect 1) %s "
+                 "(expect 0) ok=%d\n", removed, qPrintable(trkErr), trackRemaps, qPrintable(trkShown), ok6);
+    std::fprintf(stderr, "connected-clip G31 (7) undo %s (expect 0) redelete=%d %s (expect 1 {1:1>1:0 | "
+                 "dropped 1:0}) ok=%d\n", qPrintable(undoShown), deleted2, qPrintable(redelShown), ok7);
+    std::fprintf(stderr, "connected-clip G31 (8) enabled=%d speed=%d [%s] %s (expect 0) ok=%d\n", disabled,
+                 sped, qPrintable(keepErr), qPrintable(keepShown), ok8);
+    std::fprintf(stderr, "connected-clip G31 (9) delete-tail=%d %s (expect 1 { | dropped 1:1}) append=%d %s "
+                 "(expect 0) redelete=%d [%s] %s (expect 1 { | dropped 1:1}) ok=%d\n", tailDeleted1,
+                 qPrintable(tailDelShown), appended, qPrintable(appendShown), tailDeleted2,
+                 qPrintable(tailErr), qPrintable(tailRedelShown), ok9);
+    tally.gate(31, ok1 && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9,
+               "clipKeysRemapped was not emitted exactly once with the identity-free map for a delete / "
+               "reorder / cross-track drop / storyline insert + reconcile / repeated external remap / "
+               "delete after undo / delete after a key-preserving append, or it fired for a track removal "
+               "or a key-preserving edit");
+}
+
+// G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
+// runConnectedClipSelftest hands over.
+struct SidecarView {
+    QHash<QString, TimeRemapClipEntry> *timeRemap = nullptr;
+    QHash<QString, QJsonObject> *text3D = nullptr;
+    QHash<QString, exprbind::ClipExpressionBindings> *expressions = nullptr;
+    QHash<QString, wiggle::WiggleParams> *wiggle = nullptr;
+    QVector<BrushAnimationEntry> *brush = nullptr;
+    QHash<QString, BrushAnimation *> *liveBrush = nullptr;
+    BrushAnimation *(MainWindow::*materializeBrush)(const QString &) = nullptr;
+    void (MainWindow::*addBrush)() = nullptr;
+    bool (MainWindow::*save)(const QString &, QString *) = nullptr;
+    bool (MainWindow::*open)(const QString &, QString *, bool) = nullptr;
+    QString (MainWindow::*brushPreviewClipId)() const = nullptr;
+};
+
+// G32 (US-1302): the position-keyed sidecars follow the clip they were put on.
+void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                      const SidecarView &view)
+{
+    auto clearSidecars = [&] {
+        view.timeRemap->clear();
+        view.text3D->clear();
+        view.expressions->clear();
+        view.wiggle->clear();
+        view.brush->clear();
+        for (BrushAnimation *live : std::as_const(*view.liveBrush))
+            if (live) live->deleteLater();
+        view.liveBrush->clear();
+    };
+    auto sortedKeys = [](QStringList keys) { keys.sort(); return keys.join(','); };
+    // Where each kind sits, the timeRemap value's own clipId in brackets.
+    auto where = [&] {
+        QStringList remaps;
+        for (auto it = view.timeRemap->cbegin(); it != view.timeRemap->cend(); ++it)
+            remaps.append(it.key() + QStringLiteral("(") + it.value().clipId + QStringLiteral(")"));
+        QStringList brushes;
+        for (const BrushAnimationEntry &entry : std::as_const(*view.brush))
+            brushes.append(entry.clipId);
+        return QStringLiteral("tr=%1 wg=%2 t3=%3 ex=%4 br=%5")
+            .arg(sortedKeys(remaps), sortedKeys(view.wiggle->keys()), sortedKeys(view.text3D->keys()),
+                 sortedKeys(view.expressions->keys()), sortedKeys(brushes));
+    };
+    auto at = [](const QString &key) {
+        return QStringLiteral("tr=%1(%1) wg=%1 t3=%1 ex=%1 br=%1").arg(key);
+    };
+    auto owner = [&tl](const QString &key) {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        const TimelineTrack *track = parts.size() == 2 ? tl.trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        return track && index >= 0 && index < track->clipCount()
+            ? track->clips().at(index).displayName : QString();
+    };
+    // b's values: they move with b, so a value found on another key is b's.
+    auto attach = [&](const QString &key) {
+        TimeRemapClipEntry remap;
+        remap.clipId = key;
+        remap.curve.sourceFps = 10.0;
+        remap.curve.addKey(0.0, 0.0);
+        remap.curve.addKey(2.0, 1.0);
+        view.timeRemap->insert(key, remap);
+        wiggle::WiggleParams params;
+        params.enabled = true;
+        params.seed = 32;
+        params.positionAmplitude = QPointF(4.0, 0.0);
+        view.wiggle->insert(key, params);
+        view.text3D->insert(key, QJsonObject{{QStringLiteral("text"), QStringLiteral("G32")}});
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+        view.expressions->insert(key, bindings);
+        BrushAnimationEntry brush;
+        brush.clipId = key;
+        brush.brushData = QJsonObject{{QStringLiteral("text"), QStringLiteral("G32")}};
+        view.brush->append(brush);
+    };
+    auto valuesIntact = [&](const QString &key) {
+        return view.wiggle->value(key).seed == 32u
+            && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32")
+            && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("50")
+            && view.timeRemap->value(key).curve.keys.size() == 2
+            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+                   return entry.clipId == key
+                       && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32");
+               });
+    };
+
+    // V1 [x 0-10], V2 [a 0-2 | b 3-5], V3 [c 10-12]; the sidecars go on b ("1:1").
+    clearSidecars();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+              {clipFor("c", 2.0, 10.0)}});
+    attach(QStringLiteral("1:1"));
+    BrushAnimation *live = (window.*view.materializeBrush)(QStringLiteral("1:1"));
+    // Adding a brush animation records an undo point (its progress keyframes), so the
+    // fixture does the same after attaching.
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+
+    // (1) delete a: b becomes "1:0".
+    QString err;
+    const bool deleted = tl.deleteClipByIndex(false, 1, 0, false, &err);
+    const QString after1 = where();
+    const QString owner1 = owner(QStringLiteral("1:0"));
+    const bool liveMoved = live && view.liveBrush->value(QStringLiteral("1:0")) == live
+        && !view.liveBrush->contains(QStringLiteral("1:1"));
+    const bool ok1 = deleted && after1 == at(QStringLiteral("1:0")) && owner1 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0")) && liveMoved;
+
+    // (3) undo / redo.
+    tl.undo();
+    const QString afterUndo = where();
+    const bool undoOk = afterUndo == at(QStringLiteral("1:1")) && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:1"));
+    tl.redo();
+    const QString afterRedo = where();
+    const bool redoOk = afterRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+    const bool ok3 = undoOk && redoOk;
+
+    // (3') undo, then the same delete again.
+    tl.undo();
+    const QString afterUndo2 = where();
+    QString err2;
+    const bool redeleted = tl.deleteClipByIndex(false, 1, 0, false, &err2);
+    const QString afterRedelete = where();
+    const bool ok3b = afterUndo2 == at(QStringLiteral("1:1")) && redeleted
+        && afterRedelete == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+
+    // (2) b dropped from V2 onto V3 at 0 (before c): "2:0".
+    const bool dropped = sendClipDropOnTrack(tl.trackAt(false, 1), 0, tl.trackAt(false, 2), 0.0);
+    const QString after2 = where();
+    const QString owner2 = owner(QStringLiteral("2:0"));
+    const bool ok2 = dropped && after2 == at(QStringLiteral("2:0")) && owner2 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("2:0"));
+
+    // (4) save, then load into the same window.
+    QTemporaryDir dir;
+    const QString projectPath = dir.filePath(QStringLiteral("g32.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*view.save)(projectPath, &saveErr);
+    clearSidecars();
+    const bool opened = saved && (window.*view.open)(projectPath, &openErr, false);
+    const QString after4 = where();
+    const QString owner4 = owner(QStringLiteral("2:0"));
+    const bool ok4 = opened && after4 == at(QStringLiteral("2:0")) && owner4 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("2:0"));
+
+    // (5) remove V2 (empty now): V3 becomes V2, b "1:0".
+    QString removeErr;
+    const bool removed = tl.removeTrack(false, 1, &removeErr);
+    const QString after5 = where();
+    const QString owner5 = owner(QStringLiteral("1:0"));
+    const bool ok5 = removed && after5 == at(QStringLiteral("1:0")) && owner5 == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+
+    // (6) an unrelated undoable edit (x at speed 2), then wiggle / text3D / timeRemap /
+    // expression edits that record no undo point, then one undo: the speed goes back, the
+    // sidecar values stay.
+    QString speedErr;
+    const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
+    (*view.wiggle)[QStringLiteral("1:0")].seed = 77;
+    view.text3D->insert(QStringLiteral("1:0"), QJsonObject{{QStringLiteral("text"), QStringLiteral("edited")}});
+    (*view.timeRemap)[QStringLiteral("1:0")].curve.sourceFps = 24.0;
+    (*view.timeRemap)[QStringLiteral("1:0")].curve.addKey(1.0, 0.5);
+    (*view.expressions)[QStringLiteral("1:0")].setExpression(QStringLiteral("transform.opacity"),
+                                                             QStringLiteral("75"));
+    tl.undo();
+    const double speedAfterUndo = tl.trackAt(false, 0)->clips().value(0).speed;
+    const QString after6 = where();
+    const unsigned seedAfterUndo = view.wiggle->value(QStringLiteral("1:0")).seed;
+    const QString textAfterUndo = view.text3D->value(QStringLiteral("1:0")).value(QStringLiteral("text")).toString();
+    const TimeRemapClipEntry remapAfterUndo = view.timeRemap->value(QStringLiteral("1:0"));
+    const int remapKeysAfterUndo = static_cast<int>(remapAfterUndo.curve.keys.size());
+    const double fpsAfterUndo = remapAfterUndo.curve.sourceFps;
+    const QString exprAfterUndo =
+        view.expressions->value(QStringLiteral("1:0")).expression(QStringLiteral("transform.opacity"));
+    const bool ok6 = sped && near(speedAfterUndo, 1.0) && after6 == at(QStringLiteral("1:0"))
+        && seedAfterUndo == 77u && textAfterUndo == QStringLiteral("edited") && remapKeysAfterUndo == 3
+        && near(fpsAfterUndo, 24.0) && exprAfterUndo == QStringLiteral("75");
+
+    // (7) delete b itself, then its track: each undo brings all five back on b, each redo
+    // takes them off again.
+    clearSidecars();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)},
+              {clipFor("c", 2.0, 10.0)}});
+    attach(QStringLiteral("1:1"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+    const QString none = QStringLiteral("tr= wg= t3= ex= br=");
+    auto onB = [&](const QString &shown) {
+        return shown == at(QStringLiteral("1:1")) && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+            && valuesIntact(QStringLiteral("1:1"));
+    };
+    QString errB;
+    const bool bDeleted = tl.deleteClipByIndex(false, 1, 1, false, &errB);
+    const QString afterBDelete = where();
+    tl.undo();
+    const QString afterBUndo = where();
+    const bool bUndoOk = onB(afterBUndo);
+    tl.redo();
+    const QString afterBRedo = where();
+    tl.undo();
+    const QString afterBUndo2 = where();
+    const bool bUndo2Ok = onB(afterBUndo2);
+    const bool ok7 = bDeleted && afterBDelete == none && bUndoOk && afterBRedo == none && bUndo2Ok;
+    QString errT;
+    const bool v2Removed = tl.removeTrack(false, 1, &errT);
+    const QString afterTrackRemove = where();
+    tl.undo();
+    const QString afterTrackUndo = where();
+    const bool trackUndoOk = onB(afterTrackUndo);
+    tl.redo();
+    const QString afterTrackRedo = where();
+    tl.undo();
+    const QString afterTrackUndo2 = where();
+    const bool trackUndo2Ok = onB(afterTrackUndo2);
+    const bool ok8 = v2Removed && afterTrackRemove == none && trackUndoOk && afterTrackRedo == none
+        && trackUndo2Ok;
+
+    // (8) the real brush add with no clip selected (the dialog accepted as it opens): the
+    // brush goes on x ("0:0") and survives an unrelated edit and its undo.
+    tl.clearSelection();
+    const int selectedBefore = tl.selectedVideoClipIndex();
+    int brushDialogs = 0;
+    int otherModals = 0;
+    {
+        QTimer acceptBrush;
+        acceptBrush.setInterval(20);
+        QObject::connect(&acceptBrush, &QTimer::timeout, &window, [&] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            auto *dialog = qobject_cast<QDialog *>(modal);
+            if (dialog && dialog->inherits("BrushAnimationDialog")) {
+                ++brushDialogs;
+                dialog->accept();
+            } else {
+                ++otherModals;
+                if (dialog) dialog->reject();
+                else modal->close();
+            }
+        });
+        acceptBrush.start();
+        (window.*view.addBrush)();
+    }
+    auto brushOnX = [&] {
+        return std::any_of(view.brush->cbegin(), view.brush->cend(), [](const BrushAnimationEntry &entry) {
+            return entry.clipId == QStringLiteral("0:0") && !entry.brushData.isEmpty();
+        });
+    };
+    const bool brushAdded = brushOnX();
+    QString speedErr2;
+    const bool sped2 = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr2);
+    tl.undo();
+    const double speedAfterUndo2 = tl.trackAt(false, 0)->clips().value(0).speed;
+    const QString afterBrushUndo = where();
+    const bool brushKept = brushOnX();
+    const bool ok9 = selectedBefore < 0 && brushDialogs == 1 && otherModals == 0 && brushAdded && sped2
+        && near(speedAfterUndo2, 1.0) && brushKept && QApplication::activeModalWidget() == nullptr;
+
+    // (7b) the only clip s ("0:0") deleted, undone and redone in one sequence: the redo takes
+    // all five off s again, and a new clip put at "0:0" afterwards carries none of them.
+    clearSidecars();
+    load(tl, {{clipFor("s", 2.0)}});
+    attach(QStringLiteral("0:0"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars"));
+    QString errS;
+    const bool sDeleted = tl.deleteClipByIndex(false, 0, 0, false, &errS);
+    const QString afterSDelete = where();
+    tl.undo();
+    const QString afterSUndo = where();
+    const bool sUndoOk = afterSUndo == at(QStringLiteral("0:0")) && owner(QStringLiteral("0:0")) == QStringLiteral("s")
+        && valuesIntact(QStringLiteral("0:0"));
+    tl.redo();
+    const QString afterSRedo = where();
+    tl.trackAt(false, 0)->addClip(clipFor("n", 2.0));
+    const QString afterNewClip = where();
+    const QString newOwner = owner(QStringLiteral("0:0"));
+    const bool ok7b = sDeleted && afterSDelete == none && sUndoOk && afterSRedo == none
+        && newOwner == QStringLiteral("n") && afterNewClip == none;
+
+    // (9) uids are unique only per track: V3's c shares b's uid (load fixture). (i) delete a,
+    // undo, redo: the values follow b ("1:1" / "1:0"), never c ("2:0"). (ii) delete b itself,
+    // undo: they come back on b although c keeps the uid live.
+    auto loadShared = [&] {
+        clearSidecars();
+        ClipInfo b = clipFor("b", 2.0, 1.0);
+        ClipInfo c = clipFor("c", 2.0, 10.0);
+        b.uid = c.uid = QStringLiteral("selftest-g32-shared-uid");
+        load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), b}, {c}});
+        attach(QStringLiteral("1:1"));
+        tl.saveUndoState(QStringLiteral("G32 sidecars"));
+        return tl.trackAt(false, 1)->clips().value(1).uid == b.uid
+            && tl.trackAt(false, 2)->clips().value(0).uid == b.uid;
+    };
+    const bool sharedLoaded1 = loadShared();
+    QString errSa;
+    const bool saDeleted = tl.deleteClipByIndex(false, 1, 0, false, &errSa);
+    tl.undo();
+    const QString afterSaUndo = where();
+    const bool saUndoOk = onB(afterSaUndo);
+    tl.redo();
+    const QString afterSaRedo = where();
+    const bool saRedoOk = afterSaRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("b")
+        && valuesIntact(QStringLiteral("1:0"));
+    const bool ok9i = sharedLoaded1 && saDeleted && saUndoOk && saRedoOk;
+    const bool sharedLoaded2 = loadShared();
+    QString errSb;
+    const bool sbDeleted = tl.deleteClipByIndex(false, 1, 1, false, &errSb);
+    const QString afterSbDelete = where();
+    tl.undo();
+    const QString afterSbUndo = where();
+    const bool sbUndoOk = onB(afterSbUndo);
+    // The redo takes them off b again (nothing left on "1:1"), a new clip appended to V2
+    // carries none of them, and the next undo brings them back on b.
+    tl.redo();
+    const QString afterSbRedo = where();
+    tl.trackAt(false, 1)->addClip(clipFor("n", 2.0, 1.0));
+    const QString afterSbNewClip = where();
+    const QString sbNewOwner = owner(QStringLiteral("1:1"));
+    tl.undo();
+    const QString afterSbUndo2 = where();
+    const bool sbUndo2Ok = onB(afterSbUndo2);
+    const bool ok9ii = sharedLoaded2 && sbDeleted && afterSbDelete == none && sbUndoOk
+        && afterSbRedo == none && sbNewOwner == QStringLiteral("n") && afterSbNewClip == none
+        && sbUndo2Ok;
+
+    // (9iii) the shared-uid fixture with distinct values on b ("1:1") and c ("2:0"), then V2
+    // removed: c's values follow c to "1:0" and none of b's stay; the undo puts each back on
+    // its own clip (no swap through the shared uid); the redo moves c's to "1:0" again.
+    auto attachC = [&](const QString &key) {
+        TimeRemapClipEntry remap;
+        remap.clipId = key;
+        remap.curve.sourceFps = 10.0;
+        remap.curve.addKey(0.0, 0.0);
+        remap.curve.addKey(1.0, 0.25);
+        remap.curve.addKey(2.0, 1.0);
+        view.timeRemap->insert(key, remap);
+        wiggle::WiggleParams params;
+        params.enabled = true;
+        params.seed = 33;
+        view.wiggle->insert(key, params);
+        view.text3D->insert(key, QJsonObject{{QStringLiteral("text"), QStringLiteral("G32c")}});
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("60"));
+        view.expressions->insert(key, bindings);
+        BrushAnimationEntry brush;
+        brush.clipId = key;
+        brush.brushData = QJsonObject{{QStringLiteral("text"), QStringLiteral("G32c")}};
+        view.brush->append(brush);
+    };
+    auto cIntact = [&](const QString &key) {
+        return view.wiggle->value(key).seed == 33u
+            && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32c")
+            && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("60")
+            && view.timeRemap->value(key).curve.keys.size() == 3
+            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+                   return entry.clipId == key
+                       && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32c");
+               });
+    };
+    const bool sharedLoaded3 = loadShared();
+    attachC(QStringLiteral("2:0"));
+    tl.saveUndoState(QStringLiteral("G32 sidecars on c"));
+    const QString onBAndC = QStringLiteral("tr=1:1(1:1),2:0(2:0) wg=1:1,2:0 t3=1:1,2:0 ex=1:1,2:0 br=1:1,2:0");
+    QString errSt;
+    const bool stRemoved = tl.removeTrack(false, 1, &errSt);
+    const QString afterStRemove = where();
+    const bool stRemoveOk = afterStRemove == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("c")
+        && cIntact(QStringLiteral("1:0"));
+    tl.undo();
+    const QString afterStUndo = where();
+    const bool stUndoOk = afterStUndo == onBAndC && owner(QStringLiteral("1:1")) == QStringLiteral("b")
+        && owner(QStringLiteral("2:0")) == QStringLiteral("c") && valuesIntact(QStringLiteral("1:1"))
+        && cIntact(QStringLiteral("2:0"));
+    tl.redo();
+    const QString afterStRedo = where();
+    const bool stRedoOk = afterStRedo == at(QStringLiteral("1:0")) && owner(QStringLiteral("1:0")) == QStringLiteral("c")
+        && cIntact(QStringLiteral("1:0"));
+    const bool ok9iii = sharedLoaded3 && stRemoved && stRemoveOk && stUndoOk && stRedoOk;
+
+    std::fprintf(stderr, "connected-clip G32 (1) delete=%d %s owner=%s liveMoved=%d (expect %s on b) ok=%d\n",
+                 deleted, qPrintable(after1), qPrintable(owner1), liveMoved,
+                 qPrintable(at(QStringLiteral("1:0"))), ok1);
+    std::fprintf(stderr, "connected-clip G32 (3) undo %s (expect %s) redo %s (expect %s) ok=%d\n",
+                 qPrintable(afterUndo), qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterRedo),
+                 qPrintable(at(QStringLiteral("1:0"))), ok3);
+    std::fprintf(stderr, "connected-clip G32 (3') undo %s redelete=%d [%s] %s (expect %s) ok=%d\n",
+                 qPrintable(afterUndo2), redeleted, qPrintable(err2), qPrintable(afterRedelete),
+                 qPrintable(at(QStringLiteral("1:0"))), ok3b);
+    std::fprintf(stderr, "connected-clip G32 (2) drop=%d %s owner=%s (expect %s on b) ok=%d\n", dropped,
+                 qPrintable(after2), qPrintable(owner2), qPrintable(at(QStringLiteral("2:0"))),
+                 ok2);
+    std::fprintf(stderr, "connected-clip G32 (4) saved=%d [%s] opened=%d [%s] %s owner=%s (expect %s on b) ok=%d\n",
+                 saved, qPrintable(saveErr), opened, qPrintable(openErr), qPrintable(after4),
+                 qPrintable(owner4), qPrintable(at(QStringLiteral("2:0"))), ok4);
+    std::fprintf(stderr, "connected-clip G32 (5) removed=%d [%s] %s owner=%s (expect %s on b) ok=%d\n", removed,
+                 qPrintable(removeErr), qPrintable(after5), qPrintable(owner5),
+                 qPrintable(at(QStringLiteral("1:0"))), ok5);
+    std::fprintf(stderr, "connected-clip G32 (6) sped=%d [%s] speedAfterUndo=%.3f (expect 1) %s seed=%u (expect 77) "
+                 "text3D=%s (expect edited) timeRemapKeys=%d (expect 3) sourceFps=%.3f (expect 24) "
+                 "expression=%s (expect 75) ok=%d\n", sped, qPrintable(speedErr), speedAfterUndo, qPrintable(after6),
+                 seedAfterUndo, qPrintable(textAfterUndo), remapKeysAfterUndo, fpsAfterUndo,
+                 qPrintable(exprAfterUndo), ok6);
+    std::fprintf(stderr, "connected-clip G32 (7) delete b=%d [%s] %s (expect %s) undo %s redo %s undo %s "
+                 "(expect %s on b) | remove V2=%d [%s] %s undo %s redo %s undo %s ok=%d\n", bDeleted,
+                 qPrintable(errB), qPrintable(afterBDelete), qPrintable(none), qPrintable(afterBUndo),
+                 qPrintable(afterBRedo), qPrintable(afterBUndo2), qPrintable(at(QStringLiteral("1:1"))),
+                 v2Removed, qPrintable(errT), qPrintable(afterTrackRemove), qPrintable(afterTrackUndo),
+                 qPrintable(afterTrackRedo), qPrintable(afterTrackUndo2), ok7 && ok8);
+    std::fprintf(stderr, "connected-clip G32 (7b) delete s=%d [%s] %s (expect %s) undo %s (expect %s on s) "
+                 "redo %s (expect %s) new clip %s at 0:0 %s (expect %s) ok=%d\n", sDeleted, qPrintable(errS),
+                 qPrintable(afterSDelete), qPrintable(none), qPrintable(afterSUndo),
+                 qPrintable(at(QStringLiteral("0:0"))), qPrintable(afterSRedo), qPrintable(none),
+                 qPrintable(newOwner), qPrintable(afterNewClip), qPrintable(none), ok7b);
+    std::fprintf(stderr, "connected-clip G32 (8) selected=%d (expect -1) brushDialogs=%d (expect 1) otherModals=%d "
+                 "added=%d sped=%d [%s] speedAfterUndo=%.3f (expect 1) %s brushKept=%d ok=%d\n", selectedBefore,
+                 brushDialogs, otherModals, brushAdded, sped2, qPrintable(speedErr2), speedAfterUndo2,
+                 qPrintable(afterBrushUndo), brushKept, ok9);
+    std::fprintf(stderr, "connected-clip G32 (9i) shared uid b/c loaded=%d delete a=%d [%s] undo %s (expect %s on b) "
+                 "redo %s (expect %s on b) ok=%d\n", sharedLoaded1, saDeleted, qPrintable(errSa),
+                 qPrintable(afterSaUndo), qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterSaRedo),
+                 qPrintable(at(QStringLiteral("1:0"))), ok9i);
+    std::fprintf(stderr, "connected-clip G32 (9ii) shared uid b/c loaded=%d delete b=%d [%s] %s (expect %s) undo %s "
+                 "(expect %s on b) redo %s (expect %s) new clip %s at 1:1 %s (expect %s) undo %s (expect %s on b) "
+                 "ok=%d\n", sharedLoaded2, sbDeleted, qPrintable(errSb),
+                 qPrintable(afterSbDelete), qPrintable(none), qPrintable(afterSbUndo),
+                 qPrintable(at(QStringLiteral("1:1"))), qPrintable(afterSbRedo), qPrintable(none),
+                 qPrintable(sbNewOwner), qPrintable(afterSbNewClip), qPrintable(none), qPrintable(afterSbUndo2),
+                 qPrintable(at(QStringLiteral("1:1"))), ok9ii);
+    std::fprintf(stderr, "connected-clip G32 (9iii) shared uid b/c distinct values loaded=%d remove V2=%d [%s] %s "
+                 "(expect %s on c) undo %s (expect %s, b's on 1:1 and c's on 2:0) redo %s (expect %s on c) ok=%d\n",
+                 sharedLoaded3, stRemoved, qPrintable(errSt), qPrintable(afterStRemove),
+                 qPrintable(at(QStringLiteral("1:0"))), qPrintable(afterStUndo), qPrintable(onBAndC),
+                 qPrintable(afterStRedo), qPrintable(at(QStringLiteral("1:0"))), ok9iii);
+    tally.gate(32, ok1 && ok2 && ok3 && ok3b && ok4 && ok5 && ok6 && ok7 && ok7b && ok8 && ok9 && ok9i && ok9ii
+                   && ok9iii,
+               "a position-keyed sidecar (timeRemap / wiggle / text3D / expression / brush) did not follow b "
+               "through a delete, undo / redo, the delete after an undo, a cross-track drop, a save / load or a "
+               "track removal, an edit without an undo point was rolled back by an unrelated undo, deleting b "
+               "or its track and undoing did not bring them back, redoing the delete of a sequence's only clip "
+               "left them on its key, a brush added with no selection was lost "
+               "to an unrelated undo, or a uid shared with a clip on another track sent them to the wrong "
+               "clip or lost them on undo / redo or a track removal");
+    clearSidecars();
+}
+
+// G33 (US-1320): one composed clipKeysRemapped for a storyline media drop on V1 whose
+// reconcile reorders V2 (avPath: the G29 fixture media).
+void composedRemapGate(selftest::GateTally &tally, const QString &avPath, const QString &avName)
+{
+    // The media dropped on the V1 boundary of [X|Y] with c on V2 connected to Y in front of
+    // the unconnected d: the import's V1 shift and the reconcile's V2 reorder (c is pushed
+    // past d) leave as one composed clipKeysRemapped.
+    Timeline batchTl;
+    load(batchTl, {{clipFor("x", 5.0), clipFor("y", 10.0)}, {clipFor("c", 0.5, 5.5), clipFor("d", 0.5, 0.3)}},
+         {{clipFor("bgm", 3.0)}, {}});
+    const bool batchConnected = batchTl.connectClip(TrackKind::Video, 1, 0, uidAt(batchTl, 0, 1));
+    batchTl.setStorylineMode(true);
+    batchTl.undoManager()->clear();
+    batchTl.saveUndoState(QStringLiteral("baseline"));
+    batchTl.takeConnectionWarnings();
+    const QString batchCUid = uidAt(batchTl, 1, 0);
+    QVector<Timeline::ClipKeyRemap> batchLog;
+    QObject::connect(&batchTl, &Timeline::clipKeysRemapped, &batchTl,
+                     [&batchLog](const Timeline::ClipKeyRemap &r) { batchLog.append(r); });
+    QString batchErr;
+    const bool batchDropped = batchTl.dropMediaOnTrack(batchTl.trackAt(false, 0), avPath, 5.0, &batchErr);
+    const Located batchC = locate(batchTl, false, batchCUid);
+    const double batchLen = locateByName(batchTl, false, avName).clip.effectiveDuration();
+    QStringList batchShown;
+    bool batchIdentity = false;
+    for (const Timeline::ClipKeyRemap &r : std::as_const(batchLog)) {
+        QStringList pairs;
+        for (auto it = r.oldToNew.cbegin(); it != r.oldToNew.cend(); ++it) {
+            pairs.append(it.key() + QStringLiteral(">") + it.value());
+            if (it.key() == it.value()) batchIdentity = true;
+        }
+        pairs.sort();
+        QStringList dropped(r.dropped.cbegin(), r.dropped.cend());
+        dropped.sort();
+        batchShown.append(QStringLiteral("{%1 | dropped %2}").arg(pairs.join(','), dropped.join(',')));
+    }
+    Timeline::ClipKeyRemap batchExpected;
+    batchExpected.oldToNew = {{QStringLiteral("0:1"), QStringLiteral("0:2")},
+                              {QStringLiteral("1:0"), QStringLiteral("1:1")},
+                              {QStringLiteral("1:1"), QStringLiteral("1:0")}};
+    const bool batchOk = batchConnected && batchDropped && batchLen > 0.5 && batchC.track == 1
+        && batchC.index == 1 && near(batchC.startSec, 5.5 + batchLen) && batchLog.size() == 1
+        && batchLog[0] == batchExpected && !batchIdentity;
+    std::fprintf(stderr, "connected-clip G33 connected=%d drop=%d err='%s' len=%.4f c track=%d index=%d "
+                 "start=%.4f (expect 1 1 %.4f) %lld emit(s) %s (expect 1 {0:1>0:2,1:0>1:1,1:1>1:0 | dropped }) "
+                 "identity=%d ok=%d\n",
+                 batchConnected, batchDropped, qPrintable(batchErr), batchLen, batchC.track, batchC.index,
+                 batchC.startSec, 5.5 + batchLen, static_cast<long long>(batchLog.size()),
+                 qPrintable(batchShown.join(' ')), batchIdentity, batchOk);
+    tally.gate(33, batchOk,
+               "a storyline media drop on V1 whose reconcile moves a connected V2 clip did not emit "
+               "clipKeysRemapped exactly once with the composed V1 shift + V2 reorder (identity-free)");
+}
+
+// G34 (US-1320): after a storyline insert at the V1 head moves the selection, the brush
+// preview is bound through the rekeyed brush entries: V1 [a 0-5 | b 5-10], b carries a brush.
+void brushPreviewRebindGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                            const SidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString avPath = dir.filePath(QStringLiteral("g34.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(34, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoWithAudioFile(avPath, 20)) {
+        tally.gate(34, false, "the G34 fixture media could not be written");
+        return;
+    }
+    auto clearBrushes = [&] {
+        view.brush->clear();
+        for (BrushAnimation *live : std::as_const(*view.liveBrush))
+            if (live) live->deleteLater();
+        view.liveBrush->clear();
+    };
+    struct Run {
+        bool dropped = false;
+        QString err;
+        int selectedAfter = -2;
+        QString bound;
+        QString brushKeys;
+        QString undoBrush; // "key=owner" after Timeline::undo
+        QString undoBound;
+        QString redoBrush; // "key=owner" after Timeline::redo
+        QString redoBound;
+    };
+    // Each brush entry as "key=name of the V1 clip at that key".
+    auto brushOwners = [&] {
+        QStringList owners;
+        for (const BrushAnimationEntry &entry : std::as_const(*view.brush)) {
+            const QStringList parts = entry.clipId.split(QLatin1Char(':'));
+            const TimelineTrack *track = parts.size() == 2 ? tl.trackAt(false, parts[0].toInt()) : nullptr;
+            const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+            const QString owner = track && index >= 0 && index < track->clips().size()
+                ? track->clips()[index].displayName : QStringLiteral("?");
+            owners.append(entry.clipId + QLatin1Char('=') + owner);
+        }
+        return owners.join(',');
+    };
+    // Selects V1 clip `selectIndex` the way a click does, then drops the media at t=0.
+    auto run = [&](int selectIndex) {
+        Run r;
+        clearBrushes();
+        load(tl, {{clipFor("a", 5.0), clipFor("b", 5.0)}});
+        tl.setStorylineMode(true);
+        BrushAnimationEntry brush;
+        brush.clipId = QStringLiteral("0:1");
+        brush.brushData = QJsonObject{{QStringLiteral("text"), QStringLiteral("G34")}};
+        view.brush->append(brush);
+        tl.undoManager()->clear();
+        tl.saveUndoState(QStringLiteral("G34 baseline"));
+        tl.trackAt(false, 0)->setSelectedClip(selectIndex);
+        emit tl.trackAt(false, 0)->selectionChanged(selectIndex, false);
+        r.dropped = tl.dropMediaOnTrack(tl.trackAt(false, 0), avPath, 0.0, &r.err);
+        r.selectedAfter = tl.trackAt(false, 0)->selectedClip();
+        r.bound = (window.*view.brushPreviewClipId)();
+        QStringList keys;
+        for (const BrushAnimationEntry &entry : std::as_const(*view.brush))
+            keys.append(entry.clipId);
+        r.brushKeys = keys.join(',');
+        // The drop's undo point must carry the rekeyed brush (HEAD: the old key "0:1",
+        // so the redo puts b's brush on a).
+        tl.undo();
+        r.undoBrush = brushOwners();
+        r.undoBound = (window.*view.brushPreviewClipId)();
+        tl.redo();
+        r.redoBrush = brushOwners();
+        r.redoBound = (window.*view.brushPreviewClipId)();
+        return r;
+    };
+    // (a) a selected, no brush: nothing bound (HEAD: b's brush through its old key "0:1").
+    const Run a = run(0);
+    const bool okA = a.dropped && a.selectedAfter == 1 && a.brushKeys == QStringLiteral("0:2") && a.bound.isEmpty();
+    // (b) b selected with the brush: bound on b's new key (HEAD: cleared at "0:2", never rebound).
+    const Run b = run(1);
+    const bool okB = b.dropped && b.selectedAfter == 2 && b.brushKeys == QStringLiteral("0:2")
+        && b.bound == QStringLiteral("0:2");
+    // (c) undo / redo of each drop: the brush stays on b ("0:1" before the drop, "0:2" after,
+    // a never owns it); the preview stays unbound with a selected and follows b's key with b selected.
+    const bool okC = a.undoBrush == QStringLiteral("0:1=b") && a.undoBound.isEmpty()
+        && a.redoBrush == QStringLiteral("0:2=b") && a.redoBound.isEmpty()
+        && b.undoBrush == QStringLiteral("0:1=b") && b.undoBound == QStringLiteral("0:1")
+        && b.redoBrush == QStringLiteral("0:2=b") && b.redoBound == QStringLiteral("0:2");
+    std::fprintf(stderr, "connected-clip G34 (c) (a) undo brush=%s (expect 0:1=b) bound='%s' (expect '') "
+                 "redo brush=%s (expect 0:2=b) bound='%s' (expect '') | (b) undo brush=%s (expect 0:1=b) "
+                 "bound='%s' (expect '0:1') redo brush=%s (expect 0:2=b) bound='%s' (expect '0:2') ok=%d\n",
+                 qPrintable(a.undoBrush), qPrintable(a.undoBound), qPrintable(a.redoBrush), qPrintable(a.redoBound),
+                 qPrintable(b.undoBrush), qPrintable(b.undoBound), qPrintable(b.redoBrush), qPrintable(b.redoBound),
+                 okC);
+    std::fprintf(stderr, "connected-clip G34 (a) a selected: drop=%d err='%s' selected=%d (expect 1) brush=%s "
+                 "(expect 0:2) bound='%s' (expect '') ok=%d | (b) b selected: drop=%d err='%s' selected=%d "
+                 "(expect 2) brush=%s (expect 0:2) bound='%s' (expect '0:2') ok=%d\n",
+                 a.dropped, qPrintable(a.err), a.selectedAfter, qPrintable(a.brushKeys), qPrintable(a.bound), okA,
+                 b.dropped, qPrintable(b.err), b.selectedAfter, qPrintable(b.brushKeys), qPrintable(b.bound), okB);
+    tally.gate(34, okA && okB && okC,
+               "after a storyline insert at the V1 head moved the selection, the brush preview stayed on "
+               "another clip's brush (old key) or was not bound to the selected clip's own rekeyed brush, "
+               "or the drop's undo / redo moved b's brush onto another clip");
+    tl.setStorylineMode(false);
+    clearBrushes();
 }
 
 } // namespace
@@ -2287,17 +3227,25 @@ int runConnectedClipSelftest()
             on.setStorylineMode(true);
             const bool v2Accepted = sendMediaDrop(on.trackAt(false, 1), videoPath, 7.0);
             const bool a2Accepted = sendMediaDrop(on.trackAt(true, 1), wavPath, 6.0);
-            const bool v1Accepted = sendMediaDrop(on.trackAt(false, 0), videoPath, 20.0);
             const Located v2Clip = locateByName(on, false, videoName);
             const Located a2Clip = locateByName(on, true, wavName);
             const bool clipAccepted = sendClipDropOnTrack(on.trackAt(false, 2), 0, on.trackAt(false, 1), 12.0);
             const Located movedOn = locateByName(on, false, QStringLiteral("y"));
-            const bool onOk = v2Accepted && a2Accepted && !v1Accepted && v2Clip.found && v2Clip.track == 1
+            // US-1304: a drop in the middle of V1's first clip (t=3 in a [0,5)) snaps to the
+            // boundary at 5 and pushes b by the new clip's length.
+            const int v1CountBefore = on.trackAt(false, 0)->clipCount();
+            const bool v1Accepted = sendMediaDrop(on.trackAt(false, 0), videoPath, 3.0);
+            const Located v1Clip = locateByName(on, false, videoName);
+            const Located bPushed = locateByName(on, false, QStringLiteral("b"));
+            const bool v1Ok = v1CountBefore == 2 && v1Accepted && v1Clip.found && v1Clip.track == 0
+                && v1Clip.clip.effectiveDuration() > 0.5 && near(v1Clip.startSec, 5.0)
+                && on.trackAt(false, 0)->clipCount() == 3 && bPushed.found && bPushed.track == 0
+                && near(bPushed.startSec, 5.0 + v1Clip.clip.effectiveDuration());
+            const bool onOk = v2Accepted && a2Accepted && v1Ok && v2Clip.found && v2Clip.track == 1
                 && near(v2Clip.startSec, 7.0) && v2Clip.clip.anchorUid == bUid
                 && near(v2Clip.clip.anchorOffsetSec, 2.0) && a2Clip.found && a2Clip.track == 1
                 && near(a2Clip.startSec, 6.0) && a2Clip.clip.anchorUid == bUid
-                && near(a2Clip.clip.anchorOffsetSec, 1.0) && on.trackAt(false, 0)->clipCount() == 2
-                && clipAccepted && movedOn.found && movedOn.track == 1 && near(movedOn.startSec, 12.0)
+                && near(a2Clip.clip.anchorOffsetSec, 1.0) && clipAccepted && movedOn.found && movedOn.track == 1 && near(movedOn.startSec, 12.0)
                 && movedOn.clip.anchorUid == bUid && near(movedOn.clip.anchorOffsetSec, 7.0);
             // Mode OFF: the media drop is refused (MainWindow handles it as before), the clip
             // drop moves but connects nothing.
@@ -2309,8 +3257,10 @@ int runConnectedClipSelftest()
             const bool offV2Accepted = sendMediaDrop(off.trackAt(false, 1), videoPath, 7.0);
             const bool offA2Accepted = sendMediaDrop(off.trackAt(true, 1), wavPath, 6.0);
             const bool offClipAccepted = sendClipDropOnTrack(off.trackAt(false, 2), 0, off.trackAt(false, 1), 12.0);
+            const bool offV1Accepted = sendMediaDrop(off.trackAt(false, 0), videoPath, 3.0);
             const Located movedOff = locateByName(off, false, QStringLiteral("y"));
-            const bool offOk = !offV2Accepted && !offA2Accepted
+            const bool offOk = !offV2Accepted && !offA2Accepted && !offV1Accepted
+                && off.trackAt(false, 0)->clipCount() == 2
                 && off.trackAt(false, 1)->clipCount() == v2Before + 1 && off.trackAt(true, 1)->clipCount() == a2Before
                 && offClipAccepted && movedOff.found && movedOff.track == 1 && near(movedOff.startSec, 12.0)
                 && movedOff.clip.anchorUid.isEmpty();
@@ -2403,19 +3353,517 @@ int runConnectedClipSelftest()
                          unlockedAudioAccepted, unlockedA2, lockOk, static_cast<unsigned long long>(paintBase),
                          static_cast<unsigned long long>(paintAfterFirst),
                          static_cast<unsigned long long>(paintAfterSecond), paintOk, subOk);
-            std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/0) v2[%s] "
-                         "a2[%s] clipDrop=%d y[%s] ok=%d | OFF: v2Drop=%d a2Drop=%d (expect 0/0) V2 clips "
+            std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/1) v2[%s] "
+                         "a2[%s] clipDrop=%d y[%s] v1New[%s] bPushed[%s] v1Ok=%d ok=%d | OFF: v2Drop=%d a2Drop=%d "
+                         "v1Drop=%d (expect 0/0/0) V2 clips "
                          "%d -> %d (expect +1 from the clip drop only) A2 clips %d -> %d clipDrop=%d y[%s] "
                          "ok=%d\n", v2Accepted, a2Accepted, v1Accepted, qPrintable(describe(v2Clip, bUid)),
                          qPrintable(describe(a2Clip, bUid)), clipAccepted, qPrintable(describe(movedOn, bUid)),
-                         onOk, offV2Accepted, offA2Accepted, v2Before, off.trackAt(false, 1)->clipCount(),
+                         qPrintable(describe(v1Clip, bUid)), qPrintable(describe(bPushed, bUid)), v1Ok, onOk,
+                         offV2Accepted, offA2Accepted, offV1Accepted, v2Before, off.trackAt(false, 1)->clipCount(),
                          a2Before, off.trackAt(true, 1)->clipCount(), offClipAccepted,
                          qPrintable(describe(movedOff, bUid)), offOk);
             tally.gate(26, onOk && offOk && subOk,
-                       "a storyline-mode drop did not connect to the V1 clip under it, or the mode-off "
-                       "media drop was taken / the mode-off clip drop connected / a multi-file or project drop was "
+                       "a storyline-mode drop did not connect to the V1 clip under it, or a V1 media drop did not "
+                       "snap to the boundary and push the next clip, or the mode-off "
+                       "media drop (on V2 / A2 / V1) was taken / the mode-off clip drop connected / a multi-file or project drop was "
                        "taken, a gap drop connected, or a drop landed audio on a locked partner track / a video-only drop was refused by it, or a held V1 move drag kept repainting");
         }
+    }
+
+    // G27: the real MultiCam apply path (MainWindow::onMultiCamApplyToTimeline) with its
+    // replace-V1 confirmation closed by a periodic timer (no production seam).
+    if (!mainTimeline) {
+        tally.gate(27, false, "MainWindow has no mainTimeline");
+    } else {
+        QTemporaryDir angleDir;
+        const QString anglePath = angleDir.filePath(QStringLiteral("angle.png"));
+        QImage(8, 8, QImage::Format_RGB888).save(anglePath);
+        MultiCamProject project;
+        project.angles.append({1, anglePath, 0, QStringLiteral("Cam 1")});
+        project.switches.append({0, 1});
+        project.defaultAngleId = 1;
+        const auto apply = [&](const MultiCamProject &p) {
+            (window.*member(MultiCamApplyTag{}))(p);
+        };
+
+        // (a) V1 holds a clip: the question is asked and answered Yes; the connected V2 clip
+        // stays where it was and detaches with one warning on the next commit (as in G17).
+        load(*mainTimeline, {{clipFor("a", 10.0)}, {clipFor("x", 1.0, 2.0)}});
+        const QString aUid = uidAt(*mainTimeline, 0, 0);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aUid);
+        mainTimeline->takeConnectionWarnings();
+        int answered = 0, unexpected = 0;
+        QStringList seen;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            apply(project);
+            answered = driver.answered;
+            unexpected = driver.unexpected;
+            seen = driver.seen;
+        }
+        const bool v1Replaced = mainTimeline->trackAt(false, 0)->clipCount() == 1
+            && uidAt(*mainTimeline, 0, 0) != aUid
+            && mainTimeline->trackAt(false, 0)->clips().at(0).filePath == anglePath;
+        mainTimeline->saveUndoState(QStringLiteral("unrelated"));
+        const QStringList warnings = mainTimeline->takeConnectionWarnings();
+        const Located x = locate(*mainTimeline, false, xUid);
+        const bool noModalA = QApplication::activeModalWidget() == nullptr;
+        const bool mainOk = answered == 1 && unexpected == 0 && seen.size() == 1 && v1Replaced
+            && x.found && near(x.startSec, 2.0) && x.clip.anchorUid.isEmpty() && warnings.size() == 1;
+
+        // (b) V1 empty: no question is asked, the apply still lands.
+        load(*mainTimeline, {{}, {clipFor("x", 1.0, 2.0)}});
+        int askedEmpty = -1;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            apply(project);
+            askedEmpty = driver.seen.size() + driver.unexpected;
+        }
+        const bool emptyOk = askedEmpty == 0 && mainTimeline->trackAt(false, 0)->clipCount() == 1;
+
+        // (c) control: a dialog without a Yes button is rejected and counted, not left open.
+        int strayUnexpected = 0;
+        {
+            ModalDriver driver(&window);
+            driver.start();
+            QMessageBox::information(&window, QStringLiteral("G27"), QStringLiteral("no Yes button"));
+            strayUnexpected = driver.unexpected;
+        }
+        const bool strayOk = strayUnexpected == 1;
+        const bool noModal = noModalA && QApplication::activeModalWidget() == nullptr;
+        std::fprintf(stderr, "connected-clip G27 answered=%d unexpected=%d questions=%lld (expect 1/0/1) v1Replaced=%d "
+                     "x found=%d start=%.6f (expect 2) anchorUid=[%s] (expect empty) warnings=%lld (expect 1) | "
+                     "empty V1 asked=%d (expect 0) ok=%d | stray dialog unexpected=%d (expect 1) | noModal=%d\n",
+                     answered, unexpected, static_cast<long long>(seen.size()), v1Replaced, x.found, x.startSec,
+                     qPrintable(x.clip.anchorUid), static_cast<long long>(warnings.size()), askedEmpty, emptyOk,
+                     strayUnexpected, noModal);
+        tally.gate(27, mainOk && emptyOk && strayOk && noModal,
+                   "the real MultiCam apply path did not ask / apply after Yes, kept the connection, "
+                   "asked with an empty V1, left a modal open, or a dialog without a Yes button was not rejected");
+    }
+
+    // G28: the real pre-compose menu action (QInputDialog closed by a periodic timer) with the
+    // G18 fixture and expectations plus the nested sequence name.
+    QAction *precomposeAction = nullptr;
+    for (QAction *action : window.findChildren<QAction *>())
+        if (action->text() == QStringLiteral("選択をプリコンポーズ...")) {
+            precomposeAction = action;
+            break;
+        }
+    if (!mainTimeline || !precomposeAction) {
+        std::fprintf(stderr, "connected-clip G28 missing: timeline=%d action=%d\n", mainTimeline != nullptr,
+                     precomposeAction != nullptr);
+        tally.gate(28, false, "the pre-compose menu action is not registered on the MainWindow");
+    } else {
+        load(*mainTimeline, {{clipFor("a", 10.0)}, {clipFor("x", 6.0, 2.0), clipFor("y", 0.5, 1.0)},
+                             {clipFor("s", 2.0, 4.0)}});
+        const QString aUid = uidAt(*mainTimeline, 0, 0);
+        const QString xUid = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aUid);
+        mainTimeline->connectClip(TrackKind::Video, 1, 1, aUid);
+        mainTimeline->takeConnectionWarnings();
+        for (int t = 0; t < mainTimeline->videoTrackCount(); ++t)
+            mainTimeline->trackAt(false, t)->setSelectedClip(t == 2 ? 0 : -1);
+        for (int t = 0; t < mainTimeline->audioTrackCount(); ++t)
+            mainTimeline->trackAt(true, t)->setSelectedClip(-1);
+        int answered = 0, unexpected = 0;
+        {
+            ModalDriver driver(&window, QStringLiteral("Precompose"));
+            driver.start();
+            precomposeAction->trigger();
+            answered = driver.answered;
+            unexpected = driver.unexpected;
+        }
+        const QStringList parentWarnings = mainTimeline->takeConnectionWarnings();
+        const Located left = locate(*mainTimeline, false, aUid);
+        const Located y = locateByName(*mainTimeline, false, QStringLiteral("y"));
+        const Located xLeft = locate(*mainTimeline, false, xUid);
+        const bool parentOk = left.found && left.track == 0 && near(left.startSec, 0.0)
+            && near(left.clip.effectiveDuration(), 4.0) && y.found && near(y.startSec, 9.0)
+            && y.clip.anchorUid == aUid && near(y.clip.anchorOffsetSec, 9.0) && xLeft.found
+            && near(xLeft.startSec, 2.0) && xLeft.clip.anchorUid == aUid && parentWarnings.isEmpty();
+        QString nestedId;
+        for (const TimelineSequence &sequence : mainTimeline->sequences())
+            if (sequence.name == QStringLiteral("Precompose")) nestedId = sequence.id;
+        bool nestedOk = false;
+        QString nestedDetail;
+        const QString activeParent = mainTimeline->activeSequenceId();
+        if (!nestedId.isEmpty() && mainTimeline->setActiveSequence(nestedId)) {
+            mainTimeline->saveUndoState(QStringLiteral("nested edit"));
+            const QStringList nestedWarnings = mainTimeline->takeConnectionWarnings();
+            const TimelineTrack *nv1 = mainTimeline->trackAt(false, 0);
+            const TimelineTrack *nv2 = mainTimeline->trackAt(false, 1);
+            const ClipInfo v1Piece = nv1 && nv1->clipCount() == 1 ? nv1->clips().at(0) : ClipInfo{};
+            const ClipInfo v2Piece = nv2 && nv2->clipCount() == 1 ? nv2->clips().at(0) : ClipInfo{};
+            nestedOk = !v1Piece.uid.isEmpty() && v2Piece.anchorUid == v1Piece.uid
+                && near(v2Piece.leadInSec, 0.0) && near(v2Piece.anchorOffsetSec, 0.0)
+                && nestedWarnings.isEmpty();
+            nestedDetail = QStringLiteral("v1Clips=%1 v2Clips=%2 v2 anchorUid=%3 (expect the nested V1 uid "
+                                          "%4) offset=%5 warnings=%6")
+                .arg(nv1 ? nv1->clipCount() : -1).arg(nv2 ? nv2->clipCount() : -1)
+                .arg(v2Piece.anchorUid, v1Piece.uid).arg(v2Piece.anchorOffsetSec, 0, 'f', 6)
+                .arg(nestedWarnings.size());
+            mainTimeline->setActiveSequence(activeParent);
+        }
+        const bool noModal = QApplication::activeModalWidget() == nullptr;
+        std::fprintf(stderr, "connected-clip G28 answered=%d unexpected=%d (expect 1/0) nested id=[%s] "
+                     "(name Precompose) left start=%.6f length=%.6f (expect 0 / 4) y[%s] xLeft[%s] "
+                     "parentWarnings=%lld (expect 0) parentOk=%d | nested %s ok=%d | noModal=%d\n",
+                     answered, unexpected, qPrintable(nestedId), left.startSec, left.clip.effectiveDuration(),
+                     qPrintable(describe(y, aUid)), qPrintable(describe(xLeft, aUid)),
+                     static_cast<long long>(parentWarnings.size()), parentOk, qPrintable(nestedDetail),
+                     nestedOk, noModal);
+        tally.gate(28, answered == 1 && unexpected == 0 && parentOk && nestedOk && noModal,
+                   "the real pre-compose action did not take the name from its input dialog, moved / "
+                   "detached the connection after the range, did not name the nested sequence, or left a modal open");
+    }
+
+    // G29 / G30 (US-1304): a media drop on V1 with storyline mode on is a storyline insert at the
+    // drop point (real TimelineTrack::dropEvent for G29; Timeline::dropMediaOnTrack for the texts of G30).
+    {
+        QTemporaryDir dir;
+        const QString avPath = dir.filePath(QStringLiteral("g29.mp4"));
+        QString whyNot;
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(29, qPrintable(whyNot));
+            tally.skip(30, qPrintable(whyNot));
+            tally.skip(33, qPrintable(whyNot));
+        } else if (!dir.isValid() || !writeVideoWithAudioFile(avPath, 20)) {
+            std::fprintf(stderr, "connected-clip G29 fixture media could not be written\n");
+            tally.gate(29, false, "the G29 fixture media could not be written");
+            tally.gate(30, false, "the G30 fixture media could not be written");
+            tally.gate(33, false, "the G33 fixture media could not be written");
+        } else {
+            const QString avName = QFileInfo(avPath).fileName();
+            auto linked = [](ClipInfo c, int group) {
+                c.linkGroup = group;
+                return c;
+            };
+            // Start of the first clip named `name` on a track, -1 when absent.
+            auto startOn = [](const Timeline &tl, bool audio, int track, const QString &name) {
+                double cursor = 0.0;
+                for (const ClipInfo &clip : tl.trackAt(audio, track)->clips()) {
+                    cursor += clip.leadInSec;
+                    if (clip.displayName == name) return cursor;
+                    cursor += clip.effectiveDuration();
+                }
+                return -1.0;
+            };
+            auto layout = [](const Timeline &tl, bool audio, int track) {
+                QStringList parts;
+                double cursor = 0.0;
+                for (const ClipInfo &clip : tl.trackAt(audio, track)->clips()) {
+                    cursor += clip.leadInSec;
+                    parts << QStringLiteral("%1@%2").arg(clip.displayName).arg(cursor, 0, 'f', 4);
+                    cursor += clip.effectiveDuration();
+                }
+                return QStringLiteral("[") + parts.join(QLatin1Char(' ')) + QLatin1Char(']');
+            };
+            auto baseline = [](Timeline &tl) {
+                tl.setStorylineMode(true);
+                tl.undoManager()->clear();
+                tl.saveUndoState(QStringLiteral("baseline"));
+                tl.takeConnectionWarnings();
+            };
+
+            // G29 main: V1 [X 0-5 | Y 5-15], V2 clip c connected to Y at 7, A1 unlinked BGM 0-30,
+            // A2 the linked audio of X / Y, A3 free. Y is selected, then a drop at t=5 (the X|Y boundary).
+            Timeline tl;
+            load(tl, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)}, {clipFor("c", 2.0, 7.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 1));
+            baseline(tl);
+            const QString yUid = uidAt(tl, 0, 1);
+            tl.trackAt(false, 0)->setSelectedClip(1);
+            // A click on Y: sets the timeline's active video row the way the GUI does.
+            emit tl.trackAt(false, 0)->selectionChanged(1, false);
+            const auto serialBefore = tl.undoManager()->saveSerial();
+            int lastTrack = -2;
+            int lastClip = -2;
+            QObject::connect(&tl, &Timeline::clipSelectedOnTrack, &tl, [&](int trackIdx, int clipIdx) {
+                lastTrack = trackIdx;
+                lastClip = clipIdx;
+            });
+            const bool accepted = sendMediaDrop(tl.trackAt(false, 0), avPath, 5.0);
+            bool mainMismatch = false;
+            for (const QString &w : tl.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("landing mismatch"))) mainMismatch = true;
+            const Located fresh = locateByName(tl, false, avName);
+            const Located freshAudio = locateByName(tl, true, avName);
+            const double len = fresh.clip.effectiveDuration();
+            const bool serialOk = tl.undoManager()->saveSerial() == serialBefore + 1;
+            const TimelineTrack *v1 = tl.trackAt(false, 0);
+            const int selectedAfterDrop = v1->selectedClip();
+            const bool mainOk = accepted && v1->clipCount() == 3 && fresh.found && fresh.track == 0 && fresh.index == 1
+                && len > 0.5 && near(fresh.startSec, 5.0)
+                && near(startOn(tl, false, 0, QStringLiteral("y")), 5.0 + len)
+                && near(startOn(tl, false, 1, QStringLiteral("c")), 7.0 + len)
+                && near(startOn(tl, true, 1, QStringLiteral("ya")), 5.0 + len)
+                && near(startOn(tl, true, 1, QStringLiteral("xa")), 0.0)
+                && near(startOn(tl, true, 0, QStringLiteral("bgm")), 0.0) && tl.trackAt(true, 0)->clipCount() == 1
+                && freshAudio.found && freshAudio.track == 2 && near(freshAudio.startSec, fresh.startSec)
+                && v1->clips().value(2).uid == yUid && selectedAfterDrop == 2 && serialOk
+                && !mainMismatch && lastTrack == 0 && lastClip == 2;
+            const int sigTrack = lastTrack;
+            const int sigClip = lastClip;
+            const QString mainV1 = layout(tl, false, 0);
+            const QString mainV2 = layout(tl, false, 1);
+            const QString mainA1 = layout(tl, true, 0);
+            const QString mainA2 = layout(tl, true, 1);
+            const QString mainA3 = layout(tl, true, 2);
+            tl.undo();
+            const bool undoOk = v1->clipCount() == 2 && near(startOn(tl, false, 0, QStringLiteral("y")), 5.0)
+                && near(startOn(tl, false, 1, QStringLiteral("c")), 7.0)
+                && near(startOn(tl, true, 1, QStringLiteral("ya")), 5.0) && tl.trackAt(true, 2)->clipCount() == 0
+                && tl.trackAt(true, 0)->clipCount() == 1;
+
+            // G29 sub-check (US-1304 fix round 3): the same fixture through insertClip3PointActive, a
+            // non-import insertClipPreservingDownstream-style caller. Y keeps its selection (shifted),
+            // the last clipSelectedOnTrack names V1 and Y (not -1,-1, which would clear the edit target).
+            Timeline ins;
+            load(ins, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)}, {clipFor("c", 2.0, 7.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            ins.connectClip(TrackKind::Video, 1, 0, uidAt(ins, 0, 1));
+            baseline(ins);
+            const QString insYUid = uidAt(ins, 0, 1);
+            ins.trackAt(false, 0)->setSelectedClip(1);
+            emit ins.trackAt(false, 0)->selectionChanged(1, false);
+            int insTrack = -2;
+            int insClip = -2;
+            QObject::connect(&ins, &Timeline::clipSelectedOnTrack, &ins, [&](int trackIdx, int clipIdx) {
+                insTrack = trackIdx;
+                insClip = clipIdx;
+            });
+            ins.insertClip3PointActive(5.0, clipFor("n", 3.0));
+            const TimelineTrack *insV1 = ins.trackAt(false, 0);
+            int insYIndex = -1;
+            for (int i = 0; i < insV1->clipCount(); ++i)
+                if (insV1->clips().at(i).uid == insYUid) insYIndex = i;
+            const bool insOk = insYIndex >= 0 && insV1->selectedClip() == insYIndex
+                && insTrack == 0 && insClip == insYIndex;
+            std::fprintf(stderr, "connected-clip G29 insertClip3PointActive: yIndex=%d selected=%d lastTrack=%d (expect 0) "
+                         "lastClip=%d (expect yIndex) insOk=%d\n",
+                         insYIndex, insV1->selectedClip(), insTrack, insClip, insOk);
+
+            // G29 sub-check (US-1304 fix round 4): the selected connected clip C on V2 is pushed past the
+            // unconnected D by a V1 insert before Y. Reconcile moves C (removal + re-insert); its
+            // selection must follow by uid and be reported as (V2, C's new index), never stale (V2, 0)
+            // which now points at D.
+            // Own call frame: one more Timeline local in this long function overflows the stack in
+            // MainWindow's constructor further down.
+            const bool mvOk = [&]() {
+            Timeline mv;
+            load(mv, {{linked(clipFor("x", 5.0), 61), linked(clipFor("y", 10.0), 62)},
+                      {clipFor("c", 2.0, 7.0), clipFor("d", 2.0, 3.0)}},
+                 {{clipFor("bgm", 30.0)}, {linked(clipFor("xa", 5.0), 61), linked(clipFor("ya", 10.0), 62)}, {}});
+            mv.connectClip(TrackKind::Video, 1, 0, uidAt(mv, 0, 1));
+            baseline(mv);
+            const QString mvCUid = uidAt(mv, 1, 0);
+            mv.trackAt(false, 1)->setSelectedClip(0);
+            emit mv.trackAt(false, 1)->selectionChanged(0, false);
+            int mvTrack = -2;
+            int mvClip = -2;
+            QObject::connect(&mv, &Timeline::clipSelectedOnTrack, &mv, [&](int trackIdx, int clipIdx) {
+                mvTrack = trackIdx;
+                mvClip = clipIdx;
+            });
+            mv.insertClip3PointActive(5.0, clipFor("n", 20.0));
+            const TimelineTrack *mvV2 = mv.trackAt(false, 1);
+            int mvCIndex = -1;
+            for (int i = 0; i < mvV2->clipCount(); ++i)
+                if (mvV2->clips().at(i).uid == mvCUid) mvCIndex = i;
+            const bool mvExplicitDeselect = mvTrack == -1 && mvClip == -1;
+            const bool ok = mvCIndex == 1 && mvV2->selectedClip() == mvCIndex
+                && ((mvTrack == 1 && mvClip == mvCIndex) || mvExplicitDeselect)
+                && !(mvTrack == 1 && mvClip == 0);
+            std::fprintf(stderr, "connected-clip G29 moved-selection: V2 %s cIndex=%d (expect 1) selected=%d "
+                         "lastTrack=%d lastClip=%d (expect 1,cIndex; stale 1,0 points at d) mvOk=%d\n",
+                         qPrintable(layout(mv, false, 1)), mvCIndex, mvV2->selectedClip(), mvTrack, mvClip, ok);
+            return ok;
+            }();
+
+            // G29 sub-check (US-1304 fix round 5): the same push, but C's linked audio partner Ca finds
+            // no slot (an unlinked BGM covers its target on every audio track), so the pass that moved
+            // C past D is rolled back and the group detached where it stands. C (index 0, D at 1) must
+            // stay selected and be the last one announced; the rolled-back pass had it at index 1, which
+            // on the restored V2 [C|D] names D.
+            const bool rbOk = [&]() {
+            Timeline rb;
+            load(rb, {{clipFor("x", 5.0), clipFor("y", 10.0)},
+                      {linked(clipFor("c", 2.0, 7.0), 81), clipFor("d", 2.0, 3.0)}},
+                 {{linked(clipFor("ca", 2.0, 7.0), 81), clipFor("bgm1", 30.0)}, {clipFor("bgm2", 40.0)}});
+            rb.connectClip(TrackKind::Video, 1, 0, uidAt(rb, 0, 1));
+            baseline(rb);
+            const QString rbCUid = uidAt(rb, 1, 0);
+            const QString rbDUid = uidAt(rb, 1, 1);
+            rb.trackAt(false, 1)->setSelectedClip(0);
+            emit rb.trackAt(false, 1)->selectionChanged(0, false);
+            int rbTrack = -2;
+            int rbClip = -2;
+            int rbClipSelected = -2;
+            QObject::connect(&rb, &Timeline::clipSelectedOnTrack, &rb, [&](int trackIdx, int clipIdx) {
+                rbTrack = trackIdx;
+                rbClip = clipIdx;
+            });
+            QObject::connect(&rb, &Timeline::clipSelected, &rb, [&](int clipIdx) { rbClipSelected = clipIdx; });
+            rb.insertClip3PointActive(5.0, clipFor("n", 20.0));
+            bool detachWarned = false;
+            for (const QString &w : rb.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("退避先のトラックがありません"))) detachWarned = true;
+            const TimelineTrack *rbV2 = rb.trackAt(false, 1);
+            int rbCIndex = -1;
+            for (int i = 0; i < rbV2->clipCount(); ++i)
+                if (rbV2->clips().at(i).uid == rbCUid) rbCIndex = i;
+            const QString selectedUid = rbV2->selectedClip() >= 0
+                ? rbV2->clips().value(rbV2->selectedClip()).uid : QString();
+            const bool ok = detachWarned && rbCIndex == 0 && rbV2->clips().value(1).uid == rbDUid
+                && rbV2->clips().at(0).anchorUid.isEmpty() && selectedUid == rbCUid
+                && rbTrack == 1 && rbClip == rbCIndex && rbClipSelected == rbCIndex
+                && rb.activeVideoTrackIndex() == 1;
+            std::fprintf(stderr, "connected-clip G29 rollback-selection: V2 %s A1 %s A2 %s detachWarned=%d cIndex=%d "
+                         "(expect 0) selected=%d selectedIsC=%d selectedIsD=%d lastTrack=%d lastClip=%d "
+                         "lastClipSelected=%d (expect 1,0,0) activeTrack=%d (expect 1) rbOk=%d\n",
+                         qPrintable(layout(rb, false, 1)), qPrintable(layout(rb, true, 0)),
+                         qPrintable(layout(rb, true, 1)), detachWarned, rbCIndex, rbV2->selectedClip(),
+                         int(selectedUid == rbCUid), int(selectedUid == rbDUid), rbTrack, rbClip,
+                         rbClipSelected, rb.activeVideoTrackIndex(), ok);
+            return ok;
+            }();
+
+            // G29 variant (C7): a one-frame gap in front of the drop point. V1 [x 0-5 | gap | y | z],
+            // drop at t=14 (inside y): the landing is after y at 15 once the gap is closed, not at
+            // the stale start of z (15 + gap). The new audio must start on the new V1 clip.
+            const double gap = 1.0 / 30.0;
+            Timeline gp;
+            load(gp, {{linked(clipFor("x", 5.0), 71), linked(clipFor("y", 10.0, gap), 72), linked(clipFor("z", 5.0), 73)}},
+                 {{linked(clipFor("xa", 5.0), 71), linked(clipFor("ya", 10.0, gap), 72), linked(clipFor("za", 5.0), 73)}, {}});
+            baseline(gp);
+            const bool gapAccepted = sendMediaDrop(gp.trackAt(false, 0), avPath, 14.0);
+            const Located gapFresh = locateByName(gp, false, avName);
+            const Located gapAudio = locateByName(gp, true, avName);
+            const double gapLen = gapFresh.clip.effectiveDuration();
+            bool gapMismatch = false;
+            for (const QString &w : gp.takeConnectionWarnings())
+                if (w.contains(QStringLiteral("landing mismatch"))) gapMismatch = true;
+            const bool gapOk = gapAccepted && !gapMismatch && gp.trackAt(false, 0)->clipCount() == 4 && gapFresh.found
+                && gapFresh.index == 2 && near(gapFresh.startSec, 15.0) && gapAudio.found
+                && near(gapAudio.startSec, gapFresh.startSec)
+                && near(startOn(gp, false, 0, QStringLiteral("y")), 5.0)
+                && near(startOn(gp, false, 0, QStringLiteral("z")), 15.0 + gapLen)
+                && near(startOn(gp, true, 0, QStringLiteral("ya")), 5.0)
+                && near(startOn(gp, true, 0, QStringLiteral("za")), 15.0 + gapLen);
+            std::fprintf(stderr, "connected-clip G29 main: accepted=%d len=%.4f serial+1=%d V1 %s V2 %s A1 %s A2 %s A3 %s "
+                         "selected=%d (expect 2) selectionSignal=%d,%d (expect 0,2) mismatch=%d mainOk=%d undoOk=%d | gap variant: accepted=%d len=%.4f V1 %s A1 %s A2 %s "
+                         "(expect new clip and its audio both @15.0000, z/za @15+len) gapMismatch=%d gapOk=%d\n",
+                         accepted, len, serialOk, qPrintable(mainV1), qPrintable(mainV2),
+                         qPrintable(mainA1), qPrintable(mainA2), qPrintable(mainA3),
+                         selectedAfterDrop, sigTrack, sigClip, mainMismatch, mainOk, undoOk, gapAccepted, gapLen, qPrintable(layout(gp, false, 0)),
+                         qPrintable(layout(gp, true, 0)), qPrintable(layout(gp, true, 1)), gapMismatch, gapOk);
+            tally.gate(29, mainOk && undoOk && gapOk && insOk && mvOk && rbOk,
+                       "a V1 media drop in storyline mode did not insert at the boundary with Y, its connection and "
+                       "its linked audio pushed and the BGM fixed, put the new audio off the new V1 clip's start / "
+                       "on top of other audio, took more or fewer than one undo point, lost the selection of Y, left a moved selected connected clip's selection stale or unreported (also after a rolled-back placement pass), or "
+                       "(gap variant) placed the audio from the pre-insert start instead of the closed-gap landing");
+
+            // G30: a locked V1, all audio tracks locked, and an audio track full at the landing time.
+            auto fixture = [&](Timeline &t, bool oneAudioTrackFull) {
+                load(t, {{clipFor("x", 5.0), clipFor("y", 10.0)}},
+                     oneAudioTrackFull ? QVector<QVector<ClipInfo>>{{clipFor("bgm", 30.0)}}
+                                       : QVector<QVector<ClipInfo>>{{clipFor("bgm", 3.0)}, {}});
+                baseline(t);
+            };
+            auto snapshot = [&](const Timeline &t) {
+                return layout(t, false, 0) + layout(t, true, 0) + (t.audioTracks().size() > 1 ? layout(t, true, 1) : QString())
+                    + QString::number(t.videoTracks().size()) + QString::number(t.audioTracks().size());
+            };
+            const QString lockText = QStringLiteral("ロック中のトラックには配置できません");
+            const QString slotText = QStringLiteral("音声を置ける空きトラックがありません");
+            Timeline lockedV1;
+            fixture(lockedV1, false);
+            lockedV1.trackAt(false, 0)->setLocked(true);
+            const QString lockedBefore = snapshot(lockedV1);
+            const auto lockedSerial = lockedV1.undoManager()->saveSerial();
+            QString lockedErr;
+            const bool lockedDrop = lockedV1.dropMediaOnTrack(lockedV1.trackAt(false, 0), avPath, 3.0, &lockedErr);
+            const bool lockedGui = sendMediaDrop(lockedV1.trackAt(false, 0), avPath, 3.0);
+            const bool lockedOk = !lockedDrop && !lockedGui && lockedErr == lockText
+                && snapshot(lockedV1) == lockedBefore && lockedV1.undoManager()->saveSerial() == lockedSerial;
+            Timeline audioLocked;
+            fixture(audioLocked, false);
+            for (TimelineTrack *a : audioLocked.audioTracks()) a->setLocked(true);
+            const QString audioLockedBefore = snapshot(audioLocked);
+            const auto audioLockedSerial = audioLocked.undoManager()->saveSerial();
+            QString audioLockedErr;
+            const bool audioLockedDrop = audioLocked.dropMediaOnTrack(audioLocked.trackAt(false, 0), avPath, 3.0, &audioLockedErr);
+            const bool audioLockedOk = !audioLockedDrop && audioLockedErr == slotText
+                && snapshot(audioLocked) == audioLockedBefore
+                && audioLocked.undoManager()->saveSerial() == audioLockedSerial;
+            Timeline audioFull;
+            fixture(audioFull, true);
+            const QString audioFullBefore = snapshot(audioFull);
+            const auto audioFullSerial = audioFull.undoManager()->saveSerial();
+            QString audioFullErr;
+            const bool audioFullDrop = audioFull.dropMediaOnTrack(audioFull.trackAt(false, 0), avPath, 3.0, &audioFullErr);
+            const bool audioFullOk = !audioFullDrop && audioFullErr == slotText
+                && snapshot(audioFull) == audioFullBefore && audioFull.undoManager()->saveSerial() == audioFullSerial;
+            // Control: the same fixture with one free unlocked audio track accepts the drop.
+            Timeline control;
+            fixture(control, false);
+            QString controlErr;
+            const bool controlDrop = control.dropMediaOnTrack(control.trackAt(false, 0), avPath, 3.0, &controlErr);
+            const bool controlOk = controlDrop && control.trackAt(false, 0)->clipCount() == 3;
+            std::fprintf(stderr, "connected-clip G30 lockedV1: drop=%d gui=%d err='%s' unchanged=%d ok=%d | audioLocked: drop=%d "
+                         "err='%s' unchanged=%d ok=%d | audioFull: drop=%d err='%s' unchanged=%d ok=%d | control (free track): "
+                         "drop=%d V1=%d err='%s' ok=%d (expect refusals with the lock text / the free-track text, control 1)\n",
+                         lockedDrop, lockedGui, qPrintable(lockedErr), snapshot(lockedV1) == lockedBefore, lockedOk,
+                         audioLockedDrop, qPrintable(audioLockedErr), snapshot(audioLocked) == audioLockedBefore,
+                         audioLockedOk, audioFullDrop, qPrintable(audioFullErr), snapshot(audioFull) == audioFullBefore,
+                         audioFullOk, controlDrop, control.trackAt(false, 0)->clipCount(), qPrintable(controlErr),
+                         controlOk);
+            tally.gate(30, lockedOk && audioLockedOk && audioFullOk && controlOk,
+                       "a V1 drop was taken on a locked V1 or refused with another text / changed state, or a drop with "
+                       "every audio track locked or full at the landing time changed V1 / used another text, or the "
+                       "free-track control was refused");
+
+            // G33 (US-1320), in its own function to keep this frame small.
+            composedRemapGate(tally, avPath, avName);
+        }
+    }
+
+    // G31 (US-1303), in its own function to keep this frame small.
+    keyRemapGate(tally);
+
+    // G32 (US-1302): the friend hands the private sidecars to the gate function.
+    if (!mainTimeline) {
+        tally.gate(32, false, "MainWindow has no mainTimeline");
+    } else {
+        SidecarView view;
+        view.timeRemap = &window.m_timeRemapClipEntries;
+        view.text3D = &window.m_text3DClipConfigs;
+        view.expressions = &window.m_clipExpressionBindings;
+        view.wiggle = &window.m_clipWiggleParams;
+        view.brush = &window.m_brushAnimationEntries;
+        view.liveBrush = &window.m_liveBrushAnimations;
+        view.materializeBrush = &MainWindow::materializeBrushAnimation;
+        view.addBrush = &MainWindow::addBrushAnimation;
+        view.save = &MainWindow::saveProjectToPath;
+        view.open = &MainWindow::openProjectFromPath;
+        sidecarRekeyGate(tally, window, *mainTimeline, view);
+    }
+
+    // G34 (US-1320): the brush preview after a storyline insert that moves the selection.
+    if (!mainTimeline) {
+        tally.gate(34, false, "MainWindow has no mainTimeline");
+    } else {
+        SidecarView view;
+        view.brush = &window.m_brushAnimationEntries;
+        view.liveBrush = &window.m_liveBrushAnimations;
+        view.brushPreviewClipId = &MainWindow::brushPreviewClipIdForTest;
+        brushPreviewRebindGate(tally, window, *mainTimeline, view);
     }
 
     return tally.finish("connected-clip");
