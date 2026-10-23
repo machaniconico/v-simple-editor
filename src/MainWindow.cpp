@@ -10572,8 +10572,10 @@ void MainWindow::onSourceInsertRequested(const threepoint::SourceSelection &sel)
     }
     ClipInfo clip = threepoint::buildClipInfo(sel);
     const double playheadSec = currentPlayheadSeconds();
-    m_timeline->insertClip3PointActive(playheadSec, clip);
+    const bool placed = m_timeline->insertClip3PointActive(playheadSec, clip);
     updateStatusInfo();
+    if (!placed)
+        return;
     statusBar()->showMessage(
         QStringLiteral("再生ヘッド %1 秒に挿入しました: %2")
             .arg(playheadSec, 0, 'f', 2)
@@ -10598,8 +10600,10 @@ void MainWindow::onSourceOverwriteRequested(const threepoint::SourceSelection &s
     }
     ClipInfo clip = threepoint::buildClipInfo(sel);
     const double playheadSec = currentPlayheadSeconds();
-    m_timeline->overwriteClip3PointActive(playheadSec, clip);
+    const bool placed = m_timeline->overwriteClip3PointActive(playheadSec, clip);
     updateStatusInfo();
+    if (!placed)
+        return;
     statusBar()->showMessage(
         QStringLiteral("再生ヘッド %1 秒から上書きしました: %2")
             .arg(playheadSec, 0, 'f', 2)

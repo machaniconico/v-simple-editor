@@ -11426,29 +11426,49 @@ int Timeline::selectedVideoClipIndex() const
     return m_videoTrack->selectedClip();
 }
 
-void Timeline::insertClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+bool Timeline::insertClip3PointActive(double timelineStartSec, const ClipInfo &clip)
 {
-    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
-        return;
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        emit statusMessageRequested(QStringLiteral("タイムラインがありません"), 5000);
+        return false;
+    }
     auto *track = m_videoTracks.first();
+    if (track->isLocked()) {
+        emit statusMessageRequested(QStringLiteral("ロック中のトラックには配置できません"), 5000);
+        return false;
+    }
+    ClipKeyRemapBatch keyRemapBatch(this);
+    const TrackClipSnapshot before = snapshotTrackClips(this);
     track->insertClip3Point(timelineStartSec, clip);
     // US-1203: storyline mode keeps V1 gap-free (an insert past the end).
     if (m_storylineMode)
         closeGapsOnTrack(track);
+    remapCarriersAfterExternalMutation(before);
     saveUndoState("3点編集: インサート");
+    return true;
 }
 
-void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+bool Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip)
 {
-    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
-        return;
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        emit statusMessageRequested(QStringLiteral("タイムラインがありません"), 5000);
+        return false;
+    }
     auto *track = m_videoTracks.first();
+    if (track->isLocked()) {
+        emit statusMessageRequested(QStringLiteral("ロック中のトラックには配置できません"), 5000);
+        return false;
+    }
+    ClipKeyRemapBatch keyRemapBatch(this);
+    const TrackClipSnapshot before = snapshotTrackClips(this);
     const auto spans = rangeRemovedSpans(
         track, {{timelineStartSec, timelineStartSec + clip.effectiveDuration()}});
     for (auto it = spans.cbegin(); it != spans.cend(); ++it)
         m_pendingDeletedUids[it.key()] += it.value();
     track->overwriteClip3Point(timelineStartSec, clip);
+    remapCarriersAfterExternalMutation(before);
     saveUndoState("3点編集: 上書き");
+    return true;
 }
 
 bool Timeline::insertShapeClipAtPlayhead(const ClipInfo &clip)

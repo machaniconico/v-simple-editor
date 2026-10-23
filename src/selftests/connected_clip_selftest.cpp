@@ -5,6 +5,7 @@
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
 #include "../Timeline.h"
+#include "../ThreePointEdit.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
@@ -156,6 +157,11 @@ extern "C" {
 //        (c) Timeline::undo / redo of each drop keep the brush on b ("0:1" / "0:2"). Detects:
 //        the drop's undo point saved before the batched remap reached the sidecars (redo puts
 //        b's brush on a at "0:1").
+//   G35 (US-1400): the source monitor's 3-point insert / overwrite rekey the roto, matte, parent and
+//        timeRemap carriers of b ("0:1" -> "0:2" / "0:3", one clipKeysRemapped, one undo), and a
+//        locked V1 refuses both (and the MainWindow slots keep the refusal in the status bar).
+//        Detects: no snapshot / remap in the *Active functions (HEAD: roto stays on "0:1"; a locked
+//        V1 is edited; the slots overwrite the refusal with the success message).
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -434,6 +440,11 @@ struct MultiCamApplyTag {
     friend Type member(MultiCamApplyTag);
 };
 template struct Access<MultiCamApplyTag, &MainWindow::onMultiCamApplyToTimeline>;
+struct VideoTracksTag {
+    using Type = QVector<TimelineTrack *> Timeline::*;
+    friend Type member(VideoTracksTag);
+};
+template struct Access<VideoTracksTag, &Timeline::m_videoTracks>;
 
 // 40x24 10 fps mpeg4 clip of `frames` frames (the media a drop imports).
 bool writeVideoFile(const QString &path, int frames)
@@ -748,6 +759,8 @@ struct SidecarView {
     bool (MainWindow::*save)(const QString &, QString *) = nullptr;
     bool (MainWindow::*open)(const QString &, QString *, bool) = nullptr;
     QString (MainWindow::*brushPreviewClipId)() const = nullptr;
+    void (MainWindow::*sourceInsert)(const threepoint::SourceSelection &) = nullptr;
+    void (MainWindow::*sourceOverwrite)(const threepoint::SourceSelection &) = nullptr;
 };
 
 // G32 (US-1302): the position-keyed sidecars follow the clip they were put on.
@@ -1339,6 +1352,227 @@ void brushPreviewRebindGate(selftest::GateTally &tally, MainWindow &window, Time
                "or the drop's undo / redo moved b's brush onto another clip");
     tl.setStorylineMode(false);
     clearBrushes();
+}
+
+// G35 (US-1400): the source monitor's 3-point insert / overwrite rekey the roto, matte, parent and
+// timeRemap carriers of the clips they shift (one clipKeysRemapped), and are refused on a locked V1.
+void threePointCarrierGate(selftest::GateTally &tally, Timeline &tl, const SidecarView &view,
+                           MainWindow &window)
+{
+    auto place = [&tl](bool overwrite, double at, const ClipInfo &clip) {
+        return overwrite ? tl.overwriteClip3PointActive(at, clip) : tl.insertClip3PointActive(at, clip);
+    };
+    // V1 [a 0-5 | b 5-15], V2 [x connected to b]; roto, matte, parent and timeRemap sit on b "0:1".
+    const QString bKey = QStringLiteral("0:1");
+    auto setup = [&] {
+        view.timeRemap->clear();
+        load(tl, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("x", 2.0, 7.0)}});
+        tl.connectClip(TrackKind::Video, 1, 0, uidAt(tl, 0, 1));
+        RotoClipEntry roto;
+        roto.brushMask = QImage(2, 2, QImage::Format_ARGB32);
+        tl.setRotoEntries({{bKey, roto}});
+        TimelineTrackMatteEntry matte;
+        matte.matteType = TrackMatteType::AlphaMatte;
+        matte.matteSourceClipId = QStringLiteral("1:0");
+        tl.setTrackMatteEntries({{bKey, matte}});
+        tl.setClipParent(QStringLiteral("1:0"), bKey);
+        TimeRemapClipEntry remap;
+        remap.clipId = bKey;
+        remap.curve.sourceFps = 10.0;
+        remap.curve.addKey(0.0, 0.0);
+        remap.curve.addKey(2.0, 1.0);
+        view.timeRemap->insert(bKey, remap);
+        tl.saveUndoState(QStringLiteral("G35 carriers"));
+    };
+    // Where the four carriers sit: roto / matte keys, the parent's value, the timeRemap key.
+    auto where = [&] {
+        QStringList parts;
+        QStringList roto = tl.rotoEntries().keys();
+        roto.sort();
+        QStringList matte = tl.trackMatteEntries().keys();
+        matte.sort();
+        QStringList remap = view.timeRemap->keys();
+        remap.sort();
+        QString matteSource;
+        const auto mattes = tl.trackMatteEntries();
+        if (!mattes.isEmpty()) matteSource = mattes.cbegin().value().matteSourceClipId;
+        return QStringLiteral("roto=%1 matte=%2(src %3) parent[1:0]=%4 timeRemap=%5(%6)")
+            .arg(roto.join(','), matte.join(','), matteSource, tl.clipParentEntries().value(QStringLiteral("1:0")),
+                 remap.join(','),
+                 view.timeRemap->isEmpty() ? QString() : view.timeRemap->cbegin().value().clipId);
+    };
+    auto expect = [](const QString &key) {
+        return QStringLiteral("roto=%1 matte=%1(src 1:0) parent[1:0]=%1 timeRemap=%1(%1)").arg(key);
+    };
+
+    struct Case {
+        bool overwrite;
+        double at;
+        const char *newKey;
+        const char *label;
+    };
+    const Case cases[] = {{false, 0.0, "0:2", "insert"}, {true, 2.5, "0:3", "overwrite"}};
+    bool okEdits = true;
+    for (const Case &c : cases) {
+        setup();
+        const QString bUid = uidAt(tl, 0, 1);
+        const QString startedAt = where();
+        QVector<Timeline::ClipKeyRemap> log;
+        const QMetaObject::Connection conn = QObject::connect(
+            &tl, &Timeline::clipKeysRemapped, &tl, [&log](const Timeline::ClipKeyRemap &r) { log.append(r); });
+        const bool placed = place(c.overwrite, c.at, clipFor("ins", c.overwrite ? 1.0 : 3.0));
+        QObject::disconnect(conn);
+        const Located b = locate(tl, false, bUid);
+        const QString shown = where();
+        const bool moved = placed && b.found && b.track == 0 && b.index == QString(c.newKey).mid(2).toInt()
+            && uidAt(tl, 1, 0) != bUid && tl.trackAt(false, 1)->clips().at(0).anchorUid == bUid;
+        const bool followed = shown == expect(QString::fromLatin1(c.newKey));
+        const bool once = log.size() == 1;
+        tl.undo();
+        const QString undone = where();
+        const bool undoOk = undone == expect(bKey) && startedAt == undone
+            && uidAt(tl, 0, 1) == bUid && tl.trackAt(false, 1)->clips().at(0).anchorUid == bUid;
+        std::fprintf(stderr, "connected-clip G35 (%s) placed=%d b=%d:%d (expect %s) connected=%d "
+                     "after=[%s] (expect %s) remaps=%lld (expect 1) undone=[%s] undoOk=%d\n",
+                     c.label, placed, b.track, b.index, c.newKey, moved, qPrintable(shown),
+                     qPrintable(expect(QString::fromLatin1(c.newKey))), static_cast<long long>(log.size()),
+                     qPrintable(undone), undoOk);
+        okEdits = okEdits && moved && followed && once && undoOk;
+    }
+
+    // (2') One edit, one emit: V1 [a 0-5 | b 5-15], V2 [x 5.5-6.5 connected to b, y 7-8]. The edit shifts b, x
+    // follows and V2 reorders to [y, x], so the roto remap and the connected-clip reconcile both rekey in the
+    // same edit; the composed map must reach clipKeysRemapped once and carry the V1 and the V2 key change.
+    struct ReorderCase {
+        bool overwrite;
+        bool storyline;
+        double at;
+        double len;
+        int xIndex;
+        int xAfter;
+        const char *v2Map;
+        const char *label;
+    };
+    // insert: b 5-15 moves to 8-18, x 5.5 -> 8.5 passes y at 7. overwrite keeps every downstream clip at its
+    // absolute time (it never moves x, so V2 cannot reorder); it only rekeys b, 0:1 -> 0:3, in the same fixture.
+    const ReorderCase reorderCases[] = {
+        {false, false, 0.0, 3.0, 0, 1, "1:0->1:1", "insert"},
+        {true, false, 2.5, 1.0, 0, 0, "", "overwrite"}};
+    bool okReorder = true;
+    for (const ReorderCase &c : reorderCases) {
+        load(tl, {{clipFor("a", 5.0), clipFor("b", 10.0)}, {clipFor("x", 1.0, 5.5), clipFor("y", 1.0, 0.5)}});
+        tl.setStorylineMode(c.storyline);
+        tl.connectClip(TrackKind::Video, 1, c.xIndex, uidAt(tl, 0, 1));
+        tl.saveUndoState(QStringLiteral("G35 reorder"));
+        const QString xUid = uidAt(tl, 1, c.xIndex);
+        QVector<Timeline::ClipKeyRemap> log;
+        const QMetaObject::Connection conn = QObject::connect(
+            &tl, &Timeline::clipKeysRemapped, &tl, [&log](const Timeline::ClipKeyRemap &r) { log.append(r); });
+        const bool placed = place(c.overwrite, c.at, clipFor("ins", c.len));
+        QObject::disconnect(conn);
+        const Located x = locate(tl, false, xUid);
+        QStringList mapText;
+        for (const auto &r : log) {
+            QStringList pairs;
+            for (auto it = r.oldToNew.cbegin(); it != r.oldToNew.cend(); ++it)
+                pairs.append(it.key() + QStringLiteral("->") + it.value());
+            pairs.sort();
+            mapText.append(QStringLiteral("{%1 dropped=%2}").arg(pairs.join(','), QString::number(r.dropped.size())));
+        }
+        const bool reordered = placed && x.found && x.track == 1 && x.index == c.xAfter;
+        const bool one = log.size() == 1;
+        const QStringList v2Pair = QString::fromLatin1(c.v2Map).split(QStringLiteral("->"));
+        const bool v2Key = one && (v2Pair.size() < 2 || log.first().oldToNew.value(v2Pair.value(0)) == v2Pair.value(1));
+        const bool v1Key = one && log.first().oldToNew.value(QStringLiteral("0:1"))
+            == QString::fromLatin1(c.overwrite ? "0:3" : "0:2");
+        std::fprintf(stderr, "connected-clip G35 (2' %s) placed=%d x=%d:%d (expect 1:%d) remaps=%lld (expect 1) "
+                     "map=%s v2Key(%s)=%d v1Key=%d\n", c.label, placed, x.track, x.index, c.xAfter,
+                     static_cast<long long>(log.size()), qPrintable(mapText.join(" ")), c.v2Map, v2Key, v1Key);
+        okReorder = okReorder && reordered && one && v2Key && v1Key;
+        tl.setStorylineMode(false);
+    }
+    okEdits = okEdits && okReorder;
+
+    // (3') A locked V1 refuses both, changing nothing and saying so once each.
+    setup();
+    tl.trackAt(false, 0)->setLocked(true);
+    QStringList messages;
+    const QMetaObject::Connection msgConn = QObject::connect(
+        &tl, &Timeline::statusMessageRequested, &tl, [&messages](const QString &m, int) { messages.append(m); });
+    const int clipsBefore = tl.trackAt(false, 0)->clipCount();
+    const int indexBefore = tl.undoManager()->currentIndex();
+    const QString carriersBefore = where();
+    const bool insertRefused = !place(false, 0.0, clipFor("ins", 3.0));
+    const int afterInsertMessages = messages.size();
+    const bool overwriteRefused = !place(true, 2.5, clipFor("ins", 1.0));
+    QObject::disconnect(msgConn);
+    const bool unchanged = tl.trackAt(false, 0)->clipCount() == clipsBefore
+        && tl.undoManager()->currentIndex() == indexBefore && where() == carriersBefore
+        && tl.trackAt(false, 0)->clips().at(0).displayName == QStringLiteral("a");
+    const bool lockText = afterInsertMessages == 1 && messages.size() == 2
+        && messages.value(0) == messages.value(1)
+        && messages.value(0) == QStringLiteral("ロック中のトラックには配置できません");
+    std::fprintf(stderr, "connected-clip G35 (3') locked V1: insertRefused=%d overwriteRefused=%d clips %d->%d "
+                 "undoIndex %d->%d unchanged=%d messages=%lld [%s] lockText=%d\n", insertRefused,
+                 overwriteRefused, clipsBefore, tl.trackAt(false, 0)->clipCount(), indexBefore,
+                 tl.undoManager()->currentIndex(), unchanged, static_cast<long long>(messages.size()),
+                 qPrintable(messages.join('|')), lockText);
+
+    // (3'') The same through the MainWindow slots: the status bar keeps the refusal.
+    threepoint::SourceSelection sel;
+    sel.filePath = QStringLiteral("/selftests/connected-ins.mp4");
+    sel.displayName = QStringLiteral("ins");
+    sel.durationSec = 3.0;
+    sel.sourceInSec = 0.0;
+    sel.sourceOutSec = 3.0;
+    QStringList slotLines;
+    bool slotsOk = true;
+    for (int overwrite = 0; overwrite < 2; ++overwrite) {
+        window.statusBar()->clearMessage();
+        ((window).*(overwrite ? view.sourceOverwrite : view.sourceInsert))(sel);
+        const QString shown = window.statusBar()->currentMessage();
+        const bool ok = shown == QStringLiteral("ロック中のトラックには配置できません")
+            && tl.trackAt(false, 0)->clipCount() == clipsBefore;
+        slotLines.append(QStringLiteral("%1 status='%2' clips=%3 ok=%4")
+                             .arg(overwrite ? "overwrite" : "insert", shown)
+                             .arg(tl.trackAt(false, 0)->clipCount())
+                             .arg(ok));
+        slotsOk = slotsOk && ok;
+    }
+    std::fprintf(stderr, "connected-clip G35 (3'') source monitor slots on a locked V1 (clips before %d): %s\n",
+                 clipsBefore, qPrintable(slotLines.join(" ; ")));
+
+    tl.trackAt(false, 0)->setLocked(false);
+
+    // (3''') No V1 at all: both entry points refuse with the no-timeline message and change nothing.
+    QStringList noV1Messages;
+    const QMetaObject::Connection noV1Conn = QObject::connect(
+        &tl, &Timeline::statusMessageRequested, [&noV1Messages](const QString &m) { noV1Messages.append(m); });
+    const int noV1ClipsBefore = tl.trackAt(false, 0)->clipCount();
+    const int noV1IndexBefore = tl.undoManager()->currentIndex();
+    const auto noV1CarriersBefore = where();
+    QVector<TimelineTrack *> savedVideoTracks;
+    std::swap(savedVideoTracks, tl.*member(VideoTracksTag{}));
+    const bool noV1Insert = place(false, 0.0, clipFor("ins", 3.0));
+    const bool noV1Overwrite = place(true, 2.5, clipFor("ins", 1.0));
+    std::swap(savedVideoTracks, tl.*member(VideoTracksTag{}));
+    QObject::disconnect(noV1Conn);
+    const bool noV1Ok = !noV1Insert && !noV1Overwrite && noV1Messages.size() == 2
+        && noV1Messages.value(0) == QStringLiteral("タイムラインがありません")
+        && noV1Messages.value(1) == QStringLiteral("タイムラインがありません")
+        && tl.trackAt(false, 0)->clipCount() == noV1ClipsBefore
+        && tl.undoManager()->currentIndex() == noV1IndexBefore && where() == noV1CarriersBefore;
+    std::fprintf(stderr, "connected-clip G35 (no V1) videoTracks=0 insertPlaced=%d overwritePlaced=%d messages=%lld [%s] "
+                 "clips %d->%d undoIndex %d->%d noV1Ok=%d\n", noV1Insert, noV1Overwrite,
+                 static_cast<long long>(noV1Messages.size()), qPrintable(noV1Messages.join('|')),
+                 noV1ClipsBefore, tl.trackAt(false, 0)->clipCount(), noV1IndexBefore,
+                 tl.undoManager()->currentIndex(), noV1Ok);
+
+    view.timeRemap->clear();
+    tally.gate(35, okEdits && insertRefused && overwriteRefused && unchanged && lockText && slotsOk && noV1Ok,
+               "a source-monitor 3-point insert / overwrite left the roto, matte, parent or timeRemap carrier "
+               "of the shifted clip on its old key (or emitted clipKeysRemapped other than once, or "
+               "undo did not restore all four), or a locked V1 accepted the edit / kept a success message, or a missing V1 did not refuse with タイムラインがありません");
 }
 
 } // namespace
@@ -3864,6 +4098,17 @@ int runConnectedClipSelftest()
         view.liveBrush = &window.m_liveBrushAnimations;
         view.brushPreviewClipId = &MainWindow::brushPreviewClipIdForTest;
         brushPreviewRebindGate(tally, window, *mainTimeline, view);
+    }
+
+    // G35 (US-1400): the source monitor's 3-point edits rekey the carriers and honour the V1 lock.
+    if (!mainTimeline) {
+        tally.gate(35, false, "MainWindow has no mainTimeline");
+    } else {
+        SidecarView view;
+        view.timeRemap = &window.m_timeRemapClipEntries;
+        view.sourceInsert = &MainWindow::onSourceInsertRequested;
+        view.sourceOverwrite = &MainWindow::onSourceOverwriteRequested;
+        threePointCarrierGate(tally, *mainTimeline, view, window);
     }
 
     return tally.finish("connected-clip");

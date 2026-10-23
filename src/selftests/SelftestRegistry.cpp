@@ -873,7 +873,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
       "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (5 gates)" },
     { "connected-clip", "VEDITOR_CONNECTED_CLIP_SELFTEST", runConnectedClipSelftest, true,
-      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (34 gates)" },
+      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (35 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
