@@ -30,4 +30,14 @@ private:
     QDoubleSpinBox *m_start;
     QDoubleSpinBox *m_end;
     QDoubleSpinBox *m_offset;
+    QCheckBox *m_roundCorners;
+    QDoubleSpinBox *m_radius;
+    QCheckBox *m_zigZag;
+    QDoubleSpinBox *m_zigSize;
+    QSpinBox *m_ridges;
+    QCheckBox *m_zigSmooth;
+    QCheckBox *m_wiggle;
+    QDoubleSpinBox *m_wiggleAmp;
+    QSpinBox *m_wiggleDetail;
+    QSpinBox *m_wiggleSeed;
 };
