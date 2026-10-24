@@ -1018,6 +1018,19 @@ public:
     // clip is connected. `painter` is in m_tracksWidget coordinates.
     void paintConnections(QPainter &painter) const;
     void updateConnectionOverlay();
+    // US-1408 offline badge. m_offlinePaths caches path -> missing and paint only
+    // reads it. setOfflinePaths() replaces the whole cache (every current clip path
+    // is judged: in `missing` = true, otherwise false). refreshOfflinePathsForUnknown()
+    // judges only clip paths the cache has not seen (undo / redo, sequence switch).
+    // Empty, null-object and nested-sequence paths are never badged.
+    void setOfflinePaths(const QStringList &missing);
+    void refreshOfflinePathsForUnknown();
+    bool isPathOffline(const QString &path) const { return m_offlinePaths.value(path, false); }
+    int offlineClipCount() const;
+    // Read-only probes for selftests: cached keys and the number of paths judged
+    // by refreshOfflinePathsForUnknown() so far.
+    QStringList offlineCachedPaths() const { return m_offlinePaths.keys(); }
+    int offlineProbeCount() const { return m_offlineProbeCount; }
     // Non-modal connection warnings (detached connections). MainWindow shows the
     // newest in the status bar on connectionWarningsChanged; selftests and MCP
     // drain them with takeConnectionWarnings.
@@ -1507,6 +1520,10 @@ signals:
     // redo or load, which keep the keys valid for the restored layout).
     void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
+    // US-1408: at the success return of importMedia() (every GUI / MCP / drop
+    // import) and of createSequence(name, tracks, tracks) with clips (GUI / MCP
+    // EDL and FCPXML); MainWindow refreshes the offline cache.
+    void mediaImported();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -1746,6 +1763,8 @@ private:
     QVector<DetachedSpan> m_pendingDetachedSpans;
     bool m_rederiveDisabledForTest = false;
     QStringList m_connectionWarnings;
+    QHash<QString, bool> m_offlinePaths;
+    int m_offlineProbeCount = 0;
     bool m_reconcilingConnections = false;
     bool m_storylineMode = false;
     QWidget *m_connectionOverlay = nullptr;

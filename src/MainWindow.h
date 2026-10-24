@@ -268,6 +268,7 @@ class MainWindow : public QMainWindow
     friend int runMixerDockSelftest();
     friend int runTrackOpsSelftest();
     friend int runConnectedClipSelftest();
+    friend int runMediaRelinkSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -549,6 +550,10 @@ private slots:
     void onSceneCutDetect();
     void onAudioDuckingSettings();
     void onCollectProject();
+    // US-1408: File > メディアを再リンク…. refreshOfflineBadges() replaces the
+    // Timeline's offline cache from a populateProjectData() + missingFiles() pass.
+    void relinkMediaFromMenu();
+    void refreshOfflineBadges();
 
     // US-EXT-10: Sprint 10 pro extensions — 3 new menu actions
     void onHDRSettings();
@@ -934,6 +939,7 @@ private:
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
+    bool m_offlineRefreshQueued = false; // US-1408: coalesces mediaImported refreshes
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;

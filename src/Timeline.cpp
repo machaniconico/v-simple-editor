@@ -8,6 +8,7 @@
 #include "SilenceCut.h"
 #include "BeatDetect.h"
 #include "ClipGeometry.h"
+#include "MediaPaths.h"
 #include "clipanim/ClipAnim.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
@@ -2625,14 +2626,32 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         double dur = m_clips[i].effectiveDuration();
         int mins = static_cast<int>(dur) / 60;
         int secs = static_cast<int>(dur) % 60;
+        const bool offlineClip = m_timeline && !m_clips[i].filePath.isEmpty()
+            && m_timeline->isPathOffline(m_clips[i].filePath);
         QString label = m_clips[i].reversed
             ? QStringLiteral("◀ ") + m_clips[i].displayName
             : m_clips[i].displayName;
+        if (offlineClip)
+            label += QStringLiteral(" (オフライン)");
         if (m_clips[i].speed != 1.0)
             label += QString(" [%1x]").arg(m_clips[i].speed, 0, 'f', 1);
         label += QString(" %1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
         painter.drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
             painter.fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
+        if (offlineClip && clipWidth > 40) {
+            // US-1408: small top-left pill, drawn like the connection badge.
+            painter.save();
+            QFont badgeFont = painter.font();
+            badgeFont.setPixelSize(9);
+            painter.setFont(badgeFont);
+            const QRect badge(x + TRIM_HANDLE_WIDTH + 2, kTransBadgeYBot + 2, 42, 11);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(0xb0, 0x20, 0x20, 230));
+            painter.drawRoundedRect(badge, 3, 3);
+            painter.setPen(QColor(0xff, 0xe0, 0xe0));
+            painter.drawText(badge, Qt::AlignCenter, QStringLiteral("オフライン"));
+            painter.restore();
+        }
 
         // Transition badge. Pill at the affected corner — top-left for
         // leadIn (FadeIn), top-right for trailOut (FadeOut / CrossDissolve
@@ -4000,6 +4019,10 @@ Timeline::Timeline(QWidget *parent) : QWidget(parent)
     m_emitSequenceTimer->setSingleShot(true);
     m_emitSequenceTimer->setInterval(50);
     connect(m_emitSequenceTimer, &QTimer::timeout, this, &Timeline::emitSequenceChangedNow);
+    // US-1408: undo / redo and sequence switches judge only the paths the offline
+    // cache has not seen yet (no populateProjectData on these paths).
+    connect(this, &Timeline::trackStateRestored, this, &Timeline::refreshOfflinePathsForUnknown);
+    connect(this, &Timeline::sequencesChanged, this, &Timeline::refreshOfflinePathsForUnknown);
     setupUI();
     saveUndoState("Initial state");
 }
@@ -5686,6 +5709,7 @@ bool Timeline::importMedia(const QString &filePath,
     }
     updateInfoLabel();
     scheduleEmitSequenceChanged();
+    emit mediaImported();
     return true;
 }
 
@@ -15264,6 +15288,72 @@ void Timeline::paintConnections(QPainter &painter) const
     painter.restore();
 }
 
+namespace {
+QStringList offlineCandidatePaths(const QVector<TimelineTrack *> &videoTracks,
+                                  const QVector<TimelineTrack *> &audioTracks)
+{
+    QSet<QString> seen;
+    QStringList paths;
+    for (const auto *tracks : {&videoTracks, &audioTracks}) {
+        for (const TimelineTrack *track : *tracks) {
+            if (!track) continue;
+            for (const ClipInfo &clip : track->clips()) {
+                if (!clip.filePath.isEmpty() && !seen.contains(clip.filePath)) {
+                    seen.insert(clip.filePath);
+                    paths.append(clip.filePath);
+                }
+            }
+        }
+    }
+    return paths;
+}
+} // namespace
+
+void Timeline::setOfflinePaths(const QStringList &missing)
+{
+    const QSet<QString> missingSet(missing.cbegin(), missing.cend());
+    m_offlinePaths.clear();
+    for (const QString &path : offlineCandidatePaths(m_videoTracks, m_audioTracks))
+        m_offlinePaths.insert(path, missingSet.contains(path));
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (TimelineTrack *track : *tracks) {
+            if (track) track->update();
+        }
+    }
+}
+
+void Timeline::refreshOfflinePathsForUnknown()
+{
+    bool changed = false;
+    for (const QString &path : offlineCandidatePaths(m_videoTracks, m_audioTracks)) {
+        if (m_offlinePaths.contains(path)) continue;
+        ++m_offlineProbeCount;
+        m_offlinePaths.insert(path, mediapaths::isMissingFilesystemPath(path));
+        changed = true;
+    }
+    if (!changed) return;
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (TimelineTrack *track : *tracks) {
+            if (track) track->update();
+        }
+    }
+}
+
+int Timeline::offlineClipCount() const
+{
+    int count = 0;
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (const TimelineTrack *track : *tracks) {
+            if (!track) continue;
+            for (const ClipInfo &clip : track->clips()) {
+                if (!clip.filePath.isEmpty() && m_offlinePaths.value(clip.filePath, false))
+                    ++count;
+            }
+        }
+    }
+    return count;
+}
+
 void Timeline::autoConnectDroppedClip(TimelineTrack *track, int clipIndex)
 {
     const bool audio = track && track->isAudioTrack();
@@ -15465,6 +15555,12 @@ bool Timeline::createSequence(const QString &name,
     // Sequence navigation preserves the existing carrier keys; remapping is
     // only valid for clip mutations within the same sequence.
     saveUndoState(QStringLiteral("新規シーケンス"));
+    // US-1408: EDL / FCPXML imports (GUI and MCP) land here with clips; an empty
+    // "new sequence" has nothing to judge.
+    bool hasClips = false;
+    for (const auto &track : sequence.videoTracks) hasClips = hasClips || !track.isEmpty();
+    for (const auto &track : sequence.audioTracks) hasClips = hasClips || !track.isEmpty();
+    if (hasClips) emit mediaImported();
     return true;
 }
 

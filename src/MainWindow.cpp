@@ -2793,6 +2793,19 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::syncAudioFxDocks);
     connect(m_timeline, &Timeline::trackStateRestored,
             this, &MainWindow::syncAudioFxDocks);
+    // US-1408: every importMedia() success (storyline / track drops, ImportHub,
+    // loadMediaFile, MCP) replaces the offline cache once per event-loop turn.
+    // EDL / FCPXML imports (GUI and MCP) create a sequence through
+    // Timeline::createSequence(name, tracks, tracks), which also emits it.
+    connect(m_timeline, &Timeline::mediaImported, this, [this]() {
+        if (m_offlineRefreshQueued)
+            return;
+        m_offlineRefreshQueued = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_offlineRefreshQueued = false;
+            refreshOfflineBadges();
+        });
+    });
     m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
     m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
@@ -4225,6 +4238,13 @@ void MainWindow::setupMenuBar()
     connect(collectAction, &QAction::triggered, this, &MainWindow::onCollectProject);
     m_menuHelpEntries.append({collectAction,
         QStringLiteral("プロジェクトと参照メディアを 1 フォルダにまとめる (Collect Files)。")});
+
+    // US-1408: relink offline media at any time (no shortcut).
+    auto *relinkMediaAction = fileMenu->addAction(QStringLiteral("メディアを再リンク…"));
+    relinkMediaAction->setObjectName(QStringLiteral("file.relink_media"));
+    connect(relinkMediaAction, &QAction::triggered, this, &MainWindow::relinkMediaFromMenu);
+    m_menuHelpEntries.append({relinkMediaAction,
+        QStringLiteral("参照先が見つからないメディアを新しい場所に付け替えます。読み込み後でもいつでも開けます。")});
     m_menuHelpEntries.append({remotionAction,
         QStringLiteral("プログラム（Remotion）で再編集できる形式に書き出します。上級者向けです。")});
 
@@ -9362,6 +9382,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
     refreshSpecialClipPreview();
+    refreshOfflineBadges();
 }
 
 bool MainWindow::relinkMediaPaths(
@@ -9377,11 +9398,51 @@ bool MainWindow::relinkMediaPaths(
     // This also covers programmatic callers that populated sidecars after the
     // baseline TimelineState was created.
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
-    return m_timeline->relinkMediaPaths(
+    const bool relinked = m_timeline->relinkMediaPaths(
         oldToNew, errorOut,
         [this](const QHash<QString, QString> &mapping) {
             return relinkMediaSidecars(mapping);
         });
+    if (relinked)
+        refreshOfflineBadges();
+    return relinked;
+}
+
+void MainWindow::refreshOfflineBadges()
+{
+    if (!m_timeline)
+        return;
+    ProjectData data;
+    populateProjectData(data);
+    m_timeline->setOfflinePaths(mediapaths::missingFiles(data));
+}
+
+void MainWindow::relinkMediaFromMenu()
+{
+    if (!m_timeline)
+        return;
+    ProjectData data;
+    populateProjectData(data);
+    const QStringList missing = mediapaths::missingFiles(data);
+    m_timeline->setOfflinePaths(missing);
+    if (missing.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("オフラインのメディアはありません"), 5000);
+        return;
+    }
+    MediaRelinkDialog dialog(missing, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    const QHash<QString, QString> mapping = dialog.mapping();
+    if (mapping.isEmpty())
+        return;
+    QString error;
+    if (!relinkMediaPaths(mapping, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("メディアの再リンクに失敗しました: %1").arg(error), 5000);
+        return;
+    }
+    setWindowModified(true);
+    statusBar()->showMessage(QStringLiteral("メディアを再リンクしました"), 5000);
 }
 
 bool MainWindow::relinkMediaSidecars(
@@ -17591,10 +17652,14 @@ void MainWindow::onImportHub()
         m_importHubDialog->setObjectName(QStringLiteral("importHubDialog"));
 
         connect(m_importHubDialog, &ImportHubDialog::fcpxmlImportRequested,
-                this, [this](const QString &path) { importFcpxmlIntoTimeline(this, m_timeline, path); });
+                this, [this](const QString &path) {
+                    importFcpxmlIntoTimeline(this, m_timeline, path);
+                });
 
         connect(m_importHubDialog, &ImportHubDialog::edlImportRequested,
-                this, [this](const QString &path) { importEdlIntoTimeline(this, m_timeline, path); });
+                this, [this](const QString &path) {
+                    importEdlIntoTimeline(this, m_timeline, path);
+                });
 
         connect(m_importHubDialog, &ImportHubDialog::timelineImportRequested,
                 this, [this](const QList<obs::layout::TimelineClipPlacement> &placements) {
@@ -19511,8 +19576,9 @@ void MainWindow::loadMediaFile(const QString &filePath, bool addToTimeline, cons
         return;
 
     const QFileInfo fi(filePath);
-    if (addToTimeline && m_timeline)
+    if (addToTimeline && m_timeline) {
         m_timeline->addClip(filePath);
+    }
     if (m_recentFilesManager)
         m_recentFilesManager->addFile(filePath);
 
