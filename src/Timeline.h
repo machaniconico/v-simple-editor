@@ -1755,6 +1755,9 @@ private:
     // The V1 clip overlapping startSec; with allowPreceding, else the last V1 clip before it.
     QString storylineAnchorAt(double startSec, double *anchorStartSec,
                              bool allowPreceding) const;
+    // US-1407: the V1 clip a media drop at startSec connects to (none for a V1 drop,
+    // which is a storyline insert). Shared by dropMediaOnTrack / dropMediaOnNewTrack.
+    QString dropAnchorUid(bool audio, int trackIndex, double startSec) const;
     QString reconcileSequenceKey() const;
     bool hasConnectedClips() const;
     void renameAnchorReferences(const QString &fromUid, const QString &toUid);
@@ -1920,6 +1923,12 @@ private:
     friend class TimelineNewTrackDropZone;
     bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
                             TimelineTrack *src);
+    // US-1407: storyline mode on, a single local media file dropped on a new-track
+    // band creates V(n+1) / A(n+1) and imports there (one undo point). A video band
+    // takes a file with a video stream, an audio band a file with an audio stream
+    // (audio only); anything else is refused with *err and no track is left behind.
+    bool dropMediaOnNewTrack(bool audio, const QString &filePath, double dropTimeSec,
+                             QString *err = nullptr);
     // Explicit index map for one clip moved between tracks by dropEvent
     // (the linked members moved by handleCrossTrackLinkedDrop take
     // remapCarriersByUid instead):

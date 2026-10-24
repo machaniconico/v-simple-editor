@@ -3831,7 +3831,8 @@ bool TimelineTrack::promotesCrossTrackDrag(int y) const
 // US-1117: thin band at the end of the video block (above the V/A separator)
 // and at the end of the audio block. A timeline clip of the band's kind
 // dropped here creates V(n+1) / A(n+1) and moves there; media-bin drops and a
-// clip of the other kind are ignored. No shortcut.
+// clip of the other kind are ignored. No shortcut. US-1407: with storyline mode
+// on, a single local media file dropped here is imported on the new track.
 static constexpr int kNewTrackDropZoneHeight = 10;
 
 class TimelineNewTrackDropZone : public QWidget
@@ -3874,6 +3875,21 @@ protected:
     void dropEvent(QDropEvent *event) override
     {
         setHover(false);
+        if (event->mimeData()->hasUrls() && !event->mimeData()->hasFormat("application/x-vse-clip")) {
+            QString err;
+            const double dropTimeSec = m_timeline
+                ? qMax(0.0, event->position().toPoint().x() / m_timeline->m_zoomLevel) : 0.0;
+            if (m_timeline && isSingleLocalMediaDrop(event->mimeData())
+                && m_timeline->dropMediaOnNewTrack(
+                    m_audio, event->mimeData()->urls().first().toLocalFile(), dropTimeSec, &err)) {
+                event->acceptProposedAction();
+            } else {
+                event->ignore();
+                if (m_timeline && !err.isEmpty())
+                    emit m_timeline->statusMessageRequested(err, 4000);
+            }
+            return;
+        }
         if (m_timeline && m_timeline->dropClipOnNewTrack(m_audio, event->mimeData(),
                                                           event->position().toPoint(),
                                                           dropSourceTrack(event)))
@@ -3885,6 +3901,11 @@ protected:
 private:
     bool accepts(const QDropEvent *event) const
     {
+        // US-1407: a single local media file, storyline mode on only.
+        if (m_timeline && m_timeline->storylineMode()
+            && !event->mimeData()->hasFormat("application/x-vse-clip")
+            && isSingleLocalMediaDrop(event->mimeData()))
+            return true;
         auto *src = qobject_cast<TimelineTrack *>(event->source());
         return event->mimeData()->hasFormat("application/x-vse-clip") && src
             && src->isAudioTrack() == m_audio;
@@ -14924,12 +14945,52 @@ bool Timeline::dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
         if (partner && partner->isLocked() && probeTimelineMedia(filePath).audioStreamFound)
             return setTimelineEditError(err, QStringLiteral("ロック中のトラックには配置できません"));
     }
-    // A drop connects only to the V1 clip it overlaps; otherwise it is imported unconnected.
-    // A V1 drop is a storyline insert, never a connection.
-    const QString anchorUid = trackIndex == 0 && !audio ? QString()
-                                                         : storylineAnchorAt(startSec, nullptr, false);
+    const QString anchorUid = dropAnchorUid(audio, trackIndex, startSec);
     return importMedia(filePath, trackIndex, startSec, nullptr, err,
                        audio ? ImportMediaKind::AudioOnly : ImportMediaKind::Auto, anchorUid);
+}
+
+QString Timeline::dropAnchorUid(bool audio, int trackIndex, double startSec) const
+{
+    // A drop connects only to the V1 clip it overlaps; otherwise it is imported unconnected.
+    // A V1 drop is a storyline insert, never a connection.
+    return trackIndex == 0 && !audio ? QString() : storylineAnchorAt(startSec, nullptr, false);
+}
+
+bool Timeline::dropMediaOnNewTrack(bool audio, const QString &filePath, double dropTimeSec,
+                                   QString *err)
+{
+    if (err) err->clear();
+    if (!m_storylineMode)
+        return setTimelineEditError(err, QStringLiteral("ストーリーラインモードが OFF です"));
+    const QFileInfo fileInfo(filePath);
+    if (!fileInfo.exists() || !fileInfo.isFile())
+        return setTimelineEditError(err, QStringLiteral("ファイルが見つかりません: %1").arg(filePath));
+    const TimelineMediaProbe probe = probeTimelineMedia(filePath);
+    if (!probe.openedOk || (!probe.videoStreamFound && !probe.audioStreamFound))
+        return setTimelineEditError(
+            err, QStringLiteral("メディアとして開けません (動画/音声ストリームがありません): %1").arg(filePath));
+    if (!audio && !probe.videoStreamFound)
+        return setTimelineEditError(err, QStringLiteral("映像の帯には映像ファイルだけ置けます"));
+    if (audio && !probe.audioStreamFound)
+        return setTimelineEditError(err, QStringLiteral("音声の帯には音声を持つファイルだけ置けます"));
+    const double startSec = qMax(0.0, dropTimeSec);
+    // addVideoTrack(false) / addAudioTrack(false) skip the external-state capture;
+    // take it before the track exists so importMedia's one undo point also removes it.
+    captureExternalTrackStateForCompoundEdit();
+    if (audio)
+        addAudioTrack(false);
+    else
+        addVideoTrack(false);
+    const int newIdx = int((audio ? m_audioTracks : m_videoTracks).size()) - 1;
+    const QString anchorUid = dropAnchorUid(audio, newIdx, startSec);
+    QString importErr;
+    if (importMedia(filePath, newIdx, startSec, nullptr, &importErr,
+                    audio ? ImportMediaKind::AudioOnly : ImportMediaKind::Auto, anchorUid)) {
+        return true;
+    }
+    removeTrackInternal(audio, newIdx);
+    return setTimelineEditError(err, importErr);
 }
 
 bool Timeline::closeGapsOnTrack(TimelineTrack *track)
