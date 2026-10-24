@@ -2089,39 +2089,6 @@ QString fcpxFrameDuration(int fps)
 }
 #endif
 
-void syncTimeRemapEntriesToTimelineImpl(
-    Timeline *timeline,
-    const QHash<QString, TimeRemapClipEntry> &source)
-{
-    if (!timeline)
-        return;
-
-    bool anyChanged = false;
-    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
-    for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
-        TimelineTrack *track = tracks[trackIdx];
-        if (!track)
-            continue;
-        QVector<ClipInfo> clips = track->clips();
-        bool trackChanged = false;
-        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
-            const QString clipId = trackMatteClipKey(trackIdx, clipIdx);
-            const auto it = source.constFind(clipId);
-            if (it == source.cend())
-                continue;
-            clips[clipIdx].timeRemapCurve = it.value().curve;
-            trackChanged = true;
-        }
-        if (trackChanged) {
-            track->setClips(clips);
-            anyChanged = true;
-        }
-    }
-
-    if (anyChanged)
-        timeline->refreshPlaybackSequence();
-}
-
 // RM-1.2 / RM-4: snapshotTrackClips is defined in TrackMatteKey.cpp
 // (hoisted for testability). The types
 // ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
@@ -2587,13 +2554,6 @@ void loudnessauto::prepareJobAsync(RenderJob job, std::function<void(RenderJob, 
             }, Qt::QueuedConnection);
         if (!posted) orphan.removeTempFiles(&leftover);
     });
-}
-
-void syncTimeRemapEntriesToTimeline(
-    Timeline *timeline,
-    const QHash<QString, TimeRemapClipEntry> &source)
-{
-    syncTimeRemapEntriesToTimelineImpl(timeline, source);
 }
 
 namespace effectmaskui {
@@ -9259,7 +9219,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                        data.markOut, data.zoomLevel);
         // US-1203: the toggle drives Timeline::setStorylineMode.
         if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
-        syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
+        ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
     // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).
@@ -14868,7 +14828,7 @@ void MainWindow::openTimeRemapDialog()
     if (entry.curve.sourceFps <= 0.0)
         entry.curve.sourceFps = fps;
     m_timeRemapClipEntries.insert(clipId, entry);
-    syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
+    ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("タイムリマップを %1 に保存しました").arg(clip.displayName), 4000);

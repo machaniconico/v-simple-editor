@@ -2546,17 +2546,7 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     // consumer (tlrender::renderClipId uses the same formula).
     QHash<QString, TimelineTrackMatteEntry> matteEntries;
     matteEntries.reserve(data.trackMatteClipEntries.size());
-    auto canonicalKey = [](const QString &raw) -> QString {
-        const int colon = raw.indexOf(QLatin1Char(':'));
-        if (colon <= 0)
-            return raw;
-        bool okT = false, okC = false;
-        const int t = raw.left(colon).toInt(&okT);
-        const int c = raw.mid(colon + 1).toInt(&okC);
-        if (okT && okC && t >= 0 && c >= 0)
-            return trackMatteClipKey(t, c);
-        return raw;
-    };
+    const auto canonicalKey = [](const QString &raw) { return canonicalClipKey(raw); };
     for (const TrackMatteClipEntry &entry : data.trackMatteClipEntries) {
         if (entry.clipId.isEmpty())
             continue;
@@ -2582,6 +2572,9 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
             parentEntries.insert(child, parent);
     }
     tl->setClipParentEntries(parentEntries);
+    // The saved time-remap / freeze-frame curves live only in the sidecar
+    // section, so the file-path export has to put them back on the clips.
+    ProjectFile::applyTimeRemapEntries(tl, data.timeRemapClipEntries);
 
     if (ownedOut)
         *ownedOut = tl;
