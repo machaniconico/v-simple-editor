@@ -1905,12 +1905,19 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     ClipInfo &original = m_clips[index];
     double effectiveStart = original.inPoint;
     double effectiveEnd = (original.outPoint > 0.0) ? original.outPoint : original.duration;
-    double splitPoint = effectiveStart + localSeconds * original.speed;
+    // A reversed clip with a uniform speed plays its source from out down to
+    // in, so local second L sits at source out - L * speed: the left half keeps
+    // [split, out] and the right half takes [in, split]. Ramped / remapped
+    // reversed clips keep the forward formula (not handled yet).
+    const bool reversedUniform = original.reversed && original.speedRamp.isIdentity()
+        && original.timeRemapCurve.keys.isEmpty();
+    double splitPoint = reversedUniform ? effectiveEnd - localSeconds * original.speed
+                                        : effectiveStart + localSeconds * original.speed;
     constexpr double kSplitEps = 1e-6;
     if (splitPoint <= effectiveStart + kSplitEps || splitPoint >= effectiveEnd - kSplitEps) return;
     ClipInfo secondHalf = original;
-    secondHalf.inPoint = splitPoint;
-    secondHalf.outPoint = effectiveEnd;
+    secondHalf.inPoint = reversedUniform ? effectiveStart : splitPoint;
+    secondHalf.outPoint = reversedUniform ? splitPoint : effectiveEnd;
     secondHalf.leadInSec = 0.0;
     // The cut creates a hard edge between the halves: the right half's left
     // edge is no longer the original's leadIn, and the left half's right edge
@@ -1920,7 +1927,12 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);
-    original.outPoint = splitPoint;
+    if (reversedUniform) {
+        original.inPoint = splitPoint;
+        original.outPoint = effectiveEnd;
+    } else {
+        original.outPoint = splitPoint;
+    }
     original.trailOut = Transition{};
     const QString leftUid = original.uid;
     m_clips.insert(index + 1, secondHalf);
