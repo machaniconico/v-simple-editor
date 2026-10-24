@@ -664,6 +664,14 @@ public:
     // with nothing changed when the payload, the source or the slot is invalid.
     bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
                         bool toNewTrack = false);
+    // Whether clip (from src) dropped at dropTime may land here: the plain slot,
+    // or (US-1403) a slot held only by its own link group when that group can move
+    // to another unlocked track (groupIndexesOut: those members). Never mutates.
+    // acceptClipDrop and dragMoveEvent (the indicator) both use it.
+    bool dropEligible(const ClipInfo &clip, double dropTime, TimelineTrack *src, bool toNewTrack,
+                      QSet<int> *groupIndexesOut = nullptr) const;
+    // Selftest read of the drop indicator's valid flag.
+    bool dropIndicatorValid() const { return m_dropIndicatorValid; }
     // US-1202: the clip being moved by an in-track MoveClip drag and how far its
     // start has travelled from the press (seconds). False when no such drag.
     bool moveDragInfo(int *clipIndex, double *deltaSec) const;

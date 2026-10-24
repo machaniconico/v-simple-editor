@@ -3677,7 +3677,7 @@ void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
         event->ignore();
         return;
     }
-    auto *src = qobject_cast<TimelineTrack *>(event->source());
+    TimelineTrack *src = dropSourceTrack(event);
     if (!src || src == this) {
         // Same-track drags are handled by the leadInSec path — nothing to do here.
         event->ignore();
@@ -3707,9 +3707,8 @@ void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
         update();
         return;
     }
-    const DropPlan plan = planDrop(dropTime, src->m_clips[srcIdx].effectiveDuration());
     m_dropIndicatorX = qMax(0, dropX);
-    m_dropIndicatorValid = plan.valid;
+    m_dropIndicatorValid = dropEligible(src->m_clips[srcIdx], dropTime, src, false);
     event->acceptProposedAction();
     update();
 }
@@ -3773,6 +3772,32 @@ void TimelineTrack::dropEvent(QDropEvent *event)
         event->ignore();
 }
 
+bool TimelineTrack::dropEligible(const ClipInfo &clip, double dropTime, TimelineTrack *src,
+                                 bool toNewTrack, QSet<int> *groupIndexesOut) const
+{
+    if (groupIndexesOut) groupIndexesOut->clear();
+    const double clipDur = clip.effectiveDuration();
+    if (planDrop(dropTime, clipDur).valid)
+        return true;
+    // US-1403: a slot held only by members of the dropped clip's own link group.
+    if (clip.linkGroup <= 0 || !m_timeline || toNewTrack)
+        return false;
+    QSet<int> groupIndexes;
+    for (int i = 0; i < m_clips.size(); ++i)
+        if (m_clips[i].linkGroup == clip.linkGroup) groupIndexes.insert(i);
+    if (groupIndexes.isEmpty() || !planDrop(dropTime, clipDur, &groupIndexes).valid)
+        return false;
+    const auto &tracks = m_isAudioTrack ? m_timeline->audioTracks() : m_timeline->videoTracks();
+    const int destIdx = tracks.indexOf(const_cast<TimelineTrack *>(this));
+    const bool intoStoryline = m_timeline->storylineMode() && m_isAudioTrack && destIdx == 0;
+    // Every member sits on this track, so they share one target.
+    if (destIdx < 0
+        || Timeline::sameKindLinkTarget(tracks, destIdx, destIdx, tracks.indexOf(src), intoStoryline) == destIdx)
+        return false;
+    if (groupIndexesOut) *groupIndexesOut = groupIndexes;
+    return true;
+}
+
 bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
                                    TimelineTrack *src, bool toNewTrack)
 {
@@ -3796,25 +3821,16 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
     // US-1403: a slot held only by members of the dropped clip's own link group
     // takes the drop when those members can move with the group, by the rule
     // handleCrossTrackLinkedDrop applies to them, to another unlocked track;
-    // otherwise the drop is refused with nothing changed.
+    // otherwise the drop is refused with nothing changed (dropEligible).
     QVector<DetachedClip> sameGroup;
-    if (!storylineInsert && !plan.valid) {
-        if (clipData.linkGroup <= 0 || !m_timeline || toNewTrack)
-            return false;
+    if (!storylineInsert) {
         QSet<int> groupIndexes;
-        for (int i = 0; i < m_clips.size(); ++i)
-            if (m_clips[i].linkGroup == clipData.linkGroup) groupIndexes.insert(i);
-        if (groupIndexes.isEmpty() || !planDrop(dropTime, clipDur, &groupIndexes).valid)
+        if (!dropEligible(clipData, dropTime, src, toNewTrack, &groupIndexes))
             return false;
-        const auto &tracks = m_isAudioTrack ? m_timeline->audioTracks() : m_timeline->videoTracks();
-        const int destIdx = tracks.indexOf(this);
-        const bool intoStoryline = m_timeline->storylineMode() && m_isAudioTrack && destIdx == 0;
-        // Every member sits on this track, so they share one target.
-        if (destIdx < 0
-            || Timeline::sameKindLinkTarget(tracks, destIdx, destIdx, tracks.indexOf(src), intoStoryline) == destIdx)
-            return false;
-        for (int i = 0; i < m_clips.size(); ++i)
-            if (groupIndexes.contains(i)) sameGroup.append({i, m_clips[i]});
+        if (!groupIndexes.isEmpty()) {
+            for (int i = 0; i < m_clips.size(); ++i)
+                if (groupIndexes.contains(i)) sameGroup.append({i, m_clips[i]});
+        }
     }
 
     // Order matters: remove from source first (while our indices are still

@@ -287,6 +287,21 @@ bool storyClipDrop(TimelineTrack *src, int srcIdx, TimelineTrack *dest, double t
     return event.isAccepted();
 }
 
+// Hovers src's clip srcIdx over dest at timeSec (QDragMoveEvent) and returns dest's drop
+// indicator valid flag, -1 when the hover left no indicator.
+int storyHoverValid(TimelineTrack *src, int srcIdx, TimelineTrack *dest, double timeSec)
+{
+    QMimeData mime;
+    mime.setData(QStringLiteral("application/x-vse-clip"),
+                 QByteArray::number(srcIdx) + QByteArray(":0"));
+    QDragMoveEvent event(QPoint(static_cast<int>(timeSec * dest->pixelsPerSecond()), 4), Qt::MoveAction,
+                         &mime, Qt::LeftButton, Qt::NoModifier);
+    TimelineTrack::setSelftestDropSource(src);
+    static_cast<QObject *>(dest)->event(&event);
+    TimelineTrack::setSelftestDropSource(nullptr);
+    return event.isAccepted() ? (dest->dropIndicatorValid() ? 1 : 0) : -1;
+}
+
 // US-1305: press on the left / right trim handle of clip clipIdx, move by deltaSec and
 // release (QTest mouse events, as in linked_trim_selftest). Returns the delta in
 // timeline seconds the pixels actually carry.
@@ -2522,6 +2537,8 @@ int runTrackOpsSelftest()
             return s;
         };
         bool mainOk = false;
+        int hoverMain = -2;
+        bool eligibleMain = false;
         {
             MainWindow window;
             Timeline *t = window.m_timeline;
@@ -2555,6 +2572,10 @@ int runTrackOpsSelftest()
                 const std::string remapBefore = timeRemapWhere();
                 const QString pUid = storyFind(t->trackAt(false, 1), "P") ? storyFind(t->trackAt(false, 1), "P")->uid : QString();
                 const auto serial = t->undoManager()->saveSerial();
+                // (ix-a) hovering P over Q's slot shows a valid indicator, and the helper agrees.
+                hoverMain = storyHoverValid(t->trackAt(false, 1), 0, t->trackAt(false, 2), 5.0);
+                eligibleMain = t->trackAt(false, 2)->dropEligible(t->trackAt(false, 1)->clips().at(0), 5.0,
+                                                                  t->trackAt(false, 1), false);
                 QSignalSpy keysSpy(t, &Timeline::clipKeysRemapped);
                 const bool accepted = storyClipDrop(t->trackAt(false, 1), 0, t->trackAt(false, 2), 5.0);
                 const int keysRemapped = keysSpy.count();
@@ -2624,6 +2645,8 @@ int runTrackOpsSelftest()
                          int(t.undoManager()->saveSerial() - serial), layoutBefore.c_str(), layoutAfter.c_str(), ok);
             return ok;
         };
+        int hoverV = -2;
+        bool eligibleV = true;
         bool vOk = false, viOk = false, viiOk = false, unrelatedOk = false;
         {
             Timeline t;
@@ -2631,6 +2654,10 @@ int runTrackOpsSelftest()
                 QVector<QVector<ClipInfo>>{{}, {storyClip("P", 3.0, 1, 5.0)}, {storyClip("Q", 3.0, 1, 5.0)}, {}},
                 QVector<QVector<ClipInfo>>{{}, {storyClip("Pa", 3.0, 1, 5.0)}}, 0.0, -1.0, -1.0, 100);
             t.trackAt(false, 3)->setLocked(true);
+            // (ix-b) the refused hover shows the invalid indicator, and the helper agrees.
+            hoverV = storyHoverValid(t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+            eligibleV = t.trackAt(false, 2)->dropEligible(t.trackAt(false, 1)->clips().at(0), 5.0,
+                                                          t.trackAt(false, 1), false);
             vOk = refused("(v) V4 locked", t, t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
         }
         {
@@ -2690,9 +2717,13 @@ int runTrackOpsSelftest()
                          " -> %d\n", t.storylineMode(), accepted, layoutBefore.c_str(), layoutAfter.c_str(), placed,
                          rotoBefore.c_str(), rotoAfter.c_str(), rotoExpected.c_str(), viiiOk);
         }
-        std::fprintf(stderr, "[track-ops] G31: main=%d (v)=%d (vi)=%d (vii)=%d unrelated=%d (viii)=%d\n", mainOk, vOk,
-                     viOk, viiOk, unrelatedOk, viiiOk);
-        gate(31, mainOk && vOk && viOk && viiOk && unrelatedOk && viiiOk);
+        // (ix) the hover indicator and the eligibility helper agree with the drop's verdict.
+        const bool ixOk = hoverMain == 1 && eligibleMain && hoverV == 0 && !eligibleV;
+        std::fprintf(stderr, "[track-ops] G31 (ix): main hover valid=%d (expect 1) eligible=%d (expect 1); (v) hover valid=%d "
+                     "(expect 0) eligible=%d (expect 0) -> %d\n", hoverMain, eligibleMain, hoverV, eligibleV, ixOk);
+        std::fprintf(stderr, "[track-ops] G31: main=%d (v)=%d (vi)=%d (vii)=%d unrelated=%d (viii)=%d (ix)=%d\n", mainOk,
+                     vOk, viOk, viiOk, unrelatedOk, viiiOk, ixOk);
+        gate(31, mainOk && vOk && viOk && viiOk && unrelatedOk && viiiOk && ixOk);
     }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
