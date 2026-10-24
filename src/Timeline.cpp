@@ -2186,12 +2186,20 @@ TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDura
     return plan;
 }
 
+namespace {
+// US-1405: set by Timeline::restoreFromProject while it loads the video tracks
+// top-down, so a uid repeated on a later video track is repaired too.
+QSet<QString> *g_loadVideoSeenUids = nullptr;
+} // namespace
+
 void TimelineTrack::setClips(const QVector<ClipInfo> &clips)
 {
     m_clips = clips;
     // Every clip leaving setClips has a uid; a uid repeated within the track
-    // keeps it on the earlier clip and gives the later one a fresh uid.
-    QSet<QString> seen;
+    // (or, while a project loads, on an earlier video track) keeps it on the
+    // earlier clip and gives the later one a fresh uid.
+    QSet<QString> localSeen;
+    QSet<QString> &seen = g_loadVideoSeenUids ? *g_loadVideoSeenUids : localSeen;
     for (ClipInfo &clip : m_clips) {
         if (!clip.uid.isEmpty() && seen.contains(clip.uid)) {
             clip.uid.clear();
@@ -16217,6 +16225,10 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
     while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
 
+    // Video uids are repaired across tracks (the first track keeps its uid);
+    // audio tracks are left alone.
+    QSet<QString> videoSeenUids;
+    g_loadVideoSeenUids = &videoSeenUids;
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
         const auto &clips = (i < videoTracks.size())
@@ -16224,6 +16236,7 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             : QVector<ClipInfo>{};
         m_videoTracks[i]->setClips(clips);
     }
+    g_loadVideoSeenUids = nullptr;
 
     for (int i = 0; i < m_audioTracks.size(); ++i) {
         if (!m_audioTracks[i]) continue;

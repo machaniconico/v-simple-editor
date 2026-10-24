@@ -277,6 +277,15 @@ QString uidAt(const Timeline &timeline, int track, int index)
 
 bool near(double a, double b) { return std::abs(a - b) < 1e-6; }
 
+// restoreFromProject repairs a uid shared across video tracks (US-1405), so a fixture that needs
+// a twin uid on another track overwrites it afterwards: setClips keeps one clip per track as is.
+void shareUid(Timeline &timeline, int track, int index, const QString &uid)
+{
+    QVector<ClipInfo> clips = timeline.trackAt(false, track)->clips();
+    clips[index].uid = uid;
+    timeline.trackAt(false, track)->setClips(clips);
+}
+
 void load(Timeline &timeline, const QVector<QVector<ClipInfo>> &video,
           const QVector<QVector<ClipInfo>> &audio = {{}})
 {
@@ -1033,12 +1042,36 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
         ClipInfo b = clipFor("b", 2.0, 1.0);
         ClipInfo c = clipFor("c", 2.0, 10.0);
         b.uid = c.uid = QStringLiteral("selftest-g32-shared-uid");
+        // restoreFromProject repairs a uid shared across tracks (US-1405), so load first and
+        // overwrite V3's clip afterwards with setClips (which keeps it, one clip per track).
         load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), b}, {c}});
+        tl.trackAt(false, 2)->setClips({c});
         attach(QStringLiteral("1:1"));
         tl.saveUndoState(QStringLiteral("G32 sidecars"));
         return tl.trackAt(false, 1)->clips().value(1).uid == b.uid
             && tl.trackAt(false, 2)->clips().value(0).uid == b.uid;
     };
+    // Prepared for US-1401 G36 (4): V2 = [a, b] and V3 = [a', b'] with a'.uid == a.uid, b'.uid == b.uid.
+    auto loadSharedSameOrder = [&] {
+        clearSidecars();
+        ClipInfo a = clipFor("a", 2.0);
+        ClipInfo b = clipFor("b", 2.0);
+        ClipInfo a2 = clipFor("a2", 2.0);
+        ClipInfo b2 = clipFor("b2", 2.0);
+        a.uid = a2.uid = QStringLiteral("selftest-same-order-a");
+        b.uid = b2.uid = QStringLiteral("selftest-same-order-b");
+        load(tl, {{clipFor("x", 10.0)}, {a, b}, {a2, b2}});
+        tl.trackAt(false, 1)->setClips({a, b});
+        tl.trackAt(false, 2)->setClips({a2, b2});
+        const QString v2a = tl.trackAt(false, 1)->clips().value(0).uid;
+        const QString v2b = tl.trackAt(false, 1)->clips().value(1).uid;
+        const QString v3a = tl.trackAt(false, 2)->clips().value(0).uid;
+        const QString v3b = tl.trackAt(false, 2)->clips().value(1).uid;
+        fprintf(stderr, "[connected-clip] loadSharedSameOrder a'.uid==a.uid:%d b'.uid==b.uid:%d\n",
+                int(v3a == v2a), int(v3b == v2b));
+        return v3a == v2a && v3b == v2b;
+    };
+    (void)loadSharedSameOrder();
     const bool sharedLoaded1 = loadShared();
     QString errSa;
     const bool saDeleted = tl.deleteClipByIndex(false, 1, 0, false, &errSa);
@@ -1857,6 +1890,7 @@ int runConnectedClipSelftest()
             x.uid = y.uid = QStringLiteral("selftest-shared-uid");
             Timeline tl;
             load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}, {}});
+            shareUid(tl, 2, 0, x.uid);
             const QString anchor = uidAt(tl, 0, 0);
             const QString xId = uidAt(tl, 1, 0);
             const QString zId = uidAt(tl, 1, 1);
@@ -1954,6 +1988,7 @@ int runConnectedClipSelftest()
             x.uid = y.uid = QStringLiteral("selftest-shared-uid");
             Timeline tl;
             load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}});
+            shareUid(tl, 2, 0, x.uid);
             const QString anchor = uidAt(tl, 0, 0);
             const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
             const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
@@ -2030,6 +2065,7 @@ int runConnectedClipSelftest()
             Timeline tl;
             load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 0.5)},
                       {y, clipFor("w", 2.0, 0.5)}, {}, {}});
+            shareUid(tl, 2, 0, x.uid);
             const QString anchor = uidAt(tl, 0, 0);
             const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
             const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
