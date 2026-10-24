@@ -9693,11 +9693,60 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
         syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
 }
 
+// US-1401: the timeRemap / text3D / expression / wiggle dialog commits. A value equal
+// to the current one (toJson() compared, nullopt = no entry) records nothing; any
+// other records one undo point, which carries the four by value.
+void MainWindow::commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve)
+{
+    const auto old = m_timeRemapClipEntries.constFind(clipId);
+    if (old != m_timeRemapClipEntries.cend() && old->curve.toJson() == curve.toJson()) return;
+    TimeRemapClipEntry entry;
+    entry.clipId = clipId;
+    entry.curve = curve;
+    m_timeRemapClipEntries.insert(clipId, entry);
+    ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+    m_timeline->saveUndoState(QStringLiteral("タイムリマップを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config)
+{
+    const auto old = m_text3DClipConfigs.constFind(clipId);
+    const bool had = old != m_text3DClipConfigs.cend();
+    if (had == config.has_value() && (!had || *old == *config)) return;
+    if (config) m_text3DClipConfigs.insert(clipId, *config);
+    else m_text3DClipConfigs.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("3D テキストを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitExpressionBindings(const QString &clipId,
+                                          const std::optional<exprbind::ClipExpressionBindings> &bindings)
+{
+    const auto old = m_clipExpressionBindings.constFind(clipId);
+    const bool had = old != m_clipExpressionBindings.cend();
+    if (had == bindings.has_value() && (!had || old->toJson() == bindings->toJson())) return;
+    if (bindings) m_clipExpressionBindings.insert(clipId, *bindings);
+    else m_clipExpressionBindings.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("エクスプレッションを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params)
+{
+    const auto old = m_clipWiggleParams.constFind(clipId);
+    const bool had = old != m_clipWiggleParams.cend();
+    if (had == params.has_value() && (!had || wiggle::toJson(*old) == wiggle::toJson(*params))) return;
+    if (params) m_clipWiggleParams.insert(clipId, *params);
+    else m_clipWiggleParams.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("ウィグルを変更"));
+    refreshSpecialClipPreview();
+}
+
 // US-1302 undo rule: adding a brush animation records an undo point (its progress
-// keyframes), so the brush entries are carried by value. timeRemap / text3D /
-// expression / wiggle edits record none, so only the clip each key names is
-// carried (clipUids: key -> uid) and an undo rekeys their live values instead of
-// rolling them back.
+// keyframes), so the brush entries are carried by value. US-1401: so are the
+// timeRemap / text3D / expression / wiggle values, whose dialog commits record one
+// too. The clip each key names (clipUids: key -> uid) still rekeys the live brush.
 QJsonObject MainWindow::collectSidecarState()
 {
     QJsonObject clipUids;
@@ -9714,8 +9763,21 @@ QJsonObject MainWindow::collectSidecarState()
     QJsonArray brushes;
     for (const auto &entry : m_brushAnimationEntries)
         brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
+    QJsonObject timeRemaps, text3Ds, expressions, wiggles;
+    for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
+        timeRemaps.insert(it.key(), it.value().curve.toJson());
+    for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it)
+        text3Ds.insert(it.key(), it.value());
+    for (auto it = m_clipExpressionBindings.cbegin(); it != m_clipExpressionBindings.cend(); ++it)
+        expressions.insert(it.key(), it.value().toJson());
+    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it)
+        wiggles.insert(it.key(), wiggle::toJson(it.value()));
     return QJsonObject{{"clipUids", clipUids},
                        {"brushAnimations", brushes},
+                       {"timeRemaps", timeRemaps},
+                       {"text3DConfigs", text3Ds},
+                       {"expressionBindings", expressions},
+                       {"wiggleParams", wiggles},
                        {"sequenceId", m_timeline->activeSequenceId()},
                        {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
 }
@@ -9841,6 +9903,33 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     m_sidecarClipUidByKey.clear();
     for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
         m_sidecarClipUidByKey.insert(it.key(), it.value().toString());
+    // US-1401: the four values are the snapshot's, keyed on the restored placement,
+    // whatever the rekey above made of the live ones (in this sequence or another).
+    if (state.contains("timeRemaps")) {
+        m_timeRemapClipEntries.clear();
+        const QJsonObject values = state.value("timeRemaps").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_timeRemapClipEntries.insert(it.key(), TimeRemapClipEntry{
+                it.key(), timeremap::TimeRemapCurve::fromJson(it.value().toObject())});
+    }
+    if (state.contains("text3DConfigs")) {
+        m_text3DClipConfigs.clear();
+        const QJsonObject values = state.value("text3DConfigs").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_text3DClipConfigs.insert(it.key(), it.value().toObject());
+    }
+    if (state.contains("expressionBindings")) {
+        m_clipExpressionBindings.clear();
+        const QJsonObject values = state.value("expressionBindings").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_clipExpressionBindings[it.key()].fromJson(it.value().toObject());
+    }
+    if (state.contains("wiggleParams")) {
+        m_clipWiggleParams.clear();
+        const QJsonObject values = state.value("wiggleParams").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_clipWiggleParams.insert(it.key(), wiggle::fromJson(it.value().toObject()));
+    }
 
     QVector<BrushAnimationEntry> brushes;
     for (const auto &value : state.value("brushAnimations").toArray()) {
@@ -14824,13 +14913,10 @@ void MainWindow::openTimeRemapDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
-    entry.curve = dialog.curve();
-    if (entry.curve.sourceFps <= 0.0)
-        entry.curve.sourceFps = fps;
-    m_timeRemapClipEntries.insert(clipId, entry);
-    ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
-
-    refreshSpecialClipPreview();
+    timeremap::TimeRemapCurve curve = dialog.curve();
+    if (curve.sourceFps <= 0.0)
+        curve.sourceFps = fps;
+    commitTimeRemapEntry(clipId, curve);
     statusBar()->showMessage(QStringLiteral("タイムリマップを %1 に保存しました").arg(clip.displayName), 4000);
 }
 
@@ -15128,12 +15214,7 @@ void MainWindow::open3DExtrudedText()
     }
     const QJsonObject json = cfg->toJson();
     delete cfg;
-    if (json.isEmpty())
-        m_text3DClipConfigs.remove(clipId);
-    else
-        m_text3DClipConfigs.insert(clipId, json);
-
-    refreshSpecialClipPreview();
+    commitText3DConfig(clipId, json.isEmpty() ? std::nullopt : std::optional<QJsonObject>(json));
     statusBar()->showMessage(QStringLiteral("3D 押し出しテキストを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
@@ -15299,13 +15380,9 @@ void MainWindow::editClipExpressionBindings()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
-    exprbind::ClipExpressionBindings bindings = dialog.bindings();
-    if (bindings.isEmpty())
-        m_clipExpressionBindings.remove(clipId);
-    else
-        m_clipExpressionBindings.insert(clipId, bindings);
-
-    refreshSpecialClipPreview();
+    const exprbind::ClipExpressionBindings bindings = dialog.bindings();
+    commitExpressionBindings(clipId, bindings.isEmpty() ? std::nullopt
+                                                        : std::optional<exprbind::ClipExpressionBindings>(bindings));
     statusBar()->showMessage(QStringLiteral("エクスプレッションを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
@@ -15337,6 +15414,7 @@ void MainWindow::editClipWiggle()
     auto *enabledCheck = new QCheckBox(QStringLiteral("有効"), &dialog);
     enabledCheck->setChecked(params.enabled);
     auto *posAmpXSpin = new QDoubleSpinBox(&dialog);
+    posAmpXSpin->setObjectName(QStringLiteral("wigglePositionAmplitudeX"));
     posAmpXSpin->setRange(-200.0, 200.0);
     posAmpXSpin->setValue(params.positionAmplitude.x());
     auto *posAmpYSpin = new QDoubleSpinBox(&dialog);
@@ -15396,16 +15474,11 @@ void MainWindow::editClipWiggle()
     params.octaves = octavesSpin->value();
     params.seed = static_cast<unsigned int>(seedSpin->value());
 
-    if (!params.enabled
+    const bool inert = !params.enabled
         && params.positionAmplitude.isNull()
         && qFuzzyIsNull(params.rotationAmplitudeDeg)
-        && qFuzzyIsNull(params.scaleAmplitude)) {
-        m_clipWiggleParams.remove(clipId);
-    } else {
-        m_clipWiggleParams.insert(clipId, params);
-    }
-
-    refreshSpecialClipPreview();
+        && qFuzzyIsNull(params.scaleAmplitude);
+    commitWiggleParams(clipId, inert ? std::nullopt : std::optional<wiggle::WiggleParams>(params));
     statusBar()->showMessage(QStringLiteral("ウィグルを %1 に設定しました").arg(clip.displayName), 4000);
 }
 

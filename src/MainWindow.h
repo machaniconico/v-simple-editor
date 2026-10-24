@@ -819,6 +819,14 @@ private:
     QJsonObject collectSidecarState();
     void applySidecarState(const QJsonObject &state);
     void parkSidecars(const QString &key, const QString &uid);
+    // US-1401: a dialog's accepted value for clip key `clipId` (nullopt removes it):
+    // one undo point when it differs from the current one (toJson() compared), none
+    // otherwise.
+    void commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve);
+    void commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config);
+    void commitExpressionBindings(const QString &clipId,
+                                  const std::optional<exprbind::ClipExpressionBindings> &bindings);
+    void commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params);
     // US-1302: the four values a dropped key held, kept by the clip's "track|uid"
     // until a restore brings that clip back (the brush entries go back by value instead).
     struct ParkedSidecars {

@@ -5,6 +5,7 @@
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
 #include "../Timeline.h"
+#include "../Text3DLayer.h"
 #include "../ThreePointEdit.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
@@ -20,6 +21,7 @@
 #include <QDataStream>
 #include <QDir>
 #include <QColor>
+#include <QDoubleSpinBox>
 #include <QDropEvent>
 #include <QElapsedTimer>
 #include <QFile>
@@ -41,6 +43,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <optional>
 #include <utility>
 extern "C" {
 #include <libavutil/channel_layout.h>
@@ -142,7 +145,7 @@ extern "C" {
 //        timeRemap and brush values) on V2 clip b follow (1) a delete of the clip in front of
 //        b to "1:0", (3) undo / redo to "1:1" / "1:0", (3') the same delete after an undo to
 //        "1:0", (2) a drop of b onto V3 to "2:0", (4) a save / load, (5) the removal of V2 to
-//        "1:0"; (6) a sidecar edit that records no undo point survives the undo of an unrelated
+//        "1:0"; (6) a committed sidecar edit (US-1401) survives the undo of an unrelated
 //        edit. Detects: no rekey slot (HEAD: entries stay on the old key, on a's neighbour),
 //        the sidecar applier only on structural undo (3), the memo kept over an undo (3').
 // US-1320 (wave 14 cumulative review C-03 / C-04):
@@ -162,6 +165,14 @@ extern "C" {
 //        locked V1 refuses both (and the MainWindow slots keep the refusal in the status bar).
 //        Detects: no snapshot / remap in the *Active functions (HEAD: roto stays on "0:1"; a locked
 //        V1 is edited; the slots overwrite the refusal with the success message).
+//   G36 (US-1401): the timeRemap / text3D / expression / wiggle commits record one undo point each
+//        (none for an equal value), and undo / redo carry the four by value: the remap entry and the
+//        clip's curve stay together, two same-uid-order tracks moved and undone keep their own values,
+//        a shared-uid track removed twice and undone twice gets both back, save / load keeps them,
+//        the real wiggle dialog records one, an undo across a sequence switch restores them, and a
+//        direct map write without an undo point is rolled back by an unrelated undo (the former
+//        G32 (6) contract, inverted).
+//        Detects: commits that record no undo point / a sidecar state without the four values (HEAD).
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -754,6 +765,27 @@ void keyRemapGate(selftest::GateTally &tally)
                "or a key-preserving edit");
 }
 
+// US-1405 / US-1401 G36 (4): V2 = [a, b] and V3 = [a', b'] with a'.uid == a.uid, b'.uid == b.uid.
+bool loadSharedSameOrder(Timeline &tl)
+{
+    ClipInfo a = clipFor("a", 2.0);
+    ClipInfo b = clipFor("b", 2.0);
+    ClipInfo a2 = clipFor("a2", 2.0);
+    ClipInfo b2 = clipFor("b2", 2.0);
+    a.uid = a2.uid = QStringLiteral("selftest-same-order-a");
+    b.uid = b2.uid = QStringLiteral("selftest-same-order-b");
+    load(tl, {{clipFor("x", 10.0)}, {a, b}, {a2, b2}});
+    tl.trackAt(false, 1)->setClips({a, b});
+    tl.trackAt(false, 2)->setClips({a2, b2});
+    const QString v2a = tl.trackAt(false, 1)->clips().value(0).uid;
+    const QString v2b = tl.trackAt(false, 1)->clips().value(1).uid;
+    const QString v3a = tl.trackAt(false, 2)->clips().value(0).uid;
+    const QString v3b = tl.trackAt(false, 2)->clips().value(1).uid;
+    fprintf(stderr, "[connected-clip] loadSharedSameOrder a'.uid==a.uid:%d b'.uid==b.uid:%d\n",
+            int(v3a == v2a), int(v3b == v2b));
+    return v3a == v2a && v3b == v2b;
+}
+
 // G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
 // runConnectedClipSelftest hands over.
 struct SidecarView {
@@ -770,6 +802,12 @@ struct SidecarView {
     QString (MainWindow::*brushPreviewClipId)() const = nullptr;
     void (MainWindow::*sourceInsert)(const threepoint::SourceSelection &) = nullptr;
     void (MainWindow::*sourceOverwrite)(const threepoint::SourceSelection &) = nullptr;
+    void (MainWindow::*commitTimeRemap)(const QString &, const timeremap::TimeRemapCurve &) = nullptr;
+    void (MainWindow::*commitText3D)(const QString &, const std::optional<QJsonObject> &) = nullptr;
+    void (MainWindow::*commitExpressions)(const QString &,
+                                          const std::optional<exprbind::ClipExpressionBindings> &) = nullptr;
+    void (MainWindow::*commitWiggle)(const QString &, const std::optional<wiggle::WiggleParams> &) = nullptr;
+    void (MainWindow::*editWiggle)() = nullptr;
 };
 
 // G32 (US-1302): the position-keyed sidecars follow the clip they were put on.
@@ -910,17 +948,23 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
     const bool ok5 = removed && after5 == at(QStringLiteral("1:0")) && owner5 == QStringLiteral("b")
         && valuesIntact(QStringLiteral("1:0"));
 
-    // (6) an unrelated undoable edit (x at speed 2), then wiggle / text3D / timeRemap /
-    // expression edits that record no undo point, then one undo: the speed goes back, the
-    // sidecar values stay.
+    // (6) wiggle / text3D / timeRemap / expression edits committed (US-1401: one undo point
+    // each), then an unrelated undoable edit (x at speed 2), then one undo: the speed goes back,
+    // the sidecar values stay.
+    wiggle::WiggleParams editedWiggle = view.wiggle->value(QStringLiteral("1:0"));
+    editedWiggle.seed = 77;
+    (window.*view.commitWiggle)(QStringLiteral("1:0"), editedWiggle);
+    (window.*view.commitText3D)(QStringLiteral("1:0"),
+                                QJsonObject{{QStringLiteral("text"), QStringLiteral("edited")}});
+    timeremap::TimeRemapCurve editedCurve = view.timeRemap->value(QStringLiteral("1:0")).curve;
+    editedCurve.sourceFps = 24.0;
+    editedCurve.addKey(1.0, 0.5);
+    (window.*view.commitTimeRemap)(QStringLiteral("1:0"), editedCurve);
+    exprbind::ClipExpressionBindings editedBindings = view.expressions->value(QStringLiteral("1:0"));
+    editedBindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("75"));
+    (window.*view.commitExpressions)(QStringLiteral("1:0"), editedBindings);
     QString speedErr;
     const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
-    (*view.wiggle)[QStringLiteral("1:0")].seed = 77;
-    view.text3D->insert(QStringLiteral("1:0"), QJsonObject{{QStringLiteral("text"), QStringLiteral("edited")}});
-    (*view.timeRemap)[QStringLiteral("1:0")].curve.sourceFps = 24.0;
-    (*view.timeRemap)[QStringLiteral("1:0")].curve.addKey(1.0, 0.5);
-    (*view.expressions)[QStringLiteral("1:0")].setExpression(QStringLiteral("transform.opacity"),
-                                                             QStringLiteral("75"));
     tl.undo();
     const double speedAfterUndo = tl.trackAt(false, 0)->clips().value(0).speed;
     const QString after6 = where();
@@ -1051,27 +1095,8 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
         return tl.trackAt(false, 1)->clips().value(1).uid == b.uid
             && tl.trackAt(false, 2)->clips().value(0).uid == b.uid;
     };
-    // Prepared for US-1401 G36 (4): V2 = [a, b] and V3 = [a', b'] with a'.uid == a.uid, b'.uid == b.uid.
-    auto loadSharedSameOrder = [&] {
-        clearSidecars();
-        ClipInfo a = clipFor("a", 2.0);
-        ClipInfo b = clipFor("b", 2.0);
-        ClipInfo a2 = clipFor("a2", 2.0);
-        ClipInfo b2 = clipFor("b2", 2.0);
-        a.uid = a2.uid = QStringLiteral("selftest-same-order-a");
-        b.uid = b2.uid = QStringLiteral("selftest-same-order-b");
-        load(tl, {{clipFor("x", 10.0)}, {a, b}, {a2, b2}});
-        tl.trackAt(false, 1)->setClips({a, b});
-        tl.trackAt(false, 2)->setClips({a2, b2});
-        const QString v2a = tl.trackAt(false, 1)->clips().value(0).uid;
-        const QString v2b = tl.trackAt(false, 1)->clips().value(1).uid;
-        const QString v3a = tl.trackAt(false, 2)->clips().value(0).uid;
-        const QString v3b = tl.trackAt(false, 2)->clips().value(1).uid;
-        fprintf(stderr, "[connected-clip] loadSharedSameOrder a'.uid==a.uid:%d b'.uid==b.uid:%d\n",
-                int(v3a == v2a), int(v3b == v2b));
-        return v3a == v2a && v3b == v2b;
-    };
-    (void)loadSharedSameOrder();
+    clearSidecars();
+    (void)loadSharedSameOrder(tl);
     const bool sharedLoaded1 = loadShared();
     QString errSa;
     const bool saDeleted = tl.deleteClipByIndex(false, 1, 0, false, &errSa);
@@ -1216,12 +1241,393 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
                    && ok9iii,
                "a position-keyed sidecar (timeRemap / wiggle / text3D / expression / brush) did not follow b "
                "through a delete, undo / redo, the delete after an undo, a cross-track drop, a save / load or a "
-               "track removal, an edit without an undo point was rolled back by an unrelated undo, deleting b "
+               "track removal, a committed edit was rolled back by an unrelated undo, deleting b "
                "or its track and undoing did not bring them back, redoing the delete of a sequence's only clip "
                "left them on its key, a brush added with no selection was lost "
                "to an unrelated undo, or a uid shared with a clip on another track sent them to the wrong "
                "clip or lost them on undo / redo or a track removal");
     clearSidecars();
+}
+
+// G36 (US-1401): the timeRemap / text3D / expression / wiggle commits record one undo point
+// each, and an undo / redo takes the four back by value with the clips.
+void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                           const SidecarView &view)
+{
+    auto clearFour = [&] {
+        view.timeRemap->clear();
+        view.text3D->clear();
+        view.expressions->clear();
+        view.wiggle->clear();
+    };
+    auto depth = [&tl] { return tl.undoManager()->currentIndex(); };
+    auto clipAt = [&tl](int track, int index) {
+        const TimelineTrack *t = tl.trackAt(false, track);
+        return t && index >= 0 && index < t->clipCount() ? t->clips().at(index) : ClipInfo{};
+    };
+    // Tag n: a remap through (1, n / 1000), wiggle seed n, text "G36-n", opacity "n".
+    auto curveFor = [](int n) {
+        timeremap::TimeRemapCurve curve;
+        curve.sourceFps = 10.0;
+        curve.addKey(0.0, 0.0);
+        curve.addKey(1.0, n / 1000.0);
+        curve.addKey(2.0, 1.0);
+        return curve;
+    };
+    auto wiggleFor = [](int n) {
+        wiggle::WiggleParams params;
+        params.enabled = true;
+        params.seed = unsigned(n);
+        params.positionAmplitude = QPointF(3.0, 0.0);
+        return params;
+    };
+    auto textFor = [](int n) { return QJsonObject{{QStringLiteral("text"), QStringLiteral("G36-%1").arg(n)}}; };
+    auto bindingsFor = [](int n) {
+        exprbind::ClipExpressionBindings bindings;
+        bindings.setExpression(QStringLiteral("transform.opacity"), QString::number(n));
+        return bindings;
+    };
+    auto put = [&](const QString &key, int n) {
+        view.timeRemap->insert(key, TimeRemapClipEntry{key, curveFor(n)});
+        view.wiggle->insert(key, wiggleFor(n));
+        view.text3D->insert(key, textFor(n));
+        view.expressions->insert(key, bindingsFor(n));
+    };
+    auto commitAll = [&](const QString &key, int n) {
+        (window.*view.commitTimeRemap)(key, curveFor(n));
+        (window.*view.commitWiggle)(key, wiggleFor(n));
+        (window.*view.commitText3D)(key, textFor(n));
+        (window.*view.commitExpressions)(key, bindingsFor(n));
+    };
+    // The tag each kind carries on `key` ("-" when absent; "!id" when the remap's clipId differs).
+    auto tagsAt = [&](const QString &key) {
+        const auto tr = view.timeRemap->constFind(key);
+        const QString trTag = tr == view.timeRemap->cend() ? QStringLiteral("-")
+            : QString::number(qRound(tr->curve.srcTimeAt(1.0) * 1000.0))
+                + (tr->clipId == key ? QString() : QStringLiteral("!id"));
+        const QString wgTag = view.wiggle->contains(key) ? QString::number(view.wiggle->value(key).seed)
+                                                          : QStringLiteral("-");
+        const QString t3Tag = view.text3D->contains(key)
+            ? view.text3D->value(key).value(QStringLiteral("text")).toString().mid(4) : QStringLiteral("-");
+        const QString exTag = view.expressions->contains(key)
+            ? view.expressions->value(key).expression(QStringLiteral("transform.opacity")) : QStringLiteral("-");
+        return QStringLiteral("tr=%1 wg=%2 t3=%3 ex=%4").arg(trTag, wgTag, t3Tag, exTag);
+    };
+    auto tagged = [](int n) { return QStringLiteral("tr=%1 wg=%1 t3=%1 ex=%1").arg(n); };
+    const QString absent = QStringLiteral("tr=- wg=- t3=- ex=-");
+
+    // (1) / (1') / (2): V1 [x 0-10], V2 [a 0-2 | b 3-5], b forward over source [0.5, 2.5]; the
+    // curve's source seconds stay in [0, out - in] = [0, 2].
+    clearFour();
+    ClipInfo b = clipFor("b", 3.0, 1.0);
+    b.inPoint = 0.5;
+    b.outPoint = 2.5;
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), b}});
+    const QString bKey = QStringLiteral("1:1");
+    timeremap::TimeRemapCurve curve;
+    curve.sourceFps = 10.0;
+    curve.addKey(0.0, 0.0);
+    curve.addKey(1.0, 0.4);
+    curve.addKey(2.0, 1.6);
+    auto entryOnClip = [&] {
+        return view.timeRemap->contains(bKey) && view.timeRemap->value(bKey).clipId == bKey
+            && view.timeRemap->value(bKey).curve.toJson() == curve.toJson()
+            && clipAt(1, 1).timeRemapCurve.toJson() == curve.toJson();
+    };
+    const int d0 = depth();
+    (window.*view.commitTimeRemap)(bKey, curve);
+    const int d1 = depth();
+    const bool committed = entryOnClip();
+    tl.undo();
+    const bool undoGone = !view.timeRemap->contains(bKey) && !clipAt(1, 1).hasTimeRemap();
+    tl.redo();
+    const bool redoBack = entryOnClip();
+    const bool ok1 = d1 == d0 + 1 && committed && undoGone && redoBack;
+    (window.*view.commitTimeRemap)(bKey, curve);
+    const int d1b = depth();
+    const bool ok1b = d1b == d1 && entryOnClip();
+
+    // (2) an unrelated undoable edit (x at speed 2) after the remap, then one undo.
+    QString speedErr;
+    const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
+    tl.undo();
+    const ClipInfo b2 = clipAt(1, 1);
+    const TimeRemapClipEntry entry2 = view.timeRemap->value(bKey);
+    bool ok2 = sped && near(clipAt(0, 0).speed, 1.0) && b2.displayName == QStringLiteral("b") && !b2.reversed
+        && view.timeRemap->contains(bKey) && entry2.curve.toJson() == b2.timeRemapCurve.toJson();
+    QStringList samples;
+    const double localSecs[] = {0.5, 1.0, 1.5};
+    const double expectSecs[] = {0.2, 0.4, 1.0};
+    for (int i = 0; i < 3; ++i) {
+        const double fromEntry = entry2.curve.srcTimeAt(localSecs[i]);
+        const double fromClip = b2.sourceSecondAtLocalTime(localSecs[i]) - b2.inPoint;
+        samples.append(QStringLiteral("local=%1 entry=%2 clip=%3 (expect %4)").arg(localSecs[i])
+                           .arg(fromEntry, 0, 'f', 6).arg(fromClip, 0, 'f', 6).arg(expectSecs[i]));
+        ok2 = ok2 && std::abs(fromEntry - fromClip) < 1e-6 && std::abs(fromEntry - expectSecs[i]) < 1e-6;
+    }
+
+    // (3) text3D / expression / wiggle: commit then remove (nullopt), +1 each; two undos and two
+    // redos walk present / absent.
+    QStringList kinds;
+    auto roundTrip = [&](const char *name, const std::function<void()> &commit,
+                         const std::function<void()> &remove, const std::function<bool()> &present) {
+        const int before = depth();
+        commit();
+        const int afterCommit = depth();
+        const bool p1 = present();
+        remove();
+        const int afterRemove = depth();
+        const bool p2 = present();
+        tl.undo();
+        const bool u1 = present();
+        tl.undo();
+        const bool u2 = present();
+        tl.redo();
+        const bool r1 = present();
+        tl.redo();
+        const bool r2 = present();
+        const bool ok = afterCommit == before + 1 && afterRemove == before + 2 && p1 && !p2 && u1 && !u2
+            && r1 && !r2;
+        kinds.append(QStringLiteral("%1 depth %2->%3->%4 present commit=%5 remove=%6 undo=%7 undo=%8 redo=%9 "
+                                    "redo=%10 ok=%11").arg(QLatin1String(name)).arg(before).arg(afterCommit)
+                         .arg(afterRemove).arg(int(p1)).arg(int(p2)).arg(int(u1)).arg(int(u2)).arg(int(r1))
+                         .arg(int(r2)).arg(int(ok)));
+        return ok;
+    };
+    const bool ok3t = roundTrip("text3D", [&] { (window.*view.commitText3D)(bKey, textFor(3)); },
+        [&] { (window.*view.commitText3D)(bKey, std::nullopt); },
+        [&] { return view.text3D->value(bKey) == textFor(3); });
+    const bool ok3e = roundTrip("expression", [&] { (window.*view.commitExpressions)(bKey, bindingsFor(3)); },
+        [&] { (window.*view.commitExpressions)(bKey, std::nullopt); },
+        [&] { return view.expressions->contains(bKey)
+                  && view.expressions->value(bKey).toJson() == bindingsFor(3).toJson(); });
+    const bool ok3w = roundTrip("wiggle", [&] { (window.*view.commitWiggle)(bKey, wiggleFor(3)); },
+        [&] { (window.*view.commitWiggle)(bKey, std::nullopt); },
+        [&] { return view.wiggle->contains(bKey)
+                  && wiggle::toJson(view.wiggle->value(bKey)) == wiggle::toJson(wiggleFor(3)); });
+    const bool ok3 = ok3t && ok3e && ok3w;
+
+    // (4) V2 = [a, b] and V3 = [a', b'] with the same uids in the same order (tags 10 / 11 and
+    // 20 / 21): moving V2 below V3 and undoing does not swap the two tracks' values.
+    clearFour();
+    const bool sameOrder = loadSharedSameOrder(tl);
+    put(QStringLiteral("1:0"), 10);
+    put(QStringLiteral("1:1"), 11);
+    put(QStringLiteral("2:0"), 20);
+    put(QStringLiteral("2:1"), 21);
+    tl.saveUndoState(QStringLiteral("G36 sidecars"));
+    auto fourKeys = [&] {
+        return QStringLiteral("1:0[%1] 1:1[%2] 2:0[%3] 2:1[%4] owners=%5,%6,%7,%8")
+            .arg(tagsAt(QStringLiteral("1:0")), tagsAt(QStringLiteral("1:1")), tagsAt(QStringLiteral("2:0")),
+                 tagsAt(QStringLiteral("2:1")), clipAt(1, 0).displayName, clipAt(1, 1).displayName,
+                 clipAt(2, 0).displayName, clipAt(2, 1).displayName);
+    };
+    const QString placed = QStringLiteral("1:0[%1] 1:1[%2] 2:0[%3] 2:1[%4] owners=a,b,a2,b2")
+                               .arg(tagged(10), tagged(11), tagged(20), tagged(21));
+    const QString beforeMove = fourKeys();
+    QString moveErr;
+    const bool moved = tl.moveTrack(false, 1, 2, &moveErr);
+    const QString afterMove = fourKeys();
+    tl.undo();
+    const QString afterMoveUndo = fourKeys();
+    tl.redo();
+    const QString afterMoveRedo = fourKeys();
+    const bool ok4 = sameOrder && beforeMove == placed && moved && afterMoveUndo == placed
+        && afterMoveRedo == afterMove;
+
+    // (5) V1 [x], V2 [a | b], V3 [c] with c sharing b's uid (US-1405: load, then setClips):
+    // V2 removed, then the track c moved up to; two undos bring back b's 31 and c's 32.
+    clearFour();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)}, {clipFor("c", 2.0, 10.0)}});
+    const QString sharedUid = uidAt(tl, 1, 1);
+    shareUid(tl, 2, 0, sharedUid);
+    const bool shared = !sharedUid.isEmpty() && uidAt(tl, 2, 0) == sharedUid;
+    put(QStringLiteral("1:1"), 31);
+    put(QStringLiteral("2:0"), 32);
+    tl.saveUndoState(QStringLiteral("G36 sidecars"));
+    QString removeErr1, removeErr2;
+    const bool removed1 = tl.removeTrack(false, 1, &removeErr1);
+    const QString afterRemove1 = tagsAt(QStringLiteral("1:0")) + QStringLiteral(" owner=") + clipAt(1, 0).displayName;
+    const bool removed2 = tl.removeTrack(false, 1, &removeErr2);
+    const int tracksAfterRemove2 = tl.videoTrackCount();
+    // Step 0 (r2 risk 11): what restoreState's removeTrackInternal / addVideoTrack announce.
+    int keyRemaps = 0;
+    int trackRemaps = 0;
+    const auto keySpy = QObject::connect(&tl, &Timeline::clipKeysRemapped, &tl, [&](const Timeline::ClipKeyRemap &) {
+        ++keyRemaps;
+    });
+    const auto trackSpy = QObject::connect(&tl, &Timeline::trackIndicesRemapped, &tl, [&](bool, const QVector<int> &) {
+        ++trackRemaps;
+    });
+    tl.undo();
+    const QString afterUndo1 = tagsAt(QStringLiteral("1:0")) + QStringLiteral(" owner=") + clipAt(1, 0).displayName;
+    tl.undo();
+    const QString afterUndo2 = tagsAt(QStringLiteral("1:1")) + QStringLiteral(" owner=") + clipAt(1, 1).displayName
+        + QStringLiteral(" | ") + tagsAt(QStringLiteral("2:0")) + QStringLiteral(" owner=") + clipAt(2, 0).displayName;
+    const qsizetype sidecarBytes =
+        QJsonDocument(tl.currentState().sidecarState).toJson(QJsonDocument::Compact).size();
+    const int keyRemapsUndo = keyRemaps;
+    const int trackRemapsUndo = trackRemaps;
+    // The redo of the first removal goes through removeTrackInternal.
+    tl.redo();
+    const QString afterRedo1 = tagsAt(QStringLiteral("1:0")) + QStringLiteral(" owner=") + clipAt(1, 0).displayName;
+    QObject::disconnect(keySpy);
+    QObject::disconnect(trackSpy);
+    const QString expectRemoved = tagged(32) + QStringLiteral(" owner=c");
+    const QString expectRestored = tagged(31) + QStringLiteral(" owner=b | ") + tagged(32) + QStringLiteral(" owner=c");
+    const bool ok5 = shared && removed1 && removed2 && tracksAfterRemove2 == 1 && afterRemove1 == expectRemoved
+        && afterUndo1 == expectRemoved && afterUndo2 == expectRestored && afterRedo1 == expectRemoved;
+    // Step 0: one snapshot's sidecar JSON with these values plus a default 3D text config.
+    Text3DLayer defaultText;
+    const qsizetype text3DBytes = QJsonDocument(defaultText.toJson()).toJson(QJsonDocument::Compact).size();
+
+    // (6) the four committed on b, saved and opened: they are on b again.
+    clearFour();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)}});
+    commitAll(bKey, 41);
+    QTemporaryDir dir;
+    const QString projectPath = dir.filePath(QStringLiteral("g36.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*view.save)(projectPath, &saveErr);
+    clearFour();
+    const bool opened = saved && (window.*view.open)(projectPath, &openErr, false);
+    const QString afterOpen = tagsAt(bKey) + QStringLiteral(" owner=") + clipAt(1, 1).displayName;
+    const bool ok6 = opened && afterOpen == tagged(41) + QStringLiteral(" owner=b");
+
+    // (7) the real wiggle dialog on the selected b: accepted as it opens (the inert default, no
+    // entry: no undo point), then with the X amplitude set to 5 by the timer first (+1).
+    clearFour();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("a", 2.0), clipFor("b", 2.0, 1.0)}});
+    QString selectErr;
+    const bool selected = tl.selectClipByIndex(false, 1, 1, &selectErr);
+    auto runWiggleDialog = [&](double amplitude, int *dialogs, int *others) {
+        QTimer driver;
+        driver.setInterval(20);
+        QObject::connect(&driver, &QTimer::timeout, &window, [&] {
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            auto *dialog = qobject_cast<QDialog *>(modal);
+            auto *spin = modal->findChild<QDoubleSpinBox *>(QStringLiteral("wigglePositionAmplitudeX"));
+            if (!dialog || !spin) {
+                ++*others;
+                if (dialog) dialog->reject();
+                else modal->close();
+                return;
+            }
+            if (!qFuzzyCompare(1.0 + spin->value(), 1.0 + amplitude)) {
+                spin->setValue(amplitude);
+                return;
+            }
+            ++*dialogs;
+            dialog->accept();
+        });
+        driver.start();
+        (window.*view.editWiggle)();
+        driver.stop();
+    };
+    int dialogs = 0;
+    int others = 0;
+    const int d7 = depth();
+    runWiggleDialog(0.0, &dialogs, &others);
+    const int d7Default = depth();
+    const bool defaultNoEntry = !view.wiggle->contains(bKey);
+    runWiggleDialog(5.0, &dialogs, &others);
+    const int d7Set = depth();
+    const bool setEntry = view.wiggle->contains(bKey) && near(view.wiggle->value(bKey).positionAmplitude.x(), 5.0);
+    tl.undo();
+    const bool undoNoEntry = !view.wiggle->contains(bKey);
+    const bool ok7 = selected && dialogs == 2 && others == 0 && d7Default == d7 && defaultNoEntry
+        && d7Set == d7 + 1 && setEntry && undoNoEntry && QApplication::activeModalWidget() == nullptr;
+
+    // (8) the four committed on b ("1:0") in this sequence (tag 81), a switch to sequence G36, a
+    // wiggle commit there (82), one undo: the four are the ones from before the switch.
+    clearFour();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("b", 2.0, 1.0)}});
+    const QString b8Key = QStringLiteral("1:0");
+    commitAll(b8Key, 81);
+    TimelineSequence sequence;
+    sequence.id = QStringLiteral("seq-g36");
+    sequence.name = QStringLiteral("G36");
+    sequence.videoTracks = {{clipFor("y", 4.0)}, {clipFor("z", 2.0)}};
+    sequence.audioTracks = {{}};
+    const bool added = tl.addSequence(sequence);
+    QString seqId;
+    for (const TimelineSequence &s : tl.sequences())
+        if (s.name == QStringLiteral("G36")) seqId = s.id;
+    const QString seqBefore = tl.activeSequenceId();
+    const bool switched = !seqId.isEmpty() && tl.setActiveSequence(seqId);
+    (window.*view.commitWiggle)(b8Key, wiggleFor(82));
+    const QString inOther = tagsAt(b8Key);
+    tl.undo();
+    const QString afterSeqUndo = tagsAt(b8Key);
+    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=81")
+        && afterSeqUndo == tagged(81);
+    if (!seqBefore.isEmpty()) tl.setActiveSequence(seqBefore);
+
+    // (9) the former G32 (6) contract inverted: the four committed on b (91), then written
+    // straight into the maps (92, no commit function, no undo point), an unrelated undoable
+    // edit (x at speed 2), one undo: the four are the committed ones again.
+    clearFour();
+    load(tl, {{clipFor("x", 10.0)}, {clipFor("b", 2.0, 1.0)}});
+    const QString b9Key = QStringLiteral("1:0");
+    commitAll(b9Key, 91);
+    const QString committed9 = tagsAt(b9Key);
+    const int d9 = depth();
+    put(b9Key, 92);
+    const int d9Put = depth();
+    const QString written9 = tagsAt(b9Key);
+    QString speedErr9;
+    const bool sped9 = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr9);
+    tl.undo();
+    const double speed9 = clipAt(0, 0).speed;
+    const QString afterUndo9 = tagsAt(b9Key);
+    const bool ok9 = committed9 == tagged(91) && d9Put == d9 && written9 == tagged(92) && sped9 && near(speed9, 1.0)
+        && afterUndo9 == tagged(91);
+
+    std::fprintf(stderr, "connected-clip G36 (1) depth %d->%d (expect +1) committed=%d undo gone=%d redo back=%d "
+                 "ok=%d\n", d0, d1, committed, undoGone, redoBack, ok1);
+    std::fprintf(stderr, "connected-clip G36 (1') same curve again depth %d->%d (expect same) ok=%d\n", d1, d1b, ok1b);
+    std::fprintf(stderr, "connected-clip G36 (2) sped=%d [%s] x speed after undo=%.3f (expect 1) entry==clip curve=%d "
+                 "%s ok=%d\n", sped, qPrintable(speedErr), clipAt(0, 0).speed,
+                 int(entry2.curve.toJson() == b2.timeRemapCurve.toJson()), qPrintable(samples.join(QStringLiteral("; "))),
+                 ok2);
+    for (const QString &line : std::as_const(kinds))
+        std::fprintf(stderr, "connected-clip G36 (3) %s\n", qPrintable(line));
+    std::fprintf(stderr, "connected-clip G36 (4) sameOrder=%d before %s | moved=%d [%s] %s | undo %s (expect %s) | "
+                 "redo %s (expect the moved one) ok=%d\n", sameOrder, qPrintable(beforeMove), moved,
+                 qPrintable(moveErr), qPrintable(afterMove), qPrintable(afterMoveUndo), qPrintable(placed),
+                 qPrintable(afterMoveRedo), ok4);
+    std::fprintf(stderr, "connected-clip G36 (5) shared=%d remove V2=%d [%s] %s (expect %s) remove V2 again=%d [%s] "
+                 "tracks=%d (expect 1) | undo %s (expect %s) | undo %s (expect %s) ok=%d\n", shared, removed1,
+                 qPrintable(removeErr1), qPrintable(afterRemove1), qPrintable(expectRemoved), removed2,
+                 qPrintable(removeErr2), tracksAfterRemove2, qPrintable(afterUndo1), qPrintable(expectRemoved),
+                 qPrintable(afterUndo2), qPrintable(expectRestored), ok5);
+    std::fprintf(stderr, "connected-clip G36 step0 restoreState over removeTrackInternal / addVideoTrack: "
+                 "clipKeysRemapped=%d trackIndicesRemapped=%d (two undos, adding tracks) %d / %d (then one redo, removing "
+                 "one) | redo %s (expect %s) | sidecar JSON %lld bytes (two keys), default Text3DLayer config %lld "
+                 "bytes\n", keyRemapsUndo, trackRemapsUndo, keyRemaps - keyRemapsUndo, trackRemaps - trackRemapsUndo,
+                 qPrintable(afterRedo1), qPrintable(expectRemoved),
+                 static_cast<long long>(sidecarBytes), static_cast<long long>(text3DBytes));
+    std::fprintf(stderr, "connected-clip G36 (6) saved=%d [%s] opened=%d [%s] %s (expect %s owner=b) ok=%d\n", saved,
+                 qPrintable(saveErr), opened, qPrintable(openErr), qPrintable(afterOpen), qPrintable(tagged(41)), ok6);
+    std::fprintf(stderr, "connected-clip G36 (7) selected=%d [%s] dialogs=%d (expect 2) others=%d depth %d->%d "
+                 "(default, expect same) noEntry=%d ->%d (amplitude 5, expect +1) entry=%d undo noEntry=%d ok=%d\n",
+                 selected, qPrintable(selectErr), dialogs, others, d7, d7Default, defaultNoEntry, d7Set, setEntry,
+                 undoNoEntry, ok7);
+    std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=81 "
+                 "ex=81) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
+                 qPrintable(inOther), qPrintable(afterSeqUndo), qPrintable(tagged(81)), ok8);
+    std::fprintf(stderr, "connected-clip G36 (9) committed %s, written directly %s (expect %s) depth %d->%d (expect same) "
+                 "| sped=%d [%s] x speed after undo=%.3f (expect 1) undo %s (expect %s, the direct write gone) ok=%d\n",
+                 qPrintable(committed9), qPrintable(written9), qPrintable(tagged(92)), d9, d9Put, sped9,
+                 qPrintable(speedErr9), speed9, qPrintable(afterUndo9), qPrintable(tagged(91)), ok9);
+    tally.gate(36, ok1 && ok1b && ok2 && ok3 && ok4 && ok5 && ok6 && ok7 && ok8 && ok9,
+               "a timeRemap / text3D / expression / wiggle commit recorded no undo point (or one for an equal "
+               "value), an undo / redo left the four sidecars at their live values instead of the snapshot's "
+               "(the remap entry and the clip's curve apart, two same-order tracks swapped, a twice-removed "
+               "shared-uid track lost), a save / load moved them, the real wiggle dialog recorded none, or a "
+               "direct map write without an undo point survived an unrelated undo");
+    clearFour();
 }
 
 // G33 (US-1320): one composed clipKeysRemapped for a storyline media drop on V1 whose
@@ -4122,6 +4528,10 @@ int runConnectedClipSelftest()
         view.addBrush = &MainWindow::addBrushAnimation;
         view.save = &MainWindow::saveProjectToPath;
         view.open = &MainWindow::openProjectFromPath;
+        view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
+        view.commitText3D = &MainWindow::commitText3DConfig;
+        view.commitExpressions = &MainWindow::commitExpressionBindings;
+        view.commitWiggle = &MainWindow::commitWiggleParams;
         sidecarRekeyGate(tally, window, *mainTimeline, view);
     }
 
@@ -4145,6 +4555,25 @@ int runConnectedClipSelftest()
         view.sourceInsert = &MainWindow::onSourceInsertRequested;
         view.sourceOverwrite = &MainWindow::onSourceOverwriteRequested;
         threePointCarrierGate(tally, *mainTimeline, view, window);
+    }
+
+    // G36 (US-1401): the four sidecars' dialog commits are undo points and undo carries them by value.
+    if (!mainTimeline) {
+        tally.gate(36, false, "MainWindow has no mainTimeline");
+    } else {
+        SidecarView view;
+        view.timeRemap = &window.m_timeRemapClipEntries;
+        view.text3D = &window.m_text3DClipConfigs;
+        view.expressions = &window.m_clipExpressionBindings;
+        view.wiggle = &window.m_clipWiggleParams;
+        view.save = &MainWindow::saveProjectToPath;
+        view.open = &MainWindow::openProjectFromPath;
+        view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
+        view.commitText3D = &MainWindow::commitText3DConfig;
+        view.commitExpressions = &MainWindow::commitExpressionBindings;
+        view.commitWiggle = &MainWindow::commitWiggleParams;
+        view.editWiggle = &MainWindow::editClipWiggle;
+        sidecarUndoValuesGate(tally, window, *mainTimeline, view);
     }
 
     return tally.finish("connected-clip");
