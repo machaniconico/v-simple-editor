@@ -128,7 +128,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Puppet pin: interactive mesh deformation via draggable pins on the preview (Composition menu, off by default, CPU path so preview matches export)
 - Expression engine (wiggle, noise, ease, `audioLevel()` from linked audio)
 - Convert audio to keyframes (RMS envelope → opacity / scale / rotation / position)
-- Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths modifiers
+- Shape layers (8 primitives) as timeline clips, with Repeater / Trim Paths / Round Corners / ZigZag / Wiggle Path modifiers (Wiggle Path is static; no time variation yet)
 - Auto-orient along motion path
 - Text animator (15 types)
 - Tracker link (motion track to effect)
@@ -158,7 +158,7 @@ A professional video editing application built from scratch with C++17, Qt6, and
 - Speed ramp (variable speed with easing)
 - Timeline markers & YouTube chapter export
 - Multi-camera editing (audio-correlation sync + per-angle offset trim + camera switch)
-- Offline media detection & batch relink (project collect follows the same path list)
+- Offline media detection & batch relink (project collect follows the same path list); the File menu "メディアを再リンク…" opens the relink dialog at any time, and offline video / audio clips on the timeline carry a badge (clips 40 px wide or narrower show only the (オフライン) suffix on the name) (overlay images, particles and nested contents count in the relink list but get no badge)
 - 4 themes (Dark / Light / Midnight / Ocean)
 
 ### Scripting & Integration
@@ -647,12 +647,26 @@ v-simple-editor/
 - [x] Wave 12 (US-1100..1127; US-1112 / US-1113 EXR image-sequence export were sent to Wave 13 because the bundled avcodec had no exr encoder, and shipped there): selftest hygiene (stale `(N gates)` corrections, matte-export E2E selftest), empty-V1 exports get an audio track, matte and bus-assignment edits absorbed into undo, GPU special composite through one baked-mode entry, export audio mix split into plan / executor with an asynchronous auto-loudness preparation (GUI, mobile, MCP) and cancel, job-uuid queue isolation and a shared render-queue dialog, reversed-bake tail alignment, RenderInPlace roto restored on decompose, per-clip uid keys for roto / parent / matte, per-clip 4-band EQ, new-track drop band, per-track pan and gain (`trackMix`), strip pan / bus controls, AUX sends with bus gain / mute / solo in export, tap-source spectrum analyzer. No MCP tools added (52 tools, G1..G189)
 - [x] Wave 13 (US-1200..1221): selftest hygiene (type-only `findChild` lookups named, the autosave recovery dialog suppressed under selftests), connected clips (a clip follows a V1 anchor; Edit menu / context menu / MCP `connect_clip` and `disconnect_clip`) and an opt-in magnetic primary-storyline mode (`timeline.storyline_mode`, default OFF), FCPXML import without a track limit with transition / compound clip / multicam / clip / sync-clip support and FCPXML export of lanes and connected clips, track solo in the export mix, mobile and render-queue-dialog exports through the timeline audio mix, keyer alpha carried through later effects on opaque sources, EXR image-sequence export (display-referred or scene-linear, only when the exr encoder is available). Two MCP tools added (54 tools, G1..G192)
 - [x] Wave 14 (US-1300..1321): selftest hygiene (the real multicam-apply and precompose dialogs are driven by closing the modal prompts), alpha carried through the geometric effects DisplacementMap / LensDistortion (LensDistortion edge transparent only for alpha media), storyline mode V1 media drop as insert and ripple edge trims / nudges (RippleOut double shift fixed), import refused on locked tracks with partner tracks created only after validation, FCPXML asset-clips with audio as linked A/V pairs and multicam audio sources / connected mc-clips / container durations, link groups of three or more clips moved together on cross-track drops, one clip-key remap per mutation that rekeys the five position-keyed sidecars (undo / redo included), render-queue audio trimmed to the job start, export of timelines whose visible V1 holds no clip.
+- [x] Wave 15 (US-1400..1421): three-point insert / overwrite rekey the roto, matte, parent and sidecar carriers and are refused on a locked V1, time-remap / 3D-text / expression / wiggle dialog commits are undo points carried by value, saved-project render-queue and batch exports apply time-remap and freeze-frame (export exception), clip uids duplicated across video tracks are repaired on load, reversed (uniform speed) clips keep the source frames of both halves when split, cross-track drops onto a same-link-group member's position, media-bin / file drops on the new-track band in storyline mode, a File-menu relink entry with offline badges, the ImportHub preview PNG deleted when the import is refused, Round Corners / ZigZag / static Wiggle Path shape modifiers. No MCP tools added (54 tools, G1..G194)
 - [ ] CI green run + auto trigger on push / PR
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
 - [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
 
 ### Wave 10 で据え置いた制限事項
+
+Wave 15 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記):
+
+- 書き出し例外 (欠陥修正): 保存済みプロジェクトから書き出すレンダーキュー (ファイルを指定したジョブ) とバッチ書き出しの File が、保存されたタイムリマップとフリーズフレームを反映します。従来は保存済みプロジェクトを読み込んだ書き出しからどちらも消え、素材が元の速度とフレームのまま書き出されていました。タイムリマップまたはフリーズフレームを持つ既存プロジェクトを保存済みファイル経由で書き出した結果が変わります (利用者判断 F。US-1402)。Wave 15 で書き出しの結果が変わるのはこの項目だけです。
+- ソースモニターの 3 点 insert / overwrite は、roto / マット / 親子付けと位置 key のサイドカーを 1 回の張り替えで追従させます (undo / redo の各段でも追従)。V1 がロック中なら拒否してステータスバーに「ロック中のトラックには配置できません」を出し、成功の表示は出しません (挙動変更。US-1400)。
+- タイムリマップ / 3D テキスト / 式 / wiggle のダイアログ確定は 1 回が undo 点 1 つ (Ctrl+Z 1 回) になり、4 種は値ごと undo / redo に乗ります。内容が変わらない確定は undo 点を積みません。ブラシのアニメーションは従来どおりです (US-1401)。
+- 読み込み時に、映像トラックをまたいで重複するクリップの uid を無言で振り直します (通知は出ません。手編集した、または旧形式のプロジェクトファイルだけで起きていた状態の修復です。US-1405)。
+- reversed (一様速度) のクリップの分割は、両片が素材フレームを保ちます。ブレード / 全トラックブレード / 範囲上書き / 3 点上書き / 範囲削除 / 接続の分割など、reversed クリップの分割を伴う操作はすべて対象です。reversed クリップのフリーズフレームは再生ヘッド位置の素材を保持します (従来は元の末尾。挙動変更。US-1406)。速度ランプまたはタイムリマップを持つクリップの分割は従来どおりです (Wave 16 候補)。
+- リンクグループが 3 本以上のクリップを、同じグループのメンバーが居る位置へ別トラックから drop したとき、そのメンバーも一緒に動かして受け付けます (carrier は uid で 1 回張り替えます)。いずれかのメンバーの行き先が drop 先のトラックと同じになる、または行き先がロック中のトラックのときは、従来どおり拒否します。drop 先の候補表示も受理される位置と一致します (US-1403 / US-1420)。
+- ストーリーライン ON では、新トラックの帯がメディアビン / ファイルの drop も受け、トラックを作ってそこへ取り込みます (V の帯は映像ファイル、A の帯は音声を持つファイルを音声のみとして)。OFF では従来どおりです (US-1407)。
+- ファイルメニューの「メディアを再リンク…」から、プロジェクトを開いたあとでも再リンクのダイアログを開けます (ショートカットなし。オフラインのメディアが無いときはステータスバーに「オフラインのメディアはありません」を出します)。タイムライン上のオフラインの映像 / 音声クリップには左上にバッジが付き (幅 40px 以下のクリップはバッジを省き、名前末尾の (オフライン) だけ)、名前の末尾に (オフライン) と付きます。overlay 画像 / パーティクル / 入れ子シーケンスの中身は再リンクの件数には入りますが、バッジは付きません。オフラインの再判定は、読み込み / 再リンク / 取り込み / メニュー / undo・redo / シーケンス切替の 6 つの契機で行い、周期タイマーは使いません (US-1408)。
+- ImportHub の画像 / メッシュ / EXR 連番の取り込みが拒否されたとき (ロック中のトラックなど)、プレビュー用に書き出した PNG ファイルを削除してステータスバーに理由を出します (US-1404)。
+- シェイプモディファイアに Round Corners / ZigZag / Wiggle Path を足しました。Wiggle Path は静的で、時間変化は未対応です。3 つとも既定は無効で、既存のプロジェクトの JSON と描画は変わりません (有効のときだけ roundCorners / zigZag / wigglePath のキーを保存します)。適用順は Round Corners → ZigZag → Wiggle Path → Trim → Repeater です (US-1409)。
 
 Wave 14 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記):
 
@@ -780,20 +794,18 @@ Wave 10 で変わったこと (既存プロジェクトにも効くもの):
 - AUX センドは、バス FX を通さない並列加算です (センド先のバスのエフェクトは掛かりません)。
 - スペクトラムアナライザは、再生を一時停止している間は新しい音を取り込まず、表示が床まで減衰するだけです。表示できるのはマスターまたはトラック (FX 後・フェーダー前) で、バスは選べません。
 - 旧ビルドで Wave 12 のプロジェクトを開いて再保存すると、`uid` / `clipEq` / `renderInPlaceOriginalRoto` / `trackMix` のキーが失われます (旧ビルドでも開けますが、クリップ EQ、トラックの gain / pan、焼き込み前の roto は保存されません)。
-- 新トラックの帯へ drop できるのはタイムライン上のクリップだけです。メディアビンからの drop では新しいトラックは作られず、映像クリップを A の帯へ、音声クリップを V の帯へ drop した場合は無視されます。
+- ストーリーライン ON ではメディアビン / ファイルの drop でも新トラックを作ります (V の帯は映像ファイル、A の帯は音声を持つファイルを音声のみとして取り込みます。Wave 15。US-1407)。OFF では従来どおり、帯へ drop できるのはタイムライン上のクリップだけで、メディアビンからの drop では新しいトラックは作られず、映像クリップを A の帯へ、音声クリップを V の帯へ drop した場合は無視されます。
 - EXR 連番書き出しは、同梱の avcodec に exr エンコーダがある環境でだけ選べます (Wave 13 で出荷。エンコーダが無いと種類のコンボに EXR は出ません)。
 - 幾何 FX の alpha (A-05) は Wave 14 で直りました (US-1301)。DisplacementMap / LensDistortion を含む幾何 FX は alpha を運び、LensDistortion の画面外の縁は、クリップのメディアが alpha を持つときだけ透明、不透明な素材は従来の黒です (利用者判断 14 / 18。書き出し結果の変更点は Wave 14 の変更を参照)。メッシュワープ / パペットも同じ経路 (applyClipMeshWarp) で alpha を運びます。これは書き出しと CPU プレビュー (tlrender の描画経路) の変更で、GPU プレビューは従来のままです。残る制限: Echo / ローリングシャッター補正が有効なクリップでは、レンズのあとに alpha を落とす FX (ぼかしなど) を置くと縁が不透明に戻ります (レンズのあとが alpha を保つ FX だけなら透明のままです)。Echo と roto を併用すると、Echo の軌跡は roto で切り抜かれず、roto で透過にした外側に軌跡が見えます。
 - キーヤー後の alpha の運搬 (US-1211) は tlrender の描画経路 (書き出しと CPU プレビュー) の変更です。Exporter::doExport が applyEffectStack を直接呼ぶ旧書き出し経路との一致は、Wave 11 の roto の alpha (US-1004) と同じ扱いで、揃えていません。VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:706 と、プレビューの FX スタック VideoPlayer.cpp:4215) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで揃えていません。
-- MainWindow が位置で持つサイドカーのうち 5 種 (3D テキストの設定、タイムリマップ、式のバインド、wiggle のパラメータ、ライブブラシのアニメーション) とブラシのアニメーションの項目は、roto と同じ張り替え (編集 1 回につき 1 回) に乗り、undo / redo の各段でも追従します (Wave 14。US-1302 / US-1303)。ブレードの右片には付きません。パーティクルは filePath key で持つため張り替えの対象外です。残る制限: 同じクリップの uid が 2 本のビデオトラックに同時に存在する状態 (手編集した、または旧形式のプロジェクトファイルだけで起きる) では、uid の並びが同じ 2 トラックを入れ替える moveTrack の undo と、そのようなトラックの連続削除で、ブラシ以外の 4 種が別のトラックに戻ることがあります (安定したトラック ID は次の Wave の候補)。
-- `splitClipAt` が reversed / ramp のクリップの内容を分割後の片に保たないのは、Wave 13 以前からの挙動です (接続クリップの分割でも同じで、Wave 13 では変えていません)。
+- MainWindow が位置で持つサイドカーのうち 5 種 (3D テキストの設定、タイムリマップ、式のバインド、wiggle のパラメータ、ライブブラシのアニメーション) とブラシのアニメーションの項目は、roto と同じ張り替え (編集 1 回につき 1 回) に乗り、undo / redo の各段でも追従します (Wave 14。US-1302 / US-1303)。ブレードの右片には付きません。パーティクルは filePath key で持つため張り替えの対象外です。Wave 15 から、タイムリマップ / 3D テキスト / 式 / wiggle はダイアログの確定 1 回が undo 点 1 つ (Ctrl+Z 1 回) になり、値ごと undo / redo に乗ります (US-1401)。ブラシは従来どおりです。uid の並びが同一のトラックの入れ替えと連続削除の制限は解消しました (読み込み時に映像トラックをまたぐ重複 uid を修復します。US-1405)。
+- reversed (一様速度) のクリップの分割は、両片が素材フレームを保ちます (Wave 15。US-1406)。ブレード / 全トラックブレード / 範囲上書き / 3 点上書き / 範囲削除 / 接続の分割など、reversed クリップの分割を伴う操作はすべて両片の素材を保ちます。reversed クリップのフリーズフレームは再生ヘッド位置の素材を保持します (従来は元の末尾)。速度ランプまたはタイムリマップを持つクリップの分割は従来どおり内容を片に保ちません (Wave 16 候補)。
 - FCPXML の書き出しは、他のクリップと重なる接続のない V2 以上のクリップを、重なる spine クリップの lane の子として書きます (FCPXML は接続なしの重なりを表せないため)。書き出した FCPXML を読み戻すと、そのクリップは接続クリップになります。
 - 主ストーリーラインの ON では、V1 へのメディアファイルの drop が drop 位置への insert になり、V1 の端トリム (リンクした音声も開始位置固定) と nudge も ripple します (Wave 14。US-1304 / US-1305)。nudge で + 方向に開けた前の空きは、後続の storyline insert や移動で詰まるまで V1 に残ります。V1 と他のトラックにまたがる選択の nudge は拒否されます (選択した V1 クリップのリンク相手は対象外)。ブレードと MCP の編集ツールは ON でも ripple しません (従来どおり)。OFF のときの W と MCP の trim_clip は、下流のクリップがトリム量 d だけ動きます (従来は 2d 動く欠陥の修正)。
-- ソースモニターの 3 点 insert / overwrite は、クリップの key が変わっても roto / マット / 親子付けと上記のサイドカーを張り替えません (Wave 14 以前からの挙動)。挿入で後ろへ押されたクリップに、元の位置の設定が残ることがあります (次の Wave の候補)。
-- タイムリマップのダイアログ編集は undo 点を積まないため、無関係な編集を undo すると、プレビュー (サイドカーのカーブ) と書き出し (クリップのカーブ) でリマップが食い違うことがあります (Wave 14 以前からの挙動。次の Wave の候補)。
-- 位置 key のサイドカー 5 種が、保存済みプロジェクトから書き出すレンダーキューとバッチ書き出しに反映されるかは未確認です (RenderQueue / BatchExportQueue はサイドカーを参照しません。Wave 14 で直したのは key の追従だけです)。
-- リンクグループが 3 本以上のクリップを、同じグループのメンバーが居る位置へ別トラックから drop すると、移動先が占有されているとして drop が拒否されます (Wave 14 以前からの挙動)。
-- MainWindow が PNG を一時ファイルに書いてからクリップを追加する経路 (4 か所) は、ロックで追加が拒否されたとき、一時 PNG が OS の一時フォルダに残ります (データの損失はありません)。
+- タイムリマップとフリーズフレームは、保存済みプロジェクト経由の書き出し (レンダーキューのファイル指定とバッチ書き出しの File) にも乗ります (Wave 15。US-1402。書き出し結果の変更点は Wave 15 の変更を参照)。3D テキスト / 式 / wiggle / ブラシアニメーションはプレビュー (特殊合成 / GLPreview) 限定で、どの書き出し経路にも乗りません (Wave 16 候補)。
 - FCPXML のマルチカムは平坦化して取り込みます。MultiCamSession としての取り込みは未対応です。FCPXML の書き出しと読み戻しの往復で接続のない重なりが接続クリップになる点は、FCPXML の表現の限界として据え置きです。
+- Wiggle Path (シェイプモディファイア) は静的で、時間変化は未対応です (Wave 16 候補)。
+- バッチ書き出しで、保存済みプリセットとして解決できないプリセット名のタスクは、ラウドネス無しのまま走ります (拒否するか既定のプリセットに落とすかは未判断。Wave 16 候補)。
 - バッチ書き出しの音声: 現在のプロジェクト以外のファイルを指すタスク (task.timeline が null) は、自動ラウドネスが OFF のときだけ従来どおり元ファイルの音声で書き出されます。自動ラウドネスが ON のときは測定できないため、Queue::processNext がエラー「自動ラウドネス: 現在のプロジェクト以外のタスクでは測定できません」を記録し、RenderQueue がジョブを拒否します (書き出されません)。バッチ設定ダイアログには、組み込み名 (1080p / 720p / 4K) と同名のユーザープリセットは出ません (組み込みが優先)。ミックスはタスク実行時のタイムラインから作られるため、キュー投入後の編集が反映されます (映像と同じ)。タイムラインの長さが 0 より大きく音声の再生シーケンスが空でないときだけミックスを作ります (V1 が空で上位トラックに映像があるタスクは例外で、音声が無くても無音のミックスを作ります。長さ 0、または音声トラックが無い / 音声を持つクリップが無いときは従来どおり元ファイルの音声で、警告は出ません。全トラックがミュートでも音声を持つクリップがあれば、ミュート分を除いた無音のミックスで書き出され、警告は出ません。通常書き出しと同じ)。ミックスの作成に失敗したときは元ファイル音声で書き出し、書き出しが成功した場合だけタスクのメッセージが「Export complete (タイムライン音声ミックスの作成に失敗したため元ファイル音声で書き出します: <原因>)」になります (書き出しが失敗した場合はエラーメッセージが優先され、警告は残りません)。
 - 書き出し設定の音声ビットレートは音声を再エンコードする経路にだけ効きます。素材の音声をそのままコピーする経路では元のビットレートのままです。
 - FCPXML / EDL: 接続クリップを持つ親クリップの時刻範囲が不正 (duration が 0、または offset / start の計算が不正) な場合、その親は「lane N の時刻範囲が不正なクリップを読み飛ばしました: <名前> / <ref>」で、その接続クリップは「親クリップが不正なため接続クリップを読み飛ばしました: <名前> / <ref>」で、警告付きで読み飛ばされます (従来は取り込まれることがありました)。子を持たない spine の gap は警告を出さなくなりました。J カットが 0 秒より前に一部だけ出る分は切り詰めて警告「接続クリップをタイムライン 0 で切り詰めました: <名前> / <ref>」を出し、全体が 0 秒より前に出るクリップは取り込まれず「クリップの値が不正です (接続位置): <名前> / <ref>」で読み飛ばされます。EDL の dissolve は、長さが正のものなら素材の有無に関係なく、少なくともディゾルブ長 × 速度ぶんのハンドルが確保されて trail が常に正になるため (0 フレームのディゾルブはハンドルが 0 になり得て、trail は正になりません)、取り込み直後のトランジション区間の描画が変わります (送り側クリップは、そのハンドル分だけは常に右端を伸ばせます。ハンドルを超えて素材長まで伸びるのは、素材が見つかり probe が正の値でハンドル込みの長さより長いときだけです)。EDL はソース開始タイムコードを差し引きません (既存の制限)。
