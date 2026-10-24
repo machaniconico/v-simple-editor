@@ -17632,7 +17632,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("画像をタイムラインに追加"),
@@ -17662,7 +17668,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("メッシュをタイムラインに追加 (頂点 %1 / 三角形 %2)")
@@ -17703,7 +17715,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("EXR先頭フレームをタイムラインに追加 (%1)")
