@@ -341,6 +341,11 @@ public:
     static bool save(const QString &filePath, const ProjectData &data);
     static bool load(const QString &filePath, ProjectData &data);
 
+    // Writes each entry's curve onto the video clip it is keyed to (ids are
+    // re-canonicalised); clips without an entry are left untouched.
+    static void applyTimeRemapEntries(Timeline *timeline,
+                                      const QVector<TimeRemapClipEntry> &entries);
+
     static QString toJsonString(const ProjectData &data);
     static bool fromJsonString(const QString &json, ProjectData &data);
 

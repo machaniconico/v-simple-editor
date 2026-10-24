@@ -8,6 +8,7 @@
 #include "SilenceCut.h"
 #include "BeatDetect.h"
 #include "ClipGeometry.h"
+#include "MediaPaths.h"
 #include "clipanim/ClipAnim.h"
 #include "ThreePointEdit.h"
 #include "TrimOps.h"
@@ -1904,12 +1905,19 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     ClipInfo &original = m_clips[index];
     double effectiveStart = original.inPoint;
     double effectiveEnd = (original.outPoint > 0.0) ? original.outPoint : original.duration;
-    double splitPoint = effectiveStart + localSeconds * original.speed;
+    // A reversed clip with a uniform speed plays its source from out down to
+    // in, so local second L sits at source out - L * speed: the left half keeps
+    // [split, out] and the right half takes [in, split]. Ramped / remapped
+    // reversed clips keep the forward formula (not handled yet).
+    const bool reversedUniform = original.reversed && original.speedRamp.isIdentity()
+        && original.timeRemapCurve.keys.isEmpty();
+    double splitPoint = reversedUniform ? effectiveEnd - localSeconds * original.speed
+                                        : effectiveStart + localSeconds * original.speed;
     constexpr double kSplitEps = 1e-6;
     if (splitPoint <= effectiveStart + kSplitEps || splitPoint >= effectiveEnd - kSplitEps) return;
     ClipInfo secondHalf = original;
-    secondHalf.inPoint = splitPoint;
-    secondHalf.outPoint = effectiveEnd;
+    secondHalf.inPoint = reversedUniform ? effectiveStart : splitPoint;
+    secondHalf.outPoint = reversedUniform ? splitPoint : effectiveEnd;
     secondHalf.leadInSec = 0.0;
     // The cut creates a hard edge between the halves: the right half's left
     // edge is no longer the original's leadIn, and the left half's right edge
@@ -1919,7 +1927,12 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);
-    original.outPoint = splitPoint;
+    if (reversedUniform) {
+        original.inPoint = splitPoint;
+        original.outPoint = effectiveEnd;
+    } else {
+        original.outPoint = splitPoint;
+    }
     original.trailOut = Transition{};
     const QString leftUid = original.uid;
     m_clips.insert(index + 1, secondHalf);
@@ -2157,17 +2170,26 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec, bool n
     return true;
 }
 
-TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration) const
+TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration,
+                                                const QSet<int> *ignoreIndexes) const
 {
     DropPlan plan{};
     if (dropTime < 0.0) dropTime = 0.0;
     double cursor = 0.0; // end time of the previous clip (i.e. start of the gap before clip[i])
+    // US-1403: an ignored clip leaves its span to the gap; clipsEnd is the end of
+    // the previous clip, ignored or not, and slot the index clip[i] has without
+    // the ignored ones (both equal cursor / i when nothing is ignored).
+    double clipsEnd = 0.0;
+    int slot = 0;
     for (int i = 0; i < m_clips.size(); ++i) {
-        const double clipStart = cursor + m_clips[i].leadInSec;
+        const double clipStart = clipsEnd + m_clips[i].leadInSec;
         const double clipEnd = clipStart + m_clips[i].effectiveDuration();
+        clipsEnd = clipEnd;
+        if (ignoreIndexes && ignoreIndexes->contains(i))
+            continue;
         // Does the dropped clip fit entirely within the gap before clip[i]?
         if (dropTime + clipDuration <= clipStart + 1e-6) {
-            plan.insertIdx = i;
+            plan.insertIdx = slot;
             plan.newLeadIn = qMax(0.0, dropTime - cursor);
             plan.nextLeadInDelta = plan.newLeadIn + clipDuration;
             plan.valid = true;
@@ -2177,21 +2199,30 @@ TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDura
         if (dropTime < clipEnd - 1e-6)
             return plan; // invalid
         cursor = clipEnd;
+        ++slot;
     }
     // After the last clip: always valid, just appends.
-    plan.insertIdx = m_clips.size();
+    plan.insertIdx = slot;
     plan.newLeadIn = qMax(0.0, dropTime - cursor);
     plan.nextLeadInDelta = 0.0;
     plan.valid = true;
     return plan;
 }
 
+namespace {
+// US-1405: set by Timeline::restoreFromProject while it loads the video tracks
+// top-down, so a uid repeated on a later video track is repaired too.
+QSet<QString> *g_loadVideoSeenUids = nullptr;
+} // namespace
+
 void TimelineTrack::setClips(const QVector<ClipInfo> &clips)
 {
     m_clips = clips;
     // Every clip leaving setClips has a uid; a uid repeated within the track
-    // keeps it on the earlier clip and gives the later one a fresh uid.
-    QSet<QString> seen;
+    // (or, while a project loads, on an earlier video track) keeps it on the
+    // earlier clip and gives the later one a fresh uid.
+    QSet<QString> localSeen;
+    QSet<QString> &seen = g_loadVideoSeenUids ? *g_loadVideoSeenUids : localSeen;
     for (ClipInfo &clip : m_clips) {
         if (!clip.uid.isEmpty() && seen.contains(clip.uid)) {
             clip.uid.clear();
@@ -2617,14 +2648,32 @@ void TimelineTrack::paintEvent(QPaintEvent *event)
         double dur = m_clips[i].effectiveDuration();
         int mins = static_cast<int>(dur) / 60;
         int secs = static_cast<int>(dur) % 60;
+        const bool offlineClip = m_timeline && !m_clips[i].filePath.isEmpty()
+            && m_timeline->isPathOffline(m_clips[i].filePath);
         QString label = m_clips[i].reversed
             ? QStringLiteral("◀ ") + m_clips[i].displayName
             : m_clips[i].displayName;
+        if (offlineClip)
+            label += QStringLiteral(" (オフライン)");
         if (m_clips[i].speed != 1.0)
             label += QString(" [%1x]").arg(m_clips[i].speed, 0, 'f', 1);
         label += QString(" %1:%2").arg(mins, 2, 10, QChar('0')).arg(secs, 2, 10, QChar('0'));
         painter.drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter,
             painter.fontMetrics().elidedText(label, Qt::ElideRight, textRect.width()));
+        if (offlineClip && clipWidth > 40) {
+            // US-1408: small top-left pill, drawn like the connection badge.
+            painter.save();
+            QFont badgeFont = painter.font();
+            badgeFont.setPixelSize(9);
+            painter.setFont(badgeFont);
+            const QRect badge(x + TRIM_HANDLE_WIDTH + 2, kTransBadgeYBot + 2, 42, 11);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(0xb0, 0x20, 0x20, 230));
+            painter.drawRoundedRect(badge, 3, 3);
+            painter.setPen(QColor(0xff, 0xe0, 0xe0));
+            painter.drawText(badge, Qt::AlignCenter, QStringLiteral("オフライン"));
+            painter.restore();
+        }
 
         // Transition badge. Pill at the affected corner — top-left for
         // leadIn (FadeIn), top-right for trailOut (FadeOut / CrossDissolve
@@ -3628,7 +3677,7 @@ void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
         event->ignore();
         return;
     }
-    auto *src = qobject_cast<TimelineTrack *>(event->source());
+    TimelineTrack *src = dropSourceTrack(event);
     if (!src || src == this) {
         // Same-track drags are handled by the leadInSec path — nothing to do here.
         event->ignore();
@@ -3658,9 +3707,8 @@ void TimelineTrack::dragMoveEvent(QDragMoveEvent *event)
         update();
         return;
     }
-    const DropPlan plan = planDrop(dropTime, src->m_clips[srcIdx].effectiveDuration());
     m_dropIndicatorX = qMax(0, dropX);
-    m_dropIndicatorValid = plan.valid;
+    m_dropIndicatorValid = dropEligible(src->m_clips[srcIdx], dropTime, src, false);
     event->acceptProposedAction();
     update();
 }
@@ -3724,6 +3772,32 @@ void TimelineTrack::dropEvent(QDropEvent *event)
         event->ignore();
 }
 
+bool TimelineTrack::dropEligible(const ClipInfo &clip, double dropTime, TimelineTrack *src,
+                                 bool toNewTrack, QSet<int> *groupIndexesOut) const
+{
+    if (groupIndexesOut) groupIndexesOut->clear();
+    const double clipDur = clip.effectiveDuration();
+    if (planDrop(dropTime, clipDur).valid)
+        return true;
+    // US-1403: a slot held only by members of the dropped clip's own link group.
+    if (clip.linkGroup <= 0 || !m_timeline || toNewTrack)
+        return false;
+    QSet<int> groupIndexes;
+    for (int i = 0; i < m_clips.size(); ++i)
+        if (m_clips[i].linkGroup == clip.linkGroup) groupIndexes.insert(i);
+    if (groupIndexes.isEmpty() || !planDrop(dropTime, clipDur, &groupIndexes).valid)
+        return false;
+    const auto &tracks = m_isAudioTrack ? m_timeline->audioTracks() : m_timeline->videoTracks();
+    const int destIdx = tracks.indexOf(const_cast<TimelineTrack *>(this));
+    const bool intoStoryline = m_timeline->storylineMode() && m_isAudioTrack && destIdx == 0;
+    // Every member sits on this track, so they share one target.
+    if (destIdx < 0
+        || Timeline::sameKindLinkTarget(tracks, destIdx, destIdx, tracks.indexOf(src), intoStoryline) == destIdx)
+        return false;
+    if (groupIndexesOut) *groupIndexesOut = groupIndexes;
+    return true;
+}
+
 bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
                                    TimelineTrack *src, bool toNewTrack)
 {
@@ -3743,9 +3817,21 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
     // instead of a placement in a free slot.
     const bool storylineInsert = m_timeline && m_timeline->storylineMode() && !toNewTrack
         && m_timeline->videoTracks().value(0, nullptr) == this;
-    const DropPlan plan = storylineInsert ? DropPlan{} : planDrop(dropTime, clipDur);
-    if (!storylineInsert && !plan.valid)
-        return false;
+    DropPlan plan = storylineInsert ? DropPlan{} : planDrop(dropTime, clipDur);
+    // US-1403: a slot held only by members of the dropped clip's own link group
+    // takes the drop when those members can move with the group, by the rule
+    // handleCrossTrackLinkedDrop applies to them, to another unlocked track;
+    // otherwise the drop is refused with nothing changed (dropEligible).
+    QVector<DetachedClip> sameGroup;
+    if (!storylineInsert) {
+        QSet<int> groupIndexes;
+        if (!dropEligible(clipData, dropTime, src, toNewTrack, &groupIndexes))
+            return false;
+        if (!groupIndexes.isEmpty()) {
+            for (int i = 0; i < m_clips.size(); ++i)
+                if (groupIndexes.contains(i)) sameGroup.append({i, m_clips[i]});
+        }
+    }
 
     // Order matters: remove from source first (while our indices are still
     // valid — source and this track have separate m_clips, so removing from
@@ -3759,6 +3845,16 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
     // existed; a second capture here would record the added track.
     if (clipData.linkGroup > 0 && m_timeline && !toNewTrack)
         m_timeline->captureExternalTrackStateForCompoundEdit();
+    // US-1403: the carriers are remapped once, by uid, from this snapshot taken
+    // before any clip moves; the members leave this track first, then the slot
+    // is planned again on what is left.
+    TrackClipSnapshot sameGroupBefore;
+    if (!sameGroup.isEmpty()) {
+        sameGroupBefore = snapshotTrackClips(m_timeline);
+        for (int k = sameGroup.size() - 1; k >= 0; --k)
+            removeClipPreservingDownstream(sameGroup[k].index);
+        plan = planDrop(dropTime, clipDur);
+    }
     src->removeClipPreservingDownstream(srcIdx);
     // US-1203: a clip taken out of V1 in storyline mode closes its gap.
     if (m_timeline && m_timeline->storylineMode() && m_timeline->videoTracks().value(0, nullptr) == src)
@@ -3772,13 +3868,17 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
 
     // Every cross-track move changes clip keys on both tracks; Timeline remaps
     // the carriers before any linked-partner move below.
-    emit clipMovedAcrossTracks(src, srcIdx, insertIdx);
+    if (sameGroup.isEmpty())
+        emit clipMovedAcrossTracks(src, srcIdx, insertIdx);
 
     // Notify Timeline to move linked partners (V↔A) to the corresponding track.
     // Pass the absolute drop time so Timeline can place the partner at the same position
     // (a storyline insert: the inserted clip's start).
     const QString droppedUid = m_clips.value(insertIdx).uid;
-    if (clipData.linkGroup > 0) {
+    if (!sameGroup.isEmpty()) {
+        emit sameGroupCrossTrackDropped(insertIdx, clipData.linkGroup, partnerSec, src, sameGroupBefore,
+                                        sameGroup);
+    } else if (clipData.linkGroup > 0) {
         emit crossTrackDropped(insertIdx, clipData.linkGroup, partnerSec, src);
     }
     // US-1202: with storyline mode on, a clip landing on V2+ / A connects to the
@@ -3823,7 +3923,8 @@ bool TimelineTrack::promotesCrossTrackDrag(int y) const
 // US-1117: thin band at the end of the video block (above the V/A separator)
 // and at the end of the audio block. A timeline clip of the band's kind
 // dropped here creates V(n+1) / A(n+1) and moves there; media-bin drops and a
-// clip of the other kind are ignored. No shortcut.
+// clip of the other kind are ignored. No shortcut. US-1407: with storyline mode
+// on, a single local media file dropped here is imported on the new track.
 static constexpr int kNewTrackDropZoneHeight = 10;
 
 class TimelineNewTrackDropZone : public QWidget
@@ -3866,6 +3967,21 @@ protected:
     void dropEvent(QDropEvent *event) override
     {
         setHover(false);
+        if (event->mimeData()->hasUrls() && !event->mimeData()->hasFormat("application/x-vse-clip")) {
+            QString err;
+            const double dropTimeSec = m_timeline
+                ? qMax(0.0, event->position().toPoint().x() / m_timeline->m_zoomLevel) : 0.0;
+            if (m_timeline && isSingleLocalMediaDrop(event->mimeData())
+                && m_timeline->dropMediaOnNewTrack(
+                    m_audio, event->mimeData()->urls().first().toLocalFile(), dropTimeSec, &err)) {
+                event->acceptProposedAction();
+            } else {
+                event->ignore();
+                if (m_timeline && !err.isEmpty())
+                    emit m_timeline->statusMessageRequested(err, 4000);
+            }
+            return;
+        }
         if (m_timeline && m_timeline->dropClipOnNewTrack(m_audio, event->mimeData(),
                                                           event->position().toPoint(),
                                                           dropSourceTrack(event)))
@@ -3877,6 +3993,11 @@ protected:
 private:
     bool accepts(const QDropEvent *event) const
     {
+        // US-1407: a single local media file, storyline mode on only.
+        if (m_timeline && m_timeline->storylineMode()
+            && !event->mimeData()->hasFormat("application/x-vse-clip")
+            && isSingleLocalMediaDrop(event->mimeData()))
+            return true;
         auto *src = qobject_cast<TimelineTrack *>(event->source());
         return event->mimeData()->hasFormat("application/x-vse-clip") && src
             && src->isAudioTrack() == m_audio;
@@ -3971,6 +4092,10 @@ Timeline::Timeline(QWidget *parent) : QWidget(parent)
     m_emitSequenceTimer->setSingleShot(true);
     m_emitSequenceTimer->setInterval(50);
     connect(m_emitSequenceTimer, &QTimer::timeout, this, &Timeline::emitSequenceChangedNow);
+    // US-1408: undo / redo and sequence switches judge only the paths the offline
+    // cache has not seen yet (no populateProjectData on these paths).
+    connect(this, &Timeline::trackStateRestored, this, &Timeline::refreshOfflinePathsForUnknown);
+    connect(this, &Timeline::sequencesChanged, this, &Timeline::refreshOfflinePathsForUnknown);
     setupUI();
     saveUndoState("Initial state");
 }
@@ -5657,6 +5782,7 @@ bool Timeline::importMedia(const QString &filePath,
     }
     updateInfoLabel();
     scheduleEmitSequenceChanged();
+    emit mediaImported();
     return true;
 }
 
@@ -11426,29 +11552,49 @@ int Timeline::selectedVideoClipIndex() const
     return m_videoTrack->selectedClip();
 }
 
-void Timeline::insertClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+bool Timeline::insertClip3PointActive(double timelineStartSec, const ClipInfo &clip)
 {
-    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
-        return;
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        emit statusMessageRequested(QStringLiteral("タイムラインがありません"), 5000);
+        return false;
+    }
     auto *track = m_videoTracks.first();
+    if (track->isLocked()) {
+        emit statusMessageRequested(QStringLiteral("ロック中のトラックには配置できません"), 5000);
+        return false;
+    }
+    ClipKeyRemapBatch keyRemapBatch(this);
+    const TrackClipSnapshot before = snapshotTrackClips(this);
     track->insertClip3Point(timelineStartSec, clip);
     // US-1203: storyline mode keeps V1 gap-free (an insert past the end).
     if (m_storylineMode)
         closeGapsOnTrack(track);
+    remapCarriersAfterExternalMutation(before);
     saveUndoState("3点編集: インサート");
+    return true;
 }
 
-void Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip)
+bool Timeline::overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip)
 {
-    if (m_videoTracks.isEmpty() || !m_videoTracks.first())
-        return;
+    if (m_videoTracks.isEmpty() || !m_videoTracks.first()) {
+        emit statusMessageRequested(QStringLiteral("タイムラインがありません"), 5000);
+        return false;
+    }
     auto *track = m_videoTracks.first();
+    if (track->isLocked()) {
+        emit statusMessageRequested(QStringLiteral("ロック中のトラックには配置できません"), 5000);
+        return false;
+    }
+    ClipKeyRemapBatch keyRemapBatch(this);
+    const TrackClipSnapshot before = snapshotTrackClips(this);
     const auto spans = rangeRemovedSpans(
         track, {{timelineStartSec, timelineStartSec + clip.effectiveDuration()}});
     for (auto it = spans.cbegin(); it != spans.cend(); ++it)
         m_pendingDeletedUids[it.key()] += it.value();
     track->overwriteClip3Point(timelineStartSec, clip);
+    remapCarriersAfterExternalMutation(before);
     saveUndoState("3点編集: 上書き");
+    return true;
 }
 
 bool Timeline::insertShapeClipAtPlayhead(const ClipInfo &clip)
@@ -12373,6 +12519,11 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         [this, track](int insertIdx, int linkGroup, double dropTime, TimelineTrack *src) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime, insertIdx, src);
         });
+    connect(track, &TimelineTrack::sameGroupCrossTrackDropped, this,
+        [this, track](int insertIdx, int linkGroup, double dropTime, TimelineTrack *src,
+                      const TrackClipSnapshot &before, const QVector<TimelineTrack::DetachedClip> &detached) {
+            handleCrossTrackLinkedDrop(track, linkGroup, dropTime, insertIdx, src, &before, &detached);
+        });
     connect(track, &TimelineTrack::effectDropped, this,
         [this, track](const QString &entryId, int clipIndex) {
             const int trackIdx = m_videoTracks.indexOf(track);
@@ -12649,8 +12800,23 @@ void Timeline::clearLinkedDragState()
     m_linkedDragPartners.clear();
 }
 
+int Timeline::sameKindLinkTarget(const QVector<TimelineTrack *> &tracks, int memberTrack, int destIdx,
+                                 int dragSourceIdx, bool intoStoryline)
+{
+    if (dragSourceIdx < 0 || intoStoryline)
+        return memberTrack;
+    const int target = qMax(0, memberTrack + destIdx - dragSourceIdx);
+    // A locked track neither gives up nor takes a member.
+    if (tracks[memberTrack]->isLocked()
+        || (target < tracks.size() && tracks[target]->isLocked()))
+        return memberTrack;
+    return target;
+}
+
 void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
-                                          int droppedIdx, TimelineTrack *dragSource)
+                                          int droppedIdx, TimelineTrack *dragSource,
+                                          const TrackClipSnapshot *sameGroupBefore,
+                                          const QVector<TimelineTrack::DetachedClip> *detached)
 {
     if (linkGroup <= 0 || !destTrack) return;
     // US-1203: a storyline insert on V1. The dropped clip's audio is taken out
@@ -12738,6 +12904,7 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
         int index;
         int target;
         ClipInfo clip;
+        bool detached = false;   // US-1403: already taken off destTrack
     };
     QVector<Member> moving;
     int anchorTrack = -1;
@@ -12763,12 +12930,8 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
                         && (tracks[t]->isLocked()
                             || (target < tracks.size() && tracks[target]->isLocked())))
                         target = t;
-                } else if (dragSourceIdx >= 0 && !intoStoryline) {
-                    target = qMax(0, t + destIdx - dragSourceIdx);
-                    // A locked track neither gives up nor takes a member.
-                    if (tracks[t]->isLocked()
-                        || (target < tracks.size() && tracks[target]->isLocked()))
-                        target = t;
+                } else {
+                    target = sameKindLinkTarget(tracks, t, destIdx, dragSourceIdx, intoStoryline);
                 }
                 // A member already on its target track stays where it is.
                 if (target != t)
@@ -12778,6 +12941,14 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     };
     collect(!destIsVideo);
     collect(destIsVideo);
+    // US-1403: the members acceptClipDrop took off destTrack move by the same
+    // rule (it checked that their target is another track).
+    if (detached) {
+        for (const TimelineTrack::DetachedClip &d : *detached)
+            moving.append({destIsVideo, destIdx, d.index,
+                           sameKindLinkTarget(sameTracks, destIdx, destIdx, dragSourceIdx, intoStoryline),
+                           d.clip, true});
+    }
     if (moving.isEmpty()) return;
 
     for (const Member &m : moving) {
@@ -12792,11 +12963,14 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     // RM-5 / US-1313: snapshot (after the appended tracks, which move no key)
     // before any member leaves its track; the carriers follow every moved
     // member in one by-uid remap at the end.
-    const TrackClipSnapshot before = snapshotTrackClips(this);
+    // US-1403: a same-group drop brings its snapshot from before the dropped
+    // clip and the detached members moved.
+    const TrackClipSnapshot before = sameGroupBefore ? *sameGroupBefore : snapshotTrackClips(this);
     // All members leave first (highest index of a track first), so no member
     // blocks the slot another one is moving to.
     bool leftV1 = false;
     for (int m = moving.size() - 1; m >= 0; --m) {
+        if (moving[m].detached) continue;   // US-1403: already off destTrack
         TimelineTrack *src = (moving[m].video ? m_videoTracks : m_audioTracks)[moving[m].track];
         src->removeClipPreservingDownstream(moving[m].index);
         leftV1 = leftV1 || src == v1;
@@ -12806,11 +12980,15 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     // Each member's index on its target track, kept exact as later members land
     // on the same track before it (uid twins rule out a lookup by uid).
     QVector<int> placedIdx(moving.size(), -1);
+    // US-1403: the dropped clip's index on destTrack, kept exact the same way.
+    int droppedNow = droppedIdx;
     auto recordPlaced = [&](int m, int index) {
         for (int e = 0; e < m; ++e)
             if (moving[e].video == moving[m].video && moving[e].target == moving[m].target
                 && index <= placedIdx[e])
                 ++placedIdx[e];
+        if (moving[m].video == destIsVideo && moving[m].target == destIdx && index <= droppedNow)
+            ++droppedNow;
         placedIdx[m] = index;
     };
     for (int mi = 0; mi < moving.size(); ++mi) {
@@ -12854,8 +13032,25 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
         const Member &m = moving[mi];
         if (!m.video) continue;
         videoMoved = true;
+        // US-1403: `before` predates the dropped clip's move, so only the keys
+        // known in its coordinates are named: the detached members here and the
+        // dropped clip below; the other members follow by uid.
+        if (sameGroupBefore && !m.detached) continue;
         explicitMoves.insert(trackMatteClipKey(m.track, m.index),
                              trackMatteClipKey(m.target, placedIdx[mi]));
+    }
+    const int dragSourceVideoIdx = m_videoTracks.indexOf(dragSource);
+    if (sameGroupBefore && destIsVideo && dragSourceVideoIdx >= 0 && droppedNow >= 0
+        && droppedNow < destTrack->clipCount()) {
+        // Uids are unique per track: the dropped clip's row in `before`.
+        const QString droppedUid = destTrack->clips().at(droppedNow).uid;
+        const auto &srcRow = sameGroupBefore->value(dragSourceVideoIdx);
+        for (int i = 0; !droppedUid.isEmpty() && i < srcRow.size(); ++i) {
+            if (srcRow[i].uid != droppedUid) continue;
+            explicitMoves.insert(trackMatteClipKey(dragSourceVideoIdx, i),
+                                 trackMatteClipKey(destIdx, droppedNow));
+            break;
+        }
     }
     if (videoMoved) ++m_crossTrackMoveRemapCount;
     remapCarriersByUid(this, before, explicitMoves);
@@ -14896,12 +15091,52 @@ bool Timeline::dropMediaOnTrack(TimelineTrack *track, const QString &filePath,
         if (partner && partner->isLocked() && probeTimelineMedia(filePath).audioStreamFound)
             return setTimelineEditError(err, QStringLiteral("ロック中のトラックには配置できません"));
     }
-    // A drop connects only to the V1 clip it overlaps; otherwise it is imported unconnected.
-    // A V1 drop is a storyline insert, never a connection.
-    const QString anchorUid = trackIndex == 0 && !audio ? QString()
-                                                         : storylineAnchorAt(startSec, nullptr, false);
+    const QString anchorUid = dropAnchorUid(audio, trackIndex, startSec);
     return importMedia(filePath, trackIndex, startSec, nullptr, err,
                        audio ? ImportMediaKind::AudioOnly : ImportMediaKind::Auto, anchorUid);
+}
+
+QString Timeline::dropAnchorUid(bool audio, int trackIndex, double startSec) const
+{
+    // A drop connects only to the V1 clip it overlaps; otherwise it is imported unconnected.
+    // A V1 drop is a storyline insert, never a connection.
+    return trackIndex == 0 && !audio ? QString() : storylineAnchorAt(startSec, nullptr, false);
+}
+
+bool Timeline::dropMediaOnNewTrack(bool audio, const QString &filePath, double dropTimeSec,
+                                   QString *err)
+{
+    if (err) err->clear();
+    if (!m_storylineMode)
+        return setTimelineEditError(err, QStringLiteral("ストーリーラインモードが OFF です"));
+    const QFileInfo fileInfo(filePath);
+    if (!fileInfo.exists() || !fileInfo.isFile())
+        return setTimelineEditError(err, QStringLiteral("ファイルが見つかりません: %1").arg(filePath));
+    const TimelineMediaProbe probe = probeTimelineMedia(filePath);
+    if (!probe.openedOk || (!probe.videoStreamFound && !probe.audioStreamFound))
+        return setTimelineEditError(
+            err, QStringLiteral("メディアとして開けません (動画/音声ストリームがありません): %1").arg(filePath));
+    if (!audio && !probe.videoStreamFound)
+        return setTimelineEditError(err, QStringLiteral("映像の帯には映像ファイルだけ置けます"));
+    if (audio && !probe.audioStreamFound)
+        return setTimelineEditError(err, QStringLiteral("音声の帯には音声を持つファイルだけ置けます"));
+    const double startSec = qMax(0.0, dropTimeSec);
+    // addVideoTrack(false) / addAudioTrack(false) skip the external-state capture;
+    // take it before the track exists so importMedia's one undo point also removes it.
+    captureExternalTrackStateForCompoundEdit();
+    if (audio)
+        addAudioTrack(false);
+    else
+        addVideoTrack(false);
+    const int newIdx = int((audio ? m_audioTracks : m_videoTracks).size()) - 1;
+    const QString anchorUid = dropAnchorUid(audio, newIdx, startSec);
+    QString importErr;
+    if (importMedia(filePath, newIdx, startSec, nullptr, &importErr,
+                    audio ? ImportMediaKind::AudioOnly : ImportMediaKind::Auto, anchorUid)) {
+        return true;
+    }
+    removeTrackInternal(audio, newIdx);
+    return setTimelineEditError(err, importErr);
 }
 
 bool Timeline::closeGapsOnTrack(TimelineTrack *track)
@@ -15175,6 +15410,72 @@ void Timeline::paintConnections(QPainter &painter) const
     painter.restore();
 }
 
+namespace {
+QStringList offlineCandidatePaths(const QVector<TimelineTrack *> &videoTracks,
+                                  const QVector<TimelineTrack *> &audioTracks)
+{
+    QSet<QString> seen;
+    QStringList paths;
+    for (const auto *tracks : {&videoTracks, &audioTracks}) {
+        for (const TimelineTrack *track : *tracks) {
+            if (!track) continue;
+            for (const ClipInfo &clip : track->clips()) {
+                if (!clip.filePath.isEmpty() && !seen.contains(clip.filePath)) {
+                    seen.insert(clip.filePath);
+                    paths.append(clip.filePath);
+                }
+            }
+        }
+    }
+    return paths;
+}
+} // namespace
+
+void Timeline::setOfflinePaths(const QStringList &missing)
+{
+    const QSet<QString> missingSet(missing.cbegin(), missing.cend());
+    m_offlinePaths.clear();
+    for (const QString &path : offlineCandidatePaths(m_videoTracks, m_audioTracks))
+        m_offlinePaths.insert(path, missingSet.contains(path));
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (TimelineTrack *track : *tracks) {
+            if (track) track->update();
+        }
+    }
+}
+
+void Timeline::refreshOfflinePathsForUnknown()
+{
+    bool changed = false;
+    for (const QString &path : offlineCandidatePaths(m_videoTracks, m_audioTracks)) {
+        if (m_offlinePaths.contains(path)) continue;
+        ++m_offlineProbeCount;
+        m_offlinePaths.insert(path, mediapaths::isMissingFilesystemPath(path));
+        changed = true;
+    }
+    if (!changed) return;
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (TimelineTrack *track : *tracks) {
+            if (track) track->update();
+        }
+    }
+}
+
+int Timeline::offlineClipCount() const
+{
+    int count = 0;
+    for (const auto *tracks : {&m_videoTracks, &m_audioTracks}) {
+        for (const TimelineTrack *track : *tracks) {
+            if (!track) continue;
+            for (const ClipInfo &clip : track->clips()) {
+                if (!clip.filePath.isEmpty() && m_offlinePaths.value(clip.filePath, false))
+                    ++count;
+            }
+        }
+    }
+    return count;
+}
+
 void Timeline::autoConnectDroppedClip(TimelineTrack *track, int clipIndex)
 {
     const bool audio = track && track->isAudioTrack();
@@ -15376,6 +15677,12 @@ bool Timeline::createSequence(const QString &name,
     // Sequence navigation preserves the existing carrier keys; remapping is
     // only valid for clip mutations within the same sequence.
     saveUndoState(QStringLiteral("新規シーケンス"));
+    // US-1408: EDL / FCPXML imports (GUI and MCP) land here with clips; an empty
+    // "new sequence" has nothing to judge.
+    bool hasClips = false;
+    for (const auto &track : sequence.videoTracks) hasClips = hasClips || !track.isEmpty();
+    for (const auto &track : sequence.audioTracks) hasClips = hasClips || !track.isEmpty();
+    if (hasClips) emit mediaImported();
     return true;
 }
 
@@ -16197,6 +16504,10 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
     while (m_videoTracks.size() < videoTracks.size()) addVideoTrack(false);
     while (m_audioTracks.size() < audioTracks.size()) addAudioTrack(false);
 
+    // Video uids are repaired across tracks (the first track keeps its uid);
+    // audio tracks are left alone.
+    QSet<QString> videoSeenUids;
+    g_loadVideoSeenUids = &videoSeenUids;
     for (int i = 0; i < m_videoTracks.size(); ++i) {
         if (!m_videoTracks[i]) continue;
         const auto &clips = (i < videoTracks.size())
@@ -16204,6 +16515,7 @@ void Timeline::restoreFromProject(const QVector<QVector<ClipInfo>> &videoTracks,
                             : QVector<ClipInfo>{};
         m_videoTracks[i]->setClips(clips);
     }
+    g_loadVideoSeenUids = nullptr;
 
     for (int i = 0; i < m_audioTracks.size(); ++i) {
         if (!m_audioTracks[i]) continue;

@@ -6,7 +6,17 @@
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
 
+#if __has_include("../ImportHubDialog.h")
+#include "../ImportHubDialog.h"
+#define MAINWINDOW_LIFECYCLE_HAVE_IMPORT_HUB 1
+#endif
 #include <QApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QImage>
+#include <QMetaObject>
+#include <QSettings>
+#include <QStatusBar>
 #include <QDebug>
 #include <QPointer>
 #include <QString>
@@ -555,12 +565,33 @@ MainWindowLifecycleResult constructAndDestroyMainWindow()
     return result;
 }
 
+#ifdef MAINWINDOW_LIFECYCLE_HAVE_IMPORT_HUB
+// US-1404: pins QSettings "VSimpleEditor/Preferences" importPlacement for G4 and puts the
+// previous value (or absence) back on scope exit (same shape as track_ops_selftest.cpp).
+struct ImportPlacementPin {
+    QSettings prefs{QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences")};
+    QVariant saved = prefs.value(QStringLiteral("importPlacement"));
+    explicit ImportPlacementPin(ImportPlacement placement)
+    {
+        prefs.setValue(QStringLiteral("importPlacement"), static_cast<int>(placement));
+        prefs.sync();
+    }
+    ~ImportPlacementPin()
+    {
+        if (saved.isValid()) prefs.setValue(QStringLiteral("importPlacement"), saved);
+        else prefs.remove(QStringLiteral("importPlacement"));
+        prefs.sync();
+    }
+};
+#endif
+
 } // namespace
 
 int runMainWindowLifecycleSelftest()
 {
     int passed = 0;
     int failed = 0;
+    int skipped = 0;
     auto check = [&](int gate, const char *name, bool ok,
                      const QString &detail = QString()) {
         if (ok) {
@@ -602,8 +633,95 @@ int runMainWindowLifecycleSelftest()
               .arg(first.audioBusPanelDestroyed ? QStringLiteral("true")
                                                  : QStringLiteral("false")));
 
-    qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] summary: %1 PASS, %2 FAIL")
+#ifdef MAINWINDOW_LIFECYCLE_HAVE_IMPORT_HUB
+    // US-1404 G4: an ImportHub image import refused by importMedia (V1 / A1 locked,
+    // AppendToFirstTrack) leaves no preview PNG behind, adds no clip and reports the
+    // importMedia text. Control: unlocked, the same import keeps the PNG and adds a clip.
+    {
+        ImportPlacementPin placementPin(ImportPlacement::AppendToFirstTrack);
+
+        MainWindow window;
+        Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+        QMetaObject::invokeMethod(&window, "onImportHub", Qt::DirectConnection);
+        ImportHubDialog *hub = window.findChild<ImportHubDialog *>(QStringLiteral("importHubDialog"));
+        TimelineTrack *v1 = timeline ? timeline->trackAt(false, 0) : nullptr;
+        TimelineTrack *a1 = timeline ? timeline->trackAt(true, 0) : nullptr;
+
+        const QString hubDir = QDir::tempPath() + QStringLiteral("/v-simple-editor-importhub");
+        const auto listPngs = [&]() {
+            QStringList names = QDir(hubDir).entryList({QStringLiteral("image_g4probe*.png")}, QDir::Files);
+            names.sort();
+            return names;
+        };
+        const auto totalClips = [&]() {
+            int n = 0;
+            for (const TimelineTrack *t : timeline->videoTracks()) n += t->clipCount();
+            for (const TimelineTrack *t : timeline->audioTracks()) n += t->clipCount();
+            return n;
+        };
+        const auto otherClips = [&]() {
+            int n = 0;
+            for (const TimelineTrack *t : timeline->videoTracks()) if (t != v1) n += t->clipCount();
+            for (const TimelineTrack *t : timeline->audioTracks()) if (t != a1) n += t->clipCount();
+            return n;
+        };
+        const auto importProbe = [&]() {
+            QImage image(32, 32, QImage::Format_ARGB32);
+            image.fill(Qt::red);
+            emit hub->imageImportRequested(image, QStringLiteral("g4probe"));
+        };
+
+        bool ok = false;
+        QString detail;
+        if (timeline && hub && v1 && a1 && timeline->undoManager()) {
+            for (const QString &stale : listPngs())
+                QFile::remove(hubDir + QLatin1Char('/') + stale);
+            v1->setLocked(true);
+            a1->setLocked(true);
+            const int clipsBefore = totalClips();
+            const QStringList pngsBefore = listPngs();
+            window.statusBar()->clearMessage();
+            importProbe();
+            const QStringList pngsAfter = listPngs();
+            const int clipsAfter = totalClips();
+            const QString status = window.statusBar()->currentMessage();
+
+            v1->setLocked(false);
+            a1->setLocked(false);
+            window.statusBar()->clearMessage();
+            const int v1Before = v1->clipCount();
+            const int a1Before = a1->clipCount();
+            const int otherBefore = otherClips();
+            importProbe();
+            const QStringList pngsControl = listPngs();
+            const int v1Delta = v1->clipCount() - v1Before;
+            const int a1Delta = a1->clipCount() - a1Before;
+            const int otherDelta = otherClips() - otherBefore;
+            for (const QString &made : pngsControl)
+                QFile::remove(hubDir + QLatin1Char('/') + made);
+
+            ok = pngsBefore.isEmpty() && pngsAfter.isEmpty() && clipsAfter == clipsBefore
+                && status == QStringLiteral("ロック中のトラックには配置できません")
+                && pngsControl.size() == 1 && v1Delta == 1 && a1Delta == 1 && otherDelta == 0;
+            detail = QStringLiteral("locked: PNGs %1 -> %2 [%3], clips %4 -> %5, status [%6]; "
+                                    "control unlocked: PNGs %7 clips V1 +%8 A1 +%9 other +%10")
+                         .arg(pngsBefore.size()).arg(pngsAfter.size()).arg(pngsAfter.join(QLatin1Char(',')))
+                         .arg(clipsBefore).arg(clipsAfter).arg(status)
+                         .arg(pngsControl.size()).arg(v1Delta).arg(a1Delta).arg(otherDelta);
+        } else {
+            detail = QStringLiteral("timeline/hub/V1/A1 not found");
+        }
+        qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] G4 detail: %1").arg(detail);
+        check(4, "refused ImportHub import deletes its preview PNG", ok, detail);
+    }
+#else
+    ++skipped;
+    qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] SKIP G4 ImportHubDialog.h unavailable (env)");
+#endif
+
+    qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] summary: %1 PASS, %2 FAIL, %3 SKIP")
         .arg(passed)
-        .arg(failed);
+        .arg(failed)
+        .arg(skipped);
     return failed == 0 ? 0 : failed;
 }

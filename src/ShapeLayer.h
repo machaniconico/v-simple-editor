@@ -113,11 +113,38 @@ struct ShapeModifiers {
         double endPct = 100.0;
         double offsetPct = 0.0;
     } trim;
+    // Path-to-path modifiers, applied Round Corners -> ZigZag -> Wiggle Path
+    // -> Trim -> Repeater. Wiggle Path is static (seed-deterministic, no time).
+    struct RoundCornersConfig {
+        bool enabled = false;
+        double radius = 10.0;
+    } roundCorners;
+    struct ZigZagConfig {
+        bool enabled = false;
+        double size = 10.0;
+        int ridgesPerSegment = 4;
+        bool smooth = false;
+    } zigZag;
+    struct WigglePathConfig {
+        bool enabled = false;
+        double amplitude = 5.0;
+        int detail = 4;
+        int seed = 1;
+    } wigglePath;
 
     bool isDefault() const;
     QJsonObject toJson() const;
     static ShapeModifiers fromJson(const QJsonObject &obj);
 };
+
+// Pure QPainterPath -> QPainterPath shape modifiers (curves are flattened first).
+namespace shapemod {
+QPainterPath roundCorners(const QPainterPath &path, double radius);
+QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment,
+                    bool smooth);
+QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail,
+                        int seed);
+}
 
 // --- Shape ---
 

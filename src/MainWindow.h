@@ -268,6 +268,7 @@ class MainWindow : public QMainWindow
     friend int runMixerDockSelftest();
     friend int runTrackOpsSelftest();
     friend int runConnectedClipSelftest();
+    friend int runMediaRelinkSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -549,6 +550,10 @@ private slots:
     void onSceneCutDetect();
     void onAudioDuckingSettings();
     void onCollectProject();
+    // US-1408: File > メディアを再リンク…. refreshOfflineBadges() replaces the
+    // Timeline's offline cache from a populateProjectData() + missingFiles() pass.
+    void relinkMediaFromMenu();
+    void refreshOfflineBadges();
 
     // US-EXT-10: Sprint 10 pro extensions — 3 new menu actions
     void onHDRSettings();
@@ -819,6 +824,14 @@ private:
     QJsonObject collectSidecarState();
     void applySidecarState(const QJsonObject &state);
     void parkSidecars(const QString &key, const QString &uid);
+    // US-1401: a dialog's accepted value for clip key `clipId` (nullopt removes it):
+    // one undo point when it differs from the current one (toJson() compared), none
+    // otherwise.
+    void commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve);
+    void commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config);
+    void commitExpressionBindings(const QString &clipId,
+                                  const std::optional<exprbind::ClipExpressionBindings> &bindings);
+    void commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params);
     // US-1302: the four values a dropped key held, kept by the clip's "track|uid"
     // until a restore brings that clip back (the brush entries go back by value instead).
     struct ParkedSidecars {
@@ -926,6 +939,7 @@ private:
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
+    bool m_offlineRefreshQueued = false; // US-1408: coalesces mediaImported refreshes
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
