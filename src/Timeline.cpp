@@ -2170,17 +2170,26 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec, bool n
     return true;
 }
 
-TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration) const
+TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDuration,
+                                                const QSet<int> *ignoreIndexes) const
 {
     DropPlan plan{};
     if (dropTime < 0.0) dropTime = 0.0;
     double cursor = 0.0; // end time of the previous clip (i.e. start of the gap before clip[i])
+    // US-1403: an ignored clip leaves its span to the gap; clipsEnd is the end of
+    // the previous clip, ignored or not, and slot the index clip[i] has without
+    // the ignored ones (both equal cursor / i when nothing is ignored).
+    double clipsEnd = 0.0;
+    int slot = 0;
     for (int i = 0; i < m_clips.size(); ++i) {
-        const double clipStart = cursor + m_clips[i].leadInSec;
+        const double clipStart = clipsEnd + m_clips[i].leadInSec;
         const double clipEnd = clipStart + m_clips[i].effectiveDuration();
+        clipsEnd = clipEnd;
+        if (ignoreIndexes && ignoreIndexes->contains(i))
+            continue;
         // Does the dropped clip fit entirely within the gap before clip[i]?
         if (dropTime + clipDuration <= clipStart + 1e-6) {
-            plan.insertIdx = i;
+            plan.insertIdx = slot;
             plan.newLeadIn = qMax(0.0, dropTime - cursor);
             plan.nextLeadInDelta = plan.newLeadIn + clipDuration;
             plan.valid = true;
@@ -2190,9 +2199,10 @@ TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDura
         if (dropTime < clipEnd - 1e-6)
             return plan; // invalid
         cursor = clipEnd;
+        ++slot;
     }
     // After the last clip: always valid, just appends.
-    plan.insertIdx = m_clips.size();
+    plan.insertIdx = slot;
     plan.newLeadIn = qMax(0.0, dropTime - cursor);
     plan.nextLeadInDelta = 0.0;
     plan.valid = true;
@@ -3782,9 +3792,30 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
     // instead of a placement in a free slot.
     const bool storylineInsert = m_timeline && m_timeline->storylineMode() && !toNewTrack
         && m_timeline->videoTracks().value(0, nullptr) == this;
-    const DropPlan plan = storylineInsert ? DropPlan{} : planDrop(dropTime, clipDur);
-    if (!storylineInsert && !plan.valid)
-        return false;
+    DropPlan plan = storylineInsert ? DropPlan{} : planDrop(dropTime, clipDur);
+    // US-1403: a slot held only by members of the dropped clip's own link group
+    // takes the drop when those members can move with the group, by the rule
+    // handleCrossTrackLinkedDrop applies to them, to another unlocked track;
+    // otherwise the drop is refused with nothing changed.
+    QVector<DetachedClip> sameGroup;
+    if (!storylineInsert && !plan.valid) {
+        if (clipData.linkGroup <= 0 || !m_timeline || toNewTrack)
+            return false;
+        QSet<int> groupIndexes;
+        for (int i = 0; i < m_clips.size(); ++i)
+            if (m_clips[i].linkGroup == clipData.linkGroup) groupIndexes.insert(i);
+        if (groupIndexes.isEmpty() || !planDrop(dropTime, clipDur, &groupIndexes).valid)
+            return false;
+        const auto &tracks = m_isAudioTrack ? m_timeline->audioTracks() : m_timeline->videoTracks();
+        const int destIdx = tracks.indexOf(this);
+        const bool intoStoryline = m_timeline->storylineMode() && m_isAudioTrack && destIdx == 0;
+        // Every member sits on this track, so they share one target.
+        if (destIdx < 0
+            || Timeline::sameKindLinkTarget(tracks, destIdx, destIdx, tracks.indexOf(src), intoStoryline) == destIdx)
+            return false;
+        for (int i = 0; i < m_clips.size(); ++i)
+            if (groupIndexes.contains(i)) sameGroup.append({i, m_clips[i]});
+    }
 
     // Order matters: remove from source first (while our indices are still
     // valid — source and this track have separate m_clips, so removing from
@@ -3798,6 +3829,16 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
     // existed; a second capture here would record the added track.
     if (clipData.linkGroup > 0 && m_timeline && !toNewTrack)
         m_timeline->captureExternalTrackStateForCompoundEdit();
+    // US-1403: the carriers are remapped once, by uid, from this snapshot taken
+    // before any clip moves; the members leave this track first, then the slot
+    // is planned again on what is left.
+    TrackClipSnapshot sameGroupBefore;
+    if (!sameGroup.isEmpty()) {
+        sameGroupBefore = snapshotTrackClips(m_timeline);
+        for (int k = sameGroup.size() - 1; k >= 0; --k)
+            removeClipPreservingDownstream(sameGroup[k].index);
+        plan = planDrop(dropTime, clipDur);
+    }
     src->removeClipPreservingDownstream(srcIdx);
     // US-1203: a clip taken out of V1 in storyline mode closes its gap.
     if (m_timeline && m_timeline->storylineMode() && m_timeline->videoTracks().value(0, nullptr) == src)
@@ -3811,13 +3852,17 @@ bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
 
     // Every cross-track move changes clip keys on both tracks; Timeline remaps
     // the carriers before any linked-partner move below.
-    emit clipMovedAcrossTracks(src, srcIdx, insertIdx);
+    if (sameGroup.isEmpty())
+        emit clipMovedAcrossTracks(src, srcIdx, insertIdx);
 
     // Notify Timeline to move linked partners (V↔A) to the corresponding track.
     // Pass the absolute drop time so Timeline can place the partner at the same position
     // (a storyline insert: the inserted clip's start).
     const QString droppedUid = m_clips.value(insertIdx).uid;
-    if (clipData.linkGroup > 0) {
+    if (!sameGroup.isEmpty()) {
+        emit sameGroupCrossTrackDropped(insertIdx, clipData.linkGroup, partnerSec, src, sameGroupBefore,
+                                        sameGroup);
+    } else if (clipData.linkGroup > 0) {
         emit crossTrackDropped(insertIdx, clipData.linkGroup, partnerSec, src);
     }
     // US-1202: with storyline mode on, a clip landing on V2+ / A connects to the
@@ -12458,6 +12503,11 @@ void Timeline::wireTrackSelection(TimelineTrack *track)
         [this, track](int insertIdx, int linkGroup, double dropTime, TimelineTrack *src) {
             handleCrossTrackLinkedDrop(track, linkGroup, dropTime, insertIdx, src);
         });
+    connect(track, &TimelineTrack::sameGroupCrossTrackDropped, this,
+        [this, track](int insertIdx, int linkGroup, double dropTime, TimelineTrack *src,
+                      const TrackClipSnapshot &before, const QVector<TimelineTrack::DetachedClip> &detached) {
+            handleCrossTrackLinkedDrop(track, linkGroup, dropTime, insertIdx, src, &before, &detached);
+        });
     connect(track, &TimelineTrack::effectDropped, this,
         [this, track](const QString &entryId, int clipIndex) {
             const int trackIdx = m_videoTracks.indexOf(track);
@@ -12734,8 +12784,23 @@ void Timeline::clearLinkedDragState()
     m_linkedDragPartners.clear();
 }
 
+int Timeline::sameKindLinkTarget(const QVector<TimelineTrack *> &tracks, int memberTrack, int destIdx,
+                                 int dragSourceIdx, bool intoStoryline)
+{
+    if (dragSourceIdx < 0 || intoStoryline)
+        return memberTrack;
+    const int target = qMax(0, memberTrack + destIdx - dragSourceIdx);
+    // A locked track neither gives up nor takes a member.
+    if (tracks[memberTrack]->isLocked()
+        || (target < tracks.size() && tracks[target]->isLocked()))
+        return memberTrack;
+    return target;
+}
+
 void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
-                                          int droppedIdx, TimelineTrack *dragSource)
+                                          int droppedIdx, TimelineTrack *dragSource,
+                                          const TrackClipSnapshot *sameGroupBefore,
+                                          const QVector<TimelineTrack::DetachedClip> *detached)
 {
     if (linkGroup <= 0 || !destTrack) return;
     // US-1203: a storyline insert on V1. The dropped clip's audio is taken out
@@ -12823,6 +12888,7 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
         int index;
         int target;
         ClipInfo clip;
+        bool detached = false;   // US-1403: already taken off destTrack
     };
     QVector<Member> moving;
     int anchorTrack = -1;
@@ -12848,12 +12914,8 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
                         && (tracks[t]->isLocked()
                             || (target < tracks.size() && tracks[target]->isLocked())))
                         target = t;
-                } else if (dragSourceIdx >= 0 && !intoStoryline) {
-                    target = qMax(0, t + destIdx - dragSourceIdx);
-                    // A locked track neither gives up nor takes a member.
-                    if (tracks[t]->isLocked()
-                        || (target < tracks.size() && tracks[target]->isLocked()))
-                        target = t;
+                } else {
+                    target = sameKindLinkTarget(tracks, t, destIdx, dragSourceIdx, intoStoryline);
                 }
                 // A member already on its target track stays where it is.
                 if (target != t)
@@ -12863,6 +12925,14 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     };
     collect(!destIsVideo);
     collect(destIsVideo);
+    // US-1403: the members acceptClipDrop took off destTrack move by the same
+    // rule (it checked that their target is another track).
+    if (detached) {
+        for (const TimelineTrack::DetachedClip &d : *detached)
+            moving.append({destIsVideo, destIdx, d.index,
+                           sameKindLinkTarget(sameTracks, destIdx, destIdx, dragSourceIdx, intoStoryline),
+                           d.clip, true});
+    }
     if (moving.isEmpty()) return;
 
     for (const Member &m : moving) {
@@ -12877,11 +12947,14 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     // RM-5 / US-1313: snapshot (after the appended tracks, which move no key)
     // before any member leaves its track; the carriers follow every moved
     // member in one by-uid remap at the end.
-    const TrackClipSnapshot before = snapshotTrackClips(this);
+    // US-1403: a same-group drop brings its snapshot from before the dropped
+    // clip and the detached members moved.
+    const TrackClipSnapshot before = sameGroupBefore ? *sameGroupBefore : snapshotTrackClips(this);
     // All members leave first (highest index of a track first), so no member
     // blocks the slot another one is moving to.
     bool leftV1 = false;
     for (int m = moving.size() - 1; m >= 0; --m) {
+        if (moving[m].detached) continue;   // US-1403: already off destTrack
         TimelineTrack *src = (moving[m].video ? m_videoTracks : m_audioTracks)[moving[m].track];
         src->removeClipPreservingDownstream(moving[m].index);
         leftV1 = leftV1 || src == v1;
@@ -12891,11 +12964,15 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
     // Each member's index on its target track, kept exact as later members land
     // on the same track before it (uid twins rule out a lookup by uid).
     QVector<int> placedIdx(moving.size(), -1);
+    // US-1403: the dropped clip's index on destTrack, kept exact the same way.
+    int droppedNow = droppedIdx;
     auto recordPlaced = [&](int m, int index) {
         for (int e = 0; e < m; ++e)
             if (moving[e].video == moving[m].video && moving[e].target == moving[m].target
                 && index <= placedIdx[e])
                 ++placedIdx[e];
+        if (moving[m].video == destIsVideo && moving[m].target == destIdx && index <= droppedNow)
+            ++droppedNow;
         placedIdx[m] = index;
     };
     for (int mi = 0; mi < moving.size(); ++mi) {
@@ -12939,8 +13016,25 @@ void Timeline::handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGrou
         const Member &m = moving[mi];
         if (!m.video) continue;
         videoMoved = true;
+        // US-1403: `before` predates the dropped clip's move, so only the keys
+        // known in its coordinates are named: the detached members here and the
+        // dropped clip below; the other members follow by uid.
+        if (sameGroupBefore && !m.detached) continue;
         explicitMoves.insert(trackMatteClipKey(m.track, m.index),
                              trackMatteClipKey(m.target, placedIdx[mi]));
+    }
+    const int dragSourceVideoIdx = m_videoTracks.indexOf(dragSource);
+    if (sameGroupBefore && destIsVideo && dragSourceVideoIdx >= 0 && droppedNow >= 0
+        && droppedNow < destTrack->clipCount()) {
+        // Uids are unique per track: the dropped clip's row in `before`.
+        const QString droppedUid = destTrack->clips().at(droppedNow).uid;
+        const auto &srcRow = sameGroupBefore->value(dragSourceVideoIdx);
+        for (int i = 0; !droppedUid.isEmpty() && i < srcRow.size(); ++i) {
+            if (srcRow[i].uid != droppedUid) continue;
+            explicitMoves.insert(trackMatteClipKey(dragSourceVideoIdx, i),
+                                 trackMatteClipKey(destIdx, droppedNow));
+            break;
+        }
     }
     if (videoMoved) ++m_crossTrackMoveRemapCount;
     remapCarriersByUid(this, before, explicitMoves);

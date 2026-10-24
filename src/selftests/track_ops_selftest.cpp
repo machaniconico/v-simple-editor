@@ -2480,6 +2480,220 @@ int runTrackOpsSelftest()
             gate(30, ok1 && ok2 && ok3 && ok4 && ok5 && ok6);
         }
     }
+    // US-1403 G31: storyline mode OFF, P (V2, group 1) dropped on V3 at 5 where Q (V3, group 1)
+    // sits: the drop lands, Q moves with the group to V4 (created) and Pa (A2) to A3, one link
+    // group, one undo point that puts back every clip and carrier. (i) Q's roto and timeRemap
+    // sidecar follow it to V4; (ii) R after Q on V3 keeps its roto; (iii) one undo; (iv) one
+    // clipKeysRemapped. Refused with nothing changed (as HEAD): (v) V4 locked; (vi) P from V4
+    // onto V1's Q (the target clamps to V1); (vii) ON, onto A1's member (into the storyline);
+    // an unrelated clip under the drop. (viii) V2 = P, R, P2 (P2 same group): R's and P2's roto
+    // stay on their own clips. HEAD: planDrop refuses the main drop. Mutation control for
+    // (viii): every moved video member named by its collect-time index.
+    {
+        auto rotoAt = [](const QString &key, int marker) {
+            RotoClipEntry e;
+            e.clipId = key;
+            e.path.points.resize(marker);
+            return e;
+        };
+        // Where roto marker n (n path points) sits, for markers 1..count.
+        auto rotoWhere = [](const Timeline &t, int count) {
+            QStringList parts;
+            const auto rotos = t.rotoEntries();
+            for (int marker = 1; marker <= count; ++marker) {
+                QString at = QStringLiteral("missing");
+                for (auto it = rotos.cbegin(); it != rotos.cend(); ++it)
+                    if (it.value().path.points.size() == marker) at = it.key();
+                parts.append(QStringLiteral("roto%1@%2").arg(marker).arg(at));
+            }
+            parts.append(QStringLiteral("rotoCount=%1").arg(rotos.size()));
+            return parts.join(QLatin1Char(' ')).toStdString();
+        };
+        auto groupOf = [](const TimelineTrack *track, const QString &name) {
+            const ClipInfo *c = track ? storyFind(track, name) : nullptr;
+            return c ? c->linkGroup : -1;
+        };
+        auto layoutAll = [](const Timeline &t) {
+            std::string s;
+            for (int v = 0; v < t.videoTrackCount(); ++v)
+                s += "V" + std::to_string(v + 1) + " [" + storyLayout(t.trackAt(false, v)) + "] ";
+            for (int a = 0; a < t.audioTrackCount(); ++a)
+                s += "A" + std::to_string(a + 1) + " [" + storyLayout(t.trackAt(true, a)) + "] ";
+            return s;
+        };
+        bool mainOk = false;
+        {
+            MainWindow window;
+            Timeline *t = window.m_timeline;
+            if (t) {
+                t->restoreFromProject(
+                    QVector<QVector<ClipInfo>>{{}, {storyClip("P", 3.0, 1, 5.0)},
+                                               {storyClip("Q", 3.0, 1, 5.0), storyClip("R", 2.0, 0, 4.0)}},
+                    QVector<QVector<ClipInfo>>{{}, {storyClip("Pa", 3.0, 1, 5.0)}}, 0.0, -1.0, -1.0, 100);
+                // Roto markers: Q 1, R 2, P 3. Q also carries a timeRemap sidecar.
+                t->setRotoEntries({{trackMatteClipKey(2, 0), rotoAt(trackMatteClipKey(2, 0), 1)},
+                                   {trackMatteClipKey(2, 1), rotoAt(trackMatteClipKey(2, 1), 2)},
+                                   {trackMatteClipKey(1, 0), rotoAt(trackMatteClipKey(1, 0), 3)}});
+                TimeRemapClipEntry remap;
+                remap.clipId = trackMatteClipKey(2, 0);
+                remap.curve.sourceFps = 10.0;
+                remap.curve.addKey(0.0, 0.0);
+                remap.curve.addKey(2.0, 1.0);
+                window.m_timeRemapClipEntries.clear();
+                window.m_timeRemapClipEntries.insert(remap.clipId, remap);
+                storyBaseline(*t);
+                auto timeRemapWhere = [&window]() {
+                    QStringList parts;
+                    for (auto it = window.m_timeRemapClipEntries.cbegin(); it != window.m_timeRemapClipEntries.cend(); ++it)
+                        parts.append(QStringLiteral("%1(%2,keys=%3)").arg(it.key(), it.value().clipId)
+                                         .arg(it.value().curve.keys.size()));
+                    parts.sort();
+                    return parts.join(QLatin1Char(',')).toStdString();
+                };
+                const std::string layoutBefore = layoutAll(*t);
+                const std::string rotoBefore = rotoWhere(*t, 3);
+                const std::string remapBefore = timeRemapWhere();
+                const QString pUid = storyFind(t->trackAt(false, 1), "P") ? storyFind(t->trackAt(false, 1), "P")->uid : QString();
+                const auto serial = t->undoManager()->saveSerial();
+                QSignalSpy keysSpy(t, &Timeline::clipKeysRemapped);
+                const bool accepted = storyClipDrop(t->trackAt(false, 1), 0, t->trackAt(false, 2), 5.0);
+                const int keysRemapped = keysSpy.count();
+                const int videoCount = t->videoTrackCount();
+                const int audioCount = t->audioTrackCount();
+                const int v3Count = t->trackAt(false, 2)->clipCount();
+                const ClipInfo *pAfter = storyFind(t->trackAt(false, 2), "P");
+                const QString pUidAfter = pAfter ? pAfter->uid : QString();
+                const bool moved = accepted && videoCount == 4 && audioCount == 3
+                    && t->trackAt(false, 1)->clipCount() == 0 && v3Count == 2
+                    && t->trackAt(false, 2)->clips().at(0).displayName == QStringLiteral("P")
+                    && storyAt(t->trackAt(false, 2), "P", 5.0) && storyAt(t->trackAt(false, 2), "R", 12.0)
+                    && t->trackAt(false, 3)->clipCount() == 1 && storyAt(t->trackAt(false, 3), "Q", 5.0)
+                    && t->trackAt(true, 1)->clipCount() == 0 && t->trackAt(true, 2)->clipCount() == 1
+                    && storyAt(t->trackAt(true, 2), "Pa", 5.0) && !pUid.isEmpty() && pUidAfter == pUid;
+                const int group = groupOf(t->trackAt(false, 2), "P");
+                const bool grouped = group == 1 && videoCount == 4 && groupOf(t->trackAt(false, 3), "Q") == group
+                    && audioCount == 3 && groupOf(t->trackAt(true, 2), "Pa") == group;
+                const std::string layoutAfter = layoutAll(*t);
+                const std::string rotoAfter = rotoWhere(*t, 3);
+                const std::string remapAfter = timeRemapWhere();
+                // P V2:0 -> V3:0, Q V3:0 -> V4:0, R stays V3:1.
+                const std::string rotoExpected = "roto1@3:0 roto2@2:1 roto3@2:0 rotoCount=3";
+                const std::string remapExpected = "3:0(3:0,keys=2)";
+                const bool iOk = rotoAfter == rotoExpected && remapAfter == remapExpected;
+                const bool iiOk = rotoAfter.find("roto2@2:1") != std::string::npos;
+                const bool ivOk = keysRemapped == 1;
+                const bool oneUndo = t->undoManager()->saveSerial() == serial + 1;
+                t->undo();
+                const std::string layoutUndone = layoutAll(*t);
+                const std::string rotoUndone = rotoWhere(*t, 3);
+                const std::string remapUndone = timeRemapWhere();
+                const bool iiiOk = oneUndo && layoutUndone == layoutBefore && rotoUndone == rotoBefore
+                    && remapUndone == remapBefore;
+                mainOk = moved && grouped && iOk && iiOk && iiiOk && ivOk;
+                std::fprintf(stderr, "[track-ops] G31 main: storylineMode=%d accepted=%d videoTracks=%d audioTracks=%d "
+                             "V3 clipCount=%d (expect 2) P uid '%s' -> V3 '%s'\n"
+                             "[track-ops] G31 main: before %s\n[track-ops] G31 main: after  %s\n"
+                             "[track-ops] G31 main: (expect V2 [] V3 [P@5.00 R@12.00] V4 [Q@5.00] A3 [Pa@5.00]) "
+                             "moved=%d group=%d grouped=%d\n",
+                             t->storylineMode(), accepted, videoCount, audioCount, v3Count,
+                             pUid.toUtf8().constData(), pUidAfter.toUtf8().constData(), layoutBefore.c_str(),
+                             layoutAfter.c_str(), moved, group, grouped);
+                std::fprintf(stderr, "[track-ops] G31 (i): roto before [%s] after [%s] expect [%s]; timeRemap before [%s] "
+                             "after [%s] expect [%s] -> %d\n[track-ops] G31 (ii): R roto2 stays on V3:1 -> %d\n"
+                             "[track-ops] G31 (iii): serial +%d (expect +1) undone layout [%s] roto [%s] timeRemap [%s] "
+                             "-> %d\n[track-ops] G31 (iv): clipKeysRemapped=%d (expect 1) -> %d\n",
+                             rotoBefore.c_str(), rotoAfter.c_str(), rotoExpected.c_str(), remapBefore.c_str(),
+                             remapAfter.c_str(), remapExpected.c_str(), iOk, iiOk,
+                             int(t->undoManager()->saveSerial() - serial), layoutUndone.c_str(), rotoUndone.c_str(),
+                             remapUndone.c_str(), iiiOk, keysRemapped, ivOk);
+            } else {
+                std::fprintf(stderr, "[track-ops] G31 main: mainTimeline missing\n");
+            }
+        }
+        // A drop that must be refused leaves clips, carriers and the undo stack as they were.
+        auto refused = [&](const char *label, Timeline &t, TimelineTrack *src, int srcIdx, TimelineTrack *dest,
+                           double sec) {
+            storyBaseline(t);
+            const std::string layoutBefore = layoutAll(t);
+            const auto serial = t.undoManager()->saveSerial();
+            const bool accepted = storyClipDrop(src, srcIdx, dest, sec);
+            const std::string layoutAfter = layoutAll(t);
+            const bool ok = !accepted && layoutAfter == layoutBefore && t.undoManager()->saveSerial() == serial;
+            std::fprintf(stderr, "[track-ops] G31 %s: storylineMode=%d accepted=%d serial +%d layout before [%s] "
+                         "after [%s] (expect refused, unchanged, +0) -> %d\n", label, t.storylineMode(), accepted,
+                         int(t.undoManager()->saveSerial() - serial), layoutBefore.c_str(), layoutAfter.c_str(), ok);
+            return ok;
+        };
+        bool vOk = false, viOk = false, viiOk = false, unrelatedOk = false;
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{}, {storyClip("P", 3.0, 1, 5.0)}, {storyClip("Q", 3.0, 1, 5.0)}, {}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Pa", 3.0, 1, 5.0)}}, 0.0, -1.0, -1.0, 100);
+            t.trackAt(false, 3)->setLocked(true);
+            vOk = refused("(v) V4 locked", t, t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{storyClip("Q", 3.0, 1, 5.0)}, {}, {}, {storyClip("P", 3.0, 1, 5.0)}},
+                QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+            viOk = refused("(vi) V4 -> V1 clamp", t, t.trackAt(false, 3), 0, t.trackAt(false, 0), 5.0);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+                                 QVector<QVector<ClipInfo>>{{storyClip("Qa", 3.0, 1, 5.0)}, {storyClip("Pa", 3.0, 1, 5.0)}},
+                                 0.0, -1.0, -1.0, 100);
+            t.setStorylineMode(true);
+            viiOk = refused("(vii) ON A2 -> A1", t, t.trackAt(true, 1), 0, t.trackAt(true, 0), 5.0);
+        }
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{}, {storyClip("P", 3.0, 1, 5.0)},
+                                           {storyClip("U", 3.0, 0, 5.0), storyClip("Q", 2.0, 1, 1.0)}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Pa", 3.0, 1, 5.0)}}, 0.0, -1.0, -1.0, 100);
+            unrelatedOk = refused("unrelated U under the drop", t, t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+        }
+        bool viiiOk = false;
+        {
+            Timeline t;
+            t.restoreFromProject(
+                QVector<QVector<ClipInfo>>{{},
+                                           {storyClip("P", 3.0, 1, 5.0), storyClip("R", 2.0, 0, 2.0),
+                                            storyClip("P2", 2.0, 1, 2.0)},
+                                           {storyClip("Q", 3.0, 1, 5.0)}},
+                QVector<QVector<ClipInfo>>{{}, {storyClip("Pa", 3.0, 1, 5.0)}}, 0.0, -1.0, -1.0, 100);
+            // Roto markers: P 1, R 2, P2 3, Q 4.
+            t.setRotoEntries({{trackMatteClipKey(1, 0), rotoAt(trackMatteClipKey(1, 0), 1)},
+                              {trackMatteClipKey(1, 1), rotoAt(trackMatteClipKey(1, 1), 2)},
+                              {trackMatteClipKey(1, 2), rotoAt(trackMatteClipKey(1, 2), 3)},
+                              {trackMatteClipKey(2, 0), rotoAt(trackMatteClipKey(2, 0), 4)}});
+            storyBaseline(t);
+            const std::string layoutBefore = layoutAll(t);
+            const std::string rotoBefore = rotoWhere(t, 4);
+            const bool accepted = storyClipDrop(t.trackAt(false, 1), 0, t.trackAt(false, 2), 5.0);
+            const std::string layoutAfter = layoutAll(t);
+            const std::string rotoAfter = rotoWhere(t, 4);
+            // P V2:0 -> V3:0, R V2:1 -> V2:0, P2 V2:2 -> V3:1 (appended, its target V3 is taken
+            // at 5), Q V3:0 -> V4:0.
+            const bool placed = accepted && t.videoTrackCount() == 4
+                && t.trackAt(false, 1)->clipCount() == 1 && storyAt(t.trackAt(false, 1), "R", 10.0)
+                && t.trackAt(false, 2)->clipCount() == 2 && t.trackAt(false, 2)->clips().at(0).displayName == "P"
+                && t.trackAt(false, 2)->clips().at(1).displayName == "P2" && storyAt(t.trackAt(false, 2), "P", 5.0)
+                && t.trackAt(false, 3)->clipCount() == 1 && storyAt(t.trackAt(false, 3), "Q", 5.0);
+            const std::string rotoExpected = "roto1@2:0 roto2@1:0 roto3@2:1 roto4@3:0 rotoCount=4";
+            viiiOk = placed && rotoAfter == rotoExpected;
+            std::fprintf(stderr, "[track-ops] G31 (viii): storylineMode=%d accepted=%d before [%s] after [%s] placed=%d\n"
+                         "[track-ops] G31 (viii): roto before [%s] after [%s] expect [%s] (R roto2 on R, P2 roto3 on P2)"
+                         " -> %d\n", t.storylineMode(), accepted, layoutBefore.c_str(), layoutAfter.c_str(), placed,
+                         rotoBefore.c_str(), rotoAfter.c_str(), rotoExpected.c_str(), viiiOk);
+        }
+        std::fprintf(stderr, "[track-ops] G31: main=%d (v)=%d (vi)=%d (vii)=%d unrelated=%d (viii)=%d\n", mainOk, vOk,
+                     viOk, viiOk, unrelatedOk, viiiOk);
+        gate(31, mainOk && vOk && viOk && viiOk && unrelatedOk && viiiOk);
+    }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

@@ -584,7 +584,16 @@ public:
         double newLeadIn = 0.0;
         double nextLeadInDelta = 0.0;
     };
-    DropPlan planDrop(double dropTime, double clipDuration) const;
+    // US-1403: ignoreIndexes (null: none) are planned as if they were not on the
+    // track (their span is free, insertIdx counts only the other clips).
+    DropPlan planDrop(double dropTime, double clipDuration,
+                      const QSet<int> *ignoreIndexes = nullptr) const;
+    // US-1403: a member of the dropped clip's link group taken off the drop
+    // track (index: its position there before anything moved).
+    struct DetachedClip {
+        int index = -1;
+        ClipInfo clip;
+    };
 
     void setSnapEnabled(bool enabled) { m_snapEnabled = enabled; }
     bool snapEnabled() const { return m_snapEnabled; }
@@ -701,6 +710,13 @@ signals:
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
+    // US-1403: in place of clipMovedAcrossTracks + crossTrackDropped when the
+    // slot was held by members of the dropped clip's link group: they were taken
+    // off this track (detached) after `before` was taken and before the clip
+    // moved, so Timeline moves them with the group and remaps the carriers once.
+    void sameGroupCrossTrackDropped(int clipIndex, int linkGroup, double dropTime, TimelineTrack *src,
+                                    const TrackClipSnapshot &before,
+                                    const QVector<TimelineTrack::DetachedClip> &detached);
     // US-1214: splitClipAt split the clip with uid leftUid at its local second
     // splitLocalSec; the right piece got rightUid.
     void clipSplit(const QString &leftUid, const QString &rightUid, double splitLocalSec);
@@ -1056,6 +1072,13 @@ public:
     // Track access for SnapEngine collection
     const QVector<TimelineTrack *> &videoTracks() const { return m_videoTracks; }
     const QVector<TimelineTrack *> &audioTracks() const { return m_audioTracks; }
+    // US-1313 / US-1403: the track a link-group member on tracks[memberTrack]
+    // moves to when a clip of the same kind is dropped from tracks[dragSourceIdx]
+    // onto tracks[destIdx]: the same offset, clamped at 0; it stays (returns
+    // memberTrack) with an unknown source, into the storyline, or when either
+    // track is locked. Shared by handleCrossTrackLinkedDrop and acceptClipDrop.
+    static int sameKindLinkTarget(const QVector<TimelineTrack *> &tracks, int memberTrack, int destIdx,
+                                  int dragSourceIdx, bool intoStoryline);
 
     // EPIC-7/NEST-1: multiple named sequences in a project. The active
     // sequence remains mirrored into the legacy video/audio track arrays so
@@ -1934,8 +1957,13 @@ private:
     void applyLinkedTrimDelta(double deltaSec);
     // US-1313: moves every other member of linkGroup after the clip at
     // droppedIdx of destTrack (from dragSource) moved; one by-uid carrier remap.
+    // US-1403: with sameGroupBefore / detached (sameGroupCrossTrackDropped), the
+    // snapshot is the caller's (taken before any clip moved) and the detached
+    // members of destTrack move too.
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
-                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr);
+                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr,
+                                    const TrackClipSnapshot *sameGroupBefore = nullptr,
+                                    const QVector<TimelineTrack::DetachedClip> *detached = nullptr);
     // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
     // moves it there through TimelineTrack::acceptClipDrop (one undo point).
     // Only a timeline clip of the band's kind is accepted.
