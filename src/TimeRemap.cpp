@@ -82,6 +82,23 @@ double TimeRemapCurve::srcTimeAt(double outTime) const
 }
 
 // ---------------------------------------------------------------------------
+// TimeRemapCurve::sliced (US-1501)
+// ---------------------------------------------------------------------------
+TimeRemapCurve TimeRemapCurve::sliced(double fromOut, double toOut, double srcBase) const
+{
+    TimeRemapCurve piece;
+    piece.blendMode = blendMode;
+    piece.sourceFps = sourceFps;
+    piece.keys.append({0.0, srcTimeAt(fromOut) - srcBase});
+    for (const TimeRemapKey& k : keys) {
+        if (k.outTime > fromOut && k.outTime < toOut)
+            piece.keys.append({k.outTime - fromOut, k.srcTime - srcBase});
+    }
+    piece.keys.append({toOut - fromOut, srcTimeAt(toOut) - srcBase});
+    return piece;
+}
+
+// ---------------------------------------------------------------------------
 // TimeRemapCurve::toJson / fromJson
 // ---------------------------------------------------------------------------
 QJsonObject TimeRemapCurve::toJson() const

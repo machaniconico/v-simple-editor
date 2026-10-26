@@ -88,6 +88,38 @@ struct SpeedRamp {
     // sourceToTimelineUs(sourceDuration) + holds-trailing-speed.
     qint64 outputDuration(qint64 sourceDuration) const;
 
+    // ---- split pieces (US-1501) ----
+
+    // The ramp of one split piece that covers ramp time [fromUs, toUs] of
+    // this ramp. Piece time is tau' = (tau - fromUs) * timeScale and piece
+    // speeds are v' = v * speedScale, so the piece consumes the same source
+    // as this ramp over [fromUs, toUs] starting from 0. Keyframes are built
+    // directly (no 1 ms de-duplication): a key at piece time 0, the keys
+    // inside the range and a key at the piece end. Returns false (and leaves
+    // *out alone) when a piece speed falls outside [kMinSpeed, kMaxSpeed] or
+    // fromUs lies before the first keyframe (the source does not advance
+    // there, which no speed in range can express).
+    bool sliced(qint64 fromUs, qint64 toUs, double timeScale, double speedScale,
+                SpeedRamp *out) const;
+
+    struct CurvePoint {
+        double localSec = 0.0;   // seconds from the start of the range
+        double sourceSec = 0.0;  // min(source(tau), limitSec), in-relative
+    };
+
+    // Piecewise-linear approximation of g(t) = min(source(t * speed),
+    // limitSec) over clip-local seconds [fromSec, toSec] (source in
+    // seconds, evaluated in double precision). Keys sit at both ends, at
+    // every keyframe and at the time g first reaches limitSec; each span
+    // between them is cut into n = max(1, ceil(sqrt(speed * |dv| * dt /
+    // (8 * eps)))) equal parts so the interpolation error stays <= eps.
+    // eps starts at 1e-5 s and doubles while the curve has more than 4096
+    // keys, stopping once every span has n = 1. *epsilonOut receives the
+    // final eps.
+    QVector<CurvePoint> approximateSourceCurve(double fromSec, double toSec,
+                                               double speed, double limitSec,
+                                               double *epsilonOut = nullptr) const;
+
     // ---- mutators ----
 
     // Insert a new keyframe (or replace if one already exists within 1 ms

@@ -1899,25 +1899,166 @@ void TimelineTrack::moveClip(int fromIndex, int toIndex)
     emit clipMoved(fromIndex, toIndex); emit modified();
 }
 
+namespace {
+
+// US-1501 consumed-interval split (rule (73)) of a clip whose source position
+// is not linear in local time. Each piece covers local [a, b] of the clip and
+// keeps exactly the source it consumes there: with g(t) the source consumed
+// before the reverse fold (in [0, out - in]) and [mn, mx] its range on the
+// piece, the piece is [in + mn, in + mx] (reversed [out - mx, out - mn]) at
+// speed' = (mx - mn) / (b - a), so both halves map every local second to the
+// source of the unsplit clip and keep the lengths L / D - L. A piece whose
+// source does not move (mx - mn < 1 us * speed) keeps the speed and holds F
+// with a one-key remap; a ramp piece whose speeds leave [0.1, 10] becomes a
+// time-remap curve. Audio tracks never get a remap (AudioMixer does not read
+// it): there a held or out-of-range forward piece plays its source 1:1 from
+// min(in + mn, out - len * speed), and an out-of-range reversed piece plays
+// the mirrored range at speed'.
+bool splitClipByConsumedSource(const ClipInfo &clip, double localSec, bool audioTrack,
+                               ClipInfo *left, ClipInfo *right)
+{
+    constexpr double kSplitEps = 1e-6;
+    const double inSec = clip.inPoint;
+    const double outSec = (clip.outPoint > 0.0) ? clip.outPoint : clip.duration;
+    const double totalSec = clip.effectiveDuration();
+    if (!(outSec > inSec) || !std::isfinite(totalSec) || localSec <= kSplitEps
+        || localSec >= totalSec - kSplitEps) {
+        return false;
+    }
+    const double speed = (clip.speed > 0.0) ? clip.speed : 1.0;
+    const double rangeSec = outSec - inSec;
+    const bool useRemap = !audioTrack && !clip.timeRemapCurve.keys.isEmpty();
+    ClipInfo mapping = clip;
+    if (!useRemap)
+        mapping.timeRemapCurve = timeremap::TimeRemapCurve{};
+    const auto consumedSec = [&](double t) {
+        const double sourceSec = mapping.sourceSecondAtLocalTime(t);
+        return qBound(0.0, clip.reversed ? outSec - sourceSec : sourceSec - inSec, rangeSec);
+    };
+
+    const auto makePiece = [&](double fromSec, double toSec, ClipInfo *out) {
+        const double lenSec = toSec - fromSec;
+        double mn = qMin(consumedSec(fromSec), consumedSec(toSec));
+        double mx = qMax(consumedSec(fromSec), consumedSec(toSec));
+        if (useRemap) {
+            for (const timeremap::TimeRemapKey &key : clip.timeRemapCurve.keys) {
+                if (key.outTime <= fromSec || key.outTime >= toSec)
+                    continue;
+                const double keySec = qBound(0.0, key.srcTime, rangeSec);
+                mn = qMin(mn, keySec);
+                mx = qMax(mx, keySec);
+            }
+        }
+        const double heldSourceSec = mapping.sourceSecondAtLocalTime(fromSec);
+
+        ClipInfo piece = clip;
+        piece.speedRamp = speedramp::SpeedRamp::identity();
+        piece.timeRemapCurve = timeremap::TimeRemapCurve{};
+        const bool held = mx - mn < 1e-6 * speed;
+        bool plainOneToOne = false;
+        if (!held) {
+            piece.speed = (mx - mn) / lenSec;
+            piece.inPoint = clip.reversed ? outSec - mx : inSec + mn;
+            piece.outPoint = clip.reversed ? outSec - mn : inSec + mx;
+            if (useRemap) {
+                piece.speedRamp = clip.speedRamp;
+                piece.timeRemapCurve = clip.timeRemapCurve.sliced(fromSec, toSec, mn);
+            } else if (!clip.speedRamp.sliced(qRound64(fromSec * speed * 1'000'000.0),
+                                              qRound64(toSec * speed * 1'000'000.0),
+                                              piece.speed / speed, speed / piece.speed,
+                                              &piece.speedRamp)) {
+                if (audioTrack) {
+                    plainOneToOne = !clip.reversed;
+                } else {
+                    timeremap::TimeRemapCurve curve;
+                    curve.blendMode = timeremap::FrameBlendMode::NearestFrame;
+                    curve.sourceFps = 0.0;
+                    const QVector<speedramp::SpeedRamp::CurvePoint> points =
+                        clip.speedRamp.approximateSourceCurve(fromSec, toSec, speed, rangeSec);
+                    for (const speedramp::SpeedRamp::CurvePoint &point : points)
+                        curve.keys.append({point.localSec, point.sourceSec - mn});
+                    piece.timeRemapCurve = curve;
+                }
+            }
+        }
+        if (held || plainOneToOne) {
+            const double spanSec = lenSec * speed;
+            piece.speed = clip.speed;
+            piece.speedRamp = speedramp::SpeedRamp::identity();
+            piece.timeRemapCurve = timeremap::TimeRemapCurve{};
+            if (clip.reversed) {
+                piece.outPoint = qMax(outSec - mn, inSec + spanSec);
+                piece.inPoint = piece.outPoint - spanSec;
+            } else {
+                piece.inPoint = qMin(inSec + mn, outSec - spanSec);
+                piece.outPoint = piece.inPoint + spanSec;
+            }
+            if (held && !audioTrack) {
+                timeremap::TimeRemapCurve hold;
+                hold.blendMode = useRemap ? clip.timeRemapCurve.blendMode
+                                          : timeremap::FrameBlendMode::NearestFrame;
+                hold.sourceFps = useRemap ? clip.timeRemapCurve.sourceFps : 0.0;
+                hold.addKey(0.0, clip.reversed ? piece.outPoint - heldSourceSec
+                                               : heldSourceSec - piece.inPoint);
+                piece.timeRemapCurve = hold;
+            }
+        }
+        if (!(piece.inPoint < piece.outPoint))
+            return false;
+        *out = piece;
+        return true;
+    };
+    return makePiece(0.0, localSec, left) && makePiece(localSec, totalSec, right);
+}
+
+} // namespace
+
 void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
     ClipInfo &original = m_clips[index];
     double effectiveStart = original.inPoint;
     double effectiveEnd = (original.outPoint > 0.0) ? original.outPoint : original.duration;
-    // A reversed clip with a uniform speed plays its source from out down to
-    // in, so local second L sits at source out - L * speed: the left half keeps
-    // [split, out] and the right half takes [in, split]. Ramped / remapped
-    // reversed clips keep the forward formula (not handled yet).
-    const bool reversedUniform = original.reversed && original.speedRamp.isIdentity()
-        && original.timeRemapCurve.keys.isEmpty();
-    double splitPoint = reversedUniform ? effectiveEnd - localSeconds * original.speed
-                                        : effectiveStart + localSeconds * original.speed;
-    constexpr double kSplitEps = 1e-6;
-    if (splitPoint <= effectiveStart + kSplitEps || splitPoint >= effectiveEnd - kSplitEps) return;
+    // US-1501: speed-ramped / time-remapped clips are cut by the consumed
+    // source (splitClipByConsumedSource). Audio tracks follow the ramp only
+    // where AudioMixer reads it (atempo or reversed) and never the remap.
+    const bool hasRamp = !original.speedRamp.isIdentity();
+    const bool hasRemap = !original.timeRemapCurve.keys.isEmpty();
+    const bool consumedRule = m_isAudioTrack
+        ? hasRamp && (original.atempoEnabled || original.reversed)
+        : hasRamp || hasRemap;
     ClipInfo secondHalf = original;
-    secondHalf.inPoint = reversedUniform ? effectiveStart : splitPoint;
-    secondHalf.outPoint = reversedUniform ? splitPoint : effectiveEnd;
+    if (consumedRule) {
+        ClipInfo firstHalf = original;
+        if (!splitClipByConsumedSource(original, localSeconds, m_isAudioTrack,
+                                       &firstHalf, &secondHalf)) {
+            return;
+        }
+        original = firstHalf;
+    } else {
+        // A reversed clip with a uniform speed plays its source from out down
+        // to in, so local second L sits at source out - L * speed: the left
+        // half keeps [split, out] and the right half takes [in, split]. Only
+        // uniform clips reach here (an audio clip's ramp without atempo, or
+        // its remap, is not played; the remap is dropped below).
+        const bool reversedUniform = original.reversed;
+        double splitPoint = reversedUniform ? effectiveEnd - localSeconds * original.speed
+                                            : effectiveStart + localSeconds * original.speed;
+        constexpr double kSplitEps = 1e-6;
+        if (splitPoint <= effectiveStart + kSplitEps || splitPoint >= effectiveEnd - kSplitEps) return;
+        secondHalf.inPoint = reversedUniform ? effectiveStart : splitPoint;
+        secondHalf.outPoint = reversedUniform ? splitPoint : effectiveEnd;
+        if (reversedUniform) {
+            original.inPoint = splitPoint;
+            original.outPoint = effectiveEnd;
+        } else {
+            original.outPoint = splitPoint;
+        }
+        if (hasRemap) {
+            original.timeRemapCurve = timeremap::TimeRemapCurve{};
+            secondHalf.timeRemapCurve = timeremap::TimeRemapCurve{};
+        }
+    }
     secondHalf.leadInSec = 0.0;
     // The cut creates a hard edge between the halves: the right half's left
     // edge is no longer the original's leadIn, and the left half's right edge
@@ -1927,12 +2068,6 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);
-    if (reversedUniform) {
-        original.inPoint = splitPoint;
-        original.outPoint = effectiveEnd;
-    } else {
-        original.outPoint = splitPoint;
-    }
     original.trailOut = Transition{};
     const QString leftUid = original.uid;
     m_clips.insert(index + 1, secondHalf);
@@ -6096,6 +6231,10 @@ bool Timeline::freezeFrameAtPlayhead(TimelineTrack *track, int clipIndex)
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     int holdIndex = clipIndex;
     const double localSeconds = qBound(0.0, m_playheadPos - clipStart, clipEnd - clipStart);
+    // US-1501: hold the source frame under the playhead (F), whatever piece
+    // of the source the right half was cut to.
+    const double heldSourceSec = beforeClips[clipIndex].sourceSecondAtLocalTime(
+        localSeconds > kEps ? localSeconds : 0.0);
     if (localSeconds > kEps) {
         const int beforeCount = track->clipCount();
         track->splitClipAt(clipIndex, localSeconds, false);
@@ -6114,7 +6253,10 @@ bool Timeline::freezeFrameAtPlayhead(TimelineTrack *track, int clipIndex)
     holdCurve.sourceFps = hadTimeRemap && updated[holdIndex].timeRemapCurve.sourceFps > 0.0
         ? updated[holdIndex].timeRemapCurve.sourceFps
         : 0.0;
-    holdCurve.addKey(0.0, 0.0);
+    const ClipInfo &held = updated[holdIndex];
+    const double heldOutSec = (held.outPoint > 0.0) ? held.outPoint : held.duration;
+    holdCurve.addKey(0.0, held.reversed ? heldOutSec - heldSourceSec
+                                        : heldSourceSec - held.inPoint);
     updated[holdIndex].timeRemapCurve = holdCurve;
     track->setClips(updated);
     track->setSelectedClip(holdIndex);
