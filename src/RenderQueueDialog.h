@@ -44,7 +44,7 @@ public:
     // Optional: reuse an externally-owned queue. The dialog takes ownership
     // of signal connections only; lifetime stays with the caller. MainWindow
     // passes ensureRenderQueue() so dialog jobs share the GUI / MCP queue (and
-    // its export notification); "停止" then stops that whole queue. The private
+    // its export notification); "キュー全体を停止" then stops that whole queue. The private
     // queue made in the constructor stays the default for a standalone dialog.
     void setQueue(RenderQueue *queue);
 
@@ -70,6 +70,7 @@ public:
 private slots:
     void onAddJobClicked();
     void onRemoveJobClicked();
+    void onCancelJobClicked();
     void onStartClicked();
     void onStopClicked();
     void onJobsChanged();
@@ -96,6 +97,7 @@ private:
     QTableWidget      *m_table          = nullptr;
     QPushButton       *m_addBtn         = nullptr;
     QPushButton       *m_removeBtn      = nullptr;
+    QPushButton       *m_cancelJobBtn   = nullptr;
     QPushButton       *m_startBtn       = nullptr;
     QPushButton       *m_stopBtn        = nullptr;
     QPushButton       *m_closeBtn       = nullptr;
