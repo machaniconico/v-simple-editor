@@ -5,6 +5,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "SelftestRegistry.h"
 
 #if __has_include("../ImportHubDialog.h")
 #include "../ImportHubDialog.h"
@@ -723,5 +724,7 @@ int runMainWindowLifecycleSelftest()
         .arg(passed)
         .arg(failed)
         .arg(skipped);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, skipped);
     return failed == 0 ? 0 : failed;
 }
