@@ -1143,7 +1143,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "batchexport",       "VEDITOR_BATCHEXPORT_SELFTEST",        runBatchExportSelftest,        true,
       "Batch export pipeline smoke (queue manager + per-item preset binding)" },
     { "batchexport-e2e",   "VEDITOR_BATCHEXPORT_E2E_SELFTEST",    runBatchExportE2ESelftest,    true,
-      "Batch export dialog task bridge: live Timeline/source tagging, fps/config precedence, and pause signal contract, user preset loudness resolution, timeline audio mix and tempFiles cleanup (23 gates)" },
+      "Batch export dialog task bridge: live Timeline/source tagging, fps/config precedence, and pause signal contract, user preset loudness resolution, timeline audio mix and tempFiles cleanup (24 gates)" },
     { "chroma",            "VEDITOR_CHROMA_SELFTEST",             runChromaSelftest,             true,
       "Chroma key (greenscreen) module smoke (spill-suppress + matte refine)" },
     { "audiorestore",      "VEDITOR_AUDIORESTORE_SELFTEST",       runAudioRestoreSelftest,       true,
