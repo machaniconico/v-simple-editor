@@ -272,9 +272,13 @@ QJsonObject ShapeModifiers::toJson() const
         obj["zigZag"] = QJsonObject{{"enabled", true}, {"size", zigZag.size},
                                     {"ridges", zigZag.ridgesPerSegment},
                                     {"smooth", zigZag.smooth}};
-    if (wigglePath.enabled)
-        obj["wigglePath"] = QJsonObject{{"enabled", true}, {"amplitude", wigglePath.amplitude},
-                                        {"detail", wigglePath.detail}, {"seed", wigglePath.seed}};
+    if (wigglePath.enabled) {
+        QJsonObject wp{{"enabled", true}, {"amplitude", wigglePath.amplitude},
+                       {"detail", wigglePath.detail}, {"seed", wigglePath.seed}};
+        if (wigglePath.wigglesPerSecond != 0.0)
+            wp["wigglesPerSecond"] = wigglePath.wigglesPerSecond;
+        obj["wigglePath"] = wp;
+    }
     return obj;
 }
 
@@ -306,6 +310,7 @@ ShapeModifiers ShapeModifiers::fromJson(const QJsonObject &obj)
     m.wigglePath.amplitude = qBound(-1000000.0, wp["amplitude"].toDouble(5.0), 1000000.0);
     m.wigglePath.detail = qBound(1, wp["detail"].toInt(4), 100);
     m.wigglePath.seed = wp["seed"].toInt(1);
+    m.wigglePath.wigglesPerSecond = qBound(0.0, wp["wigglesPerSecond"].toDouble(0.0), 100.0);
     return m;
 }
 
@@ -659,7 +664,8 @@ QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment,
     return result;
 }
 
-QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, int seed)
+QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, int seed,
+                        double timeSec, double wigglesPerSecond)
 {
     if (!std::isfinite(amplitude)) return path;
     const int parts = qBound(1, detail, 100);
@@ -669,6 +675,14 @@ QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, 
     params.positionAmplitude = QPointF(amplitude, amplitude);
     params.octaves = 2;
     params.seed = static_cast<unsigned int>(seed);
+    // Time-varying part: 0.5 * (n2(counter * K + t * wps) - n2(counter * K)) on top of the
+    // static n(counter), so total amplitude stays <= 2A and t == 0 / wps == 0 is the static path.
+    // n2 is the separate series p2 = p with a shifted seed, so it does not replay the static pattern.
+    wiggle::WiggleParams params2 = params;
+    params2.seed = params.seed ^ 0x9E3779B9u;
+    constexpr double kTimeStride = 1024.0;
+    const double timeShift = std::isfinite(timeSec) && std::isfinite(wigglesPerSecond)
+        ? timeSec * wigglesPerSecond : 0.0;
     QPainterPath result;
     result.setFillRule(path.fillRule());
     int counter = 0; // running vertex index = noise time, shared across subpaths
@@ -683,8 +697,13 @@ QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, 
                 pts.append(a + (b - a) * (double(k) / parts));
         }
         if (!poly.closed) pts.append(p.last());
-        for (QPointF &pt : pts)
-            pt += wiggle::evaluate(params, double(counter++)).positionOffset;
+        for (QPointF &pt : pts) {
+            pt += wiggle::evaluate(params, double(counter)).positionOffset;
+            if (timeShift != 0.0)
+                pt += 0.5 * (wiggle::evaluate(params2, double(counter) * kTimeStride + timeShift).positionOffset
+                             - wiggle::evaluate(params2, double(counter) * kTimeStride).positionOffset);
+            ++counter;
+        }
         appendPoly(result, pts, poly.closed, false);
     }
     return result;
@@ -745,7 +764,7 @@ QPainterPath ShapeLayer::trimPathRange(const QPainterPath &path, double startPct
     return result;
 }
 
-void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
+void ShapeLayer::renderShape(const Shape &shape, QPainter &painter, double timeSec)
 {
     painter.save();
 
@@ -763,7 +782,8 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
     }
     if (shape.modifiers.wigglePath.enabled) {
         const auto &w = shape.modifiers.wigglePath;
-        path = shapemod::wigglePath(path, w.amplitude, w.detail, w.seed);
+        path = shapemod::wigglePath(path, w.amplitude, w.detail, w.seed, timeSec,
+                                    w.wigglesPerSecond);
     }
     if (shape.modifiers.trim.enabled) {
         const auto &trim = shape.modifiers.trim;
@@ -822,7 +842,8 @@ QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
 }
 
 QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
-                                       const QSize &canvasSize)
+                                       const QSize &canvasSize,
+                                       double timeSec)
 {
     if (canvasSize.isEmpty())
         return QImage();
@@ -835,7 +856,7 @@ QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
     for (const Shape &shape : shapes)
-        renderShape(shape, painter);
+        renderShape(shape, painter, timeSec);
 
     painter.end();
     return image;

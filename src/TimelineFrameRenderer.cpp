@@ -1768,7 +1768,7 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              bool sampleFromLeftBoundary)
 {
     if (!clip.shapes.isEmpty())
-        return ShapeLayer::renderShapesToImage(clip.shapes, outSize);
+        return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
 
     // `sampleFromLeftBoundary` carries an ancestor sequence's source-time
     // direction. Compose it with this clip's resolved local direction. The

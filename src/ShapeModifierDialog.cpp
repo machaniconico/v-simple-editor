@@ -104,7 +104,7 @@ ShapeModifierDialog::ShapeModifierDialog(const ShapeModifiers &initial, QWidget 
     zigForm->addRow(m_zigSmooth);
     contentLayout->addWidget(zigBox);
 
-    auto *wiggleBox = new QGroupBox(QStringLiteral("パスのウィグル (静的)"), this);
+    auto *wiggleBox = new QGroupBox(QStringLiteral("パスのウィグル"), this);
     auto *wiggleForm = new QFormLayout(wiggleBox);
     m_wiggle = new QCheckBox(QStringLiteral("有効"), wiggleBox);
     m_wiggle->setChecked(initial.wigglePath.enabled);
@@ -115,6 +115,8 @@ ShapeModifierDialog::ShapeModifierDialog(const ShapeModifiers &initial, QWidget 
                              1, 100, initial.wigglePath.detail);
     m_wiggleSeed = intSpin(wiggleForm, QStringLiteral("シード"), QStringLiteral("wiggleSeed"),
                            -1000000, 1000000, initial.wigglePath.seed);
+    spin(wiggleForm, QStringLiteral("毎秒のウィグル数"), QStringLiteral("wigglesPerSecond"),
+         0, 100, initial.wigglePath.wigglesPerSecond, QString());
     contentLayout->addWidget(wiggleBox);
     contentLayout->addStretch();
     scroll->setWidget(content);
@@ -160,5 +162,7 @@ ShapeModifiers ShapeModifierDialog::modifiers() const
     m.wigglePath.amplitude = m_wiggleAmp->value();
     m.wigglePath.detail = m_wiggleDetail->value();
     m.wigglePath.seed = m_wiggleSeed->value();
+    if (const auto *wps = findChild<QDoubleSpinBox *>(QStringLiteral("wigglesPerSecond")))
+        m.wigglePath.wigglesPerSecond = wps->value();
     return m;
 }

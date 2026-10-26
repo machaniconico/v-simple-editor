@@ -114,7 +114,8 @@ struct ShapeModifiers {
         double offsetPct = 0.0;
     } trim;
     // Path-to-path modifiers, applied Round Corners -> ZigZag -> Wiggle Path
-    // -> Trim -> Repeater. Wiggle Path is static (seed-deterministic, no time).
+    // -> Trim -> Repeater. Wiggle Path is seed-deterministic and varies with clip-local time
+    // only when wigglesPerSecond > 0 (0 = static).
     struct RoundCornersConfig {
         bool enabled = false;
         double radius = 10.0;
@@ -130,6 +131,7 @@ struct ShapeModifiers {
         double amplitude = 5.0;
         int detail = 4;
         int seed = 1;
+        double wigglesPerSecond = 0.0;
     } wigglePath;
 
     bool isDefault() const;
@@ -143,7 +145,7 @@ QPainterPath roundCorners(const QPainterPath &path, double radius);
 QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment,
                     bool smooth);
 QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail,
-                        int seed);
+                        int seed, double timeSec = 0.0, double wigglesPerSecond = 0.0);
 }
 
 // --- Shape ---
@@ -188,10 +190,11 @@ public:
     // Shape-clip preview/export SSOT. Renders the supplied shapes onto a
     // transparent canvas without requiring a mutable ShapeLayer instance.
     static QImage renderShapesToImage(const QVector<Shape> &shapes,
-                                      const QSize &canvasSize);
+                                      const QSize &canvasSize,
+                                      double timeSec = 0.0);
 
     // Render a single shape using the given painter
-    static void renderShape(const Shape &shape, QPainter &painter);
+    static void renderShape(const Shape &shape, QPainter &painter, double timeSec = 0.0);
 
     // Length-based, cyclic trim. Full ranges return the original path.
     static QPainterPath trimPathRange(const QPainterPath &path, double startPct,

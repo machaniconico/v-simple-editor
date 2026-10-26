@@ -703,6 +703,66 @@ int runShapeClipSelftest()
         reportGate(13, pathStable && sameSeed && otherSeed && offIdentity && legacyOk,
                    "Wiggle Path determinism/seed/disabled identity/legacy regression failed",
                    passed, failed);
+
+        // G14: Wiggle Path varies with clip-local time through wigglesPerSecond.
+        ShapeModifiers timeMods = wigMods;
+        timeMods.wigglePath.wigglesPerSecond = 2.0;
+        Shape timeShape = fullyPopulatedShape(ShapeType::Star);
+        timeShape.position = QPointF(90, 70);
+        timeShape.modifiers = timeMods;
+        Shape staticShape = timeShape;
+        staticShape.modifiers.wigglePath.wigglesPerSecond = 0.0;
+        const QImage t0 = ShapeLayer::renderShapesToImage({timeShape}, canvas, 0.0);
+        const QImage tQuarter = ShapeLayer::renderShapesToImage({timeShape}, canvas, 0.25);
+        const bool timeVaries = t0 != tQuarter;
+        const bool wpsZeroStable = ShapeLayer::renderShapesToImage({staticShape}, canvas, 0.25)
+            == ShapeLayer::renderShapesToImage({staticShape}, canvas, 0.0);
+        const bool t0IsStatic = t0 == wig7a;
+
+        auto exportAt = [&](const Shape &shape, qint64 us) {
+            Timeline exportTimeline;
+            exportTimeline.videoTracks().first()->setClips(QVector<ClipInfo>{makeShapeClip(shape)});
+            exportTimeline.refreshPlaybackSequence();
+            return tlrender::renderFrameAt(&exportTimeline, us, canvas);
+        };
+        const QImage expA = exportAt(timeShape, 500000), expB = exportAt(timeShape, 1000000);
+        const bool exportVaries = !expA.isNull() && !expB.isNull() && expA != expB;
+        const bool exportStatic = !exportAt(staticShape, 500000).isNull()
+            && exportAt(staticShape, 500000) == exportAt(staticShape, 1000000);
+
+        const ShapeModifiers timeBack = ShapeModifiers::fromJson(timeMods.toJson());
+        const bool timeJson = timeBack.wigglePath.wigglesPerSecond == 2.0
+            && timeBack.toJson() == timeMods.toJson()
+            && !wigMods.toJson()["wigglePath"].toObject().contains(QStringLiteral("wigglesPerSecond"));
+
+        QPainterPath polyLine;
+        polyLine.moveTo(0, 0);
+        polyLine.lineTo(100, 0);
+        auto displacements = [&](double timeSec) {
+            const QPainterPath out = shapemod::wigglePath(polyLine, 6.0, 20, 7, timeSec, 2.0);
+            QVector<QPointF> d;
+            for (int i = 0; i < out.elementCount(); ++i)
+                d.append(QPointF(out.elementAt(i).x - 100.0 * i / 20.0, out.elementAt(i).y));
+            return d;
+        };
+        const QVector<QPointF> d0 = displacements(0.0), d1 = displacements(0.5);
+        bool shifted = d0.size() == d1.size() && d0.size() > 2;
+        double maxDiff = 0.0, maxBound = 0.0;
+        for (int i = 0; shifted && i + 1 < d0.size(); ++i) {
+            maxDiff = std::max(maxDiff, QLineF(d1[i], d0[i + 1]).length());
+        }
+        for (int i = 0; shifted && i < d0.size(); ++i)
+            maxBound = std::max({maxBound, std::abs(d0[i].x()), std::abs(d0[i].y()),
+                                 std::abs(d1[i].x()), std::abs(d1[i].y())});
+        const bool notShifted = shifted && maxDiff > 1e-6 && maxBound <= 2.0 * 6.0 + 1e-9;
+        std::fprintf(stderr, "[shape-clip] G14 timeVaries=%d wpsZeroStable=%d t0IsStatic=%d exportVaries=%d "
+                     "exportStatic=%d json=%d notShifted=%d maxShiftDiff=%.6f maxDisp=%.6f\n",
+                     timeVaries, wpsZeroStable, t0IsStatic, exportVaries, exportStatic, timeJson,
+                     notShifted, maxDiff, maxBound);
+        reportGate(14, timeVaries && wpsZeroStable && t0IsStatic && exportVaries && exportStatic
+                       && timeJson && notShifted,
+                   "Wiggle Path time variation/static identity/export/JSON/shift failed",
+                   passed, failed);
     }
 
     std::fprintf(stderr, "[shape-clip] summary: %d PASS, %d FAIL\n",
