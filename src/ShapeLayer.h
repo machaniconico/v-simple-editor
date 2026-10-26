@@ -114,7 +114,7 @@ struct ShapeModifiers {
         double offsetPct = 0.0;
     } trim;
     // Path-to-path modifiers, applied Round Corners -> ZigZag -> Wiggle Path
-    // -> Trim -> Repeater. Wiggle Path is seed-deterministic and varies with clip-local time
+    // -> Pucker & Bloat -> Twist -> Offset Path -> Trim -> Repeater. Wiggle Path is seed-deterministic and varies with clip-local time
     // only when wigglesPerSecond > 0 (0 = static).
     struct RoundCornersConfig {
         bool enabled = false;
@@ -133,6 +133,18 @@ struct ShapeModifiers {
         int seed = 1;
         double wigglesPerSecond = 0.0;
     } wigglePath;
+    struct PuckerBloatConfig {
+        bool enabled = false;
+        double amountPct = 0.0; // >0 pucker (anchors in, handles out), <0 bloat
+    } puckerBloat;
+    struct TwistConfig {
+        bool enabled = false;
+        double angleDeg = 30.0;
+    } twist;
+    struct OffsetPathConfig {
+        bool enabled = false;
+        double amount = 10.0; // >0 grows (united), <0 shrinks (subtracted)
+    } offsetPath;
 
     bool isDefault() const;
     QJsonObject toJson() const;
@@ -146,6 +158,12 @@ QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment,
                     bool smooth);
 QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail,
                         int seed, double timeSec = 0.0, double wigglesPerSecond = 0.0);
+// Anchors move to (1 - a/100) of their distance from the bounding centre, handles to (1 + a/100).
+QPainterPath puckerBloat(const QPainterPath &path, double amountPct);
+// Rotates by angleDeg * (1 - d/R) about the bounding centre (R = farthest vertex distance).
+QPainterPath twist(const QPainterPath &path, double angleDeg);
+// Qt boolean offset: united with / subtracted by the stroke band; open paths become the outline.
+QPainterPath offsetPath(const QPainterPath &path, double amount);
 }
 
 // --- Shape ---

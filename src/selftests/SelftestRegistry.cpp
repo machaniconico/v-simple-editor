@@ -972,7 +972,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-lut",          "VEDITOR_CLIP_LUT_SELFTEST",            runClipLutSelftest,            true,
       "Clip LUT G1-G10: ProjectFile round-trip, render reflection, no-LUT identity, MainWindow menu application + undo" },
     { "shape-clip",        "VEDITOR_SHAPE_CLIP_SELFTEST",          runShapeClipSelftest,          true,
-      "Shape clip G1-G14: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
+      "Shape clip G1-G17: JSON, raster SSOT, preview/export, trim/repeater, modifier dialog + undo, legacy brush byte identity" },
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
