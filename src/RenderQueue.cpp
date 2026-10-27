@@ -2543,10 +2543,11 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
 
     auto *tl = new Timeline();
     // US-1504: the project canvas the dynamic overlay (wiggle) normalizes with,
-    // the same value MainWindow gives the live Timeline (the fps is left as is).
+    // and (US-1520) the fps its expressions read, the same values MainWindow
+    // gives the live Timeline.
     if (data.config.width > 0 && data.config.height > 0)
         tl->setProjectOutputConfig(data.config.width, data.config.height,
-                                   data.config.explicitOutputResolution);
+                                   data.config.explicitOutputResolution, data.config.fps);
     tl->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,

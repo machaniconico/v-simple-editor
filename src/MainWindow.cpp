@@ -9657,6 +9657,27 @@ static QString sidecarClipId(const QString &key, const QString &uid)
     return key.section(QLatin1Char(':'), 0, 0) + QLatin1Char('|') + uid;
 }
 
+// US-1520: a split (or a freeze frame) re-cuts a remapped clip's own curve (sliced, or a
+// hold) and its inPoint, while the entry under its key still holds the whole curve. Every
+// sidecar edit goes into the clip through applyTimeRemapEntries, so the clip's curve wins
+// wherever the clip has one. A clip with none keeps its entry: a video piece of a remapped
+// clip always keeps a curve (splitClipByConsumedSource), and an entry may name a clip
+// that does not carry it yet.
+static void syncTimeRemapEntriesToClips(QHash<QString, TimeRemapClipEntry> &entries,
+                                        const QVector<TimelineTrack *> &tracks)
+{
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        const QStringList parts = it.key().split(QLatin1Char(':'));
+        if (parts.size() != 2) continue;
+        const int t = parts[0].toInt();
+        const int c = parts[1].toInt();
+        if (t < 0 || t >= tracks.size() || !tracks[t] || c < 0 || c >= tracks[t]->clipCount()) continue;
+        const timeremap::TimeRemapCurve &clipCurve = tracks[t]->clips().at(c).timeRemapCurve;
+        if (!clipCurve.keys.isEmpty() && clipCurve.toJson() != it.value().curve.toJson())
+            it.value().curve = clipCurve;
+    }
+}
+
 void MainWindow::parkSidecars(const QString &key, const QString &uid)
 {
     if (uid.isEmpty()) return;
@@ -9699,6 +9720,7 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
     rekeySidecarMap(m_timeRemapClipEntries, remap);
     for (auto it = m_timeRemapClipEntries.begin(); it != m_timeRemapClipEntries.end(); ++it)
         it.value().clipId = it.key();
+    syncTimeRemapEntriesToClips(m_timeRemapClipEntries, m_timeline->videoTracks());
     rekeySidecarMap(m_text3DClipConfigs, remap);
     QVector<BrushAnimationEntry> brushes;
     for (BrushAnimationEntry entry : std::as_const(m_brushAnimationEntries)) {
@@ -9764,6 +9786,9 @@ QJsonObject MainWindow::collectSidecarState()
     for (const auto &entry : m_brushAnimationEntries)
         brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
     QJsonObject timeRemaps, text3Ds;
+    // A split of a track's last clip moves no key, so no rekey ran: the undo point
+    // takes the clips' curves here.
+    syncTimeRemapEntriesToClips(m_timeRemapClipEntries, tracks);
     for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
         timeRemaps.insert(it.key(), it.value().curve.toJson());
     for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it)

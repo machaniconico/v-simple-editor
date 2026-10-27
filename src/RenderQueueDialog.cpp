@@ -264,7 +264,7 @@ void RenderQueueDialog::buildUi()
     m_cancelJobBtn->setObjectName(QStringLiteral("renderQueueCancelJobButton"));
     m_stopBtn   = new QPushButton(QStringLiteral("キュー全体を停止"), this);
     m_stopBtn->setToolTip(QStringLiteral(
-        "待機中のジョブは一覧から外れます / MCP・通常書き出しのジョブも止まります"));
+        "実行中のジョブを中止してキューを止めます (待機中のジョブは一覧に残ります) / MCP・通常書き出しのジョブも止まります"));
     toolbar->addWidget(m_addBtn);
     toolbar->addWidget(m_removeBtn);
     toolbar->addWidget(m_cancelJobBtn);

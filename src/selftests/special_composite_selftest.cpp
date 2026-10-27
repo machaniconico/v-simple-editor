@@ -5,7 +5,9 @@
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
 #include "../MainWindow.h"
+#include "../RotoApply.h"
 #include "../RotoClipEntry.h"
+#include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../SequenceExport.h"
 #include "../TrackMatteKey.h"
@@ -202,7 +204,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 10; ++g)
+        for (int g = 1; g <= 12; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -244,7 +246,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 10; ++g)
+        for (int g = 5; g <= 12; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -339,6 +341,8 @@ int runSpecialCompositeSelftest()
             tally.skip(g, "no usable QOpenGLWidget context");
         tally.skip(9, "no usable QOpenGLWidget context");
         tally.skip(10, "no usable QOpenGLWidget context");
+        tally.skip(11, "no usable QOpenGLWidget context");
+        tally.skip(12, "no usable QOpenGLWidget context");
         return tally.finish("special-composite");
     }
     // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
@@ -1518,6 +1522,136 @@ int runSpecialCompositeSelftest()
                "the clip expressions are missing from the export / special composite, not replacing / ordered "
                "before the wiggle, the audio-level snapshot did not follow an edit, a nested clip read the root "
                "audio, or an expression without audioLevel() decoded (see values above)");
+
+    // G11 (US-1520 C-02): the file-backed export Timeline (RenderQueue::resolveTimeline) takes
+    // the project fps the expressions read. A 24 fps project whose clip has
+    // transform.rotation = time*fps*2 shows 24 degrees at t = 0.5 s (30 on a Timeline left at its
+    // 30 fps default). (0) the saved clip carries the binding, and it is not constant: the
+    // evaluator gives 24 / 30 for fps 24 / 30, and the live frames at 24 and 30 fps differ;
+    // (1) the file-backed export == the live 24 fps frame; (2) it differs from the live 30 fps
+    // frame. HEAD: resolveTimeline drops the fps, so the export equals the 30 fps frame.
+    const double g11t = 0.5;
+    ClipInfo g11Clip = base;
+    g11Clip.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*fps*2"));
+    clipanim::EvalEnv g11Env24;
+    g11Env24.fps = 24.0;
+    g11Env24.canvas = size;
+    clipanim::EvalEnv g11Env30 = g11Env24;
+    g11Env30.fps = 30.0;
+    const double g11Rot24 = clipanim::effectiveTransformAt(g11Clip, g11t, g11Env24).rotationDeg;
+    const double g11Rot30 = clipanim::effectiveTransformAt(g11Clip, g11t, g11Env30).rotationDeg;
+    setClip(g11Clip);
+    timeline->setProjectOutputConfig(kW, kH, true, 24.0);
+    const QImage g11Live24 = liveFrame(g11t);
+    timeline->setProjectOutputConfig(kW, kH, true, 30.0);
+    const QImage g11Live30 = liveFrame(g11t);
+    timeline->setProjectOutputConfig(kW, kH, true, kFps);
+    ProjectData g11Project;
+    g11Project.config.width = kW;
+    g11Project.config.height = kH;
+    g11Project.config.fps = 24;
+    g11Project.config.explicitOutputResolution = true;
+    g11Project.videoTracks = QVector<QVector<ClipInfo>>{{g11Clip}};
+    const G8Export g11Export = exportFrame(g11Project, QStringLiteral("g11-fps24"), g11t);
+    ProjectData g11Loaded;
+    const bool g11Saved = ProjectFile::load(dir.filePath(QStringLiteral("g11-fps24.veditor")), g11Loaded)
+        && g11Loaded.config.fps == 24 && g11Loaded.videoTracks.size() == 1 && g11Loaded.videoTracks[0].size() == 1
+        && g11Loaded.videoTracks[0][0].expressions.expression(QStringLiteral("transform.rotation"))
+               == QStringLiteral("time*fps*2");
+    const G8Diff g11LiveDiff = diffImages(g11Live24, g11Live30);
+    const G8Diff g11Diff24 = diffImages(g11Export.image, g11Live24);
+    const G8Diff g11Diff30 = diffImages(g11Export.image, g11Live30);
+    const bool g11ok0 = g11Saved && std::abs(g11Rot24 - 24.0) <= 1e-9 && std::abs(g11Rot30 - 30.0) <= 1e-9
+        && g11LiveDiff.sameSize && g11LiveDiff.differing > 50;
+    const bool g11ok1 = g11Export.ok && g11Diff24.sameSize && g11Diff24.maxChannel <= 2;
+    const bool g11ok2 = g11Export.ok && g11Diff30.sameSize && g11Diff30.differing > 50;
+    std::cerr << "special-composite G11 (0) saved binding+fps=" << g11Saved << " rotation fps24=" << g11Rot24
+              << " fps30=" << g11Rot30 << " live24 vs live30 [" << diffText(g11LiveDiff) << "] ok=" << g11ok0 << '\n'
+              << "special-composite G11 (1) export ok=" << g11Export.ok << " vs live24 [" << diffText(g11Diff24)
+              << "] (expect maxChannelDiff<=2) ok=" << g11ok1 << '\n'
+              << "special-composite G11 (2) export vs live30 [" << diffText(g11Diff30)
+              << "] (expect differingPixels>50, HEAD equal) ok=" << g11ok2 << '\n';
+    tally.gate(11, g11ok0 && g11ok1 && g11ok2,
+               "the file-backed export evaluated the expressions at another fps than the project's "
+               "(see values above)");
+
+    // G12 (US-1520 C-02, roto side): the file-backed export Timeline's project fps is also the
+    // roto fallback fps (TimelineFrameRenderer rotoSourceFps -> roto::clipEffectiveSourceFps)
+    // when the source fps cannot be probed and there is no remap sourceFps. A shape clip has no
+    // file, so roto::probeVideoStreamFps returns 0. Its roto mask moves between keyframes 0 and
+    // 30, so at t = 0.5 s the 24 fps project reads mask frame 12 (a 30 fps Timeline reads 15).
+    // (0) probe == 0, the masks at frames 12 and 15 differ, and the live frames at 24 and 30 fps
+    // differ; (1) the file-backed export == the live 24 fps frame; (2) it differs from the live
+    // 30 fps frame. HEAD: resolveTimeline drops the fps, so the export reads mask frame 15.
+    const double g12t = 0.5;
+    ClipInfo g12Clip;
+    g12Clip.duration = g12Clip.outPoint = 1.0;
+    g12Clip.speed = 1.0;
+    g12Clip.opacity = 1.0;
+    Shape g12Shape;
+    g12Shape.type = ShapeType::Rectangle;
+    g12Shape.properties.size = QSizeF(2 * kW, 2 * kH);
+    g12Shape.position = QPointF(0, 0);
+    g12Shape.fill.color = QColor(230, 200, 40);
+    g12Shape.fill.opacity = 1.0;
+    g12Shape.fill.enabled = true;
+    g12Shape.fill.gradient = false;
+    g12Shape.stroke.enabled = false;
+    g12Clip.shapes = {g12Shape};
+    const auto g12Rect = [](double x0, double x1) {
+        RotoPath path;
+        RotoPoint p;
+        for (const QPointF &q : {QPointF(x0, 0), QPointF(x1, 0), QPointF(x1, kH), QPointF(x0, kH)}) {
+            p.position = p.handleIn = p.handleOut = q;
+            path.points.append(p);
+        }
+        path.closed = true;
+        return path;
+    };
+    RotoClipEntry g12Entry;
+    g12Entry.clipId = rotoKey;
+    g12Entry.keyframes = {RotoKeyframe{0, g12Rect(0, 40)}, RotoKeyframe{30, g12Rect(240, 280)}};
+    const double g12Probe = roto::probeVideoStreamFps(g12Clip.filePath);
+    const int g12Frame24 = roto::sourceFrameIndexFor(g12t, 24.0);
+    const int g12Frame30 = roto::sourceFrameIndexFor(g12t, 30.0);
+    QImage g12Solid(size, QImage::Format_ARGB32_Premultiplied);
+    g12Solid.fill(Qt::white);
+    const G8Diff g12MaskDiff = diffImages(flatten(roto::applyEntryToFrame(g12Entry, g12Solid, g12Frame24)),
+                                          flatten(roto::applyEntryToFrame(g12Entry, g12Solid, g12Frame30)));
+    setClip(g12Clip);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{{rotoKey, g12Entry}});
+    timeline->setProjectOutputConfig(kW, kH, true, 24.0);
+    const QImage g12Live24 = liveFrame(g12t);
+    timeline->setProjectOutputConfig(kW, kH, true, 30.0);
+    const QImage g12Live30 = liveFrame(g12t);
+    timeline->setProjectOutputConfig(kW, kH, true, kFps);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    ProjectData g12Project;
+    g12Project.config.width = kW;
+    g12Project.config.height = kH;
+    g12Project.config.fps = 24;
+    g12Project.config.explicitOutputResolution = true;
+    g12Project.videoTracks = QVector<QVector<ClipInfo>>{{g12Clip}};
+    g12Project.rotoClipEntries = {g12Entry};
+    const G8Export g12Export = exportFrame(g12Project, QStringLiteral("g12-roto-fps24"), g12t);
+    const int g12ExportFrame = roto::lastRenderSourceFrameIndex();
+    const G8Diff g12LiveDiff = diffImages(g12Live24, g12Live30);
+    const G8Diff g12Diff24 = diffImages(g12Export.image, g12Live24);
+    const G8Diff g12Diff30 = diffImages(g12Export.image, g12Live30);
+    const bool g12ok0 = g12Probe == 0.0 && g12Frame24 == 12 && g12Frame30 == 15 && g12MaskDiff.sameSize
+        && g12MaskDiff.differing > 50 && g12LiveDiff.sameSize && g12LiveDiff.differing > 50;
+    const bool g12ok1 = g12Export.ok && g12Diff24.sameSize && g12Diff24.maxChannel <= 2;
+    const bool g12ok2 = g12Export.ok && g12Diff30.sameSize && g12Diff30.differing > 50;
+    std::cerr << "special-composite G12 (0) probeVideoStreamFps=" << g12Probe << " (expect 0) mask frame fps24="
+              << g12Frame24 << " fps30=" << g12Frame30 << " mask12 vs mask15 [" << diffText(g12MaskDiff)
+              << "] live24 vs live30 [" << diffText(g12LiveDiff) << "] ok=" << g12ok0 << '\n'
+              << "special-composite G12 (1) export ok=" << g12Export.ok << " last mask frame=" << g12ExportFrame
+              << " vs live24 [" << diffText(g12Diff24) << "] (expect maxChannelDiff<=2) ok=" << g12ok1 << '\n'
+              << "special-composite G12 (2) export vs live30 [" << diffText(g12Diff30)
+              << "] (expect differingPixels>50, HEAD equal) ok=" << g12ok2 << '\n';
+    tally.gate(12, g12ok0 && g12ok1 && g12ok2,
+               "the file-backed export took the roto fallback fps from somewhere other than the project "
+               "fps for an unprobeable source (see values above)");
 
     return tally.finish("special-composite");
 }
