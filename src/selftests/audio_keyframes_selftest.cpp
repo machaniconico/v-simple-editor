@@ -1,9 +1,12 @@
 #include "../AudioKeyframes.h"
 #include "../ClipExpressionBindings.h"
 #include "../Expression.h"
+#include "../ProjectFile.h"
 #include "../Timeline.h"
 #include "../clipanim/ClipAnim.h"
 #include "../libavcore/AudioExtract.h"
+#include "SelftestRegistry.h"
+#include <QApplication>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <algorithm>
@@ -11,6 +14,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <thread>
 
 int runAudioKeyframesSelftest()
@@ -212,6 +216,87 @@ int runAudioKeyframesSelftest()
                  int(aEnteredDelay), int(bServed), int(aDoneWhenBReturned), int(aDoneAtEnd));
     gate(7, bCached && aEnteredDelay && bServed && !aDoneWhenBReturned && aDoneAtEnd);
 
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
+    // G8 (US-1709): a Timeline loaded from a project file (ProjectFile::load ->
+    // restoreFromProject, the Timeline a file-based render job uses) gets its
+    // audioLevel() envelope from buildExpressionAudioEnv + setExpressionAudioEnv:
+    // the V1 clip linked to a loud audio clip samples > 0, linked to a silent one 0.
+    // Control: the same loaded Timeline without the set has no sampler (level 0).
+    {
+        int argc = 1;
+        char arg0[] = "audio-keyframes";
+        char *argv[] = {arg0, nullptr};
+        std::unique_ptr<QApplication> ownedApp;
+        if (!QCoreApplication::instance()) {
+            qputenv("QT_QPA_PLATFORM", "offscreen");
+            ownedApp = std::make_unique<QApplication>(argc, argv);
+        }
+        const bool haveApp = qobject_cast<QApplication *>(QCoreApplication::instance()) != nullptr;
+        const QString loudWav = temp.filePath(QStringLiteral("g8-loud.wav"));
+        const QString silentWav = temp.filePath(QStringLiteral("g8-silent.wav"));
+        QByteArray loudPcm, silentPcm;
+        for (int i = 0; i < sr * 2; ++i) {
+            loudPcm.append(char(0x00));
+            loudPcm.append(char(0x40));
+            silentPcm.append(char(0x00));
+            silentPcm.append(char(0x00));
+        }
+        const bool g8Wavs = temp.isValid()
+            && libavcore::writePcm16AsWav(loudWav, loudPcm, sr, 1, &error)
+            && libavcore::writePcm16AsWav(silentWav, silentPcm, sr, 1, &error);
+        // Loads the project through the file and samples audioLevel() of V1 at 0.5 s.
+        const auto levelFromFile = [&](const QString &audioPath, const QString &name,
+                                       bool publish, bool *hasSampler) {
+            *hasSampler = false;
+            ClipInfo video{};
+            video.displayName = QStringLiteral("g8 video");
+            video.duration = video.outPoint = 2.0;
+            video.linkGroup = 11;
+            video.expressions.setExpression(QStringLiteral("transform.opacity"),
+                                            QStringLiteral("audioLevel() * 100"));
+            ClipInfo audio{};
+            audio.duration = audio.outPoint = 2.0;
+            audio.linkGroup = 11;
+            audio.filePath = audioPath;
+            ProjectData saved;
+            saved.videoTracks = QVector<QVector<ClipInfo>>{{video}};
+            saved.audioTracks = QVector<QVector<ClipInfo>>{{audio}};
+            const QString projectPath = temp.filePath(name + QStringLiteral(".veditor"));
+            ProjectData loaded;
+            if (!ProjectFile::save(projectPath, saved) || !ProjectFile::load(projectPath, loaded))
+                return -1.0;
+            Timeline timeline;
+            timeline.restoreFromProject(loaded.videoTracks, loaded.audioTracks, 0.0, -1.0, -1.0, 100);
+            if (publish)
+                timeline.setExpressionAudioEnv(
+                    timeline.buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
+            const auto *v1 = timeline.videoTracks().value(0);
+            if (!v1 || v1->clips().isEmpty()) return -1.0;
+            const auto sampler = timeline.expressionAudioLevelSampler(v1->clips().first(), 0.0);
+            *hasSampler = bool(sampler);
+            ExpressionContext context;
+            context.time = 0.5;
+            context.audioLevelAtTime = sampler;
+            const auto level = Expression::evaluate(QStringLiteral("audioLevel()"), context);
+            return level.success ? level.value : -1.0;
+        };
+        bool loudSampler = false, silentSampler = false, unsetSampler = false;
+        const double loud = haveApp && g8Wavs
+            ? levelFromFile(loudWav, QStringLiteral("g8-loud"), true, &loudSampler) : -1.0;
+        const double silent = haveApp && g8Wavs
+            ? levelFromFile(silentWav, QStringLiteral("g8-silent"), true, &silentSampler) : -1.0;
+        const double unset = haveApp && g8Wavs
+            ? levelFromFile(loudWav, QStringLiteral("g8-unset"), false, &unsetSampler) : -1.0;
+        const bool oneCache = audiokf::sharedEnvelopeCache()
+            && audiokf::sharedEnvelopeCache() == audiokf::sharedEnvelopeCache();
+        std::fprintf(stderr, "audio-keyframes G8 app=%d wavs=%d loud=%.4f sampler=%d silent=%.4f "
+                     "sampler=%d unset=%.4f sampler=%d (expect 0 / 0) oneCache=%d\n", int(haveApp),
+                     int(g8Wavs), loud, int(loudSampler), silent, int(silentSampler), unset,
+                     int(unsetSampler), int(oneCache));
+        gate(8, haveApp && g8Wavs && loudSampler && loud > 0.1 && silentSampler && silent == 0.0
+            && !unsetSampler && unset == 0.0 && oneCache);
+    }
+
+    selftests::reportTally(pass, fail, 0);
+    std::fprintf(stderr, "summary: %d PASS, %d FAIL, 0 SKIP\n", pass, fail);
     return fail;
 }

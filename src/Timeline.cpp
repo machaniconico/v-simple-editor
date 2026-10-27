@@ -7755,6 +7755,19 @@ std::function<double(double)> Timeline::expressionAudioLevelSampler(const ClipIn
     return audiokf::makeLinkedAudioSamplerFrom(*env, clip.linkGroup, clipStartSec);
 }
 
+std::shared_ptr<const audiokf::ExprAudioEnv> Timeline::buildExpressionAudioEnv(
+    std::shared_ptr<audiokf::EnvelopeCache> cache) const
+{
+    auto env = std::make_shared<audiokf::ExprAudioEnv>();
+    env->audioClipsByTrack.reserve(m_audioTracks.size());
+    for (const auto *track : m_audioTracks) {
+        if (track) env->audioClipsByTrack.append(track->clips());
+    }
+    env->cache = std::move(cache);
+    env->generation = m_clipGeneration;
+    return env;
+}
+
 void Timeline::setExpressionAudioEnv(std::shared_ptr<const audiokf::ExprAudioEnv> env)
 {
     std::atomic_store(&m_exprAudioEnv, std::move(env));

@@ -202,6 +202,12 @@ std::function<double(double)> makeLinkedAudioSampler(
     return {};
 }
 
+std::shared_ptr<EnvelopeCache> sharedEnvelopeCache()
+{
+    static const std::shared_ptr<EnvelopeCache> cache = std::make_shared<EnvelopeCache>();
+    return cache;
+}
+
 std::function<double(double)> makeLinkedAudioSamplerFrom(
     const ExprAudioEnv& env, int linkGroup, double clipStart)
 {

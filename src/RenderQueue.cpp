@@ -9,6 +9,7 @@
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
+#include "AudioKeyframes.h"
 #include "ExportRange.h"
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
@@ -2566,6 +2567,10 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     tl->setProjectLights(projectLights);
     tl->setProjectLightViewPosition(projectCamera.camera().position);
     tl->setProjectCamera(projectCamera);
+    // US-1709: the expression audioLevel() envelope, published once from the
+    // loaded audio tracks (the owned Timeline has no rebuild hook; the snapshot
+    // stays as published for the whole export).
+    tl->setExpressionAudioEnv(tl->buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
 
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths

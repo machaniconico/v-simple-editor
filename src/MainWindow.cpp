@@ -2811,6 +2811,8 @@ MainWindow::MainWindow(QWidget *parent)
     // this hook whenever a UI-thread read finds it older than the clip generation;
     // undo / redo, sequence create / delete / switch, every clip edit (debounced) and
     // track remove / move also rebuild it (project load / new project call it directly).
+    // US-1709: the envelope cache is the process-wide one file-based render jobs use too.
+    m_audioEnvelopeCache = audiokf::sharedEnvelopeCache();
     m_timeline->setExpressionAudioEnvRebuildHook([this]() { rebuildExpressionAudioEnv(); });
     connect(m_timeline, &Timeline::trackStateRestored, this, &MainWindow::rebuildExpressionAudioEnv);
     connect(m_timeline, &Timeline::sequencesChanged, this, &MainWindow::rebuildExpressionAudioEnv);
@@ -15317,14 +15319,7 @@ void MainWindow::open3DExtrudedText()
 void MainWindow::rebuildExpressionAudioEnv()
 {
     if (!m_timeline) return;
-    auto env = std::make_shared<audiokf::ExprAudioEnv>();
-    env->audioClipsByTrack.reserve(m_timeline->audioTracks().size());
-    for (const auto *track : m_timeline->audioTracks()) {
-        if (track) env->audioClipsByTrack.append(track->clips());
-    }
-    env->cache = m_audioEnvelopeCache;
-    env->generation = m_timeline->audioClipGeneration();
-    m_timeline->setExpressionAudioEnv(std::move(env));
+    m_timeline->setExpressionAudioEnv(m_timeline->buildExpressionAudioEnv(m_audioEnvelopeCache));
 }
 
 void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)

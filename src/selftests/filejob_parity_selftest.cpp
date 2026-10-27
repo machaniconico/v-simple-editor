@@ -5,6 +5,8 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../AudioKeyframes.h"
+#include "../libavcore/AudioExtract.h"
 #include "SelftestGate.h"
 
 #include <QColor>
@@ -157,6 +159,27 @@ QImage liveFrame(const ProjectData &project, const Camera3D &camera, double targ
                                            1000000.0 / kFps));
 }
 
+// A 2-D V1 layer whose opacity is the expression audioLevel() * 100, linked
+// (linkGroup) to an audio clip of audioPath when audioPath is not empty.
+ProjectData audioLevelProject(const QString &audioPath)
+{
+    ClipInfo clip = layerClip(false);
+    clip.is3DLayer = false;
+    clip.layer3D.rotationY = 0.0;
+    clip.linkGroup = 5;
+    clip.expressions.setExpression(QStringLiteral("transform.opacity"),
+                                   QStringLiteral("audioLevel() * 100"));
+    ProjectData project = projectWith(clip, Camera3D{});
+    if (!audioPath.isEmpty()) {
+        ClipInfo audio;
+        audio.duration = audio.outPoint = 2.0;
+        audio.linkGroup = 5;
+        audio.filePath = audioPath;
+        project.audioTracks = QVector<QVector<ClipInfo>>{{audio}};
+    }
+    return project;
+}
+
 } // namespace
 
 int runFileJobParitySelftest()
@@ -166,6 +189,7 @@ int runFileJobParitySelftest()
     if (!tempDir.isValid()) {
         tally.gate(1, false, "temporary directory missing");
         tally.gate(2, false, "temporary directory missing");
+        tally.gate(3, false, "temporary directory missing");
         return tally.finish("filejob-parity");
     }
     const QDir dir(tempDir.path());
@@ -206,6 +230,44 @@ int runFileJobParitySelftest()
                   << " noOrientVsLive=" << orientDiff << '\n';
         tally.gate(2, !live.isNull() && !fileJob.isNull() && diff == 0 && headDiff > 0 && orientDiff > 0,
                    "auto-orient file job frame differs from the live frame under the project camera");
+    }
+
+    // G3 (US-1709): a V1 layer whose opacity is audioLevel() * 100, linked to a
+    // loud (0.5 amplitude) audio clip. The file-backed job frame must differ from
+    // the same project without the audio track (HEAD: the owned Timeline has no
+    // audio-level snapshot, so audioLevel() is 0 either way and the frames are
+    // identical) and equal the live frame whose Timeline publishes the snapshot
+    // the way MainWindow does.
+    {
+        QString error;
+        const QString wav = dir.filePath(QStringLiteral("g3-loud.wav"));
+        QByteArray pcm;
+        for (int i = 0; i < 48000 * 2; ++i) {
+            pcm.append(char(0x00));
+            pcm.append(char(0x40));
+        }
+        const bool wavOk = libavcore::writePcm16AsWav(wav, pcm, 48000, 1, &error);
+        const ProjectData withAudio = audioLevelProject(wav);
+        const ProjectData withoutAudio = audioLevelProject(QString());
+        const QImage fileWith = renderFileJobFrame(dir, withAudio, QStringLiteral("g3a"), targetSec);
+        const QImage fileWithout = renderFileJobFrame(dir, withoutAudio, QStringLiteral("g3b"), targetSec);
+        QImage live;
+        {
+            Timeline timeline;
+            timeline.setProjectOutputConfig(kW, kH, withAudio.config.explicitOutputResolution, kFps);
+            timeline.restoreFromProject(withAudio.videoTracks, withAudio.audioTracks, 0.0, -1.0, -1.0, 100);
+            timeline.setExpressionAudioEnv(
+                timeline.buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
+            live = flatten(tlrender::renderFrameAt(&timeline, qint64(targetSec * 1000000.0),
+                                                   QSize(kW, kH), 1000000.0 / kFps));
+        }
+        const qint64 audioDiff = differingPixels(fileWith, fileWithout);
+        const qint64 liveDiff = differingPixels(fileWith, live);
+        std::cerr << "filejob-parity G3 wav=" << wavOk << " withVsWithoutAudio=" << audioDiff
+                  << " (HEAD 0) fileJobVsLive=" << liveDiff << '\n';
+        tally.gate(3, wavOk && !fileWith.isNull() && !fileWithout.isNull() && !live.isNull()
+                          && audioDiff > 0 && liveDiff == 0,
+                   "file job audioLevel() opacity ignores the linked audio or differs from the live frame");
     }
 
     return tally.finish("filejob-parity");

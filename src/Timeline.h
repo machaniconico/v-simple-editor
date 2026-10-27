@@ -113,7 +113,7 @@ QString clipLabelToString(ClipLabel label);
 class AudioMixer;
 class UndoManager;
 class Timeline;
-namespace audiokf { struct ExprAudioEnv; }
+namespace audiokf { struct ExprAudioEnv; class EnvelopeCache; }
 class PlayheadOverlay;
 class TextStripWidget;
 struct TimelineState;
@@ -955,6 +955,11 @@ public:
     // expressionAudioEnvForRead() (empty when there is no snapshot).
     std::function<double(double)> expressionAudioLevelSampler(const ClipInfo &clip,
                                                               double clipStartSec) const;
+    // US-1709: a new snapshot of this Timeline's audio tracks (clips by value, cache,
+    // the current clip generation), on the thread that edits this Timeline. MainWindow's rebuild and the Timeline
+    // a file-based render job loads (RenderQueue::resolveTimeline) publish it.
+    std::shared_ptr<const audiokf::ExprAudioEnv> buildExpressionAudioEnv(
+        std::shared_ptr<audiokf::EnvelopeCache> cache) const;
     // Publishes a snapshot (std::atomic_store); MainWindow's rebuild calls it.
     void setExpressionAudioEnv(std::shared_ptr<const audiokf::ExprAudioEnv> env);
     // The rebuild MainWindow registers (UI thread). Called only by

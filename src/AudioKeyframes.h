@@ -53,6 +53,10 @@ private:
     QStringList m_lru;
 };
 
+// US-1709: the one EnvelopeCache of the process, shared by the live Timeline's
+// snapshot (MainWindow) and the Timelines that file-based render jobs load.
+std::shared_ptr<EnvelopeCache> sharedEnvelopeCache();
+
 // Clip lists are inspected only during construction; the sampler owns its source
 // snapshot and cache. No timeline widgets are needed, and decoding stays lazy.
 std::function<double(double)> makeLinkedAudioSampler(
