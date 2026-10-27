@@ -61,6 +61,12 @@ struct TimeRemapCurve {
     // Piecewise-linear interpolation (see class doc for edge cases).
     double srcTimeAt(double outTime) const;
 
+    // US-1501: the part of this curve over output time [fromOut, toOut],
+    // shifted so the piece starts at output 0 and source srcBase maps to 0.
+    // Keys strictly inside the range are kept; both ends get interpolated
+    // keys. blendMode / sourceFps are copied.
+    TimeRemapCurve sliced(double fromOut, double toOut, double srcBase) const;
+
     // JSON serialisation (keys, blendMode enum as int, sourceFps).
     QJsonObject toJson() const;
     static TimeRemapCurve fromJson(const QJsonObject& obj);

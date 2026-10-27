@@ -35,6 +35,9 @@ void copyComposition(const ClipInfo &from, ClipInfo &to)
     to.material = from.material;
     to.motionBlurEnabled = from.motionBlurEnabled;
     to.autoOrientEnabled = from.autoOrientEnabled;
+    to.autoOrientToCamera = from.autoOrientToCamera;
+    to.wiggle = from.wiggle;
+    to.expressions = from.expressions;
     to.opacity = from.opacity;
     to.visible = from.visible;
     to.blendMode = from.blendMode;

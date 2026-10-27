@@ -2725,6 +2725,115 @@ int runTrackOpsSelftest()
                      vOk, viOk, viiOk, unrelatedOk, viiiOk, ixOk);
         gate(31, mainOk && vOk && viOk && viiOk && unrelatedOk && viiiOk && ixOk);
     }
+    // G32 (US-1520 C-01): V1 [A] or V1 [A, B], A over source [1, 9] with the remap (0,2) (4,6)
+    // (8,3) committed through the dialog path; a blade at local 6 cuts A by the consumed source,
+    // so the left half takes inPoint 3 and the sliced curve. (0) the sidecar entry exists before
+    // the cut; (1) the entry on the left key equals the left clip's curve; (2) the source second
+    // at left local 0 is 3 through the special-clip preview's curve choice (the sidecar wins) and
+    // after save + ProjectFile::load + applyTimeRemapEntries; (3) after undo and redo the entry
+    // still equals the clip's curve. "A" alone moves no key (no rekey); "A, B" moves B's.
+    // HEAD: the entry keeps the whole curve, so the left local 0 reads source 5.
+    {
+        bool caseOk[2] = {false, false};
+        for (int withB = 0; withB < 2; ++withB) {
+            const char *label = withB ? "A, B" : "A";
+            MainWindow window;
+            Timeline *t = window.m_timeline;
+            if (!t) {
+                std::fprintf(stderr, "[track-ops] G32 [%s]: mainTimeline missing\n", label);
+                continue;
+            }
+            ClipInfo a;
+            a.filePath = QStringLiteral("track-ops-g32-a.mov");
+            a.displayName = QStringLiteral("A");
+            a.duration = 10.0;
+            a.inPoint = 1.0;
+            a.outPoint = 9.0;
+            QVector<ClipInfo> v1{a};
+            if (withB) v1.append(clip(7));
+            t->restoreFromProject(QVector<QVector<ClipInfo>>{v1}, QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+            storyBaseline(*t);
+            const QString key = trackMatteClipKey(0, 0);
+            timeremap::TimeRemapCurve curve;
+            curve.sourceFps = 10.0;
+            curve.addKey(0.0, 2.0);
+            curve.addKey(4.0, 6.0);
+            curve.addKey(8.0, 3.0);
+            window.commitTimeRemapEntry(key, curve);
+            const TimelineTrack *v1Track = t->trackAt(false, 0);
+            const bool entryBefore = window.m_timeRemapClipEntries.contains(key)
+                && window.m_timeRemapClipEntries.value(key).curve.toJson() == curve.toJson()
+                && v1Track && v1Track->clipCount() == 1 + withB
+                && v1Track->clips().at(0).timeRemapCurve.toJson() == curve.toJson();
+            auto entryMatchesClip = [&]() {
+                const TimelineTrack *track = t->trackAt(false, 0);
+                if (!track || track->clipCount() < 1 || !window.m_timeRemapClipEntries.contains(key)) return false;
+                const ClipInfo &left = track->clips().at(0);
+                return !left.timeRemapCurve.keys.isEmpty()
+                    && window.m_timeRemapClipEntries.value(key).curve.toJson() == left.timeRemapCurve.toJson();
+            };
+            // The special-clip preview (buildSpecialClipComposite, forward branch): the entry's
+            // curve wins over the clip's, source = inPoint + srcTimeAt(local) within [in, out].
+            auto previewSourceAt0 = [&]() {
+                const TimelineTrack *track = t->trackAt(false, 0);
+                if (!track || track->clipCount() < 1) return -1.0;
+                const ClipInfo &left = track->clips().at(0);
+                const auto it = window.m_timeRemapClipEntries.constFind(key);
+                const timeremap::TimeRemapCurve &chosen =
+                    it != window.m_timeRemapClipEntries.cend() ? it->curve : left.timeRemapCurve;
+                const double sourceOut = left.outPoint > 0.0 ? left.outPoint : left.duration;
+                return qBound(left.inPoint, left.inPoint + qMax(0.0, chosen.srcTimeAt(0.0)), sourceOut);
+            };
+            t->setPlayheadPosition(6.0);
+            t->bladeAllTracksAtPlayhead();
+            const int countAfter = t->trackAt(false, 0) ? t->trackAt(false, 0)->clipCount() : -1;
+            const double leftIn = countAfter > 0 ? t->trackAt(false, 0)->clips().at(0).inPoint : -1.0;
+            const double leftClipSec = countAfter > 0 ? t->trackAt(false, 0)->clips().at(0).sourceSecondAtLocalTime(0.0) : -1.0;
+            const QString entryJson = QString::fromUtf8(QJsonDocument(
+                window.m_timeRemapClipEntries.value(key).curve.toJson()).toJson(QJsonDocument::Compact));
+            const bool cut = countAfter == 2 + withB && std::abs(leftIn - 3.0) < 1e-6 && std::abs(leftClipSec - 3.0) < 1e-6;
+            const bool ok1 = entryMatchesClip();
+            const double previewSec = previewSourceAt0();
+            // Save, load, rebuild a Timeline and push the saved sidecar into its clips.
+            QTemporaryDir dir;
+            const QString path = dir.filePath(QStringLiteral("g32.veditor"));
+            QString saveErr;
+            const bool saved = dir.isValid() && window.saveProjectToPath(path, &saveErr);
+            ProjectData loaded;
+            const bool loadedOk = saved && ProjectFile::load(path, loaded);
+            double reopenedSec = -1.0;
+            if (loadedOk) {
+                Timeline reopened;
+                reopened.restoreFromProject(loaded.videoTracks, loaded.audioTracks, 0.0, -1.0, -1.0, 100);
+                ProjectFile::applyTimeRemapEntries(&reopened, loaded.timeRemapClipEntries);
+                if (reopened.trackAt(false, 0) && reopened.trackAt(false, 0)->clipCount() > 0)
+                    reopenedSec = reopened.trackAt(false, 0)->clips().at(0).sourceSecondAtLocalTime(0.0);
+            }
+            const bool ok2 = std::abs(previewSec - 3.0) < 1e-6 && std::abs(reopenedSec - 3.0) < 1e-6;
+            t->undo();
+            const int countUndone = t->trackAt(false, 0) ? t->trackAt(false, 0)->clipCount() : -1;
+            const bool undoneOk = countUndone == 1 + withB && entryMatchesClip()
+                && window.m_timeRemapClipEntries.value(key).curve.toJson() == curve.toJson();
+            t->redo();
+            const int countRedone = t->trackAt(false, 0) ? t->trackAt(false, 0)->clipCount() : -1;
+            const bool redoneOk = countRedone == 2 + withB && entryMatchesClip()
+                && std::abs(previewSourceAt0() - 3.0) < 1e-6;
+            const bool ok3 = undoneOk && redoneOk;
+            caseOk[withB] = entryBefore && cut && ok1 && ok2 && ok3;
+            std::fprintf(stderr, "[track-ops] G32 [%s] (0): entry before the cut=%d; cut: clips %d (expect %d) left "
+                         "inPoint %.6f (expect 3) left clip source@local0 %.6f -> %d\n"
+                         "[track-ops] G32 [%s] (1): entry on %s = %s, equals the left clip's curve -> %d\n"
+                         "[track-ops] G32 [%s] (2): source@left local0 preview %.6f, saved=%d loaded=%d reopened %.6f "
+                         "(expect 3, HEAD 5) -> %d\n"
+                         "[track-ops] G32 [%s] (3): undo clips %d entry = whole curve and clip -> %d; redo clips %d "
+                         "entry = clip, preview 3 -> %d\n",
+                         label, entryBefore, countAfter, 2 + withB, leftIn, leftClipSec, cut,
+                         label, key.toUtf8().constData(), entryJson.toUtf8().constData(), ok1,
+                         label, previewSec, saved, loadedOk, reopenedSec, ok2,
+                         label, countUndone, undoneOk, countRedone, redoneOk);
+        }
+        gate(32, caseOk[0] && caseOk[1]);
+    }
     std::fprintf(stderr, "[track-ops] summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

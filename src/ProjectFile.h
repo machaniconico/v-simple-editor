@@ -158,13 +158,15 @@ struct Text3DClipEntry {
     QJsonObject config;
 };
 
-// US-3D-11: per-clip expression bindings (transform.* etc).
+// US-3D-11: per-clip expression bindings (transform.* etc). US-1505: the legacy
+// root section only; load / fromJsonString move it onto ClipInfo::expressions.
 struct ExpressionBindingsClipEntry {
     QString clipId;
     exprbind::ClipExpressionBindings bindings;
 };
 
-// US-3D-11: per-clip wiggle / handheld-camera transform jitter.
+// US-3D-11: per-clip wiggle / handheld-camera transform jitter. US-1504: the
+// legacy root section only; load / fromJsonString move it onto ClipInfo::wiggle.
 struct WiggleClipEntry {
     QString clipId;
     wiggle::WiggleParams params;
@@ -280,8 +282,8 @@ struct ProjectData {
 
     // US-3D-11: motion-graphics sprint persistence
     QVector<Text3DClipEntry> text3DClipEntries;
-    QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;
-    QVector<WiggleClipEntry> wiggleClipEntries;
+    QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;  // US-1505: always empty after load
+    QVector<WiggleClipEntry> wiggleClipEntries;  // US-1504: always empty after load
     QJsonObject projectCamera;   // Camera3D::toJson() — single per-project camera
     QJsonArray projectLights;     // Light3D::toJson() entries — project-level lights
 
@@ -423,10 +425,9 @@ private:
     // US-3D-11: motion-graphics sprint persistence helpers
     static QJsonObject text3DClipEntryToJson(const Text3DClipEntry &entry);
     static Text3DClipEntry text3DClipEntryFromJson(const QJsonObject &obj);
-    static QJsonObject expressionBindingsEntryToJson(const ExpressionBindingsClipEntry &entry);
     static ExpressionBindingsClipEntry expressionBindingsEntryFromJson(const QJsonObject &obj);
-    static QJsonObject wiggleClipEntryToJson(const WiggleClipEntry &entry);
     static WiggleClipEntry wiggleClipEntryFromJson(const QJsonObject &obj);
+    static void migrateLegacyClipSidecars(const QJsonObject &root, ProjectData &data);
 
     // US-AETEXT-12: AE text feature persistence
     static QJsonObject pathTextToJson(const PathTextEntry &e);

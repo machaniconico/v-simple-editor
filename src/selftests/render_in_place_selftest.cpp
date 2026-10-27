@@ -324,7 +324,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 8; ++number) gate(number, false);
+        for (int number = 1; number <= 11; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -724,6 +724,87 @@ int runRenderInPlaceSelftest()
         && chroma.undoManager()->saveSerial() == chromaSerial
         && clipJson(chroma.videoTracks()[0]->clips()[0]) == clipJson(keyed)
         && clipJson(chroma.videoTracks()[1]->clips()[0]) == clipJson(background));
+
+    // G9 (US-1504): the wiggle acts on the layer after the material, like the
+    // transform, so the baked replacement keeps it (renderinplace::copyComposition)
+    // and the bake itself renders without it. Detects a copyComposition that drops
+    // ClipInfo::wiggle (negative control: that line removed in a mutation build).
+    ClipInfo wiggled = original;
+    wiggled.wiggle.enabled = true;
+    wiggled.wiggle.seed = 3;
+    wiggled.wiggle.positionAmplitude = QPointF(20.0, 20.0);
+    Timeline wiggleTimeline;
+    wiggleTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{wiggled}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto wiggleOptions = options;
+    wiggleOptions.handlesSec = 0.0;
+    wiggleOptions.outputDir = output.filePath(QStringLiteral("wiggle"));
+    QString wigglePath, wiggleError;
+    const bool wiggleBaked = renderinplace::renderClipInPlace(
+        wiggleTimeline, 0, 0, wiggleOptions, &wigglePath, &wiggleError);
+    const ClipInfo wiggleAfter = wiggleBaked ? wiggleTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool wiggleReplaced = wiggleBaked && wiggleAfter.filePath != wiggled.filePath
+        && wiggleAfter.renderInPlaceOriginal;
+    const bool wiggleKept = wiggleAfter.wiggle.enabled
+        && wiggle::toJson(wiggleAfter.wiggle) == wiggle::toJson(wiggled.wiggle);
+    std::fprintf(stderr, "G9 baked=%d [%s] replaced=%d wiggle enabled=%d seed=%u ampX=%.3f "
+        "(expect 1 / 3 / 20) kept=%d\n", int(wiggleBaked), qPrintable(wiggleError),
+        int(wiggleReplaced), int(wiggleAfter.wiggle.enabled), wiggleAfter.wiggle.seed,
+        wiggleAfter.wiggle.positionAmplitude.x(), int(wiggleKept));
+    gate(9, wiggleReplaced && wiggleKept);
+
+    // G10 (US-1505): the expression bindings drive the transform / opacity like the
+    // wiggle, so the baked replacement keeps them (renderinplace::copyComposition).
+    // Detects a copyComposition that drops ClipInfo::expressions (negative control:
+    // that line removed in a mutation build).
+    ClipInfo expressed = original;
+    expressed.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    expressed.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    Timeline expressionTimeline;
+    expressionTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{expressed}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto expressionOptions = options;
+    expressionOptions.handlesSec = 0.0;
+    expressionOptions.outputDir = output.filePath(QStringLiteral("expressions"));
+    QString expressionPath, expressionError;
+    const bool expressionBaked = renderinplace::renderClipInPlace(
+        expressionTimeline, 0, 0, expressionOptions, &expressionPath, &expressionError);
+    const ClipInfo expressionAfter = expressionBaked
+        ? expressionTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool expressionReplaced = expressionBaked && expressionAfter.filePath != expressed.filePath
+        && expressionAfter.renderInPlaceOriginal;
+    const bool expressionsKept = !expressionAfter.expressions.isEmpty()
+        && expressionAfter.expressions.toJson() == expressed.expressions.toJson();
+    std::fprintf(stderr, "G10 baked=%d [%s] replaced=%d rotation=[%s] opacity=[%s] "
+        "(expect time*90 / 50) kept=%d\n", int(expressionBaked), qPrintable(expressionError),
+        int(expressionReplaced),
+        qPrintable(expressionAfter.expressions.expression(QStringLiteral("transform.rotation"))),
+        qPrintable(expressionAfter.expressions.expression(QStringLiteral("transform.opacity"))),
+        int(expressionsKept));
+    gate(10, expressionReplaced && expressionsKept);
+
+    // G11 (US-1509): the orient-towards-camera flag stays on the baked replacement
+    // (renderinplace::copyComposition). Detects a copyComposition that drops
+    // ClipInfo::autoOrientToCamera (negative control: that line removed in a mutation build).
+    ClipInfo oriented = original;
+    oriented.is3DLayer = true;
+    oriented.autoOrientToCamera = true;
+    Timeline orientTimeline;
+    orientTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{oriented}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto orientOptions = options;
+    orientOptions.handlesSec = 0.0;
+    orientOptions.outputDir = output.filePath(QStringLiteral("orient"));
+    QString orientPath, orientError;
+    const bool orientBaked = renderinplace::renderClipInPlace(
+        orientTimeline, 0, 0, orientOptions, &orientPath, &orientError);
+    const ClipInfo orientAfter = orientBaked ? orientTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool orientReplaced = orientBaked && orientAfter.filePath != oriented.filePath
+        && orientAfter.renderInPlaceOriginal;
+    std::fprintf(stderr, "G11 baked=%d [%s] replaced=%d autoOrientToCamera=%d is3DLayer=%d "
+        "(expect 1 / 1)\n", int(orientBaked), qPrintable(orientError), int(orientReplaced),
+        int(orientAfter.autoOrientToCamera), int(orientAfter.is3DLayer));
+    gate(11, orientReplaced && orientAfter.autoOrientToCamera && orientAfter.is3DLayer);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

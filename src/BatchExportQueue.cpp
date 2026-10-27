@@ -100,12 +100,16 @@ Queue::Queue(QObject *parent)
 }
 
 // Resolve the task's saved user preset into the auto-loudness fields. Built-in
-// preset names never resolve to a user preset.
-static void captureLoudness(ExportTask &task)
+// preset names never resolve to a user preset. Returns whether the name resolved (built-in or
+// a saved user preset); only a resolved name counts as captured (loudnessResolved).
+static bool captureLoudness(ExportTask &task)
 {
-    task.loudnessResolved = true;
+    task.loudnessResolved = false;
     task.autoLoudness = false;
-    if (isBatchBuiltinName(task.preset)) return;
+    if (isBatchBuiltinName(task.preset)) {
+        task.loudnessResolved = true;
+        return true;
+    }
     // Same rule as presetChoices(): look the saved user preset up by name directly, so a user
     // preset sharing a name with an ExportDialog built-in still resolves.
     ExportConfig presetConfig;
@@ -116,11 +120,14 @@ static void captureLoudness(ExportTask &task)
         found = true;
         break;
     }
-    if (!found || !presetConfig.autoLoudness) return;
+    if (!found) return false;
+    task.loudnessResolved = true;
+    if (!presetConfig.autoLoudness) return true;
     QJsonObject loudness;
     presetConfig.appendLoudnessSettings(loudness);
     task.autoLoudness = true;
     task.targetLufs = loudness.value("targetLufs").toDouble(-14.0);
+    return true;
 }
 
 QString Queue::addTask(const QString &projectPath,
@@ -285,8 +292,18 @@ void Queue::processNext()
         return;
 
     // Find first Queued task and delegate it to the real RenderQueue.
-    for (auto &task : m_tasks) {
+    for (int taskIndex = 0; taskIndex < m_tasks.size(); ++taskIndex) {
+        ExportTask &task = m_tasks[taskIndex];
         if (task.state == TaskState::Queued) {
+            // A name that could not be resolved when queued (or a task restored without a
+            // capture) is looked up again now; if it is still unknown the task fails
+            // instead of silently exporting with the 1080p defaults.
+            if (!task.loudnessResolved && !captureLoudness(task)) {
+                task.state   = TaskState::Failed;
+                task.message = QStringLiteral("プリセット '%1' が見つかりません").arg(task.preset);
+                emit taskStateChanged(task.id, TaskState::Failed);
+                continue;
+            }
             m_currentId   = task.id;
             task.state    = TaskState::Running;
             task.progress = 0;

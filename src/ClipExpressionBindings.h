@@ -62,15 +62,11 @@ public:
     //   - the bound code is empty/whitespace, OR
     //   - expression evaluation fails (Expression::evaluate returns !success), OR
     //   - the resulting value is not finite (NaN / inf).
-    // Never throws; never returns NaN or inf.
+    // Never throws; never returns NaN or inf. audioLevel() reads ctx.audioLevelAtTime
+    // (US-1505: the bindings are a plain value on ClipInfo and carry no sampler).
     double resolve(const QString &propPath,
                    const ExpressionContext &ctx,
                    double keyframeValue) const;
-
-    // Runtime-only source sampler, supplied by MainWindow; never serialized.
-    void setAudioLevelSampler(std::function<double(double)> sampler) {
-        m_audioLevelAtTime = std::move(sampler);
-    }
 
     // Serialisation: JSON object mapping propPath -> code for every bound path.
     QJsonObject toJson() const;
@@ -84,7 +80,6 @@ public:
     bool isEmpty() const;
 
 private:
-    std::function<double(double)> m_audioLevelAtTime;
     QHash<QString, QString> m_bindings; // propPath -> expression code
 };
 

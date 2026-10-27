@@ -4,6 +4,8 @@
 #include "../EffectParamSchema.h"
 #include "../Keyframe.h"
 #include "../Timeline.h"
+#include "../WiggleTransform.h"
+#include "../ClipExpressionBindings.h"
 
 #include <QColor>
 
@@ -699,6 +701,79 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
     if (!trackHasKeyframes(clip.keyframes, kOpacityTrack))
         return staticOpacity;
     return clip.keyframes.valueAt(kOpacityTrack, clipLocalSeconds, staticOpacity);
+}
+
+bool hasAnyDynamicTransform(const ClipInfo& clip)
+{
+    return hasAnyMotionKeyframes(clip) || clip.wiggle.enabled || !clip.expressions.isEmpty();
+}
+
+void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,
+                         const EvalEnv& env, double *posX, double *posY,
+                         double *scale, double *rotationDeg, double *opacity01)
+{
+    if (!clip.expressions.isEmpty()) {
+        ExpressionContext ctx;
+        ctx.time = clipLocalSeconds;
+        ctx.fps = env.fps;
+        ctx.duration = clip.effectiveDuration();
+        ctx.canvasWidth = env.canvas.width();
+        ctx.canvasHeight = env.canvas.height();
+        ctx.audioLevelAtTime = env.audioLevelAtTime;
+        const exprbind::ClipExpressionBindings &bindings = clip.expressions;
+        if (posX)
+            *posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, *posX);
+        if (posY)
+            *posY = bindings.resolve(QStringLiteral("transform.position.y"), ctx, *posY);
+        if (scale)
+            *scale = bindings.resolve(QStringLiteral("transform.scale"), ctx, *scale);
+        if (rotationDeg)
+            *rotationDeg = bindings.resolve(QStringLiteral("transform.rotation"), ctx, *rotationDeg);
+        if (opacity01 && bindings.hasExpression(QStringLiteral("transform.opacity"))) {
+            const double percent = bindings.resolve(QStringLiteral("transform.opacity"), ctx,
+                                                    *opacity01 * 100.0);
+            *opacity01 = qBound(0.0, percent / 100.0, 1.0);
+        }
+    }
+    if (clip.wiggle.enabled) {
+        const wiggle::WiggleOffset off = wiggle::evaluate(clip.wiggle, clipLocalSeconds);
+        // wiggle::positionOffset is in PIXELS; posX/posY are NORMALIZED
+        // canvas fractions (canonical clipgeom contract). Convert the pixel
+        // offset with the project canvas so wiggle keeps its visual
+        // magnitude under clipgeom placement at any output size.
+        if (posX && env.canvas.width() > 0)
+            *posX += off.positionOffset.x() / env.canvas.width();
+        if (posY && env.canvas.height() > 0)
+            *posY += off.positionOffset.y() / env.canvas.height();
+        if (rotationDeg)
+            *rotationDeg += off.rotationOffsetDeg;
+        if (scale)
+            *scale *= off.scaleMultiplier;
+    }
+}
+
+clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
+                                             double clipLocalSeconds,
+                                             const EvalEnv& env)
+{
+    clipgeom::ClipTransform transform = effectiveTransformAt(clip, clipLocalSeconds);
+    if (!hasAnyDynamicTransform(clip))
+        return transform;
+    applyDynamicOverlay(clip, clipLocalSeconds, env, &transform.videoDx,
+                        &transform.videoDy, &transform.videoScale,
+                        &transform.rotationDeg, nullptr);
+    return transform;
+}
+
+double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
+                          double staticOpacity, const EvalEnv& env)
+{
+    double opacity = effectiveOpacityAt(clip, clipLocalSeconds, staticOpacity);
+    if (!hasAnyDynamicTransform(clip))
+        return opacity;
+    applyDynamicOverlay(clip, clipLocalSeconds, env, nullptr, nullptr, nullptr,
+                        nullptr, &opacity);
+    return opacity;
 }
 
 QVector<VideoEffect> effectiveEffectsAt(const ClipInfo& clip,

@@ -180,6 +180,17 @@ private:
     void ensureLayerIndex(int index);
 };
 
+struct ClipInfo;
+
+namespace camera3d {
+// US-1509: the 3D layer transform a projection / lighting site must use. Returns
+// clip.layer3D unchanged unless the clip is a 3D layer with autoOrientToCamera under a
+// trueProjection camera; then rotationX / rotationY face the layer at layerPosPx
+// (canvas px, centre origin, y down) at the camera position (rotationZ is kept).
+Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
+                                    const Camera3DState &camera);
+} // namespace camera3d
+
 // Shared opt-in compositing step for preview and export.
 QImage applyProjectCameraProjection(const QImage &image,
                                     const Layer3DTransform &layer3D,
