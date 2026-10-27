@@ -319,6 +319,212 @@ int runSpecialCompositeSelftest()
     tally.gate(4, varyOk && g4.sizeMatch && g4.maxDiff <= 2,
                "preview/export mismatch for out-of-range remap + Echo (see values above)");
 
+    // G8 needs no GL context, so it runs before the GL probe and also without one.
+    // G8: a file-backed RenderQueue job (resolveTimeline) must put the saved
+    // time-remap entries and the freeze-frame curve (which lives only on the
+    // ClipInfo until populateProjectData turns it into an entry) back on the
+    // clips. The job is a one-frame PNG sequence export (lossless, still goes
+    // through resolveTimeline and tlrender::renderFrameAt), compared with the
+    // live Timeline frame over the WHOLE image: same size and every pixel
+    // equal. The fixture's frame i is a uniform colour with R = 25 * i, so the
+    // centre pixel's red (diagnostic only) names the source frame. The 0.5x
+    // remap shows frame 4 at timeline 0.8 s (speed alone would show frame 8);
+    // the freeze holds the in-point frame 4 (speed alone would show frame 7 at
+    // 0.3 s). Negative controls: the same projects exported WITHOUT their
+    // entries are the HEAD behaviour and must differ from the live frame, with
+    // the centre red more than 50 apart. A failed save, export or decode is
+    // never a passing control: every export reports success and a decoded image.
+    struct G8Export {
+        bool ok = false;
+        QImage image;
+    };
+    struct G8Diff {
+        bool sameSize = false;
+        qint64 differing = -1;
+        int maxChannel = -1;
+        bool equal() const { return sameSize && differing == 0; }
+    };
+    const auto centreRed = [](const QImage &image) {
+        return image.isNull() ? -1000 : image.convertToFormat(QImage::Format_RGB888).pixelColor(kW / 2, kH / 2).red();
+    };
+    // The sequence writer flattens onto black into RGB888 (keepAlpha off); do
+    // the same to the live frame so both sides are in one format.
+    const auto flatten = [](const QImage &image) {
+        QImage opaque(image.size(), QImage::Format_RGB888);
+        opaque.fill(Qt::black);
+        QPainter painter(&opaque);
+        painter.drawImage(0, 0, image);
+        painter.end();
+        return opaque;
+    };
+    const auto diffImages = [&](const QImage &a, const QImage &b) {
+        G8Diff diff;
+        if (a.isNull() || b.isNull()) return diff;
+        diff.sameSize = a.size() == b.size();
+        if (!diff.sameSize) return diff;
+        const QImage left = a.convertToFormat(QImage::Format_RGB888);
+        const QImage right = b.convertToFormat(QImage::Format_RGB888);
+        diff.differing = 0;
+        diff.maxChannel = 0;
+        for (int y = 0; y < left.height(); ++y)
+            for (int x = 0; x < left.width(); ++x) {
+                const QColor l = left.pixelColor(x, y);
+                const QColor r = right.pixelColor(x, y);
+                const int d = std::max({std::abs(l.red() - r.red()), std::abs(l.green() - r.green()),
+                                        std::abs(l.blue() - r.blue())});
+                if (d > 0) ++diff.differing;
+                diff.maxChannel = std::max(diff.maxChannel, d);
+            }
+        return diff;
+    };
+    struct SequenceTestGuard {
+        const bool previous = sequenceexport::enabledForTest();
+        SequenceTestGuard() { sequenceexport::setEnabledForTest(true); }
+        ~SequenceTestGuard() { sequenceexport::setEnabledForTest(previous); }
+    };
+    const auto exportFrame = [&](ProjectData project, const QString &name, double targetSec) {
+        G8Export result;
+        const QString projectPath = dir.filePath(name + QStringLiteral(".veditor"));
+        const QString folder = dir.filePath(name);
+        if (!ProjectFile::save(projectPath, project))
+            return result;
+        const qint64 startUs = qint64(targetSec * 1000000.0);
+        RenderJob renderJob;
+        renderJob.projectFilePath = projectPath;
+        renderJob.outputPath = folder;
+        renderJob.width = kW;
+        renderJob.height = kH;
+        renderJob.startUs = startUs;
+        renderJob.endUs = startUs + qint64(1000000.0 / kFps);
+        renderJob.exportConfig.insert(QStringLiteral("fps"), kFps);
+        renderJob.exportConfig.insert(QStringLiteral("imageSequence"), true);
+        renderJob.exportConfig.insert(QStringLiteral("sequenceFolder"), folder);
+        renderJob.exportConfig.insert(QStringLiteral("sequencePattern"), QStringLiteral("g8_%04d.png"));
+        renderJob.exportConfig.insert(QStringLiteral("sequenceDigits"), 4);
+        renderJob.exportConfig.insert(QStringLiteral("sequenceStart"), 0);
+        bool completed = false;
+        {
+            SequenceTestGuard guard;
+            RenderQueue renderQueue;
+            QSignalSpy done(&renderQueue, &RenderQueue::jobCompletedUuid);
+            renderQueue.addJob(renderJob);
+            renderQueue.start();
+            if (done.isEmpty()) done.wait(120000);
+            completed = !done.isEmpty() && done.first().value(1).toBool();
+        }
+        result.image = QImage(QDir(folder).filePath(QStringLiteral("g8_0000.png")));
+        result.ok = completed && !result.image.isNull() && QDir(folder).entryList(QDir::Files).size() == 1;
+        return result;
+    };
+    const double g8StepUs = 1000000.0 / kFps;
+    const auto liveFrame = [&](double targetSec) {
+        return flatten(tlrender::renderFrameAt(timeline, qint64(targetSec * 1000000.0), size, g8StepUs));
+    };
+
+    // (1)(2) remap entry -> file-backed export == live Timeline.
+    ClipInfo halfSpeed = base;
+    halfSpeed.filePath = varyPath;
+    halfSpeed.timeRemapCurve.sourceFps = kFps;
+    halfSpeed.timeRemapCurve.addKey(0.0, 0.0);
+    halfSpeed.timeRemapCurve.addKey(1.0, 0.5);
+    setClip(halfSpeed);
+    const double g8TimelineSec = 0.8;
+    const double g8RemapLocalSec = g8TimelineSec - halfSpeed.leadInSec;
+    const double g8SourceSec = halfSpeed.inPoint + halfSpeed.timeRemapCurve.srcTimeAt(g8RemapLocalSec);
+    const QImage liveRemap = liveFrame(g8TimelineSec);
+    ClipInfo halfSpeedStored = halfSpeed;
+    halfSpeedStored.timeRemapCurve = timeremap::TimeRemapCurve();
+    ProjectData remapProject;
+    remapProject.videoTracks = QVector<QVector<ClipInfo>>{{halfSpeedStored}};
+    TimeRemapClipEntry remapEntry;
+    remapEntry.clipId = QStringLiteral("0:0");
+    remapEntry.curve = halfSpeed.timeRemapCurve;
+    remapProject.timeRemapClipEntries = {remapEntry};
+    const G8Export remapExport = exportFrame(remapProject, QStringLiteral("g8-remap"), g8TimelineSec);
+    ProjectData remapNoEntry = remapProject;
+    remapNoEntry.timeRemapClipEntries.clear();
+    const G8Export remapHead = exportFrame(remapNoEntry, QStringLiteral("g8-remap-head"), g8TimelineSec);
+    const G8Diff remapDiff = diffImages(remapExport.image, liveRemap);
+    const G8Diff remapHeadDiff = diffImages(remapHead.image, liveRemap);
+    const int liveRemapRed = centreRed(liveRemap);
+    const int remapExportRed = centreRed(remapExport.image);
+    const int remapHeadRed = centreRed(remapHead.image);
+    const bool remapOk = !liveRemap.isNull() && remapExport.ok && remapHead.ok
+        && remapDiff.equal() && !remapHeadDiff.equal()
+        && std::abs(remapHeadRed - liveRemapRed) > 50;
+
+    // (3) freeze frame saved through populateProjectData.
+    ClipInfo frozen = base;
+    frozen.filePath = varyPath;
+    frozen.inPoint = 0.4;
+    frozen.outPoint = 1.0;
+    frozen.timeRemapCurve.blendMode = timeremap::FrameBlendMode::NearestFrame;
+    frozen.timeRemapCurve.sourceFps = kFps;
+    frozen.timeRemapCurve.addKey(0.0, 0.0);
+    setClip(frozen);
+    window.m_timeRemapClipEntries.clear();
+    const double g8FreezeTimelineSec = 0.3;
+    const double g8FreezeLocalSec = g8FreezeTimelineSec - frozen.leadInSec;
+    const double g8FreezeSourceSec = frozen.inPoint + frozen.timeRemapCurve.srcTimeAt(g8FreezeLocalSec);
+    const QImage liveFreeze = liveFrame(g8FreezeTimelineSec);
+    ProjectData freezeProject;
+    window.populateProjectData(freezeProject);
+    const bool freezeEntryPresent = freezeProject.timeRemapClipEntries.size() == 1;
+    const G8Export freezeExport = exportFrame(freezeProject, QStringLiteral("g8-freeze"), g8FreezeTimelineSec);
+    ProjectData freezeNoEntry = freezeProject;
+    freezeNoEntry.timeRemapClipEntries.clear();
+    const G8Export freezeHead = exportFrame(freezeNoEntry, QStringLiteral("g8-freeze-head"), g8FreezeTimelineSec);
+    const G8Diff freezeDiff = diffImages(freezeExport.image, liveFreeze);
+    const G8Diff freezeHeadDiff = diffImages(freezeHead.image, liveFreeze);
+    const int liveFreezeRed = centreRed(liveFreeze);
+    const int freezeExportRed = centreRed(freezeExport.image);
+    const int freezeHeadRed = centreRed(freezeHead.image);
+    const bool freezeOk = freezeEntryPresent && !liveFreeze.isNull() && freezeExport.ok && freezeHead.ok
+        && freezeDiff.equal() && !freezeHeadDiff.equal()
+        && std::abs(freezeHeadRed - liveFreezeRed) > 50;
+
+    // (4) no entries: file-backed export == live Timeline (regression).
+    ClipInfo plainClip = base;
+    plainClip.filePath = varyPath;
+    setClip(plainClip);
+    const double g8PlainLocalSec = g8TimelineSec - plainClip.leadInSec;
+    const double g8PlainSourceSec = plainClip.inPoint + g8PlainLocalSec * plainClip.speed;
+    const QImage livePlain = liveFrame(g8TimelineSec);
+    ProjectData plainProject;
+    plainProject.videoTracks = QVector<QVector<ClipInfo>>{{plainClip}};
+    const G8Export plainExport = exportFrame(plainProject, QStringLiteral("g8-plain"), g8TimelineSec);
+    const G8Diff plainDiff = diffImages(plainExport.image, livePlain);
+    const int livePlainRed = centreRed(livePlain);
+    const int plainExportRed = centreRed(plainExport.image);
+    const bool plainOk = !livePlain.isNull() && plainExport.ok && plainDiff.equal();
+
+    const auto diffText = [](const G8Diff &d) {
+        return std::string("sameSize=") + (d.sameSize ? "1" : "0") + " differingPixels=" + std::to_string(d.differing)
+            + " maxChannelDiff=" + std::to_string(d.maxChannel);
+    };
+    std::cerr << "special-composite G8 (1)(2) remap timelineSec=" << g8TimelineSec
+              << " localSec=" << g8RemapLocalSec << " sourceSec=" << g8SourceSec
+              << " liveRed=" << liveRemapRed << " exportRed=" << remapExportRed
+              << " noEntryControlRed=" << remapHeadRed
+              << " exportOk=" << remapExport.ok << " controlOk=" << remapHead.ok
+              << " export[" << diffText(remapDiff) << "] noEntryControl[" << diffText(remapHeadDiff)
+              << "] ok=" << remapOk << '\n';
+    std::cerr << "special-composite G8 (3) freeze timelineSec=" << g8FreezeTimelineSec
+              << " localSec=" << g8FreezeLocalSec << " sourceSec=" << g8FreezeSourceSec
+              << " entryFromPopulate=" << freezeEntryPresent
+              << " liveRed=" << liveFreezeRed << " exportRed=" << freezeExportRed
+              << " noEntryControlRed=" << freezeHeadRed
+              << " exportOk=" << freezeExport.ok << " controlOk=" << freezeHead.ok
+              << " export[" << diffText(freezeDiff) << "] noEntryControl[" << diffText(freezeHeadDiff)
+              << "] ok=" << freezeOk << '\n';
+    std::cerr << "special-composite G8 (4) plain timelineSec=" << g8TimelineSec
+              << " localSec=" << g8PlainLocalSec << " sourceSec=" << g8PlainSourceSec
+              << " liveRed=" << livePlainRed << " exportRed=" << plainExportRed
+              << " exportOk=" << plainExport.ok
+              << " export[" << diffText(plainDiff) << "] ok=" << plainOk << '\n';
+    tally.gate(8, remapOk && freezeOk && plainOk,
+               "file-backed export lost the saved time-remap or freeze-frame (see values above)");
+
     // G5-G7 (US-1106): GLPreview output of a special-composite frame. The
     // widget is the frame's logical size with no display transform and the
     // frame texture sampled Nearest, so each frame pixel is read back exactly
@@ -753,211 +959,6 @@ int runSpecialCompositeSelftest()
     tally.gate(7, glGrab.rawSizeOk && translucentFormat == QImage::Format_ARGB32_Premultiplied
                    && routedErr <= 2 && straightErr > 2,
                "translucent special composite no longer composites correctly (see values above)");
-
-    // G8: a file-backed RenderQueue job (resolveTimeline) must put the saved
-    // time-remap entries and the freeze-frame curve (which lives only on the
-    // ClipInfo until populateProjectData turns it into an entry) back on the
-    // clips. The job is a one-frame PNG sequence export (lossless, still goes
-    // through resolveTimeline and tlrender::renderFrameAt), compared with the
-    // live Timeline frame over the WHOLE image: same size and every pixel
-    // equal. The fixture's frame i is a uniform colour with R = 25 * i, so the
-    // centre pixel's red (diagnostic only) names the source frame. The 0.5x
-    // remap shows frame 4 at timeline 0.8 s (speed alone would show frame 8);
-    // the freeze holds the in-point frame 4 (speed alone would show frame 7 at
-    // 0.3 s). Negative controls: the same projects exported WITHOUT their
-    // entries are the HEAD behaviour and must differ from the live frame, with
-    // the centre red more than 50 apart. A failed save, export or decode is
-    // never a passing control: every export reports success and a decoded image.
-    struct G8Export {
-        bool ok = false;
-        QImage image;
-    };
-    struct G8Diff {
-        bool sameSize = false;
-        qint64 differing = -1;
-        int maxChannel = -1;
-        bool equal() const { return sameSize && differing == 0; }
-    };
-    const auto centreRed = [](const QImage &image) {
-        return image.isNull() ? -1000 : image.convertToFormat(QImage::Format_RGB888).pixelColor(kW / 2, kH / 2).red();
-    };
-    // The sequence writer flattens onto black into RGB888 (keepAlpha off); do
-    // the same to the live frame so both sides are in one format.
-    const auto flatten = [](const QImage &image) {
-        QImage opaque(image.size(), QImage::Format_RGB888);
-        opaque.fill(Qt::black);
-        QPainter painter(&opaque);
-        painter.drawImage(0, 0, image);
-        painter.end();
-        return opaque;
-    };
-    const auto diffImages = [&](const QImage &a, const QImage &b) {
-        G8Diff diff;
-        if (a.isNull() || b.isNull()) return diff;
-        diff.sameSize = a.size() == b.size();
-        if (!diff.sameSize) return diff;
-        const QImage left = a.convertToFormat(QImage::Format_RGB888);
-        const QImage right = b.convertToFormat(QImage::Format_RGB888);
-        diff.differing = 0;
-        diff.maxChannel = 0;
-        for (int y = 0; y < left.height(); ++y)
-            for (int x = 0; x < left.width(); ++x) {
-                const QColor l = left.pixelColor(x, y);
-                const QColor r = right.pixelColor(x, y);
-                const int d = std::max({std::abs(l.red() - r.red()), std::abs(l.green() - r.green()),
-                                        std::abs(l.blue() - r.blue())});
-                if (d > 0) ++diff.differing;
-                diff.maxChannel = std::max(diff.maxChannel, d);
-            }
-        return diff;
-    };
-    struct SequenceTestGuard {
-        const bool previous = sequenceexport::enabledForTest();
-        SequenceTestGuard() { sequenceexport::setEnabledForTest(true); }
-        ~SequenceTestGuard() { sequenceexport::setEnabledForTest(previous); }
-    };
-    const auto exportFrame = [&](ProjectData project, const QString &name, double targetSec) {
-        G8Export result;
-        const QString projectPath = dir.filePath(name + QStringLiteral(".veditor"));
-        const QString folder = dir.filePath(name);
-        if (!ProjectFile::save(projectPath, project))
-            return result;
-        const qint64 startUs = qint64(targetSec * 1000000.0);
-        RenderJob renderJob;
-        renderJob.projectFilePath = projectPath;
-        renderJob.outputPath = folder;
-        renderJob.width = kW;
-        renderJob.height = kH;
-        renderJob.startUs = startUs;
-        renderJob.endUs = startUs + qint64(1000000.0 / kFps);
-        renderJob.exportConfig.insert(QStringLiteral("fps"), kFps);
-        renderJob.exportConfig.insert(QStringLiteral("imageSequence"), true);
-        renderJob.exportConfig.insert(QStringLiteral("sequenceFolder"), folder);
-        renderJob.exportConfig.insert(QStringLiteral("sequencePattern"), QStringLiteral("g8_%04d.png"));
-        renderJob.exportConfig.insert(QStringLiteral("sequenceDigits"), 4);
-        renderJob.exportConfig.insert(QStringLiteral("sequenceStart"), 0);
-        bool completed = false;
-        {
-            SequenceTestGuard guard;
-            RenderQueue renderQueue;
-            QSignalSpy done(&renderQueue, &RenderQueue::jobCompletedUuid);
-            renderQueue.addJob(renderJob);
-            renderQueue.start();
-            if (done.isEmpty()) done.wait(120000);
-            completed = !done.isEmpty() && done.first().value(1).toBool();
-        }
-        result.image = QImage(QDir(folder).filePath(QStringLiteral("g8_0000.png")));
-        result.ok = completed && !result.image.isNull() && QDir(folder).entryList(QDir::Files).size() == 1;
-        return result;
-    };
-    const double g8StepUs = 1000000.0 / kFps;
-    const auto liveFrame = [&](double targetSec) {
-        return flatten(tlrender::renderFrameAt(timeline, qint64(targetSec * 1000000.0), size, g8StepUs));
-    };
-
-    // (1)(2) remap entry -> file-backed export == live Timeline.
-    ClipInfo halfSpeed = base;
-    halfSpeed.filePath = varyPath;
-    halfSpeed.timeRemapCurve.sourceFps = kFps;
-    halfSpeed.timeRemapCurve.addKey(0.0, 0.0);
-    halfSpeed.timeRemapCurve.addKey(1.0, 0.5);
-    setClip(halfSpeed);
-    const double g8TimelineSec = 0.8;
-    const double g8RemapLocalSec = g8TimelineSec - halfSpeed.leadInSec;
-    const double g8SourceSec = halfSpeed.inPoint + halfSpeed.timeRemapCurve.srcTimeAt(g8RemapLocalSec);
-    const QImage liveRemap = liveFrame(g8TimelineSec);
-    ClipInfo halfSpeedStored = halfSpeed;
-    halfSpeedStored.timeRemapCurve = timeremap::TimeRemapCurve();
-    ProjectData remapProject;
-    remapProject.videoTracks = QVector<QVector<ClipInfo>>{{halfSpeedStored}};
-    TimeRemapClipEntry remapEntry;
-    remapEntry.clipId = QStringLiteral("0:0");
-    remapEntry.curve = halfSpeed.timeRemapCurve;
-    remapProject.timeRemapClipEntries = {remapEntry};
-    const G8Export remapExport = exportFrame(remapProject, QStringLiteral("g8-remap"), g8TimelineSec);
-    ProjectData remapNoEntry = remapProject;
-    remapNoEntry.timeRemapClipEntries.clear();
-    const G8Export remapHead = exportFrame(remapNoEntry, QStringLiteral("g8-remap-head"), g8TimelineSec);
-    const G8Diff remapDiff = diffImages(remapExport.image, liveRemap);
-    const G8Diff remapHeadDiff = diffImages(remapHead.image, liveRemap);
-    const int liveRemapRed = centreRed(liveRemap);
-    const int remapExportRed = centreRed(remapExport.image);
-    const int remapHeadRed = centreRed(remapHead.image);
-    const bool remapOk = !liveRemap.isNull() && remapExport.ok && remapHead.ok
-        && remapDiff.equal() && !remapHeadDiff.equal()
-        && std::abs(remapHeadRed - liveRemapRed) > 50;
-
-    // (3) freeze frame saved through populateProjectData.
-    ClipInfo frozen = base;
-    frozen.filePath = varyPath;
-    frozen.inPoint = 0.4;
-    frozen.outPoint = 1.0;
-    frozen.timeRemapCurve.blendMode = timeremap::FrameBlendMode::NearestFrame;
-    frozen.timeRemapCurve.sourceFps = kFps;
-    frozen.timeRemapCurve.addKey(0.0, 0.0);
-    setClip(frozen);
-    window.m_timeRemapClipEntries.clear();
-    const double g8FreezeTimelineSec = 0.3;
-    const double g8FreezeLocalSec = g8FreezeTimelineSec - frozen.leadInSec;
-    const double g8FreezeSourceSec = frozen.inPoint + frozen.timeRemapCurve.srcTimeAt(g8FreezeLocalSec);
-    const QImage liveFreeze = liveFrame(g8FreezeTimelineSec);
-    ProjectData freezeProject;
-    window.populateProjectData(freezeProject);
-    const bool freezeEntryPresent = freezeProject.timeRemapClipEntries.size() == 1;
-    const G8Export freezeExport = exportFrame(freezeProject, QStringLiteral("g8-freeze"), g8FreezeTimelineSec);
-    ProjectData freezeNoEntry = freezeProject;
-    freezeNoEntry.timeRemapClipEntries.clear();
-    const G8Export freezeHead = exportFrame(freezeNoEntry, QStringLiteral("g8-freeze-head"), g8FreezeTimelineSec);
-    const G8Diff freezeDiff = diffImages(freezeExport.image, liveFreeze);
-    const G8Diff freezeHeadDiff = diffImages(freezeHead.image, liveFreeze);
-    const int liveFreezeRed = centreRed(liveFreeze);
-    const int freezeExportRed = centreRed(freezeExport.image);
-    const int freezeHeadRed = centreRed(freezeHead.image);
-    const bool freezeOk = freezeEntryPresent && !liveFreeze.isNull() && freezeExport.ok && freezeHead.ok
-        && freezeDiff.equal() && !freezeHeadDiff.equal()
-        && std::abs(freezeHeadRed - liveFreezeRed) > 50;
-
-    // (4) no entries: file-backed export == live Timeline (regression).
-    ClipInfo plainClip = base;
-    plainClip.filePath = varyPath;
-    setClip(plainClip);
-    const double g8PlainLocalSec = g8TimelineSec - plainClip.leadInSec;
-    const double g8PlainSourceSec = plainClip.inPoint + g8PlainLocalSec * plainClip.speed;
-    const QImage livePlain = liveFrame(g8TimelineSec);
-    ProjectData plainProject;
-    plainProject.videoTracks = QVector<QVector<ClipInfo>>{{plainClip}};
-    const G8Export plainExport = exportFrame(plainProject, QStringLiteral("g8-plain"), g8TimelineSec);
-    const G8Diff plainDiff = diffImages(plainExport.image, livePlain);
-    const int livePlainRed = centreRed(livePlain);
-    const int plainExportRed = centreRed(plainExport.image);
-    const bool plainOk = !livePlain.isNull() && plainExport.ok && plainDiff.equal();
-
-    const auto diffText = [](const G8Diff &d) {
-        return std::string("sameSize=") + (d.sameSize ? "1" : "0") + " differingPixels=" + std::to_string(d.differing)
-            + " maxChannelDiff=" + std::to_string(d.maxChannel);
-    };
-    std::cerr << "special-composite G8 (1)(2) remap timelineSec=" << g8TimelineSec
-              << " localSec=" << g8RemapLocalSec << " sourceSec=" << g8SourceSec
-              << " liveRed=" << liveRemapRed << " exportRed=" << remapExportRed
-              << " noEntryControlRed=" << remapHeadRed
-              << " exportOk=" << remapExport.ok << " controlOk=" << remapHead.ok
-              << " export[" << diffText(remapDiff) << "] noEntryControl[" << diffText(remapHeadDiff)
-              << "] ok=" << remapOk << '\n';
-    std::cerr << "special-composite G8 (3) freeze timelineSec=" << g8FreezeTimelineSec
-              << " localSec=" << g8FreezeLocalSec << " sourceSec=" << g8FreezeSourceSec
-              << " entryFromPopulate=" << freezeEntryPresent
-              << " liveRed=" << liveFreezeRed << " exportRed=" << freezeExportRed
-              << " noEntryControlRed=" << freezeHeadRed
-              << " exportOk=" << freezeExport.ok << " controlOk=" << freezeHead.ok
-              << " export[" << diffText(freezeDiff) << "] noEntryControl[" << diffText(freezeHeadDiff)
-              << "] ok=" << freezeOk << '\n';
-    std::cerr << "special-composite G8 (4) plain timelineSec=" << g8TimelineSec
-              << " localSec=" << g8PlainLocalSec << " sourceSec=" << g8PlainSourceSec
-              << " liveRed=" << livePlainRed << " exportRed=" << plainExportRed
-              << " exportOk=" << plainExport.ok
-              << " export[" << diffText(plainDiff) << "] ok=" << plainOk << '\n';
-    tally.gate(8, remapOk && freezeOk && plainOk,
-               "file-backed export lost the saved time-remap or freeze-frame (see values above)");
 
     // G9 (US-1504): the wiggle is ClipInfo::wiggle, evaluated by the one shared overlay
     // (clipanim::applyDynamicOverlay) on top of keyframes -> autoOrient, so export
