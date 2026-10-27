@@ -131,6 +131,7 @@ int runExposureAidsSelftest();
 int runFcpxmlImportSelftest();
 int runFcpxmlSelftest();
 int runFeatureTrackerSelftest();
+int runFileJobParitySelftest();
 int runFlipSolidSelftest();
 int runFrameClipboardSelftest();
 int runFrameExportSelftest();
@@ -798,6 +799,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "サーフェスツールの画面座標とソース UV をフィット・クリップ変換込みで往復・ドラッグ量・解像度変更・scale 0・影響円・余白クリック・親判定 3 形態・借用区間のキー付き子 (13 gates)" },
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
+    { "filejob-parity", "VEDITOR_FILEJOB_PARITY_SELFTEST", runFileJobParitySelftest, true,
+      "File-backed RenderQueue job == live renderFrameAt under the project camera: animated trueProjection camera and auto-orient (2 gates)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing (16 gates)" },
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,

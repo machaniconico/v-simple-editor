@@ -2565,6 +2565,7 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         projectCamera.fromJson(data.projectCamera);
     tl->setProjectLights(projectLights);
     tl->setProjectLightViewPosition(projectCamera.camera().position);
+    tl->setProjectCamera(projectCamera);
 
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths
