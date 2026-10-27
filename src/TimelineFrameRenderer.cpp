@@ -2254,6 +2254,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     QImage v1LayerSource;
     clipgeom::ClipTransform v1Transform;
     bool v1NullObject = false;
+    bool v1Disabled = false;
     if (v1Hidden) {
         base = QImage(outSize, QImage::Format_RGBA8888);
         base.fill(Qt::transparent);
@@ -2274,7 +2275,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 return QImage();
 
             const ClipInfo &v1Clip = v1Clips[v1Idx];
-            const bool v1Disabled = clipenabletest::disabled(v1Clip);
+            v1Disabled = clipenabletest::disabled(v1Clip);
             v1ClipPtr = v1Disabled ? &hiddenV1Clip : &v1Clip;
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
@@ -2835,6 +2836,23 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QImage styledBase = base;
         if (!v1Clip.layerStyle.isIdentity())
             styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
+        // A lone V1 clip below full opacity is painted over a transparent
+        // canvas exactly like the composite path below (SourceOver, layer
+        // skipped at opacity <= 0.001), so it matches the same clip on V2
+        // over an empty V1. Opacity 1.0 keeps the untouched shortcut bytes.
+        if (v1Idx >= 0 && !v1Disabled && !v1NullObject && v1EffectiveOpacity < 1.0) {
+            QImage composed(styledBase.size(), QImage::Format_ARGB32_Premultiplied);
+            composed.fill(Qt::transparent);
+            const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
+            if (v1Opacity > 0.001) {
+                QPainter p(&composed);
+                p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                p.setOpacity(v1Opacity);
+                p.drawImage(0, 0, styledBase);
+            }
+            styledBase = composed.convertToFormat(QImage::Format_RGBA8888);
+        }
         const QImage adj = applyTimelineGlobals
             ? applyAdjustmentLayers(styledBase, timeline, sampledUsec)
             : styledBase;

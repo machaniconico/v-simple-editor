@@ -987,7 +987,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
-      "Render-time per-clip motion/opacity keyframe evaluation parity (6 gates); byte-identical no-keyframe guard" },
+      "Render-time per-clip motion/opacity keyframe evaluation parity (7 gates); byte-identical no-keyframe guard" },
     { "motion-blur-p2", "VEDITOR_MOTION_BLUR_P2_SELFTEST", runMotionBlurP2Selftest, true,
       "Motion blur P2 activation: env force OR per-clip opt-in + ProjectFile true-only persistence (5 gates)" },
     { "motion-blur-parity", "VEDITOR_MOTION_BLUR_PARITY_SELFTEST", runMotionBlurParitySelftest, true,
