@@ -7,6 +7,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../ProjectFile.h"
 #include "../UndoManager.h"
+#include "SelftestRegistry.h"
 #include "../libavcore/Probe.h"
 #include <QFileInfo>
 #include <QFile>
@@ -326,6 +327,7 @@ int runRenderInPlaceSelftest()
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
         for (int number = 1; number <= 11; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+        selftests::reportTally(passed, failed, 0);
         return failed;
     }
     original.inPoint = 1.0;
@@ -806,5 +808,7 @@ int runRenderInPlaceSelftest()
         int(orientAfter.autoOrientToCamera), int(orientAfter.is3DLayer));
     gate(11, orientReplaced && orientAfter.autoOrientToCamera && orientAfter.is3DLayer);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

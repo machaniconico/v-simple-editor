@@ -5,6 +5,7 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "SelftestRegistry.h"
 
 #include <QJsonDocument>
 #include <QLineF>
@@ -75,7 +76,7 @@ ClipInfo fixtureClip(const QColor &color, const QSize &canvas)
 
 int runCamera3DSelftest()
 {
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, skipped = 0;
     auto gate = [&](int number, bool ok) {
         std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", number);
         ok ? ++passed : ++failed;
@@ -544,5 +545,7 @@ int runCamera3DSelftest()
         gate(10, helperOk && upperOk && v1Ok && flatOk && lightOk && glOk && jsonOk && undoOk);
     }
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, skipped);
     return failed;
 }
