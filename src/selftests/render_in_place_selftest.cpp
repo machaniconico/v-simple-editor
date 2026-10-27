@@ -324,7 +324,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 9; ++number) gate(number, false);
+        for (int number = 1; number <= 10; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -752,6 +752,36 @@ int runRenderInPlaceSelftest()
         int(wiggleReplaced), int(wiggleAfter.wiggle.enabled), wiggleAfter.wiggle.seed,
         wiggleAfter.wiggle.positionAmplitude.x(), int(wiggleKept));
     gate(9, wiggleReplaced && wiggleKept);
+
+    // G10 (US-1505): the expression bindings drive the transform / opacity like the
+    // wiggle, so the baked replacement keeps them (renderinplace::copyComposition).
+    // Detects a copyComposition that drops ClipInfo::expressions (negative control:
+    // that line removed in a mutation build).
+    ClipInfo expressed = original;
+    expressed.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    expressed.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    Timeline expressionTimeline;
+    expressionTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{expressed}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto expressionOptions = options;
+    expressionOptions.handlesSec = 0.0;
+    expressionOptions.outputDir = output.filePath(QStringLiteral("expressions"));
+    QString expressionPath, expressionError;
+    const bool expressionBaked = renderinplace::renderClipInPlace(
+        expressionTimeline, 0, 0, expressionOptions, &expressionPath, &expressionError);
+    const ClipInfo expressionAfter = expressionBaked
+        ? expressionTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool expressionReplaced = expressionBaked && expressionAfter.filePath != expressed.filePath
+        && expressionAfter.renderInPlaceOriginal;
+    const bool expressionsKept = !expressionAfter.expressions.isEmpty()
+        && expressionAfter.expressions.toJson() == expressed.expressions.toJson();
+    std::fprintf(stderr, "G10 baked=%d [%s] replaced=%d rotation=[%s] opacity=[%s] "
+        "(expect time*90 / 50) kept=%d\n", int(expressionBaked), qPrintable(expressionError),
+        int(expressionReplaced),
+        qPrintable(expressionAfter.expressions.expression(QStringLiteral("transform.rotation"))),
+        qPrintable(expressionAfter.expressions.expression(QStringLiteral("transform.opacity"))),
+        int(expressionsKept));
+    gate(10, expressionReplaced && expressionsKept);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

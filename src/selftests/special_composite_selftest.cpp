@@ -13,7 +13,10 @@
 #include "../TimelineFrameRenderer.h"
 #include "../WarpDistortion.h"
 #include "../WiggleTransform.h"
+#include "../AudioKeyframes.h"
+#include "../TrimOps.h"
 #include "../clipanim/ClipAnim.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
 #include "SelftestGate.h"
@@ -29,13 +32,16 @@
 #include <QTest>
 #include <QString>
 #include <QTemporaryDir>
+#include <QUuid>
 #include <QVector>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iomanip>
+#include <sstream>
 #include <utility>
 #include <iostream>
 
@@ -196,7 +202,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 9; ++g)
+        for (int g = 1; g <= 10; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -238,7 +244,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 9; ++g)
+        for (int g = 5; g <= 10; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -332,6 +338,7 @@ int runSpecialCompositeSelftest()
         for (int g = 5; g <= 7; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
         tally.skip(9, "no usable QOpenGLWidget context");
+        tally.skip(10, "no usable QOpenGLWidget context");
         return tally.finish("special-composite");
     }
     // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
@@ -1218,6 +1225,299 @@ int runSpecialCompositeSelftest()
     tally.gate(9, g9ok1 && g9ok2 && g9ok3 && g9ok4 && g9ok5 && g9ok6,
                "the clip wiggle is missing from the export or a preview, applied twice on the baked frame, "
                "written back by arrange, or normalized by the output size (see values above)");
+
+    // G10 (US-1505): the expression bindings are ClipInfo::expressions, evaluated by the shared
+    // overlay (keyframes -> autoOrient -> expressions (replace) -> wiggle (add)); audioLevel()
+    // reads the Timeline's audio-level snapshot (Timeline::expressionAudioEnvForRead).
+    //   (1) renderFrameAt at t = 0.5 with transform.rotation = time*90 differs from without
+    //       (HEAD: the export ignores MainWindow's expression sidecar -> equal).
+    //   (2) effectiveTransformAt(clip, 0.5, env).rotationDeg == 45 (replaces a base 10).
+    //   (3) transform.opacity = 50 -> effectiveOpacityAt == 0.5.
+    //   (4) opacity = audioLevel()*100: env.audioLevelAtTime returning 0.5 -> 0.5, no sampler -> 0.
+    //   (5) empty bindings: the env form == the two-argument form (keyframed clip, byte-equal).
+    //   (6) position.x = 0.5 with the wiggle on: videoDx = 0.5 + wiggle offset (the wiggle after).
+    //   (7) time remap + rotation expression: the special composite == renderFrameAt, and the
+    //       expression is visible.
+    //   (8') a stepped WAV linked to V1 (opacity = audioLevel()*100): relinkMediaPaths, a gap
+    //        (ripple delete of an unlinked filler in front), applyTrimLinked (RippleIn, V1 moves
+    //        too) and unlinkClipGroupForTest each change the value after the 50 ms debounce (150 ms wait), with a new
+    //        snapshot pointer; the old snapshot still gives the old value. Mutation control:
+    //        no emit in unlinkClipGroup and no generation compare -> the unlink value stays.
+    //   (8'') regression item (HEAD reads the live clips and passes): setClipSpeed(2.0) on the
+    //        selected V1[0] changes the linked A1[0] speed (no emit) -> the value changes.
+    //        Mutation control: no generation compare -> stale.
+    //   (10) a RenderQueue export of the live Timeline: an expression without audioLevel() never
+    //        decodes (invocationCountForTest() == 0), one with audioLevel() does (> 0).
+    //   (9) a nested sequence's child clip with transform.position.x = audioLevel() and a root A1
+    //       of its link group renders at level 0 (the bar stays at x 224); the same clip at the
+    //       root moves by the level (bar gone). Position, not opacity: a lone V1 layer is drawn
+    //       without its opacity (HEAD's single-layer path).
+    //       Mutation control: the depth check removed -> the child reads the root audio.
+    std::cerr << "special-composite G10 begin\n";
+    const auto g10Wav = [&](const QString &name, double silentSec) {
+        const QString wavPath = dir.filePath(name);
+        constexpr int g10Sr = 48000;
+        QByteArray pcm;
+        pcm.reserve(g10Sr * 2 * 2);
+        for (int i = 0; i < g10Sr * 2; ++i) {
+            const bool loud = silentSec >= 0.0 && i >= int(silentSec * g10Sr);
+            pcm.append(char(0x00));
+            pcm.append(loud ? char(0x40) : char(0x00));
+        }
+        QString err;
+        return libavcore::writePcm16AsWav(wavPath, pcm, g10Sr, 1, &err) ? wavPath : QString();
+    };
+    const QString steppedWav = g10Wav(QStringLiteral("g10-stepped.wav"), 0.5); // silent [0, 0.5)
+    const QString loudWav = g10Wav(QStringLiteral("g10-loud.wav"), 0.0);
+    const QString silentWav = g10Wav(QStringLiteral("g10-silent.wav"), -1.0);
+    const bool g10Fixture = !steppedWav.isEmpty() && !loudWav.isEmpty() && !silentWav.isEmpty();
+    const auto audioClip = [](const QString &wavPath, double duration, int linkGroup) {
+        ClipInfo clip;
+        clip.filePath = wavPath;
+        clip.duration = clip.outPoint = duration;
+        clip.speed = 1.0;
+        clip.linkGroup = linkGroup;
+        return clip;
+    };
+    const double g10t = 0.5;
+
+    // (1)
+    ClipInfo rotClip = base;
+    rotClip.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    const DiffStat g10d1 = compare(renderOne(rotClip, size, g10t, size), renderOne(base, size, g10t, size));
+    const bool g10ok1 = g10d1.sizeMatch && g10d1.diffPixels > 50;
+
+    // (2) / (3) / (4) / (5) / (6): the shared evaluator.
+    clipanim::EvalEnv g10Env;
+    g10Env.fps = kFps;
+    g10Env.canvas = size;
+    ClipInfo rotBased = rotClip;
+    rotBased.rotation2DDegrees = 10.0;
+    const double g10Rot = clipanim::effectiveTransformAt(rotBased, g10t, g10Env).rotationDeg;
+    const bool g10ok2 = std::abs(g10Rot - 45.0) <= 1e-9
+        && clipanim::effectiveTransformAt(rotBased, g10t).rotationDeg == 10.0;
+    ClipInfo opClip = base;
+    opClip.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    const double g10Op = clipanim::effectiveOpacityAt(opClip, g10t, opClip.opacity, g10Env);
+    const bool g10ok3 = std::abs(g10Op - 0.5) <= 1e-12;
+    ClipInfo levelClip = base;
+    levelClip.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel()*100"));
+    clipanim::EvalEnv g10EnvLevel = g10Env;
+    g10EnvLevel.audioLevelAtTime = [](double) { return 0.5; };
+    const double g10OpLevel = clipanim::effectiveOpacityAt(levelClip, g10t, levelClip.opacity, g10EnvLevel);
+    const double g10OpNoSampler = clipanim::effectiveOpacityAt(levelClip, g10t, levelClip.opacity, g10Env);
+    const bool g10ok4 = std::abs(g10OpLevel - 0.5) <= 1e-12 && g10OpNoSampler == 0.0;
+    ClipInfo keyed = base;
+    keyed.keyframes.addTrack(audiokf::propertyTrack(QStringLiteral("transform.position.x"),
+        {KeyframePoint{0.0, 0.0}, KeyframePoint{1.0, 0.4}}, 0.0));
+    const clipgeom::ClipTransform g10Two = clipanim::effectiveTransformAt(keyed, g10t);
+    const clipgeom::ClipTransform g10EnvForm = clipanim::effectiveTransformAt(keyed, g10t, g10EnvLevel);
+    const bool g10KeyedDynamic = clipanim::hasAnyDynamicTransform(keyed) && keyed.expressions.isEmpty();
+    const bool g10ok5 = g10KeyedDynamic && std::memcmp(&g10Two, &g10EnvForm, sizeof g10Two) == 0
+        && std::abs(g10Two.videoDx - 0.2) <= 1e-9
+        && clipanim::effectiveOpacityAt(keyed, g10t, 0.7, g10EnvLevel)
+            == clipanim::effectiveOpacityAt(keyed, g10t, 0.7);
+    ClipInfo posWig = base;
+    posWig.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("0.5"));
+    posWig.wiggle = g9Wiggle;
+    const double g10PosX = clipanim::effectiveTransformAt(posWig, g10t, env1080).videoDx;
+    const double g10PosExp = 0.5 + g9Off.positionOffset.x() / 1920.0;
+    const bool g10ok6 = g9OffSane && std::abs(g10PosX - g10PosExp) <= 1e-9 && std::abs(g10PosX - 0.5) > 1e-4;
+
+    // (7) time remap + expression through the special composite.
+    ClipInfo remapRot = remapped;
+    remapRot.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapped}},
+        QVector<QVector<ClipInfo>>{}, g10t, -1.0, -1.0, 100);
+    const QImage g10RemapPlain = tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size);
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapRot}},
+        QVector<QVector<ClipInfo>>{}, g10t, -1.0, -1.0, 100);
+    const QImage g10RemapExport = tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size);
+    const QImage g10RemapSpecial = window.buildSpecialClipComposite(g10t);
+    const DiffStat g10d7 = compare(g10RemapSpecial, g10RemapExport);
+    const DiffStat g10d7v = compare(g10RemapExport, g10RemapPlain);
+    const bool g10ok7 = !g10RemapSpecial.isNull() && g10d7.sizeMatch && g10d7.maxDiff <= 2
+        && g10d7v.diffPixels > 50;
+
+    // (8') / (8''): the snapshot follows the audio edits.
+    ClipInfo linkedV = base;
+    linkedV.linkGroup = 9;
+    linkedV.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel()*100"));
+    const auto levelNow = [&](double local) {
+        const TimelineTrack *v1 = timeline->videoTracks().value(0);
+        if (!v1 || v1->clipCount() == 0) return -1.0;
+        const ClipInfo v = v1->clips().at(0);
+        clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+        env.audioLevelAtTime = timeline->expressionAudioLevelSampler(v, qMax(0.0, v.leadInSec));
+        return clipanim::effectiveOpacityAt(v, local, v.opacity, env);
+    };
+    struct SnapStep {
+        bool edited = false;
+        double before = -1.0, after = -1.0, oldHolder = -2.0;
+        bool ptrChanged = false;
+        bool ok() const
+        {
+            return edited && std::abs(after - before) > 0.2 && ptrChanged && std::abs(oldHolder - before) <= 1e-9;
+        }
+    };
+    const auto runStep = [&](const QVector<ClipInfo> &a1, double local, const std::function<bool()> &edit) {
+        SnapStep step;
+        timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{linkedV}}, QVector<QVector<ClipInfo>>{a1},
+            0.0, -1.0, -1.0, 100);
+        // The setup's own debounced (50 ms) sequence emit lands before the edit; 150 ms
+        // leaves room for the Windows timer granularity (a 60 ms wait let it land after).
+        QTest::qWait(150);
+        step.before = levelNow(local);
+        const auto envBefore = timeline->expressionAudioEnvForRead();
+        const ClipInfo vBefore = timeline->videoTracks().value(0)->clips().value(0);
+        step.edited = edit();
+        QTest::qWait(150); // past the 50 ms debounce of scheduleEmitSequenceChanged
+        QApplication::processEvents();
+        step.after = levelNow(local);
+        const auto envAfter = timeline->expressionAudioEnvForRead();
+        step.ptrChanged = envBefore && envAfter && envBefore.get() != envAfter.get();
+        if (envBefore) {
+            clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+            env.audioLevelAtTime = audiokf::makeLinkedAudioSamplerFrom(*envBefore, vBefore.linkGroup,
+                                                                       qMax(0.0, vBefore.leadInSec));
+            step.oldHolder = clipanim::effectiveOpacityAt(vBefore, local, vBefore.opacity, env);
+        }
+        return step;
+    };
+    QString g10Err;
+    const SnapStep relinkStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        return timeline->relinkMediaPaths(QHash<QString, QString>{{steppedWav, silentWav}}, &g10Err);
+    });
+    ClipInfo filler = audioClip(silentWav, 0.5, 0);
+    const SnapStep gapStep = runStep({filler, audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        return timeline->deleteClipByIndex(true, 0, 0, true, &g10Err);
+    });
+    const SnapStep trimStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.25, [&] {
+        return timeline->applyTrimLinked(timeline->trackAt(true, 0), 0, trimops::TrimType::RippleIn, 0.5, &g10Err);
+    });
+    const SnapStep unlinkStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        timeline->unlinkClipGroupForTest(9);
+        return timeline->videoTracks().value(0)->clips().value(0).linkGroup == 0;
+    });
+    const SnapStep speedStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.4, [&] {
+        timeline->videoTracks().value(0)->setSelectedClip(0);
+        timeline->setClipSpeed(2.0);
+        return timeline->audioTracks().value(0)->clips().value(0).speed == 2.0;
+    });
+    const bool g10ok8 = g10Fixture && relinkStep.ok() && gapStep.ok() && trimStep.ok() && unlinkStep.ok()
+        && std::abs(unlinkStep.after) <= 1e-12 && std::abs(relinkStep.before - 0.5) < 0.05;
+    const bool g10ok8b = g10Fixture && speedStep.ok();
+
+    // (10) RenderQueue export of the live Timeline (render thread: atomic_load of the snapshot).
+    const auto exportLive = [&](const QString &expression, const QString &outName, QString *err) {
+        ClipInfo v = linkedV;
+        v.expressions = exprbind::ClipExpressionBindings{};
+        v.expressions.setExpression(QStringLiteral("transform.opacity"), expression);
+        timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{v}},
+            QVector<QVector<ClipInfo>>{{audioClip(loudWav, 2.0, 9)}}, 0.0, -1.0, -1.0, 100);
+        QTest::qWait(150);
+        audiokf::resetInvocationCountForTest();
+        const QString outPath = dir.filePath(outName);
+        RenderPreset preset{QStringLiteral("G10"), kW, kH, QStringLiteral("mpeg4"), 600000, QStringLiteral("mp4")};
+        RenderJob job = RenderQueue::jobFromPreset(preset, outPath, 0, 500000);
+        job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        job.timeline = timeline;
+        job.exportConfig["fps"] = kFps;
+        job.exportConfig["videoCodec"] = QStringLiteral("mpeg4");
+        RenderQueue queue;
+        QEventLoop loop;
+        bool done = false, success = false;
+        QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                         [&](const QString &uuid, bool okJob, const QString &message) {
+                             if (uuid != job.uuid) return;
+                             done = true;
+                             success = okJob;
+                             *err = message;
+                             loop.quit();
+                         });
+        queue.addJob(job);
+        queue.start();
+        if (!done) loop.exec();
+        return std::make_pair(success, audiokf::invocationCountForTest());
+    };
+    QString g10NoLevelErr, g10LevelErr;
+    const auto g10NoLevel = exportLive(QStringLiteral("time*100"), QStringLiteral("g10-nolevel.mp4"), &g10NoLevelErr);
+    const auto g10WithLevel = exportLive(QStringLiteral("audioLevel()*100"), QStringLiteral("g10-level.mp4"), &g10LevelErr);
+    const bool g10ok10 = g10Fixture && g10NoLevel.first && g10NoLevel.second == 0
+        && g10WithLevel.first && g10WithLevel.second > 0;
+
+    // (9) nested: the child clip reads level 0; the same clip at the root does not.
+    const auto barLevel = [](const QImage &img) {
+        if (img.isNull()) return -1;
+        const QRgb p = img.convertToFormat(QImage::Format_ARGB32).pixel(224, kH / 2);
+        return qRed(p) * qAlpha(p) / 255;
+    };
+    ClipInfo levelPosV = base;
+    levelPosV.linkGroup = 9;
+    levelPosV.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("audioLevel()"));
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{levelPosV}},
+        QVector<QVector<ClipInfo>>{{audioClip(loudWav, 2.0, 9)}}, 0.0, -1.0, -1.0, 100);
+    QTest::qWait(150);
+    const int g10RootBar = barLevel(tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size));
+    TimelineSequence g10Child;
+    g10Child.id = g10Child.name = QStringLiteral("g10-child");
+    g10Child.videoTracks = {{levelPosV}};
+    g10Child.audioTracks = {{}};
+    ClipInfo g10Nested = base;
+    g10Nested.filePath = timeline_nesting::sequenceClipFilePath(g10Child.id);
+    g10Nested.sequenceRefId = g10Child.id;
+    TimelineSequence g10Main;
+    g10Main.id = g10Main.name = QStringLiteral("g10-main");
+    g10Main.videoTracks = {{g10Nested}};
+    g10Main.audioTracks = {{audioClip(loudWav, 2.0, 9)}};
+    timeline->setSequences({g10Main, g10Child}, g10Main.id);
+    QTest::qWait(150);
+    const bool g10NestedActive = timeline->videoTracks().value(0)
+        && timeline->videoTracks().value(0)->clipCount() == 1
+        && timeline->videoTracks().value(0)->clips().at(0).isSequenceReference()
+        && timeline->audioTracks().value(0) && timeline->audioTracks().value(0)->clipCount() == 1;
+    const int g10NestedBar = barLevel(tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size));
+    const bool g10ok9 = g10Fixture && g10NestedActive && g10RootBar >= 0 && g10RootBar < 20 && g10NestedBar > 200;
+
+    const auto stepText = [](const SnapStep &s) {
+        std::ostringstream out;
+        out << "edited=" << s.edited << " before=" << s.before << " after=" << s.after
+            << " ptrChanged=" << s.ptrChanged << " oldHolder=" << s.oldHolder << " ok=" << s.ok();
+        return out.str();
+    };
+    std::cerr << std::setprecision(12)
+              << "special-composite G10 (1) rotation expr vs none sizeMatch=" << g10d1.sizeMatch << " maxDiff="
+              << g10d1.maxDiff << " diffPixels=" << g10d1.diffPixels << " (expect >50) ok=" << g10ok1 << '\n'
+              << "special-composite G10 (2) rotationDeg=" << g10Rot << " (expect 45, base 10) ok=" << g10ok2 << '\n'
+              << "special-composite G10 (3) opacity=" << g10Op << " (expect 0.5) ok=" << g10ok3 << '\n'
+              << "special-composite G10 (4) audioLevel opacity sampler0.5=" << g10OpLevel << " none="
+              << g10OpNoSampler << " (expect 0.5 / 0) ok=" << g10ok4 << '\n'
+              << "special-composite G10 (5) keyed dynamic=" << g10KeyedDynamic << " twoArg dx=" << g10Two.videoDx
+              << " env dx=" << g10EnvForm.videoDx << " byteEqual="
+              << (std::memcmp(&g10Two, &g10EnvForm, sizeof g10Two) == 0) << " ok=" << g10ok5 << '\n'
+              << "special-composite G10 (6) position.x=0.5 + wiggle dx=" << g10PosX << " expect=" << g10PosExp
+              << " ok=" << g10ok6 << '\n'
+              << "special-composite G10 (7) remap+expr special vs export sizeMatch=" << g10d7.sizeMatch
+              << " maxDiff=" << g10d7.maxDiff << " (expect <=2) expr visible diffPixels=" << g10d7v.diffPixels
+              << " (expect >50) ok=" << g10ok7 << '\n'
+              << "special-composite G10 (8') fixture=" << g10Fixture << " err=[" << g10Err.toStdString() << "]\n"
+              << "special-composite G10 (8') relink " << stepText(relinkStep) << '\n'
+              << "special-composite G10 (8') gap " << stepText(gapStep) << '\n'
+              << "special-composite G10 (8') trimLinked " << stepText(trimStep) << '\n'
+              << "special-composite G10 (8') unlink " << stepText(unlinkStep) << " (expect after 0) ok=" << g10ok8 << '\n'
+              << "special-composite G10 (8'') setClipSpeed " << stepText(speedStep) << " ok=" << g10ok8b << '\n'
+              << "special-composite G10 (10) export no audioLevel ok=" << g10NoLevel.first << " ["
+              << g10NoLevelErr.toStdString() << "] invocations=" << g10NoLevel.second << " (expect 0) | audioLevel ok="
+              << g10WithLevel.first << " [" << g10LevelErr.toStdString() << "] invocations=" << g10WithLevel.second
+              << " (expect >0) ok=" << g10ok10 << '\n'
+              << "special-composite G10 (9) root bar@224=" << g10RootBar << " (expect <20, moved by the level) nested active="
+              << g10NestedActive << " nested child bar@224=" << g10NestedBar << " (expect >200, level 0) ok=" << g10ok9 << '\n';
+    tally.gate(10, g10ok1 && g10ok2 && g10ok3 && g10ok4 && g10ok5 && g10ok6 && g10ok7 && g10ok8 && g10ok8b
+                   && g10ok9 && g10ok10,
+               "the clip expressions are missing from the export / special composite, not replacing / ordered "
+               "before the wiggle, the audio-level snapshot did not follow an edit, a nested clip read the root "
+               "audio, or an expression without audioLevel() decoded (see values above)");
 
     return tally.finish("special-composite");
 }

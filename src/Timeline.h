@@ -52,6 +52,7 @@
 #include "ShapeLayer.h"
 #include "WarpDistortion.h"
 #include "WiggleTransform.h"
+#include "ClipExpressionBindings.h"
 
 // Shared timeline/source bounds after borrowing transition handles.
 struct OverlapInterval {
@@ -112,6 +113,7 @@ QString clipLabelToString(ClipLabel label);
 class AudioMixer;
 class UndoManager;
 class Timeline;
+namespace audiokf { struct ExprAudioEnv; }
 class PlayheadOverlay;
 class TextStripWidget;
 struct TimelineState;
@@ -252,6 +254,9 @@ struct ClipInfo {
     // US-1504: per-clip wiggle / handheld-camera jitter, evaluated on top of the
     // keyframed transform by clipanim::applyDynamicOverlay (disabled by default).
     wiggle::WiggleParams wiggle;
+    // US-1505: per-clip expression bindings (propPath -> code), evaluated by
+    // clipanim::applyDynamicOverlay after autoOrient and before the wiggle (empty by default).
+    exprbind::ClipExpressionBindings expressions;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -746,6 +751,9 @@ protected:
     void dropEvent(QDropEvent *event) override;
 
 private:
+    // US-1505: every write of m_clips (other than setClips) goes through here; it
+    // advances the owning Timeline's clip generation (Timeline::audioClipGeneration).
+    QVector<ClipInfo> &mutableClips();
     void updateMinimumWidth();
     int snapToEdge(int x) const;
     bool tryHitTrimEdge(QMouseEvent *ev, int clipIndex, const QRectF &clipRect);
@@ -927,6 +935,34 @@ public:
     // value differs from the current one (toJson() compared), none otherwise; false when
     // the clip does not exist or its track is locked.
     bool setClipWiggle(int trackIndex, int clipIndex, const wiggle::WiggleParams &params);
+    // US-1505: the expression bindings of video clip (trackIndex, clipIndex), with the
+    // same undo rule as setClipWiggle (toJson() compared).
+    bool setClipExpressions(int trackIndex, int clipIndex,
+                            const exprbind::ClipExpressionBindings &bindings);
+    // US-1505: the audio-level snapshot expressions read (audioLevel()). The one read
+    // point: on the UI thread, a snapshot older than audioClipGeneration() (or none)
+    // is rebuilt first through the rebuild hook; any other thread (the export render
+    // threads) only atomic_loads the current one. Null = audio level 0 (no hook: a
+    // file-backed export Timeline, or nothing published yet).
+    std::shared_ptr<const audiokf::ExprAudioEnv> expressionAudioEnvForRead() const;
+    // The audioLevel() sampler of clip (timeline start clipStartSec) built from
+    // expressionAudioEnvForRead() (empty when there is no snapshot).
+    std::function<double(double)> expressionAudioLevelSampler(const ClipInfo &clip,
+                                                              double clipStartSec) const;
+    // Publishes a snapshot (std::atomic_store); MainWindow's rebuild calls it.
+    void setExpressionAudioEnv(std::shared_ptr<const audiokf::ExprAudioEnv> env);
+    // The rebuild MainWindow registers (UI thread). Called only by
+    // expressionAudioEnvForRead() and ensureExpressionAudioEnvCurrent().
+    void setExpressionAudioEnvRebuildHook(std::function<void()> hook);
+    // UI thread: rebuilds the snapshot now when it is older than the clip generation
+    // (RenderQueue::startNextJob, before a job starts rendering).
+    void ensureExpressionAudioEnvCurrent();
+    // Monotonic per-Timeline counter: +1 on every clip-list write of any track
+    // (TimelineTrack::mutableClips / setClips), track add / remove / move and
+    // restoreState. Read on the UI thread only.
+    quint64 audioClipGeneration() const { return m_clipGeneration; }
+    // Selftest entry to the private unlinkClipGroup.
+    void unlinkClipGroupForTest(int linkGroup) { unlinkClipGroup(linkGroup); }
     // タイムライン時刻からソース時刻を引く。選択中の動画トラックを優先し、
     // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
     bool matchFrame(double timelineSec, MatchFrameResult *result,
@@ -1654,6 +1690,12 @@ private:
     std::function<QJsonObject()> m_sidecarStateCollector;
     std::function<void(const QJsonObject&)> m_sidecarStateApplier;
     void captureExternalTrackState();
+    // US-1505: see audioClipGeneration(); TimelineTrack advances it (noteClipsChanged).
+    friend class TimelineTrack;
+    void noteClipsChanged() { ++m_clipGeneration; }
+    quint64 m_clipGeneration = 0;
+    std::shared_ptr<const audiokf::ExprAudioEnv> m_exprAudioEnv;
+    std::function<void()> m_exprAudioEnvRebuildHook;
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
     void removeTrackInternal(bool audio, int index);

@@ -1252,6 +1252,11 @@ void RenderQueue::startNextJob()
     // contract is unchanged: jobProgress per frame, jobCompleted / jobFailed
     // on finish, cancellation honoured, and the next pending job is started
     // from finishCurrentJob().
+    // US-1505: the job starts with the live Timeline's expression audio-level
+    // snapshot current (UI thread); its render thread then reads the latest
+    // published one per frame. A file-backed job has its own Timeline (level 0).
+    if (job.timeline)
+        job.timeline->ensureExpressionAudioEnvCurrent();
     startRenderPipe(m_currentJobIndex);
 }
 

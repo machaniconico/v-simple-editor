@@ -1,6 +1,7 @@
 #include "RenderInPlace.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
+#include "AudioKeyframes.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
 #include "AudioClipEditor.h"
@@ -43,6 +44,7 @@
 #include <QSignalBlocker>
 #include <QRubberBand>
 #include <QSet>
+#include <QThread>
 #include <QtMath>
 #include <QDir>
 #include <QFont>
@@ -1857,24 +1859,30 @@ void TimelineTrack::ensureUid(ClipInfo &clip)
     if (clip.uid.isEmpty()) clip.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
 }
 
+QVector<ClipInfo> &TimelineTrack::mutableClips()
+{
+    if (m_timeline) m_timeline->noteClipsChanged();
+    return m_clips;
+}
+
 void TimelineTrack::addClip(const ClipInfo &clip)
 {
     ClipInfo added = clip;
     ensureUid(added);
-    m_clips.append(added); updateMinimumWidth(); update(); emit modified();
+    mutableClips().append(added); updateMinimumWidth(); update(); emit modified();
 }
 void TimelineTrack::insertClip(int index, const ClipInfo &clip)
 {
     if (index < 0 || index > m_clips.size()) index = m_clips.size();
     ClipInfo inserted = clip;
     ensureUid(inserted);
-    m_clips.insert(index, inserted); updateMinimumWidth(); update(); emit modified();
+    mutableClips().insert(index, inserted); updateMinimumWidth(); update(); emit modified();
 }
 
 void TimelineTrack::removeClip(int index)
 {
     if (index < 0 || index >= m_clips.size()) return;
-    m_clips.removeAt(index);
+    mutableClips().removeAt(index);
     QList<int> newSel;
     for (int s : m_selectedClips) {
         if (s < index) newSel.append(s);
@@ -1891,8 +1899,8 @@ void TimelineTrack::moveClip(int fromIndex, int toIndex)
     if (toIndex < 0 || toIndex >= m_clips.size()) return;
     if (fromIndex == toIndex) return;
     ClipInfo clip = m_clips[fromIndex];
-    m_clips.removeAt(fromIndex);
-    m_clips.insert(toIndex, clip);
+    mutableClips().removeAt(fromIndex);
+    mutableClips().insert(toIndex, clip);
     m_selectedClips = {toIndex};
     updateMinimumWidth(); update();
     emit selectionChanged(toIndex, false);
@@ -2016,7 +2024,7 @@ bool splitClipByConsumedSource(const ClipInfo &clip, double localSec, bool audio
 void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
-    ClipInfo &original = m_clips[index];
+    ClipInfo &original = mutableClips()[index];
     double effectiveStart = original.inPoint;
     double effectiveEnd = (original.outPoint > 0.0) ? original.outPoint : original.duration;
     // US-1501: speed-ramped / time-remapped clips are cut by the consumed
@@ -2070,7 +2078,7 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     ensureUid(secondHalf);
     original.trailOut = Transition{};
     const QString leftUid = original.uid;
-    m_clips.insert(index + 1, secondHalf);
+    mutableClips().insert(index + 1, secondHalf);
     emit clipSplit(leftUid, secondHalf.uid, localSeconds);
     if (notify) {
         updateMinimumWidth(); update(); emit modified();
@@ -2083,7 +2091,7 @@ bool TimelineTrack::applyTrim(int clipIndex, trimops::TrimType type,
     // 純粋エンジン trimops:: が境界判定と in-place 変更を担う。成功時のみ
     // split/insert と同じ後処理 (幅再計算 + 再描画 + modified 発火) を行う。
     // 失敗時は m_clips が一切変更されないので何もせず false を返す。
-    if (!trimops::applyTrim(m_clips, clipIndex, type, deltaSec, errorOut))
+    if (!trimops::applyTrim(mutableClips(), clipIndex, type, deltaSec, errorOut))
         return false;
     updateMinimumWidth(); update(); emit modified();
     return true;
@@ -2092,9 +2100,9 @@ bool TimelineTrack::applyTrim(int clipIndex, trimops::TrimType type,
 void TimelineTrack::applyDragMove(int clipIdx, double leadIn, double nextLeadIn)
 {
     if (clipIdx < 0 || clipIdx >= m_clips.size()) return;
-    m_clips[clipIdx].leadInSec = qMax(0.0, leadIn);
+    mutableClips()[clipIdx].leadInSec = qMax(0.0, leadIn);
     if (nextLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
-        m_clips[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
+        mutableClips()[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
     updateMinimumWidth();
     update();
 }
@@ -2116,16 +2124,16 @@ void TimelineTrack::applyLinkedTrim(int clipIdx, bool leftEdge, double edgePoint
                                     double nextLeadIn)
 {
     if (clipIdx < 0 || clipIdx >= m_clips.size()) return;
-    ClipInfo &clip = m_clips[clipIdx];
+    ClipInfo &clip = mutableClips()[clipIdx];
     if (leftEdge) {
         clip.inPoint = edgePoint;
         clip.leadInSec = qMax(0.0, gapLeadIn);
         if (nextLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
-            m_clips[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
+            mutableClips()[clipIdx + 1].leadInSec = qMax(0.0, nextLeadIn);
     } else {
         clip.outPoint = edgePoint;
         if (gapLeadIn >= 0.0 && clipIdx + 1 < m_clips.size())
-            m_clips[clipIdx + 1].leadInSec = qMax(0.0, gapLeadIn);
+            mutableClips()[clipIdx + 1].leadInSec = qMax(0.0, gapLeadIn);
     }
     updateMinimumWidth();
     update();
@@ -2135,11 +2143,11 @@ void TimelineTrack::removeClipPreservingDownstream(int index, bool notify)
 {
     if (index < 0 || index >= m_clips.size()) return;
     const double absorbed = m_clips[index].leadInSec + m_clips[index].effectiveDuration();
-    m_clips.removeAt(index);
+    mutableClips().removeAt(index);
     // Push the vacated time into the next clip's leadInSec so everything
     // downstream stays at the same absolute timeline position.
     if (index < m_clips.size())
-        m_clips[index].leadInSec += absorbed;
+        mutableClips()[index].leadInSec += absorbed;
     QList<int> newSel;
     for (int s : m_selectedClips) {
         if (s < index) newSel.append(s);
@@ -2162,7 +2170,7 @@ void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &cl
     ensureUid(newClip);
     newClip.leadInSec = qMax(0.0, leadInSec);
     const double consumed = newClip.leadInSec + newClip.effectiveDuration();
-    m_clips.insert(index, newClip);
+    mutableClips().insert(index, newClip);
     // Selected clips at or after the insert point moved one slot right (the
     // mirror of removeClipPreservingDownstream); the selection follows them.
     bool selectionMoved = false;
@@ -2174,7 +2182,7 @@ void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &cl
     // insertion, prevEnd effectively advanced by `consumed`, so we shave
     // `consumed` off its leadInSec. If we'd go negative the plan was bad.
     if (index + 1 < m_clips.size()) {
-        double &nextLead = m_clips[index + 1].leadInSec;
+        double &nextLead = mutableClips()[index + 1].leadInSec;
         nextLead -= consumed;
         if (nextLead < 0) nextLead = 0;
     }
@@ -2286,7 +2294,7 @@ bool TimelineTrack::rippleDeleteTimeRange(double startSec, double endSec, bool n
     for (int i = 0; i < m_clips.size(); ++i) {
         const double clipStart = cursor + m_clips[i].leadInSec;
         if (clipStart >= startSec - kEps) {
-            double &lead = m_clips[i].leadInSec;
+            double &lead = mutableClips()[i].leadInSec;
             const double newLead = qMax(0.0, lead - deletedLen);
             if (qAbs(newLead - lead) > kEps) {
                 lead = newLead;
@@ -2352,6 +2360,7 @@ QSet<QString> *g_loadVideoSeenUids = nullptr;
 
 void TimelineTrack::setClips(const QVector<ClipInfo> &clips)
 {
+    if (m_timeline) m_timeline->noteClipsChanged();
     m_clips = clips;
     // Every clip leaving setClips has a uid; a uid repeated within the track
     // (or, while a project loads, on an earlier video track) keeps it on the
@@ -2420,12 +2429,12 @@ void TimelineTrack::moveSelectedClipsGroup(int targetIndex)
 
     // Remove sources from highest to lowest so indices stay valid.
     for (int i = sortedSel.size() - 1; i >= 0; --i)
-        m_clips.removeAt(sortedSel[i]);
+        mutableClips().removeAt(sortedSel[i]);
 
     adjustedTarget = qBound(0, adjustedTarget, m_clips.size());
 
     for (int i = 0; i < movedClips.size(); ++i)
-        m_clips.insert(adjustedTarget + i, movedClips[i]);
+        mutableClips().insert(adjustedTarget + i, movedClips[i]);
 
     // New selection is the consecutive range of inserted clips.
     QList<int> newSel;
@@ -3106,7 +3115,7 @@ bool TimelineTrack::tryHitEnvelopeKeyframe(QMouseEvent *ev, int clipIndex)
         return false;
     if (clipIndex < 0 || clipIndex >= m_clips.size())
         return false;
-    ClipInfo &clip = m_clips[clipIndex];
+    ClipInfo &clip = mutableClips()[clipIndex];
     const double effDur = clip.effectiveDuration();
     if (effDur <= 0.0) return false;
     const QPoint pos = ev->pos();
@@ -3350,7 +3359,7 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
     }
     if (m_envelopeDragClipIdx >= 0 && m_envelopeDragPointIdx >= 0
         && m_envelopeDragClipIdx < m_clips.size()) {
-        ClipInfo &clip = m_clips[m_envelopeDragClipIdx];
+        ClipInfo &clip = mutableClips()[m_envelopeDragClipIdx];
         if (m_envelopeDragPointIdx < clip.volumeEnvelope.size()) {
             const double effDur = clip.effectiveDuration();
             if (effDur > 0.0) {
@@ -3393,9 +3402,9 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         if (promotesCrossTrackDrag(y)) {
             // Snapshot the data we need before mutating the drag state.
             const int srcIdx = m_dragClipIndex;
-            m_clips[srcIdx].leadInSec = m_dragOriginalLeadIn;
+            mutableClips()[srcIdx].leadInSec = m_dragOriginalLeadIn;
             if (m_dragOriginalLeadInNext >= 0.0 && srcIdx + 1 < m_clips.size())
-                m_clips[srcIdx + 1].leadInSec = m_dragOriginalLeadInNext;
+                mutableClips()[srcIdx + 1].leadInSec = m_dragOriginalLeadInNext;
             const int grabOffsetPx = m_dragStartX - clipStartX(srcIdx);
 
             // Ask Timeline to roll back any linked partners it already
@@ -3482,10 +3491,10 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
             deltaSec = -m_dragOriginalLeadIn;
         if (m_dragOriginalLeadInNext >= 0.0 && deltaSec > m_dragOriginalLeadInNext)
             deltaSec = m_dragOriginalLeadInNext;
-        m_clips[m_dragClipIndex].leadInSec = m_dragOriginalLeadIn + deltaSec;
+        mutableClips()[m_dragClipIndex].leadInSec = m_dragOriginalLeadIn + deltaSec;
         if (m_dragOriginalLeadInNext >= 0.0
             && m_dragClipIndex + 1 < m_clips.size()) {
-            m_clips[m_dragClipIndex + 1].leadInSec =
+            mutableClips()[m_dragClipIndex + 1].leadInSec =
                 m_dragOriginalLeadInNext - deltaSec;
         }
         setCursor(Qt::ClosedHandCursor);
@@ -3502,7 +3511,7 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
             setCursor(Qt::ArrowCursor);
             return;
         }
-        ClipInfo &clip = m_clips[m_dragClipIndex];
+        ClipInfo &clip = mutableClips()[m_dragClipIndex];
         const double maxDur = qMax(0.1, clip.effectiveDuration());
         const int dx = event->pos().x() - m_dragStartX;
         const double deltaSec = static_cast<double>(dx) / m_pixelsPerSecond;
@@ -3541,7 +3550,7 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
             emit linkedTrimDelta(m_dragClipIndex, m_dragMode == DragMode::TrimLeft, clamped);
             updateMinimumWidth(); update(); return;
         }
-        ClipInfo &clip = m_clips[m_dragClipIndex];
+        ClipInfo &clip = mutableClips()[m_dragClipIndex];
         // deltaSec is a TIMELINE delta; inPoint/outPoint live in SOURCE time.
         // For a speed-scaled clip the source moves speed× as fast as the
         // timeline, so convert timeline→source with *speed (and back with
@@ -3660,7 +3669,7 @@ void TimelineTrack::mouseReleaseEvent(QMouseEvent *event)
     }
     if (m_envelopeDragClipIdx >= 0 && m_envelopeDragPointIdx >= 0
         && m_envelopeDragClipIdx < m_clips.size()) {
-        ClipInfo &clip = m_clips[m_envelopeDragClipIdx];
+        ClipInfo &clip = mutableClips()[m_envelopeDragClipIdx];
         if (m_envelopeDragPointIdx < clip.volumeEnvelope.size()) {
             // The dragged point may have crossed neighbours during the move
             // — re-sort so the AudioMixer evaluator's monotonic-time
@@ -4932,6 +4941,7 @@ void Timeline::addVideoTrack(bool recordUndo)
 
     m_videoTracks.append(track);
     m_trackStructureRevision = ++m_nextTrackStructureRevision;
+    noteClipsChanged();
     wireTrackSelection(track);
     updateInfoLabel();
     if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
@@ -5018,6 +5028,7 @@ void Timeline::addAudioTrack(bool recordUndo)
 
     m_audioTracks.append(track);
     m_trackStructureRevision = ++m_nextTrackStructureRevision;
+    noteClipsChanged();
     wireTrackSelection(track);
     updateInfoLabel();
     if (recordUndo) saveUndoState(QStringLiteral("トラックを追加"));
@@ -5197,6 +5208,7 @@ bool Timeline::moveTrack(bool audio, int from, int to, QString *err)
 void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
 {
     m_trackStructureRevision = ++m_nextTrackStructureRevision;
+    noteClipsChanged();
     // Track identity is the widget during this operation. Clip order within
     // each widget is unchanged; clip-order survivor remapping must not run.
     auto &tracks = audio ? m_audioTracks : m_videoTracks;
@@ -7671,6 +7683,72 @@ bool Timeline::setClipWiggle(int trackIndex, int clipIndex, const wiggle::Wiggle
     return true;
 }
 
+bool Timeline::setClipExpressions(int trackIndex, int clipIndex,
+                                  const exprbind::ClipExpressionBindings &bindings)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].expressions.toJson() == bindings.toJson())
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].expressions = bindings;
+    track->setClips(clips);
+
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("エクスプレッションを変更"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+std::shared_ptr<const audiokf::ExprAudioEnv> Timeline::expressionAudioEnvForRead() const
+{
+    // Only the UI thread compares the generation and rebuilds; a render thread reads
+    // whatever snapshot is published (std::atomic_load), never the counter.
+    if (m_exprAudioEnvRebuildHook && QThread::currentThread() == thread()) {
+        const auto current = std::atomic_load(&m_exprAudioEnv);
+        if (!current || current->generation != m_clipGeneration)
+            m_exprAudioEnvRebuildHook();
+    }
+    return std::atomic_load(&m_exprAudioEnv);
+}
+
+std::function<double(double)> Timeline::expressionAudioLevelSampler(const ClipInfo &clip,
+                                                                    double clipStartSec) const
+{
+    const auto env = expressionAudioEnvForRead();
+    if (!env)
+        return {};
+    return audiokf::makeLinkedAudioSamplerFrom(*env, clip.linkGroup, clipStartSec);
+}
+
+void Timeline::setExpressionAudioEnv(std::shared_ptr<const audiokf::ExprAudioEnv> env)
+{
+    std::atomic_store(&m_exprAudioEnv, std::move(env));
+}
+
+void Timeline::setExpressionAudioEnvRebuildHook(std::function<void()> hook)
+{
+    m_exprAudioEnvRebuildHook = std::move(hook);
+}
+
+void Timeline::ensureExpressionAudioEnvCurrent()
+{
+    if (!m_exprAudioEnvRebuildHook || QThread::currentThread() != thread())
+        return;
+    const auto current = std::atomic_load(&m_exprAudioEnv);
+    if (!current || current->generation != m_clipGeneration)
+        m_exprAudioEnvRebuildHook();
+}
+
 bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
                           QString *errorOut) const
 {
@@ -9402,6 +9480,8 @@ void Timeline::unlinkClipGroup(int linkGroup)
     if (changed) {
         saveUndoState("Unlink clip");
         updateInfoLabel();
+        // US-1505: the audio-level snapshot (linkGroup) follows, as relinkClipAt does.
+        scheduleEmitSequenceChanged();
     }
 }
 
@@ -16364,6 +16444,7 @@ TimelineState Timeline::currentState() const
 void Timeline::restoreState(const TimelineState &state)
 {
     undotrace::log("restoreState:enter");
+    noteClipsChanged();
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
         || m_videoTracks.size() != state.videoTracks.size()
         || m_audioTracks.size() != state.audioTracks.size();

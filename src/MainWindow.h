@@ -816,7 +816,7 @@ private:
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
-    // US-1302: the position-keyed sidecars ("t:i": timeRemap / text3D / expression /
+    // US-1302: the position-keyed sidecars ("t:i": timeRemap / text3D /
     // live brush, and the brush entries with the clipId in their values)
     // follow Timeline::clipKeysRemapped and, through Timeline::setSidecarStateHooks,
     // every undo / redo.
@@ -829,14 +829,11 @@ private:
     // otherwise.
     void commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve);
     void commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config);
-    void commitExpressionBindings(const QString &clipId,
-                                  const std::optional<exprbind::ClipExpressionBindings> &bindings);
-    // US-1302: the three values a dropped key held, kept by the clip's "track|uid"
+    // US-1302: the two values a dropped key held, kept by the clip's "track|uid"
     // until a restore brings that clip back (the brush entries go back by value instead).
     struct ParkedSidecars {
         std::optional<TimeRemapClipEntry> timeRemap;
         std::optional<QJsonObject> text3D;
-        std::optional<exprbind::ClipExpressionBindings> expressions;
     };
     QHash<QString, ParkedSidecars> m_parkedSidecarsByUid;
     // Key -> uid of the placement the last collect / apply saw, rekeyed with the
@@ -943,11 +940,10 @@ private:
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
     QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
-    std::function<double(double)> linkedAudioSampler(const ClipInfo &clip,
-                                                    double clipStart) const;
+    // US-1505: publishes Timeline's expression audio-level snapshot (its rebuild hook).
+    void rebuildExpressionAudioEnv();
     std::shared_ptr<audiokf::EnvelopeCache> m_audioEnvelopeCache =
         std::make_shared<audiokf::EnvelopeCache>();
-    QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     Camera3D m_projectCamera;                                 // single per-project camera
     QJsonObject m_projectCameraUndoSlot;
     int m_projectCameraUndoTimelineDepth = -1;

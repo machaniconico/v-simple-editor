@@ -936,14 +936,6 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         }
         root["text3DClipEntries"] = t3Arr;
     }
-    {
-        QJsonArray exprArr;
-        for (const auto &entry : data.expressionBindingsEntries) {
-            if (!entry.bindings.isEmpty())
-                exprArr.append(expressionBindingsEntryToJson(entry));
-        }
-        root["expressionBindingsEntries"] = exprArr;
-    }
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
@@ -1279,11 +1271,6 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         for (const auto &v : root["text3DClipEntries"].toArray())
             data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
     }
-    data.expressionBindingsEntries.clear();
-    if (root.contains("expressionBindingsEntries")) {
-        for (const auto &v : root["expressionBindingsEntries"].toArray())
-            data.expressionBindingsEntries.append(expressionBindingsEntryFromJson(v.toObject()));
-    }
     migrateLegacyClipSidecars(root, data);
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
@@ -1600,14 +1587,6 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         }
         root["text3DClipEntries"] = t3Arr;
     }
-    {
-        QJsonArray exprArr;
-        for (const auto &entry : data.expressionBindingsEntries) {
-            if (!entry.bindings.isEmpty())
-                exprArr.append(expressionBindingsEntryToJson(entry));
-        }
-        root["expressionBindingsEntries"] = exprArr;
-    }
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
@@ -1889,11 +1868,6 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         for (const auto &v : root["text3DClipEntries"].toArray())
             data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
     }
-    data.expressionBindingsEntries.clear();
-    if (root.contains("expressionBindingsEntries")) {
-        for (const auto &v : root["expressionBindingsEntries"].toArray())
-            data.expressionBindingsEntries.append(expressionBindingsEntryFromJson(v.toObject()));
-    }
     migrateLegacyClipSidecars(root, data);
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
@@ -2100,6 +2074,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["autoOrientEnabled"] = true;
     if (wiggle::toJson(clip.wiggle) != wiggle::toJson(wiggle::WiggleParams{}))
         obj["wiggle"] = wiggle::toJson(clip.wiggle);
+    if (!clip.expressions.isEmpty())
+        obj["expressions"] = clip.expressions.toJson();
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -2238,6 +2214,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.wiggle = obj.contains("wiggle")
         ? wiggle::fromJson(obj["wiggle"].toObject())
         : wiggle::WiggleParams{};
+    clip.expressions.fromJson(obj["expressions"].toObject());
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();
@@ -3039,14 +3016,6 @@ Text3DClipEntry ProjectFile::text3DClipEntryFromJson(const QJsonObject &obj)
     return entry;
 }
 
-QJsonObject ProjectFile::expressionBindingsEntryToJson(const ExpressionBindingsClipEntry &entry)
-{
-    QJsonObject obj;
-    obj["clipId"] = entry.clipId;
-    obj["bindings"] = entry.bindings.toJson();
-    return obj;
-}
-
 ExpressionBindingsClipEntry ProjectFile::expressionBindingsEntryFromJson(const QJsonObject &obj)
 {
     ExpressionBindingsClipEntry entry;
@@ -3063,23 +3032,35 @@ WiggleClipEntry ProjectFile::wiggleClipEntryFromJson(const QJsonObject &obj)
     return entry;
 }
 
-// US-1504: the legacy root section "wiggleClipEntries" ("track:clip" -> params, the
-// active sequence's video tracks) moves onto the clips it names. The section is read
-// only here (load and fromJsonString), data.wiggleClipEntries stays empty, and save /
-// toJsonString never write it.
+// US-1504 / US-1505: the legacy root sections "wiggleClipEntries" and
+// "expressionBindingsEntries" ("track:clip" -> value, the active sequence's video
+// tracks) move onto the clips they name. The sections are read only here (load and
+// fromJsonString), data.wiggleClipEntries / data.expressionBindingsEntries stay empty,
+// and save / toJsonString never write them.
 void ProjectFile::migrateLegacyClipSidecars(const QJsonObject &root, ProjectData &data)
 {
-    data.wiggleClipEntries.clear();
-    for (const auto &v : root.value(QStringLiteral("wiggleClipEntries")).toArray()) {
-        const WiggleClipEntry entry = wiggleClipEntryFromJson(v.toObject());
-        const QStringList parts = canonicalClipKey(entry.clipId).split(QLatin1Char(':'));
+    auto clipAt = [&data](const QString &clipId) -> ClipInfo * {
+        const QStringList parts = canonicalClipKey(clipId).split(QLatin1Char(':'));
         bool okTrack = false, okClip = false;
         const int track = parts.size() == 2 ? parts[0].toInt(&okTrack) : -1;
         const int clip = parts.size() == 2 ? parts[1].toInt(&okClip) : -1;
         if (!okTrack || !okClip || track < 0 || track >= data.videoTracks.size()
             || clip < 0 || clip >= data.videoTracks[track].size())
-            continue;
-        data.videoTracks[track][clip].wiggle = entry.params;
+            return nullptr;
+        return &data.videoTracks[track][clip];
+    };
+    data.wiggleClipEntries.clear();
+    for (const auto &v : root.value(QStringLiteral("wiggleClipEntries")).toArray()) {
+        const WiggleClipEntry entry = wiggleClipEntryFromJson(v.toObject());
+        if (ClipInfo *clip = clipAt(entry.clipId))
+            clip->wiggle = entry.params;
+    }
+    data.expressionBindingsEntries.clear();
+    for (const auto &v : root.value(QStringLiteral("expressionBindingsEntries")).toArray()) {
+        const ExpressionBindingsClipEntry entry = expressionBindingsEntryFromJson(v.toObject());
+        ClipInfo *clip = entry.bindings.isEmpty() ? nullptr : clipAt(entry.clipId);
+        if (clip)
+            clip->expressions = entry.bindings;
     }
 }
 

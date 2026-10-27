@@ -5,6 +5,7 @@
 #include "../Keyframe.h"
 #include "../Timeline.h"
 #include "../WiggleTransform.h"
+#include "../ClipExpressionBindings.h"
 
 #include <QColor>
 
@@ -704,14 +705,36 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
 
 bool hasAnyDynamicTransform(const ClipInfo& clip)
 {
-    return hasAnyMotionKeyframes(clip) || clip.wiggle.enabled;
+    return hasAnyMotionKeyframes(clip) || clip.wiggle.enabled || !clip.expressions.isEmpty();
 }
 
 void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,
                          const EvalEnv& env, double *posX, double *posY,
                          double *scale, double *rotationDeg, double *opacity01)
 {
-    (void)opacity01;
+    if (!clip.expressions.isEmpty()) {
+        ExpressionContext ctx;
+        ctx.time = clipLocalSeconds;
+        ctx.fps = env.fps;
+        ctx.duration = clip.effectiveDuration();
+        ctx.canvasWidth = env.canvas.width();
+        ctx.canvasHeight = env.canvas.height();
+        ctx.audioLevelAtTime = env.audioLevelAtTime;
+        const exprbind::ClipExpressionBindings &bindings = clip.expressions;
+        if (posX)
+            *posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, *posX);
+        if (posY)
+            *posY = bindings.resolve(QStringLiteral("transform.position.y"), ctx, *posY);
+        if (scale)
+            *scale = bindings.resolve(QStringLiteral("transform.scale"), ctx, *scale);
+        if (rotationDeg)
+            *rotationDeg = bindings.resolve(QStringLiteral("transform.rotation"), ctx, *rotationDeg);
+        if (opacity01 && bindings.hasExpression(QStringLiteral("transform.opacity"))) {
+            const double percent = bindings.resolve(QStringLiteral("transform.opacity"), ctx,
+                                                    *opacity01 * 100.0);
+            *opacity01 = qBound(0.0, percent / 100.0, 1.0);
+        }
+    }
     if (clip.wiggle.enabled) {
         const wiggle::WiggleOffset off = wiggle::evaluate(clip.wiggle, clipLocalSeconds);
         // wiggle::positionOffset is in PIXELS; posX/posY are NORMALIZED

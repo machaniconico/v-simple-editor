@@ -42,21 +42,26 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
 // canvas is the PROJECT canvas (Timeline::projectOutputSize(); the special
 // composite passes its canvasSize), never the output / display size, so a
 // pixel amplitude keeps its normalized magnitude at any export resolution.
-// audioSamplerFor is reserved for expression bindings (empty = level 0).
+// US-1505: audioLevelAtTime is the evaluated clip's audioLevel() sampler (clip-local
+// seconds), set by the caller per clip from Timeline::expressionAudioLevelSampler
+// at the root (sequence depth 0) only; empty = level 0.
 struct EvalEnv {
     double fps = 30.0;
     QSize canvas;
-    std::function<std::function<double(double)>(const ClipInfo&, double clipStart)> audioSamplerFor;
+    std::function<double(double)> audioLevelAtTime;
 };
 
-// True when the clip has motion keyframes or an enabled wiggle: the drawing
-// callers gate the env evaluation on this predicate.
+// True when the clip has motion keyframes, an enabled wiggle or expression
+// bindings: the drawing callers gate the env evaluation on this predicate.
 bool hasAnyDynamicTransform(const ClipInfo& clip);
 
 // The single dynamic overlay applied on top of the keyframed values (in the
-// order keyframes -> autoOrient -> overlay): wiggle adds its pixel offset,
-// converted to normalized canvas fractions through env.canvas, its rotation
-// and its scale multiplier. Null pointers are skipped.
+// order keyframes -> autoOrient -> expressions -> wiggle): the expressions
+// replace position x / y, scale, rotation and opacity (as percent) with their
+// value (time = clipLocalSeconds, fps / canvas from env, audioLevel() from
+// env.audioLevelAtTime); then wiggle adds its pixel offset, converted to
+// normalized canvas fractions through env.canvas, its rotation and its scale
+// multiplier. Null pointers are skipped.
 void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,
                          const EvalEnv& env, double *posX, double *posY,
                          double *scale, double *rotationDeg, double *opacity01);

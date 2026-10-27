@@ -137,10 +137,12 @@ QImage applyPlanarRotation(const QImage &image, double degrees)
 
 // US-1504: one dynamic overlay per frame. A compositeBaked frame already holds
 // the special composite's wiggle, so it takes the keyframes only (two-argument
-// form); every other frame evaluates the env form with the Timeline's canvas.
+// form); every other frame evaluates the env form with the Timeline's canvas
+// (US-1505: and, for expression bindings, the audioLevel() sampler of the clip
+// starting at clipStartSec).
 PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx,
-                                    double clipLocalSeconds, bool compositeBaked,
-                                    const Timeline *timeline)
+                                    double clipLocalSeconds, double clipStartSec,
+                                    bool compositeBaked, const Timeline *timeline)
 {
     PreviewClipMotion motion;
     motion.valid = true;
@@ -154,7 +156,9 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.is3DLayer = clip.is3DLayer;
     motion.layer3D = clip.layer3D;
     if (clipanim::hasAnyDynamicTransform(clip)) {
-        const clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+        clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+        if (!compositeBaked && timeline && !clip.expressions.isEmpty())
+            env.audioLevelAtTime = timeline->expressionAudioLevelSampler(clip, clipStartSec);
         const clipgeom::ClipTransform transform = compositeBaked
             ? clipanim::effectiveTransformAt(clip, clipLocalSeconds)
             : clipanim::effectiveTransformAt(clip, clipLocalSeconds, env);
@@ -217,6 +221,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
                                  activeClips.first().trackIdx,
                                  activeClips.first().clipIdx,
                                  timelineSec - activeClips.first().timelineStartSec,
+                                 activeClips.first().timelineStartSec,
                                  compositeBaked, timeline);
 
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
@@ -230,7 +235,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
             if (ref.trackIdx == trackIdx && ref.clipIdx == selectedClipIdx)
                 return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
                                          timelineSec - ref.timelineStartSec,
-                                         false, timeline);
+                                         ref.timelineStartSec, false, timeline);
         }
     }
 
@@ -238,7 +243,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
         const PreviewClipMotion motion =
             makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
                               timelineSec - ref.timelineStartSec,
-                              false, timeline);
+                              ref.timelineStartSec, false, timeline);
         if (fuzzyMatchMotionValue(motion.scale, currentScale)
             && fuzzyMatchMotionValue(motion.dx, currentDx)
             && fuzzyMatchMotionValue(motion.dy, currentDy)) {
@@ -250,6 +255,7 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
                              activeClips.first().trackIdx,
                              activeClips.first().clipIdx,
                              timelineSec - activeClips.first().timelineStartSec,
+                             activeClips.first().timelineStartSec,
                              compositeBaked, timeline);
 }
 } // namespace

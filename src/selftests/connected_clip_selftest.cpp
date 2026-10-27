@@ -189,6 +189,18 @@ extern "C" {
 //        Detects: the clip JSON key not read back (mutation build: clipFromJson ignores
 //        "wiggle"); a Smart Render guard that ignores the wiggle (mutation build:
 //        timelineHasDynamicTransform returns false); HEAD has no ClipInfo::wiggle.
+//        US-1505: the expression bindings are ClipInfo::expressions too (an entry = non-empty
+//        bindings, the commit is Timeline::setClipExpressions); G32 / G36 read them through
+//        ClipExpressionView.
+//   G38 (US-1505): G37's six items for the expression bindings: setClipExpressions is one undo
+//        point (none for an equal value) undone to none and redone; they save / open with the
+//        clip (clip key "expressions" on V1[1] only); a legacy root "expressionBindingsEntries"
+//        "0:1" moves onto V1[1] through ProjectFile::load / fromJsonString / MainWindow's open and
+//        is not written again; RenderQueue::resolveTimeline has them (and no audio-level
+//        snapshot: level 0, user decision D); a split puts them on both halves; with
+//        VEDITOR_SMART_RENDER=1 a full-length V1 clip with transform.position.x = 0.3 is encoded
+//        (moved at 0.5 s), not stream-copied. Detects: HEAD has no ClipInfo::expressions (and
+//        the root section is written there); hasAnyDynamicTransform ignoring the bindings.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -858,12 +870,69 @@ struct ClipWiggleView {
     }
 };
 
+// US-1505: the expression bindings are ClipInfo::expressions, no MainWindow map. G32 / G36
+// read them through this view of the Timeline's video clips ("t:i"), where non-empty
+// bindings are an entry; insert / clear write the clips directly with no undo point, as the
+// map writes did, and commit is the dialog's Timeline::setClipExpressions.
+struct ClipExpressionView {
+    Timeline *tl = nullptr;
+    exprbind::ClipExpressionBindings value(const QString &key) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        const TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        return track && index >= 0 && index < track->clipCount() ? track->clips().at(index).expressions
+                                                                 : exprbind::ClipExpressionBindings{};
+    }
+    bool contains(const QString &key) const { return !value(key).isEmpty(); }
+    QStringList keys() const
+    {
+        QStringList out;
+        const auto &tracks = tl->videoTracks();
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c = 0; c < tracks[t]->clipCount(); ++c)
+                if (!tracks[t]->clips().at(c).expressions.isEmpty()) out.append(trackMatteClipKey(t, c));
+        return out;
+    }
+    void insert(const QString &key, const exprbind::ClipExpressionBindings &bindings) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        if (!track || index < 0 || index >= track->clipCount()) return;
+        QVector<ClipInfo> clips = track->clips();
+        clips[index].expressions = bindings;
+        track->setClips(clips);
+    }
+    // nullopt = no bindings (the dialog's empty result).
+    void commit(const QString &key, const std::optional<exprbind::ClipExpressionBindings> &bindings) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        if (parts.size() == 2)
+            tl->setClipExpressions(parts[0].toInt(), parts[1].toInt(),
+                                   bindings.value_or(exprbind::ClipExpressionBindings{}));
+    }
+    void clear() const
+    {
+        for (TimelineTrack *track : tl->videoTracks()) {
+            QVector<ClipInfo> clips = track->clips();
+            bool changed = false;
+            for (ClipInfo &clip : clips) {
+                if (clip.expressions.isEmpty()) continue;
+                clip.expressions = exprbind::ClipExpressionBindings{};
+                changed = true;
+            }
+            if (changed) track->setClips(clips);
+        }
+    }
+};
+
 // G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
 // runConnectedClipSelftest hands over.
 struct SidecarView {
     QHash<QString, TimeRemapClipEntry> *timeRemap = nullptr;
     QHash<QString, QJsonObject> *text3D = nullptr;
-    QHash<QString, exprbind::ClipExpressionBindings> *expressions = nullptr;
+    const ClipExpressionView *expressions = nullptr;
     const ClipWiggleView *wiggle = nullptr;
     QVector<BrushAnimationEntry> *brush = nullptr;
     QHash<QString, BrushAnimation *> *liveBrush = nullptr;
@@ -876,8 +945,6 @@ struct SidecarView {
     void (MainWindow::*sourceOverwrite)(const threepoint::SourceSelection &) = nullptr;
     void (MainWindow::*commitTimeRemap)(const QString &, const timeremap::TimeRemapCurve &) = nullptr;
     void (MainWindow::*commitText3D)(const QString &, const std::optional<QJsonObject> &) = nullptr;
-    void (MainWindow::*commitExpressions)(const QString &,
-                                          const std::optional<exprbind::ClipExpressionBindings> &) = nullptr;
     void (MainWindow::*editWiggle)() = nullptr;
 };
 
@@ -1033,7 +1100,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
     (window.*view.commitTimeRemap)(QStringLiteral("1:0"), editedCurve);
     exprbind::ClipExpressionBindings editedBindings = view.expressions->value(QStringLiteral("1:0"));
     editedBindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("75"));
-    (window.*view.commitExpressions)(QStringLiteral("1:0"), editedBindings);
+    view.expressions->commit(QStringLiteral("1:0"), editedBindings);
     QString speedErr;
     const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
     tl.undo();
@@ -1368,7 +1435,7 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
         (window.*view.commitTimeRemap)(key, curveFor(n));
         view.wiggle->commit(key, wiggleFor(n));
         (window.*view.commitText3D)(key, textFor(n));
-        (window.*view.commitExpressions)(key, bindingsFor(n));
+        view.expressions->commit(key, bindingsFor(n));
     };
     // The tag each kind carries on `key` ("-" when absent; "!id" when the remap's clipId differs).
     auto tagsAt = [&](const QString &key) {
@@ -1468,8 +1535,8 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     const bool ok3t = roundTrip("text3D", [&] { (window.*view.commitText3D)(bKey, textFor(3)); },
         [&] { (window.*view.commitText3D)(bKey, std::nullopt); },
         [&] { return view.text3D->value(bKey) == textFor(3); });
-    const bool ok3e = roundTrip("expression", [&] { (window.*view.commitExpressions)(bKey, bindingsFor(3)); },
-        [&] { (window.*view.commitExpressions)(bKey, std::nullopt); },
+    const bool ok3e = roundTrip("expression", [&] { view.expressions->commit(bKey, bindingsFor(3)); },
+        [&] { view.expressions->commit(bKey, std::nullopt); },
         [&] { return view.expressions->contains(bKey)
                   && view.expressions->value(bKey).toJson() == bindingsFor(3).toJson(); });
     const bool ok3w = roundTrip("wiggle", [&] { view.wiggle->commit(bKey, wiggleFor(3)); },
@@ -1638,7 +1705,9 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     const QString inOther = tagsAt(b8Key);
     tl.undo();
     const QString afterSeqUndo = tagsAt(b8Key);
-    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=81")
+    // US-1505: the expressions ride on b's clip like the wiggle, so G36's "1:0" (clip z) has
+    // none (formerly the position-keyed map value 81).
+    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=-")
         && afterSeqUndo == tagged(81);
     if (!seqBefore.isEmpty()) tl.setActiveSequence(seqBefore);
 
@@ -1693,7 +1762,7 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                  selected, qPrintable(selectErr), dialogs, others, d7, d7Default, defaultNoEntry, d7Set, setEntry,
                  undoNoEntry, ok7);
     std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=81 "
-                 "ex=81) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
+                 "ex=-) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
                  qPrintable(inOther), qPrintable(afterSeqUndo), qPrintable(tagged(81)), ok8);
     std::fprintf(stderr, "connected-clip G36 (9) committed %s, written directly %s (expect %s) depth %d->%d (expect same) "
                  "| sped=%d [%s] x speed after undo=%.3f (expect 1) undo %s (expect %s, the direct write gone) ok=%d\n",
@@ -1971,6 +2040,258 @@ void clipWiggleGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl
                "and open with the clip, a legacy root wiggleClipEntries section was not moved onto V1[1] by load / "
                "fromJsonString / open or was written again, the file-backed export Timeline lost it, or a split "
                "left a half without it, or Smart Render stream-copied a wiggle clip");
+}
+
+// G38 (US-1505): the expression bindings are ClipInfo::expressions, the same six items as
+// G37: one Timeline::setClipExpressions is one undo point (none for an equal value), they save
+// and open with the clip, a legacy root "expressionBindingsEntries" section moves onto the clip
+// it names through ProjectFile::load, fromJsonString and MainWindow's open and is never written
+// again, the file-backed export Timeline has them, a split puts them on both halves, and Smart
+// Render encodes (does not stream-copy) a full-length V1 expression clip.
+void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                        bool (MainWindow::*save)(const QString &, QString *),
+                        bool (MainWindow::*open)(const QString &, QString *, bool))
+{
+    auto depth = [&tl] { return tl.undoManager()->currentIndex(); };
+    auto exprAt = [&tl](int track, int index) {
+        const TimelineTrack *t = tl.trackAt(false, track);
+        return t && index >= 0 && index < t->clipCount() ? t->clips().at(index).expressions
+                                                         : exprbind::ClipExpressionBindings{};
+    };
+    exprbind::ClipExpressionBindings eb;
+    eb.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    eb.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    const QJsonObject ebJson = eb.toJson();
+    auto isEb = [&ebJson](const exprbind::ClipExpressionBindings &b) {
+        return !b.isEmpty() && b.toJson() == ebJson;
+    };
+    auto fileRoot = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    };
+    auto clipKeyOnV1 = [](const QJsonObject &root, int index) {
+        const QJsonArray v1 = root.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+        return v1.at(index).toObject().contains(QStringLiteral("expressions"));
+    };
+    const QString section = QStringLiteral("expressionBindingsEntries");
+
+    // (1) V1 [x | e]: set on e (+1), the same value again (+0), undo -> none, redo -> back.
+    load(tl, {{clipFor("x", 2.0), clipFor("e", 2.0)}});
+    const int d0 = depth();
+    const bool set1 = tl.setClipExpressions(0, 1, eb);
+    const int d1 = depth();
+    const bool onClip = isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool setAgain = tl.setClipExpressions(0, 1, eb);
+    const int d1b = depth();
+    tl.undo();
+    const bool undoNone = exprAt(0, 1).isEmpty();
+    tl.redo();
+    const bool redoBack = isEb(exprAt(0, 1));
+    const bool ok1 = set1 && d1 == d0 + 1 && onClip && setAgain && d1b == d1 && undoNone && redoBack;
+
+    // (2) saved and opened through MainWindow: on e again; the file has the clip key on V1[1]
+    // and no root section.
+    QTemporaryDir dir;
+    const QString savedPath = dir.filePath(QStringLiteral("g38.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*save)(savedPath, &saveErr);
+    const QJsonObject savedRoot = fileRoot(savedPath);
+    load(tl, {{clipFor("x", 2.0), clipFor("e", 2.0)}});
+    const bool wiped = exprAt(0, 1).isEmpty();
+    const bool opened = saved && (window.*open)(savedPath, &openErr, false);
+    const bool onE2 = isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool clipKey = clipKeyOnV1(savedRoot, 1) && !clipKeyOnV1(savedRoot, 0);
+    const bool ok2 = saved && opened && wiped && onE2 && clipKey && !savedRoot.isEmpty()
+        && !savedRoot.contains(section);
+
+    // (3) a legacy project: no clip key, the root section names "0:1".
+    ProjectData legacyData;
+    legacyData.config.width = 1280;
+    legacyData.config.height = 720;
+    legacyData.config.fps = 30;
+    legacyData.videoTracks = {{clipFor("x", 2.0), clipFor("e", 2.0)}};
+    legacyData.audioTracks = {{}};
+    QJsonObject legacyRoot = QJsonDocument::fromJson(ProjectFile::toJsonString(legacyData).toUtf8()).object();
+    legacyRoot.insert(section, QJsonArray{QJsonObject{{QStringLiteral("clipId"), QStringLiteral("0:1")},
+                                                      {QStringLiteral("bindings"), ebJson}}});
+    const QByteArray legacyBytes = QJsonDocument(legacyRoot).toJson();
+    const QString legacyPath = dir.filePath(QStringLiteral("g38-legacy.veditor"));
+    {
+        QFile file(legacyPath);
+        if (file.open(QIODevice::WriteOnly)) file.write(legacyBytes);
+    }
+    ProjectData loaded;
+    const bool legacyLoaded = ProjectFile::load(legacyPath, loaded);
+    const bool loadMigrated = legacyLoaded && loaded.videoTracks.size() == 1 && loaded.videoTracks[0].size() == 2
+        && isEb(loaded.videoTracks[0][1].expressions) && loaded.videoTracks[0][0].expressions.isEmpty()
+        && loaded.expressionBindingsEntries.isEmpty();
+    const QString resavedPath = dir.filePath(QStringLiteral("g38-resaved.veditor"));
+    const bool resaved = ProjectFile::save(resavedPath, loaded);
+    const QJsonObject resavedRoot = fileRoot(resavedPath);
+    const bool resavedNoSection = resaved && !resavedRoot.isEmpty() && !resavedRoot.contains(section)
+        && clipKeyOnV1(resavedRoot, 1);
+    ProjectData fromString;
+    const bool stringLoaded = ProjectFile::fromJsonString(QString::fromUtf8(legacyBytes), fromString);
+    const bool stringMigrated = stringLoaded && fromString.videoTracks.size() == 1
+        && fromString.videoTracks[0].size() == 2 && isEb(fromString.videoTracks[0][1].expressions)
+        && fromString.videoTracks[0][0].expressions.isEmpty() && fromString.expressionBindingsEntries.isEmpty()
+        && !QJsonDocument::fromJson(ProjectFile::toJsonString(fromString).toUtf8()).object().contains(section);
+    QString legacyOpenErr;
+    const bool legacyOpened = (window.*open)(legacyPath, &legacyOpenErr, false);
+    const bool openMigrated = legacyOpened && isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool ok3 = loadMigrated && resavedNoSection && stringMigrated && openMigrated;
+
+    // (4) the file-backed export Timeline (RenderQueue::resolveTimeline) of the legacy and of
+    // the MainWindow-saved project: the bindings on e, and no audio-level snapshot (level 0).
+    auto resolved = [](const QString &path, bool *noSnapshot) {
+        RenderJob job;
+        job.projectFilePath = path;
+        Timeline *owned = nullptr;
+        Timeline *timeline = member(ResolveTimelineTag{})(job, &owned);
+        exprbind::ClipExpressionBindings out;
+        if (timeline && !timeline->videoTracks().isEmpty() && timeline->videoTracks()[0]->clipCount() > 1)
+            out = timeline->videoTracks()[0]->clips().at(1).expressions;
+        if (noSnapshot) *noSnapshot = timeline && !timeline->expressionAudioEnvForRead();
+        delete owned;
+        return out;
+    };
+    bool legacyNoSnapshot = false, savedNoSnapshot = false;
+    const exprbind::ClipExpressionBindings resolvedLegacy = resolved(legacyPath, &legacyNoSnapshot);
+    const exprbind::ClipExpressionBindings resolvedSaved = resolved(savedPath, &savedNoSnapshot);
+    const bool ok4 = isEb(resolvedLegacy) && isEb(resolvedSaved) && legacyNoSnapshot && savedNoSnapshot;
+
+    // (5) a split of the expression clip: both halves carry the bindings.
+    load(tl, {{clipFor("e", 4.0)}});
+    const bool set5 = tl.setClipExpressions(0, 0, eb);
+    QString splitErr;
+    const bool split = tl.splitClipByIndex(false, 0, 0, 2.0, &splitErr);
+    const int pieces = tl.trackAt(false, 0)->clipCount();
+    const bool halvesEb = isEb(exprAt(0, 0)) && isEb(exprAt(0, 1));
+    const bool ok5 = set5 && split && pieces == 2 && halvesEb;
+
+    // (6) Smart Render on (VEDITOR_SMART_RENDER=1 and VEDITOR_SMARTRENDER_TEST_SEAM=1, both
+    // restored after, as in G37): a single full-length V1 mpeg4 clip is stream-copied without
+    // bindings (control) and encoded with transform.position.x = 0.3, so the output frame at
+    // 0.5 s is moved off the source frame.
+    const QString srcPath = dir.filePath(QStringLiteral("g38-src.mp4"));
+    const QString silentPath = dir.filePath(QStringLiteral("g38-silent.png"));
+    QImage silent(2, 2, QImage::Format_RGB32);
+    silent.fill(Qt::black);
+    const bool fixture6 = writeVideoFile(srcPath, 20) && silent.save(silentPath);
+    const bool envSet6 = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+    const QByteArray env6 = qgetenv("VEDITOR_SMART_RENDER");
+    const bool seamSet6 = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+    const QByteArray seam6 = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    auto exportOnce = [&](bool withExpressions, const QString &outName, QStringList *log, QString *err) {
+        ClipInfo clip;
+        clip.filePath = srcPath;
+        clip.displayName = QStringLiteral("g38-src");
+        clip.duration = 2.0;
+        clip.outPoint = 2.0;
+        if (withExpressions)
+            clip.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("0.3"));
+        Timeline export6;
+        export6.setProjectOutputConfig(40, 24, true, 10.0);
+        export6.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QString outPath = dir.filePath(outName);
+        RenderPreset preset{QStringLiteral("G38"), 40, 24, QStringLiteral("mpeg4"), 600000, QStringLiteral("mp4")};
+        RenderJob job = RenderQueue::jobFromPreset(preset, outPath, 0, 2000000);
+        job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        job.timeline = &export6;
+        job.projectFilePath = silentPath;
+        job.exportConfig["fps"] = 10;
+        job.exportConfig["videoCodec"] = QStringLiteral("mpeg4");
+        const QByteArray hadEnv = qgetenv("VEDITOR_SMART_RENDER");
+        const bool envWasSet = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+        const QByteArray hadSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        const bool seamWasSet = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+        qputenv("VEDITOR_SMART_RENDER", "1");
+        qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+        g_smartRenderLog = log;
+        g_previousSmartRenderHandler = qInstallMessageHandler(captureSmartRender);
+        RenderQueue queue;
+        QEventLoop loop;
+        bool done = false, success = false;
+        QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                         [&](const QString &uuid, bool okJob, const QString &message) {
+                             if (uuid != job.uuid) return;
+                             done = true;
+                             success = okJob;
+                             *err = message;
+                             loop.quit();
+                         });
+        queue.addJob(job);
+        queue.start();
+        if (!done) loop.exec();
+        qInstallMessageHandler(g_previousSmartRenderHandler);
+        g_previousSmartRenderHandler = nullptr;
+        g_smartRenderLog = nullptr;
+        if (envWasSet) qputenv("VEDITOR_SMART_RENDER", hadEnv);
+        else qunsetenv("VEDITOR_SMART_RENDER");
+        if (seamWasSet) qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", hadSeam);
+        else qunsetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        return success ? outPath : QString();
+    };
+    auto logHas = [](const QStringList &log, const char *needle) {
+        for (const QString &line : log)
+            if (line.contains(QLatin1String(needle))) return true;
+        return false;
+    };
+    auto maxDiff = [](const QImage &a, const QImage &b) {
+        if (a.isNull() || b.isNull() || a.size() != b.size()) return -1;
+        const QImage x = a.convertToFormat(QImage::Format_RGB32), y = b.convertToFormat(QImage::Format_RGB32);
+        int worst = 0;
+        for (int yy = 0; yy < x.height(); ++yy)
+            for (int xx = 0; xx < x.width(); ++xx) {
+                const QRgb p = x.pixel(xx, yy), q = y.pixel(xx, yy);
+                worst = std::max({worst, std::abs(qRed(p) - qRed(q)), std::abs(qGreen(p) - qGreen(q)),
+                                  std::abs(qBlue(p) - qBlue(q))});
+            }
+        return worst;
+    };
+    QStringList plainLog, exprLog;
+    QString plainErr, exprErr;
+    const QString plainOut = fixture6 ? exportOnce(false, QStringLiteral("g38-plain.mp4"), &plainLog, &plainErr) : QString();
+    const QString exprOut = fixture6 ? exportOnce(true, QStringLiteral("g38-expr.mp4"), &exprLog, &exprErr) : QString();
+    const bool envRestored = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER") == envSet6
+        && qgetenv("VEDITOR_SMART_RENDER") == env6
+        && qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM") == seamSet6
+        && qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM") == seam6;
+    const QImage srcFrame = fixture6 ? libavcore::grabFrameAt(srcPath, 0.5) : QImage();
+    const int plainDiff = plainOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(plainOut, 0.5));
+    const int exprDiff = exprOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(exprOut, 0.5));
+    const bool plainCopied = !plainOut.isEmpty() && logHas(plainLog, "stream-copied whole timeline");
+    const bool exprCopied = logHas(exprLog, "stream-copied whole timeline");
+    const bool exprReason = logHas(exprLog, "timeline has a dynamic transform");
+    const bool ok6 = fixture6 && plainCopied && plainDiff >= 0 && plainDiff <= 2 && !exprOut.isEmpty()
+        && !exprCopied && exprReason && exprDiff > 60 && envRestored;
+
+    std::fprintf(stderr, "connected-clip G38 (1) set=%d depth %d->%d (expect +1) onClip=%d same again=%d depth %d "
+                 "(expect same) undo none=%d redo back=%d ok=%d\n", set1, d0, d1, onClip, setAgain, d1b,
+                 undoNone, redoBack, ok1);
+    std::fprintf(stderr, "connected-clip G38 (2) saved=%d [%s] wiped=%d opened=%d [%s] on e=%d clip key V1[1] only=%d "
+                 "root %s=%d (expect 0) ok=%d\n", saved, qPrintable(saveErr), wiped, opened, qPrintable(openErr),
+                 int(onE2), int(clipKey), qPrintable(section), int(savedRoot.contains(section)), ok2);
+    std::fprintf(stderr, "connected-clip G38 (3) legacy \"0:1\": load=%d migrated=%d resaved=%d root section=%d "
+                 "(expect 0) | fromJsonString=%d migrated=%d | open=%d [%s] on V1[1]=%d ok=%d\n", legacyLoaded,
+                 loadMigrated, resaved, int(resavedRoot.contains(section)), stringLoaded, stringMigrated,
+                 legacyOpened, qPrintable(legacyOpenErr), openMigrated, ok3);
+    std::fprintf(stderr, "connected-clip G38 (4) resolveTimeline legacy bindings=%d no snapshot=%d | saved bindings=%d "
+                 "no snapshot=%d ok=%d\n", int(isEb(resolvedLegacy)), int(legacyNoSnapshot),
+                 int(isEb(resolvedSaved)), int(savedNoSnapshot), ok4);
+    std::fprintf(stderr, "connected-clip G38 (5) set=%d split=%d [%s] pieces=%d (expect 2) both halves carry them=%d "
+                 "ok=%d\n", set5, split, qPrintable(splitErr), pieces, int(halvesEb), ok5);
+    std::fprintf(stderr, "connected-clip G38 (6) smart render: fixture=%d | no bindings out=%d [%s] stream-copied=%d "
+                 "(expect 1) maxdiff@0.5=%d (expect <=2) | expression out=%d [%s] stream-copied=%d (expect 0) "
+                 "dynamic-transform reason=%d maxdiff@0.5=%d (expect >60) env restored=%d ok=%d\n", int(fixture6),
+                 int(!plainOut.isEmpty()), qPrintable(plainErr), int(plainCopied), plainDiff, int(!exprOut.isEmpty()),
+                 qPrintable(exprErr), int(exprCopied), int(exprReason), exprDiff, int(envRestored), ok6);
+    tally.gate(38, ok1 && ok2 && ok3 && ok4 && ok5 && ok6,
+               "the clip expression commit recorded no / an extra undo point or did not undo / redo, the "
+               "bindings did not save and open with the clip, a legacy root expressionBindingsEntries section "
+               "was not moved onto V1[1] by load / fromJsonString / open or was written again, the file-backed "
+               "export Timeline lost them (or had a snapshot), a split left a half without them, or Smart Render "
+               "stream-copied an expression clip");
 }
 
 // G33 (US-1320): one composed clipKeysRemapped for a storyline media drop on V1 whose
@@ -4863,6 +5184,8 @@ int runConnectedClipSelftest()
 
     // US-1504: G32 / G36 read and commit the wiggle on the Timeline's clips.
     const ClipWiggleView wiggleView{mainTimeline};
+    // US-1505: and the expression bindings.
+    const ClipExpressionView expressionView{mainTimeline};
 
     // G32 (US-1302): the friend hands the private sidecars to the gate function.
     if (!mainTimeline) {
@@ -4871,7 +5194,7 @@ int runConnectedClipSelftest()
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
         view.text3D = &window.m_text3DClipConfigs;
-        view.expressions = &window.m_clipExpressionBindings;
+        view.expressions = &expressionView;
         view.wiggle = &wiggleView;
         view.brush = &window.m_brushAnimationEntries;
         view.liveBrush = &window.m_liveBrushAnimations;
@@ -4881,7 +5204,6 @@ int runConnectedClipSelftest()
         view.open = &MainWindow::openProjectFromPath;
         view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
         view.commitText3D = &MainWindow::commitText3DConfig;
-        view.commitExpressions = &MainWindow::commitExpressionBindings;
         sidecarRekeyGate(tally, window, *mainTimeline, view);
     }
 
@@ -4914,13 +5236,12 @@ int runConnectedClipSelftest()
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
         view.text3D = &window.m_text3DClipConfigs;
-        view.expressions = &window.m_clipExpressionBindings;
+        view.expressions = &expressionView;
         view.wiggle = &wiggleView;
         view.save = &MainWindow::saveProjectToPath;
         view.open = &MainWindow::openProjectFromPath;
         view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
         view.commitText3D = &MainWindow::commitText3DConfig;
-        view.commitExpressions = &MainWindow::commitExpressionBindings;
         view.editWiggle = &MainWindow::editClipWiggle;
         sidecarUndoValuesGate(tally, window, *mainTimeline, view);
     }
@@ -4931,6 +5252,14 @@ int runConnectedClipSelftest()
     else
         clipWiggleGate(tally, window, *mainTimeline, &MainWindow::saveProjectToPath,
                        &MainWindow::openProjectFromPath);
+
+    // G38 (US-1505): the clip expressions' undo, persistence, legacy migration, export Timeline,
+    // split and Smart Render.
+    if (!mainTimeline)
+        tally.gate(38, false, "MainWindow has no mainTimeline");
+    else
+        clipExpressionGate(tally, window, *mainTimeline, &MainWindow::saveProjectToPath,
+                           &MainWindow::openProjectFromPath);
 
     return tally.finish("connected-clip");
 }

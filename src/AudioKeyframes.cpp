@@ -6,17 +6,23 @@
 #include <QTemporaryDir>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <limits>
+#include <thread>
 
 namespace audiokf {
 namespace {
 std::atomic<bool> disabled{false};
 std::atomic<int> invocations{0};
+std::atomic<int> decodeDelayMs{0};
+std::atomic<int> decodeDelayEntries{0};
 }
 void setDisabledForTest(bool value) { disabled = value; }
 void resetInvocationCountForTest() { invocations = 0; }
 int invocationCountForTest() { return invocations.load(); }
+void setDecodeDelayForTest(int ms) { decodeDelayMs = qMax(0, ms); }
+int decodeDelayEntriesForTest() { return decodeDelayEntries.load(); }
 
 Envelope computeEnvelope(const QVector<float>& mono, int sampleRate,
                          double fps, double smoothingMs)
@@ -124,17 +130,44 @@ std::shared_ptr<const Envelope> EnvelopeCache::envelope(const QString& filePath)
     const QFileInfo info(filePath);
     const QString key = info.absoluteFilePath();
     const qint64 modified = info.lastModified().toMSecsSinceEpoch();
-    std::lock_guard<std::mutex> lock(m_mutex);
-    auto it = m_entries.constFind(key);
-    if (it != m_entries.cend() && it->size == info.size() && it->modified == modified) {
-        m_lru.removeAll(key);
-        m_lru.append(key);
-        return it->value;
+    std::unique_lock<std::mutex> lock(m_mutex);
+    for (bool waited = false;; waited = true) {
+        auto it = m_entries.constFind(key);
+        if (it != m_entries.cend() && it->size == info.size() && it->modified == modified) {
+            m_lru.removeAll(key);
+            m_lru.append(key);
+            return it->value;
+        }
+        // Another caller is decoding this file: wait for it once, then read again
+        // (and decode here when its result does not match this file's size / mtime).
+        if (waited || !m_inFlight.contains(key)) break;
+        m_decoded.wait(lock, [&] { return !m_inFlight.contains(key); });
+    }
+    const bool owner = !m_inFlight.contains(key);
+    if (owner) m_inFlight.insert(key);
+    lock.unlock();
+    // Clears the in-flight mark and wakes the waiters on every exit, a throw included.
+    struct InFlightGuard {
+        EnvelopeCache *cache;
+        const QString &key;
+        bool owner;
+        ~InFlightGuard()
+        {
+            if (!owner) return;
+            std::lock_guard<std::mutex> relock(cache->m_mutex);
+            cache->m_inFlight.remove(key);
+            cache->m_decoded.notify_all();
+        }
+    } guard{this, key, owner};
+    if (const int delayMs = decodeDelayMs.load(); delayMs > 0) {
+        ++decodeDelayEntries;
+        std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
     }
     QVector<float> mono;
     int sr = 0;
     auto value = std::make_shared<Envelope>();
     if (decodeMono(filePath, mono, sr)) *value = computeEnvelope(mono, sr, 60.0, 50.0);
+    std::lock_guard<std::mutex> relock(m_mutex);
     m_lru.removeAll(key);
     m_entries.remove(key);
     while (m_entries.size() >= 16) m_entries.remove(m_lru.takeFirst());
@@ -167,5 +200,14 @@ std::function<double(double)> makeLinkedAudioSampler(
         }
     }
     return {};
+}
+
+std::function<double(double)> makeLinkedAudioSamplerFrom(
+    const ExprAudioEnv& env, int linkGroup, double clipStart)
+{
+    QVector<const QVector<ClipInfo>*> audioTracks;
+    audioTracks.reserve(env.audioClipsByTrack.size());
+    for (const QVector<ClipInfo>& clips : env.audioClipsByTrack) audioTracks.append(&clips);
+    return makeLinkedAudioSampler(linkGroup, clipStart, audioTracks, env.cache);
 }
 } // namespace audiokf
