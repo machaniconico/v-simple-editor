@@ -394,6 +394,8 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("speed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("reversed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("autoOrient"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        // US-1711: optional (required に入れない)。
+        {QStringLiteral("autoOrientToCamera"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -756,6 +758,110 @@ bool readClipTarget(const QJsonObject& args, MainWindow* window,
     return setError(err, QStringLiteral("clip index is out of range"));
 }
 
+// US-1711: wiggle / 式 / 3D レイヤー系は映像クリップだけが持つ。音声クリップ指定は
+// 黙って無視せずエラーにし、編集系はロック中トラックも先に断る。
+bool readVideoClipTarget(const QJsonObject& args, MainWindow* window,
+                         Timeline* currentTimeline, bool forWrite,
+                         ClipTarget* out, QString* err)
+{
+    ClipTarget target;
+    if (!readClipTarget(args, window, currentTimeline, &target, err))
+        return false;
+    if (target.audio)
+        return setError(err, QStringLiteral("音声クリップには指定できません (kind は video のみ)"));
+    if (forWrite && target.track && target.track->isLocked())
+        return setError(err, QStringLiteral("ロック中のトラックのクリップは編集できません"));
+    if (out)
+        *out = target;
+    return true;
+}
+
+// wiggle の入力。未指定のキーは wiggle::WiggleParams の既定値になる (全置換)。
+// 未知キーは拒否し、octaves は wiggle 側の有効範囲 [1, 6] に丸める。
+bool parseWiggleArgument(const QJsonValue& raw, wiggle::WiggleParams* out, QString* err)
+{
+    if (!raw.isObject())
+        return setError(err, QStringLiteral("wiggle must be an object"));
+    const QJsonObject object = raw.toObject();
+    static const QStringList kNumberKeys{
+        QStringLiteral("positionFrequency"), QStringLiteral("rotationFrequency"),
+        QStringLiteral("rotationAmplitudeDeg"), QStringLiteral("scaleFrequency"),
+        QStringLiteral("scaleAmplitude")};
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
+        const QString& key = it.key();
+        if (kNumberKeys.contains(key)) {
+            if (!it.value().isDouble() || !std::isfinite(it.value().toDouble()))
+                return setError(err, QStringLiteral("wiggle.%1 must be a finite number").arg(key));
+        } else if (key == QStringLiteral("positionAmplitude")) {
+            if (!it.value().isObject())
+                return setError(err, QStringLiteral("wiggle.positionAmplitude must be an object {x, y}"));
+            const QJsonObject amplitude = it.value().toObject();
+            for (auto axis = amplitude.constBegin(); axis != amplitude.constEnd(); ++axis) {
+                if ((axis.key() != QStringLiteral("x") && axis.key() != QStringLiteral("y"))
+                    || !axis.value().isDouble() || !std::isfinite(axis.value().toDouble())) {
+                    return setError(err, QStringLiteral("wiggle.positionAmplitude must contain only finite numbers x / y"));
+                }
+            }
+        } else if (key == QStringLiteral("seed") || key == QStringLiteral("octaves")) {
+            const double number = it.value().toDouble(std::numeric_limits<double>::quiet_NaN());
+            if (!it.value().isDouble() || !std::isfinite(number) || number != std::floor(number)
+                || number < 0.0 || number > 2147483647.0) {
+                return setError(err, QStringLiteral("wiggle.%1 must be a non-negative integer").arg(key));
+            }
+        } else if (key == QStringLiteral("enabled")) {
+            if (!it.value().isBool())
+                return setError(err, QStringLiteral("wiggle.enabled must be a boolean"));
+        } else {
+            return setError(err, QStringLiteral("unknown wiggle key: %1").arg(key));
+        }
+    }
+    wiggle::WiggleParams params = wiggle::fromJson(object);
+    params.octaves = qBound(1, params.octaves, 6);
+    if (out)
+        *out = params;
+    return true;
+}
+
+QJsonObject wiggleInputSchema()
+{
+    const auto number = [] {
+        return QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}};
+    };
+    return QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("object")},
+        {QStringLiteral("properties"), QJsonObject{
+            {QStringLiteral("positionFrequency"), number()},
+            {QStringLiteral("positionAmplitude"), objectSchema(QJsonObject{
+                {QStringLiteral("x"), number()}, {QStringLiteral("y"), number()}})},
+            {QStringLiteral("rotationFrequency"), number()},
+            {QStringLiteral("rotationAmplitudeDeg"), number()},
+            {QStringLiteral("scaleFrequency"), number()},
+            {QStringLiteral("scaleAmplitude"), number()},
+            {QStringLiteral("seed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                                                  {QStringLiteral("minimum"), 0}}},
+            {QStringLiteral("octaves"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")},
+                                                     {QStringLiteral("minimum"), 0},
+                                                     {QStringLiteral("description"),
+                                                      QStringLiteral("any non-negative integer; the stored value is clamped to 1..6")}}},
+            {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        }},
+        {QStringLiteral("additionalProperties"), false}
+    };
+}
+
+QJsonObject wiggleOutputSchema()
+{
+    return QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}};
+}
+
+QJsonObject expressionsOutputSchema()
+{
+    return QJsonObject{
+        {QStringLiteral("type"), QStringLiteral("object")},
+        {QStringLiteral("additionalProperties"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+    };
+}
+
 bool detectMusicRemixBeats(const ClipInfo &clip, QVector<double> *beatTimes,
                            double *bpm, QString *err)
 {
@@ -1050,6 +1156,7 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         {QStringLiteral("speed"), clip.speed},
         {QStringLiteral("reversed"), clip.reversed},
         {QStringLiteral("autoOrient"), clip.autoOrientEnabled},
+        {QStringLiteral("autoOrientToCamera"), clip.autoOrientToCamera},
         {QStringLiteral("volume"), clip.volume},
         {QStringLiteral("opacity"), clip.opacity},
         {QStringLiteral("enabled"), clip.visible},
@@ -2193,7 +2300,8 @@ void McpEditorTools::registerWriteTools()
             QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}},
             QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}
         }}}},
-        {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+        {QStringLiteral("linkedApplied"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("is3DLayer"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
     }, {QStringLiteral("ok"), QStringLiteral("property"),
         QStringLiteral("value")});
 
@@ -3989,7 +4097,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。autoOrientToCamera と is3DLayer は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -3998,10 +4106,11 @@ void McpEditorTools::registerWriteTools()
                     QStringLiteral("volume"), QStringLiteral("opacity"),
                     QStringLiteral("speed"), QStringLiteral("pan"),
                     QStringLiteral("videoScale"), QStringLiteral("reversed"),
-                    QStringLiteral("autoOrient")
+                    QStringLiteral("autoOrient"), QStringLiteral("autoOrientToCamera"),
+                    QStringLiteral("is3DLayer")
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed / autoOrient")}
+                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed / autoOrient / autoOrientToCamera / is3DLayer")}
             }},
             {QStringLiteral("value"), QJsonObject{
                 {QStringLiteral("oneOf"), QJsonArray{
@@ -4009,7 +4118,7 @@ void McpEditorTools::registerWriteTools()
                     QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("property に応じた値。reversed / autoOrient は boolean、それ以外は number。")}
+                 QStringLiteral("property に応じた値。reversed / autoOrient / autoOrientToCamera / is3DLayer は boolean、それ以外は number。")}
             }}
         }), {QStringLiteral("clipIndex"), QStringLiteral("property"), QStringLiteral("value")}),
         guardedWrite(QStringLiteral("set_clip_property"),
@@ -4025,7 +4134,10 @@ void McpEditorTools::registerWriteTools()
                 return {};
             const bool isReversedProperty = property == QStringLiteral("reversed");
             const bool isAutoOrientProperty = property == QStringLiteral("autoOrient");
-            const bool isBooleanProperty = isReversedProperty || isAutoOrientProperty;
+            const bool isAutoOrientToCameraProperty = property == QStringLiteral("autoOrientToCamera");
+            const bool isIs3DLayerProperty = property == QStringLiteral("is3DLayer");
+            const bool isBooleanProperty = isReversedProperty || isAutoOrientProperty
+                || isAutoOrientToCameraProperty || isIs3DLayerProperty;
             double value = 0.0;
             bool booleanValue = false;
             if (isBooleanProperty) {
@@ -4065,6 +4177,41 @@ void McpEditorTools::registerWriteTools()
                     return setError(err, QStringLiteral("clip auto-orient update failed")),
                            QJsonObject();
                 }
+            } else if (isAutoOrientToCameraProperty || isIs3DLayerProperty) {
+                // US-1711: 映像クリップ専用。音声 / ロック中トラックは理由付きで断る。
+                if (target.audio)
+                    return setError(err, QStringLiteral("%1 は音声クリップには指定できません (kind は video のみ)")
+                                             .arg(property)),
+                           QJsonObject();
+                if (target.track->isLocked())
+                    return setError(err, QStringLiteral("ロック中のトラックのクリップは編集できません")),
+                           QJsonObject();
+                if (isAutoOrientToCameraProperty) {
+                    if (!currentTimeline->setClipAutoOrientToCamera(
+                            target.trackIndex, target.clipIndex, booleanValue)) {
+                        return setError(err, QStringLiteral("clip camera auto-orient update failed")),
+                               QJsonObject();
+                    }
+                } else {
+                    // setClipMotion は undo 点を作らないので、値が変わるときだけ
+                    // ここで 1 回積む (GUI の motion 編集と同じ 1 操作 = 1 undo)。
+                    const ClipInfo current = target.track->clips().at(target.clipIndex);
+                    if (current.is3DLayer != booleanValue) {
+                        effectctrl::MotionState motion;
+                        motion.scale = current.videoScale;
+                        motion.dx = current.videoDx;
+                        motion.dy = current.videoDy;
+                        motion.rotation2DDeg = current.rotation2DDegrees;
+                        motion.opacity = current.opacity;
+                        motion.is3DLayer = booleanValue;
+                        motion.posZ = current.layer3D.positionZ;
+                        motion.rotX = current.layer3D.rotationX;
+                        motion.rotY = current.layer3D.rotationY;
+                        motion.rotZ = current.layer3D.rotationZ;
+                        currentTimeline->setClipMotion(target.trackIndex, target.clipIndex, motion);
+                        currentTimeline->saveUndoState(QStringLiteral("3D レイヤーを変更"));
+                    }
+                }
             } else if (!currentTimeline->setClipPropertyByIndex(
                            target.audio, target.trackIndex, target.clipIndex,
                            property, value, err, applyToLinked)) {
@@ -4076,10 +4223,124 @@ void McpEditorTools::registerWriteTools()
                 {QStringLiteral("property"), property},
                 {QStringLiteral("value"), isBooleanProperty
                     ? QJsonValue(booleanValue) : QJsonValue(value)},
-                {QStringLiteral("linkedApplied"), applyToLinked}
+                {QStringLiteral("linkedApplied"), applyToLinked},
+                {QStringLiteral("is3DLayer"),
+                 target.track->clips().at(target.clipIndex).is3DLayer}
             };
         })
     }, setClipPropertyOutputSchema));
+
+    // US-1711: wiggle / 式 / 3D レイヤーの動的設定。set は undo 1 段、get は読み取り専用。
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_wiggle"),
+        QStringLiteral("映像クリップの wiggle (手ブレ風の揺れ) を設定する。wiggle は全置換で、省略したキーは既定値 (enabled=false) に戻る。キー: positionFrequency / positionAmplitude {x,y} (px) / rotationFrequency / rotationAmplitudeDeg / scaleFrequency / scaleAmplitude / seed / octaves (1..6 に丸める) / enabled。未知のキーは拒否する。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("wiggle"), wiggleInputSchema()}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("wiggle")}),
+        guardedWrite(QStringLiteral("set_clip_wiggle"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("wiggle")},
+                                        err))
+                return {};
+            wiggle::WiggleParams params;
+            if (!parseWiggleArgument(args.value(QStringLiteral("wiggle")), &params, err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/true, &target, err))
+                return {};
+            if (!timeline()->setClipWiggle(target.trackIndex, target.clipIndex, params))
+                return setError(err, QStringLiteral("clip wiggle update failed")), QJsonObject();
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("wiggle"), wiggle::toJson(
+                    target.track->clips().at(target.clipIndex).wiggle)}
+            };
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("wiggle"), wiggleOutputSchema()}
+    }, {QStringLiteral("ok"), QStringLiteral("wiggle")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_expression"),
+        QStringLiteral("映像クリップのプロパティへ式 (expression) を設定する。propPath は式を付けられる正規パス (例: transform.position.x)。未知の propPath はエラー。code が空文字・空白だけなら、そのプロパティの式を解除する。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで戻せる。"),
+        schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
+            {QStringLiteral("propPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+            {QStringLiteral("code"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("propPath"), QStringLiteral("code")}),
+        guardedWrite(QStringLiteral("set_clip_expression"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("propPath"),
+                                         QStringLiteral("code")},
+                                        err))
+                return {};
+            QString propPath;
+            QString code;
+            if (!requiredString(args, QStringLiteral("propPath"), &propPath, err)
+                || !requiredString(args, QStringLiteral("code"), &code, err)) {
+                return {};
+            }
+            const QString pathError = exprbind::validatePath(propPath);
+            if (!pathError.isEmpty())
+                return setError(err, pathError), QJsonObject();
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/true, &target, err))
+                return {};
+            exprbind::ClipExpressionBindings bindings =
+                target.track->clips().at(target.clipIndex).expressions;
+            bindings.setExpression(propPath, code);
+            if (!timeline()->setClipExpressions(target.trackIndex, target.clipIndex, bindings))
+                return setError(err, QStringLiteral("clip expression update failed")), QJsonObject();
+            syncSelectionAfterEdit();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("propPath"), propPath},
+                {QStringLiteral("cleared"), code.trimmed().isEmpty()},
+                {QStringLiteral("expressions"), target.track->clips()
+                    .at(target.clipIndex).expressions.toJson()}
+            };
+        })
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("propPath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+        {QStringLiteral("cleared"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("expressions"), expressionsOutputSchema()}
+    }, {QStringLiteral("ok"), QStringLiteral("propPath"), QStringLiteral("cleared"),
+        QStringLiteral("expressions")})));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_clip_dynamics"),
+        QStringLiteral("映像クリップの動的設定を読む (読み取り専用)。is3DLayer / autoOrientToCamera / wiggle / expressions (propPath -> code) を返す。音声クリップは拒否する。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/false, &target, err))
+                return {};
+            const ClipInfo& clip = target.track->clips().at(target.clipIndex);
+            return QJsonObject{
+                {QStringLiteral("is3DLayer"), clip.is3DLayer},
+                {QStringLiteral("autoOrientToCamera"), clip.autoOrientToCamera},
+                {QStringLiteral("wiggle"), wiggle::toJson(clip.wiggle)},
+                {QStringLiteral("expressions"), clip.expressions.toJson()}
+            };
+        }
+    }, outputSchemaOf(QJsonObject{
+        {QStringLiteral("is3DLayer"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("autoOrientToCamera"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("wiggle"), wiggleOutputSchema()},
+        {QStringLiteral("expressions"), expressionsOutputSchema()}
+    }, {QStringLiteral("is3DLayer"), QStringLiteral("autoOrientToCamera"),
+        QStringLiteral("wiggle"), QStringLiteral("expressions")})));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("music_remix"),
