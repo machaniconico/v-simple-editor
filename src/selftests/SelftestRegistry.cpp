@@ -835,7 +835,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
       "Project camera: opt-in projection, view/roll, JSON, overlap and animated export parity (G1-G10) (10 gates)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
-      "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (17 gates)" },
+      "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (19 gates)" },
     { "edl-import", "VEDITOR_EDL_IMPORT_SELFTEST", runEdlImportSelftest, true,
       "CMX3600 import, dissolve, offline media and sequence undo (13 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
