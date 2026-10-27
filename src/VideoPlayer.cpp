@@ -1197,16 +1197,17 @@ void applyLayerMotionOpacity(const Timeline *timeline,
     layer->vfxBlackLevel = entry.vfxBlackLevel;
 
     const ClipInfo *clip = clipForPlaybackEntry(timeline, entry);
-    if (!clip || !clip->keyframes.hasAnyKeyframes())
+    if (!clip || !clipanim::hasAnyDynamicTransform(*clip))
         return;
 
     const double clipLocalSec =
         (static_cast<double>(timelineUsec) - entry.timelineStart * 1'000'000.0)
         / 1'000'000.0;
+    const clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
     const clipgeom::ClipTransform transform =
-        clipanim::effectiveTransformAt(*clip, clipLocalSec);
+        clipanim::effectiveTransformAt(*clip, clipLocalSec, env);
     layer->opacity =
-        clipanim::effectiveOpacityAt(*clip, clipLocalSec, staticOpacity);
+        clipanim::effectiveOpacityAt(*clip, clipLocalSec, staticOpacity, env);
     layer->videoScale = transform.videoScale;
     layer->videoDx = transform.videoDx;
     layer->videoDy = transform.videoDy;

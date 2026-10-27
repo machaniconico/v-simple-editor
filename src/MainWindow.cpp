@@ -8526,7 +8526,6 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || trackMatteEntries.contains(clipId)
                 || m_text3DClipConfigs.contains(clipId)
                 || m_clipExpressionBindings.contains(clipId)
-                || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled)
                 || (lightingEnabled && clip.material.acceptsLights);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
@@ -8707,20 +8706,13 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 const double opacityVal = bindings.resolve(QStringLiteral("transform.opacity"), ctx, opacityKf);
                 layerOpacity = qBound(0.0, opacityVal / 100.0, 1.0);
             }
-            if (auto wigIt = m_clipWiggleParams.constFind(clipId);
-                wigIt != m_clipWiggleParams.cend() && wigIt.value().enabled) {
-                const wiggle::WiggleOffset off = wiggle::evaluate(wigIt.value(), localSeconds);
-                // wiggle::positionOffset is in PIXELS; posX/posY are NORMALIZED
-                // canvas fractions (canonical clipgeom contract). Convert the
-                // pixel offset to the same normalized space before summing so
-                // wiggle keeps its visual magnitude under clipgeom placement.
-                if (canvasSize.width() > 0)
-                    posX += off.positionOffset.x() / canvasSize.width();
-                if (canvasSize.height() > 0)
-                    posY += off.positionOffset.y() / canvasSize.height();
-                layerRotation += off.rotationOffsetDeg;
-                layerScale *= off.scaleMultiplier;
-            }
+            // US-1504: the clip's wiggle through the shared overlay, once, on the
+            // static values (canvasSize is this composite's project canvas).
+            clipanim::EvalEnv overlayEnv;
+            overlayEnv.fps = m_projectConfig.fps > 0 ? m_projectConfig.fps : 30.0;
+            overlayEnv.canvas = canvasSize;
+            clipanim::applyDynamicOverlay(clip, localSeconds, overlayEnv, &posX, &posY,
+                                          &layerScale, &layerRotation, &layerOpacity);
 
             ActiveLayer active;
             active.clipId = clipId;
@@ -8836,17 +8828,13 @@ void MainWindow::refreshSpecialClipPreview()
         return;
 
     const int timelineMs = qRound(m_timeline->playheadPosition() * 1000.0);
-    bool anyWiggleEnabled = false;
-    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it) {
-        if (it.value().enabled) { anyWiggleEnabled = true; break; }
-    }
     const double playheadSeconds = m_timeline->playheadPosition();
     const bool anyLightingEnabled = light3d::hasActiveLights(
         light3d::statesAt(m_projectLights, playheadSeconds));
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_timeline->trackMatteEntries().isEmpty() && m_text3DClipConfigs.isEmpty()
-        && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled
+        && m_clipExpressionBindings.isEmpty()
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
@@ -8955,15 +8943,6 @@ void MainWindow::populateProjectData(ProjectData &data)
     }
     std::sort(data.expressionBindingsEntries.begin(), data.expressionBindingsEntries.end(),
               [](const ExpressionBindingsClipEntry &a, const ExpressionBindingsClipEntry &b) { return a.clipId < b.clipId; });
-    data.wiggleClipEntries.clear();
-    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it) {
-        WiggleClipEntry entry;
-        entry.clipId = it.key();
-        entry.params = it.value();
-        data.wiggleClipEntries.append(entry);
-    }
-    std::sort(data.wiggleClipEntries.begin(), data.wiggleClipEntries.end(),
-              [](const WiggleClipEntry &a, const WiggleClipEntry &b) { return a.clipId < b.clipId; });
     data.projectCamera = m_projectCamera.toJson();
     data.projectLights = QJsonArray{};
     for (const Light3D &light : m_projectLights)
@@ -9192,13 +9171,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         if (!entry.clipId.isEmpty() && !entry.bindings.isEmpty())
             m_clipExpressionBindings.insert(entry.clipId, entry.bindings);
     }
-    m_clipWiggleParams.clear();
     m_parkedSidecarsByUid.clear();
     m_sidecarClipUidByKey.clear();
-    for (const auto &entry : data.wiggleClipEntries) {
-        if (!entry.clipId.isEmpty())
-            m_clipWiggleParams.insert(entry.clipId, entry.params);
-    }
     m_projectCamera = Camera3D{};
     m_projectCameraUndoSlot = QJsonObject{};
     m_projectCameraUndoTimelineDepth = -1;
@@ -9642,7 +9616,7 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
     // US-1302: the position-keyed sidecars take the new track numbers; a key on
     // the removed track goes.
     QStringList keys = m_liveBrushAnimations.keys() + m_timeRemapClipEntries.keys()
-        + m_text3DClipConfigs.keys() + m_clipExpressionBindings.keys() + m_clipWiggleParams.keys();
+        + m_text3DClipConfigs.keys() + m_clipExpressionBindings.keys();
     for (const auto &entry : std::as_const(m_brushAnimationEntries))
         keys.append(entry.clipId);
     Timeline::ClipKeyRemap remap;
@@ -9698,8 +9672,7 @@ void MainWindow::parkSidecars(const QString &key, const QString &uid)
     if (m_timeRemapClipEntries.contains(key)) parked.timeRemap = m_timeRemapClipEntries.value(key);
     if (m_text3DClipConfigs.contains(key)) parked.text3D = m_text3DClipConfigs.value(key);
     if (m_clipExpressionBindings.contains(key)) parked.expressions = m_clipExpressionBindings.value(key);
-    if (m_clipWiggleParams.contains(key)) parked.wiggle = m_clipWiggleParams.value(key);
-    if (parked.timeRemap || parked.text3D || parked.expressions || parked.wiggle)
+    if (parked.timeRemap || parked.text3D || parked.expressions)
         m_parkedSidecarsByUid.insert(sidecarClipId(key, uid), parked);
 }
 
@@ -9737,7 +9710,6 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
         it.value().clipId = it.key();
     rekeySidecarMap(m_text3DClipConfigs, remap);
     rekeySidecarMap(m_clipExpressionBindings, remap);
-    rekeySidecarMap(m_clipWiggleParams, remap);
     QVector<BrushAnimationEntry> brushes;
     for (BrushAnimationEntry entry : std::as_const(m_brushAnimationEntries)) {
         const auto to = remap.oldToNew.constFind(entry.clipId);
@@ -9754,9 +9726,9 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
         syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
 }
 
-// US-1401: the timeRemap / text3D / expression / wiggle dialog commits. A value equal
+// US-1401: the timeRemap / text3D / expression dialog commits. A value equal
 // to the current one (toJson() compared, nullopt = no entry) records nothing; any
-// other records one undo point, which carries the four by value.
+// other records one undo point, which carries the three by value.
 void MainWindow::commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve)
 {
     const auto old = m_timeRemapClipEntries.constFind(clipId);
@@ -9793,20 +9765,9 @@ void MainWindow::commitExpressionBindings(const QString &clipId,
     refreshSpecialClipPreview();
 }
 
-void MainWindow::commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params)
-{
-    const auto old = m_clipWiggleParams.constFind(clipId);
-    const bool had = old != m_clipWiggleParams.cend();
-    if (had == params.has_value() && (!had || wiggle::toJson(*old) == wiggle::toJson(*params))) return;
-    if (params) m_clipWiggleParams.insert(clipId, *params);
-    else m_clipWiggleParams.remove(clipId);
-    m_timeline->saveUndoState(QStringLiteral("ウィグルを変更"));
-    refreshSpecialClipPreview();
-}
-
 // US-1302 undo rule: adding a brush animation records an undo point (its progress
 // keyframes), so the brush entries are carried by value. US-1401: so are the
-// timeRemap / text3D / expression / wiggle values, whose dialog commits record one
+// timeRemap / text3D / expression values, whose dialog commits record one
 // too. The clip each key names (clipUids: key -> uid) still rekeys the live brush.
 QJsonObject MainWindow::collectSidecarState()
 {
@@ -9824,21 +9785,18 @@ QJsonObject MainWindow::collectSidecarState()
     QJsonArray brushes;
     for (const auto &entry : m_brushAnimationEntries)
         brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
-    QJsonObject timeRemaps, text3Ds, expressions, wiggles;
+    QJsonObject timeRemaps, text3Ds, expressions;
     for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
         timeRemaps.insert(it.key(), it.value().curve.toJson());
     for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it)
         text3Ds.insert(it.key(), it.value());
     for (auto it = m_clipExpressionBindings.cbegin(); it != m_clipExpressionBindings.cend(); ++it)
         expressions.insert(it.key(), it.value().toJson());
-    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it)
-        wiggles.insert(it.key(), wiggle::toJson(it.value()));
     return QJsonObject{{"clipUids", clipUids},
                        {"brushAnimations", brushes},
                        {"timeRemaps", timeRemaps},
                        {"text3DConfigs", text3Ds},
                        {"expressionBindings", expressions},
-                       {"wiggleParams", wiggles},
                        {"sequenceId", m_timeline->activeSequenceId()},
                        {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
 }
@@ -9957,14 +9915,12 @@ void MainWindow::applySidecarState(const QJsonObject &state)
             m_text3DClipConfigs.insert(key, *parked->text3D);
         if (parked->expressions && !m_clipExpressionBindings.contains(key))
             m_clipExpressionBindings.insert(key, *parked->expressions);
-        if (parked->wiggle && !m_clipWiggleParams.contains(key))
-            m_clipWiggleParams.insert(key, *parked->wiggle);
         m_parkedSidecarsByUid.erase(parked);
     }
     m_sidecarClipUidByKey.clear();
     for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
         m_sidecarClipUidByKey.insert(it.key(), it.value().toString());
-    // US-1401: the four values are the snapshot's, keyed on the restored placement,
+    // US-1401: the three values are the snapshot's, keyed on the restored placement,
     // whatever the rekey above made of the live ones (in this sequence or another).
     if (state.contains("timeRemaps")) {
         m_timeRemapClipEntries.clear();
@@ -9984,12 +9940,6 @@ void MainWindow::applySidecarState(const QJsonObject &state)
         const QJsonObject values = state.value("expressionBindings").toObject();
         for (auto it = values.constBegin(); it != values.constEnd(); ++it)
             m_clipExpressionBindings[it.key()].fromJson(it.value().toObject());
-    }
-    if (state.contains("wiggleParams")) {
-        m_clipWiggleParams.clear();
-        const QJsonObject values = state.value("wiggleParams").toObject();
-        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
-            m_clipWiggleParams.insert(it.key(), wiggle::fromJson(it.value().toObject()));
     }
 
     QVector<BrushAnimationEntry> brushes;
@@ -15462,8 +15412,7 @@ void MainWindow::editClipWiggle()
                                  QStringLiteral("先にビデオクリップを選択してください。"));
         return;
     }
-    const QString clipId = brushClipId(trackIdx, clipIdx);
-    wiggle::WiggleParams params = m_clipWiggleParams.value(clipId);
+    wiggle::WiggleParams params = clip.wiggle;
 
     QDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("ウィグル / 手持ちカメラ風 - %1").arg(clip.displayName));
@@ -15473,6 +15422,7 @@ void MainWindow::editClipWiggle()
     presetCombo->addItems({QStringLiteral("なし"), QStringLiteral("手持ち"),
                            QStringLiteral("神経質"), QStringLiteral("ふわふわ")});
     auto *enabledCheck = new QCheckBox(QStringLiteral("有効"), &dialog);
+    enabledCheck->setObjectName(QStringLiteral("wiggleEnabled"));
     enabledCheck->setChecked(params.enabled);
     auto *posAmpXSpin = new QDoubleSpinBox(&dialog);
     posAmpXSpin->setObjectName(QStringLiteral("wigglePositionAmplitudeX"));
@@ -15539,7 +15489,11 @@ void MainWindow::editClipWiggle()
         && params.positionAmplitude.isNull()
         && qFuzzyIsNull(params.rotationAmplitudeDeg)
         && qFuzzyIsNull(params.scaleAmplitude);
-    commitWiggleParams(clipId, inert ? std::nullopt : std::optional<wiggle::WiggleParams>(params));
+    if (!m_timeline->setClipWiggle(trackIdx, clipIdx, inert ? wiggle::WiggleParams{} : params)) {
+        statusBar()->showMessage(QStringLiteral("ウィグルを設定できません (トラックがロックされています)"), 4000);
+        return;
+    }
+    refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("ウィグルを %1 に設定しました").arg(clip.displayName), 4000);
 }
 

@@ -12,6 +12,8 @@
 #include "../VideoPlayer.h"
 #include "../TimelineFrameRenderer.h"
 #include "../WarpDistortion.h"
+#include "../WiggleTransform.h"
+#include "../clipanim/ClipAnim.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
 #include "SelftestGate.h"
@@ -32,6 +34,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <iomanip>
+#include <utility>
 #include <iostream>
 
 namespace {
@@ -191,7 +196,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 8; ++g)
+        for (int g = 1; g <= 9; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -233,7 +238,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 8; ++g)
+        for (int g = 5; g <= 9; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -326,6 +331,7 @@ int runSpecialCompositeSelftest()
     if (!glOk) {
         for (int g = 5; g <= 7; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
+        tally.skip(9, "no usable QOpenGLWidget context");
         return tally.finish("special-composite");
     }
     // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
@@ -941,6 +947,277 @@ int runSpecialCompositeSelftest()
               << " export[" << diffText(plainDiff) << "] ok=" << plainOk << '\n';
     tally.gate(8, remapOk && freezeOk && plainOk,
                "file-backed export lost the saved time-remap or freeze-frame (see values above)");
+
+    // G9 (US-1504): the wiggle is ClipInfo::wiggle, evaluated by the one shared overlay
+    // (clipanim::applyDynamicOverlay) on top of keyframes -> autoOrient, so export
+    // (renderFrameAt), both previews and the special composite carry it once.
+    //   (1) renderFrameAt at t = 0.5 with the wiggle (seed 3, 20 px) differs from without
+    //       (HEAD: the export ignores the wiggle sidecar -> equal).
+    //   (2') effectiveTransformAt(clip, 0.5, env{1920x1080}).videoDx == base + off.x / 1920
+    //       (1e-9, also dy), the two-argument form == base, two env calls byte-equal.
+    //   (3) a keyframe-less wiggle clip: the GLPreview motion (makePreviewMotion through
+    //       paintGL -> videoSourceDx/Dy), the VideoPlayer layer values (cpu-composite record)
+    //       and renderFrameAt (== a static clip holding the evaluated transform, pixel-exact)
+    //       all carry the env value (mutation control: the three gates left on
+    //       keyframes.hasAnyKeyframes() -> the base values).
+    //   (4') time remap + wiggle, single clip: the window's GL upload of the special composite
+    //       == renderFrameAt (inner rect), and the baked frame's GL motion is keyframes-only
+    //       (no second wiggle; mutation control: the env form under compositeBaked).
+    //   (5) arrange (Left) writes the same videoDx with and without the wiggle.
+    //   (6) a 1920x1080 project rendered at 1280x720 and 1920x1080 both equal a static clip
+    //       holding the wiggle normalized by the 1920x1080 project canvas (control: by 1280).
+    timeline->setProjectOutputConfig(kW, kH, true, kFps); // MainWindow keeps it with m_projectConfig
+    wiggle::WiggleParams g9Wiggle;
+    g9Wiggle.enabled = true;
+    g9Wiggle.seed = 3;
+    g9Wiggle.positionAmplitude = QPointF(20.0, 20.0);
+    const double g9t = 0.5;
+    const wiggle::WiggleOffset g9Off = wiggle::evaluate(g9Wiggle, g9t);
+    // Sanity band on the shared evaluator itself: a real, bounded pixel offset.
+    const bool g9OffSane = std::abs(g9Off.positionOffset.x()) > 0.5 && std::abs(g9Off.positionOffset.x()) <= 40.0
+        && std::abs(g9Off.positionOffset.y()) <= 40.0;
+    const auto staticHolding = [](ClipInfo clip, const clipgeom::ClipTransform &tr) {
+        clip.wiggle = wiggle::WiggleParams{};
+        clip.videoScale = tr.videoScale;
+        clip.videoDx = tr.videoDx;
+        clip.videoDy = tr.videoDy;
+        clip.rotation2DDegrees = tr.rotationDeg;
+        return clip;
+    };
+    const auto renderOne = [](const ClipInfo &clip, QSize project, double sec, QSize out) {
+        Timeline tl;
+        tl.setProjectOutputConfig(project.width(), project.height(), true, kFps);
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        return tlrender::renderFrameAt(&tl, qint64(sec * 1000000.0), out);
+    };
+
+    // (1)
+    ClipInfo g9Clip = base;
+    g9Clip.wiggle = g9Wiggle;
+    const QImage g9Plain = renderOne(base, size, g9t, size);
+    const QImage g9Wig = renderOne(g9Clip, size, g9t, size);
+    const DiffStat g9d1 = compare(g9Wig, g9Plain);
+    const bool g9ok1 = g9OffSane && g9d1.sizeMatch && g9d1.diffPixels > 50;
+
+    // (2')
+    ClipInfo g9Based = g9Clip;
+    g9Based.videoDx = 0.1;
+    g9Based.videoDy = -0.05;
+    clipanim::EvalEnv env1080;
+    env1080.canvas = QSize(1920, 1080);
+    const clipgeom::ClipTransform g9EnvA = clipanim::effectiveTransformAt(g9Based, g9t, env1080);
+    const clipgeom::ClipTransform g9EnvB = clipanim::effectiveTransformAt(g9Based, g9t, env1080);
+    const clipgeom::ClipTransform g9Two = clipanim::effectiveTransformAt(g9Based, g9t);
+    const double g9ExpDx = 0.1 + g9Off.positionOffset.x() / 1920.0;
+    const double g9ExpDy = -0.05 + g9Off.positionOffset.y() / 1080.0;
+    const bool g9ok2 = g9OffSane && std::abs(g9EnvA.videoDx - g9ExpDx) <= 1e-9
+        && std::abs(g9EnvA.videoDy - g9ExpDy) <= 1e-9 && g9Two.videoDx == 0.1 && g9Two.videoDy == -0.05
+        && std::memcmp(&g9EnvA, &g9EnvB, sizeof g9EnvA) == 0;
+
+    // (3)
+    Timeline g9tl;
+    g9tl.setProjectOutputConfig(kW, kH, true, kFps);
+    g9tl.restoreFromProject(QVector<QVector<ClipInfo>>{{g9Clip}}, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    g9tl.refreshPlaybackSequence();
+    const clipanim::EvalEnv g9Env = tlrender::dynamicEvalEnv(&g9tl);
+    const auto envAt = [&](double localSec) { return clipanim::effectiveTransformAt(g9Clip, localSec, g9Env); };
+    const clipgeom::ClipTransform g9Exp05 = envAt(g9t);
+    const QImage g9Static = renderOne(staticHolding(base, g9Exp05), size, g9t, size);
+    const DiffStat g9d3 = compare(g9Wig, g9Static);
+    double glDx = 0.0, glDy = 0.0, glLocal = -1.0, vpDx = 0.0, vpDy = 0.0, vpLocal = -1.0;
+    clipgeom::ClipTransform glExp, vpExp;
+    bool glBaked = true, vpRecorded = false, g9Seeked = false;
+    int vpAttempts = 0;
+    {
+        VideoPlayer vp;
+        vp.resize(kW, kH);
+        vp.setCanvasSize(kW, kH);
+        vp.setProjectOutputSize(size);
+        vp.glPreview()->setTimeline(&g9tl);
+        vp.setSequence(g9tl.computePlaybackSequence());
+        vp.show();
+        QSignalSpy vpFrames(&vp, &VideoPlayer::frameComposited);
+        vp.seek(int(g9t * 1000));
+        g9Seeked = QTest::qWaitFor([&] {
+            return vpFrames.count() > 0 && std::llabs(vp.timelinePositionUs() - qint64(g9t * 1000000.0)) < 50000;
+        }, 15000);
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        (void)vp.glPreview()->grabFramebuffer(); // paintGL resolves the clip motion
+        glBaked = vp.glPreview()->compositeBakedMode();
+        glDx = vp.glPreview()->videoSourceDx();
+        glDy = vp.glPreview()->videoSourceDy();
+        glLocal = double(vp.timelinePositionUs()) / 1000000.0;
+        glExp = envAt(glLocal);
+        // The cpu-composite path (a CPU-only preview stack) records the layer values
+        // applyLayerMotionOpacity produced; a paused seek alone may leave its V1 base
+        // empty, so a short playback fills it (as in video-player-parent).
+        const auto cpuRecord = [&]() {
+            vp.setParentAdmissionObservationForTest(true);
+            const int before = vpFrames.count();
+            vp.setPreviewEffects({VideoEffect::createFilmGrain(0.3, 1, 0.0, false)});
+            (void)QTest::qWaitFor([&] { return vpFrames.count() > before; }, 3000);
+            const auto records = vp.parentAdmissionRecordsForTest();
+            vp.setPreviewEffects({});
+            vp.setParentAdmissionObservationForTest(false);
+            ++vpAttempts;
+            for (const auto &record : records) {
+                if (record.path != QLatin1String("cpu-composite") || record.sourceTrack != 0) continue;
+                vpRecorded = true;
+                vpDx = record.localTransform.videoDx;
+                vpDy = record.localTransform.videoDy;
+                vpLocal = double(record.timelineUs) / 1000000.0;
+            }
+        };
+        cpuRecord();
+        if (!vpRecorded) {
+            const int beforePlay = vpFrames.count();
+            vp.play();
+            (void)QTest::qWaitFor([&] { return vpFrames.count() >= beforePlay + 3; }, 5000);
+            vp.pause();
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            cpuRecord();
+        }
+        vpExp = envAt(vpLocal);
+        vp.hide();
+    }
+    const bool glMoves = std::abs(glExp.videoDx - base.videoDx) > 1e-4;
+    const bool g9ok3 = g9Seeked && !glBaked && glMoves
+        && g9Env.canvas == size
+        && std::abs(glDx - glExp.videoDx) <= 1e-9 && std::abs(glDy - glExp.videoDy) <= 1e-9
+        && vpRecorded && std::abs(vpDx - vpExp.videoDx) <= 1e-9 && std::abs(vpDy - vpExp.videoDy) <= 1e-9
+        && std::abs(vpExp.videoDx - base.videoDx) > 1e-4
+        && g9d3.sizeMatch && g9d3.maxDiff == 0 && g9d1.diffPixels > 50;
+
+    // (4') the window route: GL shows the special composite of a time-remap + wiggle clip.
+    ClipInfo remapWig = remapped;
+    remapWig.wiggle = g9Wiggle;
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapped}},
+        QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+    const QImage remapNoWig = tlrender::renderFrameAt(timeline, qint64(g9t * 1000000.0), size);
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapWig}},
+        QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    const QImage remapExpected = tlrender::renderFrameAt(timeline, qint64(g9t * 1000000.0), size);
+    const QImage remapSpecial = window.buildSpecialClipComposite(g9t);
+    // The GL framebuffer grab is compared inside the band the wiggle shifts: that edge band is
+    // transparent in the export and the GL clear grey on screen. Band = ceil(max |baked offset| px) + 1.
+    const clipgeom::ClipTransform g9RemapEnv =
+        clipanim::effectiveTransformAt(remapWig, g9t, tlrender::dynamicEvalEnv(timeline));
+    const clipgeom::ClipTransform g9RemapKf = clipanim::effectiveTransformAt(remapWig, g9t);
+    const double g9ShiftPx = std::max(std::abs(g9RemapEnv.videoDx - g9RemapKf.videoDx) * size.width(),
+        std::abs(g9RemapEnv.videoDy - g9RemapKf.videoDy) * size.height());
+    const int g9Band = int(std::ceil(g9ShiftPx)) + 1;
+    const QRect g9Inner(g9Band, g9Band, kW - 2 * g9Band, kH - 2 * g9Band);
+    int g9GlInner = 255;
+    double g9BakedDx = 1.0, g9BakedDy = 1.0;
+    bool g9WOk = false, g9WBaked = false;
+    DeviceGrab g9Grab;
+    {
+        VideoPlayer *wp = window.m_player;
+        GLPreview *wgl = wp ? wp->glPreview() : nullptr;
+        if (wp && wgl) {
+            wgl->setFixedSize(kW, kH);
+            wgl->setFrameTextureNearestForTest(true);
+            window.show();
+            for (int i = 0; i < 8 && !g9WOk; ++i) {
+                QApplication::processEvents(QEventLoop::AllEvents, 25);
+                const QImage probe = wgl->grabFramebuffer();
+                g9WOk = wgl->context() && wgl->context()->isValid() && !probe.isNull();
+            }
+            bool seeked = false;
+            const auto conn = QObject::connect(wp, &VideoPlayer::positionChanged, wp,
+                [&](double pos) { if (std::abs(pos - g9t) < 0.001) seeked = true; });
+            wp->seek(int(g9t * 1000) + 1);
+            wp->seek(int(g9t * 1000));
+            (void)QTest::qWaitFor([&] { return seeked; }, 15000);
+            QObject::disconnect(conn);
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            window.refreshSpecialClipPreview();
+            QApplication::processEvents(QEventLoop::AllEvents, 25);
+            const QImage g9GlFrame = g9Grab.toFrame(wgl->grabFramebuffer(), wgl->devicePixelRatioF());
+            g9WBaked = wgl->compositeBakedMode();
+            g9BakedDx = wgl->videoSourceDx();
+            g9BakedDy = wgl->videoSourceDy();
+            g9GlInner = rgbMaxDiff(g9GlFrame, remapExpected, g9Inner);
+        }
+    }
+    const DiffStat g9WigVisible = compare(remapExpected, remapNoWig);
+    // The upload frame is a CPU QImage (no GL clear): it must equal renderFrameAt over the full frame, RGBA.
+    const DiffStat g9SpecialFull = compare(remapSpecial, remapExpected);
+    const bool g9ok4 = g9WOk && g9Grab.rawSizeOk && g9WBaked && g9WigVisible.diffPixels > 50
+        && g9SpecialFull.sizeMatch && g9SpecialFull.maxDiff == 0 && g9GlInner <= 2 && g9Band > 1
+        && g9BakedDx == remapWig.videoDx && g9BakedDy == remapWig.videoDy;
+
+    // (5) arrange writes static values from the keyframes only.
+    const auto arrangedDx = [&](bool withWiggle) {
+        ClipInfo clip = base;
+        clip.videoScale = 0.5;
+        clip.videoDx = 0.1;
+        if (withWiggle) clip.wiggle = g9Wiggle;
+        Timeline tl;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+        tl.setProjectOutputConfig(kW, kH, true, kFps);
+        tl.setLinkedSelectionEnabled(false);
+        tl.clearSelection();
+        tl.videoTracks()[0]->toggleClipSelection(0);
+        const bool arranged = tl.arrangeSelectedLayers(Timeline::LayerArrangement::Left);
+        return std::make_pair(arranged, tl.videoTracks()[0]->clips().value(0).videoDx);
+    };
+    const auto arrangedWig = arrangedDx(true);
+    const auto arrangedPlain = arrangedDx(false);
+    const bool g9ok5 = arrangedWig.first && arrangedPlain.first && arrangedWig.second == arrangedPlain.second
+        && std::abs(arrangedPlain.second - 0.1) > 1e-6;
+
+    // (6) the project canvas, not the output size, normalizes the pixel amplitude.
+    const QSize project1080(1920, 1080), out720(1280, 720);
+    clipanim::EvalEnv envOut720;
+    envOut720.canvas = out720;
+    const clipgeom::ClipTransform g9Exp1080 = clipanim::effectiveTransformAt(g9Clip, g9t, env1080);
+    const clipgeom::ClipTransform g9ByOutput = clipanim::effectiveTransformAt(g9Clip, g9t, envOut720);
+    const DiffStat g9d6a = compare(renderOne(g9Clip, project1080, g9t, out720),
+                                   renderOne(staticHolding(base, g9Exp1080), project1080, g9t, out720));
+    const DiffStat g9d6b = compare(renderOne(g9Clip, project1080, g9t, project1080),
+                                   renderOne(staticHolding(base, g9Exp1080), project1080, g9t, project1080));
+    const DiffStat g9d6c = compare(renderOne(g9Clip, project1080, g9t, out720),
+                                   renderOne(staticHolding(base, g9ByOutput), project1080, g9t, out720));
+    const bool g9ok6 = g9d6a.sizeMatch && g9d6a.maxDiff == 0 && g9d6b.sizeMatch && g9d6b.maxDiff == 0
+        && g9d6c.sizeMatch && g9d6c.diffPixels > 0;
+
+    std::cerr << std::setprecision(12)
+              << "special-composite G9 offset t=" << g9t << " px=(" << g9Off.positionOffset.x() << ','
+              << g9Off.positionOffset.y() << ") rot=" << g9Off.rotationOffsetDeg << " scale=" << g9Off.scaleMultiplier
+              << " sane=" << g9OffSane << '\n'
+              << "special-composite G9 (1) wiggle vs none sizeMatch=" << g9d1.sizeMatch << " maxDiff=" << g9d1.maxDiff
+              << " diffPixels=" << g9d1.diffPixels << " (expect >50) ok=" << g9ok1 << '\n'
+              << "special-composite G9 (2') env1920 dx=" << g9EnvA.videoDx << " expect=" << g9ExpDx
+              << " dy=" << g9EnvA.videoDy << " expect=" << g9ExpDy << " twoArg dx=" << g9Two.videoDx
+              << " dy=" << g9Two.videoDy << " (expect 0.1 / -0.05) byteEqual="
+              << (std::memcmp(&g9EnvA, &g9EnvB, sizeof g9EnvA) == 0) << " ok=" << g9ok2 << '\n'
+              << "special-composite G9 (3) envCanvas=" << g9Env.canvas.width() << 'x' << g9Env.canvas.height()
+              << " seeked=" << g9Seeked << " glBaked=" << glBaked << " gl local=" << glLocal << " dx=" << glDx
+              << " dy=" << glDy << " expect=" << glExp.videoDx << ',' << glExp.videoDy << " | vp recorded=" << vpRecorded
+              << " attempts=" << vpAttempts << " local=" << vpLocal << " dx=" << vpDx << " dy=" << vpDy
+              << " expect=" << vpExp.videoDx << ',' << vpExp.videoDy << " | renderFrameAt vs static(expected) maxDiff="
+              << g9d3.maxDiff << " (expect 0) ok=" << g9ok3 << '\n'
+              << "special-composite G9 (4') remap+wiggle windowOk=" << g9WOk << " rawSizeOk=" << g9Grab.rawSizeOk
+              << " baked=" << g9WBaked << " shiftPx=" << g9ShiftPx << " band=" << g9Band
+              << " glVsExport innerMaxDiff(rgb, band-cropped)=" << g9GlInner
+              << " specialVsExport full-frame RGBA sizeMatch=" << g9SpecialFull.sizeMatch
+              << " maxDiff=" << g9SpecialFull.maxDiff << " diffPixels=" << g9SpecialFull.diffPixels
+              << " (expect 0 / 0) wiggleVisible maxDiff=" << g9WigVisible.maxDiff << " diffPixels="
+              << g9WigVisible.diffPixels << " (expect >50) bakedMotion dx=" << g9BakedDx << " dy="
+              << g9BakedDy << " (expect keyframes-only " << remapWig.videoDx << ',' << remapWig.videoDy
+              << ") ok=" << g9ok4 << '\n'
+              << "special-composite G9 (5) arrange Left dx wiggle=" << arrangedWig.second << " (arranged="
+              << arrangedWig.first << ") plain=" << arrangedPlain.second << " (arranged=" << arrangedPlain.first
+              << ") ok=" << g9ok5 << '\n'
+              << "special-composite G9 (6) project1920x1080 out1280x720 vs static(norm 1920) maxDiff=" << g9d6a.maxDiff
+              << " out1920x1080 maxDiff=" << g9d6b.maxDiff << " (expect 0 / 0) control static(norm 1280) diffPixels="
+              << g9d6c.diffPixels << " (expect >0) dx1920=" << g9Exp1080.videoDx << " dx1280=" << g9ByOutput.videoDx
+              << " ok=" << g9ok6 << '\n';
+    tally.gate(9, g9ok1 && g9ok2 && g9ok3 && g9ok4 && g9ok5 && g9ok6,
+               "the clip wiggle is missing from the export or a preview, applied twice on the baked frame, "
+               "written back by arrange, or normalized by the output size (see values above)");
 
     return tally.finish("special-composite");
 }

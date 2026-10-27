@@ -15,6 +15,7 @@
 #include "SmartRender.h"
 #include "AcesColor.h"  // AC: production export 経路への ACES 適用 (8bit のみ)
 #include "TimecodeBurnIn.h"
+#include "clipanim/ClipAnim.h"
 #include "color/ClipOdt.h"
 #include "playback/hdrexport16_flag.h"
 #include "playback/hdrmatte16_flag.h"
@@ -229,6 +230,22 @@ bool timelineHasProjectLighting(const Timeline *timeline)
         const Light3DState state = light.state();
         if (state.enabled && (state.intensity > 0.0 || light.hasAnimation()))
             return true;
+    }
+    return false;
+}
+
+// US-1504: the whole-timeline pass-through predicate (SmartRender) does not know
+// the wiggle, so a timeline whose video clips move over time is encoded.
+bool timelineHasDynamicTransform(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    const ProjectTrackClips videoTracks = timeline->allVideoTracks();
+    for (const QVector<ClipInfo> &clips : videoTracks) {
+        for (const ClipInfo &clip : clips) {
+            if (clipanim::hasAnyDynamicTransform(clip))
+                return true;
+        }
     }
     return false;
 }
@@ -1591,6 +1608,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
     const bool blockSmartRenderForSequences =
         timelineHasSequenceRenderModel(tl);
     const bool blockSmartRenderForLighting = timelineHasProjectLighting(tl);
+    const bool blockSmartRenderForDynamicTransform =
+        timelineHasDynamicTransform(tl);
     const bool hasExportMetadata = renderqueue_metadata::hasMetadata(cfg);
     if (smartrender::enabledFromEnv()
         && !cfg.value("keepAlpha").toBool(false)
@@ -1601,7 +1620,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && request.subtitles.empty()
         && !cfg.contains("subtitleBurnInTrack")
         && cfg.value("subtitleMode").toInt(1) != 3
-        && !blockSmartRenderForLighting) {
+        && !blockSmartRenderForLighting
+        && !blockSmartRenderForDynamicTransform) {
         if (m_cancelRequested) {
             delete owned;
             finishCurrentJob(false, QStringLiteral("cancelled"));
@@ -1672,6 +1692,12 @@ void RenderQueue::startRenderPipe(int jobIndex)
                            ? "timeline contains nested sequence state and project lighting"
                            : "timeline contains nested sequence state")
                     : "timeline contains project lighting");
+    } else if (smartrender::enabledFromEnv()
+               && !applyLoudnessFilter
+               && blockSmartRenderForDynamicTransform) {
+        qInfo().noquote()
+            << "[smart-render] whole timeline not stream-copy eligible:"
+            << "timeline has a dynamic transform (wiggle)";
     }
 
     request.rateControl = cfg.value("rateControl").toString() == "crf"
@@ -2511,6 +2537,11 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         return nullptr;
 
     auto *tl = new Timeline();
+    // US-1504: the project canvas the dynamic overlay (wiggle) normalizes with,
+    // the same value MainWindow gives the live Timeline (the fps is left as is).
+    if (data.config.width > 0 && data.config.height > 0)
+        tl->setProjectOutputConfig(data.config.width, data.config.height,
+                                   data.config.explicitOutputResolution);
     tl->restoreGeneratedCaptionOverlays(data.generatedCaptionOverlays);
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,

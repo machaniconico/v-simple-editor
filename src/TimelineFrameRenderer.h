@@ -19,6 +19,7 @@ struct VideoEffect;
 struct OverlapInterval;
 struct PlaybackEntry;
 namespace clipgeom { struct ClipTransform; }
+namespace clipanim { struct EvalEnv; }
 
 // Single Source Of Truth (SSOT) Timeline -> QImage renderer.
 //
@@ -165,6 +166,12 @@ struct ParentLayerHit {
 };
 std::optional<ParentLayerHit> parentLayerAt(const Timeline *timeline, qint64 usec,
                                             int trackIdx, int clipIdx);
+
+// US-1504: the clipanim::EvalEnv the drawing callers (renderFrameAt, GLPreview,
+// VideoPlayer) evaluate the dynamic transform overlay with: the project fps and
+// the project canvas Timeline::projectOutputSize() (never the output size). A
+// null timeline yields an empty canvas (no wiggle offset).
+clipanim::EvalEnv dynamicEvalEnv(const Timeline *timeline);
 
 namespace detail {
 // US-804 test seams (parent-gate selftest), all behind one switch that is

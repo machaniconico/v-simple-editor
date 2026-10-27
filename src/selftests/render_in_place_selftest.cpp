@@ -324,7 +324,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 8; ++number) gate(number, false);
+        for (int number = 1; number <= 9; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -724,6 +724,34 @@ int runRenderInPlaceSelftest()
         && chroma.undoManager()->saveSerial() == chromaSerial
         && clipJson(chroma.videoTracks()[0]->clips()[0]) == clipJson(keyed)
         && clipJson(chroma.videoTracks()[1]->clips()[0]) == clipJson(background));
+
+    // G9 (US-1504): the wiggle acts on the layer after the material, like the
+    // transform, so the baked replacement keeps it (renderinplace::copyComposition)
+    // and the bake itself renders without it. Detects a copyComposition that drops
+    // ClipInfo::wiggle (negative control: that line removed in a mutation build).
+    ClipInfo wiggled = original;
+    wiggled.wiggle.enabled = true;
+    wiggled.wiggle.seed = 3;
+    wiggled.wiggle.positionAmplitude = QPointF(20.0, 20.0);
+    Timeline wiggleTimeline;
+    wiggleTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{wiggled}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto wiggleOptions = options;
+    wiggleOptions.handlesSec = 0.0;
+    wiggleOptions.outputDir = output.filePath(QStringLiteral("wiggle"));
+    QString wigglePath, wiggleError;
+    const bool wiggleBaked = renderinplace::renderClipInPlace(
+        wiggleTimeline, 0, 0, wiggleOptions, &wigglePath, &wiggleError);
+    const ClipInfo wiggleAfter = wiggleBaked ? wiggleTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool wiggleReplaced = wiggleBaked && wiggleAfter.filePath != wiggled.filePath
+        && wiggleAfter.renderInPlaceOriginal;
+    const bool wiggleKept = wiggleAfter.wiggle.enabled
+        && wiggle::toJson(wiggleAfter.wiggle) == wiggle::toJson(wiggled.wiggle);
+    std::fprintf(stderr, "G9 baked=%d [%s] replaced=%d wiggle enabled=%d seed=%u ampX=%.3f "
+        "(expect 1 / 3 / 20) kept=%d\n", int(wiggleBaked), qPrintable(wiggleError),
+        int(wiggleReplaced), int(wiggleAfter.wiggle.enabled), wiggleAfter.wiggle.seed,
+        wiggleAfter.wiggle.positionAmplitude.x(), int(wiggleKept));
+    gate(9, wiggleReplaced && wiggleKept);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

@@ -817,7 +817,7 @@ private:
     void applyExternalTrackState(const QJsonObject &state);
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     // US-1302: the position-keyed sidecars ("t:i": timeRemap / text3D / expression /
-    // wiggle / live brush, and the brush entries with the clipId in their values)
+    // live brush, and the brush entries with the clipId in their values)
     // follow Timeline::clipKeysRemapped and, through Timeline::setSidecarStateHooks,
     // every undo / redo.
     void rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap);
@@ -831,14 +831,12 @@ private:
     void commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config);
     void commitExpressionBindings(const QString &clipId,
                                   const std::optional<exprbind::ClipExpressionBindings> &bindings);
-    void commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params);
-    // US-1302: the four values a dropped key held, kept by the clip's "track|uid"
+    // US-1302: the three values a dropped key held, kept by the clip's "track|uid"
     // until a restore brings that clip back (the brush entries go back by value instead).
     struct ParkedSidecars {
         std::optional<TimeRemapClipEntry> timeRemap;
         std::optional<QJsonObject> text3D;
         std::optional<exprbind::ClipExpressionBindings> expressions;
-        std::optional<wiggle::WiggleParams> wiggle;
     };
     QHash<QString, ParkedSidecars> m_parkedSidecarsByUid;
     // Key -> uid of the placement the last collect / apply saw, rekeyed with the
@@ -950,7 +948,6 @@ private:
     std::shared_ptr<audiokf::EnvelopeCache> m_audioEnvelopeCache =
         std::make_shared<audiokf::EnvelopeCache>();
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
-    QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera
     QJsonObject m_projectCameraUndoSlot;
     int m_projectCameraUndoTimelineDepth = -1;

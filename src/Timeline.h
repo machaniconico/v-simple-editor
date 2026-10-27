@@ -51,6 +51,7 @@
 #include "TimeRemap.h"
 #include "ShapeLayer.h"
 #include "WarpDistortion.h"
+#include "WiggleTransform.h"
 
 // Shared timeline/source bounds after borrowing transition handles.
 struct OverlapInterval {
@@ -248,6 +249,9 @@ struct ClipInfo {
     LayerMaterial material;
     bool motionBlurEnabled = false;
     bool autoOrientEnabled = false;
+    // US-1504: per-clip wiggle / handheld-camera jitter, evaluated on top of the
+    // keyframed transform by clipanim::applyDynamicOverlay (disabled by default).
+    wiggle::WiggleParams wiggle;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -919,6 +923,10 @@ public:
                          bool reversed, bool applyToLinked = true);
     bool setClipAutoOrientEnabled(TrackKind kind, int trackIndex, int clipIndex,
                                   bool enabled);
+    // US-1504: the wiggle of video clip (trackIndex, clipIndex). One undo point when the
+    // value differs from the current one (toJson() compared), none otherwise; false when
+    // the clip does not exist or its track is locked.
+    bool setClipWiggle(int trackIndex, int clipIndex, const wiggle::WiggleParams &params);
     // タイムライン時刻からソース時刻を引く。選択中の動画トラックを優先し、
     // 該当しなければ V1 を検索する。ClipInfo の共通 speed/reverse/remap 写像を使う。
     bool matchFrame(double timelineSec, MatchFrameResult *result,
@@ -1104,6 +1112,8 @@ public:
     bool createSequenceFromClip(const ClipInfo &clip);
     bool createSequenceFromMedia(const QString &filePath, const QString &displayName = QString());
     double projectFrameRate() const { return m_projectFrameRate; }
+    // US-1504: the project canvas set by setProjectOutputConfig (EvalEnv.canvas).
+    QSize projectOutputSize() const { return QSize(m_projectWidth, m_projectHeight); }
     QString activeSequenceId() const { return m_activeSequenceId; }
     void setSequences(const QVector<TimelineSequence> &sequences,
                       const QString &activeSequenceId = QString());

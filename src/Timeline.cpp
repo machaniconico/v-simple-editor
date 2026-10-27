@@ -7646,6 +7646,31 @@ bool Timeline::setClipAutoOrientEnabled(TrackKind kind, int trackIndex,
     return true;
 }
 
+bool Timeline::setClipWiggle(int trackIndex, int clipIndex, const wiggle::WiggleParams &params)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (wiggle::toJson(currentClips[clipIndex].wiggle) == wiggle::toJson(params))
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].wiggle = params;
+    track->setClips(clips);
+
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("wiggle を変更"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::matchFrame(double timelineSec, MatchFrameResult *result,
                           QString *errorOut) const
 {

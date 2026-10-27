@@ -31,6 +31,10 @@
 #include <QStringList>
 #include <QByteArray>
 #include <QDebug>
+#include <QFile>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QPainter>
 #include <QFont>
@@ -1096,12 +1100,20 @@ int runMographSelftest()
         exprEntry.bindings = bindings;
         saveData.expressionBindingsEntries.append(exprEntry);
 
+        // US-1504: the wiggle lives on the clip (clip JSON "wiggle"); the legacy root
+        // section "wiggleClipEntries" is only read, onto the clip it names.
         wiggle::WiggleParams wp = wiggle::nervousPreset(1.0);
         wp.seed = 4242;
-        WiggleClipEntry wEntry;
-        wEntry.clipId = QStringLiteral("0:0");
-        wEntry.params = wp;
-        saveData.wiggleClipEntries.append(wEntry);
+        saveData.videoTracks[0][0].wiggle = wp;
+        const auto sameWiggle = [&wp](const ProjectData &data) {
+            return data.wiggleClipEntries.isEmpty() && !data.videoTracks.isEmpty()
+                && !data.videoTracks[0].isEmpty()
+                && wiggle::toJson(data.videoTracks[0][0].wiggle) == wiggle::toJson(wp)
+                && data.videoTracks[0][0].wiggle.enabled == wp.enabled;
+        };
+        const auto rootHasWiggleSection = [](const QString &json) {
+            return QJsonDocument::fromJson(json.toUtf8()).object().contains(QStringLiteral("wiggleClipEntries"));
+        };
 
         Camera3D projCam = Camera3D::createDollyZoom(0.0, -5.0, 3.0);
         CameraShake cs;
@@ -1113,7 +1125,8 @@ int runMographSelftest()
         saveData.projectCamera = projCam.toJson();
 
         ProjectData loaded;
-        if (!requireSelftest(ProjectFile::fromJsonString(ProjectFile::toJsonString(saveData), loaded),
+        const QString savedJson = ProjectFile::toJsonString(saveData);
+        if (!requireSelftest(ProjectFile::fromJsonString(savedJson, loaded),
                              QStringLiteral("MOGRAPH project string round-trip failed"), &error)
             || !requireSelftest(loaded.text3DClipEntries.size() == 1
                                     && loaded.text3DClipEntries.first().clipId == QStringLiteral("0:0")
@@ -1124,13 +1137,9 @@ int runMographSelftest()
                                     && loaded.expressionBindingsEntries.first().bindings.expression(QStringLiteral("transform.rotation"))
                                            == QStringLiteral("time*45"),
                                 QStringLiteral("expression bindings round-trip mismatch"), &error)
-            || !requireSelftest(loaded.wiggleClipEntries.size() == 1
-                                    && loaded.wiggleClipEntries.first().params.enabled == wp.enabled
-                                    && loaded.wiggleClipEntries.first().params.seed == wp.seed
-                                    && loaded.wiggleClipEntries.first().params.octaves == wp.octaves
-                                    && std::abs(loaded.wiggleClipEntries.first().params.positionAmplitude.x()
-                                                - wp.positionAmplitude.x()) < 1e-6,
-                                QStringLiteral("wiggle params round-trip mismatch"), &error)
+            || !requireSelftest(sameWiggle(loaded) && !rootHasWiggleSection(savedJson),
+                                QStringLiteral("clip wiggle round-trip mismatch (or a root wiggleClipEntries "
+                                               "section written)"), &error)
             || !requireSelftest(!loaded.projectCamera.isEmpty(),
                                 QStringLiteral("project camera lost on round-trip"), &error)) {
             return 1;
@@ -1157,7 +1166,26 @@ int runMographSelftest()
                                     && legacy.expressionBindingsEntries.isEmpty()
                                     && legacy.wiggleClipEntries.isEmpty()
                                     && legacy.projectCamera.isEmpty(),
-                                QStringLiteral("legacy MOGRAPH project should default the new fields"), &error)) {
+                                QStringLiteral("legacy MOGRAPH project should default the new fields"), &error)
+            || !requireSelftest(!legacy.videoTracks.isEmpty() && !legacy.videoTracks[0].isEmpty()
+                                    && !legacy.videoTracks[0][0].wiggle.enabled,
+                                QStringLiteral("legacy MOGRAPH clip should default the wiggle"), &error)) {
+            return 1;
+        }
+
+        // A legacy project whose root section "wiggleClipEntries" names "0:0": the
+        // params move onto V1[0], the section is not kept and not written again.
+        QJsonObject legacyWiggleRoot = QJsonDocument::fromJson(legacyJson.toUtf8()).object();
+        legacyWiggleRoot.insert(QStringLiteral("wiggleClipEntries"),
+            QJsonArray{QJsonObject{{QStringLiteral("clipId"), QStringLiteral("0:0")},
+                                   {QStringLiteral("params"), wiggle::toJson(wp)}}});
+        ProjectData migrated;
+        const bool migratedLoaded = ProjectFile::fromJsonString(
+            QString::fromUtf8(QJsonDocument(legacyWiggleRoot).toJson(QJsonDocument::Compact)), migrated);
+        if (!requireSelftest(migratedLoaded && sameWiggle(migrated)
+                                 && !rootHasWiggleSection(ProjectFile::toJsonString(migrated)),
+                             QStringLiteral("legacy wiggleClipEntries not migrated onto the clip by "
+                                            "fromJsonString (or written again)"), &error)) {
             return 1;
         }
 
@@ -1167,13 +1195,34 @@ int runMographSelftest()
             return 1;
         const QString projectPath = tempDir.path() + QStringLiteral("/mograph_selftest.veditor");
         ProjectData fileLoaded;
+        const auto fileText = [](const QString &path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? QString::fromUtf8(file.readAll()) : QString();
+        };
         if (!requireSelftest(ProjectFile::save(projectPath, saveData), QStringLiteral("MOGRAPH project save failed"), &error)
             || !requireSelftest(ProjectFile::load(projectPath, fileLoaded), QStringLiteral("MOGRAPH project load failed"), &error)
             || !requireSelftest(fileLoaded.text3DClipEntries.size() == 1
                                     && fileLoaded.expressionBindingsEntries.size() == 1
-                                    && fileLoaded.wiggleClipEntries.size() == 1
+                                    && sameWiggle(fileLoaded)
+                                    && !rootHasWiggleSection(fileText(projectPath))
                                     && !fileLoaded.projectCamera.isEmpty(),
                                 QStringLiteral("saved MOGRAPH project reload mismatch"), &error)) {
+            return 1;
+        }
+        // The same legacy section through ProjectFile::load.
+        const QString legacyPath = tempDir.path() + QStringLiteral("/mograph_legacy_wiggle.veditor");
+        ProjectData legacyFileLoaded;
+        {
+            QFile legacyFile(legacyPath);
+            if (legacyFile.open(QIODevice::WriteOnly))
+                legacyFile.write(QJsonDocument(legacyWiggleRoot).toJson());
+        }
+        const QString resavedPath = tempDir.path() + QStringLiteral("/mograph_legacy_resaved.veditor");
+        if (!requireSelftest(ProjectFile::load(legacyPath, legacyFileLoaded) && sameWiggle(legacyFileLoaded)
+                                 && ProjectFile::save(resavedPath, legacyFileLoaded)
+                                 && !rootHasWiggleSection(fileText(resavedPath)),
+                             QStringLiteral("legacy wiggleClipEntries not migrated onto the clip by load "
+                                            "(or written again by save)"), &error)) {
             return 1;
         }
     }
