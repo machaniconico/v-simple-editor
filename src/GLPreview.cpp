@@ -1986,6 +1986,21 @@ void GLPreview::renderPendingD3D11Frame()
 #endif
 }
 
+VideoPlayer *GLPreview::ownerPlayer() const
+{
+    for (QWidget *w = parentWidget(); w; w = w->parentWidget()) {
+        if (auto *player = qobject_cast<VideoPlayer *>(w))
+            return player;
+    }
+    return nullptr;
+}
+
+double GLPreview::resolveCameraSeconds() const
+{
+    const auto *player = ownerPlayer();
+    return player ? player->timelinePositionUs() / 1000000.0 : 0.0;
+}
+
 void GLPreview::paintGL()
 {
     undotrace::log("gl:paintGL:enter");
@@ -1998,8 +2013,7 @@ void GLPreview::paintGL()
                 << "upload=" << m_needsUpload;
     }
 
-    const auto *cameraPlayer = qobject_cast<VideoPlayer *>(parentWidget());
-    const double cameraSec = cameraPlayer ? cameraPlayer->timelinePositionUs() / 1000000.0 : 0.0;
+    const double cameraSec = resolveCameraSeconds();
     const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
         : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
                                          : m_projectCamera.camera());
@@ -2027,7 +2041,7 @@ void GLPreview::paintGL()
     // shader grade/geometry twice. A seek or output-size change can repaint
     // before another decoded frame arrives, so both belong to the cache key.
     if (projectCamera.trueProjection && m_timeline) {
-        if (auto *player = qobject_cast<VideoPlayer *>(parentWidget())) {
+        if (auto *player = ownerPlayer()) {
             QSize canvas = player->projectOutputSize();
             if (canvas.isEmpty())
                 canvas = m_currentFrame.size();
@@ -2085,15 +2099,10 @@ void GLPreview::paintGL()
     PreviewClipMotion previewMotion;
     if (m_timeline) {
         double timelineSec = 0.0;
-        // US-1504: the view sits in the player's display stack, so the player is an
-        // ancestor rather than the direct parent; the clip motion (keyframes and the
-        // wiggle) is evaluated at the player's position.
-        for (QWidget *w = parentWidget(); w; w = w->parentWidget()) {
-            if (auto *player = qobject_cast<VideoPlayer *>(w)) {
-                timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
-                break;
-            }
-        }
+        // US-1504: the clip motion (keyframes and the wiggle) is evaluated at the
+        // player's position.
+        if (const auto *player = ownerPlayer())
+            timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
         previewMotion = resolvePreviewClipMotion(m_timeline, timelineSec,
                                                  compositeBaked,
                                                  m_videoSourceScale,
@@ -2382,7 +2391,7 @@ void GLPreview::paintGL()
     auto effLgg = m_liftGammaGain;
     if (m_timeline) {
         qint64 tlUs = 0;
-        if (auto *vp = qobject_cast<VideoPlayer *>(parentWidget()))
+        if (auto *vp = ownerPlayer())
             tlUs = vp->timelinePositionUs();
         const AdjustmentLayerComposite comp =
             composeAdjustmentLayersAt(m_timeline->adjustmentLayers(), tlUs);
@@ -2807,7 +2816,7 @@ void GLPreview::paintTimecodeBurnInOverlay()
         return;
 
     double timelineSec = m_timeline ? m_timeline->playheadPosition() : 0.0;
-    if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
+    if (auto *player = ownerPlayer())
         timelineSec = static_cast<double>(player->timelinePositionUs())
             / AV_TIME_BASE;
 

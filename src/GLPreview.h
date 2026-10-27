@@ -24,6 +24,7 @@
 class Timeline;
 class SurfaceTool;
 class BrushAnimation;
+class VideoPlayer;
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -326,6 +327,12 @@ private:
     void releaseRegisteredTexturesLocked();
     void renderPendingD3D11Frame();
     void paintTimecodeBurnInOverlay();
+    // US-1704: the VideoPlayer that owns this view. The view sits in the player's
+    // display stack, so the player is an ancestor rather than the direct parent.
+    VideoPlayer *ownerPlayer() const;
+    // US-1704: timeline seconds the project camera is evaluated at (no GL needed).
+    double resolveCameraSeconds() const;
+    friend int runCamera3DSelftest();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
