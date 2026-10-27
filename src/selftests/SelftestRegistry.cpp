@@ -833,7 +833,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
       "Planar camera solver: SVD, continuity, confidence, camera keyframes and single-slot undo (8 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,
-      "Project camera: opt-in projection, view/roll, JSON, overlap and animated export parity (G1-G9)" },
+      "Project camera: opt-in projection, view/roll, JSON, overlap and animated export parity (G1-G10)" },
     { "light3d",            "VEDITOR_LIGHT3D_SELFTEST",            runLight3DSelftest,            true,
       "3D lights: compositor/export parity, keyframe edits, dialog guards, JSON, determinism (17 gates)" },
     { "edl-import", "VEDITOR_EDL_IMPORT_SELFTEST", runEdlImportSelftest, true,
@@ -950,7 +950,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Whisper CLI resolution and subtitle translation preference persistence (5 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
-      "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (10 gates)" },
+      "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (11 gates)" },
     { "render-notify", nullptr, runRenderNotifySelftest, true,
       "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (8 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,

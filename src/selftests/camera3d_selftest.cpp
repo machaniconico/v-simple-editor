@@ -4,9 +4,11 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../UndoManager.h"
 
 #include <QJsonDocument>
 #include <QLineF>
+#include <QMatrix4x4>
 #include <QPainter>
 #include <QTemporaryDir>
 #include <algorithm>
@@ -14,6 +16,9 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+
+// GLPreview.cpp (US-1509): the layer3D GLPreview's projection uses for the clip active at a time.
+Layer3DTransform previewLayer3DForSelftest(const Timeline *timeline, double timelineSec);
 
 namespace {
 bool sameBytes(const QImage &a, const QImage &b)
@@ -341,6 +346,203 @@ int runCamera3DSelftest()
     animationOk = animationOk && sameBytes(animatedOff,
         tlrender::renderFrameAt(&animatedTimeline, 2000000, canvas));
     gate(9, animationOk);
+
+    // G10 (US-1509): autoOrientToCamera orients a 3D layer towards a trueProjection camera.
+    // Camera (0,0,-500), target = position + (0,0,-1) (the default target (0,0,-1) would make
+    // forward +z and mirror x). Detects: an effective layer3D that ignores the flag (the
+    // mutation build that never reads it renders ON == OFF), a lighting / GLPreview / overlay /
+    // V1 site that still reads clip.layer3D (ON != the baked-helper reference), a flag on a
+    // non-3D layer, a lost JSON key, an undo count != 1.
+    {
+        Camera3DState orientCam;
+        orientCam.position = QVector3D(0.0f, 0.0f, -500.0f);
+        orientCam.target = orientCam.position + QVector3D(0.0f, 0.0f, -1.0f);
+        orientCam.fov = 500.0;
+        orientCam.trueProjection = true;
+        ClipInfo tilted = fixtureClip(QColor(220, 80, 40), canvas);
+        tilted.is3DLayer = true;
+        tilted.layer3D.rotationY = 60.0;
+        tilted.layer3D.rotationZ = 15.0;
+        tilted.autoOrientToCamera = true;
+        ClipInfo offClip = tilted;
+        offClip.autoOrientToCamera = false;
+
+        // (1) helper values. The +x sign is the Step 0 print: rotationY positive.
+        const Layer3DTransform atCentre = camera3d::effectiveLayer3DAt(tilted, QPointF(0, 0), orientCam);
+        const Layer3DTransform atPlusX = camera3d::effectiveLayer3DAt(tilted, QPointF(150, 0), orientCam);
+        const Layer3DTransform atPlusY = camera3d::effectiveLayer3DAt(tilted, QPointF(0, 100), orientCam);
+        // Independent normal check: model order of projectLayerQuad (Rz, Ry, Rx), the mapped
+        // (0,0,1) must point at the camera (+z side) from the layer's position.
+        const auto normalDot = [&](const Layer3DTransform &l, QPointF px) {
+            QMatrix4x4 m;
+            m.rotate(static_cast<float>(l.rotationZ), 0, 0, 1);
+            m.rotate(static_cast<float>(l.rotationY), 0, 1, 0);
+            m.rotate(static_cast<float>(l.rotationX), 1, 0, 0);
+            const QVector3D n = m.mapVector(QVector3D(0, 0, 1)).normalized();
+            QVector3D d = orientCam.position - QVector3D(static_cast<float>(px.x()),
+                                                         static_cast<float>(px.y()),
+                                                         static_cast<float>(l.positionZ));
+            d.normalize();
+            if (d.z() < 0.0f)
+                d = -d;
+            return static_cast<double>(QVector3D::dotProduct(n, d));
+        };
+        ClipInfo rz90 = tilted;
+        rz90.layer3D.rotationZ = 90.0;
+        ClipInfo rz0 = tilted;
+        rz0.layer3D.rotationZ = 0.0;
+        const Layer3DTransform atBoth = camera3d::effectiveLayer3DAt(tilted, QPointF(150, 100), orientCam);
+        const Layer3DTransform atRz90 = camera3d::effectiveLayer3DAt(rz90, QPointF(150, 0), orientCam);
+        const Layer3DTransform atRz0 = camera3d::effectiveLayer3DAt(rz0, QPointF(150, 0), orientCam);
+        const double dotCentre = normalDot(atCentre, QPointF(0, 0));
+        const double dotPlusX = normalDot(atPlusX, QPointF(150, 0));
+        const double dotPlusY = normalDot(atPlusY, QPointF(0, 100));
+        const double dotBoth = normalDot(atBoth, QPointF(150, 100));
+        const double dotRz90 = normalDot(atRz90, QPointF(150, 0));
+        // Negative control: the round-1 solution ignored rotationZ; it must fail the same check.
+        Layer3DTransform uncomp = rz90.layer3D;
+        uncomp.rotationX = 0.0;
+        uncomp.rotationY = std::atan2(150.0, 500.0) * 180.0 / M_PI;
+        const double dotUncomp = normalDot(uncomp, QPointF(150, 0));
+        const double kNormalMin = 1.0 - 1e-6;
+        const QPolygonF quadPlusX = Camera3D::projectLayerQuad(atPlusX, orientCam, canvas);
+        std::fprintf(stderr, "camera3d G10 helper: centre rx=%.6f ry=%.6f | +x(150) rx=%.6f ry=%.6f"
+                     " | +y(100) rx=%.6f ry=%.6f | rz kept %.1f | rz0 +x ry=%.6f | rz90 +x rx=%.6f ry=%.6f"
+                     " | normal dots centre/+x/+y/both/rz90 %.9f/%.9f/%.9f/%.9f/%.9f uncompensated %.6f"
+                     " | +x quad left/right edge %.3f/%.3f\n",
+                     atCentre.rotationX, atCentre.rotationY, atPlusX.rotationX, atPlusX.rotationY,
+                     atPlusY.rotationX, atPlusY.rotationY, atPlusX.rotationZ, atRz0.rotationY,
+                     atRz90.rotationX, atRz90.rotationY, dotCentre, dotPlusX, dotPlusY, dotBoth, dotRz90,
+                     dotUncomp,
+                     quadPlusX.size() == 4 ? QLineF(quadPlusX[0], quadPlusX[3]).length() : -1.0,
+                     quadPlusX.size() == 4 ? QLineF(quadPlusX[1], quadPlusX[2]).length() : -1.0);
+        const auto sameLayer = [](const Layer3DTransform &a, const Layer3DTransform &b) {
+            return a.positionZ == b.positionZ && a.rotationX == b.rotationX
+                && a.rotationY == b.rotationY && a.rotationZ == b.rotationZ;
+        };
+        ClipInfo flat = tilted;
+        flat.is3DLayer = false;
+        Camera3DState flatCam = orientCam;
+        flatCam.trueProjection = false;
+        const bool helperOk = std::abs(atCentre.rotationX) < 1e-6 && std::abs(atCentre.rotationY) < 1e-6
+            && atRz0.rotationY > 10.0 && std::abs(atRz0.rotationY - std::atan2(150.0, 500.0) * 180.0 / M_PI) < 1e-6
+            && dotCentre > kNormalMin && dotPlusX > kNormalMin && dotPlusY > kNormalMin
+            && dotBoth > kNormalMin && dotRz90 > kNormalMin && dotUncomp < kNormalMin
+            && atPlusX.rotationZ == 15.0 && atRz90.rotationZ == 90.0
+            && sameLayer(camera3d::effectiveLayer3DAt(offClip, QPointF(150, 0), orientCam), offClip.layer3D)
+            && sameLayer(camera3d::effectiveLayer3DAt(flat, QPointF(150, 0), orientCam), flat.layer3D)
+            && sameLayer(camera3d::effectiveLayer3DAt(tilted, QPointF(150, 0), flatCam), tilted.layer3D);
+
+        // (2) renderFrameAt, upper track (overlay path): ON differs from OFF, and equals OFF with
+        // the helper's rotations baked in (a clip.layer3D read anywhere would not).
+        Timeline orientTl;
+        while (orientTl.videoTracks().size() < 2)
+            orientTl.addVideoTrack();
+        orientTl.setProjectOutputConfig(canvas.width(), canvas.height(), true, 30.0);
+        orientTl.setProjectCamera(orientCam);
+        Camera3D::setTrueProjectionEnabledForTest(true);
+        ClipInfo backdrop = fixtureClip(QColor(40, 100, 210), canvas);
+        const double dx = 0.3;
+        const QPointF px(dx * canvas.width(), 0.0);
+        const auto baked = [&](ClipInfo clip, const Camera3DState &cam) {
+            clip.layer3D = camera3d::effectiveLayer3DAt(clip, px, cam);
+            clip.autoOrientToCamera = false;
+            return clip;
+        };
+        const auto place = [&](ClipInfo clip) { clip.videoDx = dx; return clip; };
+        const auto renderPair = [&](const ClipInfo &v1, const ClipInfo &upper) {
+            orientTl.videoTracks()[0]->setClips({v1});
+            orientTl.videoTracks()[1]->setClips({upper});
+            return tlrender::renderFrameAt(&orientTl, 0, canvas);
+        };
+        const QImage upperOn = renderPair(backdrop, place(tilted));
+        const QImage upperOff = renderPair(backdrop, place(offClip));
+        const QImage upperBaked = renderPair(backdrop, place(baked(tilted, orientCam)));
+        const double upperMse = mse(upperOn, upperOff);
+        const bool upperOk = upperMse > 1.0 && sameBytes(upperOn, upperBaked);
+        // (3) v1Contained path: the 3D layer is V1.
+        const QImage v1On = renderPair(place(tilted), backdrop);
+        const QImage v1Off = renderPair(place(offClip), backdrop);
+        const QImage v1Baked = renderPair(place(baked(tilted, orientCam)), backdrop);
+        const double v1Mse = mse(v1On, v1Off);
+        const bool v1Ok = v1Mse > 1.0 && sameBytes(v1On, v1Baked);
+        // (4) a non-3D layer with the flag set renders as with it cleared.
+        const QImage flatOn = renderPair(backdrop, place(flat));
+        ClipInfo flatOff = flat;
+        flatOff.autoOrientToCamera = false;
+        const bool flatOk = sameBytes(flatOn, renderPair(backdrop, place(flatOff)));
+        // (5) lighting normals come from the helper's value (ON-lit == baked-lit), and the
+        // lighting is real and normal-sensitive (sanity bands).
+        Light3DState parallel;
+        parallel.type = LightType::Parallel;
+        parallel.position = QVector3D(0.0f, 0.0f, 500.0f);
+        parallel.target = QVector3D(0.0f, 0.0f, 0.0f);
+        orientTl.setProjectLights({Light3D(parallel)});
+        ClipInfo litOn = place(tilted), litOff = place(offClip);
+        for (ClipInfo *lit : {&litOn, &litOff}) {
+            lit->material.ambientCoeff = 0.0;
+            lit->material.diffuseCoeff = 1.0;
+        }
+        const QImage lightOn = renderPair(litOn, backdrop);
+        const QImage lightBaked = renderPair(baked(litOn, orientCam), backdrop);
+        const QImage lightOff = renderPair(litOff, backdrop);
+        const double normalOn = light3d::layerNormal(camera3d::effectiveLayer3DAt(litOn, px, orientCam)).z();
+        const double normalOff = light3d::layerNormal(litOn.layer3D).z();
+        orientTl.setProjectLights({});
+        const double lightMse = mse(lightOn, v1On);
+        const bool lightOk = sameBytes(lightOn, lightBaked) && lightMse > 0.5 && mse(lightOn, lightOff) > 1.0
+            && normalOn > normalOff + 0.2;
+        // (6) GLPreview's projection input equals the helper's value, and projecting with it
+        // by hand reproduces the exported V1 layer (the gate-7 reference).
+        orientTl.videoTracks()[0]->setClips({place(tilted)});
+        orientTl.videoTracks()[1]->setClips({});
+        const Layer3DTransform glLayer = previewLayer3DForSelftest(&orientTl, 0.0);
+        const Layer3DTransform wantLayer = camera3d::effectiveLayer3DAt(place(tilted), px, orientCam);
+        const QImage exportedV1 = tlrender::renderFrameAt(&orientTl, 0, canvas);
+        const QImage glReference = clipgeom::renderLayer(
+            Camera3D::applyTrueProjection(
+                ShapeLayer::renderShapesToImage(tilted.shapes, canvas), glLayer, orientCam, canvas),
+            {tilted.videoScale, dx, tilted.videoDy, tilted.rotation2DDegrees}, canvas, true);
+        const double glMse = mse(exportedV1, glReference);
+        std::fprintf(stderr, "camera3d G10 gl: ry=%.6f (want %.6f) mse(export, projection with GL input)=%.4f\n",
+                     glLayer.rotationY, wantLayer.rotationY, glMse);
+        const bool glOk = sameLayer(glLayer, wantLayer) && !sameLayer(glLayer, tilted.layer3D) && glMse < 1.0;
+        // (7) JSON round trip (the key is written only when set) and the setter's undo point.
+        const auto roundTrip = [](const ClipInfo &clip, QString *json) {
+            ProjectData project;
+            project.videoTracks = QVector<QVector<ClipInfo>>{{clip}};
+            *json = ProjectFile::toJsonString(project);
+            ProjectData back;
+            return ProjectFile::fromJsonString(*json, back) && !back.videoTracks.isEmpty()
+                    && !back.videoTracks[0].isEmpty()
+                ? back.videoTracks[0][0] : ClipInfo{};
+        };
+        QString onText, offText;
+        const ClipInfo onBack = roundTrip(tilted, &onText);
+        const ClipInfo offBack = roundTrip(offClip, &offText);
+        const QString key = QStringLiteral("autoOrientToCamera");
+        const bool jsonOk = onText.contains(key) && onBack.autoOrientToCamera && onBack.is3DLayer
+            && !offText.contains(key) && !offBack.autoOrientToCamera;
+        Timeline undoTl;
+        undoTl.restoreFromProject(QVector<QVector<ClipInfo>>{{offClip}}, QVector<QVector<ClipInfo>>{{}},
+                                  0.0, -1.0, -1.0, 100);
+        undoTl.undoManager()->clear();
+        undoTl.saveUndoState(QStringLiteral("Initial"));
+        const int depth0 = undoTl.undoManager()->currentIndex();
+        const bool setOn = undoTl.setClipAutoOrientToCamera(0, 0, true);
+        const int depth1 = undoTl.undoManager()->currentIndex();
+        const bool isOn = undoTl.videoTracks()[0]->clips().at(0).autoOrientToCamera;
+        const bool setAgain = undoTl.setClipAutoOrientToCamera(0, 0, true);
+        const int depth2 = undoTl.undoManager()->currentIndex();
+        undoTl.undo();
+        const bool undone = !undoTl.videoTracks()[0]->clips().at(0).autoOrientToCamera;
+        const bool undoOk = setOn && isOn && depth1 == depth0 + 1 && setAgain && depth2 == depth1 && undone;
+        std::fprintf(stderr, "camera3d G10: helper=%d upper(mse %.2f)=%d v1(mse %.2f)=%d flat=%d "
+                     "light(mse %.2f, nz %.3f vs %.3f)=%d gl=%d json=%d undo=%d\n",
+                     helperOk, upperMse, upperOk, v1Mse, v1Ok, flatOk, lightMse, normalOn, normalOff,
+                     lightOk, glOk, jsonOk, undoOk);
+        gate(10, helperOk && upperOk && v1Ok && flatOk && lightOk && glOk && jsonOk && undoOk);
+    }
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

@@ -2072,6 +2072,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["motionBlurEnabled"] = true;
     if (clip.autoOrientEnabled)
         obj["autoOrientEnabled"] = true;
+    if (clip.autoOrientToCamera)
+        obj["autoOrientToCamera"] = true;
     if (wiggle::toJson(clip.wiggle) != wiggle::toJson(wiggle::WiggleParams{}))
         obj["wiggle"] = wiggle::toJson(clip.wiggle);
     if (!clip.expressions.isEmpty())
@@ -2211,6 +2213,7 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         clip.material = LayerMaterial::fromJson(obj["layerMaterial"].toObject());
     clip.motionBlurEnabled = obj["motionBlurEnabled"].toBool(false);
     clip.autoOrientEnabled = obj["autoOrientEnabled"].toBool(false);
+    clip.autoOrientToCamera = obj["autoOrientToCamera"].toBool(false);
     clip.wiggle = obj.contains("wiggle")
         ? wiggle::fromJson(obj["wiggle"].toObject())
         : wiggle::WiggleParams{};

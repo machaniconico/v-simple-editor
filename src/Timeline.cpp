@@ -7658,6 +7658,31 @@ bool Timeline::setClipAutoOrientEnabled(TrackKind kind, int trackIndex,
     return true;
 }
 
+bool Timeline::setClipAutoOrientToCamera(int trackIndex, int clipIndex, bool enabled)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].autoOrientToCamera == enabled)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].autoOrientToCamera = enabled;
+    track->setClips(clips);
+
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("カメラへ自動的に向ける"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 bool Timeline::setClipWiggle(int trackIndex, int clipIndex, const wiggle::WiggleParams &params)
 {
     TimelineTrack *track = trackAt(false, trackIndex);
@@ -10526,6 +10551,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *autoOrientAct = menu.addAction(QStringLiteral("パスに沿って自動回転"));
     autoOrientAct->setCheckable(true);
     autoOrientAct->setChecked(clipInfo.autoOrientEnabled);
+    QAction *autoOrientCameraAct = menu.addAction(QStringLiteral("カメラへ自動的に向ける"));
+    autoOrientCameraAct->setCheckable(true);
+    autoOrientCameraAct->setChecked(clipInfo.autoOrientToCamera);
+    autoOrientCameraAct->setEnabled(clipInfo.is3DLayer);
     menu.addSeparator();
     // SNS 縦動画フィット (相互排他の3択): 幅フィット=レターボックスで全表示 /
     // 幅埋め=中央クロップで枠を歪みなく充填 / 解除=既定 (IgnoreAspectRatio で
@@ -10605,6 +10634,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     else if (chosen == autoOrientAct) {
         setClipAutoOrientEnabled(TrackKind::Video, m_videoTracks.indexOf(track),
                                  clipIndex, autoOrientAct->isChecked());
+    }
+    else if (chosen == autoOrientCameraAct) {
+        setClipAutoOrientToCamera(m_videoTracks.indexOf(track), clipIndex,
+                                  autoOrientCameraAct->isChecked());
     }
     else if (chosen == snsFitAct) applySnsFitToClip(track, clipIndex, true, false, QStringLiteral("SNS width fit center"));
     else if (chosen == snsCoverAct) applySnsFitToClip(track, clipIndex, false, true, QStringLiteral("SNS width fill crop"));

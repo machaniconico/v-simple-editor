@@ -208,6 +208,11 @@ QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
     return applyOverlapTransitionStep(composed, neighbourLayer, transitionInterval(e), T);
 }
 
+// US-1509: the layer position (canvas px, centre origin) camera3d::effectiveLayer3DAt orients from.
+static QPointF layer3DPositionPx(const clipgeom::ClipTransform &t, const QSize &canvas)
+{
+    return QPointF(t.videoDx * canvas.width(), t.videoDy * canvas.height());
+}
 
 namespace detail {
 
@@ -2217,11 +2222,15 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             : applyClipFxStackFromSource(raw, c, local);
         neighbour = applyClipMask(neighbour, c, source);
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
+        const clipgeom::ClipTransform neighbourTransform =
+            clipanim::effectiveTransformAt(c, local, clipEvalEnv(c, b.timelineStart));
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             neighbour = applyProjectCameraProjection(
-                neighbour, c.layer3D, c.is3DLayer, projectCamera, outSize);
-        neighbour = prepareTransitionLayer(neighbour,
-            clipanim::effectiveTransformAt(c, local, clipEvalEnv(c, b.timelineStart)), outSize);
+                neighbour,
+                camera3d::effectiveLayer3DAt(
+                    c, layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
+                c.is3DLayer, projectCamera, outSize);
+        neighbour = prepareTransitionLayer(neighbour, neighbourTransform, outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
     };
 
@@ -2369,8 +2378,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Nested sequence contents are projected once, as the parent reference layer.
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             v1Contained = applyProjectCameraProjection(
-                v1Contained, v1Clip.layer3D, v1Clip.is3DLayer,
-                projectCamera, outSize);
+                v1Contained,
+                camera3d::effectiveLayer3DAt(
+                    v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
+                v1Clip.is3DLayer, projectCamera, outSize);
         v1LayerSource = v1Contained;
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
@@ -2442,7 +2453,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.layerStyle = v1Clip.layerStyle;
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
-        baseLayer.layer.layer3D = v1Clip.layer3D;
+        baseLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
+            v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
         baseLayer.layer.material = v1Clip.material;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
@@ -2497,7 +2509,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
-            renderLayer.layer.layer3D = c.layer3D;
+            renderLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
+                c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
             renderLayer.layer.material = c.material;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
@@ -2569,7 +2582,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
-        renderLayer.layer.layer3D = c.layer3D;
+        const Layer3DTransform cLayer3D = camera3d::effectiveLayer3DAt(
+            c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+        renderLayer.layer.layer3D = cLayer3D;
         renderLayer.layer.material = c.material;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
@@ -2579,7 +2594,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Nested sequence contents are projected once, as the parent reference layer.
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             rgb = applyProjectCameraProjection(
-                rgb, c.layer3D, c.is3DLayer, projectCamera, outSize);
+                rgb, cLayer3D, c.is3DLayer, projectCamera, outSize);
         renderLayer.sourceRgb = rgb;
         renderLayer.layer.name = c.displayName;
         renderLayer.layer.visible = cOpacity > 0.001;
@@ -2614,7 +2629,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         overlay.rotationDeg = cTransform.rotationDeg;   // G3: carry clip rotation
         overlay.layerStyle = c.layerStyle;
         overlay.colorMeta = c.colorMeta;
-        overlay.layer3D = c.layer3D;
+        overlay.layer3D = cLayer3D;
         overlay.material = c.material;
         overlays.append(overlay);
 

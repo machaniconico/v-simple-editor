@@ -251,6 +251,9 @@ struct ClipInfo {
     LayerMaterial material;
     bool motionBlurEnabled = false;
     bool autoOrientEnabled = false;
+    // US-1509: orient a 3D layer towards the project camera (effective only with
+    // is3DLayer and a trueProjection camera; camera3d::effectiveLayer3DAt).
+    bool autoOrientToCamera = false;
     // US-1504: per-clip wiggle / handheld-camera jitter, evaluated on top of the
     // keyframed transform by clipanim::applyDynamicOverlay (disabled by default).
     wiggle::WiggleParams wiggle;
@@ -931,6 +934,9 @@ public:
                          bool reversed, bool applyToLinked = true);
     bool setClipAutoOrientEnabled(TrackKind kind, int trackIndex, int clipIndex,
                                   bool enabled);
+    // US-1509: orient-towards-camera of video clip (trackIndex, clipIndex); one undo point
+    // when the value changes; false when the clip does not exist or its track is locked.
+    bool setClipAutoOrientToCamera(int trackIndex, int clipIndex, bool enabled);
     // US-1504: the wiggle of video clip (trackIndex, clipIndex). One undo point when the
     // value differs from the current one (toJson() compared), none otherwise; false when
     // the clip does not exist or its track is locked.

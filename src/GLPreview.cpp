@@ -170,6 +170,13 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
             ? clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity)
             : clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity, env);
     }
+    // US-1509: the same orient-towards-camera layer3D the export projection uses.
+    if (timeline && !compositeBaked) {
+        const Camera3DState camera = timeline->projectCameraAt(clipStartSec + clipLocalSeconds);
+        const QSize canvas = timeline->projectOutputSize();
+        motion.layer3D = camera3d::effectiveLayer3DAt(
+            clip, QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
+    }
     return motion;
 }
 
@@ -259,6 +266,13 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
                              compositeBaked, timeline);
 }
 } // namespace
+
+// US-1509 selftest seam (camera3d G10, declared there): the layer3D the preview's projection
+// uses for the single clip active at timelineSec (makePreviewMotion, not compositeBaked).
+Layer3DTransform previewLayer3DForSelftest(const Timeline *timeline, double timelineSec)
+{
+    return resolvePreviewClipMotion(timeline, timelineSec, false, 1.0, 0.0, 0.0).layer3D;
+}
 
 // Vertex shader — simple fullscreen quad
 static const char *vertexShaderSrc = R"(

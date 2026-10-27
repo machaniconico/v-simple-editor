@@ -324,7 +324,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 10; ++number) gate(number, false);
+        for (int number = 1; number <= 11; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         return failed;
     }
@@ -782,6 +782,29 @@ int runRenderInPlaceSelftest()
         qPrintable(expressionAfter.expressions.expression(QStringLiteral("transform.opacity"))),
         int(expressionsKept));
     gate(10, expressionReplaced && expressionsKept);
+
+    // G11 (US-1509): the orient-towards-camera flag stays on the baked replacement
+    // (renderinplace::copyComposition). Detects a copyComposition that drops
+    // ClipInfo::autoOrientToCamera (negative control: that line removed in a mutation build).
+    ClipInfo oriented = original;
+    oriented.is3DLayer = true;
+    oriented.autoOrientToCamera = true;
+    Timeline orientTimeline;
+    orientTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{oriented}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    auto orientOptions = options;
+    orientOptions.handlesSec = 0.0;
+    orientOptions.outputDir = output.filePath(QStringLiteral("orient"));
+    QString orientPath, orientError;
+    const bool orientBaked = renderinplace::renderClipInPlace(
+        orientTimeline, 0, 0, orientOptions, &orientPath, &orientError);
+    const ClipInfo orientAfter = orientBaked ? orientTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+    const bool orientReplaced = orientBaked && orientAfter.filePath != oriented.filePath
+        && orientAfter.renderInPlaceOriginal;
+    std::fprintf(stderr, "G11 baked=%d [%s] replaced=%d autoOrientToCamera=%d is3DLayer=%d "
+        "(expect 1 / 1)\n", int(orientBaked), qPrintable(orientError), int(orientReplaced),
+        int(orientAfter.autoOrientToCamera), int(orientAfter.is3DLayer));
+    gate(11, orientReplaced && orientAfter.autoOrientToCamera && orientAfter.is3DLayer);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }
