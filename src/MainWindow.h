@@ -269,6 +269,7 @@ class MainWindow : public QMainWindow
     friend int runTrackOpsSelftest();
     friend int runConnectedClipSelftest();
     friend int runMediaRelinkSelftest();
+    friend int runMainWindowLifecycleSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -1015,6 +1016,7 @@ private:
     QAction *m_colorManagementAction = nullptr;
     Exporter *m_exporter;
     QString m_projectFilePath; // current .veditor file
+    int m_lastSaveImportHubMoved = 0; // US-1506: ImportHub files moved by the last save
     MultiCamSession *m_multiCam = nullptr;
     MotionTracker *m_motionTracker = nullptr;
     NoiseReduction *m_noiseReduction = nullptr;

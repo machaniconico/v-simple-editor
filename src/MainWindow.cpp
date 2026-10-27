@@ -902,6 +902,19 @@ QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
     return nullptr;
 }
 
+QString importHubTempDirPath()
+{
+    return QDir::tempPath() + QStringLiteral("/v-simple-editor-importhub");
+}
+
+// US-1506: ImportHub media of a saved project lives next to it.
+QString importHubAssetDirFor(const QString &projectFilePath)
+{
+    const QFileInfo info(projectFilePath);
+    return info.absolutePath() + QLatin1Char('/') + info.completeBaseName()
+        + QStringLiteral("_assets/importhub");
+}
+
 #ifdef HAVE_IMPORT_HUB
 QString importHubSafeStem(QString stem)
 {
@@ -920,9 +933,10 @@ QString importHubSafeStem(QString stem)
     return safe.left(48);
 }
 
-QString importHubTempPngPath(const QString& prefix, const QString& name)
+QString importHubNewPngPath(const QString& projectFilePath, const QString& prefix, const QString& name)
 {
-    QDir dir(QDir::tempPath() + QStringLiteral("/v-simple-editor-importhub"));
+    QDir dir(projectFilePath.isEmpty() ? importHubTempDirPath()
+                                       : importHubAssetDirFor(projectFilePath));
     if (!dir.exists())
         dir.mkpath(QStringLiteral("."));
 
@@ -10176,7 +10190,11 @@ void MainWindow::saveProject()
 
     QString errorMessage;
     if (saveProjectToPath(m_projectFilePath, &errorMessage))
-        statusBar()->showMessage("Saved: " + m_projectFilePath);
+        statusBar()->showMessage("Saved: " + m_projectFilePath
+            + (m_lastSaveImportHubMoved > 0
+                   ? QStringLiteral(" / 取り込み素材 %1 件をプロジェクトの隣へ移動しました")
+                         .arg(m_lastSaveImportHubMoved)
+                   : QString()));
     else
         QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
                               ? "Could not save project file." : errorMessage);
@@ -10189,7 +10207,11 @@ void MainWindow::saveProjectAs()
     if (filePath.isEmpty()) return;
     QString errorMessage;
     if (saveProjectToPath(filePath, &errorMessage))
-        statusBar()->showMessage("Saved: " + m_projectFilePath);
+        statusBar()->showMessage("Saved: " + m_projectFilePath
+            + (m_lastSaveImportHubMoved > 0
+                   ? QStringLiteral(" / 取り込み素材 %1 件をプロジェクトの隣へ移動しました")
+                         .arg(m_lastSaveImportHubMoved)
+                   : QString()));
     else
         QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
                               ? "Could not save project file." : errorMessage);
@@ -10230,14 +10252,96 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
         return false;
     }
 
+    // US-1506: ImportHub PNGs still in the OS temp dir are copied next to the
+    // project (<name>_assets/importhub/) before saving. Order: copy (failure
+    // aborts, state unchanged) -> relink (failure aborts) -> save (failure undoes
+    // the relink once, the redo entry stays) -> m_projectFilePath.
+    m_lastSaveImportHubMoved = 0;
+    QHash<QString, QString> hubMapping;
+    QStringList hubCopies;
+    QStringList hubCreatedDirs;
+    const auto discardHubCopies = [&hubCopies, &hubCreatedDirs]() {
+        for (const QString &copy : std::as_const(hubCopies))
+            QFile::remove(copy);
+        for (const QString &dirPath : std::as_const(hubCreatedDirs))
+            QDir().rmdir(dirPath);
+    };
+    {
+        ProjectData scan;
+        populateProjectData(scan);
+        const QString canonicalTemp = QDir(importHubTempDirPath()).canonicalPath();
+        if (!canonicalTemp.isEmpty()) {
+            const QString tempPrefix = canonicalTemp + QLatin1Char('/');
+            const QString assetDir = importHubAssetDirFor(path);
+            const QString assetParent = QFileInfo(assetDir).absolutePath();
+            const QVector<mediapaths::PathSlot> pathSlots = mediapaths::enumeratePathSlots(scan);
+            for (const mediapaths::PathSlot &pathSlot : pathSlots) {
+                const QString value = pathSlot.value();
+                if (value.isEmpty() || hubMapping.contains(value))
+                    continue;
+                const QFileInfo source(value);
+                const QString canonical = source.canonicalFilePath();
+                if (canonical.isEmpty() || !source.isFile()
+                    || !canonical.startsWith(tempPrefix, Qt::CaseInsensitive))
+                    continue;
+                if (hubCopies.isEmpty()) {
+                    const bool parentExisted = QDir(assetParent).exists();
+                    const bool dirExisted = QDir(assetDir).exists();
+                    if (!QDir().mkpath(assetDir)) {
+                        if (errorMessage)
+                            *errorMessage = QStringLiteral("取り込み素材の保存先を作れませんでした: %1").arg(assetDir);
+                        return false;
+                    }
+                    if (!dirExisted)
+                        hubCreatedDirs.append(assetDir);
+                    if (!parentExisted)
+                        hubCreatedDirs.append(assetParent);
+                }
+                const QFileInfo canonicalInfo(canonical);
+                QString destination = assetDir + QLatin1Char('/') + canonicalInfo.fileName();
+                for (int n = 1; QFileInfo::exists(destination); ++n) {
+                    destination = QStringLiteral("%1/%2_%3.%4").arg(assetDir)
+                        .arg(canonicalInfo.completeBaseName()).arg(n).arg(canonicalInfo.suffix());
+                }
+                if (!QFile::copy(canonical, destination)) {
+                    discardHubCopies();
+                    if (errorMessage)
+                        *errorMessage = QStringLiteral("取り込み素材をコピーできませんでした: %1").arg(value);
+                    return false;
+                }
+                hubCopies.append(destination);
+                hubMapping.insert(value, destination);
+            }
+        }
+    }
+    if (!hubMapping.isEmpty()) {
+        QString relinkError;
+        if (!relinkMediaPaths(hubMapping, &relinkError)) {
+            discardHubCopies();
+            if (errorMessage)
+                *errorMessage = QStringLiteral("取り込み素材の再リンクに失敗しました: %1").arg(relinkError);
+            return false;
+        }
+    }
+
     ProjectData data;
     populateProjectData(data);
     if (!ProjectFile::save(path, data)) {
+        // Copies are kept: the redo entry (relink snapshot) references them.
+        if (!hubMapping.isEmpty())
+            m_timeline->undo();
         if (errorMessage)
             *errorMessage = QStringLiteral("プロジェクトを保存できませんでした: %1").arg(path);
         return false;
     }
 
+    m_lastSaveImportHubMoved = static_cast<int>(hubMapping.size());
+    if (m_lastSaveImportHubMoved > 0 && statusBar()) {
+        statusBar()->showMessage(
+            QStringLiteral("取り込み素材 %1 件をプロジェクトの隣へ移動しました")
+                .arg(m_lastSaveImportHubMoved),
+            5000);
+    }
     m_projectFilePath = path;
     setWindowModified(false);
     updateTitle();
@@ -17598,7 +17702,7 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    const QString tempPng = importHubTempPngPath(QStringLiteral("image"), name);
+                    const QString tempPng = importHubNewPngPath(m_projectFilePath, QStringLiteral("image"), name);
                     if (!importingest::savePreviewPng(image, tempPng)) {
                         if (statusBar()) {
                             statusBar()->showMessage(
@@ -17634,7 +17738,7 @@ void MainWindow::onImportHub()
                     const int vertexCount = meshData.vertices.size();
                     const int triangleCount = meshData.triangleIndices.size() / 3;
                     const QImage preview = importingest::meshToPreviewImage(meshData);
-                    const QString tempPng = importHubTempPngPath(QStringLiteral("mesh"), QStringLiteral("preview"));
+                    const QString tempPng = importHubNewPngPath(m_projectFilePath, QStringLiteral("mesh"), QStringLiteral("preview"));
                     if (!importingest::savePreviewPng(preview, tempPng)) {
                         if (statusBar()) {
                             statusBar()->showMessage(
@@ -17681,7 +17785,7 @@ void MainWindow::onImportHub()
                         return;
                     }
                     const QImage firstFrame = frames.first().image;
-                    const QString tempPng = importHubTempPngPath(QStringLiteral("exr"), pattern);
+                    const QString tempPng = importHubNewPngPath(m_projectFilePath, QStringLiteral("exr"), pattern);
                     if (!importingest::savePreviewPng(firstFrame, tempPng)) {
                         if (statusBar()) {
                             statusBar()->showMessage(

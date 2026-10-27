@@ -1017,7 +1017,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
-      "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (4 gates)" },
+      "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (5 gates)" },
     { "track-ops", "VEDITOR_TRACK_OPS_SELFTEST", runTrackOpsSelftest, true,
       "Track removal/reorder: header menus, external state undo, exact row restoration and project persistence (31 gates)" },
     { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,

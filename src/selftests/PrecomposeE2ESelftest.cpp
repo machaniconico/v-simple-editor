@@ -13,11 +13,13 @@
 #endif
 #include <QApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QMetaObject>
 #include <QSettings>
 #include <QStatusBar>
+#include <QTemporaryDir>
 #include <QDebug>
 #include <QPointer>
 #include <QString>
@@ -715,9 +717,120 @@ int runMainWindowLifecycleSelftest()
         qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] G4 detail: %1").arg(detail);
         check(4, "refused ImportHub import deletes its preview PNG", ok, detail);
     }
+
+    // US-1506 G5: ImportHub PNGs of an unsaved project live in the OS temp dir; the first
+    // save copies them to <name>_assets/importhub/ (undo +1), later imports go there directly,
+    // and a failed save leaves the paths and the undo depth as they were.
+    {
+        ImportPlacementPin placementPin(ImportPlacement::AppendToFirstTrack);
+        const QString hubDir = QDir::tempPath() + QStringLiteral("/v-simple-editor-importhub");
+        const QString hubDirCanonical = QDir(hubDir).canonicalPath();
+        QTemporaryDir tmp;
+        QStringList probes;
+        // The V1 clip whose file name contains `name` (the probe's own clip, not just the last one).
+        const auto v1PathOf = [](MainWindow &w, const QString &name) {
+            Timeline *t = w.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            TimelineTrack *v = t ? t->trackAt(false, 0) : nullptr;
+            if (v) {
+                for (const ClipInfo &clip : v->clips())
+                    if (QFileInfo(clip.filePath).fileName().contains(name))
+                        return clip.filePath;
+            }
+            return QString();
+        };
+        const auto importProbe = [&](MainWindow &w, const QString &name) {
+            ImportHubDialog *hub = w.findChild<ImportHubDialog *>(QStringLiteral("importHubDialog"));
+            QImage image(32, 32, QImage::Format_ARGB32);
+            image.fill(Qt::blue);
+            emit hub->imageImportRequested(image, name);
+            const QString made = v1PathOf(w, name);
+            probes.append(made);
+            return made;
+        };
+        const auto underTemp = [&](const QString &p) {
+            const QString c = QFileInfo(p).canonicalFilePath();
+            return !hubDirCanonical.isEmpty() && c.startsWith(hubDirCanonical + QLatin1Char('/'), Qt::CaseInsensitive);
+        };
+
+        bool ok = false;
+        QString detail;
+        if (tmp.isValid()) {
+            const QString projPath = tmp.filePath(QStringLiteral("p.veditor"));
+            const QString assetDir = tmp.filePath(QStringLiteral("p_assets/importhub"));
+            MainWindow window;
+            Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            QMetaObject::invokeMethod(&window, "onImportHub", Qt::DirectConnection);
+            const bool ready = timeline && timeline->undoManager()
+                && window.findChild<ImportHubDialog *>(QStringLiteral("importHubDialog"));
+            if (ready) {
+                const QString unsaved = importProbe(window, QStringLiteral("g5probe"));
+                const bool c1 = !unsaved.isEmpty() && underTemp(unsaved);
+                const int depthBefore = timeline->undoManager()->currentIndex();
+                const bool saved = window.saveProjectToPath(projPath);
+                const int depthAfterSave = timeline->undoManager()->currentIndex();
+                const QString moved = v1PathOf(window, QStringLiteral("g5probe"));
+                const bool c2 = saved && QFileInfo(moved).absolutePath() == QFileInfo(assetDir).absoluteFilePath()
+                    && QFileInfo(moved).isFile() && QFileInfo(unsaved).isFile()
+                    && depthAfterSave == depthBefore + 1;
+                QFile projFile(projPath);
+                const bool c2json = projFile.open(QIODevice::ReadOnly)
+                    && projFile.readAll().contains(moved.toUtf8());
+                const QString after = importProbe(window, QStringLiteral("g5probe2"));
+                const bool c3 = !after.isEmpty() && after != moved && QFileInfo(after).absolutePath() == QFileInfo(assetDir).absoluteFilePath()
+                    && QFileInfo(after).isFile();
+
+                // (4) the save target is a directory: save fails, paths and undo depth unchanged.
+                MainWindow failWindow;
+                Timeline *failTimeline = failWindow.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+                QMetaObject::invokeMethod(&failWindow, "onImportHub", Qt::DirectConnection);
+                const QString failUnsaved = importProbe(failWindow, QStringLiteral("g5fail"));
+                const QString dirTarget = tmp.filePath(QStringLiteral("proj.veditor"));
+                QDir().mkpath(dirTarget);
+                const int failDepth = failTimeline->undoManager()->currentIndex();
+                const bool failSaved = failWindow.saveProjectToPath(dirTarget);
+                const int failIndex = failTimeline->undoManager()->currentIndex();
+                const bool failCanRedo = failTimeline->canRedo();
+                const bool failPathKept = v1PathOf(failWindow, QStringLiteral("g5fail")) == failUnsaved;
+                bool redoFile = false;
+                QString redone;
+                if (failCanRedo) {
+                    failTimeline->redo();
+                    redone = v1PathOf(failWindow, QStringLiteral("g5fail"));
+                    redoFile = QFileInfo(redone).isFile();
+                }
+                const bool c4 = !failSaved && failPathKept && underTemp(failUnsaved)
+                    && failIndex == failDepth && failCanRedo
+                    && redone != failUnsaved && redoFile
+                    && QFileInfo(redone).absolutePath() == QFileInfo(tmp.filePath(QStringLiteral("proj_assets/importhub"))).absoluteFilePath();
+
+                // Side check: a save without ImportHub media creates no _assets directory.
+                MainWindow plainWindow;
+                const bool plainSaved = plainWindow.saveProjectToPath(tmp.filePath(QStringLiteral("q.veditor")));
+                const bool c5 = plainSaved && !QDir(tmp.filePath(QStringLiteral("q_assets"))).exists();
+
+                ok = c1 && c2 && c2json && c3 && c4 && c5;
+                detail = QStringLiteral("(1) unsaved=%1 underTemp=%2; (2) saved=%3 moved=%4 json=%5 origKept=%6 undo %7->%8 ok=%9; "
+                                        "(3) after=%10 ok=%11; (4) failSaved=%12 depth=%16 index=%17 canRedo=%18 redone=%13 isFile=%19 ok=%14; plain _assets absent ok=%15")
+                             .arg(unsaved).arg(c1).arg(saved).arg(moved).arg(c2json).arg(QFileInfo(unsaved).isFile())
+                             .arg(depthBefore).arg(depthAfterSave).arg(c2)
+                             .arg(after).arg(c3).arg(failSaved).arg(redone).arg(c4).arg(c5)
+                             .arg(failDepth).arg(failIndex).arg(failCanRedo).arg(redoFile);
+            } else {
+                detail = QStringLiteral("timeline/hub not found");
+            }
+        } else {
+            detail = QStringLiteral("QTemporaryDir invalid");
+        }
+        for (const QString &p : std::as_const(probes))
+            if (underTemp(p)) QFile::remove(p);
+        qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] G5 detail: %1").arg(detail);
+        check(5, "ImportHub PNGs move next to the project on first save", ok, detail);
+    }
 #else
     ++skipped;
     qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] SKIP G4 ImportHubDialog.h unavailable (env)");
+    ++skipped;
+    qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] SKIP G5 ImportHubDialog.h unavailable (env)");
 #endif
 
     qInfo().noquote() << QStringLiteral("[mainwindow-lifecycle] summary: %1 PASS, %2 FAIL, %3 SKIP")
