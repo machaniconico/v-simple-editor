@@ -72,6 +72,7 @@ int runBroadcastCaptionSelftest();
 int runBundleAdjustSelftest();
 int runCamera3DSelftest();
 int runCameraSolveSelftest();
+int runCamsolveProbeSelftest();
 int runCamtrackSolveSelftest();
 int runCamtrackUiSelftest();
 int runCapcutCaptionSelftest();
@@ -828,6 +829,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "可変サイズ線形ソルバ、多フレーム追跡、姿勢連結、Schurバンドル調整・密版同値性・規模上限 (9 gates)" },
     { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
       "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
+    { "camsolve-probe", "VEDITOR_CAMSOLVE_PROBE_SELFTEST", runCamsolveProbeSelftest, false,
+      "Camera-solve to project-camera mapping probe on the synthetic two-view scene (1 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
       "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (6 gates)" },
     { "camtrack-solve", "VEDITOR_CAMTRACK_SOLVE_SELFTEST", runCamtrackSolveSelftest, true,

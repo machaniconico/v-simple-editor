@@ -140,6 +140,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camtrack_solve_selftest.cpp
     src/selftests/camtrack_ui_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
+    src/selftests/camsolve_probe_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp
     src/selftests/gate_tally_selftest.cpp
     src/selftests/sfm_two_view_selftest.cpp
