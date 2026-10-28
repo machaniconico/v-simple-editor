@@ -959,11 +959,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "LayerStyle: identity fast path, drop shadow, stroke, and project JSON omission/round-trip" },
     { "layer-style-ui",     "VEDITOR_LAYER_STYLE_UI_SELFTEST",     runLayerStyleUiSelftest,       true,
       "Layer Style UI: default identity, JSON round-trip, enabled-flag identity, and Timeline setter/getter checks (V1 legacy + track-aware)" },
-    { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        false,
-      "Smart Render T4: conservative stream-copy eligibility predicate + env gate" },
     { "whisper-guide",      nullptr,                                runWhisperGuideSelftest,       false,
       "Whisper CLI resolution and subtitle translation preference persistence (5 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
+    { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        true,
+      "Smart Render T4: conservative stream-copy eligibility predicate + env gate (28 gates)" },
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
       "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (11 gates)" },
     { "render-notify", nullptr, runRenderNotifySelftest, true,

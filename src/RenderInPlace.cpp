@@ -54,7 +54,8 @@ bool compositionTrack(const QString &name)
 {
     return name.startsWith(QStringLiteral("motion."))
         || name == QStringLiteral("positionX") || name == QStringLiteral("positionY")
-        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY");
+        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY")
+        || name == QStringLiteral("brush_progress");
 }
 
 QSize nativeVideoSize(const QString &path)

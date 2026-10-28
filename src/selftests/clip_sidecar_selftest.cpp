@@ -404,6 +404,17 @@ int runClipSidecarSelftest()
             ClipInfo carrying = plain;
             carrying.text3DConfig = t3A;
             carrying.brushData = brA;
+            // The brush draws only where brush_progress is above 0, so the replacement
+            // must also carry the progress keys: an animated track and a constant one.
+            KeyframeTrack animatedProgress(QStringLiteral("brush_progress"));
+            animatedProgress.addKeyframe(0.5, 0.0);
+            animatedProgress.addKeyframe(1.5, 1.0);
+            carrying.keyframes.addTrack(animatedProgress);
+            ClipInfo constant = carrying;
+            KeyframeTrack constantProgress(QStringLiteral("brush_progress"));
+            constantProgress.addKeyframe(0.5, 0.6);
+            constant.keyframes.removeTrack(QStringLiteral("brush_progress"));
+            constant.keyframes.addTrack(constantProgress);
             renderinplace::Options options;
             options.outputSize = QSize(640, 360);
             options.fps = 30;
@@ -421,14 +432,42 @@ int runClipSidecarSelftest()
                 *after = baked ? tl.videoTracks()[0]->clips()[0] : ClipInfo{};
                 return baked;
             };
-            ClipInfo carriedAfter, plainAfter;
-            QString carriedPath, plainPath, carriedError, plainError;
+            ClipInfo carriedAfter, plainAfter, constantAfter;
+            QString carriedPath, plainPath, constantPath, carriedError, plainError, constantError;
             const bool carriedBaked = bake(carrying, QStringLiteral("carrying"), &carriedAfter, &carriedPath,
                                            &carriedError);
             const bool plainBaked = bake(plain, QStringLiteral("plain"), &plainAfter, &plainPath, &plainError);
+            const bool constantBaked = bake(constant, QStringLiteral("constant"), &constantAfter, &constantPath,
+                                            &constantError);
+            // Same keys (time and value) on the replacement, and the same nonzero progress
+            // at interior times.
+            auto sameKeys = [](const ClipInfo &before, const ClipInfo &after) {
+                const KeyframeTrack *a = before.keyframes.track(QStringLiteral("brush_progress"));
+                const KeyframeTrack *b = after.keyframes.track(QStringLiteral("brush_progress"));
+                if (!a || !b || a->keyframes().size() != b->keyframes().size()) return false;
+                for (int i = 0; i < a->keyframes().size(); ++i) {
+                    if (a->keyframes()[i].time != b->keyframes()[i].time
+                        || a->keyframes()[i].value != b->keyframes()[i].value)
+                        return false;
+                }
+                return true;
+            };
+            QString progressShown;
+            bool progressKept = carriedBaked && constantBaked && sameKeys(carrying, carriedAfter)
+                && sameKeys(constant, constantAfter);
+            for (const auto &pair : {std::make_pair(&carrying, &carriedAfter),
+                                     std::make_pair(&constant, &constantAfter)}) {
+                for (double t : {0.75, 1.25}) {
+                    const double want = pair.first->keyframes.valueAt(QStringLiteral("brush_progress"), t);
+                    const double got = pair.second->keyframes.valueAt(QStringLiteral("brush_progress"), t);
+                    progressShown += QString::asprintf(" %.2f:%.3f/%.3f", t, got, want);
+                    if (want <= 0.0 || got != want) progressKept = false;
+                }
+            }
             const bool replaced = carriedBaked && carriedAfter.filePath != carrying.filePath
                 && carriedAfter.renderInPlaceOriginal;
-            const bool kept = carriedAfter.text3DConfig == t3A && carriedAfter.brushData == brA;
+            const bool kept = carriedAfter.text3DConfig == t3A && carriedAfter.brushData == brA
+                && constantAfter.brushData == brA;
             // The baked files alone (no sidecars on either) at three ticks.
             double worstDiff = -1.0;
             bool framesOk = carriedBaked && plainBaked;
@@ -448,11 +487,13 @@ int runClipSidecarSelftest()
                 worstDiff = std::max(worstDiff, diff);
             }
             const bool samePicture = framesOk && worstDiff >= 0.0 && worstDiff <= 0.5;
-            tally.gate(8, replaced && kept && samePicture, QString::asprintf(
-                "baked=%d/%d [%s|%s] replaced=%d kept text3D=[%s] brush=[%s] (expect T3A/BRA) "
+            tally.gate(8, replaced && kept && progressKept && samePicture, QString::asprintf(
+                "baked=%d/%d/%d [%s|%s|%s] replaced=%d kept text3D=[%s] brush=[%s] (expect T3A/BRA) "
+                "brush_progress keys kept=%d got/want at t:%s (expect equal and > 0) "
                 "bakedVsPlain meanAbsDiff=%.4f (expect <= 0.5)", int(carriedBaked), int(plainBaked),
-                qPrintable(carriedError), qPrintable(plainError), int(replaced),
-                qPrintable(textOf(carriedAfter.text3DConfig)), qPrintable(textOf(carriedAfter.brushData)),
+                int(constantBaked), qPrintable(carriedError), qPrintable(plainError), qPrintable(constantError),
+                int(replaced), qPrintable(textOf(carriedAfter.text3DConfig)),
+                qPrintable(textOf(carriedAfter.brushData)), int(progressKept), qPrintable(progressShown),
                 worstDiff).toStdString());
         }
     }

@@ -445,6 +445,8 @@ QString specialOverlayReasonForClip(const ClipInfo& clip)
         return QStringLiteral("clip has stabilization keyframes");
     if (clip.textManager.count() > 0)
         return QStringLiteral("clip has text overlays");
+    if (!clip.text3DConfig.isEmpty())
+        return QStringLiteral("clip has 3D text");
     if (clip.colorMeta.isHdr)
         return QStringLiteral("clip source is HDR");
     return QString();
@@ -469,6 +471,8 @@ SegmentEligibility canStreamCopy(const ClipInfo& clip,
                                  bool hasTrackMatte,
                                  bool isOverlayLayer)
 {
+    if (!clip.text3DConfig.isEmpty())
+        return reject(QStringLiteral("clip has 3D text"));
     if (hasEffects || !clip.effects.isEmpty())
         return reject(QStringLiteral("clip has effects"));
     if (hasColorCorrection || !clip.colorCorrection.isDefault() || clip.hasLut())
