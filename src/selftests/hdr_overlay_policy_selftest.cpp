@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // hdr_overlay_policy_selftest.cpp
 // Headless selftest for HDR Stage4 overlay RGBA64 policy gates.
 // Run via: --selftest=hdr-overlay-policy
@@ -83,5 +84,6 @@ int runHdrOverlayPolicySelftest()
 
     std::printf("[hdr-overlay-policy] summary: gates=8 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

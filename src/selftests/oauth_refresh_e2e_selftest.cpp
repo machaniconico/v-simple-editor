@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QEventLoop>
@@ -388,5 +389,6 @@ int runOAuthRefreshE2eSelftest() {
     qInfo().noquote().nospace()
         << "[oauth-refresh-e2e] selftest end, passed=" << passed
         << " failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

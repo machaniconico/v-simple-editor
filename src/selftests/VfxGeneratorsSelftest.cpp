@@ -445,5 +445,6 @@ int runVfxGeneratorsSelftest()
           libraryAppliesVfx);
 
     std::printf("[vfx-generators] RESULT passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

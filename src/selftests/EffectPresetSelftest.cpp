@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/EffectPresetSelftest.cpp
 // FXP-1: effect stack preset save/load/apply round-trip gates.
 
@@ -389,5 +390,6 @@ int runEffectPresetSelftest()
         qunsetenv(kPresetDirEnv);
 
     std::printf("[effect-preset] RESULT passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

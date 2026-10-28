@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../VideoEffect.h"
 #include "../GLPreview.h"
 #include "../ColorGradingPanel.h"
@@ -249,5 +250,6 @@ int runOffsetWheelSelftest()
         && !PresetLibrary::colorCorrectionToJson(ColorCorrection{}).contains("offsetR")
         && pixelsEqual(cpu,VideoEffectProcessor::applyColorCorrection(input,target.colorCorrection)));
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n",passed,failed);
+    selftests::reportTally(passed, failed, contextOk ? 0 : 1);
     return failed;
 }

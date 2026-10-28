@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../VideoEffect.h"
 
@@ -314,5 +315,6 @@ int runAeFxBlurSelftest()
     }
 
     std::printf("ae-fx-blur summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

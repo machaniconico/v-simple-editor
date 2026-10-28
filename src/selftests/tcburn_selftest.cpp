@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../TimecodeBurnIn.h"
 #include "../Exporter.h"
 #include "../Timeline.h"
@@ -303,5 +304,6 @@ int runTcburnSelftest()
 
     err << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     err.flush();
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

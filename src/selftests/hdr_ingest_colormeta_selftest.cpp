@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // hdr_ingest_colormeta_selftest.cpp
 // Headless selftest for Stage10 ingest-time ColorMeta derivation.
 // Run via: --selftest=hdr-ingest-colormeta
@@ -156,5 +157,6 @@ int runHdrIngestColorMetaSelftest()
                              << total << "expected" << kExpectedGates;
         return 1;
     }
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

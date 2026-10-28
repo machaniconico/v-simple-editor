@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/auto_proxy_policy_selftests.cpp
 // Headless selftest for AutoProxyPolicy::decide().
 // QApplication not required (pure Qt value-type engine).
@@ -237,5 +238,6 @@ int runAutoProxyPolicySelftest()
 
     // --- summary ------------------------------------------------------------
     std::printf("[app] Result: %d/%d PASSED\n", passed, passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed; // 0 = all PASS
 }

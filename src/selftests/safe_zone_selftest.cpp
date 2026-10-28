@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Safe zone headless selftest.
 //
 // QApplication 不要。safezone:: の純粋 guides()/apply() を検証する。
@@ -196,5 +197,6 @@ int runSafeZoneSelftest()
 
     qInfo().noquote() << "[safe-zone] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

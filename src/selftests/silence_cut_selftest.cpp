@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Silence cut headless selftest.
 //
 // QApplication 不要。silencecut:: の純粋 RMS silence/keep segmentation を検証する。
@@ -355,5 +356,6 @@ int runSilenceCutSelftest()
 
     qInfo().noquote() << "[silence-cut] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Deflicker.h"
 #include "../DeflickerDialog.h"
 
@@ -559,5 +560,6 @@ int runDeflickerSelftest()
 
     qInfo().noquote() << QStringLiteral("DEFLICKER-SELFTEST: %1/14 PASS, %2 FAIL")
         .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

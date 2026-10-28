@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../SubtitleTranslator.h"
 #include "../WhisperTranscriber.h"
 
@@ -103,5 +104,6 @@ int runWhisperGuideSelftest()
                 && settingsConfig.apiKey == QStringLiteral("settings-secret"));
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

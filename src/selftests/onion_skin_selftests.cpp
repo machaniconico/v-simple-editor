@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Onion skin headless selftest.
 //
 // QApplication 不要。onionskin::compose() の純粋 display-local 合成だけを検証する。
@@ -90,5 +91,6 @@ int runOnionSkinSelftest()
     }
 
     std::printf("[onion-skin] Result: %d/4 PASSED\n", passed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

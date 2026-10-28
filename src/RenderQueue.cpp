@@ -1,5 +1,6 @@
 #include "LoudnessMaster.h"
 #include "RenderQueue.h"
+#include "selftests/SelftestGate.h"
 #include "SequenceExport.h"
 #include "SubtitleIO.h"
 #include <algorithm>
@@ -495,6 +496,7 @@ int runRenderQueueAcesDecisionSelftest()
 
     std::printf("[renderqueue-aces] summary: gates=5 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 
@@ -526,6 +528,7 @@ int runRenderQueueFpsRationalSelftest()
 
     std::printf("[renderqueue-fps-rational] summary: gates=6 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 

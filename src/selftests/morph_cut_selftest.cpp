@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Overlay.h"
 #include "../OpticalFlow.h"
 #include "../mcp/McpEditorTools.h"
@@ -158,5 +159,6 @@ int runMorphCutSelftest()
     check(6, isolated);
     OverlayRenderer::clearMorphCutCacheForTest();
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

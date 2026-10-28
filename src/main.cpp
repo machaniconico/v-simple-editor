@@ -698,6 +698,7 @@ int runCredentialVaultSelftest()
         qInfo().noquote().nospace()
             << "[credential-vault] selftest end, passed=" << gates_passed
             << " failed=" << gates_failed;
+        selftests::reportTally(gates_passed - 9, gates_failed, 9);
         return gates_failed == 0 ? 0 : 1;
     }
 
@@ -779,6 +780,7 @@ int runCredentialVaultSelftest()
     qInfo().noquote().nospace()
         << "[credential-vault] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 
@@ -890,6 +892,7 @@ int runCredTtlSelftest()
     qInfo().noquote().nospace()
         << "[cred-ttl] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 
@@ -1481,6 +1484,7 @@ int runPlatformMockE2eSelftest()
     qInfo().noquote().nospace()
         << "[platform-mock-e2e] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 

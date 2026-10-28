@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../ObjectRemoval.h"
 
 #include <QColor>
@@ -492,5 +493,6 @@ int runObjectRemovalSelftest()
 
     qInfo().noquote() << QStringLiteral("[object-removal] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : failed;
 }

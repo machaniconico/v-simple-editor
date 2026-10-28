@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // clip_idt_selftest.cpp
 // Headless selftest for Stage5 per-clip input color transform into a common
 // 16-bit compositing space.
@@ -395,5 +396,6 @@ int runClipIdtSelftest()
 
     std::printf("[clip-idt] summary: gates=13 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

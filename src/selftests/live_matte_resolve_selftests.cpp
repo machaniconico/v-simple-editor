@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // live_matte_resolve_selftests.cpp
 // Headless selftest for the pure clipstack::resolveLiveMatteSources resolver
 // (src/playback/LiveMatteResolve.{h,cpp}), the STAGE4B live track-matte index
@@ -172,5 +173,6 @@ int runLiveMatteResolveSelftest()
 
     std::printf("[live-matte-resolve] Result: %d/%d PASSED\n",
                 passed, passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed; // 0 = all PASS
 }

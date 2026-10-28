@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Clip LUT selftest.
 //
 // Verifies the GAP-4 contract: ProjectFile persists per-clip LUT fields,
@@ -388,5 +389,6 @@ int runClipLutSelftest()
 
     qInfo().noquote() << QStringLiteral("[clip-lut] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : failed;
 }

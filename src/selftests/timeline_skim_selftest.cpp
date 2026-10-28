@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../ThumbnailCache.h"
 #include "../UndoManager.h"
@@ -175,5 +176,6 @@ int runTimelineSkimSelftest()
         && timeline.undoManager()->currentIndex() == undoIndex
         && timeline.undoManager()->historyDescriptions() == history);
     std::fprintf(stderr, "[timeline-skim] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../ProjectFile.h"
@@ -174,5 +175,6 @@ int runClipEnableSelftest()
         && !timeline.setClipEnabled(TrackKind::Video, 1, 0, true));
     clipenabletest::setBypass(false);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

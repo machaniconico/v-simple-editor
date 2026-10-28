@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // clip_odt_selftest.cpp
 // Headless selftest for Stage6 per-clip linear working space and ODT engine.
 
@@ -459,5 +460,6 @@ int runClipOdtSelftest()
 
     std::printf("[clip-odt] summary: gates=10 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

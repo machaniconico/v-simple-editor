@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/SpatialPathSelftest.cpp
 // AE-ANIM-2: 2D spatial Bezier position path regression gates.
 
@@ -448,5 +449,6 @@ int runSpatialPathSelftest()
     }
 
     std::printf("[spatial-path] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

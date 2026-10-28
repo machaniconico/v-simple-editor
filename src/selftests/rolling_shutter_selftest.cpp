@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
 #include "../ShaderEffect.h"
@@ -178,5 +179,6 @@ int runRollingShutterSelftest()
         && ShaderEffectLibrary::instance().findByName(
             QStringLiteral("RollingShutterRepair")).name.isEmpty());
     std::cerr << "summary: " << pass << " PASS, " << fail << " FAIL\n";
+    selftests::reportTally(pass, fail, 0);
     return fail;
 }

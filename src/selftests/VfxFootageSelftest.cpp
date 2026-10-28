@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectLibraryModel.h"
 #include "../LayerCompositor.h"
 #include "../Timeline.h"
@@ -298,5 +299,6 @@ int runVfxFootageSelftest()
 
     std::printf("[vfx-footage] RESULT passed=%d failed=%d skipped=%d\n",
                 passed, failed, skipped);
+    selftests::reportTally(passed, failed, skipped);
     return failed == 0 ? 0 : 1;
 }
