@@ -260,6 +260,11 @@ struct ClipInfo {
     // US-1505: per-clip expression bindings (propPath -> code), evaluated by
     // clipanim::applyDynamicOverlay after autoOrient and before the wiggle (empty by default).
     exprbind::ClipExpressionBindings expressions;
+    // US-1706: the clip's 3D extruded text (Text3DLayer::toJson()) and brush animation
+    // (BrushAnimation::toJson()), formerly the "track:clip" keyed MainWindow sidecars.
+    // Empty = none. A split leaves both on the left half only.
+    QJsonObject text3DConfig;
+    QJsonObject brushData;
 
     // Future multi-track compositing groundwork. 1.0 = opaque (current
     // V1-wins behaviour). <1.0 values are placeholders until the layered
@@ -945,6 +950,10 @@ public:
     // same undo rule as setClipWiggle (toJson() compared).
     bool setClipExpressions(int trackIndex, int clipIndex,
                             const exprbind::ClipExpressionBindings &bindings);
+    // US-1706: the 3D text config / brush data of video clip (trackIndex, clipIndex)
+    // (empty = none), with the same undo rule as setClipWiggle (JSON compared).
+    bool setClipText3DConfig(int trackIndex, int clipIndex, const QJsonObject &config);
+    bool setClipBrushData(int trackIndex, int clipIndex, const QJsonObject &brushData);
     // US-1505: the audio-level snapshot expressions read (audioLevel()). The one read
     // point: on the UI thread, a snapshot older than audioClipGeneration() (or none)
     // is rebuilt first through the rebuild hook; any other thread (the export render

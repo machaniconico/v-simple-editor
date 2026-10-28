@@ -1015,6 +1015,22 @@ bool timelineHasClipTimeRemap(const Timeline *timeline)
     return false;
 }
 
+// US-1706: any video clip carrying a 3D text (ClipInfo::text3DConfig).
+bool timelineHasClipText3D(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    for (const auto *track : timeline->videoTracks()) {
+        if (!track)
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (!clip.text3DConfig.isEmpty())
+                return true;
+        }
+    }
+    return false;
+}
+
 QString trackMatteTypeLabel(TrackMatteType type)
 {
     switch (type) {
@@ -3415,41 +3431,43 @@ QString MainWindow::brushClipId(int trackIdx, int clipIdx)
     return trackMatteClipKey(trackIdx, clipIdx);
 }
 
-void MainWindow::setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries)
+void MainWindow::clearLiveBrushAnimations()
 {
     for (auto it = m_liveBrushAnimations.cbegin(); it != m_liveBrushAnimations.cend(); ++it) {
-        if (it.value())
-            it.value()->deleteLater();
+        if (it.value().animation)
+            it.value().animation->deleteLater();
     }
     m_liveBrushAnimations.clear();
-    m_brushAnimationEntries = entries;
 }
 
-void MainWindow::upsertBrushAnimationEntry(const BrushAnimationEntry &entry)
-{
-    for (auto &existing : m_brushAnimationEntries) {
-        if (existing.clipId == entry.clipId) {
-            existing = entry;
-            return;
-        }
-    }
-    m_brushAnimationEntries.append(entry);
-}
-
+// US-1706: the brush is ClipInfo::brushData of the video clip `clipId` names; the live
+// object is rebuilt whenever the clip there no longer has the data it was built from.
 BrushAnimation *MainWindow::materializeBrushAnimation(const QString &clipId)
 {
-    if (auto *live = m_liveBrushAnimations.value(clipId, nullptr))
-        return live;
+    QJsonObject brushData;
+    const QStringList parts = clipId.split(QLatin1Char(':'));
+    const TimelineTrack *track = m_timeline && parts.size() == 2
+        ? m_timeline->videoTracks().value(parts[0].toInt(), nullptr) : nullptr;
+    const int clipIdx = parts.size() == 2 ? parts[1].toInt() : -1;
+    if (track && clipIdx >= 0 && clipIdx < track->clipCount())
+        brushData = track->clips().at(clipIdx).brushData;
 
-    for (const auto &entry : m_brushAnimationEntries) {
-        if (entry.clipId != clipId)
-            continue;
-        auto *animation = new BrushAnimation(this);
-        animation->fromJson(entry.brushData);
-        m_liveBrushAnimations.insert(clipId, animation);
-        return animation;
+    const LiveBrushAnimation live = m_liveBrushAnimations.value(clipId);
+    if (live.animation && live.brushData == brushData)
+        return live.animation;
+    if (live.animation) {
+        // The preview may still hold the stale object; the caller binds again.
+        if (m_player && m_player->glPreview())
+            m_player->glPreview()->clearBrushAnimation();
+        live.animation->deleteLater();
     }
-    return nullptr;
+    m_liveBrushAnimations.remove(clipId);
+    if (brushData.isEmpty())
+        return nullptr;
+    auto *animation = new BrushAnimation(this);
+    animation->fromJson(brushData);
+    m_liveBrushAnimations.insert(clipId, LiveBrushAnimation{animation, brushData});
+    return animation;
 }
 
 void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
@@ -8550,7 +8568,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || m_timeRemapClipEntries.contains(clipId)
                 || clip.hasTimeRemap()
                 || trackMatteEntries.contains(clipId)
-                || m_text3DClipConfigs.contains(clipId)
+                || !clip.text3DConfig.isEmpty()
                 || (lightingEnabled && clip.material.acceptsLights);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
@@ -8688,10 +8706,9 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
             // US-3D-11: alpha-over a rendered 3D extruded-text layer when this
             // clip carries one. localSeconds is the clip-local time in seconds.
-            if (auto t3It = m_text3DClipConfigs.constFind(clipId);
-                t3It != m_text3DClipConfigs.cend() && !t3It.value().isEmpty()) {
+            if (!clip.text3DConfig.isEmpty()) {
                 Text3DLayer text3D;
-                text3D.fromJson(t3It.value());
+                text3D.fromJson(clip.text3DConfig);
                 const Camera3D &textCamera = text3D.camera();
                 const QImage textImage = shouldUseText3DPreviewProxy(text3D, frame.size(), text3DProxyThreshold)
                     ? renderText3DProxy(text3D, frame.size(), localSeconds, textCamera)
@@ -8843,7 +8860,7 @@ void MainWindow::refreshSpecialClipPreview()
         light3d::statesAt(m_projectLights, playheadSeconds));
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
-        && m_timeline->trackMatteEntries().isEmpty() && m_text3DClipConfigs.isEmpty()
+        && m_timeline->trackMatteEntries().isEmpty() && !timelineHasClipText3D(m_timeline)
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
@@ -8878,7 +8895,6 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
     data.storylineMode = m_timeline->storylineMode();
-    data.brushAnimations = m_brushAnimationEntries;
     data.rotoClipEntries.clear();
     const auto rotoEntries = m_timeline->rotoEntries();
     for (auto it = rotoEntries.cbegin(); it != rotoEntries.cend(); ++it)
@@ -8929,18 +8945,7 @@ void MainWindow::populateProjectData(ProjectData &data)
     std::sort(data.clipParentEntries.begin(), data.clipParentEntries.end(),
               [](const ClipParentEntry &a, const ClipParentEntry &b) { return a.clipId < b.clipId; });
 
-    // US-3D-11: motion-graphics sprint sidecars
-    data.text3DClipEntries.clear();
-    for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it) {
-        if (it.value().isEmpty())
-            continue;
-        Text3DClipEntry entry;
-        entry.clipId = it.key();
-        entry.config = it.value();
-        data.text3DClipEntries.append(entry);
-    }
-    std::sort(data.text3DClipEntries.begin(), data.text3DClipEntries.end(),
-              [](const Text3DClipEntry &a, const Text3DClipEntry &b) { return a.clipId < b.clipId; });
+    // US-3D-11 / US-1706: the 3D text and the brush are saved with the clips.
     data.projectCamera = m_projectCamera.toJson();
     data.projectLights = QJsonArray{};
     for (const Light3D &light : m_projectLights)
@@ -9124,7 +9129,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         m_recentFilesManager->addFile(filePath);
 
     m_projectConfig = data.config;
-    setBrushAnimationEntries(data.brushAnimations);
+    clearLiveBrushAnimations();
     // roto は restoreFromProject より前に carrier へ入れる (setClips は carrier を
     // 消さない)。読込後の undo 基線 (undoManager()->clear() + saveState) に入る。
     if (m_timeline) {
@@ -9158,12 +9163,6 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     }
     if (m_timeline)
         m_timeline->setClipParentEntries(parentEntries);
-    // US-3D-11: motion-graphics sprint sidecars
-    m_text3DClipConfigs.clear();
-    for (const auto &entry : data.text3DClipEntries) {
-        if (!entry.clipId.isEmpty() && !entry.config.isEmpty())
-            m_text3DClipConfigs.insert(entry.clipId, entry.config);
-    }
     m_parkedSidecarsByUid.clear();
     m_sidecarClipUidByKey.clear();
     m_projectCamera = Camera3D{};
@@ -9609,10 +9608,7 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
     m_particleClipConfigs = std::move(particles);
     // US-1302: the position-keyed sidecars take the new track numbers; a key on
     // the removed track goes.
-    QStringList keys = m_liveBrushAnimations.keys() + m_timeRemapClipEntries.keys()
-        + m_text3DClipConfigs.keys();
-    for (const auto &entry : std::as_const(m_brushAnimationEntries))
-        keys.append(entry.clipId);
+    const QStringList keys = m_liveBrushAnimations.keys() + m_timeRemapClipEntries.keys();
     Timeline::ClipKeyRemap remap;
     for (const QString &key : std::as_const(keys)) {
         const QStringList parts = key.split(QLatin1Char(':'));
@@ -9685,8 +9681,7 @@ void MainWindow::parkSidecars(const QString &key, const QString &uid)
     if (uid.isEmpty()) return;
     ParkedSidecars parked;
     if (m_timeRemapClipEntries.contains(key)) parked.timeRemap = m_timeRemapClipEntries.value(key);
-    if (m_text3DClipConfigs.contains(key)) parked.text3D = m_text3DClipConfigs.value(key);
-    if (parked.timeRemap || parked.text3D)
+    if (parked.timeRemap)
         m_parkedSidecarsByUid.insert(sidecarClipId(key, uid), parked);
 }
 
@@ -9709,33 +9704,29 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
             parkSidecars(key, uid);
     }
     rekeySidecarMap(m_sidecarClipUidByKey, remap);
+    // US-1706: the 3D text and the brush are on the clips. The live brush cache is not
+    // rekeyed: an entry whose key moves or goes is dropped, and materializeBrushAnimation
+    // builds it again from the clip's brushData.
     bool liveDropped = false;
-    for (auto it = m_liveBrushAnimations.cbegin(); it != m_liveBrushAnimations.cend(); ++it) {
-        if (it.value() && !remap.oldToNew.contains(it.key()) && remap.dropped.contains(it.key())) {
-            it.value()->deleteLater();
-            liveDropped = true;
+    for (auto it = m_liveBrushAnimations.begin(); it != m_liveBrushAnimations.end();) {
+        if (remap.oldToNew.contains(it.key()) || remap.dropped.contains(it.key())) {
+            if (it.value().animation) {
+                it.value().animation->deleteLater();
+                liveDropped = true;
+            }
+            it = m_liveBrushAnimations.erase(it);
+        } else {
+            ++it;
         }
     }
     if (liveDropped && m_player && m_player->glPreview())
         m_player->glPreview()->clearBrushAnimation();
-    rekeySidecarMap(m_liveBrushAnimations, remap);
     rekeySidecarMap(m_timeRemapClipEntries, remap);
     for (auto it = m_timeRemapClipEntries.begin(); it != m_timeRemapClipEntries.end(); ++it)
         it.value().clipId = it.key();
     syncTimeRemapEntriesToClips(m_timeRemapClipEntries, m_timeline->videoTracks());
-    rekeySidecarMap(m_text3DClipConfigs, remap);
-    QVector<BrushAnimationEntry> brushes;
-    for (BrushAnimationEntry entry : std::as_const(m_brushAnimationEntries)) {
-        const auto to = remap.oldToNew.constFind(entry.clipId);
-        if (to != remap.oldToNew.cend())
-            entry.clipId = to.value();
-        else if (remap.dropped.contains(entry.clipId))
-            continue;
-        brushes.append(entry);
-    }
-    m_brushAnimationEntries = std::move(brushes);
     // US-1320: the selection moved mid-mutation and bound the preview through the old
-    // keys; bind it again now that the brush maps carry the new ones.
+    // keys; bind it again now that the clips are in place.
     if (!remap.oldToNew.isEmpty() || !remap.dropped.isEmpty())
         syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
 }
@@ -9756,21 +9747,24 @@ void MainWindow::commitTimeRemapEntry(const QString &clipId, const timeremap::Ti
     refreshSpecialClipPreview();
 }
 
+// US-1706: the 3D text is ClipInfo::text3DConfig of the video clip `clipId` names
+// (Timeline::setClipText3DConfig; nullopt = none).
 void MainWindow::commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config)
 {
-    const auto old = m_text3DClipConfigs.constFind(clipId);
-    const bool had = old != m_text3DClipConfigs.cend();
-    if (had == config.has_value() && (!had || *old == *config)) return;
-    if (config) m_text3DClipConfigs.insert(clipId, *config);
-    else m_text3DClipConfigs.remove(clipId);
-    m_timeline->saveUndoState(QStringLiteral("3D テキストを変更"));
-    refreshSpecialClipPreview();
+    const QStringList parts = clipId.split(QLatin1Char(':'));
+    const TimelineTrack *track = m_timeline && parts.size() == 2
+        ? m_timeline->videoTracks().value(parts[0].toInt(), nullptr) : nullptr;
+    const int clipIdx = parts.size() == 2 ? parts[1].toInt() : -1;
+    if (!track || clipIdx < 0 || clipIdx >= track->clipCount()) return;
+    const QJsonObject value = config.value_or(QJsonObject());
+    if (track->clips().at(clipIdx).text3DConfig == value) return;
+    if (m_timeline->setClipText3DConfig(parts[0].toInt(), clipIdx, value))
+        refreshSpecialClipPreview();
 }
 
-// US-1302 undo rule: adding a brush animation records an undo point (its progress
-// keyframes), so the brush entries are carried by value. US-1401: so are the
-// timeRemap / text3D values, whose dialog commits record one
-// too. The clip each key names (clipUids: key -> uid) still rekeys the live brush.
+// US-1401: the timeRemap values are carried by value, since their dialog commits
+// record an undo point. The clip each key names (clipUids: key -> uid) rekeys them.
+// US-1706: the 3D text and the brush ride on the clips in the TimelineState.
 QJsonObject MainWindow::collectSidecarState()
 {
     QJsonObject clipUids;
@@ -9784,21 +9778,14 @@ QJsonObject MainWindow::collectSidecarState()
             m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
         }
     }
-    QJsonArray brushes;
-    for (const auto &entry : m_brushAnimationEntries)
-        brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
-    QJsonObject timeRemaps, text3Ds;
+    QJsonObject timeRemaps;
     // A split of a track's last clip moves no key, so no rekey ran: the undo point
     // takes the clips' curves here.
     syncTimeRemapEntriesToClips(m_timeRemapClipEntries, tracks);
     for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
         timeRemaps.insert(it.key(), it.value().curve.toJson());
-    for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it)
-        text3Ds.insert(it.key(), it.value());
     return QJsonObject{{"clipUids", clipUids},
-                       {"brushAnimations", brushes},
                        {"timeRemaps", timeRemaps},
-                       {"text3DConfigs", text3Ds},
                        {"sequenceId", m_timeline->activeSequenceId()},
                        {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
 }
@@ -9913,14 +9900,12 @@ void MainWindow::applySidecarState(const QJsonObject &state)
             entry.clipId = key;
             m_timeRemapClipEntries.insert(key, entry);
         }
-        if (parked->text3D && !m_text3DClipConfigs.contains(key))
-            m_text3DClipConfigs.insert(key, *parked->text3D);
         m_parkedSidecarsByUid.erase(parked);
     }
     m_sidecarClipUidByKey.clear();
     for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
         m_sidecarClipUidByKey.insert(it.key(), it.value().toString());
-    // US-1401: the two values are the snapshot's, keyed on the restored placement,
+    // US-1401: the timeRemap values are the snapshot's, keyed on the restored placement,
     // whatever the rekey above made of the live ones (in this sequence or another).
     if (state.contains("timeRemaps")) {
         m_timeRemapClipEntries.clear();
@@ -9929,34 +9914,8 @@ void MainWindow::applySidecarState(const QJsonObject &state)
             m_timeRemapClipEntries.insert(it.key(), TimeRemapClipEntry{
                 it.key(), timeremap::TimeRemapCurve::fromJson(it.value().toObject())});
     }
-    if (state.contains("text3DConfigs")) {
-        m_text3DClipConfigs.clear();
-        const QJsonObject values = state.value("text3DConfigs").toObject();
-        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
-            m_text3DClipConfigs.insert(it.key(), it.value().toObject());
-    }
-
-    QVector<BrushAnimationEntry> brushes;
-    for (const auto &value : state.value("brushAnimations").toArray()) {
-        const QJsonObject obj = value.toObject();
-        BrushAnimationEntry entry;
-        entry.clipId = obj.value("clipId").toString();
-        entry.brushData = obj.value("brushData").toObject();
-        brushes.append(entry);
-    }
-    const auto sameBrushes = [&] {
-        if (brushes.size() != m_brushAnimationEntries.size()) return false;
-        for (int i = 0; i < brushes.size(); ++i)
-            if (brushes[i].clipId != m_brushAnimationEntries[i].clipId
-                || brushes[i].brushData != m_brushAnimationEntries[i].brushData) return false;
-        return true;
-    };
-    if (sameBrushes()) return;
-    // The live animations are rebuilt lazily; the preview drops its pointer first and
-    // takes a new one when restoreState re-selects the clip.
-    if (m_player && m_player->glPreview())
-        m_player->glPreview()->clearBrushAnimation();
-    setBrushAnimationEntries(brushes);
+    // US-1706: the 3D text and the brush come back with the clips; the live brush
+    // cache rebuilds from them when restoreState re-selects the clip.
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -14822,21 +14781,36 @@ void MainWindow::addBrushAnimation()
     const int selectedIdx = m_timeline->selectedVideoClipIndex();
     const int clipIdx = (selectedIdx >= 0 && selectedIdx < clips.size()) ? selectedIdx : 0;
     const QString clipId = brushClipId(trackIdx, clipIdx);
+    TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track || track->isLocked()) {
+        statusBar()->showMessage("ブラシアニメ追加失敗 — トラックがロックされています");
+        brushAnim->deleteLater();
+        return;
+    }
 
-    BrushAnimationEntry entry;
-    entry.clipId = clipId;
-    entry.brushData = brushAnim->toJson();
-    upsertBrushAnimationEntry(entry);
-
-    if (auto *previous = m_liveBrushAnimations.value(clipId, nullptr))
-        previous->deleteLater();
-    m_liveBrushAnimations.insert(clipId, brushAnim);
-
-    // The keyframes go on the clip the brush was put on, so the undo point this
-    // records always carries the new entry (with no selection too).
+    // US-1706: the brush goes on the clip (ClipInfo::brushData) with its progress
+    // keyframes, in one undo point: the keyframes are put on the clip first and
+    // Timeline::setClipBrushData records both (an unchanged brush records the
+    // keyframes' point, as before).
+    const QJsonObject brushData = brushAnim->toJson();
     KeyframeManager km = clips[clipIdx].keyframes;
     ensureBrushProgressTrack(km);
-    m_timeline->setClipKeyframes(TrackKind::Video, trackIdx, clipIdx, km);
+    if (track->clips().at(clipIdx).brushData == brushData) {
+        m_timeline->setClipKeyframes(TrackKind::Video, trackIdx, clipIdx, km);
+    } else {
+        QVector<ClipInfo> updated = track->clips();
+        updated[clipIdx].keyframes = km;
+        track->setClips(updated);
+        m_timeline->setClipBrushData(trackIdx, clipIdx, brushData);
+    }
+
+    const LiveBrushAnimation previous = m_liveBrushAnimations.value(clipId);
+    if (previous.animation && previous.animation != brushAnim) {
+        if (m_player && m_player->glPreview())
+            m_player->glPreview()->clearBrushAnimation();
+        previous.animation->deleteLater();
+    }
+    m_liveBrushAnimations.insert(clipId, LiveBrushAnimation{brushAnim, brushData});
 
     syncBrushAnimationPreviewForClip(trackIdx, clipIdx);
 
@@ -15295,9 +15269,9 @@ void MainWindow::open3DExtrudedText()
 
     Text3DExtrusionDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("3D 押し出しテキスト - %1").arg(clip.displayName));
-    if (m_text3DClipConfigs.contains(clipId)) {
+    if (!clip.text3DConfig.isEmpty()) {
         Text3DLayer seed;
-        seed.fromJson(m_text3DClipConfigs.value(clipId));
+        seed.fromJson(clip.text3DConfig);
         dialog.setLayer(seed);
     }
     if (dialog.exec() != QDialog::Accepted)

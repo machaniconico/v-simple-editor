@@ -196,8 +196,8 @@ extern "C" {
 //        point (none for an equal value) undone to none and redone; they save / open with the
 //        clip (clip key "expressions" on V1[1] only); a legacy root "expressionBindingsEntries"
 //        "0:1" moves onto V1[1] through ProjectFile::load / fromJsonString / MainWindow's open and
-//        is not written again; RenderQueue::resolveTimeline has them (and no audio-level
-//        snapshot: level 0, user decision D); a split puts them on both halves; with
+//        is not written again; RenderQueue::resolveTimeline has them (and, since US-1709, the
+//        audio-level snapshot); a split puts them on both halves; with
 //        VEDITOR_SMART_RENDER=1 a full-length V1 clip with transform.position.x = 0.3 is encoded
 //        (moved at 0.5 s), not stream-copied. Detects: HEAD has no ClipInfo::expressions (and
 //        the root section is written there); hasAnyDynamicTransform ignoring the bindings.
@@ -927,15 +927,102 @@ struct ClipExpressionView {
     }
 };
 
+// US-1706: the 3D text is ClipInfo::text3DConfig and the brush ClipInfo::brushData, no
+// MainWindow maps. G32 / G34 / G36 read them through these views of the Timeline's video
+// clips ("t:i"), where a non-empty value is an entry; insert / append / clear write the
+// clips directly with no undo point, as the map writes did.
+static const ClipInfo *viewClipAt(Timeline *tl, const QString &key)
+{
+    const QStringList parts = key.split(QLatin1Char(':'));
+    const TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+    const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+    return track && index >= 0 && index < track->clipCount() ? &track->clips().at(index) : nullptr;
+}
+
+static void viewWriteClip(Timeline *tl, const QString &key, QJsonObject ClipInfo::*field,
+                          const QJsonObject &value)
+{
+    const QStringList parts = key.split(QLatin1Char(':'));
+    TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+    const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+    if (!track || index < 0 || index >= track->clipCount()) return;
+    QVector<ClipInfo> clips = track->clips();
+    clips[index].*field = value;
+    track->setClips(clips);
+}
+
+static void viewClearField(Timeline *tl, QJsonObject ClipInfo::*field)
+{
+    for (TimelineTrack *track : tl->videoTracks()) {
+        QVector<ClipInfo> clips = track->clips();
+        bool changed = false;
+        for (ClipInfo &clip : clips) {
+            if ((clip.*field).isEmpty()) continue;
+            clip.*field = QJsonObject();
+            changed = true;
+        }
+        if (changed) track->setClips(clips);
+    }
+}
+
+struct ClipText3DView {
+    Timeline *tl = nullptr;
+    QJsonObject value(const QString &key) const
+    {
+        const ClipInfo *clip = viewClipAt(tl, key);
+        return clip ? clip->text3DConfig : QJsonObject();
+    }
+    bool contains(const QString &key) const { return !value(key).isEmpty(); }
+    QStringList keys() const
+    {
+        QStringList out;
+        const auto &tracks = tl->videoTracks();
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c = 0; c < tracks[t]->clipCount(); ++c)
+                if (!tracks[t]->clips().at(c).text3DConfig.isEmpty()) out.append(trackMatteClipKey(t, c));
+        return out;
+    }
+    void insert(const QString &key, const QJsonObject &config) const
+    {
+        viewWriteClip(tl, key, &ClipInfo::text3DConfig, config);
+    }
+    void clear() const { viewClearField(tl, &ClipInfo::text3DConfig); }
+};
+
+struct ClipBrushView {
+    Timeline *tl = nullptr;
+    QVector<BrushAnimationEntry> entries() const
+    {
+        QVector<BrushAnimationEntry> out;
+        const auto &tracks = tl->videoTracks();
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c = 0; c < tracks[t]->clipCount(); ++c)
+                if (!tracks[t]->clips().at(c).brushData.isEmpty())
+                    out.append(BrushAnimationEntry{trackMatteClipKey(t, c), tracks[t]->clips().at(c).brushData});
+        return out;
+    }
+    template <typename Pred>
+    bool any(Pred pred) const
+    {
+        const QVector<BrushAnimationEntry> all = entries();
+        return std::any_of(all.cbegin(), all.cend(), pred);
+    }
+    void append(const BrushAnimationEntry &entry) const
+    {
+        viewWriteClip(tl, entry.clipId, &ClipInfo::brushData, entry.brushData);
+    }
+    void clear() const { viewClearField(tl, &ClipInfo::brushData); }
+};
+
 // G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
 // runConnectedClipSelftest hands over.
 struct SidecarView {
     QHash<QString, TimeRemapClipEntry> *timeRemap = nullptr;
-    QHash<QString, QJsonObject> *text3D = nullptr;
+    const ClipText3DView *text3D = nullptr;
     const ClipExpressionView *expressions = nullptr;
     const ClipWiggleView *wiggle = nullptr;
-    QVector<BrushAnimationEntry> *brush = nullptr;
-    QHash<QString, BrushAnimation *> *liveBrush = nullptr;
+    const ClipBrushView *brush = nullptr;
+    void (MainWindow::*clearLiveBrush)() = nullptr;
     BrushAnimation *(MainWindow::*materializeBrush)(const QString &) = nullptr;
     void (MainWindow::*addBrush)() = nullptr;
     bool (MainWindow::*save)(const QString &, QString *) = nullptr;
@@ -958,9 +1045,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
         view.expressions->clear();
         view.wiggle->clear();
         view.brush->clear();
-        for (BrushAnimation *live : std::as_const(*view.liveBrush))
-            if (live) live->deleteLater();
-        view.liveBrush->clear();
+        (window.*view.clearLiveBrush)();
     };
     auto sortedKeys = [](QStringList keys) { keys.sort(); return keys.join(','); };
     // Where each kind sits, the timeRemap value's own clipId in brackets.
@@ -969,7 +1054,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
         for (auto it = view.timeRemap->cbegin(); it != view.timeRemap->cend(); ++it)
             remaps.append(it.key() + QStringLiteral("(") + it.value().clipId + QStringLiteral(")"));
         QStringList brushes;
-        for (const BrushAnimationEntry &entry : std::as_const(*view.brush))
+        for (const BrushAnimationEntry &entry : view.brush->entries())
             brushes.append(entry.clipId);
         return QStringLiteral("tr=%1 wg=%2 t3=%3 ex=%4 br=%5")
             .arg(sortedKeys(remaps), sortedKeys(view.wiggle->keys()), sortedKeys(view.text3D->keys()),
@@ -1012,7 +1097,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
             && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32")
             && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("50")
             && view.timeRemap->value(key).curve.keys.size() == 2
-            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+            && view.brush->any([&key](const BrushAnimationEntry &entry) {
                    return entry.clipId == key
                        && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32");
                });
@@ -1033,8 +1118,11 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
     const bool deleted = tl.deleteClipByIndex(false, 1, 0, false, &err);
     const QString after1 = where();
     const QString owner1 = owner(QStringLiteral("1:0"));
-    const bool liveMoved = live && view.liveBrush->value(QStringLiteral("1:0")) == live
-        && !view.liveBrush->contains(QStringLiteral("1:1"));
+    // US-1706: the live brush is rebuilt from the clip now at "1:0" (b's data), none at "1:1".
+    BrushAnimation *liveAt0 = (window.*view.materializeBrush)(QStringLiteral("1:0"));
+    const bool liveMoved = live && liveAt0
+        && liveAt0->toJson().value(QStringLiteral("text")).toString() == QStringLiteral("G32")
+        && !(window.*view.materializeBrush)(QStringLiteral("1:1"));
     const bool ok1 = deleted && after1 == at(QStringLiteral("1:0")) && owner1 == QStringLiteral("b")
         && valuesIntact(QStringLiteral("1:0")) && liveMoved;
 
@@ -1181,7 +1269,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
         (window.*view.addBrush)();
     }
     auto brushOnX = [&] {
-        return std::any_of(view.brush->cbegin(), view.brush->cend(), [](const BrushAnimationEntry &entry) {
+        return view.brush->any([](const BrushAnimationEntry &entry) {
             return entry.clipId == QStringLiteral("0:0") && !entry.brushData.isEmpty();
         });
     };
@@ -1296,7 +1384,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
             && view.text3D->value(key).value(QStringLiteral("text")).toString() == QStringLiteral("G32c")
             && view.expressions->value(key).expression(QStringLiteral("transform.opacity")) == QStringLiteral("60")
             && view.timeRemap->value(key).curve.keys.size() == 3
-            && std::any_of(view.brush->cbegin(), view.brush->cend(), [&key](const BrushAnimationEntry &entry) {
+            && view.brush->any([&key](const BrushAnimationEntry &entry) {
                    return entry.clipId == key
                        && entry.brushData.value(QStringLiteral("text")).toString() == QStringLiteral("G32c");
                });
@@ -1705,9 +1793,9 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     const QString inOther = tagsAt(b8Key);
     tl.undo();
     const QString afterSeqUndo = tagsAt(b8Key);
-    // US-1505: the expressions ride on b's clip like the wiggle, so G36's "1:0" (clip z) has
-    // none (formerly the position-keyed map value 81).
-    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=-")
+    // US-1505 / US-1706: the expressions and the 3D text ride on b's clip like the wiggle, so
+    // G36's "1:0" (clip z) has none (formerly the position-keyed map value 81).
+    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=- ex=-")
         && afterSeqUndo == tagged(81);
     if (!seqBefore.isEmpty()) tl.setActiveSequence(seqBefore);
 
@@ -1761,7 +1849,7 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                  "(default, expect same) noEntry=%d ->%d (amplitude 5, expect +1) entry=%d undo noEntry=%d ok=%d\n",
                  selected, qPrintable(selectErr), dialogs, others, d7, d7Default, defaultNoEntry, d7Set, setEntry,
                  undoNoEntry, ok7);
-    std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=81 "
+    std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=- "
                  "ex=-) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
                  qPrintable(inOther), qPrintable(afterSeqUndo), qPrintable(tagged(81)), ok8);
     std::fprintf(stderr, "connected-clip G36 (9) committed %s, written directly %s (expect %s) depth %d->%d (expect same) "
@@ -2142,7 +2230,8 @@ void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline
     const bool ok3 = loadMigrated && resavedNoSection && stringMigrated && openMigrated;
 
     // (4) the file-backed export Timeline (RenderQueue::resolveTimeline) of the legacy and of
-    // the MainWindow-saved project: the bindings on e, and no audio-level snapshot (level 0).
+    // the MainWindow-saved project: the bindings on e, and the audio-level snapshot published
+    // (US-1709: file-based render jobs get the expression audio envelope).
     auto resolved = [](const QString &path, bool *noSnapshot) {
         RenderJob job;
         job.projectFilePath = path;
@@ -2158,7 +2247,7 @@ void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline
     bool legacyNoSnapshot = false, savedNoSnapshot = false;
     const exprbind::ClipExpressionBindings resolvedLegacy = resolved(legacyPath, &legacyNoSnapshot);
     const exprbind::ClipExpressionBindings resolvedSaved = resolved(savedPath, &savedNoSnapshot);
-    const bool ok4 = isEb(resolvedLegacy) && isEb(resolvedSaved) && legacyNoSnapshot && savedNoSnapshot;
+    const bool ok4 = isEb(resolvedLegacy) && isEb(resolvedSaved) && !legacyNoSnapshot && !savedNoSnapshot;
 
     // (5) a split of the expression clip: both halves carry the bindings.
     load(tl, {{clipFor("e", 4.0)}});
@@ -2277,7 +2366,7 @@ void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline
                  loadMigrated, resaved, int(resavedRoot.contains(section)), stringLoaded, stringMigrated,
                  legacyOpened, qPrintable(legacyOpenErr), openMigrated, ok3);
     std::fprintf(stderr, "connected-clip G38 (4) resolveTimeline legacy bindings=%d no snapshot=%d | saved bindings=%d "
-                 "no snapshot=%d ok=%d\n", int(isEb(resolvedLegacy)), int(legacyNoSnapshot),
+                 "no snapshot=%d (expect 0, US-1709) ok=%d\n", int(isEb(resolvedLegacy)), int(legacyNoSnapshot),
                  int(isEb(resolvedSaved)), int(savedNoSnapshot), ok4);
     std::fprintf(stderr, "connected-clip G38 (5) set=%d split=%d [%s] pieces=%d (expect 2) both halves carry them=%d "
                  "ok=%d\n", set5, split, qPrintable(splitErr), pieces, int(halvesEb), ok5);
@@ -2290,7 +2379,7 @@ void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline
                "the clip expression commit recorded no / an extra undo point or did not undo / redo, the "
                "bindings did not save and open with the clip, a legacy root expressionBindingsEntries section "
                "was not moved onto V1[1] by load / fromJsonString / open or was written again, the file-backed "
-               "export Timeline lost them (or had a snapshot), a split left a half without them, or Smart Render "
+               "export Timeline lost them (or had no audio snapshot), a split left a half without them, or Smart Render "
                "stream-copied an expression clip");
 }
 
@@ -2366,9 +2455,7 @@ void brushPreviewRebindGate(selftest::GateTally &tally, MainWindow &window, Time
     }
     auto clearBrushes = [&] {
         view.brush->clear();
-        for (BrushAnimation *live : std::as_const(*view.liveBrush))
-            if (live) live->deleteLater();
-        view.liveBrush->clear();
+        (window.*view.clearLiveBrush)();
     };
     struct Run {
         bool dropped = false;
@@ -2384,7 +2471,7 @@ void brushPreviewRebindGate(selftest::GateTally &tally, MainWindow &window, Time
     // Each brush entry as "key=name of the V1 clip at that key".
     auto brushOwners = [&] {
         QStringList owners;
-        for (const BrushAnimationEntry &entry : std::as_const(*view.brush)) {
+        for (const BrushAnimationEntry &entry : view.brush->entries()) {
             const QStringList parts = entry.clipId.split(QLatin1Char(':'));
             const TimelineTrack *track = parts.size() == 2 ? tl.trackAt(false, parts[0].toInt()) : nullptr;
             const int index = parts.size() == 2 ? parts[1].toInt() : -1;
@@ -2412,7 +2499,7 @@ void brushPreviewRebindGate(selftest::GateTally &tally, MainWindow &window, Time
         r.selectedAfter = tl.trackAt(false, 0)->selectedClip();
         r.bound = (window.*view.brushPreviewClipId)();
         QStringList keys;
-        for (const BrushAnimationEntry &entry : std::as_const(*view.brush))
+        for (const BrushAnimationEntry &entry : view.brush->entries())
             keys.append(entry.clipId);
         r.brushKeys = keys.join(',');
         // The drop's undo point must carry the rekeyed brush (HEAD: the old key "0:1",
@@ -5184,6 +5271,9 @@ int runConnectedClipSelftest()
 
     // US-1504: G32 / G36 read and commit the wiggle on the Timeline's clips.
     const ClipWiggleView wiggleView{mainTimeline};
+    // US-1706: and the 3D text / brush.
+    const ClipText3DView text3DView{mainTimeline};
+    const ClipBrushView brushView{mainTimeline};
     // US-1505: and the expression bindings.
     const ClipExpressionView expressionView{mainTimeline};
 
@@ -5193,11 +5283,11 @@ int runConnectedClipSelftest()
     } else {
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
-        view.text3D = &window.m_text3DClipConfigs;
+        view.text3D = &text3DView;
         view.expressions = &expressionView;
         view.wiggle = &wiggleView;
-        view.brush = &window.m_brushAnimationEntries;
-        view.liveBrush = &window.m_liveBrushAnimations;
+        view.brush = &brushView;
+        view.clearLiveBrush = &MainWindow::clearLiveBrushAnimations;
         view.materializeBrush = &MainWindow::materializeBrushAnimation;
         view.addBrush = &MainWindow::addBrushAnimation;
         view.save = &MainWindow::saveProjectToPath;
@@ -5212,8 +5302,8 @@ int runConnectedClipSelftest()
         tally.gate(34, false, "MainWindow has no mainTimeline");
     } else {
         SidecarView view;
-        view.brush = &window.m_brushAnimationEntries;
-        view.liveBrush = &window.m_liveBrushAnimations;
+        view.brush = &brushView;
+        view.clearLiveBrush = &MainWindow::clearLiveBrushAnimations;
         view.brushPreviewClipId = &MainWindow::brushPreviewClipIdForTest;
         brushPreviewRebindGate(tally, window, *mainTimeline, view);
     }
@@ -5235,7 +5325,7 @@ int runConnectedClipSelftest()
     } else {
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
-        view.text3D = &window.m_text3DClipConfigs;
+        view.text3D = &text3DView;
         view.expressions = &expressionView;
         view.wiggle = &wiggleView;
         view.save = &MainWindow::saveProjectToPath;

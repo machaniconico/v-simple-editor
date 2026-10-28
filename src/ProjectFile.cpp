@@ -810,17 +810,8 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["planarTracks"] = ptArr;
     }
 
-    // US-BRUSH-5: brush animations
-    {
-        QJsonArray baArr;
-        for (const auto &entry : data.brushAnimations) {
-            QJsonObject obj;
-            obj["clipId"] = entry.clipId;
-            obj["brushData"] = entry.brushData;
-            baArr.append(obj);
-        }
-        root["brushAnimations"] = baArr;
-    }
+    // US-BRUSH-5 / US-1706: the brush animations are on the clips (clip JSON "brush");
+    // the legacy root section "brushAnimations" is no longer written.
 
     // US-AETEXT-12: AE text features
     {
@@ -927,15 +918,8 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
-    // US-3D-11: motion-graphics sprint persistence
-    {
-        QJsonArray t3Arr;
-        for (const auto &entry : data.text3DClipEntries) {
-            if (!entry.config.isEmpty())
-                t3Arr.append(text3DClipEntryToJson(entry));
-        }
-        root["text3DClipEntries"] = t3Arr;
-    }
+    // US-3D-11 / US-1706: the 3D text is on the clips (clip JSON "text3D"); the legacy
+    // root section "text3DClipEntries" is no longer written.
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
@@ -1160,17 +1144,8 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.planarTracks.append(planarTrackFromJson(v.toObject()));
     }
 
-    // US-BRUSH-5: brush animations — backward compat: missing key = empty list
-    data.brushAnimations.clear();
-    if (root.contains("brushAnimations")) {
-        for (const auto &v : root["brushAnimations"].toArray()) {
-            QJsonObject obj = v.toObject();
-            BrushAnimationEntry entry;
-            entry.clipId = obj["clipId"].toString();
-            entry.brushData = obj["brushData"].toObject();
-            data.brushAnimations.append(entry);
-        }
-    }
+    // US-BRUSH-5 / US-1706: the legacy root section "brushAnimations" moves onto the
+    // clips in migrateLegacyClipSidecars.
 
     // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
     data.pathTexts.clear();
@@ -1264,13 +1239,8 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
 
-    // US-3D-11: motion-graphics sprint persistence — backward compat:
-    // missing key = empty / disabled.
-    data.text3DClipEntries.clear();
-    if (root.contains("text3DClipEntries")) {
-        for (const auto &v : root["text3DClipEntries"].toArray())
-            data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
-    }
+    // US-3D-11: motion-graphics sprint persistence. US-1706: the legacy root sections
+    // "text3DClipEntries" / "brushAnimations" move onto the clips here too.
     migrateLegacyClipSidecars(root, data);
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
@@ -1466,17 +1436,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["planarTracks"] = ptArr;
     }
 
-    // US-BRUSH-5: brush animations
-    {
-        QJsonArray baArr;
-        for (const auto &entry : data.brushAnimations) {
-            QJsonObject obj;
-            obj["clipId"] = entry.clipId;
-            obj["brushData"] = entry.brushData;
-            baArr.append(obj);
-        }
-        root["brushAnimations"] = baArr;
-    }
+    // US-BRUSH-5 / US-1706: the brush animations are on the clips (clip JSON "brush");
+    // the legacy root section "brushAnimations" is no longer written.
 
     // US-AETEXT-12: AE text features
     {
@@ -1578,15 +1539,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
-    // US-3D-11: motion-graphics sprint persistence
-    {
-        QJsonArray t3Arr;
-        for (const auto &entry : data.text3DClipEntries) {
-            if (!entry.config.isEmpty())
-                t3Arr.append(text3DClipEntryToJson(entry));
-        }
-        root["text3DClipEntries"] = t3Arr;
-    }
+    // US-3D-11 / US-1706: the 3D text is on the clips (clip JSON "text3D"); the legacy
+    // root section "text3DClipEntries" is no longer written.
     if (!data.projectCamera.isEmpty())
         root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
     if (!data.projectLights.isEmpty())
@@ -1757,17 +1711,8 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.planarTracks.append(planarTrackFromJson(v.toObject()));
     }
 
-    // US-BRUSH-5: brush animations — backward compat: missing key = empty list
-    data.brushAnimations.clear();
-    if (root.contains("brushAnimations")) {
-        for (const auto &v : root["brushAnimations"].toArray()) {
-            QJsonObject obj = v.toObject();
-            BrushAnimationEntry entry;
-            entry.clipId = obj["clipId"].toString();
-            entry.brushData = obj["brushData"].toObject();
-            data.brushAnimations.append(entry);
-        }
-    }
+    // US-BRUSH-5 / US-1706: the legacy root section "brushAnimations" moves onto the
+    // clips in migrateLegacyClipSidecars.
 
     // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
     data.pathTexts.clear();
@@ -1861,13 +1806,8 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
 
-    // US-3D-11: motion-graphics sprint persistence — backward compat:
-    // missing key = empty / disabled.
-    data.text3DClipEntries.clear();
-    if (root.contains("text3DClipEntries")) {
-        for (const auto &v : root["text3DClipEntries"].toArray())
-            data.text3DClipEntries.append(text3DClipEntryFromJson(v.toObject()));
-    }
+    // US-3D-11: motion-graphics sprint persistence. US-1706: the legacy root sections
+    // "text3DClipEntries" / "brushAnimations" move onto the clips here too.
     migrateLegacyClipSidecars(root, data);
     data.projectCamera = root.contains("projectCamera")
         ? root["projectCamera"].toObject()
@@ -2078,6 +2018,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["wiggle"] = wiggle::toJson(clip.wiggle);
     if (!clip.expressions.isEmpty())
         obj["expressions"] = clip.expressions.toJson();
+    if (!clip.text3DConfig.isEmpty())
+        obj["text3D"] = clip.text3DConfig;
+    if (!clip.brushData.isEmpty())
+        obj["brush"] = clip.brushData;
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -2218,6 +2162,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         ? wiggle::fromJson(obj["wiggle"].toObject())
         : wiggle::WiggleParams{};
     clip.expressions.fromJson(obj["expressions"].toObject());
+    clip.text3DConfig = obj["text3D"].toObject();
+    clip.brushData = obj["brush"].toObject();
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();
@@ -3035,11 +2981,11 @@ WiggleClipEntry ProjectFile::wiggleClipEntryFromJson(const QJsonObject &obj)
     return entry;
 }
 
-// US-1504 / US-1505: the legacy root sections "wiggleClipEntries" and
-// "expressionBindingsEntries" ("track:clip" -> value, the active sequence's video
-// tracks) move onto the clips they name. The sections are read only here (load and
-// fromJsonString), data.wiggleClipEntries / data.expressionBindingsEntries stay empty,
-// and save / toJsonString never write them.
+// US-1504 / US-1505 / US-1706: the legacy root sections "wiggleClipEntries",
+// "expressionBindingsEntries", "text3DClipEntries" and "brushAnimations" ("track:clip"
+// -> value, the active sequence's video tracks) move onto the clips they name. The
+// sections are read only here (load and fromJsonString), the four ProjectData lists
+// stay empty, and save / toJsonString never write them.
 void ProjectFile::migrateLegacyClipSidecars(const QJsonObject &root, ProjectData &data)
 {
     auto clipAt = [&data](const QString &clipId) -> ClipInfo * {
@@ -3064,6 +3010,23 @@ void ProjectFile::migrateLegacyClipSidecars(const QJsonObject &root, ProjectData
         ClipInfo *clip = entry.bindings.isEmpty() ? nullptr : clipAt(entry.clipId);
         if (clip)
             clip->expressions = entry.bindings;
+    }
+    // US-1706: "text3DClipEntries" ({clipId, config}) and "brushAnimations"
+    // ({clipId, brushData}) the same way (an empty value is no entry).
+    data.text3DClipEntries.clear();
+    for (const auto &v : root.value(QStringLiteral("text3DClipEntries")).toArray()) {
+        const Text3DClipEntry entry = text3DClipEntryFromJson(v.toObject());
+        ClipInfo *clip = entry.config.isEmpty() ? nullptr : clipAt(entry.clipId);
+        if (clip)
+            clip->text3DConfig = entry.config;
+    }
+    data.brushAnimations.clear();
+    for (const auto &v : root.value(QStringLiteral("brushAnimations")).toArray()) {
+        const QJsonObject obj = v.toObject();
+        const QJsonObject brushData = obj.value(QStringLiteral("brushData")).toObject();
+        ClipInfo *clip = brushData.isEmpty() ? nullptr : clipAt(obj.value(QStringLiteral("clipId")).toString());
+        if (clip)
+            clip->brushData = brushData;
     }
 }
 
