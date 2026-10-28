@@ -12,6 +12,7 @@
 #include "../SequenceExport.h"
 #include "../TrackMatteKey.h"
 #include "../VideoPlayer.h"
+#include "../Text3DLayer.h"
 #include "../TimelineFrameRenderer.h"
 #include "../WarpDistortion.h"
 #include "../WiggleTransform.h"
@@ -26,6 +27,7 @@
 #include <QApplication>
 #include <QColor>
 #include <QDir>
+#include <QFont>
 #include <QPainter>
 #include <QImage>
 #include <QOpenGLContext>
@@ -204,7 +206,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 12; ++g)
+        for (int g = 1; g <= 13; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -246,7 +248,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 12; ++g)
+        for (int g = 5; g <= 13; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -549,6 +551,7 @@ int runSpecialCompositeSelftest()
         tally.skip(10, "no usable QOpenGLWidget context");
         tally.skip(11, "no usable QOpenGLWidget context");
         tally.skip(12, "no usable QOpenGLWidget context");
+        tally.skip(13, "no usable QOpenGLWidget context");
         return tally.finish("special-composite");
     }
     // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
@@ -1653,6 +1656,51 @@ int runSpecialCompositeSelftest()
     tally.gate(12, g12ok0 && g12ok1 && g12ok2,
                "the file-backed export took the roto fallback fps from somewhere other than the project "
                "fps for an unprobeable source (see values above)");
+
+    // G13 (US-1707): a 3D text clip on V1 (dx -0.25, scale 0.4, opacity 0.8, no
+    // mask) and an opaque clip on V2 (dx +0.25, scale 0.4) that do not overlap on
+    // screen, on a 320 px canvas (no preview proxy): buildSpecialClipComposite(t)
+    // == renderFrameAt(t) over every pixel (maxDiff 0). Stacking order is not
+    // tested here (text3d-export G4 covers it). Control: the export with the
+    // text differs from the export without it (HEAD: renderFrameAt drew no 3D
+    // text, so preview and export differed).
+    {
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        window.m_projectConfig.fps = kFps;
+        Text3DLayer g13Text;
+        g13Text.setText(QStringLiteral("SC13"), QFont(QStringLiteral("Arial"), 72));
+        g13Text.setExtrudeEnabled(true);
+        g13Text.setExtrude(0.35, 0.03, 0.03, 2);
+        g13Text.setCameraDistance(3.0);
+        ClipInfo g13Plain = base;
+        g13Plain.videoDx = -0.25;
+        g13Plain.videoScale = 0.4;
+        g13Plain.opacity = 0.8;
+        ClipInfo g13TextClip = g13Plain;
+        g13TextClip.text3DConfig = g13Text.toJson();
+        ClipInfo g13Cover = base;
+        g13Cover.filePath = varyPath;
+        g13Cover.videoDx = 0.25;
+        g13Cover.videoScale = 0.4;
+        const auto setTracks = [&](const ClipInfo &v1) {
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{v1}, {g13Cover}},
+                QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        };
+        const double g13t = 0.5;
+        setTracks(g13TextClip);
+        const QImage g13Preview = window.buildSpecialClipComposite(g13t);
+        const QImage g13Export = tlrender::renderFrameAt(timeline, qint64(g13t * 1000000.0), size);
+        setTracks(g13Plain);
+        const QImage g13ExportPlain = tlrender::renderFrameAt(timeline, qint64(g13t * 1000000.0), size);
+        const DiffStat g13 = compare(g13Preview, g13Export);
+        const DiffStat g13Text3D = compare(g13Export, g13ExportPlain);
+        std::cerr << "special-composite G13 previewNull=" << g13Preview.isNull()
+                  << " sizeMatch=" << g13.sizeMatch << " maxDiff=" << g13.maxDiff
+                  << " diffPixels=" << g13.diffPixels
+                  << " exportTextVsPlainDiffPixels=" << g13Text3D.diffPixels << " (HEAD 0)" << '\n';
+        tally.gate(13, varyOk && g13.sizeMatch && g13.maxDiff == 0 && g13Text3D.diffPixels > 100,
+                   "3D text preview/export mismatch (see values above)");
+    }
 
     return tally.finish("special-composite");
 }

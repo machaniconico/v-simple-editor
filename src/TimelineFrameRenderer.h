@@ -135,6 +135,17 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
                                     QSize outSize,
                                     qint64 timelineUsec);
 
+// US-1707: the native layer source renderFrameAt builds for clip `clipIdx` on
+// video track `trackIdx` at `usec` (roto -> VFX -> grade -> FX -> clip mask ->
+// 3D text), before fit, projection and placement. Null when that clip is not
+// the one the track shows at `usec` or decodes nothing. An empty `outSize`
+// means the project output size.
+QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                          qint64 usec, QSize outSize = QSize());
+// Number of clip layer sources built so far (V1, upper layers, transition
+// neighbours, renderClipSourceAt), for tests.
+quint64 clipLayerSourceCallsForTest();
+
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
                      double frameDurationUs);

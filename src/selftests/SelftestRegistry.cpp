@@ -273,6 +273,7 @@ int runSubtitleKaraokeSelftest();
 int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTcburnSelftest();
+int runText3dExportSelftest();
 int runText3dPreviewSelftest();
 int runTextBasedEditSelftest();
 int runTextExportSelftest();
@@ -760,7 +761,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (12 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (13 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
@@ -802,7 +803,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "filejob-parity", "VEDITOR_FILEJOB_PARITY_SELFTEST", runFileJobParitySelftest, true,
-      "File-backed RenderQueue job == live renderFrameAt under the project camera: animated trueProjection camera and auto-orient (3 gates)" },
+      "File-backed RenderQueue job == live renderFrameAt under the project camera: animated trueProjection camera and auto-orient (4 gates)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing (16 gates)" },
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
@@ -853,6 +854,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "WorkspaceManager: named layout CRUD + base64 blob JSON round-trip" },
     { "text-based-edit",   "VEDITOR_TEXT_BASED_EDIT_SELFTEST",    runTextBasedEditSelftest,      false,
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
+    { "text3d-export", "VEDITOR_TEXT3D_EXPORT_SELFTEST", runText3dExportSelftest, true,
+      "3D text export: drawn on the clip layer source after the mask and before placement, empty configs unchanged, z order, transform, time, worker thread, production path, transition neighbour (10 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
       "Text3D preview camera persistence and proxy policy checks" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,

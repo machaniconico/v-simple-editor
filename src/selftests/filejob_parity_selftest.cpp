@@ -1,4 +1,5 @@
 #include "../Camera3D.h"
+#include "../Text3DLayer.h"
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
 #include "../SequenceExport.h"
@@ -11,6 +12,7 @@
 
 #include <QColor>
 #include <QDir>
+#include <QFont>
 #include <QImage>
 #include <QPainter>
 #include <QSignalSpy>
@@ -190,6 +192,7 @@ int runFileJobParitySelftest()
         tally.gate(1, false, "temporary directory missing");
         tally.gate(2, false, "temporary directory missing");
         tally.gate(3, false, "temporary directory missing");
+        tally.gate(4, false, "temporary directory missing");
         return tally.finish("filejob-parity");
     }
     const QDir dir(tempDir.path());
@@ -268,6 +271,33 @@ int runFileJobParitySelftest()
         tally.gate(3, wavOk && !fileWith.isNull() && !fileWithout.isNull() && !live.isNull()
                           && audioDiff > 0 && liveDiff == 0,
                    "file job audioLevel() opacity ignores the linked audio or differs from the live frame");
+    }
+
+    // G4 (US-1707): a 2-D V1 layer carrying a 3D text. The file-backed job frame
+    // must differ from the same project without the text (HEAD: renderFrameAt
+    // ignored text3DConfig, so the two were identical) and equal the live frame.
+    {
+        ClipInfo clip = layerClip(false);
+        clip.is3DLayer = false;
+        clip.layer3D.rotationY = 0.0;
+        const ProjectData withoutText = projectWith(clip, Camera3D{});
+        Text3DLayer text;
+        text.setText(QStringLiteral("FJ4"), QFont(QStringLiteral("Arial"), 72));
+        text.setExtrudeEnabled(true);
+        text.setExtrude(0.35, 0.03, 0.03, 2);
+        text.setCameraDistance(3.0);
+        clip.text3DConfig = text.toJson();
+        const ProjectData withText = projectWith(clip, Camera3D{});
+        const QImage fileWith = renderFileJobFrame(dir, withText, QStringLiteral("g4a"), targetSec);
+        const QImage fileWithout = renderFileJobFrame(dir, withoutText, QStringLiteral("g4b"), targetSec);
+        const QImage live = liveFrame(withText, Camera3D{}, targetSec);
+        const qint64 textDiff = differingPixels(fileWith, fileWithout);
+        const qint64 liveDiff = differingPixels(fileWith, live);
+        std::cerr << "filejob-parity G4 withVsWithoutText=" << textDiff
+                  << " (HEAD 0) fileJobVsLive=" << liveDiff << '\n';
+        tally.gate(4, !fileWith.isNull() && !fileWithout.isNull() && !live.isNull()
+                          && textDiff > 100 && liveDiff == 0,
+                   "file job frame lost the 3D text or differs from the live frame");
     }
 
     return tally.finish("filejob-parity");
