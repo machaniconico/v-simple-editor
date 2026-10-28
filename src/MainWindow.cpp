@@ -3503,11 +3503,35 @@ void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
         return;
     }
 
-    const double progress = clips[clipIdx].keyframes.valueAt(
-        QStringLiteral("brush_progress"), 0.0, 0.0);
     m_brushPreviewClipIdForTest = clipId;
     m_player->glPreview()->setBrushAnimation(animation);
-    m_player->glPreview()->setBrushAnimationProgress(progress);
+    m_player->glPreview()->setBrushAnimationProgress(0.0);
+    updateBrushPreviewProgress(static_cast<double>(m_player->timelinePositionUs()) / AV_TIME_BASE);
+}
+
+// US-1708: the bound brush's progress follows the playhead: "brush_progress" of its
+// clip at the clip-local time export uses (tlrender::clipLocalSecAt). Only the
+// progress is set; the brush is not rebuilt and the preview repaints only when the
+// value changes.
+void MainWindow::updateBrushPreviewProgress(double timelineSec)
+{
+    if (m_brushPreviewClipIdForTest.isEmpty() || !m_timeline || !m_player
+        || !m_player->glPreview())
+        return;
+    const QStringList parts = m_brushPreviewClipIdForTest.split(QLatin1Char(':'));
+    if (parts.size() != 2)
+        return;
+    const int trackIdx = parts[0].toInt();
+    const int clipIdx = parts[1].toInt();
+    const TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
+    if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
+        return;
+    double localSec = 0.0;
+    if (!tlrender::clipLocalSecAt(m_timeline, trackIdx, clipIdx, timelineSec, &localSec))
+        return;
+    m_player->glPreview()->setBrushAnimationProgress(
+        track->clips().at(clipIdx).keyframes.valueAt(
+            QStringLiteral("brush_progress"), localSec, 0.0));
 }
 
 void MainWindow::setupUI()
@@ -3820,14 +3844,17 @@ void MainWindow::setupUI()
             m_timeline->setPlayheadPosition(seconds);
         }
         pushAnimatedHslPreview(seconds);
+        updateBrushPreviewProgress(seconds);
         emit playheadSecondsChanged(seconds);
     });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
+        updateBrushPreviewProgress(seconds);
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
+        updateBrushPreviewProgress(seconds);
         m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.

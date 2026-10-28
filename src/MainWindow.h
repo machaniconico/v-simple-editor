@@ -270,6 +270,7 @@ class MainWindow : public QMainWindow
     friend int runConnectedClipSelftest();
     friend int runMediaRelinkSelftest();
     friend int runMainWindowLifecycleSelftest();
+    friend int runBrushExportSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -885,6 +886,7 @@ private:
     void clearLiveBrushAnimations();
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
     void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
+    void updateBrushPreviewProgress(double timelineSec);
     // selftest: the clipId syncBrushAnimationPreviewForClip last bound (empty once cleared).
     QString m_brushPreviewClipIdForTest;
     QString brushPreviewClipIdForTest() const { return m_brushPreviewClipIdForTest; }

@@ -170,6 +170,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/effects_selftests.cpp
     src/selftests/Text3dPreviewSelftest.cpp
     src/selftests/text3d_export_selftest.cpp
+    src/selftests/brush_export_selftest.cpp
     src/selftests/AeFxBlurSelftest.cpp
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp

@@ -274,6 +274,7 @@ int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTcburnSelftest();
 int runText3dExportSelftest();
+int runBrushExportSelftest();
 int runText3dPreviewSelftest();
 int runTextBasedEditSelftest();
 int runTextExportSelftest();
@@ -803,7 +804,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "rolling-shutter", "VEDITOR_ROLLING_SHUTTER_SELFTEST", runRollingShutterSelftest, true,
       "Rolling shutter: bypass, repair, direction, last frame, determinism, presets (G1-G6)" },
     { "filejob-parity", "VEDITOR_FILEJOB_PARITY_SELFTEST", runFileJobParitySelftest, true,
-      "File-backed RenderQueue job == live renderFrameAt under the project camera: animated trueProjection camera and auto-orient (4 gates)" },
+      "File-backed RenderQueue job == live renderFrameAt under the project camera: animated trueProjection camera and auto-orient (5 gates)" },
     { "fxgrain-echo",      "VEDITOR_FXGRAIN_ECHO_SELFTEST",       runFxGrainEchoSelftest,         false,
       "FilmGrain deterministic CPU effect + Echo temporal compositor + preview routing (16 gates)" },
     { "flip-solid", "VEDITOR_FLIP_SOLID_SELFTEST", runFlipSolidSelftest, true,
@@ -856,6 +857,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     { "text3d-export", "VEDITOR_TEXT3D_EXPORT_SELFTEST", runText3dExportSelftest, true,
       "3D text export: drawn on the clip layer source after the mask and before placement, empty configs unchanged, z order, transform, time, worker thread, production path, transition neighbour (10 gates)" },
+    { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
+      "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (9 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
       "Text3D preview camera persistence and proxy policy checks" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,

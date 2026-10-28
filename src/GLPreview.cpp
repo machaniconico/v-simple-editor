@@ -1217,6 +1217,25 @@ void GLPreview::setBrushAnimation(BrushAnimation *animation)
     update();
 }
 
+// US-1708: the image paintGL uploads before motion / projection: the baked
+// project-camera frame or the decoded frame, with the bound brush drawn on the
+// decoded frame (never on the baked frame, which already holds every track).
+QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
+{
+    QImage frame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
+    if (m_brushAnimation && !cameraBaked) {
+        OverlayRenderer::renderBrushOverlay(frame,
+                                            m_brushAnimation,
+                                            m_brushAnimationProgress);
+    }
+    return frame;
+}
+
+QImage GLPreview::uploadFrameForTest() const
+{
+    return brushedUploadFrame(m_timeline && !m_projectCameraFrame.isNull());
+}
+
 void GLPreview::clearBrushAnimation()
 {
     m_brushAnimation = nullptr;
@@ -2114,12 +2133,7 @@ void GLPreview::paintGL()
     double renderDx = m_videoSourceDx;
     double renderDy = m_videoSourceDy;
     double clipOpacity = 1.0;
-    QImage uploadFrame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
-    if (m_brushAnimation && !cameraBaked) {
-        OverlayRenderer::renderBrushOverlay(uploadFrame,
-                                            m_brushAnimation,
-                                            m_brushAnimationProgress);
-    }
+    QImage uploadFrame = brushedUploadFrame(cameraBaked);
     if (previewMotion.valid && !cameraBaked) {
         renderScale = previewMotion.scale;
         renderDx = previewMotion.dx;

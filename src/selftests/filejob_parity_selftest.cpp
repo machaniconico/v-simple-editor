@@ -1,4 +1,6 @@
+#include "../BrushAnimation.h"
 #include "../Camera3D.h"
+#include "../Keyframe.h"
 #include "../Text3DLayer.h"
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
@@ -193,6 +195,7 @@ int runFileJobParitySelftest()
         tally.gate(2, false, "temporary directory missing");
         tally.gate(3, false, "temporary directory missing");
         tally.gate(4, false, "temporary directory missing");
+        tally.gate(5, false, "temporary directory missing");
         return tally.finish("filejob-parity");
     }
     const QDir dir(tempDir.path());
@@ -298,6 +301,34 @@ int runFileJobParitySelftest()
         tally.gate(4, !fileWith.isNull() && !fileWithout.isNull() && !live.isNull()
                           && textDiff > 100 && liveDiff == 0,
                    "file job frame lost the 3D text or differs from the live frame");
+    }
+
+    // G5 (US-1708): a 2-D V1 layer carrying a brush at progress 1. The file-backed job
+    // frame must differ from the same project without the brush (HEAD: renderFrameAt
+    // ignored brushData, so the two were identical) and equal the live frame.
+    {
+        ClipInfo clip = layerClip(false);
+        clip.is3DLayer = false;
+        clip.layer3D.rotationY = 0.0;
+        const ProjectData withoutBrush = projectWith(clip, Camera3D{});
+        BrushAnimation brush;
+        brush.setText(QStringLiteral("FJ5"), QFont(QStringLiteral("Arial"), 90), QPointF(30.0, 140.0));
+        brush.setBrushWidth(10.0);
+        clip.brushData = brush.toJson();
+        KeyframeTrack progress(QStringLiteral("brush_progress"), 0.0);
+        progress.addKeyframe(0.0, 1.0);
+        clip.keyframes.addTrack(progress);
+        const ProjectData withBrush = projectWith(clip, Camera3D{});
+        const QImage fileWith = renderFileJobFrame(dir, withBrush, QStringLiteral("g5a"), targetSec);
+        const QImage fileWithout = renderFileJobFrame(dir, withoutBrush, QStringLiteral("g5b"), targetSec);
+        const QImage live = liveFrame(withBrush, Camera3D{}, targetSec);
+        const qint64 brushDiff = differingPixels(fileWith, fileWithout);
+        const qint64 liveDiff = differingPixels(fileWith, live);
+        std::cerr << "filejob-parity G5 withVsWithoutBrush=" << brushDiff
+                  << " (HEAD 0) fileJobVsLive=" << liveDiff << '\n';
+        tally.gate(5, !fileWith.isNull() && !fileWithout.isNull() && !live.isNull()
+                          && brushDiff > 100 && liveDiff == 0,
+                   "file job frame lost the brush or differs from the live frame");
     }
 
     return tally.finish("filejob-parity");

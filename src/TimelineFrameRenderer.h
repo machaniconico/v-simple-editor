@@ -142,6 +142,22 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
 // means the project output size.
 QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
                           qint64 usec, QSize outSize = QSize());
+// US-1708: the stages renderClipLayerSourceStageForTest can stop at. Final is
+// renderClipSourceAt; AfterBrush is the roto'd raw with the clip's brush
+// strokes drawn, before VFX / grade (the image the preview uploads in its
+// non-composite-baked mode).
+enum class Stage { Final, AfterBrush };
+QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx,
+                                         int clipIdx, qint64 usec, Stage stage,
+                                         QSize outSize = QSize());
+// US-1708: the clip-local time export gives clip (trackIdx, clipIdx) at
+// `timelineSec`: the selected overlap interval's start while the clip is shown
+// inside a transition overlap, else its placement start (cursor + leadInSec
+// walk; a nested-sequence parent uses the parent's own placement). When the
+// track does not show the clip at `timelineSec` the value is the offset from the
+// placement start clamped into [0, effectiveDuration]. False on a bad index.
+bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                    double timelineSec, double *localSec);
 // Number of clip layer sources built so far (V1, upper layers, transition
 // neighbours, renderClipSourceAt), for tests.
 quint64 clipLayerSourceCallsForTest();
