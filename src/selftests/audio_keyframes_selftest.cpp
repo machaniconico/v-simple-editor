@@ -9,6 +9,7 @@
 #include <QApplication>
 #include <QElapsedTimer>
 #include <QTemporaryDir>
+#include <QThreadPool>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -294,7 +295,185 @@ int runAudioKeyframesSelftest()
                      int(unsetSampler), int(oneCache));
         gate(8, haveApp && g8Wavs && loudSampler && loud > 0.1 && silentSampler && silent == 0.0
             && !unsetSampler && unset == 0.0 && oneCache);
+
+        // G9-G11 (US-1710): publishing the expression audio snapshot (setExpressionAudioEnv)
+        // warms the envelopes that audioLevel() will read on audiokf::prefetchPool(). Each
+        // spec is {linkGroup, expression code} for a V1 clip and {linkGroup, wav path} for an
+        // audio clip; the env is published on the Timeline with a local cache.
+        struct VideoSpec { int linkGroup; QString code; };
+        struct AudioSpec { int linkGroup; QString path; };
+        const auto makeWav = [&](const QString &name) {
+            QByteArray pcm;
+            for (int i = 0; i < sr; ++i) {
+                pcm.append(char(0x00));
+                pcm.append(char(0x40));
+            }
+            const QString path = temp.filePath(name);
+            return libavcore::writePcm16AsWav(path, pcm, sr, 1, &error) ? path : QString();
+        };
+        const auto loadTimeline = [&](Timeline &timeline, const QVector<VideoSpec> &videos,
+                                      const QVector<AudioSpec> &audios, bool separateAudioTracks = false) {
+            QVector<ClipInfo> videoClips, audioClips;
+            for (const VideoSpec &spec : videos) {
+                ClipInfo video{};
+                video.displayName = QStringLiteral("g9 video");
+                video.duration = video.outPoint = 1.0;
+                video.linkGroup = spec.linkGroup;
+                video.expressions.setExpression(QStringLiteral("transform.opacity"), spec.code);
+                videoClips.append(video);
+            }
+            for (const AudioSpec &spec : audios) {
+                ClipInfo audio{};
+                audio.duration = audio.outPoint = 1.0;
+                audio.linkGroup = spec.linkGroup;
+                audio.filePath = spec.path;
+                audioClips.append(audio);
+            }
+            QVector<QVector<ClipInfo>> audioTracks;
+            if (separateAudioTracks) {
+                for (const ClipInfo &audio : audioClips)
+                    audioTracks.append(QVector<ClipInfo>{audio});
+            } else {
+                audioTracks.append(audioClips);
+            }
+            timeline.restoreFromProject(QVector<QVector<ClipInfo>>{videoClips}, audioTracks, 0.0, -1.0,
+                                        -1.0, 100);
+        };
+        struct DelayReset {
+            ~DelayReset() { audiokf::setDecodeDelayForTest(0); }
+        } delayReset;
+        const QString audioLevelCode = QStringLiteral("audioLevel() * 100");
+
+        // G9: two audioLevel() clips; after the publish both envelopes get cached in the
+        // background, so the first sampler call is fast and decodes nothing more.
+        // Control: the same sampler over a fresh cache that was never warmed pays the full
+        // 300 ms delay (what the first call costs without the prefetch).
+        const QString g9A = makeWav(QStringLiteral("g9-a.wav"));
+        const QString g9B = makeWav(QStringLiteral("g9-b.wav"));
+        bool g9Warm = false, g9Fast = false, g9NoMore = false, g9ControlSlow = false;
+        double g9FirstMs = -1.0, g9ControlMs = -1.0;
+        int g9Entries = 0, g9Invocations = 0;
+        if (haveApp && !g9A.isEmpty() && !g9B.isEmpty()) {
+            Timeline timeline;
+            loadTimeline(timeline, {{21, audioLevelCode}, {22, audioLevelCode}},
+                         {{21, g9A}, {22, g9B}});
+            const auto cache = std::make_shared<audiokf::EnvelopeCache>();
+            audiokf::setDecodeDelayForTest(300);
+            audiokf::resetInvocationCountForTest();
+            const int entriesBefore = audiokf::decodeDelayEntriesForTest();
+            timeline.setExpressionAudioEnv(timeline.buildExpressionAudioEnv(cache));
+            QElapsedTimer wait;
+            wait.start();
+            while (!(audiokf::decodeDelayEntriesForTest() == entriesBefore + 2
+                     && cache->isCachedForTest(g9A) && cache->isCachedForTest(g9B))
+                   && wait.elapsed() < 5000)
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            g9Warm = audiokf::decodeDelayEntriesForTest() == entriesBefore + 2
+                && cache->isCachedForTest(g9A) && cache->isCachedForTest(g9B);
+            const ClipInfo &first = timeline.videoTracks().value(0)->clips().first();
+            const auto sampler = timeline.expressionAudioLevelSampler(first, 0.0);
+            QElapsedTimer firstCall;
+            firstCall.start();
+            const int invBefore = audiokf::invocationCountForTest();
+            const double level = sampler ? sampler(0.5) : -1.0;
+            g9FirstMs = double(firstCall.nsecsElapsed()) / 1e6;
+            g9Invocations = audiokf::invocationCountForTest() - invBefore;
+            g9Fast = sampler && level > 0.1 && g9FirstMs < 50.0;
+            g9Entries = audiokf::decodeDelayEntriesForTest() - entriesBefore;
+            g9NoMore = g9Entries == 2;
+            // Control: no publish, no prefetch -> the first call decodes (>= 300 ms).
+            const auto coldCache = std::make_shared<audiokf::EnvelopeCache>();
+            audiokf::ExprAudioEnv coldEnv;
+            ClipInfo coldAudio{};
+            coldAudio.duration = coldAudio.outPoint = 1.0;
+            coldAudio.linkGroup = 21;
+            coldAudio.filePath = g9A;
+            coldEnv.audioClipsByTrack = QVector<QVector<ClipInfo>>{{coldAudio}};
+            coldEnv.cache = coldCache;
+            const auto coldSampler = audiokf::makeLinkedAudioSamplerFrom(coldEnv, 21, 0.0);
+            QElapsedTimer coldCall;
+            coldCall.start();
+            if (coldSampler) coldSampler(0.5);
+            g9ControlMs = double(coldCall.nsecsElapsed()) / 1e6;
+            g9ControlSlow = g9ControlMs >= 300.0;
+            audiokf::setDecodeDelayForTest(0);
+        }
+        audiokf::prefetchPool().waitForDone();
+        std::fprintf(stderr, "audio-keyframes G9 warm=%d firstCallMs=%.2f (expect < 50) entriesDelta=%d "
+                     "(expect 2) invocationsDelta=%d (expect 1) controlColdMs=%.2f (expect >= 300)\n", int(g9Warm),
+                     g9FirstMs, g9Entries, g9Invocations, g9ControlMs);
+        gate(9, haveApp && g9Warm && g9Fast && g9NoMore && g9ControlSlow);
+
+        // G10: the last shared_ptr to the cache is dropped while a prefetch worker is inside
+        // its (delayed) decode. The worker holds the cache through weak_ptr::lock(), so the
+        // pool drains within 5 s with no deadlock or crash (the cache dies on the worker).
+        const QString g10A = makeWav(QStringLiteral("g10-a.wav"));
+        bool g10Entered = false, g10Drained = false;
+        int g10Entries = 0;
+        if (haveApp && !g10A.isEmpty()) {
+            Timeline timeline;
+            loadTimeline(timeline, {{41, audioLevelCode}}, {{41, g10A}});
+            auto cache = std::make_shared<audiokf::EnvelopeCache>();
+            audiokf::setDecodeDelayForTest(300);
+            const int entriesBefore = audiokf::decodeDelayEntriesForTest();
+            timeline.setExpressionAudioEnv(timeline.buildExpressionAudioEnv(cache));
+            QElapsedTimer wait;
+            wait.start();
+            while (audiokf::decodeDelayEntriesForTest() == entriesBefore && wait.elapsed() < 5000)
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            g10Entered = audiokf::decodeDelayEntriesForTest() > entriesBefore;
+            timeline.setExpressionAudioEnv(nullptr);
+            cache.reset();
+            g10Drained = audiokf::prefetchPool().waitForDone(5000);
+            g10Entries = audiokf::decodeDelayEntriesForTest() - entriesBefore;
+            audiokf::setDecodeDelayForTest(0);
+        }
+        std::fprintf(stderr, "audio-keyframes G10 enteredDecode=%d drainedWithin5s=%d entriesDelta=%d\n",
+                     int(g10Entered), int(g10Drained), g10Entries);
+        gate(10, haveApp && g10Entered && g10Drained && g10Entries == 1);
+
+        // G11 (MJ3): only the audio an audioLevel() expression reads is decoded.
+        // (a) no audioLevel expression -> the decode counter does not move (control: with one
+        // audioLevel clip the same counter moves by 1, so the counter is live).
+        // (b) one audioLevel clip (linkGroup 51) next to an unrelated audio clip (52): only
+        // the linked one is cached.
+        const QString g11A = makeWav(QStringLiteral("g11-a.wav"));
+        const QString g11B = makeWav(QStringLiteral("g11-b.wav"));
+        int g11PlainDelta = -1, g11ControlDelta = -1;
+        bool g11OnlyLinked = false, g11OtherCached = true;
+        if (haveApp && !g11A.isEmpty() && !g11B.isEmpty()) {
+            audiokf::setDecodeDelayForTest(1);
+            {
+                Timeline timeline;
+                loadTimeline(timeline, {{51, QStringLiteral("time * 100")}}, {{51, g11A}, {52, g11B}}, true);
+                const auto cache = std::make_shared<audiokf::EnvelopeCache>();
+                const int before = audiokf::decodeDelayEntriesForTest();
+                timeline.setExpressionAudioEnv(timeline.buildExpressionAudioEnv(cache));
+                audiokf::prefetchPool().waitForDone();
+                g11PlainDelta = audiokf::decodeDelayEntriesForTest() - before;
+            }
+            {
+                Timeline timeline;
+                loadTimeline(timeline, {{51, audioLevelCode}}, {{51, g11A}, {52, g11B}}, true);
+                const auto cache = std::make_shared<audiokf::EnvelopeCache>();
+                const int before = audiokf::decodeDelayEntriesForTest();
+                timeline.setExpressionAudioEnv(timeline.buildExpressionAudioEnv(cache));
+                audiokf::prefetchPool().waitForDone();
+                g11ControlDelta = audiokf::decodeDelayEntriesForTest() - before;
+                g11OnlyLinked = cache->isCachedForTest(g11A);
+                g11OtherCached = cache->isCachedForTest(g11B);
+            }
+            audiokf::setDecodeDelayForTest(0);
+        }
+        std::fprintf(stderr, "audio-keyframes G11 noExprDelta=%d (expect 0) oneExprDelta=%d (expect 1) "
+                     "linkedCached=%d otherCached=%d (expect 0)\n", g11PlainDelta, g11ControlDelta,
+                     int(g11OnlyLinked), int(g11OtherCached));
+        gate(11, haveApp && g11PlainDelta == 0 && g11ControlDelta == 1 && g11OnlyLinked
+            && !g11OtherCached);
     }
+
+    // The prefetch workers of G9-G11 are drained before the tally (no aboutToQuit here).
+    audiokf::prefetchPool().waitForDone();
 
     selftests::reportTally(pass, fail, 0);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL, 0 SKIP\n", pass, fail);

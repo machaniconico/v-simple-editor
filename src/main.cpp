@@ -43,6 +43,8 @@
 #include "util/CrashHandler.h"
 #include "util/Logger.h"
 #include "AudioMixer.h"
+#include "AudioKeyframes.h"  // US-1710: prefetchPool drained at quit
+#include <QThreadPool>
 #include "FrameDiff.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
@@ -1619,6 +1621,11 @@ int main(int argc, char *argv[])
         }
     }
 
+    // US-1710: stop the audioLevel() envelope prefetch workers before static teardown.
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [] {
+        audiokf::prefetchPool().clear();
+        audiokf::prefetchPool().waitForDone();
+    });
     const int rc = app.exec();
     writeLogLine("INFO", QString("event loop exited rc=%1").arg(rc));
     return rc;

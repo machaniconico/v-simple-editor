@@ -734,7 +734,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "trim-ops",          "VEDITOR_TRIM_OPS_SELFTEST",           runTrimOpsSelftest,            false,
       "TrimOps engine: ripple/roll/slip/slide + bounds" },
     { "audio-keyframes", "VEDITOR_AUDIO_KEYFRAMES_SELFTEST", runAudioKeyframesSelftest, false,
-      "Audio RMS envelope, keyframe mapping, smoothing, audioLevel expressions and determinism (8 gates)" },
+      "Audio RMS envelope, keyframe mapping, smoothing, audioLevel expressions and determinism (11 gates)" },
     { "audio-bus",         "VEDITOR_AUDIO_BUS_SELFTEST",          runAudioBusSelftest,           false,
       "AudioBusRouting: bus/submix/aux-send gain resolution + cycle guard" },
     { "audio-channel-map", "VEDITOR_AUDIO_CHANNEL_MAP_SELFTEST",  runAudioChannelMapSelftest,    false,
