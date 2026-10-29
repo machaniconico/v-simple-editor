@@ -585,7 +585,7 @@ int runCamtrackUiSelftest()
         std::streambuf* const previous = std::cerr.rdbuf(captured.rdbuf());
         selftest::GateTally scratch;
         const bool aborted = abortStuck(scratch, 1);
-        const int scratchFailed = scratch.finish();
+        const int scratchFailed = scratch.finish(nullptr, false);
         std::cerr.rdbuf(previous);
         const QString abortText = QString::fromStdString(captured.str()).trimmed()
             .replace(QLatin1Char('\n'), QStringLiteral(" | "));

@@ -779,7 +779,7 @@ int runSmartRenderSelftest()
         auto request = passThroughRequest();
         request.hasTimelineTextOverlays = true;
         checkPassThroughRejected(
-            100, "timelinePassThrough rejects project-level captions", request);
+            28, "timelinePassThrough rejects project-level captions", request);
     }
     {
         QString error;
