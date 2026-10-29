@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CameraSolver.h"
 #include "Keyframe.h"
 #include "LayerCompositor.h"
 
@@ -11,6 +12,8 @@
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
+
+#include <optional>
 
 // --- Camera state at a point in time ---
 
@@ -131,6 +134,11 @@ public:
     void setShake(const CameraShake &s);
     CameraShake shake() const { return m_shake; }
 
+    // --- Feature camera-solve mapping (JSON "solveMapping"; absent when unset) ---
+
+    void setSolveMapping(const std::optional<camsolve::SolveMapping> &mapping) { m_solveMapping = mapping; }
+    std::optional<camsolve::SolveMapping> solveMapping() const { return m_solveMapping; }
+
     // --- Built-in camera moves (static factory methods) ---
 
     static Camera3D createDollyZoom(double startZ, double endZ, double duration);
@@ -167,6 +175,8 @@ private:
 
     CameraShake m_shake;
 
+    std::optional<camsolve::SolveMapping> m_solveMapping;
+
     // --- Deterministic value-noise helpers (shake) ---
 
     static unsigned int hashMix(unsigned int h);
@@ -189,6 +199,10 @@ namespace camera3d {
 // (canvas px, centre origin, y down) at the camera position (rotationZ is kept).
 Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
                                     const Camera3DState &camera);
+// US-1810: canvas px of a world point (canvas px, centre origin, y down) under the
+// projectLayerQuad projection; nullopt when fov + view z <= 1e-3 (at / behind the pinhole).
+std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
+                                         const QSize &canvas);
 } // namespace camera3d
 
 // Shared opt-in compositing step for preview and export.

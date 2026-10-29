@@ -832,7 +832,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "sfm-two-view", "VEDITOR_SFM_TWO_VIEW_SELFTEST", runSfmTwoViewSelftest, false,
       "Two-view essential pose, RANSAC, triangulation, degeneracy and determinism (6 gates)" },
     { "camsolve-probe", "VEDITOR_CAMSOLVE_PROBE_SELFTEST", runCamsolveProbeSelftest, false,
-      "Camera-solve to project-camera mapping probe on the synthetic two-view scene (1 gates)" },
+      "Camera-solve to project-camera mapping probe on the synthetic two-view scene (5 gates)" },
     { "feature-tracker", "VEDITOR_FEATURE_TRACKER_SELFTEST", runFeatureTrackerSelftest, false,
       "Shi-Tomasi 特徴点検出とピラミッド LK 多点追跡 (6 gates)" },
     { "camtrack-solve", "VEDITOR_CAMTRACK_SOLVE_SELFTEST", runCamtrackSolveSelftest, true,

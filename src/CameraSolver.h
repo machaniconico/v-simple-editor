@@ -35,4 +35,43 @@ Camera3DState poseToCameraState(const Pose& pose, const Camera3DState& base);
 void applyPosesToCamera(Camera3D& camera, const QVector<Pose>& poses,
                         double fps, double startSec);
 
+// Feature-solve mapping onto the project camera (canvas px). unitScalePx (S) scales solver
+// units to px; focalPx is the analysis-image focal length; referenceIndex is the pose the
+// solve is centred on. legacy marks the planar path, which keeps applyPosesToCamera.
+struct SolveMapping {
+    double unitScalePx = 0;
+    double focalPx = 0;
+    QSize analysisSize;
+    QSize canvasSize;
+    int referenceIndex = -1;
+    bool legacy = false;
+};
+struct CameraSolveApplied {
+    QVector<Pose> poses;
+    double fps = 0;
+    double startSec = 0;
+    SolveMapping mapping;
+    QVector<QVector3D> points; // solver units
+};
+
+// Canvas focal length f = focalPx / max(aw/cw, ah/ch) (the inverse of the dialog's focal).
+double canvasFocalPx(const SolveMapping& mapping);
+// First valid pose, or -1.
+int referencePoseIndex(const QVector<Pose>& poses);
+// Re-expresses poses and points in the reference camera frame (the reference pose becomes
+// identity at the origin). Returns false and changes nothing when refIndex is not a valid pose.
+bool normaliseToReference(QVector<Pose>& poses, QVector<QVector3D>& points, int refIndex);
+// f / median(z) over the reference-frame points with z > 0, unrounded; f when there is none.
+double defaultUnitScale(const QVector<QVector3D>& normalisedPoints, double f);
+// Camera at a normalised pose: position = S*c + f*(R3 - e3), forward = -R3, fov = f, so the
+// pinhole (position + f*forward) is S*c - f*e3 and the reference pose is the default camera.
+Camera3DState poseToProjectCameraState(const Pose& normalised, const Camera3DState& base,
+                                       const SolveMapping& mapping);
+// World px of a normalised solver point: S*p - f*e3.
+QVector3D solvePointToWorldPx(const QVector3D& normalisedPoint, const SolveMapping& mapping);
+// Centres on the first valid pose, keyframes every valid pose with fov = f (the Fov track is
+// replaced) and stores the mapping (referenceIndex = that pose). Rejects focalPx <= 0, a
+// non-finite f / S or S <= 0, no valid pose, or a bad fps / startSec: camera unchanged, false.
+bool applySolvedPosesToCamera(Camera3D& camera, const CameraSolveApplied& applied);
+
 } // namespace camsolve

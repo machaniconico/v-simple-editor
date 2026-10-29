@@ -376,6 +376,43 @@ QImage Camera3D::applyPerspective(const QImage &image,
 namespace {
 thread_local bool s_trueProjectionEnabled = true;
 thread_local int s_trueProjectionCalls = 0;
+
+// The view / roll / scale core shared by projectLayerQuad and camera3d::projectWorldPoint.
+struct ProjectionCore {
+    QMatrix4x4 view;
+    double c = 1, s = 0, cx = 0, cy = 0, fov = 0;
+};
+
+inline ProjectionCore projectionCore(const Camera3DState &cameraState, const QSize &canvasSize)
+{
+    ProjectionCore core;
+    QVector3D forward = cameraState.target - cameraState.position;
+    if (forward.lengthSquared() < 1e-12f)
+        forward = QVector3D(0, 0, -1);
+    forward.normalize();
+    // A parallel up vector has no unique lookAt basis. Choose a stable fallback.
+    const QVector3D up = std::abs(QVector3D::dotProduct(forward, QVector3D(0, 1, 0))) > 0.9999f
+        ? QVector3D(0, 0, 1) : QVector3D(0, 1, 0);
+    core.view.lookAt(cameraState.position, cameraState.position + forward, up);
+    const double angle = cameraState.roll * 3.14159265358979323846 / 180.0;
+    core.c = std::cos(angle);
+    core.s = std::sin(angle);
+    core.cx = canvasSize.width() / 2.0;
+    core.cy = canvasSize.height() / 2.0;
+    core.fov = cameraState.fov;
+    return core;
+}
+
+// v is a view-space point.
+inline QPointF projectViewPoint(const ProjectionCore &core, const QVector3D &v)
+{
+    // Default lookAt is identity; positive Z retains the legacy away-depth.
+    // Positive camera roll rotates the image counter-clockwise in screen space.
+    const double x = core.c * v.x() + core.s * v.y();
+    const double y = -core.s * v.x() + core.c * v.y();
+    const double scale = core.fov / std::max(0.001, core.fov + v.z());
+    return QPointF(core.cx + x * scale, core.cy + y * scale);
+}
 }
 
 void Camera3D::setTrueProjectionEnabledForTest(bool enabled)
@@ -395,36 +432,20 @@ QPolygonF Camera3D::projectLayerQuad(const Layer3DTransform &layer3D,
 {
     if (canvasSize.isEmpty())
         return {};
-    QVector3D forward = cameraState.target - cameraState.position;
-    if (forward.lengthSquared() < 1e-12f)
-        forward = QVector3D(0, 0, -1);
-    forward.normalize();
-    // A parallel up vector has no unique lookAt basis. Choose a stable fallback.
-    const QVector3D up = std::abs(QVector3D::dotProduct(forward, QVector3D(0, 1, 0))) > 0.9999f
-        ? QVector3D(0, 0, 1) : QVector3D(0, 1, 0);
-    QMatrix4x4 view;
-    view.lookAt(cameraState.position, cameraState.position + forward, up);
+    const ProjectionCore core = projectionCore(cameraState, canvasSize);
     QMatrix4x4 model;
     model.translate(0, 0, static_cast<float>(layer3D.positionZ));
     // Qt post-multiplies: these act on each corner in X -> Y -> Z order.
     model.rotate(static_cast<float>(layer3D.rotationZ), 0, 0, 1);
     model.rotate(static_cast<float>(layer3D.rotationY), 0, 1, 0);
     model.rotate(static_cast<float>(layer3D.rotationX), 1, 0, 0);
-    const double angle = cameraState.roll * 3.14159265358979323846 / 180.0;
-    const double c = std::cos(angle), s = std::sin(angle);
-    const double cx = canvasSize.width() / 2.0, cy = canvasSize.height() / 2.0;
+    const double cx = core.cx, cy = core.cy;
     const QPolygonF corners{QPointF(-cx, -cy), QPointF(cx, -cy),
                             QPointF(cx, cy), QPointF(-cx, cy)};
     QPolygonF result;
     for (const QPointF &corner : corners) {
-        const QVector3D v = view.map(model.map(QVector3D(
-            static_cast<float>(corner.x()), static_cast<float>(corner.y()), 0)));
-        // Default lookAt is identity; positive Z retains the legacy away-depth.
-        // Positive camera roll rotates the image counter-clockwise in screen space.
-        const double x = c * v.x() + s * v.y();
-        const double y = -s * v.x() + c * v.y();
-        const double scale = cameraState.fov / std::max(0.001, cameraState.fov + v.z());
-        result.append(QPointF(cx + x * scale, cy + y * scale));
+        result.append(projectViewPoint(core, core.view.map(model.map(QVector3D(
+            static_cast<float>(corner.x()), static_cast<float>(corner.y()), 0)))));
     }
     return result;
 }
@@ -486,6 +507,18 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
     result.rotationX = -std::asin(std::clamp(uy / length, -1.0, 1.0)) * kRadiansToDegrees;
     result.rotationY = std::atan2(ux, dz) * kRadiansToDegrees;
     return result;
+}
+
+std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
+                                         const QSize &canvas)
+{
+    if (canvas.isEmpty())
+        return std::nullopt;
+    const ProjectionCore core = projectionCore(camera, canvas);
+    const QVector3D v = core.view.map(worldPx);
+    if (!(core.fov + v.z() > 1e-3))
+        return std::nullopt;
+    return projectViewPoint(core, v);
 }
 
 } // namespace camera3d
@@ -878,6 +911,19 @@ QJsonObject Camera3D::toJson() const
         obj[QStringLiteral("shake")] = shakeObj;
     }
 
+    if (m_solveMapping) {
+        QJsonObject mappingObj;
+        mappingObj[QStringLiteral("version")] = 2;
+        mappingObj[QStringLiteral("unitScalePx")] = m_solveMapping->unitScalePx;
+        mappingObj[QStringLiteral("focalPx")] = m_solveMapping->focalPx;
+        mappingObj[QStringLiteral("analysisWidth")] = m_solveMapping->analysisSize.width();
+        mappingObj[QStringLiteral("analysisHeight")] = m_solveMapping->analysisSize.height();
+        mappingObj[QStringLiteral("canvasWidth")] = m_solveMapping->canvasSize.width();
+        mappingObj[QStringLiteral("canvasHeight")] = m_solveMapping->canvasSize.height();
+        mappingObj[QStringLiteral("referenceIndex")] = m_solveMapping->referenceIndex;
+        obj[QStringLiteral("solveMapping")] = mappingObj;
+    }
+
     return obj;
 }
 
@@ -926,5 +972,19 @@ void Camera3D::fromJson(const QJsonObject &obj)
         m_shake.smoothness = shakeObj[QStringLiteral("smoothness")].toDouble(1.0);
     } else {
         m_shake.enabled = false;
+    }
+
+    m_solveMapping.reset();
+    if (obj[QStringLiteral("solveMapping")].isObject()) {
+        const QJsonObject mappingObj = obj[QStringLiteral("solveMapping")].toObject();
+        camsolve::SolveMapping mapping;
+        mapping.unitScalePx = mappingObj[QStringLiteral("unitScalePx")].toDouble(0.0);
+        mapping.focalPx = mappingObj[QStringLiteral("focalPx")].toDouble(0.0);
+        mapping.analysisSize = QSize(mappingObj[QStringLiteral("analysisWidth")].toInt(),
+                                     mappingObj[QStringLiteral("analysisHeight")].toInt());
+        mapping.canvasSize = QSize(mappingObj[QStringLiteral("canvasWidth")].toInt(),
+                                   mappingObj[QStringLiteral("canvasHeight")].toInt());
+        mapping.referenceIndex = mappingObj[QStringLiteral("referenceIndex")].toInt(-1);
+        m_solveMapping = mapping;
     }
 }
