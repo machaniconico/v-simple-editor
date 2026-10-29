@@ -716,5 +716,51 @@ int runBrushExportSelftest()
                    "brush missing on the overlap-transition neighbour");
     }
 
+    // G10: the project-camera baked preview (trueProjection) shows renderFrameAt of the
+    // whole timeline, which already draws every clip's brush (G1 / G4), and never draws
+    // the bound brush again on top (brushedUploadFrame skips it when cameraBaked). Pin
+    // (passes at HEAD): the uploaded frame == renderFrameAt of the brushed timeline even
+    // with the preview brush bound at progress 1; the plain timeline's frame differs
+    // (control), and so does a hand double-draw of the brush (the double-draw control).
+    {
+        Camera3DState state;
+        state.trueProjection = true;
+        const Camera3D camera{state};
+        const auto brushedTl = makeTimeline({{brushed}});
+        const auto plainTl = makeTimeline({{plain}});
+        brushedTl->setProjectCamera(camera);
+        plainTl->setProjectCamera(camera);
+        const QImage expected = frameAt(brushedTl.get(), 0.0);
+        const QImage plainFrame = frameAt(plainTl.get(), 0.0);
+
+        VideoPlayer player;
+        GLPreview *view = player.glPreview();
+        const bool glOn = player.isGLAccelerated();
+        if (!view || !glOn) {
+            tally.skip(10, "OpenGL preview unavailable in this environment");
+        } else {
+            player.setProjectOutputSize(QSize(kW, kH));
+            view->setTimeline(brushedTl.get());
+            view->setProjectCamera(camera);
+            BrushAnimation animation;
+            animation.fromJson(brush);
+            view->setBrushAnimation(&animation);
+            view->setBrushAnimationProgress(1.0);
+            view->grabFramebuffer(); // runs paintGL, which bakes m_projectCameraFrame
+            const QImage upload = view->uploadFrameForTest();
+            view->clearBrushAnimation();
+            const bool same = sameBytes(upload, expected);
+            const qint64 brushVisible = diffPixels(expected, plainFrame);
+            const qint64 doubleDrawDiff = diffPixels(handBrush(expected, brush, 1.0), expected);
+            std::cerr << "brush-export G10 uploadEqualsRenderFrameAt=" << same
+                      << " uploadSize=" << upload.width() << "x" << upload.height()
+                      << " brushVisible=" << brushVisible
+                      << " doubleDrawDiff=" << doubleDrawDiff << '\n';
+            tally.gate(10, same && brushVisible > 200 && doubleDrawDiff > 0,
+                       "the camera-baked preview upload differs from renderFrameAt (brush "
+                       "drawn twice or missing)");
+        }
+    }
+
     return tally.finish("brush-export");
 }
