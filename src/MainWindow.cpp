@@ -8864,6 +8864,26 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             layer.position.y() * canvasSize.height()));
     }
 
+    // US-1804: with no track matte active at THIS frame (renderFrameAt's
+    // hasTrackMatteLayer predicate, evaluated on the remapped array), stack
+    // V1 LAST (frontmost) like renderFrameAt's matte-free branch. With a matte
+    // the ascending adjacency order above is kept. Images and lighting offsets
+    // move with their layers; the now-unused matte indices are cleared so the
+    // reversed positions cannot turn a self-reference into a valid source.
+    bool hasTrackMatteLayer = false;
+    for (int i = 0; i < layers.size() && !hasTrackMatteLayer; ++i) {
+        const int sourceIndex = layers[i].matteSourceLayerIndex;
+        hasTrackMatteLayer = layers[i].matteType != TrackMatteType::None
+            && sourceIndex >= 0 && sourceIndex < layers.size() && sourceIndex != i;
+    }
+    if (!hasTrackMatteLayer) {
+        std::reverse(layers.begin(), layers.end());
+        std::reverse(layerImages.begin(), layerImages.end());
+        std::reverse(lightingOffsets.begin(), lightingOffsets.end());
+        for (CompositeLayer &layer : layers)
+            layer.matteSourceLayerIndex = -1;
+    }
+
     if (lightingEnabled)
         layerImages = tlrender::detail::applyLightingToLayerImages(
             layers, layerImages, canvasSize, lightingOffsets, projectLights,
