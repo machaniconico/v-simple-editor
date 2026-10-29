@@ -438,7 +438,7 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     const bool bakesRoto = sourceRoto.contains(rotoKey);
     if (bakesRoto)
         temporary.setRotoEntries({{trackMatteClipKey(0, prefixCount), sourceRoto.value(rotoKey)}});
-    temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true);
+    temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true, timeline.projectFrameRate());
 
     QString directory = options.outputDir;
     if (directory.isEmpty()) {
