@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../VideoEffect.h"
 #include "../ProjectFile.h"
 #include "../EffectPreset.h"
@@ -104,5 +105,6 @@ int runColorWarperSelftest()
     cc.hueSatWarp.satScale[0][0]=0.5f;
     check(6,nonDefault && resetDefault && !cc.isDefault());
     std::fprintf(stderr,"summary: %d PASS, %d FAIL\n",passed,failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

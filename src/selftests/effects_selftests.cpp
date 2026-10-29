@@ -1090,7 +1090,17 @@ int runMographSelftest()
         Text3DClipEntry t3Entry;
         t3Entry.clipId = QStringLiteral("0:0");
         t3Entry.config = text3D.toJson();
-        saveData.text3DClipEntries.append(t3Entry);
+        // US-1706: the 3D text lives on the clip (clip JSON "text3D"); the legacy root
+        // section "text3DClipEntries" is only read, onto the clip it names.
+        saveData.videoTracks[0][0].text3DConfig = t3Entry.config;
+        const auto sameText3D = [&t3Entry](const ProjectData &data) {
+            return data.text3DClipEntries.isEmpty() && !data.videoTracks.isEmpty()
+                && !data.videoTracks[0].isEmpty()
+                && data.videoTracks[0][0].text3DConfig == t3Entry.config;
+        };
+        const auto rootHasText3DSection = [](const QString &json) {
+            return QJsonDocument::fromJson(json.toUtf8()).object().contains(QStringLiteral("text3DClipEntries"));
+        };
 
         exprbind::ClipExpressionBindings bindings;
         bindings.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*45"));
@@ -1138,10 +1148,9 @@ int runMographSelftest()
         const QString savedJson = ProjectFile::toJsonString(saveData);
         if (!requireSelftest(ProjectFile::fromJsonString(savedJson, loaded),
                              QStringLiteral("MOGRAPH project string round-trip failed"), &error)
-            || !requireSelftest(loaded.text3DClipEntries.size() == 1
-                                    && loaded.text3DClipEntries.first().clipId == QStringLiteral("0:0")
-                                    && loaded.text3DClipEntries.first().config == t3Entry.config,
-                                QStringLiteral("text3d clip entry round-trip mismatch"), &error)
+            || !requireSelftest(sameText3D(loaded) && !rootHasText3DSection(savedJson),
+                                QStringLiteral("text3d clip round-trip mismatch (or a root "
+                                               "text3DClipEntries section written)"), &error)
             || !requireSelftest(sameExpressions(loaded) && !rootHasExpressionSection(savedJson),
                                 QStringLiteral("clip expression bindings round-trip mismatch (or a root "
                                                "expressionBindingsEntries section written)"), &error)
@@ -1219,7 +1228,8 @@ int runMographSelftest()
         };
         if (!requireSelftest(ProjectFile::save(projectPath, saveData), QStringLiteral("MOGRAPH project save failed"), &error)
             || !requireSelftest(ProjectFile::load(projectPath, fileLoaded), QStringLiteral("MOGRAPH project load failed"), &error)
-            || !requireSelftest(fileLoaded.text3DClipEntries.size() == 1
+            || !requireSelftest(sameText3D(fileLoaded)
+                                    && !rootHasText3DSection(fileText(projectPath))
                                     && sameExpressions(fileLoaded)
                                     && !rootHasExpressionSection(fileText(projectPath))
                                     && sameWiggle(fileLoaded)

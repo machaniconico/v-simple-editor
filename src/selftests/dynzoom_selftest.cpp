@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../DynamicZoom.h"
 
 #include <QIODevice>
@@ -129,5 +130,6 @@ int runDynzoomSelftest()
 
     err << "summary: " << passed << " PASS, " << failed << " FAIL\n";
     err.flush();
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

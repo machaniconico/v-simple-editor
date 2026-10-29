@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../ExportRange.h"
 
 #include <cstdio>
@@ -77,5 +78,6 @@ int runExportRangeSelftest()
                failed);
 
     std::printf("[export-range] summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

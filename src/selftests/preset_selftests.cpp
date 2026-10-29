@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/preset_selftests.cpp
 // PRD-SPLIT-MAIN-2 Phase 1: Tracker / Planar / Project preset selftests
 // moved verbatim from src/main.cpp. Dispatch via SelftestRegistry.{h,cpp}.
@@ -39,8 +40,10 @@ extern void writeLogLine(const QString& level, const QString& msg);
 int runTrackerPresetSelftest()
 {
     using tracker_preset::TrackerPreset;
-    auto fail = [](const QString& msg) -> int {
+    int passed = 0;
+    auto fail = [&](const QString& msg) -> int {
         writeLogLine("CRIT", QString("TRACKER-PRESET selftest FAILED: %1").arg(msg));
+        selftests::reportTally(passed, 1, 0);
         return 1;
     };
     writeLogLine("INFO", "TRACKER-PRESET selftest: preset application regression gate");
@@ -51,12 +54,16 @@ int runTrackerPresetSelftest()
         return fail(QString("builtinPresets size != 7 (got %1)").arg(builtins.size()));
     writeLogLine("INFO", QString("TRACKER-PRESET (1): builtinPresets count = %1").arg(builtins.size()));
 
+    ++passed;
+
     // (2) findBuiltin success for all 7
     for (const auto& p : builtins) {
         if (!tracker_preset::findBuiltin(p.id).has_value())
             return fail(QString("findBuiltin failed for id=%1").arg(p.id));
     }
     writeLogLine("INFO", "TRACKER-PRESET (2): findBuiltin OK for all 7");
+
+    ++passed;
 
     // (3) toJson/fromJson round-trip
     for (const auto& p : builtins) {
@@ -74,6 +81,8 @@ int runTrackerPresetSelftest()
     }
     writeLogLine("INFO", "TRACKER-PRESET (3): round-trip OK for all 7");
 
+    ++passed;
+
     // (4) fromJson rejects invalid inputs
     {
         QJsonObject bad1; bad1["id"] = "x"; bad1["displayName"] = "x"; bad1["searchRadius"] = -1;
@@ -88,6 +97,8 @@ int runTrackerPresetSelftest()
     }
     writeLogLine("INFO", "TRACKER-PRESET (4): fromJson rejects 3 invalid inputs");
 
+    ++passed;
+
     // (5) applyToMotionTracker — all 7 + nullptr safety
     MotionTracker tracker;
     for (const auto& p : builtins)
@@ -95,11 +106,15 @@ int runTrackerPresetSelftest()
     tracker_preset::applyToMotionTracker(nullptr, builtins.front());
     writeLogLine("INFO", "TRACKER-PRESET (5): applyToMotionTracker OK for all 7 + nullptr");
 
+    ++passed;
+
     // (6) Registry::allPresets().size() >= 7
     const int registrySize = static_cast<int>(tracker_preset::Registry::instance().allPresets().size());
     if (registrySize < 7)
         return fail(QString("Registry::allPresets size < 7 (got %1)").arg(registrySize));
     writeLogLine("INFO", QString("TRACKER-PRESET (6): Registry size = %1").arg(registrySize));
+
+    ++passed;
 
     // (7) Registry CRUD
     TrackerPreset custom = builtins.front();
@@ -120,6 +135,8 @@ int runTrackerPresetSelftest()
         if (p.id == custom.id)
             return fail("removed preset still in allPresets");
     writeLogLine("INFO", "TRACKER-PRESET (7): Registry CRUD OK");
+
+    ++passed;
 
     // (8) JSON I/O round-trip via QFile (QTemporaryFile)
     {
@@ -161,6 +178,8 @@ int runTrackerPresetSelftest()
     }
     qInfo().noquote() << "[INFO] TRACKER-PRESET (8): JSON QFile round-trip OK for all 7";
 
+    ++passed;
+
     // (9) description 非空 gate (US-MTD2-1 ゲート)
     {
         for (const auto& p : builtins) {
@@ -169,6 +188,8 @@ int runTrackerPresetSelftest()
         }
     }
     qInfo().noquote() << "[INFO] TRACKER-PRESET (9): description non-empty for all 7";
+
+    ++passed;
 
     // (10) description JSON round-trip
     {
@@ -184,6 +205,8 @@ int runTrackerPresetSelftest()
     qInfo().noquote() << "[INFO] TRACKER-PRESET (10): description JSON round-trip OK";
 
     writeLogLine("INFO", "TRACKER-PRESET selftest PASSED");
+    ++passed;
+    selftests::reportTally(passed, 0, 0);
     return 0;
 }
 
@@ -204,8 +227,10 @@ int runTrackerPresetSelftest()
 int runPlanarPresetSelftest()
 {
     using planar_tracker_preset::PlanarTrackerPreset;
-    auto fail = [](const QString& msg) -> int {
+    int passed = 0;
+    auto fail = [&](const QString& msg) -> int {
         qCritical().noquote() << "[CRIT] PLANAR-PRESET selftest FAILED:" << msg;
+        selftests::reportTally(passed, 1, 0);
         return 1;
     };
     qInfo().noquote() << "[INFO] PLANAR-PRESET selftest: preset application regression gate";
@@ -216,12 +241,16 @@ int runPlanarPresetSelftest()
         return fail(QString("builtinPresets size != 5 (got %1)").arg(builtins.size()));
     qInfo().noquote() << "[INFO] PLANAR-PRESET (1): builtinPresets count =" << builtins.size();
 
+    ++passed;
+
     // (2) findBuiltin OK for all 5
     for (const auto& p : builtins) {
         if (!planar_tracker_preset::findBuiltin(p.id).has_value())
             return fail(QString("findBuiltin failed for id=%1").arg(p.id));
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (2): findBuiltin OK for all 5";
+
+    ++passed;
 
     // (3) toJson/fromJson round-trip
     for (const auto& p : builtins) {
@@ -240,6 +269,8 @@ int runPlanarPresetSelftest()
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (3): round-trip OK for all 5";
 
+    ++passed;
+
     // (4) fromJson 値域不正 → nullopt
     {
         QJsonObject bad1; bad1["id"]="x"; bad1["displayName"]="x"; bad1["searchRadiusPx"]=2.0;
@@ -254,6 +285,8 @@ int runPlanarPresetSelftest()
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (4): fromJson rejects 3 invalid inputs";
 
+    ++passed;
+
     // (5) applyToPlanarTracker — 5 preset 全て + nullptr safety
     planar::Tracker tracker;
     for (const auto& p : builtins)
@@ -261,12 +294,16 @@ int runPlanarPresetSelftest()
     planar_tracker_preset::applyToPlanarTracker(nullptr, builtins.front());
     qInfo().noquote() << "[INFO] PLANAR-PRESET (5): applyToPlanarTracker OK for all 5 + nullptr";
 
+    ++passed;
+
     // (6) Registry::allPresets().size() >= 5
     const int registrySize = static_cast<int>(
         planar_tracker_preset::Registry::instance().allPresets().size());
     if (registrySize < 5)
         return fail(QString("Registry size < 5 (got %1)").arg(registrySize));
     qInfo().noquote() << "[INFO] PLANAR-PRESET (6): Registry size =" << registrySize;
+
+    ++passed;
 
     // (7) Registry CRUD
     {
@@ -285,6 +322,8 @@ int runPlanarPresetSelftest()
             if (p.id == custom.id) return fail("removed preset still in allPresets");
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (7): Registry CRUD OK";
+
+    ++passed;
 
     // (8) JSON QFile round-trip via QTemporaryFile
     for (const auto& p : builtins) {
@@ -317,12 +356,16 @@ int runPlanarPresetSelftest()
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (8): JSON QFile round-trip OK for all 5";
 
+    ++passed;
+
     // (9) description 非空
     for (const auto& p : builtins) {
         if (p.description.isEmpty())
             return fail(QString("description is empty for id=%1").arg(p.id));
     }
     qInfo().noquote() << "[INFO] PLANAR-PRESET (9): description non-empty for all 5";
+
+    ++passed;
 
     // (10) description JSON round-trip
     {
@@ -338,6 +381,8 @@ int runPlanarPresetSelftest()
     qInfo().noquote() << "[INFO] PLANAR-PRESET (10): description JSON round-trip OK";
 
     qInfo().noquote() << "[INFO] PLANAR-PRESET selftest PASSED";
+    ++passed;
+    selftests::reportTally(passed, 0, 0);
     return 0;
 }
 #endif // HAVE_PLANARTRACKER_PRESET
@@ -582,5 +627,6 @@ int runProjectPresetSelftest()
         qCritical().noquote() << summary;
     }
     writeLogLine(failed == 0 ? "INFO" : "CRIT", summary);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

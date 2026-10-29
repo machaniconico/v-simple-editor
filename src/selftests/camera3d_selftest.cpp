@@ -1,15 +1,19 @@
 #include "../Camera3D.h"
 #include "../ClipGeometry.h"
+#include "../GLPreview.h"
 #include "../ProjectFile.h"
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
+#include "SelftestRegistry.h"
 
 #include <QJsonDocument>
 #include <QLineF>
 #include <QMatrix4x4>
 #include <QPainter>
+#include <QTest>
 #include <QTemporaryDir>
 #include <algorithm>
 #include <cmath>
@@ -75,7 +79,7 @@ ClipInfo fixtureClip(const QColor &color, const QSize &canvas)
 
 int runCamera3DSelftest()
 {
-    int passed = 0, failed = 0;
+    int passed = 0, failed = 0, skipped = 0;
     auto gate = [&](int number, bool ok) {
         std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", number);
         ok ? ++passed : ++failed;
@@ -543,6 +547,43 @@ int runCamera3DSelftest()
                      lightOk, glOk, jsonOk, undoOk);
         gate(10, helperOk && upperOk && v1Ok && flatOk && lightOk && glOk && jsonOk && undoOk);
     }
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+
+    // G11 (US-1704): the preview camera time comes from the owning VideoPlayer. The
+    // view sits in the player's display stack, so a cast of the direct parent finds
+    // no player and the camera stayed at 0 s. paintGL is not run (no GL needed).
+    {
+        ClipInfo media;
+        media.filePath = QStringLiteral("test_assets/e2e_clip.mp4");
+        media.duration = 5.0;
+        media.inPoint = 0.0;
+        media.outPoint = 5.0;
+        Timeline seekTl;
+        seekTl.restoreFromProject(QVector<QVector<ClipInfo>>{{media}}, QVector<QVector<ClipInfo>>{},
+                                  0.0, -1.0, -1.0, 100);
+        seekTl.refreshPlaybackSequence();
+        VideoPlayer player;
+        GLPreview *view = player.glPreview();
+        if (!view) {
+            std::fprintf(stderr, "SKIP G11 (no GLPreview in VideoPlayer)\n");
+            ++skipped;
+        } else {
+            player.setGLAcceleration(false);
+            player.setSequence(seekTl.computePlaybackSequence());
+            const qint64 targetUs = 2000000;
+            player.seek(2000);
+            const bool seeked = QTest::qWaitFor([&] { return player.timelinePositionUs() == targetUs; }, 10000);
+            const double cameraSec = view->resolveCameraSeconds();
+            const bool owned = view->ownerPlayer() == &player;
+            const bool directParentIsPlayer = qobject_cast<VideoPlayer *>(view->parentWidget()) != nullptr;
+            std::fprintf(stderr, "camera3d G11: seeked=%d positionUs=%lld cameraSec=%.6f owner=%d "
+                         "directParentIsPlayer=%d\n",
+                         seeked, static_cast<long long>(player.timelinePositionUs()), cameraSec, owned,
+                         directParentIsPlayer);
+            gate(11, seeked && owned && cameraSec == 2.0);
+        }
+    }
+    std::fprintf(stderr, "summary: %d PASS, %d FAIL, %d SKIP\n", passed, failed, skipped);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, skipped);
     return failed;
 }

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // matte16_parity_selftests.cpp
 // Stage7 S7-1: headless parity for the dormant RGBA64 track-matte compositor.
 
@@ -473,5 +474,6 @@ int runMatte16ParitySelftest()
 
     std::printf("[matte16-parity] summary: gates=8 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

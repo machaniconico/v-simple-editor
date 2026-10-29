@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
 
@@ -196,5 +197,6 @@ int runProjectDiffSelftest()
     gate(8, connectionChanges == 0 && pathChanges > 0);
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

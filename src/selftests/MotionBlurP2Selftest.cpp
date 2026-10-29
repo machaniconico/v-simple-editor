@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // MotionBlurP2Selftest.cpp
 // T5 MOTION BLUR P2: per-clip activation gate and true-only persistence.
 // Run via: --selftest=motion-blur-p2
@@ -122,5 +123,6 @@ int runMotionBlurP2Selftest()
     qInfo().noquote() << QStringLiteral("[motion-blur-p2] summary passed=%1 failed=%2")
                              .arg(passed)
                              .arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

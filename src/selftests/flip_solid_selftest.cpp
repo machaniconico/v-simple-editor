@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectLibraryModel.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
@@ -178,5 +179,6 @@ int runFlipSolidSelftest()
     gate(5, solid);
     VideoEffectProcessor::setFlipEnabledForTesting(true);
     std::fprintf(stderr, "[flip-solid] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

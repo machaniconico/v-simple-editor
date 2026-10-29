@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // AE-ANIM-1: Elastic/Bounce/Back keyframe easing preset regression gates.
 
 #include "../EasingCurveModel.h"
@@ -174,5 +175,6 @@ int runEasingPresetsSelftest()
     }
 
     std::printf("[easing-presets] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

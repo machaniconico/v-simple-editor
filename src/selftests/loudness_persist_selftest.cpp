@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../MainWindow.h"
 #include "../AudioMixer.h"
 #include "../Exporter.h"
@@ -140,5 +141,6 @@ int runLoudnessPersistSelftest()
               && reset() && collect().loudnessSettings == legacy, "G4");
 
     std::fprintf(stderr, "[loudness-persist] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

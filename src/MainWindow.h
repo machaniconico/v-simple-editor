@@ -270,6 +270,7 @@ class MainWindow : public QMainWindow
     friend int runConnectedClipSelftest();
     friend int runMediaRelinkSelftest();
     friend int runMainWindowLifecycleSelftest();
+    friend int runBrushExportSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -817,10 +818,10 @@ private:
     QJsonObject collectExternalTrackState() const;
     void applyExternalTrackState(const QJsonObject &state);
     void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
-    // US-1302: the position-keyed sidecars ("t:i": timeRemap / text3D /
-    // live brush, and the brush entries with the clipId in their values)
-    // follow Timeline::clipKeysRemapped and, through Timeline::setSidecarStateHooks,
-    // every undo / redo.
+    // US-1302: the position-keyed sidecars ("t:i": timeRemap) follow
+    // Timeline::clipKeysRemapped and, through Timeline::setSidecarStateHooks,
+    // every undo / redo. US-1706: the 3D text and the brush are on the clips;
+    // the live brush cache drops the keys a remap moves or drops.
     void rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap);
     QJsonObject collectSidecarState();
     void applySidecarState(const QJsonObject &state);
@@ -830,11 +831,10 @@ private:
     // otherwise.
     void commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve);
     void commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config);
-    // US-1302: the two values a dropped key held, kept by the clip's "track|uid"
-    // until a restore brings that clip back (the brush entries go back by value instead).
+    // US-1302: the value a dropped key held, kept by the clip's "track|uid"
+    // until a restore brings that clip back.
     struct ParkedSidecars {
         std::optional<TimeRemapClipEntry> timeRemap;
-        std::optional<QJsonObject> text3D;
     };
     QHash<QString, ParkedSidecars> m_parkedSidecarsByUid;
     // Key -> uid of the placement the last collect / apply saw, rekeyed with the
@@ -883,10 +883,10 @@ private:
     // roto carrier (Timeline::rotoEntries) の唯一の書き手。空 entry なら削除し、
     // 1 回の saveUndoState で 1 undo にする。
     void storeRotoEntry(const QString &clipId, const RotoClipEntry &entry);
-    void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
-    void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
+    void clearLiveBrushAnimations();
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
     void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
+    void updateBrushPreviewProgress(double timelineSec);
     // selftest: the clipId syncBrushAnimationPreviewForClip last bound (empty once cleared).
     QString m_brushPreviewClipIdForTest;
     QString brushPreviewClipIdForTest() const { return m_brushPreviewClipIdForTest; }
@@ -925,7 +925,6 @@ private:
     QImage m_lastCompositedFrame;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
-    QVector<BrushAnimationEntry> m_brushAnimationEntries;
     QVector<OverlayItem> m_projectOverlays;
     QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
     struct MediaRelinkSidecarState {
@@ -937,10 +936,14 @@ private:
     quint64 m_mediaRelinkObservedSaveSerial = 0;
     bool m_offlineRefreshQueued = false; // US-1408: coalesces mediaImported refreshes
     int m_mediaRelinkObservedUndoIndex = -1;
-    QHash<QString, BrushAnimation *> m_liveBrushAnimations;
+    // US-1706: the preview's cache of the clips' brushes (ClipInfo::brushData), keyed
+    // "t:i"; an entry is reused only while the clip there still has the data it was built from.
+    struct LiveBrushAnimation {
+        BrushAnimation *animation = nullptr;
+        QJsonObject brushData;
+    };
+    QHash<QString, LiveBrushAnimation> m_liveBrushAnimations;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
-    // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
-    QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
     // US-1505: publishes Timeline's expression audio-level snapshot (its rebuild hook).
     void rebuildExpressionAudioEnv();
     std::shared_ptr<audiokf::EnvelopeCache> m_audioEnvelopeCache =

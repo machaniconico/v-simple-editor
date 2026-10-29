@@ -5,16 +5,20 @@
 #include "../ClipGeometry.h"
 #include "../FrameDiff.h"
 #include "../Keyframe.h"
+#include "../LayerStyle.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/Encode.h"
+#include "SelftestRegistry.h"
 
 #include <cmath>
 #include <cstdio>
 
 #include <QColor>
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QDebug>
+#include <QStringList>
 #include <QTemporaryDir>
 
 namespace {
@@ -99,6 +103,36 @@ bool near(double a, double b, double eps = kEps)
     return std::abs(a - b) <= eps;
 }
 
+QString imageDigest(const QImage &image)
+{
+    if (image.isNull())
+        return QStringLiteral("null");
+    const QByteArray bytes(reinterpret_cast<const char *>(image.constBits()),
+                           static_cast<int>(image.sizeInBytes()));
+    return QString::fromLatin1(
+        QCryptographicHash::hash(bytes, QCryptographicHash::Sha1).toHex().left(12));
+}
+
+bool sameBytes(const QImage &a, const QImage &b)
+{
+    return !a.isNull() && !b.isNull() && a.size() == b.size()
+        && a.format() == b.format() && a == b;
+}
+
+int maxAlpha(const QImage &image)
+{
+    if (image.isNull())
+        return -1;
+    const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+    int best = 0;
+    for (int y = 0; y < rgba.height(); ++y) {
+        const uchar *row = rgba.constScanLine(y);
+        for (int x = 0; x < rgba.width(); ++x)
+            best = qMax(best, int(row[x * 4 + 3]));
+    }
+    return best;
+}
+
 } // namespace
 
 int runKeyframeAnimParitySelftest()
@@ -108,12 +142,12 @@ int runKeyframeAnimParitySelftest()
 
     auto check = [&](int gate, const char *name, bool ok, const QString &detail = QString()) {
         const QByteArray detailUtf8 = detail.toUtf8();
-        std::printf("[keyframe-anim-parity] %s G%d %s%s%s\n",
-                    ok ? "PASS" : "FAIL",
-                    gate,
-                    name,
-                    detail.isEmpty() ? "" : " - ",
-                    detail.isEmpty() ? "" : detailUtf8.constData());
+        std::fprintf(stderr, "[keyframe-anim-parity] %s G%d %s%s%s\n",
+                             ok ? "PASS" : "FAIL",
+                             gate,
+                             name,
+                             detail.isEmpty() ? "" : " - ",
+                             detail.isEmpty() ? "" : detailUtf8.constData());
         ok ? ++passed : ++failed;
     };
 
@@ -266,9 +300,140 @@ int runKeyframeAnimParitySelftest()
                   .arg(effectiveMode, 0, 'g', 12));
     }
 
+    // G7 (US-1703): the single-layer export shortcut keeps a lone V1 clip's
+    // effective opacity. The same clip rendered (a) alone on V1 and (b) on V2
+    // over an empty V1 must produce the same bytes for a static opacity, a
+    // keyed opacity, a transform.opacity expression, and a layer style +
+    // opacity. HEAD returned (a) opaque (max alpha 255) and FAILed here.
+    // Sub-check (regression pin): at opacity 1.0 (a) == (b), and the (a)
+    // digest is printed so builds before / after the fix can be compared.
+    {
+        const QSize outSize(80, 60);
+        const qint64 usec = 500000;
+        auto renderBoth = [&](const ClipInfo &clip, QImage *alone, QImage *onV2) {
+            Timeline v1Timeline;
+            setTimelineClip(v1Timeline, clip);
+            *alone = tlrender::renderFrameAt(&v1Timeline, usec, outSize);
+            Timeline v2Timeline;
+            v2Timeline.addVideoTrack(false);
+            v2Timeline.videoTracks()[1]->setClips(QVector<ClipInfo>{clip});
+            *onV2 = tlrender::renderFrameAt(&v2Timeline, usec, outSize);
+        };
+
+        bool ok = true;
+        QStringList parts;
+
+        // Step 0 item 11: (a) vs (b) at opacity 1.0 decides the reference
+        // (plain clip, and the scaled + stroked clip of the last variant).
+        // Measured at HEAD: the plain clip is byte-identical, the stroked one
+        // has identical pixels but the shortcut hands back layerstyle's
+        // ARGB32_Premultiplied image (format 6) instead of RGBA8888 (17). The
+        // opacity 1.0 shortcut is left untouched, so that pin compares pixels
+        // after converting (a); (b) stays the reference for opacity < 1.
+        {
+            ClipInfo styledOpaque = makeClip(clipPath);
+            styledOpaque.videoScale = 0.75;
+            styledOpaque.layerStyle.strokeEnabled = true;
+            styledOpaque.layerStyle.strokeColor = QColor(255, 40, 40);
+            styledOpaque.layerStyle.strokeWidth = 3.0;
+            const QVector<QPair<const char *, ClipInfo>> opaque = {
+                {"opacity1.0", makeClip(clipPath)},
+                {"opacity1.0+layerStyle", styledOpaque},
+            };
+            for (const auto &o : opaque) {
+                QImage alone, onV2;
+                renderBoth(o.second, &alone, &onV2);
+                const bool same = sameBytes(alone, onV2);
+                const bool samePixels = !alone.isNull()
+                    && sameBytes(alone.convertToFormat(QImage::Format_RGBA8888), onV2);
+                parts << QStringLiteral("%1 a==b:%2 pixels:%9 a=%3 b=%4 aMaxAlpha=%5 fmt=%6/%7 mse=%8")
+                             .arg(QString::fromLatin1(o.first))
+                             .arg(same ? QStringLiteral("yes") : QStringLiteral("no"))
+                             .arg(imageDigest(alone), imageDigest(onV2))
+                             .arg(maxAlpha(alone))
+                             .arg(int(alone.format()))
+                             .arg(int(onV2.format()))
+                             .arg(framediff::mse(alone, onV2), 0, 'g', 12)
+                             .arg(samePixels ? QStringLiteral("yes") : QStringLiteral("no"));
+                ok = ok && samePixels;
+            }
+        }
+
+        struct Variant {
+            const char *name;
+            ClipInfo clip;
+        };
+        QVector<Variant> variants;
+        {
+            ClipInfo clip = makeClip(clipPath);
+            clip.opacity = 0.5;
+            variants.append({"static0.5", clip});
+        }
+        {
+            ClipInfo clip = makeClip(clipPath);
+            KeyframeTrack opacity(QStringLiteral("motion.opacity"), 1.0);
+            opacity.addKeyframe(0.0, 1.0);
+            opacity.addKeyframe(1.0, 0.2);
+            clip.keyframes.addTrack(opacity);
+            variants.append({"keyed0.6", clip});
+        }
+        {
+            ClipInfo clip = makeClip(clipPath);
+            clip.expressions.setExpression(QStringLiteral("transform.opacity"),
+                                           QStringLiteral("time * 100"));
+            variants.append({"expr0.5", clip});
+        }
+        // The layer-style variant is scaled down so the stroke has an alpha
+        // edge to draw on (a full-canvas layer has none and the style would
+        // be a no-op); the unstyled twin below proves the style is visible.
+        ClipInfo unstyledSmall = makeClip(clipPath);
+        unstyledSmall.opacity = 0.5;
+        unstyledSmall.videoScale = 0.75;
+        {
+            ClipInfo clip = unstyledSmall;
+            clip.layerStyle.strokeEnabled = true;
+            clip.layerStyle.strokeColor = QColor(255, 40, 40);
+            clip.layerStyle.strokeWidth = 3.0;
+            variants.append({"layerStyle+static0.5", clip});
+        }
+        for (const Variant &v : variants) {
+            QImage alone, onV2;
+            renderBoth(v.clip, &alone, &onV2);
+            const bool same = sameBytes(alone, onV2);
+            const int aAlpha = maxAlpha(alone);
+            const int bAlpha = maxAlpha(onV2);
+            // Sanity band on the reference itself: (b) must be translucent.
+            const bool translucent = bAlpha > 0 && bAlpha < 255;
+            parts << QStringLiteral("%1 a==b:%2 a=%3 b=%4 aMaxAlpha=%5 bMaxAlpha=%6 mse=%7")
+                         .arg(QString::fromLatin1(v.name))
+                         .arg(same ? QStringLiteral("yes") : QStringLiteral("no"))
+                         .arg(imageDigest(alone), imageDigest(onV2))
+                         .arg(aAlpha)
+                         .arg(bAlpha)
+                         .arg(framediff::mse(alone, onV2), 0, 'g', 12);
+            ok = ok && same && translucent;
+        }
+        {
+            QImage styledAlone, styledOnV2, plainAlone, plainOnV2;
+            renderBoth(variants.last().clip, &styledAlone, &styledOnV2);
+            renderBoth(unstyledSmall, &plainAlone, &plainOnV2);
+            const bool styleVisible = !sameBytes(styledOnV2, plainOnV2);
+            parts << QStringLiteral("layerStyle visible on b:%1 styled=%2 plain=%3")
+                         .arg(styleVisible ? QStringLiteral("yes") : QStringLiteral("no"))
+                         .arg(imageDigest(styledOnV2), imageDigest(plainOnV2));
+            ok = ok && styleVisible;
+        }
+        check(7, "lone V1 effective opacity == same clip on V2 over empty V1",
+              ok, parts.join(QStringLiteral("; ")));
+    }
+
     qInfo().noquote()
         << QStringLiteral("KEYFRAME-ANIM-PARITY: %1/%2 PASS")
                .arg(passed)
                .arg(passed + failed);
+    std::fprintf(stderr, "[keyframe-anim-parity] summary: %d PASS, %d FAIL, 0 SKIP\n",
+                 passed, failed);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

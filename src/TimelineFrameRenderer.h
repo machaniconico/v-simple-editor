@@ -135,6 +135,33 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
                                     QSize outSize,
                                     qint64 timelineUsec);
 
+// US-1707: the native layer source renderFrameAt builds for clip `clipIdx` on
+// video track `trackIdx` at `usec` (roto -> VFX -> grade -> FX -> clip mask ->
+// 3D text), before fit, projection and placement. Null when that clip is not
+// the one the track shows at `usec` or decodes nothing. An empty `outSize`
+// means the project output size.
+QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                          qint64 usec, QSize outSize = QSize());
+// US-1708: the stages renderClipLayerSourceStageForTest can stop at. Final is
+// renderClipSourceAt; AfterBrush is the roto'd raw with the clip's brush
+// strokes drawn, before VFX / grade (the image the preview uploads in its
+// non-composite-baked mode).
+enum class Stage { Final, AfterBrush };
+QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx,
+                                         int clipIdx, qint64 usec, Stage stage,
+                                         QSize outSize = QSize());
+// US-1708: the clip-local time export gives clip (trackIdx, clipIdx) at
+// `timelineSec`: the selected overlap interval's start while the clip is shown
+// inside a transition overlap, else its placement start (cursor + leadInSec
+// walk; a nested-sequence parent uses the parent's own placement). When the
+// track does not show the clip at `timelineSec` the value is the offset from the
+// placement start clamped into [0, effectiveDuration]. False on a bad index.
+bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                    double timelineSec, double *localSec);
+// Number of clip layer sources built so far (V1, upper layers, transition
+// neighbours, renderClipSourceAt), for tests.
+quint64 clipLayerSourceCallsForTest();
+
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
                      double frameDurationUs);

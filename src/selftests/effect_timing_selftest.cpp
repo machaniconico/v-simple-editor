@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/effect_timing_selftest.cpp
 // Render-time clip-local VideoEffect active-range gates.
 
@@ -306,5 +307,6 @@ int runEffectTimingSelftest()
         << QStringLiteral("EFFECT-TIMING: %1/%2 PASS")
                .arg(passed)
                .arg(passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

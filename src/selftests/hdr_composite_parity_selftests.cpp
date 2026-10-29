@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/hdr_composite_parity_selftests.cpp
 // GPU RGBA16 (16-bit) vs CPU 16-bit oracle measured-parity selftest — Stage4C HDR-2.
 //
@@ -430,5 +431,6 @@ int runHdrCompositeParitySelftest()
     }
 
     std::printf("[hdr-composite-parity] Result: %d/%d PASSED\n", passed, total);
+    selftests::reportTally(passed, total - passed, 0);
     return (passed == total) ? 0 : 1;
 }

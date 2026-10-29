@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // ClipColor headless selftest.
 //
 // QApplication 不要・QtCore のみ。clipcolor:: の純粋モデルを JSON round-trip、
@@ -127,5 +128,6 @@ int runClipColorSelftest()
 
     qInfo().noquote() << "[clip-color] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

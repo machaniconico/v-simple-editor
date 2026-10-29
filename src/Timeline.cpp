@@ -2073,6 +2073,10 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // is no longer the original's trailOut. Reset those so neither transition
     // is duplicated onto both halves.
     secondHalf.leadIn = Transition{};
+    // US-1706: the 3D text and the brush stay on the left half only (the rule the
+    // position-keyed sidecars had: every split path comes through here).
+    secondHalf.text3DConfig = QJsonObject();
+    secondHalf.brushData = QJsonObject();
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);
@@ -7734,6 +7738,57 @@ bool Timeline::setClipExpressions(int trackIndex, int clipIndex,
     return true;
 }
 
+// US-1706: the 3D text / brush moved onto the clip; same shape as setClipWiggle.
+bool Timeline::setClipText3DConfig(int trackIndex, int clipIndex, const QJsonObject &config)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].text3DConfig == config)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].text3DConfig = config;
+    track->setClips(clips);
+
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("3D テキストを変更"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
+bool Timeline::setClipBrushData(int trackIndex, int clipIndex, const QJsonObject &brushData)
+{
+    TimelineTrack *track = trackAt(false, trackIndex);
+    if (!track || track->isLocked()
+        || clipIndex < 0 || clipIndex >= track->clipCount()) {
+        return false;
+    }
+
+    const QVector<ClipInfo> currentClips = track->clips();
+    if (currentClips[clipIndex].brushData == brushData)
+        return true;
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = currentClips;
+    clips[clipIndex].brushData = brushData;
+    track->setClips(clips);
+
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("ブラシを変更"));
+    updateInfoLabel();
+    scheduleEmitSequenceChanged();
+    return true;
+}
+
 std::shared_ptr<const audiokf::ExprAudioEnv> Timeline::expressionAudioEnvForRead() const
 {
     // Only the UI thread compares the generation and rebuilds; a render thread reads
@@ -7755,9 +7810,57 @@ std::function<double(double)> Timeline::expressionAudioLevelSampler(const ClipIn
     return audiokf::makeLinkedAudioSamplerFrom(*env, clip.linkGroup, clipStartSec);
 }
 
+std::shared_ptr<const audiokf::ExprAudioEnv> Timeline::buildExpressionAudioEnv(
+    std::shared_ptr<audiokf::EnvelopeCache> cache) const
+{
+    auto env = std::make_shared<audiokf::ExprAudioEnv>();
+    env->audioClipsByTrack.reserve(m_audioTracks.size());
+    for (const auto *track : m_audioTracks) {
+        if (track) env->audioClipsByTrack.append(track->clips());
+    }
+    env->cache = std::move(cache);
+    env->generation = m_clipGeneration;
+    return env;
+}
+
 void Timeline::setExpressionAudioEnv(std::shared_ptr<const audiokf::ExprAudioEnv> env)
 {
+    // US-1710: audioLevel() is the only reader of the envelopes. Warm up just the first
+    // audio clip of each linkGroup that a video clip with an audioLevel() expression
+    // links to (the clip makeLinkedAudioSampler picks), de-duplicated, within the
+    // EnvelopeCache LRU limit.
+    QStringList warmPaths;
+    if (env && env->cache) {
+        QSet<int> seenGroups;
+        for (const TimelineTrack *track : std::as_const(m_videoTracks)) {
+            if (!track) continue;
+            for (const ClipInfo &clip : track->clips()) {
+                if (clip.linkGroup <= 0 || seenGroups.contains(clip.linkGroup)) continue;
+                bool usesAudioLevel = false;
+                for (const QString &path : clip.expressions.boundPaths())
+                    usesAudioLevel = usesAudioLevel
+                        || clip.expressions.expression(path).contains(QStringLiteral("audioLevel"));
+                if (!usesAudioLevel) continue;
+                seenGroups.insert(clip.linkGroup);
+                const ClipInfo *audio = nullptr;
+                for (const QVector<ClipInfo> &clips : env->audioClipsByTrack) {
+                    for (const ClipInfo &candidate : clips) {
+                        if (candidate.linkGroup == clip.linkGroup && !candidate.filePath.isEmpty()) {
+                            audio = &candidate;
+                            break;
+                        }
+                    }
+                    if (audio) break;
+                }
+                if (audio && !warmPaths.contains(audio->filePath) && warmPaths.size() < 16)
+                    warmPaths.append(audio->filePath);
+            }
+        }
+    }
+    const std::weak_ptr<audiokf::EnvelopeCache> cache = env ? env->cache : nullptr;
     std::atomic_store(&m_exprAudioEnv, std::move(env));
+    if (!warmPaths.isEmpty())
+        audiokf::EnvelopeCache::prefetch(cache, warmPaths);
 }
 
 void Timeline::setExpressionAudioEnvRebuildHook(std::function<void()> hook)

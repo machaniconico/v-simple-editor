@@ -43,6 +43,8 @@
 #include "util/CrashHandler.h"
 #include "util/Logger.h"
 #include "AudioMixer.h"
+#include "AudioKeyframes.h"  // US-1710: prefetchPool drained at quit
+#include <QThreadPool>
 #include "FrameDiff.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
@@ -696,6 +698,7 @@ int runCredentialVaultSelftest()
         qInfo().noquote().nospace()
             << "[credential-vault] selftest end, passed=" << gates_passed
             << " failed=" << gates_failed;
+        selftests::reportTally(gates_passed - 9, gates_failed, 9);
         return gates_failed == 0 ? 0 : 1;
     }
 
@@ -777,6 +780,7 @@ int runCredentialVaultSelftest()
     qInfo().noquote().nospace()
         << "[credential-vault] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 
@@ -888,6 +892,7 @@ int runCredTtlSelftest()
     qInfo().noquote().nospace()
         << "[cred-ttl] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 
@@ -1479,6 +1484,7 @@ int runPlatformMockE2eSelftest()
     qInfo().noquote().nospace()
         << "[platform-mock-e2e] selftest end, passed=" << gates_passed
         << " failed=" << gates_failed;
+    selftests::reportTally(gates_passed, gates_failed, 0);
     return gates_failed == 0 ? 0 : 1;
 }
 
@@ -1619,6 +1625,11 @@ int main(int argc, char *argv[])
         }
     }
 
+    // US-1710: stop the audioLevel() envelope prefetch workers before static teardown.
+    QObject::connect(&app, &QCoreApplication::aboutToQuit, &app, [] {
+        audiokf::prefetchPool().clear();
+        audiokf::prefetchPool().waitForDone();
+    });
     const int rc = app.exec();
     writeLogLine("INFO", QString("event loop exited rc=%1").arg(rc));
     return rc;

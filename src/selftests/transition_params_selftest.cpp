@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Overlay.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
@@ -261,5 +262,6 @@ int runTransitionParamsSelftest()
     OverlayRenderer::setEdgeParamsEnabledForTest(true);
     tlrender::setTransitionStepsEnabledForTest(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

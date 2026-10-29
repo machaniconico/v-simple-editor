@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // SwsColor headless selftest.
 //
 // QApplication 不要。swscale 色行列 helper の enum 解決と係数差分を検証する。
@@ -76,5 +77,6 @@ int runSwsColorSelftest()
 
     qInfo().noquote() << "[sws-color] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

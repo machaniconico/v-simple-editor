@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
@@ -686,5 +687,6 @@ int runAeFxColor2Selftest()
 
     std::printf("ae-fx-color2 summary gates=%d passed=%d failed=%d\n",
                 passed + failed, passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

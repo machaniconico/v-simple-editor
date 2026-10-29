@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include <QDebug>
 #include <QList>
 #include <QString>
@@ -170,5 +171,6 @@ int runTranscriptHighlighterOfflineSelftest()
     }
 
     qInfo().noquote().nospace() << "[transcript-highlighter-offline] selftest end, passed=" << passed << " failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

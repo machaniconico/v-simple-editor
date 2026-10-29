@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/bezier_easing_selftest.cpp
 // S3: per-keyframe cubic-bezier easing regression gates.
 
@@ -184,5 +185,6 @@ int runBezierEasingSelftest()
     }
 
     std::printf("[bezier-easing] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

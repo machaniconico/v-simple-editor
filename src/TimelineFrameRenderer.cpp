@@ -3,6 +3,8 @@
 #include "OpticalFlow.h"
 #include <atomic>
 #include "Light3D.h"
+#include "BrushAnimation.h"
+#include "Overlay.h"
 #include "Camera3D.h"
 #include "VideoEffect.h"        // VideoEffectProcessor::applyColorCorrection (CPU SSOT)
 #include "LutImporter.h"        // LutImporter::loadCubeFile / applyLutWithIntensity
@@ -20,6 +22,7 @@
 #include "RotoApply.h"          // US-908 — roto stage shared with the preview
 #include "VfxFootageLibrary.h"  // VFX-C source-side black level + intensity
 #include "ShapeLayer.h"         // SHAPE-CLIP generated source-frame SSOT
+#include "Text3DLayer.h"        // US-1707 — clip 3D text on the layer source
 #include <cstring>              // std::memcpy (decode row copy)
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
@@ -41,8 +44,10 @@
 
 #include <QtGlobal>
 #include <QByteArray>
+#include <QCryptographicHash>
 #include <QFile>
 #include <QHash>
+#include <QJsonDocument>
 #include <QMutex>
 #include <QPainter>
 #include <QRectF>
@@ -53,6 +58,7 @@
 #include <limits>
 #include <QImageReader>
 #include <map>
+#include <memory>
 #include <tuple>
 #include <functional>
 
@@ -1827,6 +1833,213 @@ QImage applyVfxFootageControls(const QImage &native, const ClipInfo &clip)
         tightened, clip.vfxIntensity);
 }
 
+// US-908: roto stage right after each top-level layer decode (V1, upper
+// layers, transition incoming), before VFX/grade/FX/mask — the preview's
+// position (MainWindow::buildSpecialClipComposite -> applyStoredRotoData).
+// A reversed clip's source second is the right-hand boundary of the decoded
+// frame (reverse decode keeps the last frame strictly before it); the preview
+// indexes the mask one source frame earlier, in both its time-remap and plain
+// reversed branches. Do the same here.
+QImage applyRotoForRender(const Timeline *timeline,
+                          const QHash<QString, RotoClipEntry> &rotoEntries,
+                          int t, int clipIdx, const ClipInfo &c,
+                          const QImage &raw, double sourceSec, double localSec)
+{
+    if (rotoEntries.isEmpty() || raw.isNull())
+        return raw;
+    const auto it = rotoEntries.constFind(renderClipId(t, clipIdx));
+    if (it == rotoEntries.cend())
+        return raw;
+    const double fps = rotoSourceFps(c, timeline->projectFrameRate());
+    if (c.reversed && c.sourceTimeRunsBackwardAtLocalTime(localSec)) {
+        // A RenderInPlace stand-in (its original on the same media) has an
+        // inPoint lowered by the handles. Its retained samples clamp to the
+        // original's inPoint, as the source timeline does.
+        const ClipInfo *original = c.renderInPlaceOriginal.get();
+        const double inSec = original && original->filePath == c.filePath
+                && sourceSec >= original->inPoint
+            ? original->inPoint : c.inPoint;
+        sourceSec = qMax(inSec, sourceSec - 1.0 / fps);
+    }
+    return roto::applyEntryForRender(
+        it.value(), raw, roto::sourceFrameIndexFor(sourceSec, fps));
+}
+
+// US-1707: one Text3DLayer per (clip, config), built on first use by whichever
+// thread renders it. renderFrame is const but fills a mutable mesh cache, so
+// the whole call runs under the lock. Never freed: a QFont outliving the
+// application at static destruction is not safe.
+QMutex g_text3DLayerCacheMutex;
+std::map<QByteArray, std::unique_ptr<Text3DLayer>> &text3DLayerCache()
+{
+    static auto *cache = new std::map<QByteArray, std::unique_ptr<Text3DLayer>>();
+    return *cache;
+}
+std::atomic<quint64> g_clipLayerSourceCalls{0};
+
+// US-1707: alpha-over the clip's 3D text on its native layer source, after the
+// clip mask (user decision M: the mask does not cut the text) and before the
+// placement transform, with the same painter calls as the preview
+// (MainWindow::buildSpecialClipComposite). A text that draws nothing (empty
+// string) leaves the source untouched.
+QImage applyClipText3D(const QImage &native, const ClipInfo &clip,
+                       double localSec, const QString &clipId)
+{
+    if (clip.text3DConfig.isEmpty() || native.isNull())
+        return native;
+    QByteArray key = clipId.toUtf8();
+    key += '\n';
+    key += QCryptographicHash::hash(
+        QJsonDocument(clip.text3DConfig).toJson(QJsonDocument::Compact),
+        QCryptographicHash::Sha1);
+    QImage textImage;
+    {
+        QMutexLocker lock(&g_text3DLayerCacheMutex);
+        auto &cache = text3DLayerCache();
+        auto it = cache.find(key);
+        if (it == cache.end()) {
+            if (cache.size() >= 64)
+                cache.clear();
+            auto layer = std::make_unique<Text3DLayer>();
+            layer->fromJson(clip.text3DConfig);
+            it = cache.emplace(key, std::move(layer)).first;
+        }
+        textImage = it->second->renderFrame(native.size(), localSec,
+                                            it->second->camera());
+    }
+    if (textImage.isNull())
+        return native;
+    const QImage alpha = textImage.convertToFormat(QImage::Format_Alpha8);
+    bool drawsAnything = false;
+    for (int y = 0; y < alpha.height() && !drawsAnything; ++y) {
+        const uchar *row = alpha.constScanLine(y);
+        for (int x = 0; x < alpha.width(); ++x) {
+            if (row[x] != 0) {
+                drawsAnything = true;
+                break;
+            }
+        }
+    }
+    if (!drawsAnything)
+        return native;
+    QImage base = native.convertToFormat(QImage::Format_ARGB32);
+    QPainter painter(&base);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+    painter.drawImage(QRect(QPoint(0, 0), base.size()), textImage);
+    painter.end();
+    return base;
+}
+
+// US-1708: one BrushAnimation per (clip, brush data), built on first use by
+// whichever thread renders it, under the same lock discipline as the 3D text
+// layers (renderFrame runs under the lock). Never freed, like text3DLayerCache.
+QMutex g_brushAnimationCacheMutex;
+std::map<QByteArray, std::unique_ptr<BrushAnimation>> &brushAnimationCache()
+{
+    static auto *cache = new std::map<QByteArray, std::unique_ptr<BrushAnimation>>();
+    return *cache;
+}
+
+// US-1708: draw the clip's brush strokes onto the roto'd raw source, before
+// VFX / grade (the preview's non-composite-baked stage: the brush goes on the
+// decoded frame and the shader grades it afterwards). Progress follows the
+// clip's "brush_progress" keyframes. No strokes, or progress 0, leave the
+// source byte-unchanged.
+QImage applyClipBrush(const QImage &raw, const ClipInfo &clip, double localSec,
+                      const QString &clipId)
+{
+    if (clip.brushData.isEmpty() || raw.isNull())
+        return raw;
+    const double progress = clip.keyframes.valueAt(
+        QStringLiteral("brush_progress"), localSec, 0.0);
+    if (progress <= 0.0)
+        return raw;
+    QByteArray key = clipId.toUtf8();
+    key += '\n';
+    key += QCryptographicHash::hash(
+        QJsonDocument(clip.brushData).toJson(QJsonDocument::Compact),
+        QCryptographicHash::Sha1);
+    QImage out = raw;
+    QMutexLocker lock(&g_brushAnimationCacheMutex);
+    auto &cache = brushAnimationCache();
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() >= 64)
+            cache.clear();
+        auto animation = std::make_unique<BrushAnimation>();
+        animation->fromJson(clip.brushData);
+        it = cache.emplace(key, std::move(animation)).first;
+    }
+    OverlayRenderer::renderBrushOverlay(out, it->second.get(), progress);
+    return out;
+}
+
+// US-1707: the native layer source of one clip (rule (78)): roto -> VFX ->
+// grade -> FX pack / echo stack / mesh warp -> clip mask -> 3D text, before
+// fit and placement. V1, the upper layers and the overlap-transition neighbour
+// all build their source here. Only the echo past-frame provider stays raw.
+// Null when the clip decodes nothing; each caller keeps its own null branch.
+// promoteMaskTo16 keeps the V1 / upper-layer RGBA64 mask input under the HDR
+// flags (the transition neighbour never had it).
+QImage renderClipLayerSource(const Timeline *timeline,
+                             const QHash<QString, RotoClipEntry> &rotoEntries,
+                             int trackIdx, int clipIdx, const ClipInfo &clip,
+                             double sourceSec, double localSec, QSize outSize,
+                             int sequenceDepth,
+                             const QVector<TimelineSequence> &sequenceSnapshot,
+                             QVector<QString> &sequenceStack,
+                             const QVector<Light3DState> &projectLights,
+                             const QVector3D &projectLightViewPosition,
+                             bool sampleFromLeftBoundary,
+                             bool promoteMaskTo16,
+                             bool stopAfterBrush = false)
+{
+    g_clipLayerSourceCalls.fetch_add(1, std::memory_order_relaxed);
+    const QString scopedClipId = renderScopedClipId(trackIdx, clipIdx, sequenceDepth,
+                                                    sequenceStack);
+    const QImage roto = applyRotoForRender(timeline, rotoEntries, trackIdx, clipIdx, clip,
+        renderClipSourceFrame(
+            timeline, clip, sourceSec, localSec, outSize, sequenceDepth,
+            sequenceSnapshot, sequenceStack, projectLights,
+            projectLightViewPosition, sampleFromLeftBoundary),
+        sourceSec, localSec);
+    if (roto.isNull())
+        return QImage();
+    // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
+    // that image feeds both the echo and the plain branch; the echo past-frame
+    // provider below stays brush-free.
+    const QImage raw = applyClipBrush(roto, clip, localSec, scopedClipId);
+    if (stopAfterBrush)
+        return raw;
+    QImage fx;
+    if (hasActiveEcho(clip, localSec) || hasActiveRollingShutter(clip, localSec)) {
+        const EchoFrameProvider echoFrameProvider =
+            [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
+                const QImage sampleRaw = renderClipSourceFrame(
+                    timeline, clip, sampleSourceSec, sampleLocalSec,
+                    outSize, sequenceDepth,
+                    sequenceSnapshot, sequenceStack, projectLights,
+                    projectLightViewPosition, sampleFromLeftBoundary);
+                if (sampleRaw.isNull())
+                    return QImage();
+                return prepareClipSourceForEcho(sampleRaw, clip, sampleLocalSec);
+            };
+        fx = applyClipFxStackWithEchoFromSource(
+            raw, clip, localSec, sourceSec, echoFrameProvider);
+    } else {
+        fx = applyClipFxStackFromSource(raw, clip, localSec);
+    }
+    // S7: the per-clip compositing mask (motion-tracker animated) on the
+    // graded+FX'd native frame, before it is scaled onto the canvas. No-op
+    // when the clip has no mask.
+    if (promoteMaskTo16 && clip.hasMask()
+        && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
+        fx = fx.convertToFormat(QImage::Format_RGBA64);
+    }
+    return applyClipText3D(applyClipMask(fx, clip, sourceSec), clip, localSec,
+                           scopedClipId);
+}
+
 // ── Per-track clip selection shared by renderFrameFromTracks and
 // tlrender::parentLayerAt (US-804). Extracted verbatim from the former
 // inline blocks of renderFrameFromTracks; evaluation order and comparisons
@@ -2131,38 +2344,19 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                                    t, c, local, reverse,
                                    /*countDisabled=*/true);
     };
-    // US-908: roto stage right after each top-level layer decode (V1, upper
-    // layers, transition incoming), before VFX/grade/FX/mask — the preview's
-    // position (MainWindow::buildSpecialClipComposite -> applyStoredRotoData).
+    // US-908: roto stage (applyRotoForRender, inside renderClipLayerSource).
     // Echo samples and nested-sequence layers get none, as in the preview.
     const QHash<QString, RotoClipEntry> rotoEntries =
         (sequenceDepth == 0 && timeline) ? timeline->rotoEntries()
                                          : QHash<QString, RotoClipEntry>();
-    // A reversed clip's source second is the right-hand boundary of the
-    // decoded frame (reverse decode keeps the last frame strictly before it);
-    // the preview indexes the mask one source frame earlier, in both its
-    // time-remap and plain reversed branches. Do the same here.
-    auto applyRoto = [&](int t, int clipIdx, const ClipInfo &c,
-                         const QImage &raw, double sourceSec,
-                         double localSec) -> QImage {
-        if (rotoEntries.isEmpty() || raw.isNull())
-            return raw;
-        const auto it = rotoEntries.constFind(renderClipId(t, clipIdx));
-        if (it == rotoEntries.cend())
-            return raw;
-        const double fps = rotoSourceFps(c, timeline->projectFrameRate());
-        if (c.reversed && c.sourceTimeRunsBackwardAtLocalTime(localSec)) {
-            // A RenderInPlace stand-in (its original on the same media) has an
-            // inPoint lowered by the handles. Its retained samples clamp to the
-            // original's inPoint, as the source timeline does.
-            const ClipInfo *original = c.renderInPlaceOriginal.get();
-            const double inSec = original && original->filePath == c.filePath
-                    && sourceSec >= original->inPoint
-                ? original->inPoint : c.inPoint;
-            sourceSec = qMax(inSec, sourceSec - 1.0 / fps);
-        }
-        return roto::applyEntryForRender(
-            it.value(), raw, roto::sourceFrameIndexFor(sourceSec, fps));
+    // US-1707: every top-level clip layer source of this composition.
+    auto layerSource = [&](int t, int clipIdx, const ClipInfo &c,
+                           double sourceSec, double localSec,
+                           bool promoteMaskTo16) {
+        return renderClipLayerSource(
+            timeline, rotoEntries, t, clipIdx, c, sourceSec, localSec, outSize,
+            sequenceDepth, sequenceSnapshot, sequenceStack, projectLights,
+            projectLightViewPosition, sampleFromLeftBoundary, promoteMaskTo16);
     };
 
     // The preview applies transitions to its primary playback entry only,
@@ -2204,23 +2398,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool reverse = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
         const double source = overlapSourceSecond(b, c, local, reverse);
-        const QImage raw = applyRoto(primaryTrack, b.clipIdx, c,
-            renderClipSourceFrame(
-                timeline, c, source, local, outSize, sequenceDepth,
-                sequenceSnapshot, sequenceStack, projectLights,
-                projectLightViewPosition, sampleFromLeftBoundary),
-            source, local);
-        if (raw.isNull()) return composed;
-        const EchoFrameProvider provider = [&](double src, double loc) {
-            return prepareClipSourceForEcho(renderClipSourceFrame(
-                timeline, c, src, loc, outSize, sequenceDepth,
-                sequenceSnapshot, sequenceStack, projectLights,
-                projectLightViewPosition, sampleFromLeftBoundary), c, loc);
-        };
-        QImage neighbour = (hasActiveEcho(c, local) || hasActiveRollingShutter(c, local))
-            ? applyClipFxStackWithEchoFromSource(raw, c, local, source, provider)
-            : applyClipFxStackFromSource(raw, c, local);
-        neighbour = applyClipMask(neighbour, c, source);
+        QImage neighbour = layerSource(primaryTrack, b.clipIdx, c, source, local,
+                                       /*promoteMaskTo16=*/false);
+        if (neighbour.isNull()) return composed;
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
         const clipgeom::ClipTransform neighbourTransform =
             clipanim::effectiveTransformAt(c, local, clipEvalEnv(c, b.timelineStart));
@@ -2254,6 +2434,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     QImage v1LayerSource;
     clipgeom::ClipTransform v1Transform;
     bool v1NullObject = false;
+    bool v1Disabled = false;
     if (v1Hidden) {
         base = QImage(outSize, QImage::Format_RGBA8888);
         base.fill(Qt::transparent);
@@ -2274,7 +2455,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 return QImage();
 
             const ClipInfo &v1Clip = v1Clips[v1Idx];
-            const bool v1Disabled = clipenabletest::disabled(v1Clip);
+            v1Disabled = clipenabletest::disabled(v1Clip);
             v1ClipPtr = v1Disabled ? &hiddenV1Clip : &v1Clip;
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
@@ -2310,67 +2491,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             base.fill(Qt::transparent);
         } else {
 
-        const QImage v1NativeRaw = applyRoto(0, v1Idx, v1Clip,
-            renderClipSourceFrame(
-                timeline, v1Clip, v1SourceSec, v1LocalSec, outSize, sequenceDepth,
-                sequenceSnapshot, sequenceStack, projectLights,
-                projectLightViewPosition, sampleFromLeftBoundary),
-            v1SourceSec, v1LocalSec);
-        if (v1NativeRaw.isNull())
+        // S4 / S5 / S7 (+ US-1707 3D text): the V1 clip's native layer source —
+        // grade, FX and mask in NATIVE resolution before it is scaled onto the
+        // canvas, each a strict no-op for a default clip so a lone V1 clip
+        // stays byte-identical to S2.
+        const QImage v1Native = layerSource(0, v1Idx, v1Clip, v1SourceSec, v1LocalSec,
+                                            /*promoteMaskTo16=*/true);
+        if (v1Native.isNull())
             return QImage();
-
-        const QImage v1Vfx = applyVfxFootageControls(v1NativeRaw, v1Clip);
-
-        // S4: grade the V1 clip in NATIVE resolution before it is scaled onto the
-        // canvas — the preview shader colour-corrects/LUTs the sampled texel, i.e.
-        // grading happens per source pixel, independent of canvas scale. For a
-        // clip with default colour and no LUT this is a strict no-op so a lone V1
-        // clip stays byte-identical to S2.
-        const QImage v1Graded =
-            gradeClipNativeFrame(v1Vfx, v1Clip, v1LocalSec);
-
-        // S5: apply the V1 clip's FX pack on the GRADED native frame — the preview
-        // shader runs the FX uniforms AFTER the CC+LUT block closes
-        // (GLPreview.cpp:908 closes the grade branch; FX consumed at
-        // GLPreview.cpp:910-916), so FX comes strictly after CC -> LUT. No-op when
-        // the clip carries no effects, so a lone V1 clip stays byte-identical to
-        // S2/S3/S4.
-        QImage v1Fx;
-        if (hasActiveEcho(v1Clip, v1LocalSec)
-            || hasActiveRollingShutter(v1Clip, v1LocalSec)) {
-            const EchoFrameProvider echoFrameProvider =
-                [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
-                    const QImage sampleRaw = renderClipSourceFrame(
-                        timeline, v1Clip, sampleSourceSec, sampleLocalSec,
-                        outSize, sequenceDepth,
-                        sequenceSnapshot, sequenceStack, projectLights,
-                        projectLightViewPosition, sampleFromLeftBoundary);
-                    if (sampleRaw.isNull())
-                        return QImage();
-                    return prepareClipSourceForEcho(
-                        sampleRaw, v1Clip, sampleLocalSec);
-                };
-            v1Fx = applyClipFxStackWithEchoFromSource(
-                v1NativeRaw, v1Clip, v1LocalSec, v1SourceSec,
-                echoFrameProvider);
-        } else {
-            v1Fx = applyClipMeshWarp(
-                applyClipFxPack(v1Graded, v1Clip, v1LocalSec), v1Clip);
-        }
-
-        // S7: apply the V1 clip's per-clip compositing mask (motion-tracker
-        // animated) on the GRADED+FX'd native frame, BEFORE it is scaled onto
-        // the canvas — a per-clip AE/Premiere mask cuts the layer's alpha at the
-        // source-pixel level, before scale + the multi-track SourceOver
-        // composite (src/VideoPlayer.cpp:4558-4579), so a lower track shows
-        // through exactly where the mask cuts. No-op when the clip has no mask,
-        // so a lone V1 clip stays byte-identical to S2/S3/S4/S5/S6.
-        QImage v1MaskInput = v1Fx;
-        if (v1Clip.hasMask()
-            && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
-            v1MaskInput = v1MaskInput.convertToFormat(QImage::Format_RGBA64);
-        }
-        const QImage v1Native = applyClipMask(v1MaskInput, v1Clip, v1SourceSec);
         const bool contained =
             snsfit::shouldFit(v1Clip.fitContain, v1Clip.fitCover, outSize, v1Native.size());
         QImage v1Contained =
@@ -2525,54 +2653,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayers.append(renderLayer);
             continue;
         }
-        const QImage nativeRaw = applyRoto(t, idx, c,
-            renderClipSourceFrame(
-                timeline, c, srcSec, localSec, outSize, sequenceDepth,
-                sequenceSnapshot,
-                sequenceStack, projectLights, projectLightViewPosition,
-                sampleFromLeftBoundary),
-            srcSec, localSec);
-        if (nativeRaw.isNull())
+        // S4 / S5 / S7 (+ US-1707 3D text): the overlay's native layer source,
+        // in the same CC -> LUT -> FX -> MASK per-clip order as V1, BEFORE it
+        // is scaled onto the shared canvas. No-op for plain overlays, so S3's
+        // multi-track MSE stays ~0.
+        QImage native = layerSource(t, idx, c, srcSec, localSec,
+                                    /*promoteMaskTo16=*/true);
+        if (native.isNull())
             continue;
-        // S4: grade each overlay clip in native resolution too (same per-clip
-        // CC -> LUT order as V1 and the preview shader). No-op for un-graded
-        // overlays, so S3's multi-track MSE stays ~0.
-        // S5: then the overlay's FX pack, on the graded frame, in the same
-        // CC -> LUT -> FX order as V1 and the shader (GLPreview.cpp:910-916).
-        // No-op for effect-free overlays, so S3's multi-track MSE stays ~0.
-        // S7: then the overlay's per-clip compositing mask (tracker-animated),
-        // on the graded+FX'd native frame, BEFORE it is scaled onto the
-        // shared canvas — so the masked-out region is transparent when this
-        // overlay is SourceOver-composited and the layers beneath show
-        // through (same CC -> LUT -> FX -> MASK per-clip order as V1). No-op
-        // for un-masked overlays, so S3's multi-track MSE stays ~0.
-        const QImage gradedNative = gradeClipNativeFrame(
-            applyVfxFootageControls(nativeRaw, c), c, localSec);
-        QImage nativeForMask;
-        if (hasActiveEcho(c, localSec) || hasActiveRollingShutter(c, localSec)) {
-            const EchoFrameProvider echoFrameProvider =
-                [&](double sampleSourceSec, double sampleLocalSec) -> QImage {
-                    const QImage sampleRaw = renderClipSourceFrame(
-                        timeline, c, sampleSourceSec, sampleLocalSec,
-                        outSize, sequenceDepth,
-                        sequenceSnapshot, sequenceStack, projectLights,
-                        projectLightViewPosition, sampleFromLeftBoundary);
-                    if (sampleRaw.isNull())
-                        return QImage();
-                    return prepareClipSourceForEcho(
-                        sampleRaw, c, sampleLocalSec);
-                };
-            nativeForMask = applyClipFxStackWithEchoFromSource(
-                nativeRaw, c, localSec, srcSec, echoFrameProvider);
-        } else {
-            nativeForMask = applyClipMeshWarp(
-                applyClipFxPack(gradedNative, c, localSec), c);
-        }
-        if (c.hasMask()
-            && (hdrexport16::enabledFromEnv() || hdrmatte16::enabledFromEnv())) {
-            nativeForMask = nativeForMask.convertToFormat(QImage::Format_RGBA64);
-        }
-        QImage native = applyClipMask(nativeForMask, c, srcSec);
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
         RenderLayer renderLayer;
         renderLayer.clipId =
@@ -2835,6 +2923,23 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         QImage styledBase = base;
         if (!v1Clip.layerStyle.isIdentity())
             styledBase = layerstyle::apply(styledBase, v1Clip.layerStyle);
+        // A lone V1 clip below full opacity is painted over a transparent
+        // canvas exactly like the composite path below (SourceOver, layer
+        // skipped at opacity <= 0.001), so it matches the same clip on V2
+        // over an empty V1. Opacity 1.0 keeps the untouched shortcut bytes.
+        if (v1Idx >= 0 && !v1Disabled && !v1NullObject && v1EffectiveOpacity < 1.0) {
+            QImage composed(styledBase.size(), QImage::Format_ARGB32_Premultiplied);
+            composed.fill(Qt::transparent);
+            const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
+            if (v1Opacity > 0.001) {
+                QPainter p(&composed);
+                p.setRenderHint(QPainter::SmoothPixmapTransform, false);
+                p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                p.setOpacity(v1Opacity);
+                p.drawImage(0, 0, styledBase);
+            }
+            styledBase = composed.convertToFormat(QImage::Format_RGBA8888);
+        }
         const QImage adj = applyTimelineGlobals
             ? applyAdjustmentLayers(styledBase, timeline, sampledUsec)
             : styledBase;
@@ -3209,6 +3314,113 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
 }
 
 } // namespace
+
+static QImage renderClipSourceAtStage(const Timeline *timeline, int trackIdx, int clipIdx,
+                                      qint64 usec, QSize outSize, bool stopAfterBrush)
+{
+    if (!timeline)
+        return QImage();
+    if (outSize.isEmpty())
+        outSize = timeline->projectOutputSize();
+    if (outSize.isEmpty())
+        return QImage();
+    // Same clip choice and time mapping as renderFrameAt's top-level pass
+    // (selectClipOnTrack / sourceSecondOnTrack, the `sourceAt` of
+    // renderFrameFromTracks), without counting disabled-clip skips.
+    const QVector<RenderTrackSnapshot> tracks = snapshotsFromTimeline(timeline);
+    if (trackIdx < 0 || trackIdx >= tracks.size()
+        || clipIdx < 0 || clipIdx >= tracks[trackIdx].clips.size())
+        return QImage();
+    const double targetSec = static_cast<double>(usec) / 1'000'000.0;
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, /*applyTimelineGlobals=*/true, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, targetSec, overlapA, overlapB);
+    double start = 0.0;
+    if (selectClipOnTrack(tracks, intervals, overlapA, overlapB, trackIdx,
+                          targetSec, /*clamp=*/trackIdx == 0, &start,
+                          /*countDisabled=*/false) != clipIdx)
+        return QImage();
+    const QVector<TimelineSequence> sequenceSnapshot = timeline->sequences();
+    const ClipInfo &c = tracks[trackIdx].clips[clipIdx];
+    const double localSec = targetSec - start;
+    const bool reverse = clipParticipatesInReverseComposition(c, sequenceSnapshot);
+    const double sourceSec = sourceSecondOnTrack(
+        tracks, intervals, overlapA, overlapB, trackIdx, c, localSec, reverse,
+        /*countDisabled=*/false);
+    QVector<QString> sequenceStack;
+    const QString activeId = timeline->activeSequenceId();
+    if (!activeId.isEmpty())
+        sequenceStack.append(activeId);
+    const QVector<Light3DState> projectLights = light3d::statesAt(
+        timeline->projectLights(), targetSec);
+    return renderClipLayerSource(
+        timeline, timeline->rotoEntries(), trackIdx, clipIdx, c, sourceSec,
+        localSec, outSize, /*sequenceDepth=*/0, sequenceSnapshot, sequenceStack,
+        projectLights, timeline->projectLightViewPosition(),
+        /*sampleFromLeftBoundary=*/false, /*promoteMaskTo16=*/true, stopAfterBrush);
+}
+
+QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                          qint64 usec, QSize outSize)
+{
+    return renderClipSourceAtStage(timeline, trackIdx, clipIdx, usec, outSize, false);
+}
+
+bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
+                    double timelineSec, double *localSec)
+{
+    if (!timeline || !localSec)
+        return false;
+    const QVector<RenderTrackSnapshot> tracks = snapshotsFromTimeline(timeline);
+    if (trackIdx < 0 || trackIdx >= tracks.size()
+        || clipIdx < 0 || clipIdx >= tracks[trackIdx].clips.size())
+        return false;
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, /*applyTimelineGlobals=*/true, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, timelineSec, overlapA, overlapB);
+    if (overlapA[trackIdx] >= 0) {
+        // Export draws the incoming B member at targetSec - b.timelineStart,
+        // so either overlap member measures local time from its own interval.
+        for (const int idx : {overlapA[trackIdx], overlapB[trackIdx]}) {
+            if (idx >= 0 && intervals[trackIdx][idx].clipIdx == clipIdx) {
+                *localSec = timelineSec - intervals[trackIdx][idx].timelineStart;
+                return true;
+            }
+        }
+    }
+    double start = 0.0;
+    if (selectClipOnTrack(tracks, intervals, overlapA, overlapB, trackIdx,
+                          timelineSec, /*clamp=*/trackIdx == 0, &start,
+                          /*countDisabled=*/false) == clipIdx) {
+        *localSec = timelineSec - start;
+        return true;
+    }
+    double cursor = 0.0;
+    for (int i = 0; i < clipIdx; ++i)
+        cursor += tracks[trackIdx].clips[i].leadInSec
+                + tracks[trackIdx].clips[i].effectiveDuration();
+    const ClipInfo &c = tracks[trackIdx].clips[clipIdx];
+    *localSec = qBound(0.0, timelineSec - (cursor + c.leadInSec), c.effectiveDuration());
+    return true;
+}
+
+QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx, int clipIdx,
+                                         qint64 usec, Stage stage, QSize outSize)
+{
+    return renderClipSourceAtStage(timeline, trackIdx, clipIdx, usec, outSize,
+                                   stage == Stage::AfterBrush);
+}
+
+quint64 clipLayerSourceCallsForTest()
+{
+    return g_clipLayerSourceCalls.load(std::memory_order_relaxed);
+}
 
 QImage renderClipSourceFrameForEcho(const Timeline *timeline,
                                     const ClipInfo &clip,
