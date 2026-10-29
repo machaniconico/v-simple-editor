@@ -14,6 +14,7 @@
 #include <QByteArray>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QString>
 #include <QTemporaryDir>
@@ -947,6 +948,35 @@ int runSmartRenderSelftest()
                     int(plainCopy.eligible), plainCopy.reason.toUtf8().constData(),
                     int(textCopy.eligible), textCopy.reason.toUtf8().constData());
         check(27, "timelinePassThrough and canStreamCopy reject a clip with 3D text", ok);
+    }
+
+    {
+        // brushData with no brush_progress track: canStreamCopy must refuse (HEAD copied it).
+        ClipInfo brush = pristineClip();
+        brush.brushData = QJsonObject{{QStringLiteral("strokes"), QJsonArray{1}}};
+        const smartrender::SegmentEligibility brushOnly = eligibleFor(brush);
+        // Control: the same clip without brushData stays eligible, so the rejection above
+        // cannot come from an unrelated field.
+        ClipInfo noBrush = brush;
+        noBrush.brushData = QJsonObject();
+        const smartrender::SegmentEligibility noBrushCopy = eligibleFor(noBrush);
+        // Keyframe control: brushData plus a brush_progress keyframe is also refused.
+        ClipInfo animated = brush;
+        KeyframeTrack progress(QStringLiteral("brush_progress"), 0.0);
+        progress.addKeyframe(0.0, 0.0);
+        progress.addKeyframe(1.0, 1.0);
+        animated.keyframes.addTrack(progress);
+        const smartrender::SegmentEligibility animatedCopy = eligibleFor(animated);
+        const bool a = !brushOnly.eligible && brushOnly.reason.contains(QStringLiteral("brush"))
+            && noBrushCopy.eligible;
+        const bool b = animated.keyframes.hasAnyKeyframes() && !animatedCopy.eligible;
+        std::printf("[smart-render] brush detail: brushOnly=%d [%s] noBrush=%d [%s] "
+                    "animated=%d [%s]\n",
+                    int(brushOnly.eligible), brushOnly.reason.toUtf8().constData(),
+                    int(noBrushCopy.eligible), noBrushCopy.reason.toUtf8().constData(),
+                    int(animatedCopy.eligible), animatedCopy.reason.toUtf8().constData());
+        const bool g29 = a && b;
+        check(29, "canStreamCopy rejects brushData with and without a brush_progress track (control: empty brush eligible)", g29);
     }
 
     std::printf("[smart-render] summary: passed=%d failed=%d\n",

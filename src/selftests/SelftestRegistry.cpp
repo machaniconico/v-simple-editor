@@ -963,7 +963,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Whisper CLI resolution and subtitle translation preference persistence (5 gates)" },
     // QApplication-required (needsQApplication=true) ----------------------
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        true,
-      "Smart Render T4: conservative stream-copy eligibility predicate + env gate (28 gates)" },
+      "Smart Render T4: conservative stream-copy eligibility predicate + env gate (29 gates)" },
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
       "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (12 gates)" },
     { "render-notify", nullptr, runRenderNotifySelftest, true,
