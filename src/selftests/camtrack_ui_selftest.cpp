@@ -6,8 +6,10 @@
 
 #include <QApplication>
 #include <QAbstractButton>
+#include <QDoubleSpinBox>
 #include <QElapsedTimer>
 #include <QEventLoop>
+#include <QJsonObject>
 #include <QLabel>
 #include <QMessageBox>
 #include <QPainter>
@@ -31,6 +33,80 @@
 #include <limits>
 
 namespace {
+// Reaches MainWindow's apply path and project camera without widening its API.
+template<class Tag, typename Tag::Type Member> struct Access {
+    friend typename Tag::Type member(Tag) { return Member; }
+};
+#define ACCESS(Name, TypeExpr, MemberExpr) \
+    struct Name { using Type = TypeExpr; friend Type member(Name); }; \
+    template struct Access<Name, MemberExpr>;
+ACCESS(Apply, void (MainWindow::*)(const camsolve::CameraSolveApplied&), &MainWindow::applyCameraSolve)
+ACCESS(Camera, Camera3D MainWindow::*, &MainWindow::m_projectCamera)
+ACCESS(UndoSlot, QJsonObject MainWindow::*, &MainWindow::m_projectCameraUndoSlot)
+#undef ACCESS
+
+// Noise-free, nonplanar 64-point / 10-frame scene (camera arc, depths 4..8 in front of
+// frame 0). Frame 0 is the identity pose.
+sfm::MultiViewTracks solveScene(QVector<camsolve::Pose>& truth, double focal)
+{
+    sfm::MultiViewTracks tracks;
+    tracks.frameCount = 10;
+    truth.clear();
+    for (int frame = 0; frame < tracks.frameCount; ++frame) {
+        const double angle = .04*frame + .003*frame*frame;
+        const double c = std::cos(angle), s = std::sin(angle);
+        const double center[3] = {6*s, .2*std::sin(2*angle), 6*(1-c)};
+        camsolve::Pose p;
+        const double rotation[9] = {c,0,s, 0,1,0, -s,0,c};
+        std::copy(rotation, rotation+9, p.R);
+        for (int row = 0; row < 3; ++row) {
+            double t = 0;
+            for (int col = 0; col < 3; ++col) t -= p.R[3*row+col]*center[col];
+            p.t[row] = float(t);
+        }
+        p.valid = true;
+        truth.append(p);
+    }
+    std::mt19937 rng(48213);
+    const auto uniform = [&] { return (double(rng())+.5)/4294967296.0; };
+    for (int id = 0; id < 64; ++id) {
+        const double point[3] = {3*uniform()-1.5, 2*uniform()-1, 4+4*uniform()};
+        sfm::Track2D track;
+        track.pointId = id;
+        track.strength = 64-id;
+        for (int frame = 0; frame < tracks.frameCount; ++frame) {
+            const auto& p = truth[frame];
+            double projected[3] = {};
+            for (int row = 0; row < 3; ++row) {
+                projected[row] = p.t[row];
+                for (int col = 0; col < 3; ++col) projected[row] += p.R[3*row+col]*point[col];
+            }
+            track.observations.append(qMakePair(frame,
+                QPointF(focal*projected[0]/projected[2]+640, focal*projected[1]/projected[2]+360)));
+        }
+        tracks.tracks.append(track);
+    }
+    return tracks;
+}
+
+// f / median(depth in the reference camera) for the emitted solve, from its own first valid pose.
+double referenceScale(const camsolve::CameraSolveApplied& applied, double f)
+{
+    const camsolve::Pose* ref = nullptr;
+    for (const auto& pose : applied.poses)
+        if (pose.valid) { ref = &pose; break; }
+    QVector<double> depths;
+    if (ref)
+        for (const QVector3D& p : applied.points) {
+            const double z = ref->R[6]*p.x() + ref->R[7]*p.y() + ref->R[8]*p.z() + ref->t.z();
+            if (z > 0) depths.append(z);
+        }
+    if (depths.isEmpty()) return std::numeric_limits<double>::quiet_NaN();
+    std::sort(depths.begin(), depths.end());
+    const qsizetype n = depths.size();
+    return f / (n % 2 ? depths[n/2] : (depths[n/2-1] + depths[n/2]) / 2);
+}
+
 QImage texture(QSize size)
 {
     QImage image(size, QImage::Format_RGB888);
@@ -152,6 +228,7 @@ struct PlanarRun {
     int applied = 0;
     double fps = 0, start = 0;
     QVector<camsolve::Pose> poses;
+    camsolve::CameraSolveApplied solve;
 };
 
 PlanarRun runPlanar(const QImage& reference, bool lazy)
@@ -166,9 +243,10 @@ PlanarRun runPlanar(const QImage& reference, bool lazy)
     else
         dialog.setFrames(frames); // Existing public entry point, still production code.
     const auto connection = QObject::connect(&dialog, &PlanarTrackerDialog::cameraSolveApplied,
-        &dialog, [&](const QVector<camsolve::Pose>& poses, double fps, double start) {
+        &dialog, [&](const camsolve::CameraSolveApplied& applied) {
             ++result.applied;
-            result.poses = poses; result.fps = fps; result.start = start;
+            result.solve = applied;
+            result.poses = applied.poses; result.fps = applied.fps; result.start = applied.startSec;
         });
     result.invoked = QMetaObject::invokeMethod(&dialog, "onTrackClicked", Qt::DirectConnection);
     auto* button = dialog.findChild<QPushButton*>("cameraSolveButton");
@@ -492,6 +570,131 @@ int runCamtrackUiSelftest()
                  && got == want && got > 0 && !text.contains(QStringLiteral("投入: 0")));
         }
         if (d) d->hide();
+    }
+
+    {
+        // G11: the feature path applies the reference-centred, scaled mapping and writes the
+        // analysed focal length to the Fov track. Run at fov 800 (S > 100) and at the default
+        // fov 60 (the control: S < 100, so a hard-coded 100 cannot pass), then once more with
+        // an edited scale field.
+        QVector<camsolve::Pose> truth;
+        bool all = true;
+        for (const double fov : {800.0, 60.0}) {
+            const auto tracks11 = solveScene(truth, fov);
+            MainWindow window;
+            auto& camera = window.*member(Camera{});
+            PlanarTrackerDialog d;
+            d.setCameraSolveContext({1280, 720}, fov, 24, 5);
+            d.setFeatureTrackingSource(QStringLiteral("synthetic"), 24, 240);
+            d.setFeatureTrackingResult(tracks11, {1280, 720}, 0);
+            int signals11 = 0;
+            camsolve::CameraSolveApplied emitted;
+            QObject::connect(&d, &PlanarTrackerDialog::cameraSolveApplied, &window,
+                [&](const camsolve::CameraSolveApplied& applied) {
+                    ++signals11;
+                    emitted = applied;
+                    (window.*member(Apply{}))(applied);
+                });
+            const bool solved = d.solveFeatureCamera();
+            const double expectedS = referenceScale(emitted, fov);
+            const double refTime = emitted.startSec; // pose 0 is the reference
+            const auto ref = camera.getCameraAt(refTime);
+            const double positionError = ref.position.length();
+            const double targetError = (ref.target - QVector3D(0, 0, -1)).length();
+            const double fovLate = camera.getCameraAt(refTime + 5.0 / 24).fov;
+            const QJsonObject mapping = camera.toJson().value(QStringLiteral("solveMapping")).toObject();
+            const double jsonS = mapping.value(QStringLiteral("unitScalePx")).toDouble(-1);
+            auto* spin = d.findChild<QDoubleSpinBox*>(QStringLiteral("featureScale"));
+            const double shown = spin ? spin->value() : -1;
+            const bool scaleOk = std::isfinite(expectedS) && jsonS == emitted.mapping.unitScalePx
+                && std::abs(jsonS - expectedS) <= 1e-9 * expectedS
+                && spin && std::abs(shown - expectedS) <= 5e-4 + 1e-9
+                && (fov != 60.0 || expectedS < 100);
+            // The user edits the scale field; the next solve applies that value.
+            if (spin) spin->setValue(25.0);
+            const bool resolved = d.solveFeatureCamera();
+            const double editedS = camera.toJson().value(QStringLiteral("solveMapping")).toObject()
+                .value(QStringLiteral("unitScalePx")).toDouble(-1);
+            const bool ok = solved && resolved && signals11 == 2 && positionError < 1e-4
+                && targetError < 1e-4 && std::abs(ref.fov - fov) < 1e-9
+                && std::abs(fovLate - fov) < 1e-9 && scaleOk && editedS == 25.0
+                && std::abs(mapping.value(QStringLiteral("focalPx")).toDouble() - fov) < 1e-9;
+            std::fprintf(stderr, "G11 fov=%g solved=%d resolved=%d signals=%d position|.|=%.3g "
+                "targetErr=%.3g fovRef=%.12g fovLate=%.12g unitScalePx=%.17g expected=%.17g "
+                "shown=%.6g editedS=%.17g ok=%d\n", fov, int(solved), int(resolved), signals11,
+                positionError, targetError, ref.fov, fovLate, jsonS, expectedS, shown, editedS, int(ok));
+            all = all && ok;
+        }
+        gate(11, all);
+    }
+
+    {
+        // G12 (control): the planar path keeps the legacy pose mapping, leaves the Fov track
+        // alone and writes no solveMapping; a rejected feature solve leaves the undo slot alone.
+        const auto planar = runPlanar(reference, false);
+        QVector<camsolve::Pose> truth;
+        solveScene(truth, 800);
+        MainWindow window;
+        auto& camera = window.*member(Camera{});
+        const auto before = camera.toJson();
+        const double fovBefore = camera.camera().fov;
+        // Non-trivial poses, so a feature-style mapping could not coincide with the legacy one.
+        camsolve::CameraSolveApplied legacy;
+        legacy.poses = truth;
+        legacy.fps = 24; legacy.startSec = 5;
+        legacy.mapping.legacy = true;
+        (window.*member(Apply{}))(legacy);
+        bool matches = camera.track(Camera3DProperty::PositionX)
+            && camera.track(Camera3DProperty::PositionX)->count() == truth.size();
+        double maxDelta = 0;
+        for (qsizetype i = 0; matches && i < truth.size(); ++i) {
+            const auto expected = camsolve::poseToCameraState(truth[i], camera.camera());
+            const auto actual = camera.getCameraAt(5 + double(i) / 24);
+            maxDelta = std::max(maxDelta, double((actual.position - expected.position).length()));
+            maxDelta = std::max(maxDelta, double((actual.target - expected.target).length()));
+        }
+        const bool fovKept = std::abs(camera.getCameraAt(5).fov - fovBefore) < 1e-9
+            && std::abs(camera.getCameraAt(5.2).fov - fovBefore) < 1e-9;
+        const bool noMapping = !camera.toJson().contains(QStringLiteral("solveMapping"))
+            && !camera.solveMapping().has_value();
+        const bool moved = camera.toJson() != before;
+        // A feature solve with a non-positive focal length is refused: camera and undo slot unchanged.
+        const auto slotBefore = window.*member(UndoSlot{});
+        const auto cameraBefore = camera.toJson();
+        camsolve::CameraSolveApplied rejected = legacy;
+        rejected.mapping.legacy = false;
+        rejected.mapping.focalPx = 0;
+        (window.*member(Apply{}))(rejected);
+        const bool refused = camera.toJson() == cameraBefore && (window.*member(UndoSlot{})) == slotBefore;
+        // Feature -> planar transition: the legacy apply drops the feature solveMapping and the
+        // undo slot restores it.
+        camsolve::CameraSolveApplied feature = legacy;
+        feature.mapping.legacy = false;
+        feature.mapping.unitScalePx = 50;
+        feature.mapping.focalPx = 800;
+        feature.mapping.analysisSize = QSize(1280, 720);
+        feature.mapping.canvasSize = QSize(1280, 720);
+        (window.*member(Apply{}))(feature);
+        const auto featureJson = camera.toJson();
+        const bool featureMapped = camera.solveMapping().has_value()
+            && featureJson.contains(QStringLiteral("solveMapping"));
+        (window.*member(Apply{}))(legacy);
+        const bool mappingDropped = !camera.toJson().contains(QStringLiteral("solveMapping"))
+            && !camera.solveMapping().has_value();
+        const auto restoreSlot = window.*member(UndoSlot{});
+        camera = Camera3D{};
+        camera.fromJson(restoreSlot);
+        const bool mappingRestored = camera.solveMapping().has_value()
+            && camera.toJson() == featureJson;
+        const bool transition = featureMapped && mappingDropped && mappingRestored;
+        const bool emittedLegacy = planar.solve.mapping.legacy && planar.solve.points.isEmpty()
+            && planar.solve.poses.size() == 3;
+        std::fprintf(stderr, "G12 planarEmittedLegacy=%d moved=%d maxDelta=%.3g fovKept=%d "
+            "noMapping=%d refused=%d transition=%d/%d/%d\n", int(emittedLegacy), int(moved), maxDelta,
+            int(fovKept), int(noMapping), int(refused), int(featureMapped), int(mappingDropped),
+            int(mappingRestored));
+        gate(12, emittedLegacy && moved && matches && maxDelta < 1e-5 && fovKept && noMapping && refused
+             && transition);
     }
 
     {

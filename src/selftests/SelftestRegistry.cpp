@@ -838,7 +838,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "camtrack-solve", "VEDITOR_CAMTRACK_SOLVE_SELFTEST", runCamtrackSolveSelftest, true,
       "Camera tracking solve: noise-free nonplanar 64 points / 10 frames, substantial parallax; limits, rejection, undo, trim/speed/reverse, BA outliers/noise and backend parity (7 gates)" },
     { "camtrack-ui", "VEDITOR_CAMTRACK_UI_SELFTEST", runCamtrackUiSelftest, true,
-      "KLT tracking UI, bounded decoding, planar compatibility and BA limits (10 gates)" },
+      "KLT tracking UI, bounded decoding, planar compatibility and BA limits (12 gates)" },
     { "camera-solve",      "VEDITOR_CAMERA_SOLVE_SELFTEST",       runCameraSolveSelftest,        true,
       "Planar camera solver: SVD, continuity, confidence, camera keyframes and single-slot undo (8 gates)" },
     { "camera3d",           "VEDITOR_CAMERA3D_SELFTEST",           runCamera3DSelftest,           true,

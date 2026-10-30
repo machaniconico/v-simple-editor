@@ -16101,17 +16101,32 @@ void MainWindow::openPlanarTrackerDialog()
     m_planarTrackerDialog->activateWindow();
 }
 
-void MainWindow::applyCameraSolve(const QVector<camsolve::Pose>& poses,
-                                 double fps, double startSec)
+void MainWindow::applyCameraSolve(const camsolve::CameraSolveApplied& applied)
 {
+    const double fps = applied.fps, startSec = applied.startSec;
     if (!m_timeline || !std::isfinite(fps) || fps <= 0 || !std::isfinite(startSec)
-        || !std::any_of(poses.cbegin(), poses.cend(),
+        || !std::any_of(applied.poses.cbegin(), applied.poses.cend(),
                         [](const camsolve::Pose& p) { return p.valid; }))
         return;
+    const auto previousSlot = m_projectCameraUndoSlot;
+    const auto previousDepth = m_projectCameraUndoTimelineDepth;
+    const auto previousSerial = m_projectCameraUndoSaveSerial;
     m_projectCameraUndoSlot = m_projectCamera.toJson();
     m_projectCameraUndoTimelineDepth = m_timeline->undoManager()->currentIndex();
     m_projectCameraUndoSaveSerial = m_timeline->undoManager()->saveSerial();
-    camsolve::applyPosesToCamera(m_projectCamera, poses, fps, startSec);
+    if (applied.mapping.legacy) {
+        camsolve::applyPosesToCamera(m_projectCamera, applied.poses, fps, startSec);
+        // A feature solve's mapping must not outlive the legacy pose mapping that replaces it.
+        m_projectCamera.setSolveMapping(std::nullopt);
+    } else if (!camsolve::applySolvedPosesToCamera(m_projectCamera, applied)) {
+        // Rejected before the camera changed: leave the undo slot as it was.
+        m_projectCameraUndoSlot = previousSlot;
+        m_projectCameraUndoTimelineDepth = previousDepth;
+        m_projectCameraUndoSaveSerial = previousSerial;
+        statusBar()->showMessage(
+            QStringLiteral("3D カメラ解析を適用できませんでした（焦点距離またはスケールが不正です）"), 6000);
+        return;
+    }
     syncProjectLightingToTimeline();
     refreshSpecialClipPreview();
     updateEditActions();

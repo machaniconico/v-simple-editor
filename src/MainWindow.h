@@ -572,7 +572,7 @@ private slots:
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
-    void applyCameraSolve(const QVector<camsolve::Pose>& poses, double fps, double startSec);
+    void applyCameraSolve(const camsolve::CameraSolveApplied& applied);
 
     // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
     void showMotionTrackerDialog();
