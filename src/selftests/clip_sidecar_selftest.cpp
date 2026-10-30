@@ -21,11 +21,27 @@
 //   G7 setClipText3DConfig / setClipBrushData: one undo point per change (undo empties,
 //      redo restores), none for an equal value (true), false for a locked track or a
 //      missing clip. Detects: no / two undo points, or a locked track edited.
-//   G8 render in place: the replacement clip keeps both, the baked picture is the one
-//      baked from the same clip without them. Detects: the replacement losing them
-//      (mutation build: the two copyComposition lines removed).
+//   G8 render in place bakes the brush into the material: the files baked from a clip with
+//      an animated / constant brush_progress differ from the plain bake (inside the stroke
+//      box) where the progress is above 0 and not where it is 0; the replacement has no
+//      brushData and no brush_progress track and keeps the 3D text live; brush bakes take
+//      the ProRes 4444 path (.mov) from a default h264 request, a clip without a brush
+//      keeps h264 (.mp4). The stroke-free reference is the brush at progress 0 (brush-export
+//      pins that it draws nothing), so it shares the brush bakes' ProRes 4444 path and the
+//      comparison does not measure one codec against another. Detects: the brush kept live on the replacement
+//      and left out of the material (HEAD), or a brush bake left on the requested codec.
 //   G9 duplicate and copy / paste carry both to the new clip. Detects: the clone dropping
 //      them (mutation build: copyClipForPaste clears them).
+//   G10 a clip graded with ColorCorrection.exposure = -0.5 and a brush renders the same
+//      (renderFrameAt, stroke box) before and after render in place. Detects: the live
+//      brush drawn on the replacement without the grade (HEAD, Step 0: 46.18), or the
+//      strokes baked through a 4:2:0 / 4:2:2 codec (mutation build: 5.68).
+//   G11 the G10 comparison with handles 0.5 s + speed 2 and with a reversed clip (animated
+//      brush_progress, so the handle shift of the keys is visible; 0.3 / 0.7 s lie on the
+//      30 fps bake grid, between its frames the file holds while the live brush grows),
+//      and decompose restores
+//      the brushData and the brush_progress keys. Detects: as G10 (HEAD reversed 46.18),
+//      or progress keys not shifted with the handles.
 #include "../BrushAnimation.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
@@ -44,6 +60,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QPointF>
+#include <QRect>
 #include <QString>
 #include <QTemporaryDir>
 #include <QVector>
@@ -127,18 +144,71 @@ QString describe(const TimelineTrack *track)
     return parts.join(QLatin1Char(','));
 }
 
-double meanAbsDiff(const QImage &a, const QImage &b)
+// Mean absolute RGB difference over box (the whole image when box is empty); -1 when the
+// images cannot be compared.
+double meanAbsDiff(const QImage &a, const QImage &b, const QRect &box = QRect())
 {
     if (a.isNull() || b.isNull() || a.size() != b.size()) return -1.0;
+    const QRect area = box.isEmpty() ? a.rect() : box.intersected(a.rect());
+    if (area.isEmpty()) return -1.0;
     const QImage l = a.convertToFormat(QImage::Format_RGB888);
     const QImage r = b.convertToFormat(QImage::Format_RGB888);
     double sum = 0.0;
+    for (int y = area.top(); y <= area.bottom(); ++y) {
+        const uchar *pl = l.constScanLine(y);
+        const uchar *pr = r.constScanLine(y);
+        for (int x = area.left() * 3; x < (area.right() + 1) * 3; ++x) sum += std::abs(int(pl[x]) - int(pr[x]));
+    }
+    return sum / (double(area.width()) * area.height() * 3.0);
+}
+
+// Bounding box of the pixels where a and b differ by more than 8 in a channel.
+QRect changedBox(const QImage &a, const QImage &b)
+{
+    QRect box;
+    if (a.isNull() || b.isNull() || a.size() != b.size()) return box;
+    const QImage l = a.convertToFormat(QImage::Format_RGB888);
+    const QImage r = b.convertToFormat(QImage::Format_RGB888);
     for (int y = 0; y < l.height(); ++y) {
         const uchar *pl = l.constScanLine(y);
         const uchar *pr = r.constScanLine(y);
-        for (int x = 0; x < l.width() * 3; ++x) sum += std::abs(int(pl[x]) - int(pr[x]));
+        for (int x = 0; x < l.width(); ++x) {
+            for (int c = 0; c < 3; ++c) {
+                if (std::abs(int(pl[x * 3 + c]) - int(pr[x * 3 + c])) > 8) {
+                    box = box.united(QRect(x, y, 1, 1));
+                    break;
+                }
+            }
+        }
     }
-    return sum / (double(l.width()) * l.height() * 3.0);
+    return box;
+}
+
+// The brush_progress keys (time and value) of both clips are the same.
+bool sameProgressKeys(const ClipInfo &before, const ClipInfo &after)
+{
+    const KeyframeTrack *a = before.keyframes.track(QStringLiteral("brush_progress"));
+    const KeyframeTrack *b = after.keyframes.track(QStringLiteral("brush_progress"));
+    if (!a || !b || a->keyframes().size() != b->keyframes().size()) return false;
+    for (int i = 0; i < a->keyframes().size(); ++i) {
+        if (a->keyframes()[i].time != b->keyframes()[i].time
+            || a->keyframes()[i].value != b->keyframes()[i].value)
+            return false;
+    }
+    return true;
+}
+
+qint64 microsAt(double seconds)
+{
+    return qRound64(seconds * 1000000.0);
+}
+
+Timeline *loadSingleClip(Timeline &timeline, const ClipInfo &clip)
+{
+    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    timeline.undoManager()->clear();
+    timeline.saveUndoState(QStringLiteral("Initial"));
+    return &timeline;
 }
 
 } // namespace
@@ -386,8 +456,8 @@ int runClipSidecarSelftest()
             int(missingBr), int(lockedT3), int(lockedBr), qPrintable(lockedShown), lockedDepth).toStdString());
     }
 
-    // G8: render in place keeps both on the replacement and bakes the same picture as the
-    // clip without them.
+    // G8: render in place bakes the brush into the material and leaves the replacement
+    // without it; the 3D text stays live on the replacement.
     {
         ClipInfo plain{};
         plain.filePath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
@@ -400,12 +470,12 @@ int runClipSidecarSelftest()
                 qPrintable(plain.filePath), int(QFileInfo::exists(plain.filePath)), plain.duration).toStdString());
         } else {
             plain.inPoint = 0.5;
-            plain.outPoint = 1.5;
+            plain.outPoint = 2.0;
             ClipInfo carrying = plain;
             carrying.text3DConfig = t3A;
             carrying.brushData = brA;
-            // The brush draws only where brush_progress is above 0, so the replacement
-            // must also carry the progress keys: an animated track and a constant one.
+            // The brush draws only where brush_progress is above 0: an animated track (0 up
+            // to local 0.5 s) and a constant one.
             KeyframeTrack animatedProgress(QStringLiteral("brush_progress"));
             animatedProgress.addKeyframe(0.5, 0.0);
             animatedProgress.addKeyframe(1.5, 1.0);
@@ -422,10 +492,7 @@ int runClipSidecarSelftest()
             auto bake = [&](const ClipInfo &clip, const QString &dirName, ClipInfo *after, QString *bakedPath,
                             QString *error) {
                 Timeline tl;
-                tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{},
-                                      0, -1, -1, 10);
-                tl.undoManager()->clear();
-                tl.saveUndoState(QStringLiteral("Initial"));
+                loadSingleClip(tl, clip);
                 renderinplace::Options local = options;
                 local.outputDir = tempDir.filePath(dirName);
                 const bool baked = renderinplace::renderClipInPlace(tl, 0, 0, local, bakedPath, error);
@@ -436,65 +503,72 @@ int runClipSidecarSelftest()
             QString carriedPath, plainPath, constantPath, carriedError, plainError, constantError;
             const bool carriedBaked = bake(carrying, QStringLiteral("carrying"), &carriedAfter, &carriedPath,
                                            &carriedError);
-            const bool plainBaked = bake(plain, QStringLiteral("plain"), &plainAfter, &plainPath, &plainError);
+            // Stroke-free picture through the brush bakes' codec path: the brush at progress 0.
+            ClipInfo strokeFree = plain;
+            strokeFree.brushData = brA;
+            KeyframeTrack zeroProgress(QStringLiteral("brush_progress"));
+            zeroProgress.addKeyframe(0.0, 0.0);
+            strokeFree.keyframes.addTrack(zeroProgress);
+            const bool plainBaked = bake(strokeFree, QStringLiteral("plain"), &plainAfter, &plainPath, &plainError);
+            ClipInfo keptAfter;
+            QString keptPath, keptError;
+            const bool keptBaked = bake(plain, QStringLiteral("plain-h264"), &keptAfter, &keptPath, &keptError);
             const bool constantBaked = bake(constant, QStringLiteral("constant"), &constantAfter, &constantPath,
                                             &constantError);
-            // Same keys (time and value) on the replacement, and the same nonzero progress
-            // at interior times.
-            auto sameKeys = [](const ClipInfo &before, const ClipInfo &after) {
-                const KeyframeTrack *a = before.keyframes.track(QStringLiteral("brush_progress"));
-                const KeyframeTrack *b = after.keyframes.track(QStringLiteral("brush_progress"));
-                if (!a || !b || a->keyframes().size() != b->keyframes().size()) return false;
-                for (int i = 0; i < a->keyframes().size(); ++i) {
-                    if (a->keyframes()[i].time != b->keyframes()[i].time
-                        || a->keyframes()[i].value != b->keyframes()[i].value)
-                        return false;
-                }
-                return true;
+            // The stroke box: the unbaked clip with the brush at full progress against the
+            // plain clip.
+            ClipInfo full = plain;
+            full.brushData = brA;
+            KeyframeTrack fullProgress(QStringLiteral("brush_progress"));
+            fullProgress.addKeyframe(0.0, 1.0);
+            full.keyframes.addTrack(fullProgress);
+            QRect box;
+            {
+                Timeline withBrush, without;
+                box = changedBox(tlrender::renderFrameAt(loadSingleClip(withBrush, full), microsAt(0.75),
+                                                         options.outputSize),
+                                 tlrender::renderFrameAt(loadSingleClip(without, plain), microsAt(0.75),
+                                                         options.outputSize));
+            }
+            const bool replaced = carriedBaked && constantBaked && carriedAfter.filePath != carrying.filePath
+                && carriedAfter.renderInPlaceOriginal && constantAfter.renderInPlaceOriginal;
+            const auto brushFree = [](const ClipInfo &clip) {
+                return clip.brushData.isEmpty() && !clip.keyframes.hasTrack(QStringLiteral("brush_progress"));
             };
-            QString progressShown;
-            bool progressKept = carriedBaked && constantBaked && sameKeys(carrying, carriedAfter)
-                && sameKeys(constant, constantAfter);
-            for (const auto &pair : {std::make_pair(&carrying, &carriedAfter),
-                                     std::make_pair(&constant, &constantAfter)}) {
-                for (double t : {0.75, 1.25}) {
-                    const double want = pair.first->keyframes.valueAt(QStringLiteral("brush_progress"), t);
-                    const double got = pair.second->keyframes.valueAt(QStringLiteral("brush_progress"), t);
-                    progressShown += QString::asprintf(" %.2f:%.3f/%.3f", t, got, want);
-                    if (want <= 0.0 || got != want) progressKept = false;
-                }
-            }
-            const bool replaced = carriedBaked && carriedAfter.filePath != carrying.filePath
-                && carriedAfter.renderInPlaceOriginal;
-            const bool kept = carriedAfter.text3DConfig == t3A && carriedAfter.brushData == brA
-                && constantAfter.brushData == brA;
-            // The baked files alone (no sidecars on either) at three ticks.
-            double worstDiff = -1.0;
-            bool framesOk = carriedBaked && plainBaked;
-            for (qint64 tick : {100000LL, 500000LL, 900000LL}) {
-                if (!framesOk) break;
-                auto bakedOnly = [&](const QString &path) {
-                    ClipInfo clip{};
-                    clip.filePath = path;
-                    clip.duration = plain.effectiveDuration();
-                    Timeline tl;
-                    tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{},
-                                          0, -1, -1, 10);
-                    return tlrender::renderFrameAt(&tl, tick, options.outputSize);
-                };
-                const double diff = meanAbsDiff(bakedOnly(carriedPath), bakedOnly(plainPath));
-                if (diff < 0.0) framesOk = false;
-                worstDiff = std::max(worstDiff, diff);
-            }
-            const bool samePicture = framesOk && worstDiff >= 0.0 && worstDiff <= 0.5;
-            tally.gate(8, replaced && kept && progressKept && samePicture, QString::asprintf(
-                "baked=%d/%d/%d [%s|%s|%s] replaced=%d kept text3D=[%s] brush=[%s] (expect T3A/BRA) "
-                "brush_progress keys kept=%d got/want at t:%s (expect equal and > 0) "
-                "bakedVsPlain meanAbsDiff=%.4f (expect <= 0.5)", int(carriedBaked), int(plainBaked),
-                int(constantBaked), qPrintable(carriedError), qPrintable(plainError), qPrintable(constantError),
-                int(replaced), qPrintable(textOf(carriedAfter.text3DConfig)),
-                qPrintable(textOf(carriedAfter.brushData)), int(progressKept), qPrintable(progressShown),
-                worstDiff).toStdString());
+            const bool dropped = replaced && brushFree(carriedAfter) && brushFree(constantAfter);
+            const bool textKept = carriedAfter.text3DConfig == t3A && constantAfter.text3DConfig == t3A;
+            // The baked files alone (no sidecars on either), inside the stroke box.
+            const auto bakedOnly = [&](const QString &path, double seconds) {
+                ClipInfo clip{};
+                clip.filePath = path;
+                clip.duration = plain.effectiveDuration();
+                Timeline tl;
+                return tlrender::renderFrameAt(loadSingleClip(tl, clip), microsAt(seconds), options.outputSize);
+            };
+            const bool codecsOk = carriedPath.endsWith(QStringLiteral(".mov"))
+                && constantPath.endsWith(QStringLiteral(".mov")) && keptBaked
+                && keptPath.endsWith(QStringLiteral(".mp4"));
+            const bool framesOk = carriedBaked && plainBaked && constantBaked && !box.isEmpty();
+            const auto bakedDiff = [&](const QString &path, double seconds) {
+                return framesOk ? meanAbsDiff(bakedOnly(path, seconds), bakedOnly(plainPath, seconds), box) : -1.0;
+            };
+            const double atZero = bakedDiff(carriedPath, 0.1);
+            const double early = bakedDiff(carriedPath, 0.75);
+            const double late = bakedDiff(carriedPath, 1.25);
+            const double constantDiff = bakedDiff(constantPath, 0.1);
+            const bool picture = framesOk && atZero >= 0.0 && atZero <= 0.5 && early > 2.0
+                && late > 2.0 && constantDiff > 2.0;
+            tally.gate(8, dropped && textKept && picture && codecsOk, QString::asprintf(
+                "baked=%d/%d/%d [%s|%s|%s] replaced=%d codecs ok=%d (brush .mov, no brush h264 .mp4) [%s] replacement brushData carrying=%d constant=%d "
+                "brush_progress carrying=%d constant=%d (expect 0) text3D=[%s/%s] (expect T3A) box=(%d,%d %dx%d) "
+                "baked carrying vs plain meanAbsDiff 0.1s(progress 0)=%.4f (expect <= 0.5) 0.75s=%.4f 1.25s=%.4f "
+                "constant 0.1s=%.4f (expect > 2.0)", int(carriedBaked), int(plainBaked), int(constantBaked),
+                qPrintable(carriedError), qPrintable(plainError), qPrintable(constantError), int(replaced), int(codecsOk), qPrintable(keptError),
+                int(!carriedAfter.brushData.isEmpty()), int(!constantAfter.brushData.isEmpty()),
+                int(carriedAfter.keyframes.hasTrack(QStringLiteral("brush_progress"))),
+                int(constantAfter.keyframes.hasTrack(QStringLiteral("brush_progress"))),
+                qPrintable(textOf(carriedAfter.text3DConfig)), qPrintable(textOf(constantAfter.text3DConfig)),
+                box.x(), box.y(), box.width(), box.height(), atZero, early, late, constantDiff).toStdString());
         }
     }
 
@@ -543,6 +617,118 @@ int runClipSidecarSelftest()
             "paste=[%s] clones %d (expect 1) duplicate=[%s] clones %d (expect 2) n copies %d with values %d "
             "(expect 2 / 0)", qPrintable(afterPaste), afterPasteClones, qPrintable(afterDuplicate),
             carriedClones, nCount, nWithValues).toStdString());
+    }
+
+    // G10 / G11: a clip graded with exposure -0.5 and a brush renders the same before and
+    // after render in place (the brush is baked under the grade, the replacement draws none).
+    {
+        ClipInfo graded{};
+        graded.filePath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        graded.displayName = QStringLiteral("sidecar-graded");
+        const auto sourceDuration = libavcore::probeDurationMicroseconds(graded.filePath.toStdString());
+        graded.duration = sourceDuration ? double(*sourceDuration) / 1000000.0 : 0.0;
+        graded.inPoint = 0.5;
+        graded.outPoint = 1.5;
+        graded.colorCorrection.exposure = -0.5;
+        graded.brushData = brushFor(QStringLiteral("Brush"));
+        const QSize canvas(640, 360);
+        struct GradedBake {
+            bool baked = false;
+            QString error;
+            QRect box;
+            QVector<double> times;
+            QVector<double> diffs;
+            bool replacementBrushFree = false;
+            bool decomposed = false;
+        };
+        // Bakes clip, compares renderFrameAt before / after inside the stroke box (the
+        // brush clip against the same clip without the brush, before the bake), then
+        // decomposes and compares the restored brush with the original.
+        const auto gradedBake = [&](const ClipInfo &clip, double handlesSec, const QVector<double> &times,
+                                    const QString &dirName) {
+            GradedBake result;
+            result.times = times;
+            ClipInfo withoutBrush = clip;
+            withoutBrush.brushData = QJsonObject();
+            withoutBrush.keyframes.removeTrack(QStringLiteral("brush_progress"));
+            Timeline tl, tlPlain;
+            loadSingleClip(tl, clip);
+            loadSingleClip(tlPlain, withoutBrush);
+            QVector<QImage> before;
+            for (double t : times) {
+                before.append(tlrender::renderFrameAt(&tl, microsAt(t), canvas));
+                result.box = result.box.united(
+                    changedBox(before.last(), tlrender::renderFrameAt(&tlPlain, microsAt(t), canvas)));
+            }
+            renderinplace::Options options;
+            options.outputSize = canvas;
+            options.fps = 30;
+            options.handlesSec = handlesSec;
+            options.outputDir = tempDir.filePath(dirName);
+            result.baked = renderinplace::renderClipInPlace(tl, 0, 0, options, nullptr, &result.error);
+            if (!result.baked) return result;
+            const ClipInfo after = tl.videoTracks()[0]->clips()[0];
+            result.replacementBrushFree = after.brushData.isEmpty()
+                && !after.keyframes.hasTrack(QStringLiteral("brush_progress"));
+            for (int i = 0; i < times.size(); ++i)
+                result.diffs.append(meanAbsDiff(before[i], tlrender::renderFrameAt(&tl, microsAt(times[i]), canvas),
+                                                result.box));
+            const bool decomposed = renderinplace::decomposeRenderInPlace(tl, 0, 0);
+            const ClipInfo restored = tl.videoTracks()[0]->clips()[0];
+            result.decomposed = decomposed && restored.brushData == clip.brushData
+                && sameProgressKeys(clip, restored);
+            return result;
+        };
+        const auto within = [](const GradedBake &r) {
+            if (!r.baked || r.box.isEmpty() || r.diffs.isEmpty()) return false;
+            for (double d : r.diffs)
+                if (d < 0.0 || d > 2.0) return false;
+            return true;
+        };
+        const auto shown = [](const GradedBake &r) {
+            QString diffs;
+            for (int i = 0; i < r.diffs.size(); ++i)
+                diffs += QString::asprintf(" %.2fs=%.4f", r.times[i], r.diffs[i]);
+            return QString::asprintf("baked=%d [%s] box=(%d,%d %dx%d) replacement brush-free=%d "
+                                     "before vs after meanAbsDiff%s (expect <= 2.0) decompose=%d",
+                                     int(r.baked), qPrintable(r.error), r.box.x(), r.box.y(), r.box.width(),
+                                     r.box.height(), int(r.replacementBrushFree), qPrintable(diffs),
+                                     int(r.decomposed));
+        };
+        if (!tempDir.isValid() || !QFileInfo::exists(graded.filePath) || graded.duration < 3.0) {
+            const std::string missing = QString::asprintf(
+                "prerequisite: fixture=%s exists=%d duration=%.3f (run from the repository root)",
+                qPrintable(graded.filePath), int(QFileInfo::exists(graded.filePath)), graded.duration).toStdString();
+            tally.gate(10, false, missing);
+            tally.gate(11, false, missing);
+        } else {
+            // G10: constant brush_progress 1, no handles.
+            ClipInfo constantClip = graded;
+            KeyframeTrack constantProgress(QStringLiteral("brush_progress"));
+            constantProgress.addKeyframe(0.0, 1.0);
+            constantClip.keyframes.addTrack(constantProgress);
+            const GradedBake plainBake = gradedBake(constantClip, 0.0, {0.25, 0.75}, QStringLiteral("graded"));
+            tally.gate(10, within(plainBake), QString::asprintf(
+                "exposure -0.5 %s (HEAD Step 0: 46.18)", qPrintable(shown(plainBake))).toStdString());
+
+            // G11: animated brush_progress (0 at local 0 to 1 at local 1), handles 0.5 s with
+            // speed 2, and a reversed clip.
+            ClipInfo animated = graded;
+            KeyframeTrack animatedProgress(QStringLiteral("brush_progress"));
+            animatedProgress.addKeyframe(0.0, 0.0);
+            animatedProgress.addKeyframe(1.0, 1.0);
+            animated.keyframes.addTrack(animatedProgress);
+            ClipInfo fast = animated;
+            fast.outPoint = 2.5;
+            fast.speed = 2.0;
+            ClipInfo reversed = animated;
+            reversed.reversed = true;
+            const GradedBake handled = gradedBake(fast, 0.5, {0.3, 0.7}, QStringLiteral("graded-handles"));
+            const GradedBake backward = gradedBake(reversed, 0.0, {0.3, 0.7}, QStringLiteral("graded-reversed"));
+            tally.gate(11, within(handled) && handled.decomposed && within(backward) && backward.decomposed,
+                QString::asprintf("handles 0.5 + speed 2: %s | reversed: %s (HEAD Step 0 reversed: 46.18)",
+                                  qPrintable(shown(handled)), qPrintable(shown(backward))).toStdString());
+        }
     }
 
     return tally.finish("clip-sidecar");

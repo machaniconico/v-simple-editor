@@ -24,6 +24,9 @@ namespace renderinplace {
 namespace {
 // These properties act on the layer after the material effects. Never flatten
 // them into an opaque codec: the shared renderer must still composite them.
+// The brush (brushData, brush_progress) is drawn at the source stage before the
+// grade, so it stays on the isolated clip, is baked into the material and is not
+// carried to the replacement (decompose restores it from renderInPlaceOriginal).
 void copyComposition(const ClipInfo &from, ClipInfo &to)
 {
     to.videoScale = from.videoScale;
@@ -39,7 +42,6 @@ void copyComposition(const ClipInfo &from, ClipInfo &to)
     to.wiggle = from.wiggle;
     to.expressions = from.expressions;
     to.text3DConfig = from.text3DConfig;
-    to.brushData = from.brushData;
     to.opacity = from.opacity;
     to.visible = from.visible;
     to.blendMode = from.blendMode;
@@ -54,8 +56,7 @@ bool compositionTrack(const QString &name)
 {
     return name.startsWith(QStringLiteral("motion."))
         || name == QStringLiteral("positionX") || name == QStringLiteral("positionY")
-        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY")
-        || name == QStringLiteral("brush_progress");
+        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY");
 }
 
 QSize nativeVideoSize(const QString &path)
@@ -455,8 +456,11 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     name += QDateTime::currentDateTime().toString(QStringLiteral("_yyyyMMdd_hhmmss"));
     // Roto leaves alpha 0 outside the path and lower tracks show through it.
     // H.264 and ProRes 422 flatten that to black, so a roto bake always uses
-    // the alpha path: ProRes 4444 (keepAlpha) in MOV.
-    const QString codec = bakesRoto ? QStringLiteral("prores") : options.codec;
+    // the alpha path: ProRes 4444 (keepAlpha) in MOV. A brush bake takes the same
+    // path whatever the requested codec: the strokes' hard chroma edges do not
+    // survive the 4:2:0 / 4:2:2 codecs, and the replacement has no live brush.
+    const bool usesAlphaPath = bakesRoto || !original.brushData.isEmpty();
+    const QString codec = usesAlphaPath ? QStringLiteral("prores") : options.codec;
     // ProRes requires MOV; MP4 cannot mux ProRes in the existing encoder.
     const QString extension = codec == QStringLiteral("prores") ? QStringLiteral(".mov") : QStringLiteral(".mp4");
     QString path = QDir(directory).absoluteFilePath(name + extension);
@@ -498,8 +502,8 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         job.projectFilePath = mixPath;
     }
     job.exportConfig["fps"] = options.fps;
-    job.exportConfig["proresProfile"] = bakesRoto ? 4 : 3;
-    if (bakesRoto)
+    job.exportConfig["proresProfile"] = usesAlphaPath ? 4 : 3;
+    if (usesAlphaPath)
         job.exportConfig["keepAlpha"] = true;
     RenderQueue queue;
     QEventLoop loop;
