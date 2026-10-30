@@ -111,21 +111,26 @@ QString audioexport::ffmpegNumber(double value)
 
 QVector<AudioGainPoint> audioexport::sortedDedupedEnvelope(QVector<AudioGainPoint> env)
 {
-    std::sort(env.begin(), env.end(),
-              [](const AudioGainPoint &a, const AudioGainPoint &b) {
-                  return a.time < b.time;
-              });
+    // Stable: equal times keep their authored order, as the preview reads them.
+    std::stable_sort(env.begin(), env.end(),
+                     [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                         return a.time < b.time;
+                     });
     QVector<AudioGainPoint> out;
     out.reserve(env.size());
     for (const AudioGainPoint &point : env) {
         AudioGainPoint p;
         p.time = qMax(0.0, point.time);
         p.gain = qBound(0.0, point.gain, 2.0);
-        if (!out.isEmpty() && std::abs(out.last().time - p.time) <= 0.001) {
-            out.last().gain = qMin(out.last().gain, p.gain);
-        } else {
+        // The preview (audio::evaluateVolumeEnvelope) interpolates every point,
+        // so a fast ramp and a step stay. Only the middle of a run at one instant
+        // (within ffmpegNumber's resolution) is dropped: the run's first gain is
+        // what the preview reaches it with, the last what it leaves it with.
+        const int n = out.size();
+        if (n >= 2 && p.time - out[n - 2].time <= 0.000001)
+            out.last() = p;
+        else
             out.append(p);
-        }
     }
     return out;
 }

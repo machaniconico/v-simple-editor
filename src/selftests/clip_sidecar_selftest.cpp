@@ -13,9 +13,21 @@
 //   G4 after a clip delete, a track move and a track removal the values stay on the same
 //      clip (by displayName) and the clip without values has none. Detects: values left at
 //      the old position (the position-keyed rekey the clips no longer need).
-//   G5 a split puts neither on the right half (the left keeps both) through
-//      splitClipByIndex, bladeAllTracksAtPlayhead and splitAtPlayhead. Detects: the right
-//      half inheriting them (mutation build: the secondHalf reset in splitClipAt removed).
+//   G5 (US-1807) a split keeps the 3D text and the brush on both halves and shifts the right
+//      half's clip-local time by the cut L, so through splitClipByIndex,
+//      bladeAllTracksAtPlayhead and splitAtPlayhead renderFrameAt on the right half (and
+//      after a project JSON round trip) is byte-equal to before the split: brush progress,
+//      3D text quads (stagger) and extruded (spin), 4 opacity keys 0.5 s apart, speed 2,
+//      reversed, effect windows (cut inside / at / after the window end; a dropped effect
+//      takes its effect.<i>.* tracks and the later effects' tracks move down one index), the volume
+//      envelope (shared audio::evaluateVolumeEnvelope gain, raw and sortedDedupedEnvelope,
+//      with points no more than 1 ms apart near the cut, a fast ramp and a step),
+//      the unshifted text overlay (pin, HEAD PASS) and Text3DLayer::timeOffsetSec (JSON,
+//      non-finite values, accumulation, the extrusion dialog's setLayer -> layer()).
+//      Detects: the right half losing them or replaying from local 0 (HEAD-equivalent
+//      mutation build), a descending keyframe write-back, a source-second shift,
+//      effect tracks left at the old index after an effect is dropped, an export dedup that
+//      merges points the preview still reads (mutation build: the 1 ms lower-gain merge).
 //   G6 empty values write no "text3D" / "brush" key (the clip with values in the same
 //      project does). Detects: empty keys written.
 //   G7 setClipText3DConfig / setClipBrushData: one undo point per change (undo empties,
@@ -42,10 +54,13 @@
 //      and decompose restores
 //      the brushData and the brush_progress keys. Detects: as G10 (HEAD reversed 46.18),
 //      or progress keys not shifted with the handles.
+#include "../AudioExportMix.h"
 #include "../BrushAnimation.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
+#include "../Text3DExtrusionDialog.h"
 #include "../Text3DLayer.h"
+#include "../TextManager.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
@@ -66,7 +81,10 @@
 #include <QVector>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <limits>
+#include <memory>
 #include <string>
 
 namespace {
@@ -361,34 +379,486 @@ int runClipSidecarSelftest()
             qPrintable(afterMoveV3), int(removed), qPrintable(afterRemove), qPrintable(x)).toStdString());
     }
 
-    // G5: the right half of a split carries neither, on all three split paths.
+    // G5 (US-1807): both halves keep the 3D text and the brush, and the right half plays in
+    // the original's clip-local time on all three split paths.
     {
-        ClipInfo s = sidecarClip(QStringLiteral("s"), 4.0);
-        s.text3DConfig = t3A;
-        s.brushData = brA;
-        const QString expected = QStringLiteral("s:T3A/BRA,s:-/-");
-        QString err;
-        Timeline byIndex;
-        loadTimeline(byIndex, {{s}});
-        const bool indexSplit = byIndex.splitClipByIndex(false, 0, 0, 1.5, &err);
-        const QString indexShown = describe(byIndex.trackAt(false, 0));
-        Timeline blade;
-        loadTimeline(blade, {{s}});
-        blade.setPlayheadPosition(1.5);
-        blade.bladeAllTracksAtPlayhead();
-        const QString bladeShown = describe(blade.trackAt(false, 0));
-        Timeline atPlayhead;
-        loadTimeline(atPlayhead, {{s}});
-        const bool selected = atPlayhead.selectClipByIndex(false, 0, 0, &err);
-        atPlayhead.setPlayheadPosition(1.5);
-        atPlayhead.splitAtPlayhead();
-        const QString playheadShown = describe(atPlayhead.trackAt(false, 0));
-        const bool ok = indexSplit && indexShown == expected && bladeShown == expected
-            && selected && playheadShown == expected;
-        tally.gate(5, ok, QString::asprintf(
-            "splitClipByIndex(%d)=[%s] bladeAllTracksAtPlayhead=[%s] splitAtPlayhead(sel %d)=[%s] "
-            "(expect %s)", int(indexSplit), qPrintable(indexShown), qPrintable(bladeShown), int(selected),
-            qPrintable(playheadShown), qPrintable(expected)).toStdString());
+        bool ok5 = true;
+        QString shown5;
+        const QSize kSize(320, 180);
+        const QString mediaPath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto mediaUs = libavcore::probeDurationMicroseconds(mediaPath.toStdString());
+        const double mediaSec = mediaUs ? double(*mediaUs) / 1000000.0 : 0.0;
+        if (!QFileInfo::exists(mediaPath) || mediaSec < 4.0) {
+            ok5 = false;
+            shown5 += QString::asprintf("prerequisite: fixture=%s exists=%d duration=%.3f (run from the repository "
+                                        "root) ", qPrintable(mediaPath), int(QFileInfo::exists(mediaPath)), mediaSec);
+        }
+        auto mediaClip = [&](double outSec) {
+            ClipInfo clip{};
+            clip.filePath = mediaPath;
+            clip.displayName = QStringLiteral("split");
+            clip.duration = mediaSec;
+            clip.inPoint = 0.0;
+            clip.outPoint = outSec;
+            return clip;
+        };
+        auto frameAt = [&](const Timeline &tl, double timelineSec) {
+            return tlrender::renderFrameAt(&tl, qRound64(timelineSec * 1000000.0), kSize);
+        };
+        auto sameImage = [](const QImage &a, const QImage &b) {
+            return !a.isNull() && a.format() == b.format() && a == b;
+        };
+        static const char *const kPathNames[] = {"splitClipByIndex", "bladeAllTracksAtPlayhead",
+                                                 "splitAtPlayhead"};
+        // The clip starts at timeline 0, so the cut's timeline second is also L.
+        auto splitVia = [](Timeline &tl, int path, int clipIndex, double cutTimelineSec) {
+            QString err;
+            const int before = tl.trackAt(false, 0)->clipCount();
+            if (path == 0) {
+                tl.splitClipByIndex(false, 0, clipIndex, cutTimelineSec, &err);
+            } else if (path == 1) {
+                tl.setPlayheadPosition(cutTimelineSec);
+                tl.bladeAllTracksAtPlayhead();
+            } else {
+                if (!tl.selectClipByIndex(false, 0, clipIndex, &err)) return false;
+                tl.setPlayheadPosition(cutTimelineSec);
+                tl.splitAtPlayhead();
+            }
+            return tl.trackAt(false, 0)->clipCount() == before + 1;
+        };
+        // The split V1 written by toJsonString and read back by fromJsonString.
+        auto roundTripped = [](const Timeline &tl, Timeline *out) {
+            ProjectData data;
+            data.config.width = 640;
+            data.config.height = 360;
+            data.config.fps = 30;
+            data.videoTracks = {tl.trackAt(false, 0)->clips()};
+            data.audioTracks = {{}};
+            ProjectData loaded;
+            if (!ProjectFile::fromJsonString(ProjectFile::toJsonString(data), loaded)) return false;
+            loadTimeline(*out, loaded.videoTracks);
+            return true;
+        };
+        struct VideoCase {
+            const char *name;
+            ClipInfo clip;
+            QVector<double> rightTimes;  // timeline seconds inside the right half
+        };
+        auto opacityKeys = [](ClipInfo &clip) {
+            KeyframeTrack opacity(QStringLiteral("motion.opacity"));
+            opacity.addKeyframe(0.0, 1.0);
+            opacity.addKeyframe(0.5, 0.2);
+            opacity.addKeyframe(1.0, 0.9);
+            opacity.addKeyframe(1.5, 0.3);
+            clip.keyframes.addTrack(opacity);
+        };
+        QVector<VideoCase> cases;
+        {
+            ClipInfo brush = mediaClip(3.0);
+            brush.brushData = brushFor(QStringLiteral("Brush"));
+            KeyframeTrack progress(QStringLiteral("brush_progress"));
+            progress.addKeyframe(0.0, 0.0);
+            progress.addKeyframe(3.0, 1.0);
+            brush.keyframes.addTrack(progress);
+            cases.append({"brush_progress", brush, {1.1, 1.2}});
+            ClipInfo quads = mediaClip(3.0);
+            {
+                // The stagger only shows when the per-character animation is nonzero.
+                Text3DLayer layer;
+                layer.setText(QStringLiteral("ABCDEFGHIJKL"), QFont(QStringLiteral("Arial"), 40));
+                layer.setPerCharPosition(QVector3D(0.0f, -60.0f, 0.0f));
+                layer.setRotationAnimAxis(QVector3D(1.0f, 0.0f, 0.0f));
+                quads.text3DConfig = layer.toJson();
+            }
+            cases.append({"text3d-quads", quads, {1.1, 1.2}});
+            ClipInfo extruded = mediaClip(3.0);
+            {
+                Text3DLayer layer;
+                layer.setText(QStringLiteral("SPIN"), QFont(QStringLiteral("Arial"), 48));
+                layer.setExtrudeEnabled(true);
+                layer.setCameraDistance(3.0);  // the 400 default leaves the mesh a few pixels
+                // 45 deg/s: yaw 49.5 / 54 deg at timeline 1.1 / 1.2 (local 0.1 / 0.2 on the
+                // right half gives 4.5 / 9 deg without the offset).
+                layer.setRotationAnimAxis(QVector3D(0.0f, 0.5f, 0.0f));
+                extruded.text3DConfig = layer.toJson();
+            }
+            cases.append({"text3d-extruded", extruded, {1.1, 1.2}});
+            ClipInfo opacity = mediaClip(3.0);
+            opacityKeys(opacity);
+            cases.append({"opacity4keys", opacity, {1.1, 1.2, 2.4}});
+            ClipInfo speed2 = mediaClip(4.0);
+            speed2.speed = 2.0;
+            opacityKeys(speed2);
+            cases.append({"opacity-speed2", speed2, {1.1, 1.2}});
+            ClipInfo reversed = mediaClip(3.0);
+            reversed.reversed = true;
+            opacityKeys(reversed);
+            cases.append({"opacity-reversed", reversed, {1.1, 1.2}});
+            ClipInfo window = mediaClip(3.0);
+            VideoEffect invert = VideoEffect::createInvert();
+            invert.startSec = 0.5;
+            invert.endSec = 1.5;
+            window.effects = {invert};
+            cases.append({"effect-window", window, {1.2, 1.8}});
+        }
+        constexpr double kCut = 1.0;
+        const QVector<double> leftTimes{0.3, 0.8};
+        bool quadsOffsetsOk = true;
+        for (const VideoCase &c : cases) {
+            for (int path = 0; path < 3; ++path) {
+                Timeline tl;
+                loadTimeline(tl, {{c.clip}});
+                QVector<QImage> rightBefore, leftBefore;
+                for (double t : c.rightTimes) rightBefore.append(frameAt(tl, t));
+                for (double t : leftTimes) leftBefore.append(frameAt(tl, t));
+                const bool split = splitVia(tl, path, 0, kCut);
+                const QVector<ClipInfo> clips = tl.trackAt(false, 0)->clips();
+                const ClipInfo left = clips.value(0);
+                const ClipInfo right = clips.value(1);
+                const bool carried = split && left.text3DConfig.isEmpty() == c.clip.text3DConfig.isEmpty()
+                    && right.text3DConfig.isEmpty() == c.clip.text3DConfig.isEmpty()
+                    && left.brushData == c.clip.brushData && right.brushData == c.clip.brushData;
+                Timeline reloaded;
+                const bool tripped = split && roundTripped(tl, &reloaded);
+                QString frames;
+                bool framesOk = split && tripped;
+                for (int i = 0; i < c.rightTimes.size(); ++i) {
+                    const QImage after = frameAt(tl, c.rightTimes[i]);
+                    const QImage afterTrip = tripped ? frameAt(reloaded, c.rightTimes[i]) : QImage();
+                    const bool eq = sameImage(rightBefore[i], after);
+                    const bool eqTrip = sameImage(rightBefore[i], afterTrip);
+                    framesOk = framesOk && eq && eqTrip;
+                    frames += QString::asprintf(" R%.1f=%d/%d(mean %.3f)", c.rightTimes[i], int(eq), int(eqTrip),
+                                                meanAbsDiff(rightBefore[i], after));
+                }
+                for (int i = 0; i < leftTimes.size(); ++i) {
+                    const bool eq = sameImage(leftBefore[i], frameAt(tl, leftTimes[i]));
+                    framesOk = framesOk && eq;
+                    frames += QString::asprintf(" L%.1f=%d", leftTimes[i], int(eq));
+                }
+                if (!c.clip.text3DConfig.isEmpty()
+                    && right.text3DConfig.value(QStringLiteral("timeOffsetSec")).toDouble(-1.0) != kCut)
+                    quadsOffsetsOk = false;
+                const bool caseOk = carried && framesOk;
+                ok5 = ok5 && caseOk;
+                if (!caseOk || path == 0)
+                    shown5 += QString::asprintf("[%s via %s ok=%d split=%d carried=%d trip=%d%s] ", c.name,
+                                                kPathNames[path], int(caseOk), int(split), int(carried),
+                                                int(tripped), qPrintable(frames));
+            }
+        }
+        ok5 = ok5 && quadsOffsetsOk;
+        shown5 += QString::asprintf("text3D right timeOffsetSec==%.1f on all paths=%d ", kCut, int(quadsOffsetsOk));
+
+        // (c) effect windows: a cut at the window end keeps the effect with endSec 0, a cut
+        // after it drops the effect from the right half.
+        {
+            ClipInfo window = cases.last().clip;
+            QString windows;
+            bool windowsOk = true;
+            for (double cut : {1.0, 1.5, 2.0}) {
+                Timeline tl;
+                loadTimeline(tl, {{window}});
+                const bool split = splitVia(tl, 0, 0, cut);
+                const ClipInfo left = tl.trackAt(false, 0)->clips().value(0);
+                const ClipInfo right = tl.trackAt(false, 0)->clips().value(1);
+                const QVector<VideoEffect> &fx = right.effects;
+                bool want = split && left.effects.size() == 1 && left.effects[0].startSec == 0.5
+                    && left.effects[0].endSec == 1.5;
+                if (cut == 1.0) want = want && fx.size() == 1 && fx[0].startSec == 0.0 && fx[0].endSec == 0.5;
+                if (cut == 1.5) want = want && fx.size() == 1 && fx[0].startSec == 0.0 && fx[0].endSec == 0.0;
+                if (cut == 2.0) want = want && fx.isEmpty();
+                windowsOk = windowsOk && want;
+                windows += QString::asprintf(" cut %.1f: right effects=%d", cut, int(fx.size()));
+                if (!fx.isEmpty()) windows += QString::asprintf(" [%.3f,%.3f]", fx[0].startSec, fx[0].endSec);
+            }
+            ok5 = ok5 && windowsOk;
+            shown5 += QString::asprintf("(c) windows ok=%d%s (expect [0,0.5] / [0,0] / none) ", int(windowsOk),
+                                        qPrintable(windows));
+        }
+
+        // (c2) the effect tracks are named by index: when the cut drops effect 0 (window
+        // [0.5,0.8]), effect 1's "effect.1.brightness" becomes "effect.0.brightness" with its
+        // keys shifted by -L, effect 0's own track goes, and the right half renders as before.
+        {
+            ClipInfo clip = mediaClip(3.0);
+            VideoEffect expired = VideoEffect::createBrightnessContrast(0.0, 0.0);
+            expired.startSec = 0.5;
+            expired.endSec = 0.8;
+            const VideoEffect animated = VideoEffect::createBrightnessContrast(0.0, 0.0);
+            clip.effects = {expired, animated};
+            KeyframeTrack expiredTrack(QStringLiteral("effect.0.brightness"));
+            expiredTrack.addKeyframe(0.5, 40.0);
+            expiredTrack.addKeyframe(0.8, -40.0);
+            clip.keyframes.addTrack(expiredTrack);
+            KeyframeTrack animatedTrack(QStringLiteral("effect.1.brightness"));
+            animatedTrack.addKeyframe(0.5, -60.0);
+            animatedTrack.addKeyframe(1.5, 60.0);
+            animatedTrack.addKeyframe(2.0, -20.0);
+            clip.keyframes.addTrack(animatedTrack);
+            const QVector<double> times{1.2, 1.8};
+            Timeline tl;
+            loadTimeline(tl, {{clip}});
+            QVector<QImage> before;
+            for (double t : times) before.append(frameAt(tl, t));
+            const bool split = splitVia(tl, 0, 0, kCut);
+            const ClipInfo right = tl.trackAt(false, 0)->clips().value(1);
+            const bool oneEffect = split && right.effects.size() == 1;
+            const KeyframeTrack *renamed = right.keyframes.track(QStringLiteral("effect.0.brightness"));
+            QString keys;
+            bool keysOk = renamed && renamed->count() == 3;
+            const double wantTimes[] = {-0.5, 0.5, 1.0};
+            const double wantValues[] = {-60.0, 60.0, -20.0};
+            for (int k = 0; renamed && k < renamed->count(); ++k) {
+                const KeyframePoint &p = renamed->keyframes()[k];
+                keys += QString::asprintf("%s%g:%g", k ? "," : "", p.time, p.value);
+                if (k < 3) keysOk = keysOk && std::abs(p.time - wantTimes[k]) < 1e-9 && p.value == wantValues[k];
+            }
+            int effectTracks = 0;
+            bool staleIndex = false;
+            for (const KeyframeTrack &track : right.keyframes.tracks()) {
+                if (!track.propertyName().startsWith(QStringLiteral("effect."))) continue;
+                ++effectTracks;
+                if (track.propertyName().startsWith(QStringLiteral("effect.1."))) staleIndex = true;
+            }
+            const bool tracksOk = !staleIndex && effectTracks == 1;
+            QString frames;
+            bool framesOk = split;
+            for (int i = 0; i < times.size(); ++i) {
+                const QImage after = frameAt(tl, times[i]);
+                const bool eq = sameImage(before[i], after);
+                framesOk = framesOk && eq;
+                frames += QString::asprintf(" R%.1f=%d(mean %.3f)", times[i], int(eq), meanAbsDiff(before[i], after));
+            }
+            const bool remapOk = oneEffect && keysOk && tracksOk && framesOk;
+            ok5 = ok5 && remapOk;
+            shown5 += QString::asprintf("(c2) effect-track remap ok=%d effects=%d effect.0.brightness=[%s] (expect "
+                                        "-0.5:-60,0.5:60,1:-20) effectTracks=%d effect.1.*=%d%s ",
+                                        int(remapOk), int(right.effects.size()), qPrintable(keys), effectTracks,
+                                        int(staleIndex), qPrintable(frames));
+        }
+
+        // (d) the volume envelope of an audio-track clip cut at 1.0.
+        {
+            auto splitAudio = [&](const QVector<AudioGainPoint> &envelope, ClipInfo *rightOut) {
+                ClipInfo audio = mediaClip(4.0);
+                audio.volume = 1.0;
+                audio.volumeEnvelope = envelope;
+                Timeline tl;
+                tl.restoreFromProject(QVector<QVector<ClipInfo>>{{mediaClip(4.0)}},
+                                      QVector<QVector<ClipInfo>>{{audio}}, 0.0, -1.0, -1.0, 100);
+                tl.undoManager()->clear();
+                tl.saveUndoState(QStringLiteral("Initial"));
+                QString err;
+                const bool split = tl.splitClipByIndex(true, 0, 0, kCut, &err)
+                    && tl.trackAt(true, 0)->clipCount() == 2;
+                *rightOut = split ? tl.trackAt(true, 0)->clips().value(1) : ClipInfo{};
+                return split;
+            };
+            auto envShown = [](const QVector<AudioGainPoint> &env) {
+                QStringList parts;
+                for (const AudioGainPoint &p : env) parts.append(QString::asprintf("%g:%g", p.time, p.gain));
+                return parts.join(QLatin1Char(','));
+            };
+            auto isEnvelope = [](const QVector<AudioGainPoint> &env, const QVector<AudioGainPoint> &want) {
+                if (env.size() != want.size()) return false;
+                for (int i = 0; i < env.size(); ++i)
+                    if (std::abs(env[i].time - want[i].time) > 1e-9 || std::abs(env[i].gain - want[i].gain) > 1e-9)
+                        return false;
+                return true;
+            };
+            auto worstGainDiff = [&](const QVector<AudioGainPoint> &orig, const QVector<AudioGainPoint> &right) {
+                double worst = 0.0;
+                for (int i = 0; i <= 3000; ++i) {
+                    const double t = kCut + i * 0.001;
+                    worst = std::max(worst, std::abs(audio::evaluateVolumeEnvelope(right, t - kCut, 1.0)
+                                                     - audio::evaluateVolumeEnvelope(orig, t, 1.0)));
+                }
+                return worst;
+            };
+            const QVector<AudioGainPoint> expected{{0.0, 0.6}, {1.0, 0.2}};
+            const QVector<QVector<AudioGainPoint>> inputs{
+                {{0.0, 1.0}, {2.0, 0.2}}, {{0.0, 1.0}, {1.0, 0.6}, {2.0, 0.2}}, {{2.0, 0.2}, {0.0, 1.0}}};
+            static const char *const kEnvNames[] = {"d-1", "d-2 point at the cut", "d-3 unordered"};
+            bool envOk = true;
+            for (int k = 0; k < inputs.size(); ++k) {
+                ClipInfo right;
+                const bool split = splitAudio(inputs[k], &right);
+                const QVector<AudioGainPoint> sortedOrig = audioexport::sortedDedupedEnvelope(inputs[k]);
+                const double rawDiff = worstGainDiff(k == 2 ? sortedOrig : inputs[k], right.volumeEnvelope);
+                const double exportDiff = worstGainDiff(sortedOrig,
+                                                        audioexport::sortedDedupedEnvelope(right.volumeEnvelope));
+                const bool shape = split && isEnvelope(right.volumeEnvelope, expected);
+                const bool gains = rawDiff <= 1e-6 && exportDiff <= 1e-6;
+                envOk = envOk && shape && gains;
+                shown5 += QString::asprintf("(%s) split=%d right=[%s] (expect 0:0.6,1:0.2) gain maxdiff raw=%.3g "
+                                            "export=%.3g (expect <= 1e-6) ", kEnvNames[k], int(split),
+                                            qPrintable(envShown(right.volumeEnvelope)), rawDiff, exportDiff);
+            }
+            // (d-4 .. d-7) points no more than 1 ms apart, near the cut and away from it: the right
+            // half still starts with the cut anchor (rule 83), and both the preview gain and the
+            // exported gain (sortedDedupedEnvelope) match the preview before the split.
+            {
+                struct NearCase {
+                    const char *name;
+                    QVector<AudioGainPoint> input;
+                    QVector<AudioGainPoint> expected;
+                };
+                const QVector<NearCase> nearCases{
+                    {"d-4 point 0.5 ms after the cut",
+                     {{0.0, 0.2}, {0.999, 0.2}, {1.0005, 1.0}, {3.0, 1.0}},
+                     {{0.0, 0.733333}, {0.0005, 1.0}, {2.0, 1.0}}},
+                    {"d-5 points 0.5 ms before and 0.2 ms after the cut",
+                     {{0.0, 0.2}, {0.9995, 0.2}, {1.0002, 1.0}, {3.0, 1.0}},
+                     {{0.0, 0.771429}, {0.0002, 1.0}, {2.0, 1.0}}},
+                    {"d-6 authored 0.4 ms ramp after the cut",
+                     {{0.0, 1.0}, {1.2, 1.0}, {1.2004, 0.2}, {3.0, 0.2}},
+                     {{0.0, 1.0}, {0.2, 1.0}, {0.2004, 0.2}, {2.0, 0.2}}},
+                    {"d-7 authored step, two points at one instant",
+                     {{0.0, 0.2}, {1.5, 0.2}, {1.5, 1.0}, {3.0, 1.0}},
+                     {{0.0, 0.2}, {0.5, 0.2}, {0.5, 1.0}, {2.0, 1.0}}}};
+                for (const NearCase &c : nearCases) {
+                    ClipInfo right;
+                    const bool split = splitAudio(c.input, &right);
+                    bool shape = split && right.volumeEnvelope.size() == c.expected.size();
+                    for (int i = 0; shape && i < c.expected.size(); ++i)
+                        shape = std::abs(right.volumeEnvelope[i].time - c.expected[i].time) <= 1e-6
+                                && std::abs(right.volumeEnvelope[i].gain - c.expected[i].gain) <= 1e-6;
+                    const double rawDiff = worstGainDiff(c.input, right.volumeEnvelope);
+                    const QVector<AudioGainPoint> exportedRight =
+                        audioexport::sortedDedupedEnvelope(right.volumeEnvelope);
+                    const double exportDiff = worstGainDiff(c.input, exportedRight);
+                    double unsplitExportDiff = 0.0;
+                    const QVector<AudioGainPoint> exportedOrig = audioexport::sortedDedupedEnvelope(c.input);
+                    for (int i = 0; i <= 3000; ++i) {
+                        const double t = i * 0.001;
+                        unsplitExportDiff = std::max(unsplitExportDiff,
+                                                     std::abs(audio::evaluateVolumeEnvelope(exportedOrig, t, 1.0)
+                                                              - audio::evaluateVolumeEnvelope(c.input, t, 1.0)));
+                    }
+                    const double exportAt11 = audio::evaluateVolumeEnvelope(exportedRight, 1.1 - kCut, 1.0);
+                    const double previewAt11 = audio::evaluateVolumeEnvelope(c.input, 1.1, 1.0);
+                    envOk = envOk && shape && rawDiff <= 1e-6 && exportDiff <= 1e-6 && unsplitExportDiff <= 1e-6
+                        && std::abs(exportAt11 - previewAt11) <= 1e-6;
+                    shown5 += QString::asprintf("(%s) split=%d right=[%s] (expect %s) gain maxdiff against the preview "
+                                                "before the split: raw on [L, L+3]=%.3g export on [L, L+3]=%.3g "
+                                                "unsplit export on [0, 3]=%.3g (expect <= 1e-6) export(1.1)=%.6g "
+                                                "preview(1.1)=%.6g ",
+                                                c.name, int(split), qPrintable(envShown(right.volumeEnvelope)),
+                                                qPrintable(envShown(c.expected)), rawDiff, exportDiff,
+                                                unsplitExportDiff, exportAt11, previewAt11);
+                }
+            }
+            ok5 = ok5 && envOk;
+        }
+
+        // (e) pin (HEAD PASS): a text overlay spanning the cut is in timeline seconds and is
+        // not shifted; the right half keeps startTime / endTime and renders as before.
+        {
+            ClipInfo overlayClip = mediaClip(3.0);
+            EnhancedTextOverlay overlay;
+            overlay.text = QStringLiteral("OVERLAY");
+            overlay.font = QFont(QStringLiteral("Arial"), 40, QFont::Bold);
+            overlay.startTime = 0.5;
+            overlay.endTime = 3.0;
+            overlay.animIn.type = TextAnimationType::FadeIn;
+            overlay.animIn.duration = 0.5;
+            PositionKeyframe from;
+            from.time = 0.0;
+            from.cx = 0.2;
+            from.cy = 0.2;
+            PositionKeyframe to;
+            to.time = 2.0;
+            to.cx = 0.8;
+            to.cy = 0.8;
+            overlay.positionKeyframes = {from, to};
+            overlayClip.textManager.setOverlays({overlay});
+            bool pinOk = true;
+            for (int path = 0; path < 3; ++path) {
+                Timeline tl;
+                loadTimeline(tl, {{overlayClip}});
+                const QImage before12 = frameAt(tl, 1.2);
+                const QImage before24 = frameAt(tl, 2.4);
+                const bool split = splitVia(tl, path, 0, kCut);
+                const ClipInfo left = tl.trackAt(false, 0)->clips().value(0);
+                const ClipInfo right = tl.trackAt(false, 0)->clips().value(1);
+                const bool times = split && right.textManager.count() == 1 && left.textManager.count() == 1
+                    && right.textManager.overlays().first().startTime == 0.5
+                    && right.textManager.overlays().first().endTime == 3.0;
+                const bool eq12 = sameImage(before12, frameAt(tl, 1.2));
+                const bool eq24 = sameImage(before24, frameAt(tl, 2.4));
+                pinOk = pinOk && times && eq12 && eq24;
+                shown5 += QString::asprintf("(e) %s counts %d/%d start/end %.2f/%.2f (expect 1/1 0.50/3.00) eq "
+                                            "1.2=%d 2.4=%d ", kPathNames[path], left.textManager.count(),
+                                            right.textManager.count(),
+                                            right.textManager.count() ? right.textManager.overlays().first().startTime : -1.0,
+                                            right.textManager.count() ? right.textManager.overlays().first().endTime : -1.0,
+                                            int(eq12), int(eq24));
+            }
+            ok5 = ok5 && pinOk;
+        }
+
+        // (f) Text3DLayer::timeOffsetSec: JSON, non-finite values, accumulation over a second
+        // split, and the extrusion dialog's setLayer -> layer() (no exec()).
+        {
+            bool offsetOk = true;
+            Text3DLayer seeded;
+            seeded.fromJson(text3DFor(QStringLiteral("ABCDEFGHIJKL")));
+            seeded.setTimeOffsetSec(1.0);
+            const QJsonObject seededJson = seeded.toJson();
+            Text3DLayer back;
+            back.fromJson(seededJson);
+            const bool jsonOk = seededJson.value(QStringLiteral("timeOffsetSec")).toDouble(-1.0) == 1.0
+                && back.timeOffsetSec() == 1.0 && back.toJson() == seededJson;
+            const bool zeroOmitted = !Text3DLayer().toJson().contains(QStringLiteral("timeOffsetSec"));
+            QString nonFinite;
+            bool nonFiniteOk = true;
+            const QVector<QJsonValue> badValues{QJsonValue(QStringLiteral("abc")),
+                                                QJsonValue(std::numeric_limits<double>::quiet_NaN()),
+                                                QJsonValue(std::numeric_limits<double>::infinity())};
+            for (const QJsonValue &bad : badValues) {
+                QJsonObject obj = seededJson;
+                obj[QStringLiteral("timeOffsetSec")] = bad;
+                Text3DLayer layer;
+                layer.setTimeOffsetSec(5.0);
+                layer.fromJson(obj);
+                nonFiniteOk = nonFiniteOk && layer.timeOffsetSec() == 0.0;
+                nonFinite += QString::asprintf(" %g", layer.timeOffsetSec());
+            }
+            Text3DLayer setterLayer;
+            setterLayer.setTimeOffsetSec(5.0);
+            setterLayer.setTimeOffsetSec(std::numeric_limits<double>::infinity());
+            nonFiniteOk = nonFiniteOk && setterLayer.timeOffsetSec() == 0.0;
+            // A second cut 0.5 s into the right half (timeline 1.5) accumulates the offset.
+            ClipInfo quads = mediaClip(3.0);
+            quads.text3DConfig = text3DFor(QStringLiteral("ABCDEFGHIJKL"));
+            Timeline tl;
+            loadTimeline(tl, {{quads}});
+            const bool twice = splitVia(tl, 0, 0, kCut) && splitVia(tl, 0, 1, 1.5);
+            const double offsets[3] = {
+                tl.trackAt(false, 0)->clips().value(0).text3DConfig.value(QStringLiteral("timeOffsetSec")).toDouble(0.0),
+                tl.trackAt(false, 0)->clips().value(1).text3DConfig.value(QStringLiteral("timeOffsetSec")).toDouble(0.0),
+                tl.trackAt(false, 0)->clips().value(2).text3DConfig.value(QStringLiteral("timeOffsetSec")).toDouble(0.0)};
+            const bool accumulated = twice && offsets[0] == 0.0 && offsets[1] == 1.0 && offsets[2] == 1.5;
+            Text3DExtrusionDialog dialog;
+            dialog.setLayer(seeded);
+            std::unique_ptr<Text3DLayer> edited(dialog.layer(nullptr));
+            const double editedOffset = edited
+                ? edited->toJson().value(QStringLiteral("timeOffsetSec")).toDouble(0.0) : -1.0;
+            // Control: a dialog that was never seeded builds offset 0 (the widgets do not carry it).
+            Text3DExtrusionDialog unseeded;
+            std::unique_ptr<Text3DLayer> fresh(unseeded.layer(nullptr));
+            const double freshOffset = fresh ? fresh->timeOffsetSec() : -1.0;
+            offsetOk = jsonOk && zeroOmitted && nonFiniteOk && accumulated && editedOffset == 1.0
+                && freshOffset == 0.0;
+            ok5 = ok5 && offsetOk;
+            shown5 += QString::asprintf("(f) json=%d zeroOmitted=%d nonFinite=[%s] setter=%g (expect 0) offsets "
+                                        "%g/%g/%g (expect 0/1/1.5) dialog=%g (expect 1) unseeded=%g (expect 0)",
+                                        int(jsonOk), int(zeroOmitted), qPrintable(nonFinite.trimmed()),
+                                        setterLayer.timeOffsetSec(), offsets[0], offsets[1], offsets[2],
+                                        editedOffset, freshOffset);
+        }
+        tally.gate(5, ok5, shown5.toStdString());
     }
 
     // G6: empty values write no key; the clip with values in the same project does.
