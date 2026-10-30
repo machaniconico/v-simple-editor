@@ -18,6 +18,7 @@ namespace effectctrl {
 MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     : QWidget(parent)
 {
+    setObjectName(QStringLiteral("motionSectionWidget"));
     auto *rootLayout = new QVBoxLayout(this);
     rootLayout->setContentsMargins(0, 0, 0, 0);
     rootLayout->setSpacing(6);
@@ -32,6 +33,7 @@ MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     toggleRow->addStretch();
 
     m_toggle3D = new QToolButton(this);
+    m_toggle3D->setObjectName(QStringLiteral("motionToggle3D"));
     m_toggle3D->setCheckable(true);
     m_toggle3D->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     m_toggle3D->setIcon(QIcon(QStringLiteral(":/icons/effects.svg")));
@@ -96,11 +98,17 @@ MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     layout3D->setSpacing(4);
 
     m_posZSpin = createSpinBox(-10000.0, 10000.0, 1.0, 3, 0.0);
+    m_worldXSpin = createSpinBox(-10000.0, 10000.0, 1.0, 3, 0.0);
+    m_worldYSpin = createSpinBox(-10000.0, 10000.0, 1.0, 3, 0.0);
+    m_worldXSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) でのみ効く"));
+    m_worldYSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) でのみ効く"));
     m_rotXSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
     m_rotYSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
     m_rotZSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
 
     m_posZToggle = new EffectKeyframeToggle(this);
+    m_worldXToggle = new EffectKeyframeToggle(this);
+    m_worldYToggle = new EffectKeyframeToggle(this);
     m_rotXToggle = new EffectKeyframeToggle(this);
     m_rotYToggle = new EffectKeyframeToggle(this);
     m_rotZToggle = new EffectKeyframeToggle(this);
@@ -131,6 +139,8 @@ MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     };
 
     add3DRow(new QLabel(tr("Position-z"), this), QStringLiteral("motion.position.z"), m_posZToggle, m_posZSpin);
+    add3DRow(new QLabel(tr("ワールド X"), this), QStringLiteral("motion.world.x"), m_worldXToggle, m_worldXSpin);
+    add3DRow(new QLabel(tr("ワールド Y"), this), QStringLiteral("motion.world.y"), m_worldYToggle, m_worldYSpin);
     add3DRow(new QLabel(tr("Rotation-X"), this), QStringLiteral("motion.rotation.x"), m_rotXToggle, m_rotXSpin);
     add3DRow(new QLabel(tr("Rotation-Y"), this), QStringLiteral("motion.rotation.y"), m_rotYToggle, m_rotYSpin);
     add3DRow(new QLabel(tr("Rotation-Z"), this), QStringLiteral("motion.rotation.z"), m_rotZToggle, m_rotZSpin);
@@ -142,6 +152,8 @@ MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     bindMotionRow(m_rotation2DToggle, m_rotation2DSpin, QStringLiteral("motion.rotation"));
     bindMotionRow(m_opacityToggle, m_opacitySpin, QStringLiteral("motion.opacity"));
     bindMotionRow(m_posZToggle, m_posZSpin, QStringLiteral("motion.position.z"));
+    bindMotionRow(m_worldXToggle, m_worldXSpin, QStringLiteral("motion.world.x"));
+    bindMotionRow(m_worldYToggle, m_worldYSpin, QStringLiteral("motion.world.y"));
     bindMotionRow(m_rotXToggle, m_rotXSpin, QStringLiteral("motion.rotation.x"));
     bindMotionRow(m_rotYToggle, m_rotYSpin, QStringLiteral("motion.rotation.y"));
     bindMotionRow(m_rotZToggle, m_rotZSpin, QStringLiteral("motion.rotation.z"));
@@ -163,6 +175,8 @@ void MotionSectionWidget::setMotion(const MotionState &motion)
     const QSignalBlocker blockRot2D(m_rotation2DSpin);
     const QSignalBlocker blockOpacity(m_opacitySpin);
     const QSignalBlocker blockPosZ(m_posZSpin);
+    const QSignalBlocker blockWorldX(m_worldXSpin);
+    const QSignalBlocker blockWorldY(m_worldYSpin);
     const QSignalBlocker blockRotX(m_rotXSpin);
     const QSignalBlocker blockRotY(m_rotYSpin);
     const QSignalBlocker blockRotZ(m_rotZSpin);
@@ -174,6 +188,8 @@ void MotionSectionWidget::setMotion(const MotionState &motion)
     m_rotation2DSpin->setValue(motion.rotation2DDeg);
     m_opacitySpin->setValue(motion.opacity);
     m_posZSpin->setValue(motion.posZ);
+    m_worldXSpin->setValue(motion.worldX);
+    m_worldYSpin->setValue(motion.worldY);
     m_rotXSpin->setValue(motion.rotX);
     m_rotYSpin->setValue(motion.rotY);
     m_rotZSpin->setValue(motion.rotZ);
@@ -191,6 +207,8 @@ MotionState MotionSectionWidget::currentMotion() const
     motion.is3DLayer = m_toggle3D->isChecked();
     if (motion.is3DLayer) {
         motion.posZ = m_posZSpin->value();
+        motion.worldX = m_worldXSpin->value();
+        motion.worldY = m_worldYSpin->value();
         motion.rotX = m_rotXSpin->value();
         motion.rotY = m_rotYSpin->value();
         motion.rotZ = m_rotZSpin->value();

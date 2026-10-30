@@ -4205,6 +4205,8 @@ void McpEditorTools::registerWriteTools()
                         motion.opacity = current.opacity;
                         motion.is3DLayer = booleanValue;
                         motion.posZ = current.layer3D.positionZ;
+                        motion.worldX = current.layer3D.worldX;
+                        motion.worldY = current.layer3D.worldY;
                         motion.rotX = current.layer3D.rotationX;
                         motion.rotY = current.layer3D.rotationY;
                         motion.rotZ = current.layer3D.rotationZ;

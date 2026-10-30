@@ -9487,6 +9487,10 @@ void Timeline::setClipMotion(int trackIdx, int clipIdx,
     clip.is3DLayer = motion.is3DLayer;
     clip.layer3D.positionZ = motion.is3DLayer
         ? qBound(-10000.0, motion.posZ, 10000.0) : 0.0;
+    clip.layer3D.worldX = motion.is3DLayer
+        ? qBound(-10000.0, motion.worldX, 10000.0) : 0.0;
+    clip.layer3D.worldY = motion.is3DLayer
+        ? qBound(-10000.0, motion.worldY, 10000.0) : 0.0;
     clip.layer3D.rotationX = motion.is3DLayer
         ? qBound(-360.0, motion.rotX, 360.0) : 0.0;
     clip.layer3D.rotationY = motion.is3DLayer

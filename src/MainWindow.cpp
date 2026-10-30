@@ -11453,6 +11453,8 @@ void MainWindow::pasteEffects()
     motion.opacity = clipboard.motion().opacity;
     motion.is3DLayer = false;
     motion.posZ = 0.0;
+    motion.worldX = 0.0;
+    motion.worldY = 0.0;
     motion.rotX = 0.0;
     motion.rotY = 0.0;
     motion.rotZ = 0.0;
@@ -11498,6 +11500,8 @@ void MainWindow::pasteAttributes()
         motion.opacity = sel.pasteOpacity ? cbMotion.opacity : srcClip.opacity;
         motion.is3DLayer = srcClip.is3DLayer;
         motion.posZ = srcClip.layer3D.positionZ;
+        motion.worldX = srcClip.layer3D.worldX;
+        motion.worldY = srcClip.layer3D.worldY;
         motion.rotX = srcClip.layer3D.rotationX;
         motion.rotY = srcClip.layer3D.rotationY;
         motion.rotZ = srcClip.layer3D.rotationZ;
