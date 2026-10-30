@@ -1236,6 +1236,60 @@ QImage GLPreview::uploadFrameForTest() const
     return brushedUploadFrame(m_timeline && !m_projectCameraFrame.isNull());
 }
 
+// US-1813: the rotation / 3D projection paintGL applies to the upload when it is not
+// camera-baked. The trueProjection branch projects at the upload size, so worldX / worldY
+// (canvas px) are scaled to it (canvas = the owner player's project output size, else the
+// upload size: factor 1).
+QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, bool is3DLayer,
+                                       const Layer3DTransform &layer3D,
+                                       const Camera3DState &projectCamera,
+                                       bool compositeBaked) const
+{
+    QImage uploadFrame = upload;
+    if (!compositeBaked
+        && (std::abs(rotation2D) > 1e-4 || is3DLayer
+            || (projectCamera.trueProjection && !layer3D.isDefault()))) {
+        if (projectCamera.trueProjection) {
+            QSize canvas;
+            if (const auto *player = ownerPlayer())
+                canvas = player->projectOutputSize();
+            if (canvas.isEmpty())
+                canvas = uploadFrame.size();
+            uploadFrame = applyProjectCameraProjection(
+                uploadFrame,
+                camera3d::layer3DForPreviewScale(layer3D, uploadFrame.size(), canvas),
+                is3DLayer, projectCamera, uploadFrame.size());
+            uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
+        } else {
+            uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
+            if (is3DLayer) {
+                Camera3DState cameraState;
+                uploadFrame = Camera3D::applyPerspective(uploadFrame,
+                                                         layer3D,
+                                                         cameraState,
+                                                         uploadFrame.size());
+            }
+        }
+    }
+    return uploadFrame;
+}
+
+QImage GLPreview::projectedUploadFrameForTest(bool is3DLayer, const Layer3DTransform &layer3D,
+                                              double rotation2D) const
+{
+    const double cameraSec = resolveCameraSeconds();
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
+    const QImage upload = brushedUploadFrame(cameraBaked);
+    if (cameraBaked)
+        return upload;
+    return projectedUploadFrame(upload, rotation2D, is3DLayer, layer3D, projectCamera,
+                                m_compositeBakedMode);
+}
+
 void GLPreview::clearBrushAnimation()
 {
     m_brushAnimation = nullptr;
@@ -2144,25 +2198,9 @@ void GLPreview::paintGL()
             m_videoSourceDx = renderDx;
             m_videoSourceDy = renderDy;
         }
-        if (!compositeBaked
-            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer
-                || (projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
-            if (projectCamera.trueProjection) {
-                uploadFrame = applyProjectCameraProjection(
-                    uploadFrame, previewMotion.layer3D, previewMotion.is3DLayer,
-                    projectCamera, uploadFrame.size());
-                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-            } else {
-                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-                if (previewMotion.is3DLayer) {
-                    Camera3DState cameraState;
-                    uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                             previewMotion.layer3D,
-                                                             cameraState,
-                                                             uploadFrame.size());
-                }
-            }
-        }
+        uploadFrame = projectedUploadFrame(uploadFrame, previewMotion.rotation2D,
+                                           previewMotion.is3DLayer, previewMotion.layer3D,
+                                           projectCamera, compositeBaked);
     }
 
     // US-T34 OBS-style source transform — shrink/move the viewport so the

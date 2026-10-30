@@ -44,6 +44,11 @@ public:
     // image paintGL uploads (cameraBaked ? baked frame : decoded frame, brush drawn).
     double brushAnimationProgressForTest() const { return m_brushAnimationProgress; }
     QImage uploadFrameForTest() const;
+    // US-1813 test seam: the upload after paintGL's rotation / 3D projection for a
+    // test-supplied single-clip motion (Timeline-less GLPreview has none to resolve),
+    // with paintGL's project camera and baked state. uploadFrameForTest stays pre-projection.
+    QImage projectedUploadFrameForTest(bool is3DLayer, const Layer3DTransform &layer3D,
+                                       double rotation2D = 0.0) const;
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
@@ -348,6 +353,9 @@ private:
     QImage m_projectCameraFrame;
     qint64 m_projectCameraFrameTimeUs = -1;
     QImage brushedUploadFrame(bool cameraBaked) const;
+    QImage projectedUploadFrame(const QImage &upload, double rotation2D, bool is3DLayer,
+                                const Layer3DTransform &layer3D,
+                                const Camera3DState &projectCamera, bool compositeBaked) const;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;

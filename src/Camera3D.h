@@ -199,6 +199,11 @@ namespace camera3d {
 // (canvas px, centre origin, y down) at the camera position (rotationZ is kept).
 Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
                                     const Camera3DState &camera);
+// US-1813: layer3D for a projection done at uploadSize instead of the canvas: worldX / worldY
+// (canvas px) scale by uploadW / canvasW, Z and the rotations are kept (fov is not scaled).
+// Unchanged when either size is empty.
+Layer3DTransform layer3DForPreviewScale(const Layer3DTransform &layer3D, const QSize &uploadSize,
+                                        const QSize &canvasSize);
 // US-1810: canvas px of a world point (canvas px, centre origin, y down) under the
 // projectLayerQuad projection; nullopt when fov + view z <= 1e-3 (at / behind the pinhole).
 std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,

@@ -132,6 +132,11 @@ QJsonObject Layer3DTransform::toJson() const
     obj[QStringLiteral("rotationX")] = rotationX;
     obj[QStringLiteral("rotationY")] = rotationY;
     obj[QStringLiteral("rotationZ")] = rotationZ;
+    // US-1813: written only when set, so a layer without them keeps its HEAD JSON.
+    if (worldX != 0.0)
+        obj[QStringLiteral("worldX")] = worldX;
+    if (worldY != 0.0)
+        obj[QStringLiteral("worldY")] = worldY;
     return obj;
 }
 
@@ -142,6 +147,8 @@ Layer3DTransform Layer3DTransform::fromJson(const QJsonObject &obj)
     t.rotationX = obj[QStringLiteral("rotationX")].toDouble(0.0);
     t.rotationY = obj[QStringLiteral("rotationY")].toDouble(0.0);
     t.rotationZ = obj[QStringLiteral("rotationZ")].toDouble(0.0);
+    t.worldX = obj[QStringLiteral("worldX")].toDouble(0.0);
+    t.worldY = obj[QStringLiteral("worldY")].toDouble(0.0);
     return t;
 }
 
@@ -313,8 +320,9 @@ QImage Camera3D::applyPerspective(const QImage &image,
     if (image.isNull())
         return image;
 
-    // Short-circuit for identity 3D transform
-    if (layer3D.isDefault())
+    // Short-circuit for identity 3D transform. worldX / worldY are trueProjection-only and
+    // this body never reads them, so they must not take a layer off the short-circuit.
+    if (layer3D.isDefaultIgnoringWorld())
         return image;
 
     double focalLength = cameraState.fov;
@@ -434,7 +442,8 @@ QPolygonF Camera3D::projectLayerQuad(const Layer3DTransform &layer3D,
         return {};
     const ProjectionCore core = projectionCore(cameraState, canvasSize);
     QMatrix4x4 model;
-    model.translate(0, 0, static_cast<float>(layer3D.positionZ));
+    model.translate(static_cast<float>(layer3D.worldX), static_cast<float>(layer3D.worldY),
+                    static_cast<float>(layer3D.positionZ));
     // Qt post-multiplies: these act on each corner in X -> Y -> Z order.
     model.rotate(static_cast<float>(layer3D.rotationZ), 0, 0, 1);
     model.rotate(static_cast<float>(layer3D.rotationY), 0, 1, 0);
@@ -484,8 +493,9 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
         return clip.layer3D;
     // Layer -> camera. The layer is a plane, so the normal may point either way along
     // that line: take the +z side, which is the identity rotation for a centred layer.
-    double dx = static_cast<double>(camera.position.x()) - layerPosPx.x();
-    double dy = static_cast<double>(camera.position.y()) - layerPosPx.y();
+    // US-1813: the layer sits at its 2D position plus its pre-projection world x / y.
+    double dx = static_cast<double>(camera.position.x()) - (layerPosPx.x() + clip.layer3D.worldX);
+    double dy = static_cast<double>(camera.position.y()) - (layerPosPx.y() + clip.layer3D.worldY);
     double dz = static_cast<double>(camera.position.z()) - clip.layer3D.positionZ;
     const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (length < 1e-9)
@@ -507,6 +517,18 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
     result.rotationX = -std::asin(std::clamp(uy / length, -1.0, 1.0)) * kRadiansToDegrees;
     result.rotationY = std::atan2(ux, dz) * kRadiansToDegrees;
     return result;
+}
+
+Layer3DTransform layer3DForPreviewScale(const Layer3DTransform &layer3D, const QSize &uploadSize,
+                                        const QSize &canvasSize)
+{
+    if (uploadSize.isEmpty() || canvasSize.isEmpty())
+        return layer3D;
+    const double factor = static_cast<double>(uploadSize.width()) / canvasSize.width();
+    Layer3DTransform scaled = layer3D;
+    scaled.worldX *= factor;
+    scaled.worldY *= factor;
+    return scaled;
 }
 
 std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
