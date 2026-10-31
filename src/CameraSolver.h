@@ -45,6 +45,11 @@ struct SolveMapping {
     QSize canvasSize;
     int referenceIndex = -1;
     bool legacy = false;
+    // The solved range [startSec, startSec + sampleCount/fps]: sampleCount counts frames, solved
+    // or not. sampleCount 0 means it was not recorded (a project saved before this field).
+    double startSec = 0;
+    int sampleCount = 0;
+    double fps = 0;
 };
 struct CameraSolveApplied {
     QVector<Pose> poses;

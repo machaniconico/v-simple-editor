@@ -1326,8 +1326,10 @@ void GLPreview::setBrushAnimationProgress(double progress)
     update();
 }
 
-void GLPreview::setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas)
+void GLPreview::setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas,
+                                     const QVector<int> &indices)
 {
+    m_solvePointOverlayIndices = indices;
     if (m_solvePointOverlay == points && m_solvePointOverlayCanvas == canvas)
         return;
     m_solvePointOverlay = points;
@@ -2924,6 +2926,32 @@ void GLPreview::paintTimecodeBurnInOverlay()
         timecodeBurnInClipNameAt(m_timeline, timelineSec));
 }
 
+// US-1818: the overlay index under a widget position, or -1. The distance is measured in
+// widget px, after the same canvas -> widget mapping paintGL draws the crosses with.
+int GLPreview::solvePointAt(const QPointF &widgetPos) const
+{
+    if (m_solvePointOverlay.isEmpty() || m_solvePointOverlayCanvas.isEmpty())
+        return -1;
+    const QRectF box = letterboxRect();
+    const double scaleX = box.width() / m_solvePointOverlayCanvas.width();
+    const double scaleY = box.height() / m_solvePointOverlayCanvas.height();
+    int nearest = -1;
+    double nearestDistance = 8.0;
+    for (int i = 0; i < m_solvePointOverlay.size(); ++i) {
+        const QPointF &point = m_solvePointOverlay[i];
+        const QPointF mapped(box.left() + point.x() * scaleX, box.top() + point.y() * scaleY);
+        // paintGL clips the 4 px crosses to the box: a cross wholly outside it is not on screen.
+        if (!box.adjusted(-4.0, -4.0, 4.0, 4.0).contains(mapped))
+            continue;
+        const double distance = QLineF(widgetPos, mapped).length();
+        if (distance <= nearestDistance) {
+            nearest = i;
+            nearestDistance = distance;
+        }
+    }
+    return nearest;
+}
+
 QRectF GLPreview::letterboxRect() const
 {
     const double W = qMax(1, width());
@@ -3237,6 +3265,14 @@ void GLPreview::mousePressEvent(QMouseEvent *event)
     // US-MOCHA-3: SurfaceTool intercepts mouse events when installed and enabled.
     if (m_surfaceTool && m_surfaceTool->isEnabled()) {
         if (m_surfaceTool->handleMousePress(event->pos(), event->button(), event->modifiers())) {
+            event->accept();
+            return;
+        }
+    }
+    if (!m_textToolActive && event->button() == Qt::LeftButton) {
+        const int solvePoint = solvePointAt(event->pos());
+        if (solvePoint >= 0) {
+            emit solvePointClicked(m_solvePointOverlayIndices.value(solvePoint, solvePoint));
             event->accept();
             return;
         }

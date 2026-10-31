@@ -956,6 +956,11 @@ QJsonObject Camera3D::toJson() const
         mappingObj[QStringLiteral("canvasWidth")] = m_solveMapping->canvasSize.width();
         mappingObj[QStringLiteral("canvasHeight")] = m_solveMapping->canvasSize.height();
         mappingObj[QStringLiteral("referenceIndex")] = m_solveMapping->referenceIndex;
+        if (m_solveMapping->sampleCount > 0) {
+            mappingObj[QStringLiteral("startSec")] = m_solveMapping->startSec;
+            mappingObj[QStringLiteral("sampleCount")] = m_solveMapping->sampleCount;
+            mappingObj[QStringLiteral("fps")] = m_solveMapping->fps;
+        }
         obj[QStringLiteral("solveMapping")] = mappingObj;
     }
 
@@ -1040,6 +1045,9 @@ void Camera3D::fromJson(const QJsonObject &obj)
         mapping.canvasSize = QSize(mappingObj[QStringLiteral("canvasWidth")].toInt(),
                                    mappingObj[QStringLiteral("canvasHeight")].toInt());
         mapping.referenceIndex = mappingObj[QStringLiteral("referenceIndex")].toInt(-1);
+        mapping.startSec = mappingObj[QStringLiteral("startSec")].toDouble(0.0);
+        mapping.sampleCount = mappingObj[QStringLiteral("sampleCount")].toInt(0);
+        mapping.fps = mappingObj[QStringLiteral("fps")].toDouble(0.0);
         m_solveMapping = mapping;
     }
 

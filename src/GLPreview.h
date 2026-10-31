@@ -41,7 +41,9 @@ public:
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
     // US-1817: preview-only crosses at canvas px; painted over the frame, never uploaded.
-    void setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas);
+    // US-1818: indices[i] is what a click on points[i] reports; empty means i itself.
+    void setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas,
+                              const QVector<int> &indices = {});
     int solvePointOverlayCountForTest() const { return m_solvePointOverlay.size(); }
     // US-1708 test seams: the progress the preview draws the brush at, and the
     // image paintGL uploads (cameraBaked ? baked frame : decoded frame, brush drawn).
@@ -315,6 +317,8 @@ signals:
     // PV-B: プレビュー上で右クリックされた(グローバル座標)。VideoPlayer が
     // 受けて previewContextMenuRequested に再 emit する。
     void contextMenuRequested(const QPoint &globalPos);
+    // US-1818: a left click within 8 widget px of an overlay cross (nearest wins).
+    void solvePointClicked(int index);
 
 protected:
     void contextMenuEvent(QContextMenuEvent *event) override;
@@ -362,7 +366,9 @@ private:
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
+    int solvePointAt(const QPointF &widgetPos) const;
     QVector<QPointF> m_solvePointOverlay;
+    QVector<int> m_solvePointOverlayIndices;
     QSize m_solvePointOverlayCanvas;
     ColorCorrection m_cc;
     int m_colorCorrectionSetCountForTest = 0;

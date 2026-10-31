@@ -540,6 +540,7 @@ private slots:
     void configureTrackMatte();
     void configureClipParent();
     void createNullObjectForSelection();
+    bool createNullAtSolvePoint(int index);
 
     // US-3D-11: motion-graphics sprint — 4 new menu actions
     void open3DExtrudedText();

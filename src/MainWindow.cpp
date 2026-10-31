@@ -3527,9 +3527,20 @@ void MainWindow::refreshSolvePointOverlay(double timelineSec)
         m_player->glPreview()->setSolvePointOverlay({}, {});
         return;
     }
+    // Points behind the pinhole are left out, so each cross keeps its index into the cloud.
     const QSize canvas = m_timeline->projectOutputSize();
-    m_player->glPreview()->setSolvePointOverlay(
-        camera3d::projectedSolvePoints(m_projectCamera, timelineSec, canvas), canvas);
+    const Camera3DState state = m_projectCamera.hasAnimation()
+        ? m_projectCamera.getCameraAt(timelineSec) : m_projectCamera.camera();
+    const QVector<QVector3D> world = m_projectCamera.solvePointsWorldPx();
+    QVector<QPointF> points;
+    QVector<int> indices;
+    for (int i = 0; i < world.size(); ++i) {
+        if (const std::optional<QPointF> px = camera3d::projectWorldPoint(world[i], state, canvas)) {
+            points.append(*px);
+            indices.append(i);
+        }
+    }
+    m_player->glPreview()->setSolvePointOverlay(points, canvas, indices);
 }
 
 // US-1708: the bound brush's progress follows the playhead: "brush_progress" of its
@@ -3829,6 +3840,8 @@ void MainWindow::setupUI()
             this, &MainWindow::configureClipParent);
     connect(m_timeline, &Timeline::nullObjectRequested,
             this, &MainWindow::createNullObjectForSelection);
+    connect(m_player->glPreview(), &GLPreview::solvePointClicked,
+            this, &MainWindow::createNullAtSolvePoint);
     connect(m_timeline, &Timeline::transitionShortened,
             this, [this](const QString &name, double askedSec, double effSec) {
                 statusBar()->showMessage(
@@ -15417,6 +15430,77 @@ void MainWindow::createNullObjectForSelection()
     m_timeline->refreshPlaybackSequence();
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("ヌルオブジェクトを作成し、ペアレントに設定しました"), 4000);
+}
+
+// US-1818: a hidden 3D null at a solve point. Only the null is placed: the 2D parent chain
+// does not read a 3D parent's projected position, so children do not follow it yet.
+bool MainWindow::createNullAtSolvePoint(int index)
+{
+    const QVector<QVector3D> world = m_projectCamera.solvePointsWorldPx();
+    const QVector<KeyframePoint> &poses =
+        m_projectCamera.track(Camera3DProperty::PositionX)->keyframes();
+    const std::optional<camsolve::SolveMapping> mapping = m_projectCamera.solveMapping();
+    const bool hasRange = mapping && mapping->sampleCount > 0 && mapping->fps > 0;
+    if (!m_timeline || index < 0 || index >= world.size() || (!hasRange && poses.isEmpty()))
+        return false;
+    // Layer 3D clamps its world position to +-10000 (US-1814); keep the point out rather
+    // than place a null a later edit would snap elsewhere.
+    const QVector3D point = world[index];
+    if (!(std::abs(point.x()) <= 10000.0f && std::abs(point.y()) <= 10000.0f
+          && std::abs(point.z()) <= 10000.0f)) {
+        statusBar()->showMessage(
+            QStringLiteral("解析点の座標が範囲外（±10000）のため、ヌルオブジェクトを作成できませんでした"), 6000);
+        return false;
+    }
+
+    // The range is the solve's [startSec, startSec + n/fps]. Only a project saved before the
+    // mapping recorded it falls back to the pose keys, which may be sparse or hand-set.
+    double startSec = 0.0;
+    double duration = 0.0;
+    if (hasRange) {
+        startSec = mapping->startSec;
+        duration = mapping->sampleCount / mapping->fps;
+    } else {
+        double frameSec = 1.0 / qMax(1.0, double(m_projectConfig.fps));
+        for (int i = 1; i < poses.size(); ++i) {
+            if (i == 1 || poses[i].time - poses[i - 1].time < frameSec)
+                frameSec = poses[i].time - poses[i - 1].time;
+        }
+        startSec = poses.first().time;
+        duration = poses.last().time + frameSec - startSec;
+    }
+
+    ClipInfo nullClip;
+    nullClip.filePath = clipgeom::nullObjectFilePath();
+    nullClip.displayName = QStringLiteral("Null Object");
+    nullClip.duration = duration;
+    nullClip.inPoint = 0.0;
+    nullClip.outPoint = duration;
+    nullClip.leadInSec = qMax(0.0, startSec);
+    nullClip.opacity = 0.0;
+    nullClip.visible = false;
+    nullClip.videoScale = 1.0;
+    nullClip.videoDx = 0.0;
+    nullClip.videoDy = 0.0;
+    nullClip.rotation2DDegrees = 0.0;
+    nullClip.is3DLayer = true;
+    nullClip.layer3D.worldX = point.x();
+    nullClip.layer3D.worldY = point.y();
+    nullClip.layer3D.positionZ = point.z();
+
+    m_timeline->captureExternalTrackStateForCompoundEdit();
+    m_timeline->addVideoTrack(false);
+    TimelineTrack *nullTrack = m_timeline->videoTracks().value(m_timeline->videoTracks().size() - 1, nullptr);
+    if (!nullTrack)
+        return false;
+    nullTrack->addClip(nullClip);
+    nullTrack->setSelectedClip(-1);
+    if (m_timeline->undoManager())
+        m_timeline->saveUndoState(QStringLiteral("解析点にヌルオブジェクトを作成"));
+    m_timeline->refreshPlaybackSequence();
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("解析点にヌルオブジェクトを作成しました"), 4000);
+    return true;
 }
 
 // ──────────────────────────────────────────────────────────────────────────

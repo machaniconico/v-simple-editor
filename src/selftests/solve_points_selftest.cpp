@@ -12,7 +12,9 @@
 #include <QApplication>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QMouseEvent>
 #include <QOpenGLContext>
+#include <QStatusBar>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -33,7 +35,15 @@ ACCESS(Camera, Camera3D MainWindow::*, &MainWindow::m_projectCamera)
 ACCESS(Sync, void (MainWindow::*)(), &MainWindow::syncProjectLightingToTimeline)
 ACCESS(TimelineOf, Timeline *MainWindow::*, &MainWindow::m_timeline)
 ACCESS(PlayerOf, VideoPlayer *MainWindow::*, &MainWindow::m_player)
+ACCESS(CreateNull, bool (MainWindow::*)(int), &MainWindow::createNullAtSolvePoint)
 #undef ACCESS
+
+void clickAt(GLPreview *preview, const QPointF& pos)
+{
+    QMouseEvent press(QEvent::MouseButtonPress, pos, preview->mapToGlobal(pos), Qt::LeftButton,
+                      Qt::LeftButton, Qt::NoModifier);
+    QApplication::sendEvent(preview, &press);
+}
 
 // Noise-free, nonplanar 64-point / 10-frame scene with a nonuniform camera arc.
 sfm::MultiViewTracks scene()
@@ -330,6 +340,179 @@ int runSolvePointsSelftest()
     const bool overlayLogic = toggleOk && countDefault == 0 && !cloudPoints.isEmpty()
         && countOn == int(cloudPoints.size()) && countOff == 0 && uploadSame && follows
         && afterPlanar == 0 && afterUndo == expectT1;
+
+    // G7: a real click on a cross creates a hidden 3D null at that point. A point behind the
+    // pinhole sits first in the cloud, so the cross index and the cloud index differ by one.
+    timeline->setPlayheadPosition(t1);
+    auto cloudWithBehind = cloudPoints;
+    cloudWithBehind.prepend(QVector3D(0, 0, -3));
+    freshCamera.setSolvePoints(cloudWithBehind);
+    (fresh.*member(Sync{}))();
+    if (toggleOk) toggle->setChecked(true);
+    preview->resize(1280, 720);
+    const auto nullWorld = freshCamera.solvePointsWorldPx();
+    const QVector<QPointF> crosses = projectedAt(t1);
+    const QRectF box = preview->letterboxRect();
+    const auto toWidget = [&](const QPointF& p) {
+        return QPointF(box.left() + p.x()*box.width()/canvas.width(),
+                       box.top() + p.y()*box.height()/canvas.height());
+    };
+    // Pick a cross with no other cross near it, past the first so the index offset shows.
+    qsizetype pick = -1;
+    for (qsizetype i = 1; pick < 0 && i < crosses.size(); ++i) {
+        bool alone = true;
+        for (qsizetype j = 0; alone && j < crosses.size(); ++j)
+            alone = i == j || QLineF(toWidget(crosses[i]), toWidget(crosses[j])).length() > 10;
+        if (alone) pick = i;
+    }
+    const int tracksBefore = int(timeline->videoTracks().size());
+    const int undoBefore = timeline->undoManager()->currentIndex();
+    if (pick >= 0) clickAt(preview, toWidget(crosses[pick]));
+    const int tracksAfter = int(timeline->videoTracks().size());
+    const int undoAfter = timeline->undoManager()->currentIndex();
+    const bool oneNull = tracksAfter == tracksBefore + 1 && undoAfter == undoBefore + 1
+        && timeline->videoTracks().last()->clips().size() == 1;
+    double fieldErr = -1, maxProjErr = -1, startErr = -1, durationErr = -1;
+    bool hidden = false, diagonalsCross = false;
+    if (oneNull) {
+        const ClipInfo null = timeline->videoTracks().last()->clips().first();
+        const QVector3D w = nullWorld[pick + 1];
+        fieldErr = std::max({std::abs(null.layer3D.worldX - w.x()), std::abs(null.layer3D.worldY - w.y()),
+                             std::abs(null.layer3D.positionZ - w.z())});
+        hidden = null.is3DLayer && null.opacity == 0.0 && !null.visible
+            && null.videoDx == 0.0 && null.videoDy == 0.0;
+        startErr = std::abs(null.leadInSec - 5.0);
+        durationErr = std::abs(null.effectiveDuration() - 10.0/24.0);
+        diagonalsCross = true;
+        maxProjErr = 0;
+        for (int i = 0; i < 10; ++i) {
+            const Camera3DState state = timeline->projectCameraAt(5.0 + i/24.0);
+            const QPolygonF quad = Camera3D::projectLayerQuad(null.layer3D, state, canvas);
+            const auto expected = camera3d::projectWorldPoint(w, state, canvas);
+            QPointF crossing;
+            if (quad.size() != 4 || !expected
+                || QLineF(quad[0], quad[2]).intersects(QLineF(quad[1], quad[3]), &crossing)
+                    != QLineF::BoundedIntersection) {
+                diagonalsCross = false;
+                continue;
+            }
+            maxProjErr = std::max(maxProjErr, QLineF(crossing, *expected).length());
+        }
+    }
+    (fresh.*member(Undo{}))();
+    const bool undoneNull = int(timeline->videoTracks().size()) == tracksBefore
+        && timeline->undoManager()->currentIndex() == undoBefore;
+    // The range is the solve's even when the keys say otherwise: 100 frames at 24 fps from 7 s,
+    // thinned to every third frame, invalid at both ends, over a hand-set key at 1 s.
+    const QJsonObject beforeThinned = freshCamera.toJson();
+    auto thinned = firstEmitted;
+    thinned.startSec = 7.0;
+    thinned.poses = QVector<camsolve::Pose>(100);
+    for (int i = 3; i < 99; i += 3)
+        thinned.poses[i] = firstEmitted.poses[(i/3) % firstEmitted.poses.size()];
+    freshCamera.setCameraKeyframe(1.0, freshCamera.camera());
+    (fresh.*member(Apply{}))(thinned);
+    const auto nullRangeIs = [&](double start, double duration) {
+        if (!(fresh.*member(CreateNull{}))(0)) return false;
+        const ClipInfo null = timeline->videoTracks().last()->clips().first();
+        std::fprintf(stderr, "G7 range start=%.6f duration=%.6f want %.6f %.6f\n",
+            null.leadInSec, null.effectiveDuration(), start, duration);
+        const bool same = std::abs(null.leadInSec - start) < 1e-6
+            && std::abs(null.effectiveDuration() - duration) < 1e-6;
+        (fresh.*member(Undo{}))();
+        return same;
+    };
+    const bool rangeSolved = nullRangeIs(7.0, 100.0/24.0);
+    const QJsonObject thinnedJson = freshCamera.toJson();
+    freshCamera.fromJson(thinnedJson);
+    const bool rangeReloaded = freshCamera.toJson() == thinnedJson && nullRangeIs(7.0, 100.0/24.0);
+    (fresh.*member(Apply{}))(firstEmitted);
+    (fresh.*member(Undo{}))();
+    const bool rangeUndone = nullRangeIs(7.0, 100.0/24.0);
+    // An older file has no range: the keys decide, from the 1 s key to the last pose at 11 s
+    // plus the smallest key gap, which is the 1/24 s of the earlier solve.
+    QJsonObject olderJson = thinnedJson;
+    QJsonObject olderMapping = olderJson[QStringLiteral("solveMapping")].toObject();
+    const bool rangeStored = olderMapping[QStringLiteral("sampleCount")].toInt() == 100
+        && olderMapping[QStringLiteral("startSec")].toDouble() == 7.0
+        && olderMapping[QStringLiteral("fps")].toDouble() == 24.0;
+    for (const char *key : {"startSec", "sampleCount", "fps"})
+        olderMapping.remove(QLatin1String(key));
+    olderJson[QStringLiteral("solveMapping")] = olderMapping;
+    freshCamera.fromJson(olderJson);
+    const bool rangeOlder = nullRangeIs(1.0, 10.0 + 1.0/24.0)
+        && freshCamera.toJson() == olderJson;
+    freshCamera.fromJson(beforeThinned);
+    (fresh.*member(Sync{}))();
+    std::fprintf(stderr, "G7 pick=%lld crosses=%lld oneNull=%d fieldErr=%.6f hidden=%d diagonals=%d maxProjErr=%.4f startErr=%.6f durationErr=%.6f undone=%d rangeSolved=%d rangeReloaded=%d rangeUndone=%d rangeStored=%d rangeOlder=%d\n",
+        static_cast<long long>(pick), static_cast<long long>(crosses.size()), oneNull, fieldErr, hidden,
+        diagonalsCross, maxProjErr, startErr, durationErr, undoneNull,
+        rangeSolved, rangeReloaded, rangeUndone, rangeStored, rangeOlder);
+    tally.gate(7, oneNull && fieldErr >= 0 && fieldErr < 1e-3 && hidden && diagonalsCross
+               && maxProjErr <= 0.5 && startErr < 1e-6 && durationErr < 1e-6 && undoneNull
+               && rangeSolved && rangeReloaded && rangeUndone && rangeStored && rangeOlder);
+
+    // G8 range: one axis at a time past 10000 is refused with a status; just inside is created.
+    // S and F come from the mapping, so these solver points land on the wanted world values.
+    const double nullS = freshCamera.solveMapping()->unitScalePx;
+    const double nullF = freshCamera.solveMapping()->focalPx;
+    freshCamera.setSolvePoints({QVector3D(float(10001/nullS), 0, 0), QVector3D(0, float(-10001/nullS), 0),
+                                QVector3D(0, 0, float((10001 + nullF)/nullS)),
+                                QVector3D(float(9999/nullS), 0, 0)});
+    (fresh.*member(Sync{}))();
+    const QString refusedStatus = QStringLiteral("解析点の座標が範囲外（±10000）のため、ヌルオブジェクトを作成できませんでした");
+    bool refused = true;
+    for (int i = 0; i < 3; ++i) {
+        fresh.statusBar()->clearMessage();
+        refused = refused && !(fresh.*member(CreateNull{}))(i)
+            && fresh.statusBar()->currentMessage() == refusedStatus;
+    }
+    const bool noneMade = int(timeline->videoTracks().size()) == tracksBefore
+        && timeline->undoManager()->currentIndex() == undoBefore;
+    const bool insideMade = (fresh.*member(CreateNull{}))(3)
+        && int(timeline->videoTracks().size()) == tracksBefore + 1
+        && fresh.statusBar()->currentMessage() != refusedStatus;
+    (fresh.*member(Undo{}))();
+
+    // G8 distance: a 2:1 image in a 320x240 widget is 320x160 at y = 40, so canvas (150, 75) of
+    // 200x100 is widget (240, 160) at 1.6 widget px per canvas px. 8 widget px is 5 canvas px:
+    // 9 widget px away is refused even though it is under 8 canvas px, and the letterbox bar
+    // offset must be applied for the first click to hit at all.
+    GLPreview clickView;
+    clickView.resize(320, 240);
+    clickView.setDisplayAspectRatio(2.0);
+    clickView.setSolvePointOverlay({QPointF(150, 75), QPointF(20, 20)}, QSize(200, 100), {5, 9});
+    QVector<int> clicked;
+    QObject::connect(&clickView, &GLPreview::solvePointClicked, &clickView,
+        [&](int index) { clicked.append(index); });
+    clickAt(&clickView, QPointF(240, 160));   // on the cross
+    clickAt(&clickView, QPointF(248, 160));   // exactly 8 px right
+    clickAt(&clickView, QPointF(249, 160));   // 9 px right
+    clickAt(&clickView, QPointF(240, 169));   // 9 px down
+    clickAt(&clickView, QPointF(32, 72));     // on the second cross: (20*1.6, 20*1.6 + 40)
+    const bool distanceOk = clicked == QVector<int>{5, 5, 9};
+    // The nearer of two crosses inside the radius wins, and an off overlay clicks nothing.
+    clickView.setSolvePointOverlay({QPointF(150, 75), QPointF(155, 75)}, QSize(200, 100));
+    clicked.clear();
+    clickAt(&clickView, QPointF(246, 160));   // 6 px from the first, 2 from the second
+    const bool nearestOk = clicked == QVector<int>{1};
+    // Canvas (150, -10) maps to widget (240, 24) on the bar, past the 4 px arm: it is not drawn,
+    // so a click exactly on it picks nothing. (150, -2) at y = 36.8 still shows its lower arm.
+    clickView.setSolvePointOverlay({QPointF(150, -10)}, QSize(200, 100));
+    clicked.clear();
+    clickAt(&clickView, QPointF(240, 24));
+    const bool offBoxOk = clicked.isEmpty();
+    clickView.setSolvePointOverlay({QPointF(150, -2)}, QSize(200, 100));
+    clickAt(&clickView, QPointF(240, 36.8));
+    const bool armInBoxOk = clicked == QVector<int>{0};
+    clickView.setSolvePointOverlay({}, {});
+    clicked.clear();
+    clickAt(&clickView, QPointF(240, 160));
+    const bool offOk = clicked.isEmpty();
+    if (toggleOk) toggle->setChecked(false);
+    std::fprintf(stderr, "G8 refused=%d noneMade=%d insideMade=%d distance=%d nearest=%d offBox=%d armInBox=%d off=%d\n",
+        refused, noneMade, insideMade, distanceOk, nearestOk, offBoxOk, armInBoxOk, offOk);
+    tally.gate(8, refused && noneMade && insideMade && distanceOk && nearestOk && offBoxOk && armInBoxOk && offOk);
 
     // The crosses reach the screen at the letterboxed position: a 2:1 image in a 320x240 widget
     // is 320x160 at y = 40, so canvas (150, 75) of 200x100 is widget (240, 160). A point above

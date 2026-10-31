@@ -349,6 +349,9 @@ bool applySolvedPosesToCamera(Camera3D& camera, const CameraSolveApplied& applie
     SolveMapping mapping = applied.mapping;
     mapping.referenceIndex = ref;
     mapping.legacy = false;
+    mapping.startSec = applied.startSec;
+    mapping.sampleCount = int(applied.poses.size());
+    mapping.fps = applied.fps;
     auto base = camera.camera();
     base.trueProjection = true;
     base.fov = f;
