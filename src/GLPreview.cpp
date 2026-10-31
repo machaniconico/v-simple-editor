@@ -1326,6 +1326,15 @@ void GLPreview::setBrushAnimationProgress(double progress)
     update();
 }
 
+void GLPreview::setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas)
+{
+    if (m_solvePointOverlay == points && m_solvePointOverlayCanvas == canvas)
+        return;
+    m_solvePointOverlay = points;
+    m_solvePointOverlayCanvas = canvas;
+    update();
+}
+
 GLPreview::~GLPreview()
 {
     // ~QOpenGLWidget (which runs AFTER this body and after our members are gone)
@@ -2858,6 +2867,25 @@ void GLPreview::paintGL()
                 vpainter.drawRect(QRectF(p.x() - size / 2.0, p.y() - size / 2.0, size, size));
             }
         }
+    }
+
+    // US-1817: solved point cloud, canvas px mapped onto the displayed image area.
+    if (!m_solvePointOverlay.isEmpty() && !m_solvePointOverlayCanvas.isEmpty()) {
+        const QRectF box = letterboxRect();
+        const double scaleX = box.width() / m_solvePointOverlayCanvas.width();
+        const double scaleY = box.height() / m_solvePointOverlayCanvas.height();
+        const double arm = 4.0;
+        QVector<QLineF> crosses;
+        crosses.reserve(m_solvePointOverlay.size() * 2);
+        for (const QPointF &point : m_solvePointOverlay) {
+            const QPointF p(box.left() + point.x() * scaleX, box.top() + point.y() * scaleY);
+            crosses.append(QLineF(p.x() - arm, p.y(), p.x() + arm, p.y()));
+            crosses.append(QLineF(p.x(), p.y() - arm, p.x(), p.y() + arm));
+        }
+        QPainter opainter(this);
+        opainter.setClipRect(box);
+        opainter.setPen(QPen(QColor(80, 255, 120, 230), 1));
+        opainter.drawLines(crosses);
     }
 
     // US-MOCHA-3: SurfaceTool overlay — 4-corner pin gizmo drawn after all

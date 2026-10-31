@@ -40,6 +40,9 @@ public:
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
+    // US-1817: preview-only crosses at canvas px; painted over the frame, never uploaded.
+    void setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas);
+    int solvePointOverlayCountForTest() const { return m_solvePointOverlay.size(); }
     // US-1708 test seams: the progress the preview draws the brush at, and the
     // image paintGL uploads (cameraBaked ? baked frame : decoded frame, brush drawn).
     double brushAnimationProgressForTest() const { return m_brushAnimationProgress; }
@@ -359,6 +362,8 @@ private:
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
+    QVector<QPointF> m_solvePointOverlay;
+    QSize m_solvePointOverlayCanvas;
     ColorCorrection m_cc;
     int m_colorCorrectionSetCountForTest = 0;
     bool m_frameTextureNearestForTest = false;

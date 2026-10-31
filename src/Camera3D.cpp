@@ -543,6 +543,19 @@ std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3
     return projectViewPoint(core, v);
 }
 
+QVector<QPointF> projectedSolvePoints(const Camera3D &camera, double sec, const QSize &canvas)
+{
+    const Camera3DState state = camera.hasAnimation() ? camera.getCameraAt(sec) : camera.camera();
+    const QVector<QVector3D> world = camera.solvePointsWorldPx();
+    QVector<QPointF> projected;
+    projected.reserve(world.size());
+    for (const QVector3D &point : world) {
+        if (const std::optional<QPointF> px = projectWorldPoint(point, state, canvas))
+            projected.append(*px);
+    }
+    return projected;
+}
+
 } // namespace camera3d
 
 QImage applyProjectCameraProjection(const QImage &image,

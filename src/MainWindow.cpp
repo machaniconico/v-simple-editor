@@ -3517,6 +3517,21 @@ void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
     updateBrushPreviewProgress(static_cast<double>(m_player->timelinePositionUs()) / AV_TIME_BASE);
 }
 
+// US-1817: the single follower of the view toggle, the playhead (player, scrub, seek), the
+// project camera (syncProjectLightingToTimeline) and the canvas (applyProjectConfig).
+void MainWindow::refreshSolvePointOverlay(double timelineSec)
+{
+    if (!m_timeline || !m_player || !m_player->glPreview())
+        return;
+    if (!m_solvePointOverlayAction || !m_solvePointOverlayAction->isChecked()) {
+        m_player->glPreview()->setSolvePointOverlay({}, {});
+        return;
+    }
+    const QSize canvas = m_timeline->projectOutputSize();
+    m_player->glPreview()->setSolvePointOverlay(
+        camera3d::projectedSolvePoints(m_projectCamera, timelineSec, canvas), canvas);
+}
+
 // US-1708: the bound brush's progress follows the playhead: "brush_progress" of its
 // clip at the clip-local time export uses (tlrender::clipLocalSecAt). Only the
 // progress is set; the brush is not rebuilt and the preview repaints only when the
@@ -3853,16 +3868,19 @@ void MainWindow::setupUI()
         }
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         emit playheadSecondsChanged(seconds);
     });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.
@@ -4778,6 +4796,14 @@ void MainWindow::setupMenuBar()
         QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
             .setValue(QStringLiteral("timeline/showFilmstrip"), enabled);
     });
+    m_solvePointOverlayAction = viewMenu->addAction(QStringLiteral("解析点群を表示"));
+    m_solvePointOverlayAction->setObjectName(QStringLiteral("solvePointOverlayAction"));
+    m_solvePointOverlayAction->setCheckable(true);
+    connect(m_solvePointOverlayAction, &QAction::toggled, this, [this]() {
+        refreshSolvePointOverlay(m_timeline->playheadPosition());
+    });
+    m_menuHelpEntries.append({m_solvePointOverlayAction,
+        QStringLiteral("カメラ解析の点群を再生位置のプロジェクトカメラで写し、プレビューに十字で重ねます。書き出しには焼き込まれません。")});
     m_zoomToFitSequenceAction = viewMenu->addAction(QStringLiteral("シーケンス全体を表示"));
     connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
         m_timeline->zoomToFitSequence();
@@ -8459,6 +8485,8 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     if (m_timeline)
         m_timeline->setProjectOutputConfig(config.width, config.height,
                                            config.explicitOutputResolution, config.fps);
+    if (m_timeline)
+        refreshSolvePointOverlay(m_timeline->playheadPosition());
     applyTimecodeBurnInSettings(m_tcBurnIn);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
@@ -8474,6 +8502,7 @@ void MainWindow::syncProjectLightingToTimeline()
     m_timeline->setProjectCamera(m_projectCamera);
     if (m_player && m_player->glPreview())
         m_player->glPreview()->setProjectCamera(m_projectCamera);
+    refreshSolvePointOverlay(m_timeline->playheadPosition());
 }
 
 QString MainWindow::particleClipKey(const ClipInfo &clip)

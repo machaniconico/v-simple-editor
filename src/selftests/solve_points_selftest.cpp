@@ -1,16 +1,22 @@
 #include "../BundleAdjustment.h"
 #include "../Camera3D.h"
+#include "../GLPreview.h"
 #include "../MainWindow.h"
 #include "../PlanarTrackerDialog.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
 #include "SelftestGate.h"
 
+#include <QAction>
+#include <QApplication>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QOpenGLContext>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 
 namespace {
@@ -24,6 +30,9 @@ template<class Tag, typename Tag::Type Member> struct Access {
 ACCESS(Apply, void (MainWindow::*)(const camsolve::CameraSolveApplied&), &MainWindow::applyCameraSolve)
 ACCESS(Undo, void (MainWindow::*)(), &MainWindow::undoAction)
 ACCESS(Camera, Camera3D MainWindow::*, &MainWindow::m_projectCamera)
+ACCESS(Sync, void (MainWindow::*)(), &MainWindow::syncProjectLightingToTimeline)
+ACCESS(TimelineOf, Timeline *MainWindow::*, &MainWindow::m_timeline)
+ACCESS(PlayerOf, VideoPlayer *MainWindow::*, &MainWindow::m_player)
 #undef ACCESS
 
 // Noise-free, nonplanar 64-point / 10-frame scene with a nonuniform camera arc.
@@ -197,5 +206,163 @@ int runSolvePointsSelftest()
         undoneNonEmpty, undone, freshChanged, freshRestored, reloadCleared);
     tally.gate(2, undoneNonEmpty && undone && freshChanged && freshRestored && reloadCleared);
     tally.gate(3, directReplaced && planarEmpty && replaced);
+
+    // The overlay gates use the first solve: t1 is its reference pose, t2 its last pose.
+    (fresh.*member(Apply{}))(firstEmitted);
+    Timeline *timeline = fresh.*member(TimelineOf{});
+    VideoPlayer *player = fresh.*member(PlayerOf{});
+    const QSize canvas = timeline->projectOutputSize();
+    const double t1 = 5.0, t2 = 5.0 + 9.0/24.0;
+    const QVector<QVector3D> cloudPoints = freshCamera.solvePoints();
+
+    // G4: each point is projectWorldPoint(w(p), projectCameraAt(t)); one behind the pinhole is left out.
+    auto withBehind = cloudPoints;
+    withBehind.append(QVector3D(0, 0, -3));
+    freshCamera.setSolvePoints(withBehind);
+    (fresh.*member(Sync{}))();
+    const auto worldPoints = freshCamera.solvePointsWorldPx();
+    const auto projectedAt = [&](double sec) {
+        return camera3d::projectedSolvePoints(freshCamera, sec, canvas);
+    };
+    const auto matchesProjection = [&](double sec, const QVector<QPointF>& got) {
+        const Camera3DState state = timeline->projectCameraAt(sec);
+        QVector<QPointF> expected;
+        for (const QVector3D& w : worldPoints)
+            if (const auto px = camera3d::projectWorldPoint(w, state, canvas)) expected.append(*px);
+        bool same = !expected.isEmpty() && got.size() == expected.size();
+        for (qsizetype i = 0; same && i < got.size(); ++i)
+            same = QLineF(got[i], expected[i]).length() < 1e-6;
+        return same;
+    };
+    const auto atT1 = projectedAt(t1), atT2 = projectedAt(t2);
+    const bool g4Match = matchesProjection(t1, atT1) && matchesProjection(t2, atT2);
+    const Camera3DState stateT1 = timeline->projectCameraAt(t1);
+    const bool behindOut = worldPoints.size() == withBehind.size()
+        && !camera3d::projectWorldPoint(worldPoints.last(), stateT1, canvas)
+        && atT1.size() == cloudPoints.size();
+    // The animated camera is read at the asked time, not at its static state.
+    double moved = 0;
+    for (qsizetype i = 0; i < std::min(atT1.size(), atT2.size()); ++i)
+        moved = std::max(moved, QLineF(atT1[i], atT2[i]).length());
+    std::fprintf(stderr, "G4 cloud=%lld withBehind=%lld atT1=%lld atT2=%lld match=%d behindOut=%d moved=%.3f\n",
+        static_cast<long long>(cloudPoints.size()), static_cast<long long>(withBehind.size()),
+        static_cast<long long>(atT1.size()), static_cast<long long>(atT2.size()), g4Match, behindOut, moved);
+    tally.gate(4, g4Match && behindOut && moved > 1.0);
+
+    // G5: same CV (x, y) at z = 2 and 4 from the reference pose; the farther lands nearer the centre.
+    // Hand-written pinhole: canvas centre + F*(x/z, y/z) (analysis size == mapping canvas size).
+    Camera3D depthPair = freshCamera;
+    const QPointF cv(0.2, 0.1);
+    depthPair.setSolvePoints({QVector3D(float(cv.x()), float(cv.y()), 2), QVector3D(float(cv.x()), float(cv.y()), 4)});
+    const auto pair = camera3d::projectedSolvePoints(depthPair, t1, canvas);
+    const QPointF centre(canvas.width()/2.0, canvas.height()/2.0);
+    const double focal = freshCamera.solveMapping() ? freshCamera.solveMapping()->focalPx : 0.0;
+    const bool pairOk = pair.size() == 2 && focal > 0;
+    const double nearDist = pairOk ? QLineF(centre, pair[0]).length() : 0.0;
+    const double farDist = pairOk ? QLineF(centre, pair[1]).length() : 0.0;
+    const double nearErr = pairOk ? QLineF(pair[0], centre + cv*focal/2.0).length() : -1.0;
+    const double farErr = pairOk ? QLineF(pair[1], centre + cv*focal/4.0).length() : -1.0;
+    std::fprintf(stderr, "G5 points=%lld focal=%.3f nearDist=%.3f farDist=%.3f nearErr=%.4f farErr=%.4f\n",
+        static_cast<long long>(pair.size()), focal, nearDist, farDist, nearErr, farErr);
+    tally.gate(5, pairOk && farDist > 0 && farDist < nearDist && nearErr < 1.0 && farErr < 1.0);
+
+    // G6: the view toggle drives the overlay and it follows the playhead and the camera; the
+    // upload frame stays byte-identical. A point in front at t1 and behind at t2 makes the
+    // count show which time was projected.
+    freshCamera.setSolvePoints(cloudPoints);
+    (fresh.*member(Sync{}))();
+    GLPreview *preview = player->glPreview();
+    QImage frame(64, 36, QImage::Format_RGB32);
+    for (int y = 0; y < frame.height(); ++y)
+        for (int x = 0; x < frame.width(); ++x)
+            frame.setPixel(x, y, qRgb(4*x, 7*y, x+y));
+    preview->displayFrame(frame);
+    const QImage uploadOff = preview->uploadFrameForTest();
+    timeline->setPlayheadPosition(t1);
+    auto *toggle = fresh.findChild<QAction *>(QStringLiteral("solvePointOverlayAction"));
+    const bool toggleOk = toggle && toggle->isCheckable() && !toggle->isChecked()
+        && toggle->text() == QStringLiteral("解析点群を表示");
+    const int countDefault = preview->solvePointOverlayCountForTest();
+    if (toggleOk) toggle->setChecked(true);
+    const int countOn = preview->solvePointOverlayCountForTest();
+    const QImage uploadOn = preview->uploadFrameForTest();
+    const bool uploadSame = !uploadOff.isNull() && uploadOff.format() == uploadOn.format()
+        && uploadOff.size() == uploadOn.size() && uploadOff.sizeInBytes() == uploadOn.sizeInBytes()
+        && std::memcmp(uploadOff.constBits(), uploadOn.constBits(), size_t(uploadOff.sizeInBytes())) == 0
+        && uploadOff.pixel(10, 10) != uploadOff.pixel(50, 30);
+
+    QVector3D frontThenBehind;
+    bool flipFound = false;
+    for (int x = -400; !flipFound && x <= 400; ++x) {
+        Camera3D probe = freshCamera;
+        const QVector3D candidate(x*0.05f, 0, 0.5f);
+        probe.setSolvePoints({candidate});
+        flipFound = camera3d::projectedSolvePoints(probe, t1, canvas).size() == 1
+            && camera3d::projectedSolvePoints(probe, t2, canvas).isEmpty();
+        if (flipFound) frontThenBehind = candidate;
+    }
+    auto withFlip = cloudPoints;
+    withFlip.append(frontThenBehind);
+    freshCamera.setSolvePoints(withFlip);
+    (fresh.*member(Sync{}))();
+    const int atSyncT1 = preview->solvePointOverlayCountForTest();
+    const int expectT1 = int(projectedAt(t1).size()), expectT2 = int(projectedAt(t2).size());
+    emit timeline->positionChanged(t2);
+    const int afterSeek = preview->solvePointOverlayCountForTest();
+    emit timeline->scrubPositionChanged(t1);
+    const int afterScrub = preview->solvePointOverlayCountForTest();
+    emit player->positionChanged(t2);
+    const int afterPlayer = preview->solvePointOverlayCountForTest();
+    const bool follows = flipFound && expectT1 == expectT2 + 1 && atSyncT1 == expectT1
+        && afterSeek == expectT2 && afterScrub == expectT1 && afterPlayer == expectT2;
+
+    // A planar solve clears the cloud and its undo brings it back, both through the camera sync.
+    timeline->setPlayheadPosition(t1);
+    (fresh.*member(Apply{}))(planar);
+    const int afterPlanar = preview->solvePointOverlayCountForTest();
+    (fresh.*member(Undo{}))();
+    const int afterUndo = preview->solvePointOverlayCountForTest();
+    if (toggleOk) toggle->setChecked(false);
+    const int countOff = preview->solvePointOverlayCountForTest();
+    std::fprintf(stderr, "G6 toggle=%d default=%d on=%d solvePoints=%lld off=%d uploadSame=%d flip=%d sync=%d seek=%d scrub=%d player=%d expectT1=%d expectT2=%d planar=%d undo=%d\n",
+        toggleOk, countDefault, countOn, static_cast<long long>(cloudPoints.size()), countOff, uploadSame,
+        flipFound, atSyncT1, afterSeek, afterScrub, afterPlayer, expectT1, expectT2, afterPlanar, afterUndo);
+    const bool overlayLogic = toggleOk && countDefault == 0 && !cloudPoints.isEmpty()
+        && countOn == int(cloudPoints.size()) && countOff == 0 && uploadSame && follows
+        && afterPlanar == 0 && afterUndo == expectT1;
+
+    // The crosses reach the screen at the letterboxed position: a 2:1 image in a 320x240 widget
+    // is 320x160 at y = 40, so canvas (150, 75) of 200x100 is widget (240, 160). A point above
+    // the canvas lands on the bar and is clipped.
+    GLPreview view;
+    view.setFixedSize(320, 240);
+    view.setDisplayAspectRatio(2.0);
+    view.displayFrame(frame);
+    view.show();
+    bool glOk = false;
+    QImage plainGrab;
+    for (int i = 0; i < 8 && !glOk; ++i) {
+        QApplication::processEvents(QEventLoop::AllEvents, 25);
+        plainGrab = view.grabFramebuffer();
+        glOk = view.context() && view.context()->isValid() && !plainGrab.isNull();
+    }
+    if (!glOk) {
+        if (overlayLogic) tally.skip(6, "no usable QOpenGLWidget context");
+        else tally.gate(6, false);
+        return tally.finish();
+    }
+    view.setSolvePointOverlay({QPointF(150, 75), QPointF(150, -10)}, QSize(200, 100));
+    const QImage crossGrab = view.grabFramebuffer().convertToFormat(plainGrab.format());
+    const double dpr = plainGrab.width() / 320.0;
+    QRect changed;
+    for (int y = 0; y < crossGrab.height(); ++y)
+        for (int x = 0; x < crossGrab.width(); ++x)
+            if (crossGrab.pixel(x, y) != plainGrab.pixel(x, y)) changed |= QRect(x, y, 1, 1);
+    const bool painted = !changed.isEmpty()
+        && std::abs(changed.center().x() - 240*dpr) <= 2*dpr && std::abs(changed.center().y() - 160*dpr) <= 2*dpr
+        && changed.width() <= 12*dpr && changed.height() <= 12*dpr;
+    std::fprintf(stderr, "G6 changed=(%d,%d %dx%d) dpr=%.2f painted=%d\n",
+        changed.x(), changed.y(), changed.width(), changed.height(), dpr, painted);
+    tally.gate(6, overlayLogic && painted);
     return tally.finish();
 }

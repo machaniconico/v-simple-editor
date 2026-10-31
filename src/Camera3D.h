@@ -215,6 +215,9 @@ Layer3DTransform layer3DForPreviewScale(const Layer3DTransform &layer3D, const Q
 // projectLayerQuad projection; nullopt when fov + view z <= 1e-3 (at / behind the pinhole).
 std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
                                          const QSize &canvas);
+// US-1817: canvas px of the camera's solve point cloud at sec; points at / behind the pinhole
+// are left out, so the result can be shorter than solvePoints().
+QVector<QPointF> projectedSolvePoints(const Camera3D &camera, double sec, const QSize &canvas);
 } // namespace camera3d
 
 // Shared opt-in compositing step for preview and export.
