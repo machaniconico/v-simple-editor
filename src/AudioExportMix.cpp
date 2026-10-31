@@ -35,6 +35,29 @@ namespace {
 std::atomic<int> s_buildMixPlanGuiThreadCalls{0};
 std::atomic<int> s_buildMixPlanOtherThreadCalls{0};
 
+// The envelope merge every ducking apply used before Wave 18 (f924c62's
+// sortedDedupedEnvelope): points within 1 ms collapse to the minimum gain.
+QVector<AudioGainPoint> duckingMergedEnvelope(QVector<AudioGainPoint> env)
+{
+    std::sort(env.begin(), env.end(),
+              [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                  return a.time < b.time;
+              });
+    QVector<AudioGainPoint> out;
+    out.reserve(env.size());
+    for (const AudioGainPoint &point : env) {
+        AudioGainPoint p;
+        p.time = qMax(0.0, point.time);
+        p.gain = qBound(0.0, point.gain, 2.0);
+        if (!out.isEmpty() && std::abs(out.last().time - p.time) <= 0.001) {
+            out.last().gain = qMin(out.last().gain, p.gain);
+        } else {
+            out.append(p);
+        }
+    }
+    return out;
+}
+
 QString volumeExpressionForEntry(const PlaybackEntry &entry)
 {
     QVector<AudioGainPoint> env = audioexport::sortedDedupedEnvelope(entry.volumeEnvelope);
@@ -133,6 +156,26 @@ QVector<AudioGainPoint> audioexport::sortedDedupedEnvelope(QVector<AudioGainPoin
             out.append(p);
     }
     return out;
+}
+
+QVector<AudioGainPoint> audioexport::mergeDuckingEnvelope(const QVector<AudioGainPoint> &existing,
+                                                          const QVector<AudioGainPoint> &ducking,
+                                                          double fallbackGain)
+{
+    if (ducking.isEmpty())
+        return existing;
+    if (existing.isEmpty())
+        return ducking;
+
+    QVector<AudioGainPoint> merged = existing;
+    merged.reserve(existing.size() + ducking.size());
+    for (const AudioGainPoint &point : ducking) {
+        const double existingGain = audio::evaluateVolumeEnvelope(existing,
+                                                                  point.time,
+                                                                  fallbackGain);
+        merged.append({point.time, qMin(existingGain, point.gain)});
+    }
+    return duckingMergedEnvelope(merged);
 }
 
 QString audioexport::nextExportAudioMixPath()

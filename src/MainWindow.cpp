@@ -571,30 +571,7 @@ double dbToLinear(double db)
     return std::pow(10.0, db / 20.0);
 }
 
-double evaluateAudioGainAt(const QVector<AudioGainPoint> &env,
-                           double timeSeconds,
-                           double fallbackGain)
-{
-    if (env.isEmpty())
-        return fallbackGain;
-    if (timeSeconds <= env.first().time)
-        return env.first().gain;
-    if (timeSeconds >= env.last().time)
-        return env.last().gain;
-    for (int i = 0; i + 1 < env.size(); ++i) {
-        const double aT = env[i].time;
-        const double bT = env[i + 1].time;
-        if (timeSeconds >= aT && timeSeconds <= bT) {
-            const double span = bT - aT;
-            if (span <= 0.0)
-                return env[i + 1].gain;
-            const double u = (timeSeconds - aT) / span;
-            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
-        }
-    }
-    return fallbackGain;
-}
-
+using audioexport::mergeDuckingEnvelope;
 using audioexport::sortedDedupedEnvelope;
 
 bool envelopesNearlyEqual(const QVector<AudioGainPoint> &a,
@@ -698,26 +675,6 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
     if (!hasDucking)
         env.clear();
     return sortedDedupedEnvelope(env);
-}
-
-QVector<AudioGainPoint> mergeDuckingEnvelope(const QVector<AudioGainPoint> &existing,
-                                             const QVector<AudioGainPoint> &ducking,
-                                             double fallbackGain)
-{
-    if (ducking.isEmpty())
-        return existing;
-    if (existing.isEmpty())
-        return ducking;
-
-    QVector<AudioGainPoint> merged = existing;
-    merged.reserve(existing.size() + ducking.size());
-    for (const AudioGainPoint &point : ducking) {
-        const double existingGain = evaluateAudioGainAt(existing,
-                                                        point.time,
-                                                        fallbackGain);
-        merged.append({point.time, qMin(existingGain, point.gain)});
-    }
-    return sortedDedupedEnvelope(merged);
 }
 
 bool applyDuckingToTimeline(Timeline *timeline,
