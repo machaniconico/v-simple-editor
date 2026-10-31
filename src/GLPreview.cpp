@@ -1220,10 +1220,20 @@ void GLPreview::setBrushAnimation(BrushAnimation *animation)
 // US-1708: the image paintGL uploads before motion / projection: the baked
 // project-camera frame or the decoded frame, with the bound brush drawn on the
 // decoded frame (never on the baked frame, which already holds every track).
+// US-1805: nor on a special composite shown while paused on a timeline that
+// tlrender::timelineBrushWantsSpecialPath routes through it, which already holds
+// every clip's brush. Other composite-baked frames (the player's multi-track
+// compositor, playback, a helper-true timeline's fallback to the ordinary frame)
+// keep the selected-clip brush.
 QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
 {
     QImage frame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
-    if (m_brushAnimation && !cameraBaked) {
+    const VideoPlayer *player = ownerPlayer();
+    const bool specialCompositeHoldsBrush = m_compositeBakedMode
+        && !(player && player->isPlaying())
+        && tlrender::timelineBrushWantsSpecialPath(m_timeline)
+        && property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
+    if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush) {
         OverlayRenderer::renderBrushOverlay(frame,
                                             m_brushAnimation,
                                             m_brushAnimationProgress);
@@ -1231,9 +1241,17 @@ QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
     return frame;
 }
 
+// US-1805: cameraBaked with paintGL's expression (the project camera at the
+// player's time must be trueProjection, not just a baked frame left over).
 QImage GLPreview::uploadFrameForTest() const
 {
-    return brushedUploadFrame(m_timeline && !m_projectCameraFrame.isNull());
+    const double cameraSec = resolveCameraSeconds();
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
+    return brushedUploadFrame(cameraBaked);
 }
 
 // US-1813: the rotation / 3D projection paintGL applies to the upload when it is not

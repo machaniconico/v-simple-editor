@@ -161,6 +161,37 @@ bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
 // Number of clip layer sources built so far (V1, upper layers, transition
 // neighbours, renderClipSourceAt), for tests.
 quint64 clipLayerSourceCallsForTest();
+// US-1805: the clip's brush strokes at `localSec` (clip-local seconds) drawn on
+// its roto'd raw source, the layer-source brush stage (after roto, before VFX /
+// grade). `clipId` is the render key (renderClipId == MainWindow::brushClipId)
+// and keys the shared BrushAnimation cache. No strokes or progress 0 return
+// `raw` unchanged.
+QImage applyClipBrushSource(const QImage &raw, const ClipInfo &clip, double localSec,
+                            const QString &clipId);
+// US-1805: true when some video clip carries brushData and no video clip has a
+// non-Normal blend, is an adjustment clip or has a clip mask (nor is a shape,
+// nested-sequence or disabled clip, which that composite does not draw, nor has a
+// keyframe track other than brush_progress, fitContain / fitCover, a layer
+// style or a lead-in / trail-out transition, which it places statically or
+// skips, and the timeline has no clip parenting while parenting is enabled).
+// Such a timeline
+// is previewed (paused) through MainWindow's special composite, which draws
+// every clip's brush; any other timeline keeps the GL's selected-clip brush.
+bool timelineBrushWantsSpecialPath(const Timeline *timeline);
+// US-1805: one source frame by renderFrameAt's rule: the first frame at or after
+// `sourceSec`, or with `usePreviousSourceFrame` (a reversed source position) the
+// last frame before it, not before `sourceInSec`. Null on any failure.
+QImage decodeClipSourceFrame(const QString &filePath, double sourceSec,
+                             bool usePreviousSourceFrame, double sourceInSec);
+// Dynamic bool property on the GLPreview: the frame on screen is a special
+// composite, which already holds every clip's brush. MainWindow sets it with each
+// paused display; a helper-true timeline can also show the ordinary frame.
+inline constexpr char kSpecialCompositeHoldsBrushProperty[] = "veditorSpecialCompositeHoldsBrush";
+// The clip on one track active at `targetSec` ([start, end), leadInSec walk),
+// or -1; `clampToFirst` maps a request at/before t=0 onto clip 0 as
+// renderFrameAt does for V1. `*clipTimelineStart` receives the clip's start.
+int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
+                      bool clampToFirst, double *clipTimelineStart);
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize);
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,

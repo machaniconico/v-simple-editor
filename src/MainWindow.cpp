@@ -382,6 +382,13 @@ extern "C" {
 }
 
 // Shared by the file menu and import hub; no persistent widget state needed.
+// US-1805: whether the frame presented next is a special composite. The GL
+// leaves the bound brush off only then (tlrender::kSpecialCompositeHoldsBrushProperty).
+static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
+{
+    player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
+}
+
 static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
 {
     if (!timeline || path.isEmpty()) return;
@@ -3200,6 +3207,7 @@ void MainWindow::applyStillCompareConfig()
         return;
     const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
     if (!special.isNull()) {
+        setSpecialCompositeHoldsBrush(m_player, true);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -4040,7 +4048,11 @@ void MainWindow::setupUI()
         const double sec = m_player->hasActiveSequence()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
-        return buildSpecialClipComposite(sec);
+        const QImage special = buildSpecialClipComposite(sec);
+        // US-1805: every paused displayFrame passes here, so an ordinary frame
+        // (a null composite) clears the mark a previous composite left.
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull());
+        return special;
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -4747,6 +4759,15 @@ void MainWindow::setupMenuBar()
     connect(m_timeline, &Timeline::skimPreviewRequested, m_player, &VideoPlayer::showTimelineSkim);
     connect(m_timeline, &Timeline::skimPreviewCleared, m_player, &VideoPlayer::clearTimelineSkim);
     connect(m_player, &VideoPlayer::stateChanged, m_timeline, &Timeline::setSkimmingPlaybackActive);
+    // US-1805: pausing a brushed timeline re-enters the special composite, which
+    // the GL relies on to show every clip's brush (no other pause path refreshes).
+    // Playback frames replace the composite without passing the provider.
+    connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
+        if (playing)
+            setSpecialCompositeHoldsBrush(m_player, false);
+        else if (tlrender::timelineBrushWantsSpecialPath(m_timeline))
+            refreshSpecialClipPreview();
+    });
     auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
     filmstripAction->setCheckable(true);
     filmstripAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),
@@ -8570,6 +8591,25 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
+    // US-1805: a brushed timeline without blend / adjustment / clip mask takes
+    // this path (paused) and every clip's brush is drawn here; other timelines
+    // keep the GL's selected-clip brush on top (tlrender::timelineBrushWantsSpecialPath).
+    // Playback keeps the selected-clip brush only (decision B6).
+    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline)
+        && !(m_player && m_player->isPlaying());
+    // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
+    // non-empty V1 with none draws nothing there, so the preview falls back too.
+    int v1ExportIdx = -1;
+    if (brushWantsSpecialPath) {
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        if (v1 && !v1->isHidden() && !v1->clips().isEmpty()) {
+            double v1Start = 0.0;
+            v1ExportIdx = tlrender::activeClipOnTrack(
+                v1->clips(), timelineSeconds, /*clampToFirst=*/true, &v1Start);
+            if (v1ExportIdx < 0)
+                return {};
+        }
+    }
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
         const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
         if (!track || track->isHidden())
@@ -8577,6 +8617,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
         const auto &clips = track->clips();
         double cursor = 0.0;
+        bool trackHasExportClip = false;
         for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
             const ClipInfo &clip = clips[clipIdx];
             cursor += qMax(0.0, clip.leadInSec);
@@ -8584,7 +8625,17 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             const double clipEnd = clipStart + clip.effectiveDuration();
             cursor = clipEnd;
 
-            if (timelineSeconds + 1.0 / 120.0 < clipStart
+            if (brushWantsSpecialPath) {
+                // Export's [start, end) interval, at most one clip per track
+                // (activeClipOnTrack), so a cut matches renderFrameAt.
+                if (trackHasExportClip)
+                    break;
+                if (trackIdx == 0 && v1ExportIdx >= 0
+                        ? clipIdx != v1ExportIdx
+                        : (timelineSeconds < clipStart || timelineSeconds >= clipEnd))
+                    continue;
+                trackHasExportClip = true;
+            } else if (timelineSeconds + 1.0 / 120.0 < clipStart
                 || timelineSeconds > clipEnd + 1.0 / 120.0) {
                 continue;
             }
@@ -8596,6 +8647,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || clip.hasTimeRemap()
                 || trackMatteEntries.contains(clipId)
                 || !clip.text3DConfig.isEmpty()
+                || (!clip.brushData.isEmpty() && brushWantsSpecialPath)
                 || (lightingEnabled && clip.material.acceptsLights);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
@@ -8684,9 +8736,21 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     sourceTime = qMax(clip.inPoint,
                                       sourceTime - 1.0 / fps);
                 }
-                fxSourceSeconds = sourceTime;
+                // US-1805: the brush path anchors echo samples on export's
+                // unshifted source time.
+                fxSourceSeconds = brushWantsSpecialPath
+                    ? clip.sourceSecondAtLocalTime(localSeconds)
+                    : sourceTime;
                 sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
-                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+                // US-1805: the brush path picks export's source frame
+                // (renderClipSourceFrame), the rest keep grabFrameAt.
+                frame = brushWantsSpecialPath
+                    ? tlrender::decodeClipSourceFrame(
+                          ProxyManager::instance().getProxyPath(clip.filePath),
+                          clip.sourceSecondAtLocalTime(localSeconds),
+                          clip.sourceTimeRunsBackwardAtLocalTime(localSeconds),
+                          clip.inPoint)
+                    : decodeClipFrameAtSourceTime(clip, sourceTime);
             } else {
                 // Preserve the legacy special-compositor mapping exactly for
                 // every existing project where reverse remains OFF.
@@ -8698,12 +8762,27 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     clipOut);
                 fxSourceSeconds = sourceTime;
                 sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
-                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+                // US-1805: the brush path picks export's source frame (the first
+                // at or after sourceTime), the rest keep grabFrameAt.
+                frame = brushWantsSpecialPath
+                    ? tlrender::decodeClipSourceFrame(
+                          ProxyManager::instance().getProxyPath(clip.filePath),
+                          sourceTime, /*usePreviousSourceFrame=*/false, clip.inPoint)
+                    : decodeClipFrameAtSourceTime(clip, sourceTime);
             }
 
-            if (frame.isNull())
+            if (frame.isNull()) {
+                // US-1805: renderFrameAt draws nothing without V1's source, so
+                // the preview falls back too instead of compositing the rest.
+                if (brushWantsSpecialPath && trackIdx == 0)
+                    return {};
                 continue;
+            }
             frame = applyStoredRotoData(clipId, frame, sourceFrameIndex);
+            // US-1805: the brush on the roto'd raw, before the FX stage (rule
+            // (78), renderClipLayerSource's order and cache key).
+            if (brushWantsSpecialPath)
+                frame = tlrender::applyClipBrushSource(frame, clip, localSeconds, clipId);
 
             // US-708: run the same native FX stage as export (VFX footage
             // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
@@ -8716,9 +8795,17 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip](double sampleSourceSec, double sampleLocalSec) -> QImage {
-                        const QImage sampleRaw =
-                            decodeClipFrameAtSourceTime(clip, sampleSourceSec);
+                    [this, clip, brushWantsSpecialPath](
+                        double sampleSourceSec, double sampleLocalSec) -> QImage {
+                        // US-1805: the brush path samples export's source frame
+                        // (renderClipSourceFrame), the rest keep grabFrameAt.
+                        const QImage sampleRaw = brushWantsSpecialPath
+                            ? tlrender::decodeClipSourceFrame(
+                                  ProxyManager::instance().getProxyPath(clip.filePath),
+                                  sampleSourceSec,
+                                  clip.sourceTimeRunsBackwardAtLocalTime(sampleLocalSec),
+                                  clip.inPoint)
+                            : decodeClipFrameAtSourceTime(clip, sampleSourceSec);
                         if (sampleRaw.isNull())
                             return QImage();
                         return tlrender::prepareClipSourceForEcho(
@@ -8908,9 +8995,11 @@ void MainWindow::refreshSpecialClipPreview()
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_timeline->trackMatteEntries().isEmpty() && !timelineHasClipText3D(m_timeline)
+        && !(!m_player->isPlaying() && tlrender::timelineBrushWantsSpecialPath(m_timeline))
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
+            setSpecialCompositeHoldsBrush(m_player, false);
             m_player->previewSeek(timelineMs);
             s_refreshingPreview = false;
         }
@@ -8920,9 +9009,13 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
+        // Built while playing, it holds no brush (decision B6).
+        setSpecialCompositeHoldsBrush(m_player, !m_player->isPlaying());
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
+        // US-1805: the mark stays until an ordinary frame replaces the composite
+        // (the provider clears it there); an undecodable clip presents none.
         s_refreshingPreview = true;
         m_player->previewSeek(timelineMs);
         s_refreshingPreview = false;

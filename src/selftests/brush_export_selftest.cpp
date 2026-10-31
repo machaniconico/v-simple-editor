@@ -18,6 +18,8 @@
 #include "SelftestGate.h"
 
 #include <QColor>
+#include <QCoreApplication>
+#include <QDir>
 #include <QFont>
 #include <QImage>
 #include <QJsonObject>
@@ -25,6 +27,7 @@
 #include <QPainter>
 #include <QString>
 #include <QTemporaryDir>
+#include <QTemporaryFile>
 #include <QTest>
 #include <QVector>
 
@@ -234,23 +237,29 @@ struct FullSizeDecodeGuard {
     }
 };
 
-QImage previewUpload(const ClipInfo &clip, double progress, double sec, const QSize &expectedSize,
-                     QSize *decodedSize, bool *glOn)
+// US-1805: `tracks` is the whole timeline (the bound brush is tracks[0][0]'s);
+// `bindTimeline` hands it to the GLPreview as MainWindow does.
+QImage previewUpload(const QVector<QVector<ClipInfo>> &tracks, double progress, double sec,
+                     const QSize &expectedSize, QSize *decodedSize, bool *glOn,
+                     bool bindTimeline, bool *bakedOut = nullptr,
+                     const QHash<QString, QString> &parentEntries = {})
 {
     FullSizeDecodeGuard guard;
     Timeline timeline;
     timeline.setProjectOutputConfig(kW, kH, false, kFps);
-    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{},
-                                0.0, -1.0, -1.0, 100);
+    timeline.restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    timeline.setClipParentEntries(parentEntries);
     timeline.refreshPlaybackSequence();
     VideoPlayer player;
     GLPreview *view = player.glPreview();
     if (glOn) *glOn = player.isGLAccelerated();
     if (!view)
         return QImage();
+    if (bindTimeline)
+        view->setTimeline(&timeline);
     player.setProxyDivisor(1);
     BrushAnimation animation;
-    animation.fromJson(clip.brushData);
+    animation.fromJson(tracks.value(0).value(0).brushData);
     view->setBrushAnimation(&animation);
     view->setBrushAnimationProgress(progress);
     player.setSequence(timeline.computePlaybackSequence());
@@ -268,6 +277,8 @@ QImage previewUpload(const ClipInfo &clip, double progress, double sec, const QS
         previous = upload;
         return ok;
     }, 10000);
+    if (bakedOut) *bakedOut = view->compositeBakedMode();
+    view->setTimeline(nullptr);
     if (!settled) {
         view->clearBrushAnimation();
         return QImage();
@@ -275,6 +286,13 @@ QImage previewUpload(const ClipInfo &clip, double progress, double sec, const QS
     if (decodedSize) *decodedSize = upload.size();
     view->clearBrushAnimation();
     return upload;
+}
+
+QImage previewUpload(const ClipInfo &clip, double progress, double sec, const QSize &expectedSize,
+                     QSize *decodedSize, bool *glOn)
+{
+    return previewUpload(QVector<QVector<ClipInfo>>{{clip}}, progress, sec, expectedSize,
+                         decodedSize, glOn, false);
 }
 
 } // namespace
@@ -759,6 +777,616 @@ int runBrushExportSelftest()
             tally.gate(10, same && brushVisible > 200 && doubleDrawDiff > 0,
                        "the camera-baked preview upload differs from renderFrameAt (brush "
                        "drawn twice or missing)");
+        }
+    }
+
+    // G11-G14 (US-1805): the special-composite preview (MainWindow) of a brushed
+    // timeline. V1 = the movie with brush "P" at dx -0.25, V2 = the movie with
+    // brush "Q" at dx +0.25 (a 160x180 overlap; V1 is frontmost, US-1804, so V2
+    // shows on x 240-320 where its "Q" lies), both at progress 1, paused at t.
+    {
+        MainWindow window;
+        window.hide();
+        Timeline *mainTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+        GLPreview *view = window.m_player ? window.m_player->glPreview() : nullptr;
+        const bool glOn = window.m_player && window.m_player->isGLAccelerated();
+        window.m_projectConfig.width = kW;
+        window.m_projectConfig.height = kH;
+        window.m_projectConfig.fps = kFps;
+        const QJsonObject v1Brush = brushJson(QStringLiteral("P"), QPointF(50.0, 75.0));
+        const QJsonObject v2Brush = brushJson(QStringLiteral("Q"), QPointF(90.0, 85.0));
+        ClipInfo v1Plain = movieClipPlain;
+        v1Plain.videoDx = -0.25;
+        const ClipInfo v1Clip = fullBrush(v1Plain, v1Brush);
+        ClipInfo v2Plain = movieClipPlain;
+        v2Plain.videoDx = 0.25;
+        const ClipInfo v2Clip = fullBrush(v2Plain, v2Brush);
+        // Pixel-identical in the export's format: the composite comes back
+        // ARGB32_Premultiplied, renderFrameAt RGBA8888.
+        const auto sameAsExport = [](const QImage &composite, const QImage &exported) {
+            return !composite.isNull() && !exported.isNull()
+                && composite.convertToFormat(exported.format()) == exported;
+        };
+        const auto setTracks = [&](const QVector<QVector<ClipInfo>> &tracks) {
+            if (!mainTimeline)
+                return;
+            mainTimeline->setProjectOutputConfig(kW, kH, false, kFps);
+            mainTimeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0,
+                                             -1.0, 100);
+            mainTimeline->refreshPlaybackSequence();
+        };
+        const auto formatOf = [](const QImage &image) { return int(image.format()); };
+        // V1 = G1 [0, 0.5), a gap, G2 [0.8, 1.3); V2 = the brushed movie [0, 2).
+        ClipInfo gapG1 = v1Clip;
+        gapG1.outPoint = 0.5;
+        ClipInfo gapG2 = v1Clip;
+        gapG2.leadInSec = 0.3;
+        gapG2.outPoint = 0.5;
+        const auto settledUpload = [&] {
+            QImage upload, previous;
+            (void)QTest::qWaitFor([&] {
+                upload = view->uploadFrameForTest();
+                const bool stable = !upload.isNull() && !previous.isNull() && upload == previous;
+                previous = upload;
+                return stable;
+            }, 5000);
+            return upload;
+        };
+        // Paused at `sec` after `display` with V2's brush bound: the ordinary frame
+        // with the brush drawn on it once (the G6 shape), on a timeline the helper
+        // keeps true. `plain` is the same frame without the bound brush.
+        int boundClip = 0;
+        const auto ordinaryFrameShape = [&](const QImage &upload, QImage *plain) {
+            window.syncBrushAnimationPreviewForClip(-1, -1);
+            *plain = settledUpload();
+            window.syncBrushAnimationPreviewForClip(1, boundClip);
+            return samePixels(upload, handBrush(*plain, v2Brush, 1.0))
+                && diffPixels(upload, *plain) > 100;
+        };
+
+        // G11: two brushed tracks: buildSpecialClipComposite(t) == renderFrameAt(t),
+        // byte for byte once in the export's format (HEAD: brushData alone is no special data, so the composite
+        // is null). Controls: both brushes show in the export (each differs from the
+        // export without it), so a composite that drops either brush cannot match.
+        QImage g11Composite;
+        {
+            QImage exported, v1Only, plainBoth;
+            if (mainTimeline && movieOk) {
+                setTracks({{v1Clip}, {v2Clip}});
+                g11Composite = window.buildSpecialClipComposite(t);
+                exported = frameAt(mainTimeline, t);
+                setTracks({{v1Clip}, {v2Plain}});
+                v1Only = frameAt(mainTimeline, t);
+                setTracks({{v1Plain}, {v2Plain}});
+                plainBoth = frameAt(mainTimeline, t);
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            const bool same = sameAsExport(g11Composite, exported);
+            const qint64 v2BrushVisible = diffPixels(exported, v1Only);
+            const qint64 v1BrushVisible = diffPixels(v1Only, plainBoth);
+            // A cut on one track picks one clip over export's [start, end): V2 =
+            // A (brush "P", dx -0.25) [0, 0.87), B (brush "Q", dx +0.25, in 0.07)
+            // [0.87, 1.47), a gap, C [1.67, 2.0); V1 = the brushed movie at dx -0.5
+            // (the left half, so V2's right half shows).
+            // Sampled just before, at and just after the cut (inside the old 1/120 s
+            // slack, which drew A and B together) and in V2's gap.
+            // Control: the cut changes the export.
+            ClipInfo cutA = v1Clip;
+            cutA.outPoint = 0.87;
+            ClipInfo cutB = v2Clip;
+            cutB.inPoint = 0.07;
+            cutB.outPoint = 0.67;
+            ClipInfo cutC = v1Clip;
+            cutC.leadInSec = 0.2;
+            cutC.outPoint = 0.33;
+            ClipInfo cutV1 = movieClip;
+            cutV1.videoDx = -0.5;
+            bool cutSame = mainTimeline && movieOk;
+            QString cutLog;
+            qint64 cutVisible = -1;
+            if (mainTimeline && movieOk) {
+                setTracks({{cutV1}, {cutA, cutB, cutC}});
+                for (const double cutT : {0.866, 0.87, 0.874, 1.57}) {
+                    const QImage cutComposite = window.buildSpecialClipComposite(cutT);
+                    const QImage cutExport = frameAt(mainTimeline, cutT);
+                    const bool sameAtT = sameAsExport(cutComposite, cutExport);
+                    cutSame = cutSame && sameAtT;
+                    cutLog += QStringLiteral(" %1:%2/%3").arg(cutT).arg(int(sameAtT))
+                                  .arg(diffPixels(cutComposite, cutExport));
+                }
+                cutVisible = diffPixels(frameAt(mainTimeline, 0.866), frameAt(mainTimeline, 0.874));
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            // Off-grid times just after a source frame: export takes the first
+            // frame at or after the source time, while grabFrameAt also accepts
+            // one up to 1/120 s earlier. Then a reversed V1, whose export frame is
+            // the last one before its source position (0.796 reads source 1.204,
+            // frame 12; the composite's legacy offset lands on frame 11).
+            // Control: the frame changes between 0.796 and 0.804, so a composite
+            // holding the earlier frame cannot match.
+            bool offGridSame = mainTimeline && movieOk;
+            QString offGridLog;
+            qint64 offGridVisible = -1;
+            qint64 echoVisible = -1;
+            qint64 reversedEchoVisible = -1;
+            qint64 rollingShutterVisible = -1;
+            const auto offGridSample = [&](double gridT) {
+                const QImage gridComposite = window.buildSpecialClipComposite(gridT);
+                const QImage gridExport = frameAt(mainTimeline, gridT);
+                const bool sameAtT = sameAsExport(gridComposite, gridExport);
+                offGridSame = offGridSame && sameAtT;
+                offGridLog += QStringLiteral(" %1:%2/%3").arg(gridT).arg(int(sameAtT))
+                                  .arg(diffPixels(gridComposite, gridExport));
+            };
+            if (mainTimeline && movieOk) {
+                for (const double gridT : {0.804, 1.204})
+                    offGridSample(gridT);
+                offGridVisible = diffPixels(frameAt(mainTimeline, 0.796),
+                                            frameAt(mainTimeline, 0.804));
+                ClipInfo reversedV1 = v1Clip;
+                reversedV1.reversed = true;
+                setTracks({{reversedV1}, {v2Clip}});
+                offGridLog += QStringLiteral(" reversed");
+                offGridSample(0.796);
+                // Echo on V1: the past frame comes from the same decode as export.
+                // Forward at 0.904, the echo sample lands on source 0.804 (export
+                // frame 0.9, grabFrameAt 0.8). Reversed at 0.896, it lands on
+                // source 1.204, which the legacy shifted anchor would miss.
+                // Blend 3 (Normal): Add (0) saturates this bright fixture at 255, so
+                // a wrong echo frame would not show. Control: the echo changes both
+                // renders.
+                ClipInfo echoV1 = v1Clip;
+                echoV1.effects.append(VideoEffect::createEcho(0.1, 1, 0.5, 3));
+                setTracks({{echoV1}, {v2Clip}});
+                offGridLog += QStringLiteral(" echo");
+                offGridSample(0.904);
+                const QImage echoForward = frameAt(mainTimeline, 0.904);
+                ClipInfo reversedEchoV1 = echoV1;
+                reversedEchoV1.reversed = true;
+                setTracks({{reversedEchoV1}, {v2Clip}});
+                offGridLog += QStringLiteral(" reversedEcho");
+                offGridSample(0.896);
+                const QImage echoReversed = frameAt(mainTimeline, 0.896);
+                // Rolling shutter on V1: its second frame is the same decode too.
+                ClipInfo shutterV1 = v1Clip;
+                shutterV1.effects.append(VideoEffect::createRollingShutterRepair(1.0));
+                setTracks({{shutterV1}, {v2Clip}});
+                offGridLog += QStringLiteral(" rollingShutter");
+                offGridSample(0.904);
+                const QImage shutterFrame = frameAt(mainTimeline, 0.904);
+                setTracks({{v1Clip}, {v2Clip}});
+                rollingShutterVisible = diffPixels(shutterFrame, frameAt(mainTimeline, 0.904));
+                echoVisible = diffPixels(echoForward, frameAt(mainTimeline, 0.904));
+                setTracks({{reversedV1}, {v2Clip}});
+                reversedEchoVisible = diffPixels(echoReversed, frameAt(mainTimeline, 0.896));
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            // V1 gaps: renderFrameAt draws nothing when a visible, non-empty V1
+            // has no export-active clip, so the composite must be null there too
+            // (HEAD composited V2 alone). Samples inside G1 / G2 (both drawn,
+            // byte-equal), at G1's end, inside the gap and at G2's end (the last
+            // V1 clip). Then V1 = one clip with a 0.2 s lead-in at t = 0 (the
+            // export's clamp onto clip 0). Control: the in-clip samples are
+            // non-null, so the null agreement is not vacuous.
+            ClipInfo leadV1 = v1Clip;
+            leadV1.leadInSec = 0.2;
+            bool gapSame = mainTimeline && movieOk;
+            int gapDrawn = 0;
+            QString gapLog;
+            const auto gapSample = [&](double gapT) {
+                const QImage gapComposite = window.buildSpecialClipComposite(gapT);
+                const QImage gapExport = frameAt(mainTimeline, gapT);
+                const bool nullSame = gapComposite.isNull() == gapExport.isNull();
+                const bool sameAtT = nullSame
+                    && (gapExport.isNull() || sameAsExport(gapComposite, gapExport));
+                gapSame = gapSame && sameAtT;
+                gapDrawn += gapExport.isNull() ? 0 : 1;
+                gapLog += QStringLiteral(" %1:%2/%3/%4").arg(gapT).arg(int(gapComposite.isNull()))
+                              .arg(int(gapExport.isNull())).arg(int(sameAtT));
+            };
+            if (mainTimeline && movieOk) {
+                setTracks({{gapG1, gapG2}, {v2Clip}});
+                for (const double gapT : {0.38, 0.5, 0.65, 0.88, 1.3})
+                    gapSample(gapT);
+                setTracks({{leadV1}, {v2Clip}});
+                gapSample(0.0);
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            // V1 with no decodable source (a zero-byte file) over the brushed V2:
+            // renderFrameAt is null, so the composite is too. The samples above are
+            // the non-null control; G12 covers what the preview then shows.
+            QTemporaryFile zeroByteV1(QDir::temp().filePath(QStringLiteral("brush-XXXXXX.mp4")));
+            bool zeroByteSame = false;
+            QString zeroByteLog;
+            if (mainTimeline && movieOk && zeroByteV1.open()) {
+                zeroByteV1.close();
+                ClipInfo undecodableV1 = v1Plain;
+                undecodableV1.filePath = zeroByteV1.fileName();
+                setTracks({{undecodableV1}, {v2Clip}});
+                const QImage composite = window.buildSpecialClipComposite(t);
+                const QImage exported = frameAt(mainTimeline, t);
+                zeroByteSame = composite.isNull() && exported.isNull();
+                zeroByteLog = QStringLiteral("%1/%2").arg(int(composite.isNull()))
+                                  .arg(int(exported.isNull()));
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            std::cerr << "brush-export G11 movie=" << movieOk << " compositeNull="
+                      << g11Composite.isNull() << " (HEAD 1) compositeEqualsRenderFrameAt=" << same
+                      << " diffPixels=" << diffPixels(g11Composite, exported)
+                      << " formats=" << formatOf(g11Composite) << '/' << formatOf(exported)
+                      << " v1BrushVisible=" << v1BrushVisible
+                      << " v2BrushVisible=" << v2BrushVisible
+                      << " cut t:equal/diffPixels=" << cutLog.toStdString()
+                      << " cutVisible=" << cutVisible
+                      << " offGrid t:equal/diffPixels=" << offGridLog.toStdString()
+                      << " offGridVisible=" << offGridVisible
+                      << " echoVisible=" << echoVisible
+                      << " reversedEchoVisible=" << reversedEchoVisible
+                      << " rollingShutterVisible=" << rollingShutterVisible
+                      << " gap t:compositeNull/exportNull/equal=" << gapLog.toStdString()
+                      << " gapDrawn=" << gapDrawn
+                      << " zeroByteV1 compositeNull/exportNull=" << zeroByteLog.toStdString() << '\n';
+            tally.gate(11, movieOk && same && v1BrushVisible > 100 && v2BrushVisible > 100
+                               && cutSame && cutVisible > 100 && offGridSame && offGridVisible > 100
+                               && echoVisible > 100 && reversedEchoVisible > 100
+                               && rollingShutterVisible > 100
+                               && gapSame && gapDrawn >= 2
+                               && zeroByteSame,
+                       "the special composite of two brushed tracks differs from renderFrameAt");
+        }
+
+        // G12: the same display through the real path: play, then pause, with V1's
+        // brush bound to the GL preview at progress 1. The pause re-enters the
+        // special composite at the playhead (no direct refresh here), so the upload
+        // is buildSpecialClipComposite(playhead) (composite-baked, the bound brush
+        // not drawn again). Controls: playback really ran and its frame differs
+        // from that composite, the brush is really bound, and drawing it once more
+        // on the composite changes it (a double draw cannot hide). The non-baked
+        // control is G6 (the bound brush drawn on the decoded frame).
+        if (!view || !glOn) {
+            tally.skip(12, "OpenGL preview unavailable in this environment");
+        } else {
+            QImage upload, playUpload, pausedComposite;
+            bool bound = false, baked = false, played = false, paused = false;
+            bool markedBeforePlay = false, markedWhilePlaying = true;
+            double pausedSec = -1.0;
+            VideoPlayer *player = window.m_player;
+            if (mainTimeline && movieOk && !g11Composite.isNull()) {
+                mainTimeline->setPlayheadPosition(t);
+                window.syncBrushAnimationPreviewForClip(0, 0);
+                bound = window.brushPreviewClipIdForTest() == QStringLiteral("0:0");
+                player->seek(qRound(t * 1000.0));
+                (void)QTest::qWaitFor([&] { return player->timelinePositionUs() == us(t); }, 10000);
+                markedBeforePlay = view->property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
+                player->play();
+                played = QTest::qWaitFor([&] {
+                    return player->isPlaying() && player->timelinePositionUs() > us(t);
+                }, 10000);
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+                markedWhilePlaying = view->property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
+                playUpload = view->uploadFrameForTest();
+                player->pause();
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+                paused = !player->isPlaying();
+                // Settle: two equal reads in a row.
+                QImage previous;
+                (void)QTest::qWaitFor([&] {
+                    upload = view->uploadFrameForTest();
+                    const bool stable = !upload.isNull() && !previous.isNull() && upload == previous;
+                    previous = upload;
+                    return stable;
+                }, 5000);
+                baked = view->compositeBakedMode();
+                pausedSec = mainTimeline->playheadPosition();
+                pausedComposite = window.buildSpecialClipComposite(pausedSec);
+            }
+            // A helper-true timeline falling back to the ordinary frame keeps the
+            // selected brush: V2 bound, from a composite (mark set) to a null
+            // composite by a plain seek and by the real refresh (the mark must not
+            // go stale), and by a seek back onto a composite (the mark returns).
+            // V1-gap: V1 = G1, gap, G2. Overlap: two plain clips at 0.5 and the
+            // brushed V2 clip from 1.0. A paused seek un-bakes the frame, but a
+            // compositor frame stays composite-baked when a preview seek refuses
+            // a file switch; set here at the seam, only the mark keeps the brush.
+            // Zero-byte V1: with V2 over it the ordinary V2 frame comes; alone, no
+            // frame comes, so the composite stays, its brush not drawn again.
+            bool fallbackOk = false, lateOk = false, zeroByteOk = false;
+            QString fallbackLog;
+            if (mainTimeline && movieOk && !g11Composite.isNull()) {
+                player->setProjectOutputSize(QSize(kW, kH));
+                player->setProxyDivisor(1);
+                setTracks({{gapG1, gapG2}, {v2Clip}});
+                window.syncBrushAnimationPreviewForClip(1, 0);
+                // Pending seeks settle first, then the brush is bound (the player's
+                // position update rebinds it to the selection).
+                const auto seekTo = [&](double sec) {
+                    player->seek(qRound(sec * 1000.0));
+                    (void)QTest::qWaitFor([&] { return player->timelinePositionUs() == us(sec); }, 10000);
+                    QTest::qWait(300);
+                    window.syncBrushAnimationPreviewForClip(1, boundClip);
+                    return settledUpload();
+                };
+                const auto refreshTo = [&](double sec) {
+                    (void)seekTo(sec);
+                    mainTimeline->setPlayheadPosition(sec);
+                    window.syncBrushAnimationPreviewForClip(1, boundClip);
+                    window.refreshSpecialClipPreview();
+                    QTest::qWait(300);
+                    return settledUpload();
+                };
+                const QImage drawnA = window.buildSpecialClipComposite(0.38);
+                const bool refreshDrawn = !drawnA.isNull() && samePixels(refreshTo(0.38), drawnA);
+                const QImage gapComposite = window.buildSpecialClipComposite(0.65);
+                const QImage refreshed = refreshTo(0.65);
+                QImage plain;
+                const bool refreshShape = ordinaryFrameShape(refreshed, &plain);
+                const bool seekDrawn = samePixels(refreshTo(0.38), drawnA);
+                const QImage sought = seekTo(0.65);
+                QImage soughtPlain;
+                const bool seekShape = ordinaryFrameShape(sought, &soughtPlain);
+                const QImage drawnB = window.buildSpecialClipComposite(0.88);
+                const bool seekBack = !drawnB.isNull() && samePixels(seekTo(0.88), drawnB);
+                fallbackOk = refreshDrawn && gapComposite.isNull() && refreshShape
+                    && seekDrawn && seekShape && seekBack;
+                fallbackLog = QStringLiteral("drawn=%1 compositeNull=%2 shape=%3 brushVisible=%4 "
+                                             "seekDrawn=%5 seekShape=%6 seekBack=%7")
+                                  .arg(int(refreshDrawn)).arg(int(gapComposite.isNull()))
+                                  .arg(int(refreshShape)).arg(diffPixels(refreshed, plain))
+                                  .arg(int(seekDrawn)).arg(int(seekShape)).arg(int(seekBack));
+
+                ClipInfo plainV2Head = v2Plain;
+                plainV2Head.outPoint = 1.0;
+                setTracks({{v1Plain}, {plainV2Head, v2Clip}});
+                boundClip = 1;
+                const QImage drawnLate = window.buildSpecialClipComposite(1.2);
+                const bool lateDrawn = !drawnLate.isNull() && samePixels(refreshTo(1.2), drawnLate);
+                const QImage lateComposite = window.buildSpecialClipComposite(0.5);
+                const QImage lateUpload = refreshTo(0.5);
+                QImage latePlain;
+                const bool lateShape = ordinaryFrameShape(lateUpload, &latePlain);
+                view->setCompositeBakedMode(true);
+                const bool bakedKeepsBrush = samePixels(settledUpload(), lateUpload);
+                view->setCompositeBakedMode(false);
+                lateOk = lateDrawn && lateComposite.isNull() && lateShape && bakedKeepsBrush;
+                fallbackLog += QStringLiteral(" overlap drawn=%1 compositeNull=%2 bakedKeepsBrush=%3 shape=%4 brushVisible=%5")
+                                   .arg(int(lateDrawn)).arg(int(lateComposite.isNull()))
+                                   .arg(int(bakedKeepsBrush)).arg(int(lateShape))
+                                   .arg(diffPixels(lateUpload, latePlain));
+                boundClip = 0;
+
+                QTemporaryFile zeroByteV1(QDir::temp().filePath(QStringLiteral("brush-XXXXXX.mp4")));
+                if (zeroByteV1.open()) {
+                    zeroByteV1.close();
+                    ClipInfo undecodableV1 = v1Plain;
+                    undecodableV1.filePath = zeroByteV1.fileName();
+                    undecodableV1.outPoint = 0.5;
+                    setTracks({{gapG1, undecodableV1}, {v2Clip}});
+                    const QImage drawnZ = window.buildSpecialClipComposite(0.38);
+                    const bool zeroDrawn = !drawnZ.isNull() && samePixels(refreshTo(0.38), drawnZ);
+                    const QImage zeroComposite = window.buildSpecialClipComposite(0.65);
+                    const QImage zeroExport = frameAt(mainTimeline, 0.65);
+                    const QImage zeroUpload = refreshTo(0.65);
+                    QImage zeroPlain;
+                    const bool zeroShape = ordinaryFrameShape(zeroUpload, &zeroPlain);
+
+                    ClipInfo lateV2 = v2Clip;
+                    lateV2.leadInSec = 1.0;
+                    setTracks({{gapG1, undecodableV1}, {lateV2}});
+                    const QImage drawnS = window.buildSpecialClipComposite(0.38);
+                    const bool staleDrawn = !drawnS.isNull() && samePixels(refreshTo(0.38), drawnS);
+                    const QImage staleComposite = window.buildSpecialClipComposite(0.65);
+                    const QImage staleUpload = refreshTo(0.65);
+                    const qint64 staleDiff = diffPixels(staleUpload, drawnS);
+                    const bool doubleDrawn = samePixels(staleUpload, handBrush(drawnS, v2Brush, 1.0));
+                    zeroByteOk = zeroDrawn && zeroComposite.isNull() && zeroExport.isNull() && zeroShape
+                        && staleDrawn && staleComposite.isNull() && staleDiff == 0 && !doubleDrawn;
+                    fallbackLog += QStringLiteral(" zeroByte drawn=%1 null=%2/%3 shape=%4 alone drawn=%5 "
+                                                  "null=%6 keptDiff=%7 doubleDrawn=%8")
+                                       .arg(int(zeroDrawn)).arg(int(zeroComposite.isNull()))
+                                       .arg(int(zeroExport.isNull())).arg(int(zeroShape))
+                                       .arg(int(staleDrawn)).arg(int(staleComposite.isNull()))
+                                       .arg(staleDiff).arg(int(doubleDrawn));
+                }
+                setTracks({{v1Clip}, {v2Clip}});
+            }
+            const bool same = samePixels(upload, pausedComposite);
+            // The playback frame may come at a playback proxy size; any size
+            // other than the composite's differs too.
+            const qint64 playDiff = diffPixels(playUpload, pausedComposite);
+            const bool playDiffers = !playUpload.isNull() && !pausedComposite.isNull()
+                && (playUpload.size() != pausedComposite.size() || playDiff > 100);
+            const qint64 doubleDrawDiff = pausedComposite.isNull() ? -1
+                : diffPixels(handBrush(pausedComposite, v1Brush, 1.0), pausedComposite);
+            std::cerr << "brush-export G12 bound=" << bound << " played=" << played
+                      << " paused=" << paused << " pausedSec=" << pausedSec
+                      << " mark before/while play=" << markedBeforePlay << '/' << markedWhilePlaying
+                      << " compositeBaked=" << baked
+                      << " uploadEqualsComposite=" << same
+                      << " diffPixels=" << diffPixels(upload, pausedComposite)
+                      << " uploadSize=" << upload.width() << "x" << upload.height()
+                      << " playFrameSize=" << playUpload.width() << "x" << playUpload.height()
+                      << " playFrameDiff=" << playDiff << " playFrameDiffers=" << playDiffers
+                      << " doubleDrawDiff=" << doubleDrawDiff
+                      << " fallback " << fallbackLog.toStdString() << '\n';
+            tally.gate(12, bound && played && paused && baked && same && playDiffers
+                               && markedBeforePlay && !markedWhilePlaying
+                               && doubleDrawDiff > 100 && fallbackOk && lateOk && zeroByteOk,
+                       "the composite-baked preview upload differs from the special composite "
+                       "(bound brush drawn again or composite missing)");
+            window.syncBrushAnimationPreviewForClip(-1, -1);
+        }
+
+        // G13: a non-default grade on V1 with its brush: the special composite grades
+        // on the CPU after the brush, like renderFrameAt: byte-identical (HEAD: null).
+        // Controls: the grade shows (graded export != ungraded export) and the brush
+        // shows under it (graded export != graded export without the brush).
+        {
+            ClipInfo gradedV1 = v1Clip;
+            gradedV1.colorCorrection.brightness = -50.0;
+            gradedV1.colorCorrection.saturation = -40.0;
+            ClipInfo gradedPlainV1 = v1Plain;
+            gradedPlainV1.colorCorrection = gradedV1.colorCorrection;
+            QImage composite, exported, ungraded, unbrushed;
+            if (mainTimeline && movieOk) {
+                setTracks({{gradedV1}, {v2Clip}});
+                composite = window.buildSpecialClipComposite(t);
+                exported = frameAt(mainTimeline, t);
+                setTracks({{v1Clip}, {v2Clip}});
+                ungraded = frameAt(mainTimeline, t);
+                setTracks({{gradedPlainV1}, {v2Clip}});
+                unbrushed = frameAt(mainTimeline, t);
+            }
+            const bool same = sameAsExport(composite, exported);
+            const qint64 gradeVisible = diffPixels(exported, ungraded);
+            const qint64 brushVisible = diffPixels(exported, unbrushed);
+            std::cerr << "brush-export G13 compositeNull=" << composite.isNull() << " (HEAD 1)"
+                      << " compositeEqualsRenderFrameAt=" << same
+                      << " diffPixels=" << diffPixels(composite, exported)
+                      << " formats=" << formatOf(composite) << '/' << formatOf(exported)
+                      << " gradeVisible=" << gradeVisible << " brushVisible=" << brushVisible << '\n';
+            tally.gate(13, movieOk && same && gradeVisible > 1000 && brushVisible > 100,
+                       "graded brushed special composite differs from renderFrameAt");
+        }
+
+        // G14 (negative control): V2 with a non-Normal blend (Multiply) keeps the
+        // legacy path. (1) buildSpecialClipComposite returns {} while the same
+        // timeline with V2 Normal does not (the blend is what routes it away). (2)
+        // The preview upload keeps the HEAD shape of G6: V2 starts after V1 (lead-in
+        // 2 s) so at t the player decodes V1 alone, the GL holds the timeline, and
+        // the bound brush is drawn on the decoded frame (== renderClipSourceAt).
+        {
+            ClipInfo blendV2 = v2Clip;
+            blendV2.blendMode = BlendMode::Multiply;
+            ClipInfo lateBlendV2 = blendV2;
+            lateBlendV2.leadInSec = 2.0;
+            ClipInfo lateNormalV2 = lateBlendV2;
+            lateNormalV2.blendMode = BlendMode::Normal;
+            QImage blendComposite, lateBlendComposite, normalComposite;
+            if (mainTimeline && movieOk) {
+                setTracks({{movieClip}, {blendV2}});
+                blendComposite = window.buildSpecialClipComposite(t);
+                setTracks({{movieClip}, {lateBlendV2}});
+                lateBlendComposite = window.buildSpecialClipComposite(t);
+                setTracks({{movieClip}, {lateNormalV2}});
+                normalComposite = window.buildSpecialClipComposite(t);
+            }
+            QSize decoded;
+            bool previewGl = false, baked = true;
+            const QImage upload = movieOk
+                ? previewUpload({{movieClip}, {lateBlendV2}}, 1.0, t, QSize(160, 90), &decoded,
+                                &previewGl, true, &baked)
+                : QImage();
+            const auto tl = makeTimeline({{movieClip}, {lateBlendV2}});
+            const QImage exported = tlrender::renderClipSourceAt(tl.get(), 0, 0, us(t));
+            const auto plainTl = makeTimeline({{movieClipPlain}, {lateBlendV2}});
+            const qint64 brushVisible = diffPixels(exported,
+                tlrender::renderClipSourceAt(plainTl.get(), 0, 0, us(t)));
+            const bool same = samePixels(upload, exported);
+            // (4) A layer style (drop shadow) on V2 and V2 parented to V1: the
+            // special composite applies neither, so both keep the legacy path (the
+            // same timeline without them builds it: lateNormalCompositeNull=0), and
+            // the upload keeps the G6 shape as in (2).
+            ClipInfo styledV2 = lateNormalV2;
+            styledV2.layerStyle.dropShadowEnabled = true;
+            const QHash<QString, QString> parentV2{{QStringLiteral("1:0"), QStringLiteral("0:0")}};
+            bool styleParentLegacy = movieOk && mainTimeline;
+            QString styleParentLog;
+            for (int c = 0; c < 2; ++c) {
+                const ClipInfo &caseV2 = c == 0 ? styledV2 : lateNormalV2;
+                const QHash<QString, QString> caseParents = c == 0 ? QHash<QString, QString>{} : parentV2;
+                QImage caseComposite;
+                if (mainTimeline && movieOk) {
+                    setTracks({{movieClip}, {caseV2}});
+                    mainTimeline->setClipParentEntries(caseParents);
+                    caseComposite = window.buildSpecialClipComposite(t);
+                    mainTimeline->setClipParentEntries({});
+                }
+                QSize caseDecoded;
+                bool caseGl = false, caseBaked = true;
+                const QImage caseUpload = movieOk
+                    ? previewUpload({{movieClip}, {caseV2}}, 1.0, t, QSize(160, 90), &caseDecoded,
+                                    &caseGl, true, &caseBaked, caseParents)
+                    : QImage();
+                const bool caseSame = samePixels(caseUpload, exported);
+                styleParentLegacy = styleParentLegacy && caseComposite.isNull()
+                    && caseDecoded == QSize(160, 90) && !caseBaked && caseSame;
+                styleParentLog += QStringLiteral(" %1/%2/%3").arg(int(caseComposite.isNull()))
+                                      .arg(int(caseSame)).arg(diffPixels(caseUpload, exported));
+            }
+            // (3) Otherwise-G11-eligible timelines the special composite would
+            // misplace keep the legacy path: a keyframed position (it places layers
+            // statically), fitContain / fitCover on a square source (it stretches to
+            // the canvas), a fade-in lead-in / fade-out trail-out (it applies no
+            // transitions), a shape clip and a sequence reference (it only decodes
+            // filePath), a disabled clip (it would draw it). V1 keeps its brush, so
+            // each helper term alone decides. The control: G11's pair, whose only
+            // keyframe track is brush_progress, stays special.
+            ClipInfo animatedV2 = v2Clip;
+            KeyframeTrack posX(QStringLiteral("positionX"), 0.0);
+            posX.addKeyframe(0.0, 0.0);
+            posX.addKeyframe(2.0, 100.0);
+            animatedV2.keyframes.addTrack(posX);
+            const QString square = dir.filePath(QStringLiteral("brush-export-square.mp4"));
+            const bool squareOk = movieOk && writeClip(square, 90, 90);
+            ClipInfo fitV2 = v2Clip;
+            fitV2.filePath = square;
+            fitV2.fitContain = true;
+            ClipInfo fadeV2 = v2Clip;
+            fadeV2.leadIn.type = TransitionType::FadeIn;
+            fadeV2.leadIn.duration = 0.5;
+            ClipInfo shapeV2 = v2Clip;
+            shapeV2.shapes = shapeClip(QColor(200, 40, 40), QRectF(0, 0, kW, kH)).shapes;
+            ClipInfo sequenceV2 = v2Clip;
+            sequenceV2.sequenceRefId = QStringLiteral("brush-export-sequence");
+            ClipInfo disabledV2 = v2Clip;
+            disabledV2.visible = false;
+            ClipInfo coverV2 = v2Clip;
+            coverV2.filePath = square;
+            coverV2.fitCover = true;
+            ClipInfo trailV2 = v2Clip;
+            trailV2.trailOut.type = TransitionType::FadeOut;
+            trailV2.trailOut.duration = 0.5;
+            const bool brushProgressOnly = v2Clip.keyframes.tracks().size() == 1
+                && v2Clip.keyframes.tracks().first().propertyName() == QStringLiteral("brush_progress");
+            const bool controlSpecial = tlrender::timelineBrushWantsSpecialPath(
+                makeTimeline({{v1Clip}, {v2Clip}}).get());
+            bool excludedLegacy = squareOk;
+            QString excludedLog;
+            for (const ClipInfo &excludedV2 : {animatedV2, fitV2, fadeV2, shapeV2, sequenceV2,
+                                                disabledV2, coverV2, trailV2}) {
+                const bool special = tlrender::timelineBrushWantsSpecialPath(
+                    makeTimeline({{v1Clip}, {excludedV2}}).get());
+                QImage excludedComposite;
+                if (mainTimeline && movieOk) {
+                    setTracks({{v1Clip}, {excludedV2}});
+                    excludedComposite = window.buildSpecialClipComposite(t);
+                }
+                excludedLegacy = excludedLegacy && !special && excludedComposite.isNull();
+                excludedLog += QStringLiteral(" %1/%2").arg(int(special)).arg(int(excludedComposite.isNull()));
+            }
+            std::cerr << "brush-export G14 blendCompositeNull=" << blendComposite.isNull()
+                      << " lateBlendCompositeNull=" << lateBlendComposite.isNull()
+                      << " lateNormalCompositeNull=" << normalComposite.isNull()
+                      << " (expect 1 / 1 / 0)"
+                      << " gl=" << previewGl << " compositeBaked=" << baked << " decoded="
+                      << decoded.width() << "x" << decoded.height()
+                      << " uploadEqualsRenderClipSourceAt=" << same
+                      << " diffPixels=" << diffPixels(upload, exported)
+                      << " brushVisible=" << brushVisible
+                      << " keyframed/fitContain/fadeIn/shape/sequenceRef/disabled/fitCover/trailOut"
+                         " special/compositeNull="
+                      << excludedLog.toStdString() << " (expect 0/1 x8) squareOk=" << squareOk
+                      << " brushProgressOnlySpecial=" << controlSpecial << " (expect 1)"
+                      << " brushProgressOnly=" << brushProgressOnly
+                      << " layerStyle/parent compositeNull/uploadEquals/diffPixels="
+                      << styleParentLog.toStdString() << " (expect 1/1/0 x2)" << '\n';
+            tally.gate(14, movieOk && mainTimeline && blendComposite.isNull()
+                               && lateBlendComposite.isNull() && !normalComposite.isNull() && decoded == QSize(160, 90)
+                               && !baked && same && brushVisible > 100
+                               && excludedLegacy && controlSpecial && brushProgressOnly
+                               && styleParentLegacy,
+                       "a blended brushed timeline left the legacy preview path (composite built "
+                       "or the selected-clip brush upload changed)");
         }
     }
 
