@@ -16122,6 +16122,7 @@ void MainWindow::applyCameraSolve(const camsolve::CameraSolveApplied& applied)
         camsolve::applyPosesToCamera(m_projectCamera, applied.poses, fps, startSec);
         // A feature solve's mapping must not outlive the legacy pose mapping that replaces it.
         m_projectCamera.setSolveMapping(std::nullopt);
+        m_projectCamera.setSolvePoints({});
     } else if (!camsolve::applySolvedPosesToCamera(m_projectCamera, applied)) {
         // Rejected before the camera changed: leave the undo slot as it was.
         m_projectCameraUndoSlot = previousSlot;

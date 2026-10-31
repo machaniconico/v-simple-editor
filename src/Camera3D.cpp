@@ -946,7 +946,27 @@ QJsonObject Camera3D::toJson() const
         obj[QStringLiteral("solveMapping")] = mappingObj;
     }
 
+    if (!m_solvePoints.isEmpty()) {
+        QJsonArray pointsArr;
+        for (const QVector3D &p : m_solvePoints) {
+            pointsArr.append(static_cast<double>(p.x()));
+            pointsArr.append(static_cast<double>(p.y()));
+            pointsArr.append(static_cast<double>(p.z()));
+        }
+        obj[QStringLiteral("solvePoints")] = pointsArr;
+    }
+
     return obj;
+}
+
+QVector<QVector3D> Camera3D::solvePointsWorldPx() const
+{
+    QVector<QVector3D> world;
+    if (!m_solveMapping) return world;
+    world.reserve(m_solvePoints.size());
+    for (const QVector3D &p : m_solvePoints)
+        world.append(camsolve::solvePointToWorldPx(p, *m_solveMapping));
+    return world;
 }
 
 void Camera3D::fromJson(const QJsonObject &obj)
@@ -1009,4 +1029,12 @@ void Camera3D::fromJson(const QJsonObject &obj)
         mapping.referenceIndex = mappingObj[QStringLiteral("referenceIndex")].toInt(-1);
         m_solveMapping = mapping;
     }
+
+    m_solvePoints.clear();
+    const QJsonArray pointsArr = obj[QStringLiteral("solvePoints")].toArray();
+    m_solvePoints.reserve(pointsArr.size() / 3);
+    for (qsizetype i = 0; i + 2 < pointsArr.size(); i += 3)
+        m_solvePoints.append(QVector3D(static_cast<float>(pointsArr[i].toDouble()),
+                                       static_cast<float>(pointsArr[i + 1].toDouble()),
+                                       static_cast<float>(pointsArr[i + 2].toDouble())));
 }

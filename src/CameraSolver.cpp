@@ -1,4 +1,5 @@
 #include "CameraSolver.h"
+#include "BundleAdjustment.h"
 #include "Camera3D.h"
 #include "PlanarTracker.h"
 
@@ -362,6 +363,9 @@ bool applySolvedPosesToCamera(Camera3D& camera, const CameraSolveApplied& applie
                                      poseToProjectCameraState(poses[i], base, mapping));
     }
     camera.setSolveMapping(mapping);
+    // The cloud replaces any earlier one; it is bounded like the bundle that produced it.
+    if (points.size() > sfm::kMaxBundlePoints) points.resize(sfm::kMaxBundlePoints);
+    camera.setSolvePoints(points);
     return true;
 }
 } // namespace camsolve

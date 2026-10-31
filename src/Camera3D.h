@@ -139,6 +139,12 @@ public:
     void setSolveMapping(const std::optional<camsolve::SolveMapping> &mapping) { m_solveMapping = mapping; }
     std::optional<camsolve::SolveMapping> solveMapping() const { return m_solveMapping; }
 
+    // Bundle point cloud in reference-centred solver units (JSON "solvePoints"; omitted when empty).
+    void setSolvePoints(const QVector<QVector3D> &points) { m_solvePoints = points; }
+    const QVector<QVector3D> &solvePoints() const { return m_solvePoints; }
+    // The cloud in world px, S*p - f*e3; empty without a solve mapping.
+    QVector<QVector3D> solvePointsWorldPx() const;
+
     // --- Built-in camera moves (static factory methods) ---
 
     static Camera3D createDollyZoom(double startZ, double endZ, double duration);
@@ -176,6 +182,7 @@ private:
     CameraShake m_shake;
 
     std::optional<camsolve::SolveMapping> m_solveMapping;
+    QVector<QVector3D> m_solvePoints;
 
     // --- Deterministic value-noise helpers (shake) ---
 

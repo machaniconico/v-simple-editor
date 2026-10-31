@@ -260,6 +260,7 @@ int runSmartRenderSelftest();
 int runSnsCoverSelftest();
 int runSnsFitSelftest();
 int runSocialSelftest();
+int runSolvePointsSelftest();
 int runSpatialPathSelftest();
 int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
@@ -1077,6 +1078,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "ShortcutManager binding registration and conflict-detection tests" },
     { "social",            "VEDITOR_SOCIAL_SELFTEST",             runSocialSelftest,             true,
       "Social/sharing module smoke (Sprint-12 SNS pipeline stubs)" },
+    { "solve-points", "VEDITOR_SOLVE_POINTS_SELFTEST", runSolvePointsSelftest, true,
+      "Bundle point cloud carried into the project camera JSON in normalised solver units beside its mapping: round trip, undo, planar clears and feature re-solve replaces (3 gates)" },
     { "caption",           "VEDITOR_CAPTION_SELFTEST",            runCaptionSelftest,            true,
       "Caption/subtitle module smoke (SRT/VTT parse, burn-in, track model)" },
     { "whisper-transcribe", "VEDITOR_WHISPER_TRANSCRIBE_SELFTEST", runWhisperTranscribeSelftest,  true,
