@@ -73,6 +73,7 @@
 #include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "../UndoManager.h"
+#include <functional>
 
 namespace {
 
@@ -7445,6 +7446,154 @@ int runMcpSelftest()
                 && observeTerm(199, "get_clip_dynamics still reads", readBack.value(QStringLiteral("is3DLayer")).toBool(false)),
                 "a dynamics write changed a locked track or its error did not say the track is locked");
             dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        }
+
+        // G200 (US-1815): set_clip_property worldX / worldY on a 3D layer, reported by get_timeline.
+        // HEAD has neither property in the enum nor the get_timeline keys, so the round trip FAILs there.
+        {
+            resetDynClips();
+            ClipInfo seeded = dynTimeline->trackAt(false, 0)->clips().first();
+            seeded.videoDx = 0.7;
+            seeded.videoDy = -0.3;
+            dynTimeline->restoreFromProject(
+                QVector<QVector<ClipInfo>>{{seeded}}, QVector<QVector<ClipInfo>>{{}},
+                0.0, -1.0, -1.0, 100);
+            dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+            dynTimeline->undoManager()->clear();
+            dynTimeline->undoManager()->saveState(
+                dynTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+            const auto setNum = [&](const QString& property, const QJsonValue& value) {
+                return call(QStringLiteral("set_clip_property"),
+                            vArgs({{QStringLiteral("property"), property}, {QStringLiteral("value"), value}}));
+            };
+            const auto liveClip = [&]() { return dynTimeline->trackAt(false, 0)->clips().first(); };
+            const auto timelineClip = [&]() {
+                return toolPayload(call(QStringLiteral("get_timeline"),
+                                        QJsonObject{{QStringLiteral("kind"), QStringLiteral("video")}}))
+                    .value(QStringLiteral("video")).toArray().at(0).toObject()
+                    .value(QStringLiteral("clips")).toArray().at(0).toObject();
+            };
+
+            // (a) round trip 123 / -45 through the tool and get_timeline.
+            const QJsonObject setX = toolPayload(setNum(QStringLiteral("worldX"), 123.0));
+            const QJsonObject setY = toolPayload(setNum(QStringLiteral("worldY"), -45.0));
+            const ClipInfo afterSet = liveClip();
+            const QJsonObject timelineSet = timelineClip();
+            // (d) control: the 2D offsets and positionZ are untouched by a world write.
+            // (e) one undo per write: two writes -> two undos back to 0.
+            undoOnce();
+            const ClipInfo afterUndo1 = liveClip();
+            undoOnce();
+            const ClipInfo afterUndo2 = liveClip();
+            const QJsonObject timelineZero = timelineClip();
+
+            // (b) out of range and wrong types are refused with the value unchanged.
+            setNum(QStringLiteral("worldX"), 50.0);
+            const QJsonObject tooBig = setNum(QStringLiteral("worldX"), 10001.0);
+            const QJsonObject tooSmall = setNum(QStringLiteral("worldY"), -10001.0);
+            const QJsonObject asString = setNum(QStringLiteral("worldX"), QStringLiteral("100"));
+            const QJsonObject asBool = setNum(QStringLiteral("worldY"), true);
+            const ClipInfo afterBad = liveClip();
+
+            // (d) control: the dynamic_zoom positionX/Y keyframe counts are the 2D start/end pair and
+            // a zoom does not touch the world position.
+            const QJsonObject zoomCounts = toolPayload(call(QStringLiteral("dynamic_zoom"),
+                vArgs({{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("preset"), QStringLiteral("zoomIn")},
+                       {QStringLiteral("easing"), QStringLiteral("easeInOut")}})))
+                .value(QStringLiteral("keyframeCounts")).toObject();
+            const int zoomPosX = zoomCounts.value(QStringLiteral("positionX")).toInt(-1);
+            const int zoomPosY = zoomCounts.value(QStringLiteral("positionY")).toInt(-1);
+            const ClipInfo afterZoom = liveClip();
+
+            // (c) a non-3D clip refuses world writes; the value stays 0.
+            resetDynClips();
+            setProp(QStringLiteral("is3DLayer"), false);
+            const QJsonObject flatX = setNum(QStringLiteral("worldX"), 12.0);
+            const QJsonObject flatY = setNum(QStringLiteral("worldY"), 12.0);
+            const ClipInfo flatClip = liveClip();
+
+            // (f) get_timeline clip schema lists worldX / worldY as optional (not in required).
+            std::function<bool(const QJsonValue&)> schemaOk = [&](const QJsonValue& node) {
+                if (node.isObject()) {
+                    const QJsonObject object = node.toObject();
+                    const QJsonObject props = object.value(QStringLiteral("properties")).toObject();
+                    if (props.contains(QStringLiteral("autoOrientToCamera"))) {
+                        const QJsonArray required = object.value(QStringLiteral("required")).toArray();
+                        return props.contains(QStringLiteral("worldX")) && props.contains(QStringLiteral("worldY"))
+                            && !required.contains(QStringLiteral("worldX"))
+                            && !required.contains(QStringLiteral("worldY"));
+                    }
+                    for (auto it = object.constBegin(); it != object.constEnd(); ++it)
+                        if (schemaOk(it.value())) return true;
+                } else if (node.isArray()) {
+                    for (const QJsonValue& item : node.toArray())
+                        if (schemaOk(item)) return true;
+                }
+                return false;
+            };
+            bool timelineSchemaOk = false;
+            QJsonArray setEnum;
+            for (const QJsonValue& descriptor : projectInfoToolDescriptors) {
+                const QString toolName = descriptor.toObject().value(QStringLiteral("name")).toString();
+                if (toolName == QStringLiteral("get_timeline"))
+                    timelineSchemaOk = schemaOk(descriptor.toObject().value(QStringLiteral("outputSchema")));
+                else if (toolName == QStringLiteral("set_clip_property"))
+                    setEnum = descriptor.toObject().value(QStringLiteral("inputSchema")).toObject()
+                        .value(QStringLiteral("properties")).toObject().value(QStringLiteral("property"))
+                        .toObject().value(QStringLiteral("enum")).toArray();
+            }
+            std::fprintf(stderr, "mcp G200 set ok=%d/%d world=%g/%g timeline=%g/%g dx/dy=%g/%g "
+                         "undo1=%g/%g undo2=%g/%g timelineZeroHasKey=%d bad world=%g/%g errs [%s] [%s] [%s] [%s] "
+                         "flat errs [%s] [%s] flat world=%g/%g is3D=%d schemaOk=%d enum=%d/%d "
+                         "zoom positionX/Y=%d/%d world after zoom=%g/%g "
+                         "(expect 1/1 123/-45 123/-45 0.7/-0.3 123/0 0/0 0 0/0 ... zoom 2/2 world 50/0)\n",
+                         setX.value(QStringLiteral("ok")).toBool(false), setY.value(QStringLiteral("ok")).toBool(false),
+                         afterSet.layer3D.worldX, afterSet.layer3D.worldY,
+                         timelineSet.value(QStringLiteral("worldX")).toDouble(-1),
+                         timelineSet.value(QStringLiteral("worldY")).toDouble(-1),
+                         afterSet.videoDx, afterSet.videoDy,
+                         afterUndo1.layer3D.worldX, afterUndo1.layer3D.worldY,
+                         afterUndo2.layer3D.worldX, afterUndo2.layer3D.worldY,
+                         timelineZero.contains(QStringLiteral("worldX")),
+                         afterBad.layer3D.worldX, afterBad.layer3D.worldY,
+                         qPrintable(toolErrorText(tooBig)), qPrintable(toolErrorText(tooSmall)),
+                         qPrintable(toolErrorText(asString)), qPrintable(toolErrorText(asBool)),
+                         qPrintable(toolErrorText(flatX)), qPrintable(toolErrorText(flatY)),
+                         flatClip.layer3D.worldX, flatClip.layer3D.worldY, flatClip.is3DLayer, timelineSchemaOk,
+                         setEnum.contains(QStringLiteral("worldX")), setEnum.contains(QStringLiteral("worldY")),
+                         zoomPosX, zoomPosY, afterZoom.layer3D.worldX, afterZoom.layer3D.worldY);
+            tallyObserved(200, observeTerm(200, "worldX / worldY set ok",
+                               setX.value(QStringLiteral("ok")).toBool(false)
+                                   && setY.value(QStringLiteral("ok")).toBool(false))
+                && observeTerm(200, "clip carries 123 / -45", afterSet.is3DLayer
+                               && afterSet.layer3D.worldX == 123.0 && afterSet.layer3D.worldY == -45.0)
+                && observeTerm(200, "get_timeline reports 123 / -45",
+                               timelineSet.value(QStringLiteral("worldX")).toDouble(-1) == 123.0
+                                   && timelineSet.value(QStringLiteral("worldY")).toDouble(-1) == -45.0)
+                && observeTerm(200, "get_timeline omits zero world",
+                               !timelineZero.contains(QStringLiteral("worldX"))
+                                   && !timelineZero.contains(QStringLiteral("worldY")))
+                && observeTerm(200, "2D videoDx/Dy and positionZ unchanged",
+                               afterSet.videoDx == 0.7 && afterSet.videoDy == -0.3
+                                   && afterSet.layer3D.positionZ == 50.0)
+                && observeTerm(200, "one undo per write",
+                               afterUndo1.layer3D.worldX == 123.0 && afterUndo1.layer3D.worldY == 0.0
+                                   && afterUndo2.layer3D.worldX == 0.0 && afterUndo2.layer3D.worldY == 0.0)
+                && observeTerm(200, "10001 / -10001 / string / bool refused",
+                               isErr(tooBig) && isErr(tooSmall) && isErr(asString) && isErr(asBool))
+                && observeTerm(200, "dynamic_zoom positionX/Y counts 2/2, world kept 50/0",
+                               zoomPosX == 2 && zoomPosY == 2
+                                   && afterZoom.layer3D.worldX == 50.0 && afterZoom.layer3D.worldY == 0.0)
+                && observeTerm(200, "refused writes leave the value", afterBad.layer3D.worldX == 50.0
+                               && afterBad.layer3D.worldY == 0.0)
+                && observeTerm(200, "non-3D clip refused, value unchanged",
+                               isErr(flatX) && isErr(flatY) && !flatClip.is3DLayer
+                                   && flatClip.layer3D.worldX == 0.0 && flatClip.layer3D.worldY == 0.0)
+                && observeTerm(200, "get_timeline schema has optional worldX / worldY", timelineSchemaOk)
+                && observeTerm(200, "set_clip_property enum has worldX / worldY",
+                               setEnum.contains(QStringLiteral("worldX"))
+                                   && setEnum.contains(QStringLiteral("worldY"))),
+                "worldX / worldY through set_clip_property / get_timeline did not round-trip, validate, or undo");
         }
     }
 

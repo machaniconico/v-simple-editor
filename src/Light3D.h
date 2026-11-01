@@ -20,8 +20,16 @@ struct Layer3DTransform {
     double rotationX = 0.0;
     double rotationY = 0.0;
     double rotationZ = 0.0;
+    // US-1813: pre-projection world x / y (canvas px, origin = canvas centre, y down, the
+    // projectLayerQuad corner frame). Only the trueProjection camera reads them.
+    double worldX = 0.0;
+    double worldY = 0.0;
 
     bool isDefault() const {
+        return isDefaultIgnoringWorld() && worldX == 0.0 && worldY == 0.0;
+    }
+    // The four fields the legacy Camera3D::applyPerspective reads (it ignores worldX / worldY).
+    bool isDefaultIgnoringWorld() const {
         return positionZ == 0.0 && rotationX == 0.0
             && rotationY == 0.0 && rotationZ == 0.0;
     }

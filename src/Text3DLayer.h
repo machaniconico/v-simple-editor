@@ -29,6 +29,12 @@ public:
     void setCamera(const Camera3D &camera);
     const Camera3D &camera() const;
 
+    // US-1807: animation-time offset (seconds) added to the time renderFrame()
+    // receives, so the right half of a split clip keeps the original's
+    // stagger / spin / camera timing. 0 by default; non-finite values become 0.
+    void setTimeOffsetSec(double offsetSec);
+    double timeOffsetSec() const;
+
     // --- True extrusion mode (US-3D-3) ---
     // When extrude is enabled, renderFrame() ignores the 2D-quad path and
     // instead builds a real extruded TriMesh from the glyph contours and
@@ -87,6 +93,7 @@ private:
     QVector3D m_rotationAnimAxis;
     double m_staggerDelay = 0.08;
     double m_staggerDuration = 0.6;
+    double m_timeOffsetSec = 0.0;
 
     // --- Extrusion state ---
     bool m_extrudeEnabled = false;

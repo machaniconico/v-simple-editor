@@ -40,10 +40,20 @@ public:
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
+    // US-1817: preview-only crosses at canvas px; painted over the frame, never uploaded.
+    // US-1818: indices[i] is what a click on points[i] reports; empty means i itself.
+    void setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas,
+                              const QVector<int> &indices = {});
+    int solvePointOverlayCountForTest() const { return m_solvePointOverlay.size(); }
     // US-1708 test seams: the progress the preview draws the brush at, and the
     // image paintGL uploads (cameraBaked ? baked frame : decoded frame, brush drawn).
     double brushAnimationProgressForTest() const { return m_brushAnimationProgress; }
     QImage uploadFrameForTest() const;
+    // US-1813 test seam: the upload after paintGL's rotation / 3D projection for a
+    // test-supplied single-clip motion (Timeline-less GLPreview has none to resolve),
+    // with paintGL's project camera and baked state. uploadFrameForTest stays pre-projection.
+    QImage projectedUploadFrameForTest(bool is3DLayer, const Layer3DTransform &layer3D,
+                                       double rotation2D = 0.0) const;
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
@@ -307,6 +317,8 @@ signals:
     // PV-B: プレビュー上で右クリックされた(グローバル座標)。VideoPlayer が
     // 受けて previewContextMenuRequested に再 emit する。
     void contextMenuRequested(const QPoint &globalPos);
+    // US-1818: a left click within 8 widget px of an overlay cross (nearest wins).
+    void solvePointClicked(int index);
 
 protected:
     void contextMenuEvent(QContextMenuEvent *event) override;
@@ -348,9 +360,16 @@ private:
     QImage m_projectCameraFrame;
     qint64 m_projectCameraFrameTimeUs = -1;
     QImage brushedUploadFrame(bool cameraBaked) const;
+    QImage projectedUploadFrame(const QImage &upload, double rotation2D, bool is3DLayer,
+                                const Layer3DTransform &layer3D,
+                                const Camera3DState &projectCamera, bool compositeBaked) const;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;
+    int solvePointAt(const QPointF &widgetPos) const;
+    QVector<QPointF> m_solvePointOverlay;
+    QVector<int> m_solvePointOverlayIndices;
+    QSize m_solvePointOverlayCanvas;
     ColorCorrection m_cc;
     int m_colorCorrectionSetCountForTest = 0;
     bool m_frameTextureNearestForTest = false;

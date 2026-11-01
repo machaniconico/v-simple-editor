@@ -23,6 +23,8 @@ std::atomic<quint64> gRenderApplyCalls{0};
 std::atomic<int> gLastRenderSourceFrameIndex{-1};
 std::atomic<quint64> gProbeVideoStreamFpsOpens{0};
 std::atomic<quint64> gClampAlphaCalls{0};
+std::atomic<double> gProbeFpsOverride{0.0};
+std::atomic<bool> gProbeFpsOverrideSet{false};
 
 // The image in a format whose alpha is byte 3 of every 4-byte pixel.
 QImage withByteAlpha(const QImage &image)
@@ -83,8 +85,20 @@ quint64 probeVideoStreamFpsOpenCount()
     return gProbeVideoStreamFpsOpens.load(std::memory_order_relaxed);
 }
 
+void setProbeVideoStreamFpsOverrideForTest(std::optional<double> fps)
+{
+    if (fps) {
+        gProbeFpsOverride.store(*fps, std::memory_order_relaxed);
+        gProbeFpsOverrideSet.store(true, std::memory_order_release);
+    } else {
+        gProbeFpsOverrideSet.store(false, std::memory_order_release);
+    }
+}
+
 double probeVideoStreamFps(const QString &filePath)
 {
+    if (gProbeFpsOverrideSet.load(std::memory_order_acquire))
+        return gProbeFpsOverride.load(std::memory_order_relaxed);
     double fps = 0.0;
     if (filePath.isEmpty() || filePath.startsWith(QStringLiteral("veditor://")))
         return fps;

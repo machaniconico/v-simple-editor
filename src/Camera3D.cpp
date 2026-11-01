@@ -132,6 +132,11 @@ QJsonObject Layer3DTransform::toJson() const
     obj[QStringLiteral("rotationX")] = rotationX;
     obj[QStringLiteral("rotationY")] = rotationY;
     obj[QStringLiteral("rotationZ")] = rotationZ;
+    // US-1813: written only when set, so a layer without them keeps its HEAD JSON.
+    if (worldX != 0.0)
+        obj[QStringLiteral("worldX")] = worldX;
+    if (worldY != 0.0)
+        obj[QStringLiteral("worldY")] = worldY;
     return obj;
 }
 
@@ -142,6 +147,8 @@ Layer3DTransform Layer3DTransform::fromJson(const QJsonObject &obj)
     t.rotationX = obj[QStringLiteral("rotationX")].toDouble(0.0);
     t.rotationY = obj[QStringLiteral("rotationY")].toDouble(0.0);
     t.rotationZ = obj[QStringLiteral("rotationZ")].toDouble(0.0);
+    t.worldX = obj[QStringLiteral("worldX")].toDouble(0.0);
+    t.worldY = obj[QStringLiteral("worldY")].toDouble(0.0);
     return t;
 }
 
@@ -313,8 +320,9 @@ QImage Camera3D::applyPerspective(const QImage &image,
     if (image.isNull())
         return image;
 
-    // Short-circuit for identity 3D transform
-    if (layer3D.isDefault())
+    // Short-circuit for identity 3D transform. worldX / worldY are trueProjection-only and
+    // this body never reads them, so they must not take a layer off the short-circuit.
+    if (layer3D.isDefaultIgnoringWorld())
         return image;
 
     double focalLength = cameraState.fov;
@@ -376,6 +384,43 @@ QImage Camera3D::applyPerspective(const QImage &image,
 namespace {
 thread_local bool s_trueProjectionEnabled = true;
 thread_local int s_trueProjectionCalls = 0;
+
+// The view / roll / scale core shared by projectLayerQuad and camera3d::projectWorldPoint.
+struct ProjectionCore {
+    QMatrix4x4 view;
+    double c = 1, s = 0, cx = 0, cy = 0, fov = 0;
+};
+
+inline ProjectionCore projectionCore(const Camera3DState &cameraState, const QSize &canvasSize)
+{
+    ProjectionCore core;
+    QVector3D forward = cameraState.target - cameraState.position;
+    if (forward.lengthSquared() < 1e-12f)
+        forward = QVector3D(0, 0, -1);
+    forward.normalize();
+    // A parallel up vector has no unique lookAt basis. Choose a stable fallback.
+    const QVector3D up = std::abs(QVector3D::dotProduct(forward, QVector3D(0, 1, 0))) > 0.9999f
+        ? QVector3D(0, 0, 1) : QVector3D(0, 1, 0);
+    core.view.lookAt(cameraState.position, cameraState.position + forward, up);
+    const double angle = cameraState.roll * 3.14159265358979323846 / 180.0;
+    core.c = std::cos(angle);
+    core.s = std::sin(angle);
+    core.cx = canvasSize.width() / 2.0;
+    core.cy = canvasSize.height() / 2.0;
+    core.fov = cameraState.fov;
+    return core;
+}
+
+// v is a view-space point.
+inline QPointF projectViewPoint(const ProjectionCore &core, const QVector3D &v)
+{
+    // Default lookAt is identity; positive Z retains the legacy away-depth.
+    // Positive camera roll rotates the image counter-clockwise in screen space.
+    const double x = core.c * v.x() + core.s * v.y();
+    const double y = -core.s * v.x() + core.c * v.y();
+    const double scale = core.fov / std::max(0.001, core.fov + v.z());
+    return QPointF(core.cx + x * scale, core.cy + y * scale);
+}
 }
 
 void Camera3D::setTrueProjectionEnabledForTest(bool enabled)
@@ -395,36 +440,21 @@ QPolygonF Camera3D::projectLayerQuad(const Layer3DTransform &layer3D,
 {
     if (canvasSize.isEmpty())
         return {};
-    QVector3D forward = cameraState.target - cameraState.position;
-    if (forward.lengthSquared() < 1e-12f)
-        forward = QVector3D(0, 0, -1);
-    forward.normalize();
-    // A parallel up vector has no unique lookAt basis. Choose a stable fallback.
-    const QVector3D up = std::abs(QVector3D::dotProduct(forward, QVector3D(0, 1, 0))) > 0.9999f
-        ? QVector3D(0, 0, 1) : QVector3D(0, 1, 0);
-    QMatrix4x4 view;
-    view.lookAt(cameraState.position, cameraState.position + forward, up);
+    const ProjectionCore core = projectionCore(cameraState, canvasSize);
     QMatrix4x4 model;
-    model.translate(0, 0, static_cast<float>(layer3D.positionZ));
+    model.translate(static_cast<float>(layer3D.worldX), static_cast<float>(layer3D.worldY),
+                    static_cast<float>(layer3D.positionZ));
     // Qt post-multiplies: these act on each corner in X -> Y -> Z order.
     model.rotate(static_cast<float>(layer3D.rotationZ), 0, 0, 1);
     model.rotate(static_cast<float>(layer3D.rotationY), 0, 1, 0);
     model.rotate(static_cast<float>(layer3D.rotationX), 1, 0, 0);
-    const double angle = cameraState.roll * 3.14159265358979323846 / 180.0;
-    const double c = std::cos(angle), s = std::sin(angle);
-    const double cx = canvasSize.width() / 2.0, cy = canvasSize.height() / 2.0;
+    const double cx = core.cx, cy = core.cy;
     const QPolygonF corners{QPointF(-cx, -cy), QPointF(cx, -cy),
                             QPointF(cx, cy), QPointF(-cx, cy)};
     QPolygonF result;
     for (const QPointF &corner : corners) {
-        const QVector3D v = view.map(model.map(QVector3D(
-            static_cast<float>(corner.x()), static_cast<float>(corner.y()), 0)));
-        // Default lookAt is identity; positive Z retains the legacy away-depth.
-        // Positive camera roll rotates the image counter-clockwise in screen space.
-        const double x = c * v.x() + s * v.y();
-        const double y = -s * v.x() + c * v.y();
-        const double scale = cameraState.fov / std::max(0.001, cameraState.fov + v.z());
-        result.append(QPointF(cx + x * scale, cy + y * scale));
+        result.append(projectViewPoint(core, core.view.map(model.map(QVector3D(
+            static_cast<float>(corner.x()), static_cast<float>(corner.y()), 0)))));
     }
     return result;
 }
@@ -463,8 +493,9 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
         return clip.layer3D;
     // Layer -> camera. The layer is a plane, so the normal may point either way along
     // that line: take the +z side, which is the identity rotation for a centred layer.
-    double dx = static_cast<double>(camera.position.x()) - layerPosPx.x();
-    double dy = static_cast<double>(camera.position.y()) - layerPosPx.y();
+    // US-1813: the layer sits at its 2D position plus its pre-projection world x / y.
+    double dx = static_cast<double>(camera.position.x()) - (layerPosPx.x() + clip.layer3D.worldX);
+    double dy = static_cast<double>(camera.position.y()) - (layerPosPx.y() + clip.layer3D.worldY);
     double dz = static_cast<double>(camera.position.z()) - clip.layer3D.positionZ;
     const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (length < 1e-9)
@@ -486,6 +517,43 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
     result.rotationX = -std::asin(std::clamp(uy / length, -1.0, 1.0)) * kRadiansToDegrees;
     result.rotationY = std::atan2(ux, dz) * kRadiansToDegrees;
     return result;
+}
+
+Layer3DTransform layer3DForPreviewScale(const Layer3DTransform &layer3D, const QSize &uploadSize,
+                                        const QSize &canvasSize)
+{
+    if (uploadSize.isEmpty() || canvasSize.isEmpty())
+        return layer3D;
+    const double factor = static_cast<double>(uploadSize.width()) / canvasSize.width();
+    Layer3DTransform scaled = layer3D;
+    scaled.worldX *= factor;
+    scaled.worldY *= factor;
+    return scaled;
+}
+
+std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
+                                         const QSize &canvas)
+{
+    if (canvas.isEmpty())
+        return std::nullopt;
+    const ProjectionCore core = projectionCore(camera, canvas);
+    const QVector3D v = core.view.map(worldPx);
+    if (!(core.fov + v.z() > 1e-3))
+        return std::nullopt;
+    return projectViewPoint(core, v);
+}
+
+QVector<QPointF> projectedSolvePoints(const Camera3D &camera, double sec, const QSize &canvas)
+{
+    const Camera3DState state = camera.hasAnimation() ? camera.getCameraAt(sec) : camera.camera();
+    const QVector<QVector3D> world = camera.solvePointsWorldPx();
+    QVector<QPointF> projected;
+    projected.reserve(world.size());
+    for (const QVector3D &point : world) {
+        if (const std::optional<QPointF> px = projectWorldPoint(point, state, canvas))
+            projected.append(*px);
+    }
+    return projected;
 }
 
 } // namespace camera3d
@@ -878,7 +946,45 @@ QJsonObject Camera3D::toJson() const
         obj[QStringLiteral("shake")] = shakeObj;
     }
 
+    if (m_solveMapping) {
+        QJsonObject mappingObj;
+        mappingObj[QStringLiteral("version")] = 2;
+        mappingObj[QStringLiteral("unitScalePx")] = m_solveMapping->unitScalePx;
+        mappingObj[QStringLiteral("focalPx")] = m_solveMapping->focalPx;
+        mappingObj[QStringLiteral("analysisWidth")] = m_solveMapping->analysisSize.width();
+        mappingObj[QStringLiteral("analysisHeight")] = m_solveMapping->analysisSize.height();
+        mappingObj[QStringLiteral("canvasWidth")] = m_solveMapping->canvasSize.width();
+        mappingObj[QStringLiteral("canvasHeight")] = m_solveMapping->canvasSize.height();
+        mappingObj[QStringLiteral("referenceIndex")] = m_solveMapping->referenceIndex;
+        if (m_solveMapping->sampleCount > 0) {
+            mappingObj[QStringLiteral("startSec")] = m_solveMapping->startSec;
+            mappingObj[QStringLiteral("sampleCount")] = m_solveMapping->sampleCount;
+            mappingObj[QStringLiteral("fps")] = m_solveMapping->fps;
+        }
+        obj[QStringLiteral("solveMapping")] = mappingObj;
+    }
+
+    if (!m_solvePoints.isEmpty()) {
+        QJsonArray pointsArr;
+        for (const QVector3D &p : m_solvePoints) {
+            pointsArr.append(static_cast<double>(p.x()));
+            pointsArr.append(static_cast<double>(p.y()));
+            pointsArr.append(static_cast<double>(p.z()));
+        }
+        obj[QStringLiteral("solvePoints")] = pointsArr;
+    }
+
     return obj;
+}
+
+QVector<QVector3D> Camera3D::solvePointsWorldPx() const
+{
+    QVector<QVector3D> world;
+    if (!m_solveMapping) return world;
+    world.reserve(m_solvePoints.size());
+    for (const QVector3D &p : m_solvePoints)
+        world.append(camsolve::solvePointToWorldPx(p, *m_solveMapping));
+    return world;
 }
 
 void Camera3D::fromJson(const QJsonObject &obj)
@@ -927,4 +1033,29 @@ void Camera3D::fromJson(const QJsonObject &obj)
     } else {
         m_shake.enabled = false;
     }
+
+    m_solveMapping.reset();
+    if (obj[QStringLiteral("solveMapping")].isObject()) {
+        const QJsonObject mappingObj = obj[QStringLiteral("solveMapping")].toObject();
+        camsolve::SolveMapping mapping;
+        mapping.unitScalePx = mappingObj[QStringLiteral("unitScalePx")].toDouble(0.0);
+        mapping.focalPx = mappingObj[QStringLiteral("focalPx")].toDouble(0.0);
+        mapping.analysisSize = QSize(mappingObj[QStringLiteral("analysisWidth")].toInt(),
+                                     mappingObj[QStringLiteral("analysisHeight")].toInt());
+        mapping.canvasSize = QSize(mappingObj[QStringLiteral("canvasWidth")].toInt(),
+                                   mappingObj[QStringLiteral("canvasHeight")].toInt());
+        mapping.referenceIndex = mappingObj[QStringLiteral("referenceIndex")].toInt(-1);
+        mapping.startSec = mappingObj[QStringLiteral("startSec")].toDouble(0.0);
+        mapping.sampleCount = mappingObj[QStringLiteral("sampleCount")].toInt(0);
+        mapping.fps = mappingObj[QStringLiteral("fps")].toDouble(0.0);
+        m_solveMapping = mapping;
+    }
+
+    m_solvePoints.clear();
+    const QJsonArray pointsArr = obj[QStringLiteral("solvePoints")].toArray();
+    m_solvePoints.reserve(pointsArr.size() / 3);
+    for (qsizetype i = 0; i + 2 < pointsArr.size(); i += 3)
+        m_solvePoints.append(QVector3D(static_cast<float>(pointsArr[i].toDouble()),
+                                       static_cast<float>(pointsArr[i + 1].toDouble()),
+                                       static_cast<float>(pointsArr[i + 2].toDouble())));
 }

@@ -382,6 +382,13 @@ extern "C" {
 }
 
 // Shared by the file menu and import hub; no persistent widget state needed.
+// US-1805: whether the frame presented next is a special composite. The GL
+// leaves the bound brush off only then (tlrender::kSpecialCompositeHoldsBrushProperty).
+static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
+{
+    player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
+}
+
 static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
 {
     if (!timeline || path.isEmpty()) return;
@@ -564,30 +571,7 @@ double dbToLinear(double db)
     return std::pow(10.0, db / 20.0);
 }
 
-double evaluateAudioGainAt(const QVector<AudioGainPoint> &env,
-                           double timeSeconds,
-                           double fallbackGain)
-{
-    if (env.isEmpty())
-        return fallbackGain;
-    if (timeSeconds <= env.first().time)
-        return env.first().gain;
-    if (timeSeconds >= env.last().time)
-        return env.last().gain;
-    for (int i = 0; i + 1 < env.size(); ++i) {
-        const double aT = env[i].time;
-        const double bT = env[i + 1].time;
-        if (timeSeconds >= aT && timeSeconds <= bT) {
-            const double span = bT - aT;
-            if (span <= 0.0)
-                return env[i + 1].gain;
-            const double u = (timeSeconds - aT) / span;
-            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
-        }
-    }
-    return fallbackGain;
-}
-
+using audioexport::mergeDuckingEnvelope;
 using audioexport::sortedDedupedEnvelope;
 
 bool envelopesNearlyEqual(const QVector<AudioGainPoint> &a,
@@ -691,26 +675,6 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
     if (!hasDucking)
         env.clear();
     return sortedDedupedEnvelope(env);
-}
-
-QVector<AudioGainPoint> mergeDuckingEnvelope(const QVector<AudioGainPoint> &existing,
-                                             const QVector<AudioGainPoint> &ducking,
-                                             double fallbackGain)
-{
-    if (ducking.isEmpty())
-        return existing;
-    if (existing.isEmpty())
-        return ducking;
-
-    QVector<AudioGainPoint> merged = existing;
-    merged.reserve(existing.size() + ducking.size());
-    for (const AudioGainPoint &point : ducking) {
-        const double existingGain = evaluateAudioGainAt(existing,
-                                                        point.time,
-                                                        fallbackGain);
-        merged.append({point.time, qMin(existingGain, point.gain)});
-    }
-    return sortedDedupedEnvelope(merged);
 }
 
 bool applyDuckingToTimeline(Timeline *timeline,
@@ -3200,6 +3164,7 @@ void MainWindow::applyStillCompareConfig()
         return;
     const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
     if (!special.isNull()) {
+        setSpecialCompositeHoldsBrush(m_player, true);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -3509,6 +3474,32 @@ void MainWindow::syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx)
     updateBrushPreviewProgress(static_cast<double>(m_player->timelinePositionUs()) / AV_TIME_BASE);
 }
 
+// US-1817: the single follower of the view toggle, the playhead (player, scrub, seek), the
+// project camera (syncProjectLightingToTimeline) and the canvas (applyProjectConfig).
+void MainWindow::refreshSolvePointOverlay(double timelineSec)
+{
+    if (!m_timeline || !m_player || !m_player->glPreview())
+        return;
+    if (!m_solvePointOverlayAction || !m_solvePointOverlayAction->isChecked()) {
+        m_player->glPreview()->setSolvePointOverlay({}, {});
+        return;
+    }
+    // Points behind the pinhole are left out, so each cross keeps its index into the cloud.
+    const QSize canvas = m_timeline->projectOutputSize();
+    const Camera3DState state = m_projectCamera.hasAnimation()
+        ? m_projectCamera.getCameraAt(timelineSec) : m_projectCamera.camera();
+    const QVector<QVector3D> world = m_projectCamera.solvePointsWorldPx();
+    QVector<QPointF> points;
+    QVector<int> indices;
+    for (int i = 0; i < world.size(); ++i) {
+        if (const std::optional<QPointF> px = camera3d::projectWorldPoint(world[i], state, canvas)) {
+            points.append(*px);
+            indices.append(i);
+        }
+    }
+    m_player->glPreview()->setSolvePointOverlay(points, canvas, indices);
+}
+
 // US-1708: the bound brush's progress follows the playhead: "brush_progress" of its
 // clip at the clip-local time export uses (tlrender::clipLocalSecAt). Only the
 // progress is set; the brush is not rebuilt and the preview repaints only when the
@@ -3806,6 +3797,8 @@ void MainWindow::setupUI()
             this, &MainWindow::configureClipParent);
     connect(m_timeline, &Timeline::nullObjectRequested,
             this, &MainWindow::createNullObjectForSelection);
+    connect(m_player->glPreview(), &GLPreview::solvePointClicked,
+            this, &MainWindow::createNullAtSolvePoint);
     connect(m_timeline, &Timeline::transitionShortened,
             this, [this](const QString &name, double askedSec, double effSec) {
                 statusBar()->showMessage(
@@ -3845,16 +3838,19 @@ void MainWindow::setupUI()
         }
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         emit playheadSecondsChanged(seconds);
     });
     connect(m_timeline, &Timeline::scrubPositionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         m_player->previewSeek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     connect(m_timeline, &Timeline::positionChanged, this, [this](double seconds) {
         pushAnimatedHslPreview(seconds);
         updateBrushPreviewProgress(seconds);
+        refreshSolvePointOverlay(seconds);
         m_player->seek(qRound(static_cast<double>(seconds) * 1000.0));
     });
     // Multi-clip playback: forward Timeline's resolved schedule to VideoPlayer.
@@ -4040,7 +4036,11 @@ void MainWindow::setupUI()
         const double sec = m_player->hasActiveSequence()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
-        return buildSpecialClipComposite(sec);
+        const QImage special = buildSpecialClipComposite(sec);
+        // US-1805: every paused displayFrame passes here, so an ordinary frame
+        // (a null composite) clears the mark a previous composite left.
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull());
+        return special;
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -4747,6 +4747,15 @@ void MainWindow::setupMenuBar()
     connect(m_timeline, &Timeline::skimPreviewRequested, m_player, &VideoPlayer::showTimelineSkim);
     connect(m_timeline, &Timeline::skimPreviewCleared, m_player, &VideoPlayer::clearTimelineSkim);
     connect(m_player, &VideoPlayer::stateChanged, m_timeline, &Timeline::setSkimmingPlaybackActive);
+    // US-1805: pausing a brushed timeline re-enters the special composite, which
+    // the GL relies on to show every clip's brush (no other pause path refreshes).
+    // Playback frames replace the composite without passing the provider.
+    connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
+        if (playing)
+            setSpecialCompositeHoldsBrush(m_player, false);
+        else if (tlrender::timelineBrushWantsSpecialPath(m_timeline))
+            refreshSpecialClipPreview();
+    });
     auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
     filmstripAction->setCheckable(true);
     filmstripAction->setChecked(QSettings(QStringLiteral("VSimpleEditor"),
@@ -4757,6 +4766,14 @@ void MainWindow::setupMenuBar()
         QSettings(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"))
             .setValue(QStringLiteral("timeline/showFilmstrip"), enabled);
     });
+    m_solvePointOverlayAction = viewMenu->addAction(QStringLiteral("解析点群を表示"));
+    m_solvePointOverlayAction->setObjectName(QStringLiteral("solvePointOverlayAction"));
+    m_solvePointOverlayAction->setCheckable(true);
+    connect(m_solvePointOverlayAction, &QAction::toggled, this, [this]() {
+        refreshSolvePointOverlay(m_timeline->playheadPosition());
+    });
+    m_menuHelpEntries.append({m_solvePointOverlayAction,
+        QStringLiteral("カメラ解析の点群を再生位置のプロジェクトカメラで写し、プレビューに十字で重ねます。書き出しには焼き込まれません。")});
     m_zoomToFitSequenceAction = viewMenu->addAction(QStringLiteral("シーケンス全体を表示"));
     connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
         m_timeline->zoomToFitSequence();
@@ -8438,6 +8455,8 @@ void MainWindow::applyProjectConfig(const ProjectConfig &config)
     if (m_timeline)
         m_timeline->setProjectOutputConfig(config.width, config.height,
                                            config.explicitOutputResolution, config.fps);
+    if (m_timeline)
+        refreshSolvePointOverlay(m_timeline->playheadPosition());
     applyTimecodeBurnInSettings(m_tcBurnIn);
     updateTitle();
     statusBar()->showMessage(QString("Project: %1 — %2 %3fps")
@@ -8453,6 +8472,7 @@ void MainWindow::syncProjectLightingToTimeline()
     m_timeline->setProjectCamera(m_projectCamera);
     if (m_player && m_player->glPreview())
         m_player->glPreview()->setProjectCamera(m_projectCamera);
+    refreshSolvePointOverlay(m_timeline->playheadPosition());
 }
 
 QString MainWindow::particleClipKey(const ClipInfo &clip)
@@ -8570,6 +8590,25 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
+    // US-1805: a brushed timeline without blend / adjustment / clip mask takes
+    // this path (paused) and every clip's brush is drawn here; other timelines
+    // keep the GL's selected-clip brush on top (tlrender::timelineBrushWantsSpecialPath).
+    // Playback keeps the selected-clip brush only (decision B6).
+    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline)
+        && !(m_player && m_player->isPlaying());
+    // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
+    // non-empty V1 with none draws nothing there, so the preview falls back too.
+    int v1ExportIdx = -1;
+    if (brushWantsSpecialPath) {
+        const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
+        if (v1 && !v1->isHidden() && !v1->clips().isEmpty()) {
+            double v1Start = 0.0;
+            v1ExportIdx = tlrender::activeClipOnTrack(
+                v1->clips(), timelineSeconds, /*clampToFirst=*/true, &v1Start);
+            if (v1ExportIdx < 0)
+                return {};
+        }
+    }
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
         const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
         if (!track || track->isHidden())
@@ -8577,6 +8616,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
 
         const auto &clips = track->clips();
         double cursor = 0.0;
+        bool trackHasExportClip = false;
         for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
             const ClipInfo &clip = clips[clipIdx];
             cursor += qMax(0.0, clip.leadInSec);
@@ -8584,7 +8624,17 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             const double clipEnd = clipStart + clip.effectiveDuration();
             cursor = clipEnd;
 
-            if (timelineSeconds + 1.0 / 120.0 < clipStart
+            if (brushWantsSpecialPath) {
+                // Export's [start, end) interval, at most one clip per track
+                // (activeClipOnTrack), so a cut matches renderFrameAt.
+                if (trackHasExportClip)
+                    break;
+                if (trackIdx == 0 && v1ExportIdx >= 0
+                        ? clipIdx != v1ExportIdx
+                        : (timelineSeconds < clipStart || timelineSeconds >= clipEnd))
+                    continue;
+                trackHasExportClip = true;
+            } else if (timelineSeconds + 1.0 / 120.0 < clipStart
                 || timelineSeconds > clipEnd + 1.0 / 120.0) {
                 continue;
             }
@@ -8596,6 +8646,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || clip.hasTimeRemap()
                 || trackMatteEntries.contains(clipId)
                 || !clip.text3DConfig.isEmpty()
+                || (!clip.brushData.isEmpty() && brushWantsSpecialPath)
                 || (lightingEnabled && clip.material.acceptsLights);
             const VideoSourceInfo info = probeVideoSourceInfo(
                 ProxyManager::instance().getProxyPath(clip.filePath),
@@ -8684,9 +8735,21 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     sourceTime = qMax(clip.inPoint,
                                       sourceTime - 1.0 / fps);
                 }
-                fxSourceSeconds = sourceTime;
+                // US-1805: the brush path anchors echo samples on export's
+                // unshifted source time.
+                fxSourceSeconds = brushWantsSpecialPath
+                    ? clip.sourceSecondAtLocalTime(localSeconds)
+                    : sourceTime;
                 sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
-                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+                // US-1805: the brush path picks export's source frame
+                // (renderClipSourceFrame), the rest keep grabFrameAt.
+                frame = brushWantsSpecialPath
+                    ? tlrender::decodeClipSourceFrame(
+                          ProxyManager::instance().getProxyPath(clip.filePath),
+                          clip.sourceSecondAtLocalTime(localSeconds),
+                          clip.sourceTimeRunsBackwardAtLocalTime(localSeconds),
+                          clip.inPoint)
+                    : decodeClipFrameAtSourceTime(clip, sourceTime);
             } else {
                 // Preserve the legacy special-compositor mapping exactly for
                 // every existing project where reverse remains OFF.
@@ -8698,12 +8761,27 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                     clipOut);
                 fxSourceSeconds = sourceTime;
                 sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
-                frame = decodeClipFrameAtSourceTime(clip, sourceTime);
+                // US-1805: the brush path picks export's source frame (the first
+                // at or after sourceTime), the rest keep grabFrameAt.
+                frame = brushWantsSpecialPath
+                    ? tlrender::decodeClipSourceFrame(
+                          ProxyManager::instance().getProxyPath(clip.filePath),
+                          sourceTime, /*usePreviousSourceFrame=*/false, clip.inPoint)
+                    : decodeClipFrameAtSourceTime(clip, sourceTime);
             }
 
-            if (frame.isNull())
+            if (frame.isNull()) {
+                // US-1805: renderFrameAt draws nothing without V1's source, so
+                // the preview falls back too instead of compositing the rest.
+                if (brushWantsSpecialPath && trackIdx == 0)
+                    return {};
                 continue;
+            }
             frame = applyStoredRotoData(clipId, frame, sourceFrameIndex);
+            // US-1805: the brush on the roto'd raw, before the FX stage (rule
+            // (78), renderClipLayerSource's order and cache key).
+            if (brushWantsSpecialPath)
+                frame = tlrender::applyClipBrushSource(frame, clip, localSeconds, clipId);
 
             // US-708: run the same native FX stage as export (VFX footage
             // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
@@ -8716,9 +8794,17 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip](double sampleSourceSec, double sampleLocalSec) -> QImage {
-                        const QImage sampleRaw =
-                            decodeClipFrameAtSourceTime(clip, sampleSourceSec);
+                    [this, clip, brushWantsSpecialPath](
+                        double sampleSourceSec, double sampleLocalSec) -> QImage {
+                        // US-1805: the brush path samples export's source frame
+                        // (renderClipSourceFrame), the rest keep grabFrameAt.
+                        const QImage sampleRaw = brushWantsSpecialPath
+                            ? tlrender::decodeClipSourceFrame(
+                                  ProxyManager::instance().getProxyPath(clip.filePath),
+                                  sampleSourceSec,
+                                  clip.sourceTimeRunsBackwardAtLocalTime(sampleLocalSec),
+                                  clip.inPoint)
+                            : decodeClipFrameAtSourceTime(clip, sampleSourceSec);
                         if (sampleRaw.isNull())
                             return QImage();
                         return tlrender::prepareClipSourceForEcho(
@@ -8864,6 +8950,26 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             layer.position.y() * canvasSize.height()));
     }
 
+    // US-1804: with no track matte active at THIS frame (renderFrameAt's
+    // hasTrackMatteLayer predicate, evaluated on the remapped array), stack
+    // V1 LAST (frontmost) like renderFrameAt's matte-free branch. With a matte
+    // the ascending adjacency order above is kept. Images and lighting offsets
+    // move with their layers; the now-unused matte indices are cleared so the
+    // reversed positions cannot turn a self-reference into a valid source.
+    bool hasTrackMatteLayer = false;
+    for (int i = 0; i < layers.size() && !hasTrackMatteLayer; ++i) {
+        const int sourceIndex = layers[i].matteSourceLayerIndex;
+        hasTrackMatteLayer = layers[i].matteType != TrackMatteType::None
+            && sourceIndex >= 0 && sourceIndex < layers.size() && sourceIndex != i;
+    }
+    if (!hasTrackMatteLayer) {
+        std::reverse(layers.begin(), layers.end());
+        std::reverse(layerImages.begin(), layerImages.end());
+        std::reverse(lightingOffsets.begin(), lightingOffsets.end());
+        for (CompositeLayer &layer : layers)
+            layer.matteSourceLayerIndex = -1;
+    }
+
     if (lightingEnabled)
         layerImages = tlrender::detail::applyLightingToLayerImages(
             layers, layerImages, canvasSize, lightingOffsets, projectLights,
@@ -8888,9 +8994,11 @@ void MainWindow::refreshSpecialClipPreview()
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_timeline->trackMatteEntries().isEmpty() && !timelineHasClipText3D(m_timeline)
+        && !(!m_player->isPlaying() && tlrender::timelineBrushWantsSpecialPath(m_timeline))
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
             s_refreshingPreview = true;
+            setSpecialCompositeHoldsBrush(m_player, false);
             m_player->previewSeek(timelineMs);
             s_refreshingPreview = false;
         }
@@ -8900,9 +9008,13 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
+        // Built while playing, it holds no brush (decision B6).
+        setSpecialCompositeHoldsBrush(m_player, !m_player->isPlaying());
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
+        // US-1805: the mark stays until an ordinary frame replaces the composite
+        // (the provider clears it there); an undecodable clip presents none.
         s_refreshingPreview = true;
         m_player->previewSeek(timelineMs);
         s_refreshingPreview = false;
@@ -11433,6 +11545,8 @@ void MainWindow::pasteEffects()
     motion.opacity = clipboard.motion().opacity;
     motion.is3DLayer = false;
     motion.posZ = 0.0;
+    motion.worldX = 0.0;
+    motion.worldY = 0.0;
     motion.rotX = 0.0;
     motion.rotY = 0.0;
     motion.rotZ = 0.0;
@@ -11478,6 +11592,8 @@ void MainWindow::pasteAttributes()
         motion.opacity = sel.pasteOpacity ? cbMotion.opacity : srcClip.opacity;
         motion.is3DLayer = srcClip.is3DLayer;
         motion.posZ = srcClip.layer3D.positionZ;
+        motion.worldX = srcClip.layer3D.worldX;
+        motion.worldY = srcClip.layer3D.worldY;
         motion.rotX = srcClip.layer3D.rotationX;
         motion.rotY = srcClip.layer3D.rotationY;
         motion.rotZ = srcClip.layer3D.rotationZ;
@@ -15273,6 +15389,77 @@ void MainWindow::createNullObjectForSelection()
     statusBar()->showMessage(QStringLiteral("ヌルオブジェクトを作成し、ペアレントに設定しました"), 4000);
 }
 
+// US-1818: a hidden 3D null at a solve point. Only the null is placed: the 2D parent chain
+// does not read a 3D parent's projected position, so children do not follow it yet.
+bool MainWindow::createNullAtSolvePoint(int index)
+{
+    const QVector<QVector3D> world = m_projectCamera.solvePointsWorldPx();
+    const QVector<KeyframePoint> &poses =
+        m_projectCamera.track(Camera3DProperty::PositionX)->keyframes();
+    const std::optional<camsolve::SolveMapping> mapping = m_projectCamera.solveMapping();
+    const bool hasRange = mapping && mapping->sampleCount > 0 && mapping->fps > 0;
+    if (!m_timeline || index < 0 || index >= world.size() || (!hasRange && poses.isEmpty()))
+        return false;
+    // Layer 3D clamps its world position to +-10000 (US-1814); keep the point out rather
+    // than place a null a later edit would snap elsewhere.
+    const QVector3D point = world[index];
+    if (!(std::abs(point.x()) <= 10000.0f && std::abs(point.y()) <= 10000.0f
+          && std::abs(point.z()) <= 10000.0f)) {
+        statusBar()->showMessage(
+            QStringLiteral("解析点の座標が範囲外（±10000）のため、ヌルオブジェクトを作成できませんでした"), 6000);
+        return false;
+    }
+
+    // The range is the solve's [startSec, startSec + n/fps]. Only a project saved before the
+    // mapping recorded it falls back to the pose keys, which may be sparse or hand-set.
+    double startSec = 0.0;
+    double duration = 0.0;
+    if (hasRange) {
+        startSec = mapping->startSec;
+        duration = mapping->sampleCount / mapping->fps;
+    } else {
+        double frameSec = 1.0 / qMax(1.0, double(m_projectConfig.fps));
+        for (int i = 1; i < poses.size(); ++i) {
+            if (i == 1 || poses[i].time - poses[i - 1].time < frameSec)
+                frameSec = poses[i].time - poses[i - 1].time;
+        }
+        startSec = poses.first().time;
+        duration = poses.last().time + frameSec - startSec;
+    }
+
+    ClipInfo nullClip;
+    nullClip.filePath = clipgeom::nullObjectFilePath();
+    nullClip.displayName = QStringLiteral("Null Object");
+    nullClip.duration = duration;
+    nullClip.inPoint = 0.0;
+    nullClip.outPoint = duration;
+    nullClip.leadInSec = qMax(0.0, startSec);
+    nullClip.opacity = 0.0;
+    nullClip.visible = false;
+    nullClip.videoScale = 1.0;
+    nullClip.videoDx = 0.0;
+    nullClip.videoDy = 0.0;
+    nullClip.rotation2DDegrees = 0.0;
+    nullClip.is3DLayer = true;
+    nullClip.layer3D.worldX = point.x();
+    nullClip.layer3D.worldY = point.y();
+    nullClip.layer3D.positionZ = point.z();
+
+    m_timeline->captureExternalTrackStateForCompoundEdit();
+    m_timeline->addVideoTrack(false);
+    TimelineTrack *nullTrack = m_timeline->videoTracks().value(m_timeline->videoTracks().size() - 1, nullptr);
+    if (!nullTrack)
+        return false;
+    nullTrack->addClip(nullClip);
+    nullTrack->setSelectedClip(-1);
+    if (m_timeline->undoManager())
+        m_timeline->saveUndoState(QStringLiteral("解析点にヌルオブジェクトを作成"));
+    m_timeline->refreshPlaybackSequence();
+    refreshSpecialClipPreview();
+    statusBar()->showMessage(QStringLiteral("解析点にヌルオブジェクトを作成しました"), 4000);
+    return true;
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // US-3D-11: motion-graphics sprint — 4 menu actions
 // ──────────────────────────────────────────────────────────────────────────
@@ -16081,17 +16268,33 @@ void MainWindow::openPlanarTrackerDialog()
     m_planarTrackerDialog->activateWindow();
 }
 
-void MainWindow::applyCameraSolve(const QVector<camsolve::Pose>& poses,
-                                 double fps, double startSec)
+void MainWindow::applyCameraSolve(const camsolve::CameraSolveApplied& applied)
 {
+    const double fps = applied.fps, startSec = applied.startSec;
     if (!m_timeline || !std::isfinite(fps) || fps <= 0 || !std::isfinite(startSec)
-        || !std::any_of(poses.cbegin(), poses.cend(),
+        || !std::any_of(applied.poses.cbegin(), applied.poses.cend(),
                         [](const camsolve::Pose& p) { return p.valid; }))
         return;
+    const auto previousSlot = m_projectCameraUndoSlot;
+    const auto previousDepth = m_projectCameraUndoTimelineDepth;
+    const auto previousSerial = m_projectCameraUndoSaveSerial;
     m_projectCameraUndoSlot = m_projectCamera.toJson();
     m_projectCameraUndoTimelineDepth = m_timeline->undoManager()->currentIndex();
     m_projectCameraUndoSaveSerial = m_timeline->undoManager()->saveSerial();
-    camsolve::applyPosesToCamera(m_projectCamera, poses, fps, startSec);
+    if (applied.mapping.legacy) {
+        camsolve::applyPosesToCamera(m_projectCamera, applied.poses, fps, startSec);
+        // A feature solve's mapping must not outlive the legacy pose mapping that replaces it.
+        m_projectCamera.setSolveMapping(std::nullopt);
+        m_projectCamera.setSolvePoints({});
+    } else if (!camsolve::applySolvedPosesToCamera(m_projectCamera, applied)) {
+        // Rejected before the camera changed: leave the undo slot as it was.
+        m_projectCameraUndoSlot = previousSlot;
+        m_projectCameraUndoTimelineDepth = previousDepth;
+        m_projectCameraUndoSaveSerial = previousSerial;
+        statusBar()->showMessage(
+            QStringLiteral("3D カメラ解析を適用できませんでした（焦点距離またはスケールが不正です）"), 6000);
+        return;
+    }
     syncProjectLightingToTimeline();
     refreshSpecialClipPreview();
     updateEditActions();

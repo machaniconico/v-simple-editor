@@ -1,4 +1,5 @@
 #include "CameraSolver.h"
+#include "BundleAdjustment.h"
 #include "Camera3D.h"
 #include "PlanarTracker.h"
 
@@ -247,5 +248,127 @@ void applyPosesToCamera(Camera3D& camera, const QVector<Pose>& poses,
                                       poseToCameraState(poses[i], base));
     }
     *camera.track(Camera3DProperty::Fov) = fov;
+}
+
+double canvasFocalPx(const SolveMapping& m)
+{
+    return m.focalPx / std::max(double(m.analysisSize.width()) / m.canvasSize.width(),
+                                double(m.analysisSize.height()) / m.canvasSize.height());
+}
+
+int referencePoseIndex(const QVector<Pose>& poses)
+{
+    for (qsizetype i = 0; i < poses.size(); ++i)
+        if (poses[i].valid) return int(i);
+    return -1;
+}
+
+bool normaliseToReference(QVector<Pose>& poses, QVector<QVector3D>& points, int refIndex)
+{
+    if (refIndex < 0 || refIndex >= poses.size() || !poses[refIndex].valid) return false;
+    const auto centre = [](const Pose& p) {
+        std::array<double, 3> c{};
+        for (int i = 0; i < 3; ++i)
+            c[i] = -(p.R[i]*p.t.x() + p.R[3+i]*p.t.y() + p.R[6+i]*p.t.z());
+        return c;
+    };
+    Mat rRef;
+    std::copy(poses[refIndex].R, poses[refIndex].R + 9, rRef.begin());
+    const auto cRef = centre(poses[refIndex]);
+    // Reference-frame coordinates of a world point: R_ref * (x - c_ref).
+    const auto toRef = [&](const std::array<double, 3>& x) {
+        std::array<double, 3> d{x[0]-cRef[0], x[1]-cRef[1], x[2]-cRef[2]}, r{};
+        for (int i = 0; i < 3; ++i) r[i] = rRef[3*i]*d[0] + rRef[3*i+1]*d[1] + rRef[3*i+2]*d[2];
+        return r;
+    };
+    const Mat rRefT = transpose(rRef);
+    for (Pose& p : poses) {
+        if (!p.valid) continue;
+        const auto c = toRef(centre(p));
+        Mat r;
+        std::copy(p.R, p.R + 9, r.begin());
+        r = multiply(r, rRefT);
+        std::copy(r.cbegin(), r.cend(), p.R);
+        for (int i = 0; i < 3; ++i)
+            p.t[i] = float(-(r[3*i]*c[0] + r[3*i+1]*c[1] + r[3*i+2]*c[2]));
+    }
+    for (QVector3D& point : points) {
+        const auto q = toRef({point.x(), point.y(), point.z()});
+        point = QVector3D(float(q[0]), float(q[1]), float(q[2]));
+    }
+    return true;
+}
+
+double defaultUnitScale(const QVector<QVector3D>& normalisedPoints, double f)
+{
+    QVector<double> depths;
+    for (const QVector3D& p : normalisedPoints)
+        if (std::isfinite(p.z()) && p.z() > 0) depths.append(p.z());
+    if (depths.isEmpty()) return f;
+    std::sort(depths.begin(), depths.end());
+    const qsizetype n = depths.size();
+    const double median = n % 2 ? depths[n / 2] : (depths[n / 2 - 1] + depths[n / 2]) / 2;
+    const double scale = f / median;
+    return median > 0 && std::isfinite(scale) ? scale : f;
+}
+
+Camera3DState poseToProjectCameraState(const Pose& p, const Camera3DState& base,
+                                       const SolveMapping& mapping)
+{
+    if (!p.valid) return base;
+    // Roll and forward = -R3 are those of the legacy mapping; only position / fov differ.
+    Camera3DState state = poseToCameraState(p, base);
+    const double s = mapping.unitScalePx, f = canvasFocalPx(mapping);
+    const double e3[3] = {0, 0, 1};
+    for (int i = 0; i < 3; ++i) {
+        const double c = -(p.R[i]*p.t.x() + p.R[3+i]*p.t.y() + p.R[6+i]*p.t.z());
+        state.position[i] = static_cast<float>(s*c + f*(p.R[6+i] - e3[i]));
+    }
+    state.target = state.position + QVector3D(-float(p.R[6]), -float(p.R[7]), -float(p.R[8]));
+    state.fov = f;
+    return state;
+}
+
+QVector3D solvePointToWorldPx(const QVector3D& p, const SolveMapping& mapping)
+{
+    const double s = mapping.unitScalePx, f = canvasFocalPx(mapping);
+    return QVector3D(float(s*p.x()), float(s*p.y()), float(s*p.z() - f));
+}
+
+bool applySolvedPosesToCamera(Camera3D& camera, const CameraSolveApplied& applied)
+{
+    const double f = canvasFocalPx(applied.mapping), s = applied.mapping.unitScalePx;
+    const int ref = referencePoseIndex(applied.poses);
+    if (!(applied.mapping.focalPx > 0) || !std::isfinite(f) || !(f > 0)
+        || !std::isfinite(s) || !(s > 0) || ref < 0
+        || !std::isfinite(applied.fps) || applied.fps <= 0 || !std::isfinite(applied.startSec))
+        return false;
+    QVector<Pose> poses = applied.poses;
+    QVector<QVector3D> points = applied.points;
+    normaliseToReference(poses, points, ref);
+    SolveMapping mapping = applied.mapping;
+    mapping.referenceIndex = ref;
+    mapping.legacy = false;
+    mapping.startSec = applied.startSec;
+    mapping.sampleCount = int(applied.poses.size());
+    mapping.fps = applied.fps;
+    auto base = camera.camera();
+    base.trueProjection = true;
+    base.fov = f;
+    camera.setCamera(base);
+    // Decision C2: the solve's f replaces the whole Fov track (constant f).
+    *camera.track(Camera3DProperty::Fov) = KeyframeTrack(
+        Camera3D::propertyName(Camera3DProperty::Fov),
+        Camera3D::propertyDefaultValue(Camera3DProperty::Fov));
+    for (qsizetype i = 0; i < poses.size(); ++i) {
+        if (poses[i].valid)
+            camera.setCameraKeyframe(applied.startSec + double(i) / applied.fps,
+                                     poseToProjectCameraState(poses[i], base, mapping));
+    }
+    camera.setSolveMapping(mapping);
+    // The cloud replaces any earlier one; it is bounded like the bundle that produced it.
+    if (points.size() > sfm::kMaxBundlePoints) points.resize(sfm::kMaxBundlePoints);
+    camera.setSolvePoints(points);
+    return true;
 }
 } // namespace camsolve

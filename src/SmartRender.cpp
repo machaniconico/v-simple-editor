@@ -447,6 +447,8 @@ QString specialOverlayReasonForClip(const ClipInfo& clip)
         return QStringLiteral("clip has text overlays");
     if (!clip.text3DConfig.isEmpty())
         return QStringLiteral("clip has 3D text");
+    if (!clip.brushData.isEmpty())
+        return QStringLiteral("clip has brush strokes");
     if (clip.colorMeta.isHdr)
         return QStringLiteral("clip source is HDR");
     return QString();
@@ -473,6 +475,8 @@ SegmentEligibility canStreamCopy(const ClipInfo& clip,
 {
     if (!clip.text3DConfig.isEmpty())
         return reject(QStringLiteral("clip has 3D text"));
+    if (!clip.brushData.isEmpty())
+        return reject(QStringLiteral("clip has brush strokes"));
     if (hasEffects || !clip.effects.isEmpty())
         return reject(QStringLiteral("clip has effects"));
     if (hasColorCorrection || !clip.colorCorrection.isDefault() || clip.hasLut())

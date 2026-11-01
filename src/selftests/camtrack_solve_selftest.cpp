@@ -22,7 +22,7 @@ template<class Tag, typename Tag::Type Member> struct Access {
 #define ACCESS(Name, TypeExpr, MemberExpr) \
     struct Name { using Type = TypeExpr; friend Type member(Name); }; \
     template struct Access<Name, MemberExpr>;
-ACCESS(Apply, void (MainWindow::*)(const QVector<camsolve::Pose>&, double, double), &MainWindow::applyCameraSolve)
+ACCESS(Apply, void (MainWindow::*)(const camsolve::CameraSolveApplied&), &MainWindow::applyCameraSolve)
 ACCESS(Undo, void (MainWindow::*)(), &MainWindow::undoAction)
 ACCESS(Camera, Camera3D MainWindow::*, &MainWindow::m_projectCamera)
 ACCESS(TimelineMember, Timeline* MainWindow::*, &MainWindow::m_timeline)
@@ -93,11 +93,20 @@ int runCamtrackSolveSelftest()
     int appliedSignals = 0;
     double emittedFps = 0, emittedStart = 0;
     QVector<camsolve::Pose> emitted;
+    camsolve::CameraSolveApplied emittedApplied;
     QObject::connect(&dialog, &PlanarTrackerDialog::cameraSolveApplied, &window,
-        [&](const QVector<camsolve::Pose>& poses, double fps, double start) {
-            ++appliedSignals; emitted = poses; emittedFps = fps; emittedStart = start;
-            (window.*member(Apply{}))(poses, fps, start);
+        [&](const camsolve::CameraSolveApplied& applied) {
+            ++appliedSignals; emittedApplied = applied; emitted = applied.poses;
+            emittedFps = applied.fps; emittedStart = applied.startSec;
+            (window.*member(Apply{}))(applied);
         });
+    // The feature path applies the reference-centred, scaled mapping of the emitted solve.
+    const auto expectedState = [&](qsizetype i) {
+        auto poses = emittedApplied.poses;
+        auto points = emittedApplied.points;
+        camsolve::normaliseToReference(poses, points, camsolve::referencePoseIndex(poses));
+        return camsolve::poseToProjectCameraState(poses[i], camera.camera(), emittedApplied.mapping);
+    };
     const bool solved = dialog.solveFeatureCamera();
     const auto result = dialog.featureSolveResult();
     double rotation = 0, direction = 0;
@@ -116,7 +125,7 @@ int runCamtrackSolveSelftest()
     const auto* keys = camera.track(Camera3DProperty::PositionX);
     bool applied = keys && keys->count() == tracks.frameCount && camera.camera().trueProjection;
     for (int i = 0; applied && i < emitted.size(); ++i) {
-        const auto expected = camsolve::poseToCameraState(emitted[i], camera.camera());
+        const auto expected = expectedState(i);
         const auto actual = camera.getCameraAt(5+double(i)/24);
         applied = (actual.position-expected.position).length() < 1e-5
             && (actual.target-expected.target).length() < 1e-5;
@@ -251,7 +260,7 @@ int runCamtrackSolveSelftest()
             const int source = reversed ? tracks.frameCount-1-i : i;
             order = emitted[i].t == dialog.featureSolveResult().bundle.poses[source].t;
             const double expectedTime = 5 + (reversed ? 4-(54.0+source)/24 : (54.0+source)/24-2)/2;
-            const auto expectedCamera = camsolve::poseToCameraState(emitted[i], camera.camera());
+            const auto expectedCamera = expectedState(i);
             const auto actualCamera = camera.getCameraAt(expectedTime);
             order = order && std::abs(emittedStart+i/emittedFps-expectedTime) < 1e-10
                 && (actualCamera.position-expectedCamera.position).length() < 1e-5
@@ -319,7 +328,7 @@ int runCamtrackSolveSelftest()
                 && positionKeys && positionKeys->count() >= input.frameCount
                 && emitted.size() == input.frameCount;
             for (int i = 0; appliedNow && i < emitted.size(); ++i) {
-                const auto expected = camsolve::poseToCameraState(emitted[i], camera.camera());
+                const auto expected = expectedState(i);
                 const auto keyed = camera.getCameraAt(emittedStart+double(i)/emittedFps);
                 appliedNow = (keyed.position-expected.position).length() < 1e-5
                     && (keyed.target-expected.target).length() < 1e-5;

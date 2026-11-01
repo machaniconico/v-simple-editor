@@ -100,6 +100,9 @@ constexpr int kExportClipWidth = 64;
 constexpr int kExportClipHeight = 16;
 constexpr int kExportClipFps = 12;
 constexpr int kExportClipFrames = 3;
+constexpr double kG20MinStripLuma = 100.0;
+constexpr double kG20MinMeanDiff = 40.0;
+constexpr int kG20MinOverlapSpread = 20;
 
 QImage makeExportFrame(int frameIndex)
 {
@@ -115,11 +118,11 @@ QImage makeExportFrame(int frameIndex)
     return image;
 }
 
-bool writeExportClip(const QString &path, QString *error)
+bool writeExportClip(const QString &path, QString *error, const QImage &stillFrame = QImage())
 {
     libavcore::EncodeRequest request;
-    request.width = kExportClipWidth;
-    request.height = kExportClipHeight;
+    request.width = stillFrame.isNull() ? kExportClipWidth : stillFrame.width();
+    request.height = stillFrame.isNull() ? kExportClipHeight : stillFrame.height();
     request.fps = kExportClipFps;
     request.fpsNum = kExportClipFps;
     request.fpsDen = 1;
@@ -137,7 +140,8 @@ bool writeExportClip(const QString &path, QString *error)
         return false;
     }
     for (int frameIndex = 0; frameIndex < kExportClipFrames; ++frameIndex) {
-        if (!encoder.pushFrame(makeExportFrame(frameIndex), frameIndex)) {
+        if (!encoder.pushFrame(stillFrame.isNull() ? makeExportFrame(frameIndex) : stillFrame,
+                               frameIndex)) {
             if (error)
                 *error = QStringLiteral("FrameEncoder::pushFrame failed at frame %1")
                     .arg(frameIndex);
@@ -764,6 +768,103 @@ int runLight3DSelftest()
             QStringLiteral("actual=%1 expected=%2 (lighting rotation order differs "
                            "from projectLayerQuad)")
                 .arg(actual).arg(expectedValue).toStdString());
+    }
+
+    // G20 (US-1813): lighting follows the quad through production renderFrameAt. The render
+    // projects first and lights the projected image, where a pixel index is a canvas position,
+    // so the highlight stays at the light's canvas position while the moved pixels take the
+    // light of where they landed. The 32x16 clip is pillarboxed by fitContain into the 64x16
+    // canvas (x 16..48), which leaves canvas to move into: at Z = 0 a full-canvas layer would
+    // push its newly covered strip off the canvas. A falloff light makes the gain vary across
+    // the overlap, so lighting the moved quad a second time by worldX changes those pixels.
+    {
+        const int worldShift = 12;
+        const QRect overlap(16 + worldShift + 2, 2, 32 - worldShift - 4, kExportClipHeight - 4);
+        const QRect newlyCovered(48 + 2, 2, worldShift - 4, kExportClipHeight - 4);
+        const QRect vacated(16 + 2, 2, worldShift - 4, kExportClipHeight - 4);
+        QImage uniformFrame(QSize(32, kExportClipHeight), QImage::Format_RGB888);
+        uniformFrame.fill(QColor(100, 100, 100));
+        QString uniformMediaError;
+        const QString uniformMediaPath = exportTempDir.filePath(
+            QStringLiteral("light3d-uniform-fixture.mp4"));
+        const bool uniformMediaReady = exportTempDir.isValid()
+            && writeExportClip(uniformMediaPath, &uniformMediaError, uniformFrame);
+        Light3DState bulb;
+        bulb.type = LightType::Point;
+        bulb.position = QVector3D(38.0f, 8.0f, 12.0f);
+        bulb.falloffEnabled = true;
+        bulb.falloffRadius = 0.0;
+        bulb.falloffDistance = 40.0;
+        LayerMaterial diffuseOnly;
+        diffuseOnly.ambientCoeff = 0.0;
+        diffuseOnly.diffuseCoeff = 1.0;
+        diffuseOnly.specularCoeff = 0.0;
+        Camera3DState trueCamera;
+        trueCamera.trueProjection = true;
+        const auto renderAtWorldX = [&](double worldX) {
+            ClipInfo clip = makeExportClip(uniformMediaPath);
+            clip.is3DLayer = true;
+            clip.fitContain = true;
+            clip.material = diffuseOnly;
+            clip.layer3D.worldX = worldX;
+            Timeline timeline;
+            if (!uniformMediaReady || !setExportClip(timeline, clip))
+                return QImage();
+            timeline.setProjectCamera(trueCamera);
+            timeline.setProjectLights({Light3D(bulb)});
+            timeline.setProjectLightViewPosition(viewPos);
+            return tlrender::renderFrameAt(&timeline, 0, exportCanvas);
+        };
+        const QImage atOrigin = renderAtWorldX(0.0);
+        const QImage atWorld = renderAtWorldX(worldShift);
+        const bool rendered = !atOrigin.isNull() && !atWorld.isNull();
+        const auto regionLuma = [](const QImage &image, const QRect &region) {
+            return image.isNull() ? -1.0 : meanLuma(image.copy(region));
+        };
+        int overlapMaxChannel = -1;
+        int overlapRedMin = 255;
+        int overlapRedMax = 0;
+        double diffSum = 0.0;
+        if (rendered) {
+            for (int y = 0; y < atOrigin.height(); ++y) {
+                for (int x = 0; x < atOrigin.width(); ++x) {
+                    const QRgb a = atOrigin.pixel(x, y);
+                    const QRgb b = atWorld.pixel(x, y);
+                    diffSum += std::abs(qRed(a) - qRed(b));
+                    if (overlap.contains(x, y)) {
+                        overlapRedMin = qMin(overlapRedMin, qRed(a));
+                        overlapRedMax = qMax(overlapRedMax, qRed(a));
+                        overlapMaxChannel = qMax(overlapMaxChannel, qMax(
+                            std::abs(qRed(a) - qRed(b)), qMax(std::abs(qGreen(a) - qGreen(b)),
+                                                              std::abs(qBlue(a) - qBlue(b)))));
+                    }
+                }
+            }
+        }
+        const double meanDiff = rendered ? diffSum / (atOrigin.width() * atOrigin.height()) : -1.0;
+        const double newlyLit = regionLuma(atWorld, newlyCovered);
+        const double newlyBefore = regionLuma(atOrigin, newlyCovered);
+        const double vacatedLuma = regionLuma(atWorld, vacated);
+        const double vacatedBefore = regionLuma(atOrigin, vacated);
+        const bool highlightStays = rendered && overlapMaxChannel <= 2
+            && overlapRedMax - overlapRedMin >= kG20MinOverlapSpread;
+        const bool quadMoved = rendered && newlyLit > kG20MinStripLuma
+            && newlyBefore <= 2.0 && vacatedBefore > kG20MinStripLuma && vacatedLuma <= 2.0
+            && meanDiff > kG20MinMeanDiff;
+        std::cerr << "light3d G20 mediaReady=" << uniformMediaReady
+                  << " rendered=" << rendered
+                  << " overlapMaxChannel=" << overlapMaxChannel
+                  << " overlapRed=" << overlapRedMin << ".." << overlapRedMax
+                  << " highlightStays=" << highlightStays
+                  << " newlyLit=" << newlyLit << " newlyBefore=" << newlyBefore
+                  << " vacatedLuma=" << vacatedLuma << " vacatedBefore=" << vacatedBefore
+                  << " meanRedDiffVsOrigin=" << meanDiff
+                  << " quadMoved=" << quadMoved << '\n';
+        tally.gate(20,
+            highlightStays && quadMoved,
+            QStringLiteral("highlightStays=%1 quadMoved=%2 (lighting does not follow the moved "
+                           "quad in renderFrameAt)").arg(highlightStays).arg(quadMoved)
+                .toStdString());
     }
 
     return tally.finish("light3d");

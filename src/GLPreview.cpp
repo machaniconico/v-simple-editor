@@ -1220,10 +1220,20 @@ void GLPreview::setBrushAnimation(BrushAnimation *animation)
 // US-1708: the image paintGL uploads before motion / projection: the baked
 // project-camera frame or the decoded frame, with the bound brush drawn on the
 // decoded frame (never on the baked frame, which already holds every track).
+// US-1805: nor on a special composite shown while paused on a timeline that
+// tlrender::timelineBrushWantsSpecialPath routes through it, which already holds
+// every clip's brush. Other composite-baked frames (the player's multi-track
+// compositor, playback, a helper-true timeline's fallback to the ordinary frame)
+// keep the selected-clip brush.
 QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
 {
     QImage frame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
-    if (m_brushAnimation && !cameraBaked) {
+    const VideoPlayer *player = ownerPlayer();
+    const bool specialCompositeHoldsBrush = m_compositeBakedMode
+        && !(player && player->isPlaying())
+        && tlrender::timelineBrushWantsSpecialPath(m_timeline)
+        && property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
+    if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush) {
         OverlayRenderer::renderBrushOverlay(frame,
                                             m_brushAnimation,
                                             m_brushAnimationProgress);
@@ -1231,9 +1241,71 @@ QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
     return frame;
 }
 
+// US-1805: cameraBaked with paintGL's expression (the project camera at the
+// player's time must be trueProjection, not just a baked frame left over).
 QImage GLPreview::uploadFrameForTest() const
 {
-    return brushedUploadFrame(m_timeline && !m_projectCameraFrame.isNull());
+    const double cameraSec = resolveCameraSeconds();
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
+    return brushedUploadFrame(cameraBaked);
+}
+
+// US-1813: the rotation / 3D projection paintGL applies to the upload when it is not
+// camera-baked. The trueProjection branch projects at the upload size, so worldX / worldY
+// (canvas px) are scaled to it (canvas = the owner player's project output size, else the
+// upload size: factor 1).
+QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, bool is3DLayer,
+                                       const Layer3DTransform &layer3D,
+                                       const Camera3DState &projectCamera,
+                                       bool compositeBaked) const
+{
+    QImage uploadFrame = upload;
+    if (!compositeBaked
+        && (std::abs(rotation2D) > 1e-4 || is3DLayer
+            || (projectCamera.trueProjection && !layer3D.isDefault()))) {
+        if (projectCamera.trueProjection) {
+            QSize canvas;
+            if (const auto *player = ownerPlayer())
+                canvas = player->projectOutputSize();
+            if (canvas.isEmpty())
+                canvas = uploadFrame.size();
+            uploadFrame = applyProjectCameraProjection(
+                uploadFrame,
+                camera3d::layer3DForPreviewScale(layer3D, uploadFrame.size(), canvas),
+                is3DLayer, projectCamera, uploadFrame.size());
+            uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
+        } else {
+            uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
+            if (is3DLayer) {
+                Camera3DState cameraState;
+                uploadFrame = Camera3D::applyPerspective(uploadFrame,
+                                                         layer3D,
+                                                         cameraState,
+                                                         uploadFrame.size());
+            }
+        }
+    }
+    return uploadFrame;
+}
+
+QImage GLPreview::projectedUploadFrameForTest(bool is3DLayer, const Layer3DTransform &layer3D,
+                                              double rotation2D) const
+{
+    const double cameraSec = resolveCameraSeconds();
+    const Camera3DState projectCamera = m_timeline ? m_timeline->projectCameraAt(cameraSec)
+        : (m_projectCamera.hasAnimation() ? m_projectCamera.getCameraAt(cameraSec)
+                                         : m_projectCamera.camera());
+    const bool cameraBaked = projectCamera.trueProjection && m_timeline
+        && !m_projectCameraFrame.isNull();
+    const QImage upload = brushedUploadFrame(cameraBaked);
+    if (cameraBaked)
+        return upload;
+    return projectedUploadFrame(upload, rotation2D, is3DLayer, layer3D, projectCamera,
+                                m_compositeBakedMode);
 }
 
 void GLPreview::clearBrushAnimation()
@@ -1251,6 +1323,17 @@ void GLPreview::setBrushAnimationProgress(double progress)
         return;
     m_brushAnimationProgress = clamped;
     m_needsUpload = true;
+    update();
+}
+
+void GLPreview::setSolvePointOverlay(const QVector<QPointF> &points, const QSize &canvas,
+                                     const QVector<int> &indices)
+{
+    m_solvePointOverlayIndices = indices;
+    if (m_solvePointOverlay == points && m_solvePointOverlayCanvas == canvas)
+        return;
+    m_solvePointOverlay = points;
+    m_solvePointOverlayCanvas = canvas;
     update();
 }
 
@@ -2144,25 +2227,9 @@ void GLPreview::paintGL()
             m_videoSourceDx = renderDx;
             m_videoSourceDy = renderDy;
         }
-        if (!compositeBaked
-            && (std::abs(previewMotion.rotation2D) > 1e-4 || previewMotion.is3DLayer
-                || (projectCamera.trueProjection && !previewMotion.layer3D.isDefault()))) {
-            if (projectCamera.trueProjection) {
-                uploadFrame = applyProjectCameraProjection(
-                    uploadFrame, previewMotion.layer3D, previewMotion.is3DLayer,
-                    projectCamera, uploadFrame.size());
-                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-            } else {
-                uploadFrame = applyPlanarRotation(uploadFrame, previewMotion.rotation2D);
-                if (previewMotion.is3DLayer) {
-                    Camera3DState cameraState;
-                    uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                             previewMotion.layer3D,
-                                                             cameraState,
-                                                             uploadFrame.size());
-                }
-            }
-        }
+        uploadFrame = projectedUploadFrame(uploadFrame, previewMotion.rotation2D,
+                                           previewMotion.is3DLayer, previewMotion.layer3D,
+                                           projectCamera, compositeBaked);
     }
 
     // US-T34 OBS-style source transform — shrink/move the viewport so the
@@ -2804,6 +2871,25 @@ void GLPreview::paintGL()
         }
     }
 
+    // US-1817: solved point cloud, canvas px mapped onto the displayed image area.
+    if (!m_solvePointOverlay.isEmpty() && !m_solvePointOverlayCanvas.isEmpty()) {
+        const QRectF box = letterboxRect();
+        const double scaleX = box.width() / m_solvePointOverlayCanvas.width();
+        const double scaleY = box.height() / m_solvePointOverlayCanvas.height();
+        const double arm = 4.0;
+        QVector<QLineF> crosses;
+        crosses.reserve(m_solvePointOverlay.size() * 2);
+        for (const QPointF &point : m_solvePointOverlay) {
+            const QPointF p(box.left() + point.x() * scaleX, box.top() + point.y() * scaleY);
+            crosses.append(QLineF(p.x() - arm, p.y(), p.x() + arm, p.y()));
+            crosses.append(QLineF(p.x(), p.y() - arm, p.x(), p.y() + arm));
+        }
+        QPainter opainter(this);
+        opainter.setClipRect(box);
+        opainter.setPen(QPen(QColor(80, 255, 120, 230), 1));
+        opainter.drawLines(crosses);
+    }
+
     // US-MOCHA-3: SurfaceTool overlay — 4-corner pin gizmo drawn after all
     // other overlay visuals so it renders on top.
     if (m_surfaceTool && m_surfaceTool->isEnabled()) {
@@ -2838,6 +2924,32 @@ void GLPreview::paintTimecodeBurnInOverlay()
     m_timecodeBurnInRenderer.paintOnto(
         painter, letterboxRect(), timelineSec, m_timecodeBurnInFrameRate,
         timecodeBurnInClipNameAt(m_timeline, timelineSec));
+}
+
+// US-1818: the overlay index under a widget position, or -1. The distance is measured in
+// widget px, after the same canvas -> widget mapping paintGL draws the crosses with.
+int GLPreview::solvePointAt(const QPointF &widgetPos) const
+{
+    if (m_solvePointOverlay.isEmpty() || m_solvePointOverlayCanvas.isEmpty())
+        return -1;
+    const QRectF box = letterboxRect();
+    const double scaleX = box.width() / m_solvePointOverlayCanvas.width();
+    const double scaleY = box.height() / m_solvePointOverlayCanvas.height();
+    int nearest = -1;
+    double nearestDistance = 8.0;
+    for (int i = 0; i < m_solvePointOverlay.size(); ++i) {
+        const QPointF &point = m_solvePointOverlay[i];
+        const QPointF mapped(box.left() + point.x() * scaleX, box.top() + point.y() * scaleY);
+        // paintGL clips the 4 px crosses to the box: a cross wholly outside it is not on screen.
+        if (!box.adjusted(-4.0, -4.0, 4.0, 4.0).contains(mapped))
+            continue;
+        const double distance = QLineF(widgetPos, mapped).length();
+        if (distance <= nearestDistance) {
+            nearest = i;
+            nearestDistance = distance;
+        }
+    }
+    return nearest;
 }
 
 QRectF GLPreview::letterboxRect() const
@@ -3153,6 +3265,14 @@ void GLPreview::mousePressEvent(QMouseEvent *event)
     // US-MOCHA-3: SurfaceTool intercepts mouse events when installed and enabled.
     if (m_surfaceTool && m_surfaceTool->isEnabled()) {
         if (m_surfaceTool->handleMousePress(event->pos(), event->button(), event->modifiers())) {
+            event->accept();
+            return;
+        }
+    }
+    if (!m_textToolActive && event->button() == Qt::LeftButton) {
+        const int solvePoint = solvePointAt(event->pos());
+        if (solvePoint >= 0) {
+            emit solvePointClicked(m_solvePointOverlayIndices.value(solvePoint, solvePoint));
             event->accept();
             return;
         }
