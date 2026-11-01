@@ -2232,7 +2232,7 @@
 
 ## 調べられなかった範囲とその理由
 - 実行による再現: ビルドが通らない(下記)ため、どの指摘も実機・selftest では確認していません。「確認済み」はコード上で呼び出し元から呼び出し先まで追跡したという意味です。
-- `src/selftests/`(約 11.7 万行)はテストコードのため精読対象外とし、cppcheck の機械走査のみ行いました。ただし本番の認証情報を壊す selftest(第 2 部 Medium)は本体側の区画で検出しています。
+- `src/selftests/`(約 11.7 万行)はテストコードのため精読対象外とし、cppcheck の機械走査も 1 回目が打ち切られたため一部のみです(完走した 2 回目は selftests を除外)。ただし本番の認証情報を壊す selftest(第 2 部 Medium)は本体側の区画で検出しています。
 - 外部仕様に依存する点(FFmpeg の qsin 曲線・libx264 で crf が bitrate より優先される挙動・Final Cut Pro / Resolve の XML 解釈・各 SNS API の上限)は知識に基づく判断で、この環境では一次資料を確認していません。確認方法: FFmpeg の `libavfilter/af_afade.c` と `libavcodec/libx264.c` のソース、各ベンダーの XML / API リファレンス。
 - Windows / macOS 固有の動作(日本語パスの ANSI 変換、Defender 除外、VST bundle)は Linux 上での静的読解のみ。
 - リポジトリに `AGENTS.md` と `graphify-out/` が無いため、CLAUDE.md の graphify 参照はできませんでした。
