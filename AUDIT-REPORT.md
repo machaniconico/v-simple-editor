@@ -1,7 +1,7 @@
 # AUDIT-REPORT: v-simple-editor `feat/nle-gap-wave18`(f483e21)
 
 ## 全体所見
-- 重点 3 領域の監査(第 1 部、23 件)の後、リポジトリ全体(アプリ本体 804 ファイル・25.7 万行とスクリプト/CMake)を 19 区画で全行精読し、さらに cppcheck で機械走査しました(cppcheck は本報告の時点で未完了。末尾参照)(第 2 部、重複統合後 208 件: High 11 / Medium 101 / Low 96)。Critical はありません。
+- 重点 3 領域の監査(第 1 部、23 件)の後、リポジトリ全体(アプリ本体 804 ファイル・25.7 万行とスクリプト/CMake)を 19 区画で全行精読し、さらに cppcheck で機械走査しました(本体 393 ファイル、完走)(第 2 部、重複統合後 208 件: High 11 / Medium 101 / Low 96)。Critical はありません。
 - 最も多い不具合の型は「操作対象の取り違え」です。V1 固定の単一引数 API(`m_videoTrack`)や「V1 と同番号の A1」を書き換える経路が、エフェクトコントロール・カラーパネル・速度・音量などに散在し、V2 以上のクリップの編集が保存されない、または別のクリップを上書きします。
 - 次いで「保存/書き出しに届かない状態」(マーカー、スタビライズ結果、カラーパネルの一部、VFX コントロール、マスターコンプ)と、「成功と表示して何もしない機能」が多く、利用者が気付かないまま作業結果を失います。
 - 安全性では、MCP/AI チャット経由の任意パス書き込み、Vault を通らない配信系トークン、認証のないネットワークレンダーサーバ、API キーのエラー表示が要対応です。
@@ -2243,5 +2243,5 @@
 - 構成: `cmake -B /home/user/build18 -S . -DCMAKE_BUILD_TYPE=Release` → 成功
 - ビルド: `cmake --build /home/user/build18 -j -- -k` → 失敗(rc=2、46 翻訳単位がエラー、リンク未到達)。原因はいずれも環境のライブラリが古いこと(FFmpeg 7.1+ の `avcodec_get_supported_config` 系 API 不在、Qt 6.4 の QPointer/QWeakPointer API 非互換、QtSvg 未導入)。残りの翻訳単位はコンパイル成功。
 - selftest(`--selftest=all` 等): 実行ファイルを作れず未実行。
-- 静的解析: `cppcheck -j4 --library=qt --enable=warning,performance,portability --inconclusive --std=c++17 -Isrc src` → **走査は未完了(この報告の時点で実行中)**。途中までの出力に含まれていた本体の warning 以上 21 件を手で確認した結果、実害のある新規不具合はなし(`TextManager::defaultTemplate` の `outline2Width` 未初期化は呼び出し元が無く到達しない、`Timeline::insertAudioClipAtPlayhead` の負インデックスは呼び出し元が常に 2 を渡す、`TextOverlayBake.cpp:288` / `McpEditorTools.cpp:1246` / `CollabProjectShare.cpp:52` は誤検出)。初回の `--library=qt` なしの走査は Qt マクロを解釈できず有効な結果になりませんでした。
+- 静的解析: 1 回目 `cppcheck --library=qt ... src`(selftests を含む全体、--inconclusive)は 2 時間の実行上限で打ち切られ未完了。2 回目 `cppcheck -j4 --max-configs=1 --library=qt --enable=warning,portability --std=c++17 -Isrc --file-list=<selftests を除く本体 393 個の .cpp>` → 完走(393/393、rc=0)。warning 以上 12 件をすべて手で確認し、実害のある新規不具合はなし: `TextManager::defaultTemplate` の `outline2Width` 未初期化は呼び出し元が無く到達しない / `Timeline::insertAudioClipAtPlayhead` の負インデックスは呼び出し元が常に 2 を渡す / `CollabProjectShare.cpp:52` は誤検出 / `MainWindow.cpp:4031・9295・11295` の null 判定冗長は、コンストラクタで生成され常に非 null のメンバーに対する防御的な判定 / `Timeline.cpp:12657・12663` のポインタ変換は PCM バッファを float/double として読む意図どおりの処理 / duplInheritedMember 2 件は設計上の隠蔽で不具合ではない。Qt マクロを解釈しない最初の走査(--library=qt なし)は有効な結果になりませんでした。selftests はこの静的解析の対象外です。
 - 補助計算: 24/48/12fps のフレーム時刻切り捨て件数を Python で算出(第 1 部に記載)。
