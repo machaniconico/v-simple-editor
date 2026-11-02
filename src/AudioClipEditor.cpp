@@ -1,4 +1,5 @@
 #include "AudioClipEditor.h"
+#include "PlaybackTypes.h"
 
 #include <QPainter>
 #include <QPen>
@@ -63,11 +64,11 @@ AudioClipEditor::AudioClipEditor(QWidget* parent)
     auto* volumeLabel = new QLabel(QStringLiteral("音量"), m_controlPanel);
     m_volumeSlider = new QSlider(Qt::Horizontal, m_controlPanel);
     m_volumeSlider->setObjectName(QStringLiteral("clipVolumeSlider"));
-    m_volumeSlider->setRange(0, 200);
+    m_volumeSlider->setRange(0, qRound(audio::kMaxClipGain * 100.0));
     m_volumeSlider->setValue(100);
     m_volumeSlider->setFixedWidth(150);
     m_volumeSpin = new QDoubleSpinBox(m_controlPanel);
-    m_volumeSpin->setRange(0.0, 2.0);
+    m_volumeSpin->setRange(0.0, audio::kMaxClipGain);
     m_volumeSpin->setDecimals(2);
     m_volumeSpin->setSingleStep(0.01);
     m_volumeSpin->setValue(1.0);
@@ -323,7 +324,7 @@ double AudioClipEditor::evaluateAt(qint64 timeMs) const
 
 void AudioClipEditor::setVolume(double volume)
 {
-    m_volume = qBound(0.0, volume, 2.0);
+    m_volume = audio::clampClipGain(volume);
     m_updatingControls = true;
     if (m_volumeSlider) m_volumeSlider->setValue(qRound(m_volume * 100.0));
     if (m_volumeSpin) m_volumeSpin->setValue(m_volume);

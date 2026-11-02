@@ -261,7 +261,7 @@ inline int transBadgeWidth(double durSec, double pps, int clipWidth) {
 // audio clip interaction (drag, trim, transition badge) is unchanged.
 bool g_envelopeEditMode = false;
 constexpr int kEnvelopePointRadiusPx = 5;
-constexpr double kEnvelopeMaxGain = 2.0;     // matches ClipInfo::volume cap
+constexpr double kEnvelopeMaxGain = 2.0;     // rubber band display ceiling (not the ClipInfo::volume cap)
 constexpr double kEnvelopeHitRadiusPx = 5.0; // mouse hit radius for points
 constexpr qint64 kDefaultAdjustmentLayerDurationUs = 5LL * 1000000LL;
 constexpr int kAdjustmentLayerMinPaintWidthPx = 42;
@@ -5458,7 +5458,7 @@ void Timeline::applyDuckingFromTrack(int voiceTrackIdx,
     }
     if (voiceRanges.isEmpty()) return;
 
-    duckGain = qBound(0.0, duckGain, 2.0);
+    duckGain = audio::clampClipGain(duckGain);
     attackSec = qMax(0.0, attackSec);
     releaseSec = qMax(0.0, releaseSec);
 
@@ -7615,7 +7615,7 @@ bool Timeline::setClipPropertyByIndex(bool audio, int trackIndex, int clipIndex,
     double lower = 0.0;
     double upper = 0.0;
     if (property == QStringLiteral("volume")) {
-        upper = 2.0;
+        upper = audio::kMaxClipGain;
     } else if (property == QStringLiteral("opacity")) {
         upper = 1.0;
     } else if (property == QStringLiteral("speed")) {
@@ -11393,7 +11393,7 @@ void Timeline::setClipVolume(double volume, bool recordUndo)
 {
     int sel = m_videoTrack->selectedClip();
     if (sel < 0) return;
-    volume = qMax(0.0, qMin(2.0, volume));
+    volume = audio::clampClipGain(volume);
     auto audioClips = m_audioTrack->clips();
     if (sel < audioClips.size()) {
         audioClips[sel].volume = volume;
@@ -12708,7 +12708,7 @@ void Timeline::normalizeAudioClipPeak(int trackIdx, int clipIdx)
 
     const double oldVol = clip.volume;
     const double gainLinear = std::pow(10.0, gainDb / 20.0);
-    const double newVol = qBound(0.0, oldVol * gainLinear, 4.0);
+    const double newVol = audio::clampClipGain(oldVol * gainLinear);
 
     // Snapshot pre-mutation so Ctrl+Z restores the original volume.
     // Mirrors MainWindow::onMeterRequestNormalize ordering (saveState then

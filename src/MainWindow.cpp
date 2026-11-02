@@ -652,7 +652,7 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
     const double attackSeconds = qMax(0.0, params.attackMs / 1000.0);
     const double releaseSeconds = qMax(0.0, params.releaseMs / 1000.0);
     const double duckDb = qMin(0.0, params.targetReductionDb);
-    const double baseGain = qBound(0.0, clip.volume, 2.0);
+    const double baseGain = audio::clampClipGain(clip.volume);
     bool hasDucking = false;
 
     auto appendAt = [&](double localSeconds) {
@@ -664,7 +664,7 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
         if (activity > 0.000001)
             hasDucking = true;
         const double gain = baseGain * dbToLinear(duckDb * activity);
-        env.append({localSeconds, qBound(0.0, gain, 2.0)});
+        env.append({localSeconds, audio::clampClipGain(gain)});
     };
 
     for (double t = 0.0; t < duration; t += keyframeIntervalSeconds)
@@ -11731,7 +11731,8 @@ void MainWindow::setClipVolume()
     if (!m_timeline->hasSelection()) return;
     bool ok;
     double vol = QInputDialog::getDouble(this, "Set Clip Volume",
-        "Volume (0% = mute, 100% = normal, 200% = boost):", 100.0, 0.0, 200.0, 0, &ok);
+        "Volume (0% = mute, 100% = normal, 400% = max):", 100.0, 0.0,
+        audio::kMaxClipGain * 100.0, 0, &ok);
     if (ok) {
         m_timeline->setClipVolume(vol / 100.0);
         statusBar()->showMessage(QString("Volume: %1%").arg(static_cast<int>(vol)));

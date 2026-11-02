@@ -4245,7 +4245,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。worldX / worldY ±10000 (3D レイヤーのみ、プロジェクトカメラ (trueProjection) でのみ効く。is3DLayer=false のクリップは拒否)。autoOrientToCamera / is3DLayer / worldX / worldY は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..4、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。worldX / worldY ±10000 (3D レイヤーのみ、プロジェクトカメラ (trueProjection) でのみ効く。is3DLayer=false のクリップは拒否)。autoOrientToCamera / is3DLayer / worldX / worldY は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},

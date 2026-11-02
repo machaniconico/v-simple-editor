@@ -54,6 +54,16 @@
 //      and decompose restores
 //      the brushData and the brush_progress keys. Detects: as G10 (HEAD reversed 46.18),
 //      or progress keys not shifted with the handles.
+//   G12 (US-1901) the clip gain ceiling is one constant, audio::kMaxClipGain = 4.0: clampClipGain
+//      (3 / 5 / -1), a gain-3 envelope through sortedDedupedEnvelope / evaluateVolumeEnvelope,
+//      normalizeAudioClipPeak on a -30 dBFS wav (start 0.5 / 1.0 / 2.0), the gain-3 span-outside
+//      base of mergeDuckingEnvelope, AudioClipEditor (setVolume 3, slider 0..400),
+//      Timeline::setClipVolume through a selected video clip, setClipPropertyByIndex volume 3 / 4.5,
+//      and the export mix of a static volume-3 clip (executeMixPlan peak = 3x the volume-1 peak,
+//      a gain-3 envelope point likewise). Detects: any consumer still clamping at 2.0 (HEAD:
+//      editor 2.0, setClipVolume 2.0, property range [0, 2], export peak 2x; mutation build
+//      kMaxClipGain = 2.0).
+#include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../BrushAnimation.h"
 #include "../ProjectFile.h"
@@ -64,6 +74,7 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "SelftestGate.h"
 
@@ -76,6 +87,8 @@
 #include <QJsonObject>
 #include <QPointF>
 #include <QRect>
+#include <QSlider>
+#include <QStandardPaths>
 #include <QString>
 #include <QTemporaryDir>
 #include <QVector>
@@ -86,6 +99,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -227,6 +241,47 @@ Timeline *loadSingleClip(Timeline &timeline, const ClipInfo &clip)
     timeline.undoManager()->clear();
     timeline.saveUndoState(QStringLiteral("Initial"));
     return &timeline;
+}
+
+// A stereo 1 kHz float WAV of `seconds` at linear `amplitude`.
+bool writeToneWav(const QString &path, double amplitude, double seconds)
+{
+    std::vector<float> samples(size_t(seconds * 48000.0) * 2);
+    for (size_t i = 0; i < samples.size() / 2; ++i)
+        samples[2 * i] = samples[2 * i + 1] =
+            float(amplitude * std::sin(2.0 * 3.141592653589793 * 1000.0 * double(i) / 48000.0));
+    QString error;
+    return libavcore::writeWavFloatInterleaved(path, samples, 48000, 2, &error);
+}
+
+// Peak |sample| (0..1) of a PCM16 WAV; -1 when it cannot be read.
+double wavPeak(const QString &path)
+{
+    std::vector<double> samples;
+    int rate = 0;
+    if (!libavcore::readPcm16WavToMono(path, samples, rate) || samples.empty()) return -1.0;
+    double peak = 0.0;
+    for (double v : samples) peak = std::max(peak, std::abs(v));
+    return peak;
+}
+
+// Export mix peak of one audio clip (static volume, or a two-point envelope at `envGain`).
+double exportPeak(const QString &wav, const QString &outPath, double volume, double envGain)
+{
+    ClipInfo audio;
+    audio.filePath = wav;
+    audio.duration = audio.outPoint = 2.0;
+    audio.volume = volume;
+    if (envGain >= 0.0) audio.volumeEnvelope = {{0.0, envGain}, {2.0, envGain}};
+    AudioMixer mixer;
+    Timeline timeline;
+    timeline.setAudioMixer(&mixer);
+    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}}, QVector<QVector<ClipInfo>>{{audio}},
+                                0.0, -1.0, -1.0, 10);
+    const audioexport::MixPlan plan = audioexport::buildMixPlan(&timeline, &mixer, {outPath, 1.5});
+    QString error;
+    if (audioexport::executeMixPlan(plan, [] { return false; }, &error) != outPath) return -1.0;
+    return wavPeak(outPath);
 }
 
 } // namespace
@@ -1199,6 +1254,120 @@ int runClipSidecarSelftest()
                 QString::asprintf("handles 0.5 + speed 2: %s | reversed: %s (HEAD Step 0 reversed: 46.18)",
                                   qPrintable(shown(handled)), qPrintable(shown(backward))).toStdString());
         }
+    }
+
+    // G12 (US-1901): the clip gain ceiling is audio::kMaxClipGain = 4.0 everywhere.
+    {
+        bool ok = true;
+        QStringList shown;
+        const auto check = [&](const char *what, bool pass, const QString &value) {
+            ok = ok && pass;
+            shown << QStringLiteral("%1=%2%3").arg(QLatin1String(what), value,
+                                                 pass ? QString() : QStringLiteral("(BAD)"));
+        };
+        const auto num = [](double v) { return QString::number(v, 'f', 4); };
+
+        check("clamp3", audio::clampClipGain(3.0) == 3.0, num(audio::clampClipGain(3.0)));
+        check("clamp5", audio::clampClipGain(5.0) == 4.0, num(audio::clampClipGain(5.0)));
+        check("clamp-1", audio::clampClipGain(-1.0) == 0.0, num(audio::clampClipGain(-1.0)));
+        check("ceiling", audio::kMaxClipGain == 4.0, num(audio::kMaxClipGain));
+
+        const QVector<AudioGainPoint> env3{{0.0, 3.0}, {1.0, 3.0}};
+        const QVector<AudioGainPoint> deduped = audioexport::sortedDedupedEnvelope(env3);
+        const double dedupedGain = deduped.isEmpty() ? -1.0 : deduped.first().gain;
+        check("sortedDeduped", std::abs(dedupedGain - 3.0) <= 1e-9, num(dedupedGain));
+        const double evaluated = audio::clampClipGain(audio::evaluateVolumeEnvelope(env3, 0.5, 1.0));
+        check("evaluate", std::abs(evaluated - 3.0) <= 1e-9, num(evaluated));
+
+        const QVector<AudioGainPoint> merged = audioexport::mergeDuckingEnvelope(
+            {{0.0, 3.0}, {5.0, 3.0}}, {{1.0, 3.0}, {1.05, 3.0}}, 3.0);
+        const double mergedStart = audio::evaluateVolumeEnvelope(merged, 0.0, 3.0);
+        const double mergedEnd = audio::evaluateVolumeEnvelope(merged, 5.0, 3.0);
+        check("mergeSpanOutside", std::abs(mergedStart - 3.0) <= 1e-9 && std::abs(mergedEnd - 3.0) <= 1e-9,
+              num(mergedStart) + QLatin1Char('/') + num(mergedEnd));
+
+        // AudioClipEditor: the widgets and the stored value reach 3.0 (400 % slider).
+        {
+            AudioClipEditor editor;
+            editor.setVolume(3.0);
+            const QSlider *slider = editor.findChild<QSlider *>(QStringLiteral("clipVolumeSlider"));
+            const bool sliderOk = slider && slider->maximum() == 400 && slider->value() == 300;
+            check("editor", editor.volume() == 3.0 && sliderOk,
+                  num(editor.volume()) + QStringLiteral(" slider max/value ")
+                  + (slider ? QString::number(slider->maximum()) + QLatin1Char('/') + QString::number(slider->value())
+                            : QStringLiteral("none")));
+        }
+
+        // Timeline: setClipVolume writes the audio clip at the selected video clip's index; the
+        // MCP volume range is 0..4 and an out-of-range value names the ceiling.
+        {
+            ClipInfo video = sidecarClip(QStringLiteral("v"), 4.0);
+            ClipInfo audioClip = sidecarClip(QStringLiteral("a"), 4.0);
+            Timeline timeline;
+            timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{video}},
+                                        QVector<QVector<ClipInfo>>{{audioClip}}, 0.0, -1.0, -1.0, 100);
+            QString selectError;
+            const bool selected = timeline.selectClipByIndex(false, 0, 0, &selectError);
+            timeline.setClipVolume(3.0, false);
+            const double audioVolume = timeline.audioTracks()[0] && !timeline.audioTracks()[0]->clips().isEmpty()
+                ? timeline.audioTracks()[0]->clips()[0].volume : -1.0;
+            check("setClipVolume", selected && audioVolume == 3.0, num(audioVolume));
+
+            QString okError;
+            const bool set3 = timeline.setClipPropertyByIndex(true, 0, 0, QStringLiteral("volume"), 3.0, &okError);
+            const double after3 = timeline.audioTracks()[0]->clips()[0].volume;
+            QString badError;
+            const bool set45 = timeline.setClipPropertyByIndex(true, 0, 0, QStringLiteral("volume"), 4.5, &badError);
+            check("setClipProperty", set3 && after3 == 3.0 && !set45 && badError.contains(QLatin1Char('4')),
+                  QStringLiteral("3.0 -> %1 (%2), 4.5 -> %3 [%4]").arg(int(set3)).arg(num(after3))
+                      .arg(int(set45)).arg(badError));
+        }
+
+        // normalizeAudioClipPeak: a -30 dBFS tone reaches the ceiling.
+        const QString toneNormalize = tempDir.filePath(QStringLiteral("g12-normalize.wav"));
+        const bool toneWritten = tempDir.isValid() && writeToneWav(toneNormalize, std::pow(10.0, -30.0 / 20.0), 1.0);
+        check("normalizeFixture", toneWritten, QString::number(int(toneWritten)));
+        if (toneWritten) {
+            struct Case { double start; double expect; };
+            for (const Case c : {Case{0.5, 1.99}, Case{1.0, 3.98}, Case{2.0, 4.0}}) {
+                ClipInfo audioClip;
+                audioClip.filePath = toneNormalize;
+                audioClip.duration = audioClip.outPoint = 1.0;
+                audioClip.volume = c.start;
+                Timeline timeline;
+                timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+                                            QVector<QVector<ClipInfo>>{{audioClip}}, 0.0, -1.0, -1.0, 10);
+                timeline.normalizeAudioClipPeak(0, 0);
+                const double got = timeline.audioTracks()[0]->clips()[0].volume;
+                check(qPrintable(QStringLiteral("normalize%1").arg(c.start)),
+                      std::abs(got - c.expect) <= 0.01, num(got));
+            }
+        }
+
+        // Export mix: a static volume-3 clip and a gain-3 envelope are 3x the volume-1 mix.
+        bool exportRan = false;
+        const bool ffmpegFound = !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+        const QString toneExport = tempDir.filePath(QStringLiteral("g12-export.wav"));
+        const bool exportTone = tempDir.isValid() && writeToneWav(toneExport, 0.1, 2.0);
+        check("exportFixture", exportTone, QString::number(int(exportTone)));
+        if (exportTone && ffmpegFound) {
+            exportRan = true;
+            const double unity = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-unity.wav")), 1.0, -1.0);
+            const double staticThree = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-static3.wav")), 3.0, -1.0);
+            const double envThree = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-env3.wav")), 1.0, 3.0);
+            const auto triple = [&](double peak) {
+                return unity > 0.05 && std::abs(peak - 3.0 * unity) <= 0.05 * 3.0 * unity;
+            };
+            check("exportStatic3", triple(staticThree),
+                  QStringLiteral("peak %1 vs unity %2 (x3 expected, HEAD x2)").arg(num(staticThree), num(unity)));
+            check("exportEnvelope3", triple(envThree),
+                  QStringLiteral("peak %1 vs unity %2").arg(num(envThree), num(unity)));
+        }
+        const std::string detail = shown.join(QStringLiteral(", ")).toStdString();
+        if (ok && !exportRan && exportTone)
+            tally.skip(12, "ffmpeg unavailable (the export-mix checks did not run)");
+        else
+            tally.gate(12, ok, detail);
     }
 
     return tally.finish("clip-sidecar");

@@ -16,7 +16,7 @@
 //          duration. Final-Cut-style: speed changes stretch the envelope,
 //          trim moves the right edge so points beyond effDur clamp to the
 //          last gain. (Premiere uses source-time fixing, which we don't.)
-//   gain = linear multiplier (0.0 = silent, 1.0 = unity, 2.0 = +6 dB cap).
+//   gain = linear multiplier (0.0 = silent, 1.0 = unity, 4.0 = +12 dB cap (audio::kMaxClipGain)).
 // AudioMixer linearly interpolates between adjacent points; segments before
 // the first / after the last point clamp to that point's gain.
 struct AudioGainPoint {
@@ -25,6 +25,11 @@ struct AudioGainPoint {
 };
 
 namespace audio {
+// Ceiling for a clip's gain (static volume and envelope points), shared by preview,
+// export, the clip editor, Timeline and MCP.
+inline constexpr double kMaxClipGain = 4.0;
+inline double clampClipGain(double g) { return qBound(0.0, g, kMaxClipGain); }
+
 // Linear-interpolate the per-clip volume envelope at a given clip-local
 // time (seconds, 0.0 == clip start on the timeline). Empty envelope falls
 // back to the static `volume` field so existing behaviour is preserved
@@ -81,7 +86,7 @@ struct PlaybackEntry {
     bool fitCover = false;       // SNS cover fit, propagated from ClipInfo::fitCover
     clipcolor::ColorMeta colorMeta; // Per-clip input color metadata (Stage1 storage only)
     LayerStyle layerStyle;       // Per-clip layer style for preview/export parity; identity == no-op
-    double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
+    double volume = 1.0;         // Per-clip audio gain (0.0-4.0), propagated from ClipInfo::volume
     double pan = 0.0;            // Per-clip balance pan (-1.0..+1.0), propagated from ClipInfo::pan
     // US-1110 per-clip 4-band EQ, propagated from ClipInfo::clipEq /
     // clipEqEnabled. AudioMixer runs it before the track chain only when

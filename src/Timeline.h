@@ -218,7 +218,7 @@ struct ClipInfo {
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
-    double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    double volume = 1.0;  // 0.0 - 4.0 (0=mute, 1=normal, 4=max boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
     // US-1110 per-clip 4-band EQ. Off by default; saved as "clipEq" only when
     // clipEqEnabled. Nested sequences take the child's EQ when it is on,
