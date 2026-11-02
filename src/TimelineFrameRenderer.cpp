@@ -1982,50 +1982,81 @@ QImage applyClipBrushSource(const QImage &raw, const ClipInfo &clip, double loca
     return out;
 }
 
-bool timelineBrushWantsSpecialPath(const Timeline *timeline)
+bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
 {
     if (!timeline)
         return false;
     // Nor parenting, which renderFrameAt applies and the special composite
-    // does not.
-    if (veditor::parentingEnabledFromEnv() && !timeline->clipParentEntries().isEmpty())
-        return false;
+    // does not: an entry is checked against the active clips below.
+    const QHash<QString, QString> parentEntries = veditor::parentingEnabledFromEnv()
+        ? timeline->clipParentEntries() : QHash<QString, QString>();
     // An effective blend (the rule of the overlay loop below: VFX footage above
     // V1) is drawn by the composite, except with a matte source anywhere in the
     // timeline: that stays on the legacy path. A non-VFX blend is ignored here
     // as in the export.
     const bool hasMatteSource = !timeline->trackMatteEntries().isEmpty();
+    QSet<QString> activeClipIds;
     bool hasBrush = false;
     const auto &videoTracks = timeline->videoTracks();
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
         const auto *track = videoTracks[trackIdx];
-        if (!track)
+        if (!track || track->isHidden())
             continue;
-        for (const ClipInfo &clip : track->clips()) {
-            const bool effectiveBlend = clip.isVfxFootage && trackIdx > 0
-                && clip.blendMode != BlendMode::Normal;
-            if ((effectiveBlend && hasMatteSource) || clip.isAdjustment || clip.hasMask())
+        // The layer loop's choice, so a clip elsewhere on the timeline does not
+        // change this frame's route.
+        const QVector<ClipInfo> &clips = track->clips();
+        double clipStart = 0.0;
+        const int clipIdx = activeClipOnTrack(clips, timelineSec,
+                                              /*clampToFirst=*/trackIdx == 0, &clipStart);
+        if (clipIdx < 0)
+            continue;
+        const ClipInfo &clip = clips[clipIdx];
+        const double clipEnd = clipStart + clip.effectiveDuration();
+        activeClipIds.insert(renderClipId(trackIdx, clipIdx));
+        const bool effectiveBlend = clip.isVfxFootage && trackIdx > 0
+            && clip.blendMode != BlendMode::Normal;
+        if ((effectiveBlend && hasMatteSource) || clip.isAdjustment || clip.hasMask())
+            return false;
+        // Nor clips the special composite cannot draw as renderFrameAt does
+        // (shape, nested sequence, disabled): those frames keep their HEAD
+        // preview instead of losing the layer.
+        if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
+            return false;
+        // Nor what it places statically: keyframed transform / opacity (any
+        // track but brush_progress), SNS fit.
+        for (const KeyframeTrack &kf : clip.keyframes.tracks()) {
+            if (kf.propertyName() != QLatin1String("brush_progress"))
                 return false;
-            // Nor clips the special composite cannot draw as renderFrameAt does
-            // (shape, nested sequence, disabled): those timelines keep their
-            // HEAD preview instead of losing the layer.
-            if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
-                return false;
-            // Nor what it places statically or skips: keyframed transform /
-            // opacity (any track but brush_progress), SNS fit, transitions.
-            for (const KeyframeTrack &kf : clip.keyframes.tracks()) {
-                if (kf.propertyName() != QLatin1String("brush_progress"))
-                    return false;
-            }
-            if (clip.fitContain || clip.fitCover)
-                return false;
-            if (!clip.layerStyle.isIdentity())
-                return false;
-            if (clip.leadIn.type != TransitionType::None
-                || clip.trailOut.type != TransitionType::None)
-                return false;
-            hasBrush = hasBrush || !clip.brushData.isEmpty();
         }
+        if (clip.fitContain || clip.fitCover)
+            return false;
+        if (!clip.layerStyle.isIdentity())
+            return false;
+        // Nor the windows of the transitions it skips: an edge fade draws
+        // whatever the neighbours (applyEdgeFadeStep), a neighbour's transition
+        // overlaps this clip. Any type, whatever the alignment: conservative.
+        if ((clip.leadIn.type != TransitionType::None
+             && timelineSec < clipStart + clip.leadIn.duration)
+            || (clip.trailOut.type != TransitionType::None
+                && timelineSec >= clipEnd - clip.trailOut.duration))
+            return false;
+        if (clipIdx > 0 && clip.leadInSec <= 0.0) {
+            const ClipInfo &previous = clips[clipIdx - 1];
+            if (previous.trailOut.type != TransitionType::None
+                && timelineSec < clipStart + previous.trailOut.duration)
+                return false;
+        }
+        if (clipIdx + 1 < clips.size() && clips[clipIdx + 1].leadInSec <= 0.0) {
+            const ClipInfo &next = clips[clipIdx + 1];
+            if (next.leadIn.type != TransitionType::None
+                && timelineSec >= clipEnd - next.leadIn.duration)
+                return false;
+        }
+        hasBrush = hasBrush || !clip.brushData.isEmpty();
+    }
+    for (auto it = parentEntries.cbegin(); it != parentEntries.cend(); ++it) {
+        if (activeClipIds.contains(it.key()) || activeClipIds.contains(it.value()))
+            return false;
     }
     return hasBrush;
 }

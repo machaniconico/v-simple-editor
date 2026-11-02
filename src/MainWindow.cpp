@@ -382,8 +382,9 @@ extern "C" {
 }
 
 // Shared by the file menu and import hub; no persistent widget state needed.
-// US-1805: whether the frame presented next is a special composite. The GL
-// leaves the bound brush off only then (tlrender::kSpecialCompositeHoldsBrushProperty).
+// US-1906: whether the frame presented next is a special composite that drew the
+// brushes. The GL leaves the bound brush off only then
+// (tlrender::kSpecialCompositeHoldsBrushProperty).
 static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
 {
     player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
@@ -3162,9 +3163,10 @@ void MainWindow::applyStillCompareConfig()
     }
     if (!m_timeline)
         return;
-    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
+    bool drewBrush = false;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush);
     if (!special.isNull()) {
-        setSpecialCompositeHoldsBrush(m_player, true);
+        setSpecialCompositeHoldsBrush(m_player, drewBrush);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -4036,10 +4038,11 @@ void MainWindow::setupUI()
         const double sec = m_player->hasActiveSequence()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
-        const QImage special = buildSpecialClipComposite(sec);
+        bool drewBrush = false;
+        const QImage special = buildSpecialClipComposite(sec, &drewBrush);
         // US-1805: every paused displayFrame passes here, so an ordinary frame
         // (a null composite) clears the mark a previous composite left.
-        setSpecialCompositeHoldsBrush(m_player, !special.isNull());
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush);
         return special;
     });
 
@@ -4753,7 +4756,9 @@ void MainWindow::setupMenuBar()
     connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
         if (playing)
             setSpecialCompositeHoldsBrush(m_player, false);
-        else if (tlrender::timelineBrushWantsSpecialPath(m_timeline))
+        else if (m_timeline
+                 && tlrender::timelineBrushWantsSpecialPath(m_timeline,
+                                                            m_timeline->playheadPosition()))
             refreshSpecialClipPreview();
     });
     auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
@@ -8564,8 +8569,10 @@ QImage MainWindow::applyStoredRotoData(const QString &clipId,
     return roto::applyEntryToFrame(it.value(), frame, sourceFrameIndex);
 }
 
-QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
+QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush) const
 {
+    if (drewBrush)
+        *drewBrush = false;
     if (!m_timeline)
         return {};
 
@@ -8590,13 +8597,16 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
-    // US-1805: a brushed timeline without adjustment / clip mask (or a matte
-    // source with an effective blend, US-1905) takes
-    // this path (paused) and every clip's brush is drawn here; other timelines
-    // keep the GL's selected-clip brush on top (tlrender::timelineBrushWantsSpecialPath).
+    // US-1805: a brushed frame without adjustment / clip mask (or a matte source
+    // with an effective blend, US-1905) takes this path (paused) and every clip's
+    // brush is drawn here; other frames keep the GL's selected-clip brush on top
+    // (tlrender::timelineBrushWantsSpecialPath, the clips active at this time).
     // Playback keeps the selected-clip brush only (decision B6).
-    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline)
+    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline,
+                                                                              timelineSeconds)
         && !(m_player && m_player->isPlaying());
+    if (drewBrush)
+        *drewBrush = brushWantsSpecialPath;
     // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
     // non-empty V1 with none draws nothing there, so the preview falls back too.
     int v1ExportIdx = -1;
@@ -9025,22 +9035,25 @@ void MainWindow::refreshSpecialClipPreview()
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_timeline->trackMatteEntries().isEmpty() && !timelineHasClipText3D(m_timeline)
-        && !(!m_player->isPlaying() && tlrender::timelineBrushWantsSpecialPath(m_timeline))
+        && !(!m_player->isPlaying()
+             && tlrender::timelineBrushWantsSpecialPath(m_timeline, playheadSeconds))
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
+            // US-1906: the mark stays, as below: the provider clears it with the
+            // next ordinary frame, and an undecodable clip presents none.
             s_refreshingPreview = true;
-            setSpecialCompositeHoldsBrush(m_player, false);
             m_player->previewSeek(timelineMs);
             s_refreshingPreview = false;
         }
         return;
     }
 
-    const QImage composed = buildSpecialClipComposite(playheadSeconds);
+    bool drewBrush = false;
+    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         // Built while playing, it holds no brush (decision B6).
-        setSpecialCompositeHoldsBrush(m_player, !m_player->isPlaying());
+        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying());
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {

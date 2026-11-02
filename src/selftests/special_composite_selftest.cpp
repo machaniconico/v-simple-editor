@@ -1932,12 +1932,12 @@ int runSpecialCompositeSelftest()
 
         setBlendTracks({{v1}, {blendedV2(false, BlendMode::Multiply)}, {v3}});
         matteV2();
-        const bool nonVfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline);
+        const bool nonVfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline, bt);
         const bool nonVfxMatteSame = parity("G18 matte + non-VFX Multiply");
 
         setBlendTracks({{v1}, {blendedV2(true, BlendMode::Multiply)}, {v3}});
         matteV2();
-        const bool vfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline);
+        const bool vfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline, bt);
         const QImage vfxPreview = window.buildSpecialClipComposite(bt);
         const QImage vfxExport = exportAt();
         setBlendTracks({{withoutBrush(v1)}, {withoutBrush(blendedV2(true, BlendMode::Multiply))}, {v3}});

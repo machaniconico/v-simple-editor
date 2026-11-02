@@ -1220,18 +1220,17 @@ void GLPreview::setBrushAnimation(BrushAnimation *animation)
 // US-1708: the image paintGL uploads before motion / projection: the baked
 // project-camera frame or the decoded frame, with the bound brush drawn on the
 // decoded frame (never on the baked frame, which already holds every track).
-// US-1805: nor on a special composite shown while paused on a timeline that
-// tlrender::timelineBrushWantsSpecialPath routes through it, which already holds
-// every clip's brush. Other composite-baked frames (the player's multi-track
-// compositor, playback, a helper-true timeline's fallback to the ordinary frame)
-// keep the selected-clip brush.
+// US-1906: nor on a composite shown while paused whose mark
+// (tlrender::kSpecialCompositeHoldsBrushProperty) says it drew the brushes; the
+// mark is read alone, the composite was built for the time it shows. Other
+// composite-baked frames (the player's multi-track compositor, playback, a roto or
+// matte composite without brushes) keep the selected-clip brush.
 QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
 {
     QImage frame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
     const VideoPlayer *player = ownerPlayer();
     const bool specialCompositeHoldsBrush = m_compositeBakedMode
         && !(player && player->isPlaying())
-        && tlrender::timelineBrushWantsSpecialPath(m_timeline)
         && property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
     if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush) {
         OverlayRenderer::renderBrushOverlay(frame,
