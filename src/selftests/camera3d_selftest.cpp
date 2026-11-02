@@ -9,6 +9,7 @@
 #include "../VideoPlayer.h"
 #include "SelftestRegistry.h"
 
+#include <QCryptographicHash>
 #include <QJsonDocument>
 #include <QLineF>
 #include <QMatrix4x4>
@@ -848,6 +849,66 @@ int runCamera3DSelftest()
                      a, b, zeroF, zeroW, int(p60), int(p2304), int(p0));
         gate(16, std::fabs(a - 172.8) < 0.1 && std::fabs(b - 60.0) < 0.1 && zeroF == 180.0
                  && zeroW == 180.0 && !p60 && p2304 && !p0);
+    }
+
+    // G17 (US-1910): with the project camera off the GL preview applies no per-layer perspective
+    // (legacy 3D layers are flat, like the multi-track preview and the export); only the 2D
+    // rotation still turns the upload. trueProjection ON keeps projecting.
+    {
+        VideoPlayer player;
+        GLPreview *view = player.glPreview();
+        if (!view) {
+            std::fprintf(stderr, "SKIP G17 (no GLPreview in VideoPlayer)\n");
+            ++skipped;
+        } else if (!player.isGLAccelerated()) {
+            std::fprintf(stderr, "SKIP G17 (OpenGL preview unavailable in this environment)\n");
+            ++skipped;
+        } else {
+            const QSize bigCanvas(1920, 1080);
+            player.setProjectOutputSize(bigCanvas);
+            QImage frame1920(bigCanvas, QImage::Format_ARGB32);
+            for (int y = 0; y < frame1920.height(); ++y) {
+                QRgb *line = reinterpret_cast<QRgb *>(frame1920.scanLine(y));
+                for (int x = 0; x < frame1920.width(); ++x)
+                    line[x] = qRgba(x * 255 / 1919, y * 255 / 1079, 128, 255);
+            }
+            const QImage upload = frame1920.scaled(QSize(960, 540), Qt::IgnoreAspectRatio,
+                                                   Qt::SmoothTransformation);
+            Layer3DTransform tilted;
+            tilted.positionZ = 200.0;
+            tilted.rotationY = 30.0;
+            Camera3DState offCam;
+            offCam.trueProjection = false;
+            view->setTimeline(nullptr);
+            view->setProjectCamera(offCam);
+            view->displayFrame(upload);
+            const QImage plain = view->uploadFrameForTest();
+            const QImage flat3D = view->projectedUploadFrameForTest(true, tilted);
+            const QImage plainProjected = view->projectedUploadFrameForTest(false, Layer3DTransform{});
+            const bool flatOk = flat3D == plain && flat3D.format() == plain.format();
+            const bool plainOk = plainProjected == plain
+                && plainProjected.format() == plain.format();
+            const QImage rotated3D = view->projectedUploadFrameForTest(true, tilted, 15.0);
+            const QImage rotated2D = view->projectedUploadFrameForTest(false, Layer3DTransform{}, 15.0);
+            const bool rotOk = rotated3D == rotated2D && rotated3D.format() == rotated2D.format()
+                && !(rotated2D == plain);
+            Camera3DState onCam;
+            onCam.trueProjection = true;
+            view->setProjectCamera(onCam);
+            const QImage projected3D = view->projectedUploadFrameForTest(true, tilted);
+            const bool onProjects = !(projected3D == plain) && meanAbsDiff(projected3D, plain) > 1.0;
+            const QByteArray projectedSha = QCryptographicHash::hash(
+                QByteArray(reinterpret_cast<const char *>(projected3D.constBits()),
+                           static_cast<qsizetype>(projected3D.sizeInBytes())),
+                QCryptographicHash::Sha256).toHex();
+            std::fprintf(stderr, "camera3d G17: flatEqualsUpload=%d plainEqualsUpload=%d rotation2DOnly=%d "
+                         "trueProjectionProjects=%d format(upload)=%d format(flat)=%d "
+                         "W19SHA camera3d G17 trueProjection=1 posZ200 rotY30 sha=%d:%dx%d:%s\n",
+                         flatOk, plainOk, rotOk, onProjects, int(plain.format()), int(flat3D.format()),
+                         int(projected3D.format()), projected3D.width(), projected3D.height(),
+                         projectedSha.constData());
+            gate(17, flatOk && plainOk && rotOk && onProjects);
+        }
     }
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL, %d SKIP\n", passed, failed, skipped);

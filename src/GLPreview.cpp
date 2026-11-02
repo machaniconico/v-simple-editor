@@ -1265,8 +1265,8 @@ QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, 
 {
     QImage uploadFrame = upload;
     if (!compositeBaked
-        && (std::abs(rotation2D) > 1e-4 || is3DLayer
-            || (projectCamera.trueProjection && !layer3D.isDefault()))) {
+        && (std::abs(rotation2D) > 1e-4
+            || (projectCamera.trueProjection && (is3DLayer || !layer3D.isDefault())))) {
         if (projectCamera.trueProjection) {
             QSize canvas;
             if (const auto *player = ownerPlayer())
@@ -1280,13 +1280,6 @@ QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, 
             uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
         } else {
             uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
-            if (is3DLayer) {
-                Camera3DState cameraState;
-                uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                         layer3D,
-                                                         cameraState,
-                                                         uploadFrame.size());
-            }
         }
     }
     return uploadFrame;
