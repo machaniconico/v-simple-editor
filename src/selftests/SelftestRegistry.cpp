@@ -966,7 +966,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "smart-render",       "VEDITOR_SMART_RENDER_SELFTEST",       runSmartRenderSelftest,        true,
       "Smart Render T4: conservative stream-copy eligibility predicate + env gate (29 gates)" },
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
-      "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (12 gates)" },
+      "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (14 gates)" },
     { "render-notify", nullptr, runRenderNotifySelftest, true,
       "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (8 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
