@@ -213,7 +213,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
 //                      interval's clipOut inside an overlap, otherwise the
 //                      clip's time-remap / inPoint + local * speed mapping)
 //   decodable        = static check only: null object, sequence reference or
-//                      the file exists. A runtime decode failure (file present
+//                      the file exists and is non-empty (a zero-byte file is
+//                      not decodable). A runtime decode failure (non-empty file
 //                      but unreadable) still drops the layer in renderFrameAt
 //                      and is NOT reported here (known limitation).
 struct ParentLayerHit {

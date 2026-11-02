@@ -46,6 +46,7 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
 #include <QJsonDocument>
 #include <QMutex>
@@ -2328,9 +2329,10 @@ std::optional<ParentLayerHit> parentLayerAtInTracks(
     hit.sourceSeconds = sourceSecondOnTrack(
         tracks, intervals, overlapA, overlapB, trackIdx, c,
         hit.clipLocalSeconds, reverse, /*countDisabled=*/false);
+    const QFileInfo parentFileInfo(c.filePath);
     hit.decodable = clipgeom::isNullObjectFilePath(c.filePath)
         || !c.sequenceRefId.isEmpty()
-        || QFile::exists(c.filePath);
+        || (parentFileInfo.exists() && parentFileInfo.size() > 0);
     return hit;
 }
 
