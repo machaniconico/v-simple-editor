@@ -8887,7 +8887,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             active.layer.rotation = layerRotation;
             active.layer.anchorPoint = QPointF(0.0, 0.0);
             active.layer.zOrder = trackIdx;
-            active.layer.layer3D = clip.layer3D;
+            active.layer.layer3D = clipanim::layer3DAt(clip, localSeconds);
             active.layer.material = clip.material;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;

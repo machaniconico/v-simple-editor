@@ -34,6 +34,9 @@
 #include <QStringList>
 #include <QTemporaryDir>
 
+// GLPreview.cpp (US-1509): the layer3D GLPreview's projection uses for the clip active at a time.
+Layer3DTransform previewLayer3DForSelftest(const Timeline *timeline, double timelineSec);
+
 namespace {
 
 constexpr int kClipW = 64;
@@ -924,6 +927,90 @@ int runKeyframeAnimParitySelftest()
                          .arg(offFrameOk).arg(offValueOk)
                          .arg(imageDigest(offKeyedFrame), imageDigest(offPlainFrame));
             check(11, "no 3D keyframes or 3D off: byte-identical", ok, parts.join(QStringLiteral("; ")));
+        }
+
+        // G12: the paused preview reads the keyed values: the GL seam (static and auto-orient
+        // paths of makePreviewMotion) and the special composite's lighting input.
+        {
+            bool ok = true;
+            QStringList parts;
+            const ClipInfo keyedZ = withTrack(plain3D, QStringLiteral("motion.position.z"), 400.0);
+            Camera3DState camera;
+            camera.trueProjection = true;
+
+            Timeline glTimeline;
+            glTimeline.setProjectCamera(camera);
+            setTimelineClip(glTimeline, keyedZ);
+            const Layer3DTransform glKeyed = previewLayer3DForSelftest(&glTimeline, 1.0);
+            setTimelineClip(glTimeline, plain3D);
+            const double glStaticZ = previewLayer3DForSelftest(&glTimeline, 1.0).positionZ;
+            const bool glOk = near(glKeyed.positionZ, 200.0, 1e-9) && glStaticZ == 0.0;
+            ok = ok && glOk;
+            parts << QStringLiteral("gl keyed=%1 static z=%2").arg(str3D(glKeyed)).arg(glStaticZ);
+
+            // Off-axis, so the orientation depends on the keyed distance to the camera.
+            ClipInfo oriented = keyedZ;
+            oriented.autoOrientToCamera = true;
+            oriented.videoDx = 0.25;
+            setTimelineClip(glTimeline, oriented);
+            const Layer3DTransform glOriented = previewLayer3DForSelftest(&glTimeline, 1.0);
+            const QPointF orientedPx(0.25 * glTimeline.projectOutputSize().width(), 0.0);
+            const Camera3DState cameraAtFrame = glTimeline.projectCameraAt(1.0);
+            const Layer3DTransform wantOriented = camera3d::effectiveLayer3DAt(
+                oriented, clipanim::layer3DAt(oriented, 1.0), orientedPx, cameraAtFrame);
+            const Layer3DTransform oldOriented = camera3d::effectiveLayer3DAt(
+                oriented, orientedPx, cameraAtFrame);
+            const bool orientOk = glOriented.rotationX == wantOriented.rotationX
+                && glOriented.rotationY == wantOriented.rotationY
+                && glOriented.rotationZ == wantOriented.rotationZ
+                && near(glOriented.positionZ, 200.0, 1e-9)
+                && std::abs(wantOriented.rotationY) > 0.01
+                && std::abs(wantOriented.rotationY - oldOriented.rotationY) > 0.01;
+            ok = ok && orientOk;
+            parts << QStringLiteral("orient gl=%1 want=%2 static-base=%3 ok=%4")
+                         .arg(str3D(glOriented), str3D(wantOriented), str3D(oldOriented))
+                         .arg(orientOk);
+
+            Light3DState point;
+            point.type = LightType::Point;
+            point.position = QVector3D(200.0f, 100.0f, 150.0f);
+            point.intensity = 2.0;
+            point.falloffEnabled = true;
+            const QVector<Light3D> lights{Light3D(point)};
+            MainWindow window;
+            window.m_projectConfig.width = size3D.width();
+            window.m_projectConfig.height = size3D.height();
+            window.m_projectConfig.fps = kFps;
+            window.m_projectLights = lights;
+            window.m_timeline->setProjectLights(lights);
+            const auto composite = [&](const ClipInfo &clip) {
+                window.m_timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{clip}},
+                                                      QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                return window.buildSpecialClipComposite(1.0);
+            };
+            ClipInfo lit = plain3D;
+            lit.material.acceptsLights = true;
+            ClipInfo lit200 = lit;
+            lit200.layer3D.positionZ = 200.0;
+            const QImage keyedComposite = composite(
+                withTrack(lit, QStringLiteral("motion.position.z"), 400.0));
+            const QImage keyedExport = tlrender::renderFrameAt(window.m_timeline, oneSecondUsec, size3D);
+            const QImage staticComposite = composite(lit200);
+            const QImage zeroComposite = composite(lit);
+            const bool equalsStatic = sameBytes(keyedComposite, staticComposite);
+            const bool differsFromZero = !sameBytes(keyedComposite, zeroComposite);
+            const bool matchesExport = !keyedExport.isNull() && sameBytes(
+                keyedComposite.convertToFormat(QImage::Format_RGBA8888),
+                keyedExport.convertToFormat(QImage::Format_RGBA8888));
+            ok = ok && !keyedComposite.isNull() && !zeroComposite.isNull()
+                && equalsStatic && differsFromZero && matchesExport;
+            parts << QStringLiteral("composite keyed=%1 static200=%2 zero=%3 export=%4 "
+                                    "equal=%5 differsFromZero=%6 matchesExport=%7")
+                         .arg(imageDigest(keyedComposite), imageDigest(staticComposite),
+                              imageDigest(zeroComposite), imageDigest(keyedExport))
+                         .arg(equalsStatic).arg(differsFromZero).arg(matchesExport);
+            check(12, "3D keyframes reach the GL preview and the special composite", ok,
+                  parts.join(QStringLiteral("; ")));
         }
     }
 

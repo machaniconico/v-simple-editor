@@ -154,7 +154,7 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.rotation2D = clip.rotation2DDegrees;
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
-    motion.layer3D = clip.layer3D;
+    motion.layer3D = clipanim::layer3DAt(clip, clipLocalSeconds);
     if (clipanim::hasAnyDynamicTransform(clip)) {
         clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
         if (!compositeBaked && timeline && !clip.expressions.isEmpty())
@@ -175,7 +175,8 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
         const Camera3DState camera = timeline->projectCameraAt(clipStartSec + clipLocalSeconds);
         const QSize canvas = timeline->projectOutputSize();
         motion.layer3D = camera3d::effectiveLayer3DAt(
-            clip, QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
+            clip, motion.layer3D,
+            QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
     }
     return motion;
 }

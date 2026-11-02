@@ -271,6 +271,7 @@ class MainWindow : public QMainWindow
     friend int runMediaRelinkSelftest();
     friend int runMainWindowLifecycleSelftest();
     friend int runBrushExportSelftest();
+    friend int runKeyframeAnimParitySelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
