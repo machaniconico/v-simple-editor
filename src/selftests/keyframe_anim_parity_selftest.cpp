@@ -658,6 +658,275 @@ int runKeyframeAnimParitySelftest()
         check(8, "3D layer world x/y through motion UI surfaces", ok, parts.join(QStringLiteral("; ")));
     }
 
+    // US-1908 G9-G11: the 3D keyframe tracks reach renderFrameAt through clipanim::layer3DAt.
+    {
+        const QSize size3D(160, 90);
+        const qint64 oneSecondUsec = 1'000'000;
+        ClipInfo plain3D = makeClip(clipPath);
+        plain3D.is3DLayer = true;
+
+        const auto same3D = [](const Layer3DTransform &a, const Layer3DTransform &b) {
+            return std::abs(a.positionZ - b.positionZ) <= 1e-12
+                && std::abs(a.rotationX - b.rotationX) <= 1e-12
+                && std::abs(a.rotationY - b.rotationY) <= 1e-12
+                && std::abs(a.rotationZ - b.rotationZ) <= 1e-12
+                && std::abs(a.worldX - b.worldX) <= 1e-12
+                && std::abs(a.worldY - b.worldY) <= 1e-12;
+        };
+        const auto str3D = [](const Layer3DTransform &l) {
+            return QStringLiteral("{z %1 rx %2 ry %3 rz %4 wx %5 wy %6}")
+                .arg(l.positionZ).arg(l.rotationX).arg(l.rotationY).arg(l.rotationZ)
+                .arg(l.worldX).arg(l.worldY);
+        };
+        const auto withTrack = [](ClipInfo clip, const QString &name, double valueAtTwoSeconds) {
+            KeyframeTrack track(name, 0.0);
+            track.addKeyframe(0.0, 0.0);
+            track.addKeyframe(2.0, valueAtTwoSeconds);
+            clip.keyframes.addTrack(track);
+            return clip;
+        };
+        const auto render3D = [&](const ClipInfo &clip, bool trueProjection, bool onV2,
+                                  const QVector<Light3D> &lights) {
+            Camera3DState camera;
+            camera.trueProjection = trueProjection;
+            Timeline timeline;
+            timeline.setProjectCamera(camera);
+            timeline.setProjectLights(lights);
+            if (onV2) {
+                // V1 paints on top: half opacity keeps the V2 layer in the frame.
+                ClipInfo v1 = makeClip(clipPath);
+                v1.opacity = 0.5;
+                timeline.addVideoTrack(false);
+                setTimelineClip(timeline, v1);
+                timeline.videoTracks()[1]->setClips(QVector<ClipInfo>{clip});
+            } else {
+                setTimelineClip(timeline, clip);
+            }
+            return tlrender::renderFrameAt(&timeline, oneSecondUsec, size3D);
+        };
+        struct Track3D {
+            const char *label;
+            const char *track;
+            double Layer3DTransform::*field;
+            double valueAtTwoSeconds;
+        };
+        const Track3D posZ{"posZ", "motion.position.z", &Layer3DTransform::positionZ, 400.0};
+        const Track3D rotY{"rotY", "motion.rotation.y", &Layer3DTransform::rotationY, 60.0};
+        const Track3D worldX{"worldX", "motion.world.x", &Layer3DTransform::worldX, 300.0};
+        // A key pair at t = 1.0 equals the static value of half the end value, and not the zero one.
+        const auto compareKeyed = [&](const ClipInfo &base, const Track3D &row, bool trueProjection,
+                                      bool onV2, const QVector<Light3D> &lights, QStringList *parts) {
+            ClipInfo wantedClip = base;
+            wantedClip.layer3D.*row.field = row.valueAtTwoSeconds / 2.0;
+            const QImage keyed = render3D(withTrack(base, QString::fromLatin1(row.track),
+                                                    row.valueAtTwoSeconds),
+                                          trueProjection, onV2, lights);
+            const QImage wanted = render3D(wantedClip, trueProjection, onV2, lights);
+            const QImage zero = render3D(base, trueProjection, onV2, lights);
+            const bool equalsWanted = sameBytes(keyed, wanted);
+            const bool differsFromZero = !sameBytes(keyed, zero);
+            *parts << QStringLiteral("%1 %2 keyed=%3 static=%4 zero=%5 equal=%6 differsFromZero=%7")
+                          .arg(QString::fromLatin1(row.label), onV2 ? QStringLiteral("V2") : QStringLiteral("V1"),
+                               imageDigest(keyed), imageDigest(wanted), imageDigest(zero))
+                          .arg(equalsWanted).arg(differsFromZero);
+            return equalsWanted && differsFromZero;
+        };
+
+        // G9: keyed position z / rotation y / world x under trueProjection (HEAD: track ignored).
+        {
+            bool ok = true;
+            QStringList parts;
+            for (const Track3D *row : {&posZ, &rotY, &worldX}) {
+                ok = compareKeyed(plain3D, *row, true, false, {}, &parts) && ok;
+                ok = compareKeyed(plain3D, *row, true, true, {}, &parts) && ok;
+            }
+
+            // All six tracks land on their own fields; a track-less field keeps its static value.
+            ClipInfo allTracks = plain3D;
+            allTracks = withTrack(allTracks, QStringLiteral("motion.position.z"), 400.0);
+            allTracks = withTrack(allTracks, QStringLiteral("motion.rotation.x"), 10.0);
+            allTracks = withTrack(allTracks, QStringLiteral("motion.rotation.y"), 60.0);
+            allTracks = withTrack(allTracks, QStringLiteral("motion.rotation.z"), 14.0);
+            allTracks = withTrack(allTracks, QStringLiteral("motion.world.x"), 300.0);
+            allTracks = withTrack(allTracks, QStringLiteral("motion.world.y"), -40.0);
+            Layer3DTransform wantAll;
+            wantAll.positionZ = 200.0;
+            wantAll.rotationX = 5.0;
+            wantAll.rotationY = 30.0;
+            wantAll.rotationZ = 7.0;
+            wantAll.worldX = 150.0;
+            wantAll.worldY = -20.0;
+            const Layer3DTransform gotAll = clipanim::layer3DAt(allTracks, 1.0);
+            ClipInfo partial = withTrack(plain3D, QStringLiteral("motion.rotation.y"), 60.0);
+            partial.layer3D.positionZ = 11.0;
+            partial.layer3D.worldY = -3.0;
+            Layer3DTransform wantPartial = partial.layer3D;
+            wantPartial.rotationY = 30.0;
+            const Layer3DTransform gotPartial = clipanim::layer3DAt(partial, 1.0);
+            ok = ok && same3D(gotAll, wantAll) && same3D(gotPartial, wantPartial);
+            parts << QStringLiteral("all six %1 partial %2").arg(str3D(gotAll), str3D(gotPartial));
+
+            // The incoming side of an overlap transition is projected with the keyed value:
+            // flat keys, so the expectation does not depend on where the transition samples.
+            const auto overlapFrame = [&](const ClipInfo &incomingBase, bool *overlaps) {
+                ClipInfo outgoing = makeClip(clipPath);
+                ClipInfo incoming = incomingBase;
+                outgoing.inPoint = incoming.inPoint = 0.5;
+                outgoing.outPoint = incoming.outPoint = 1.5;
+                outgoing.trailOut.type = incoming.leadIn.type = TransitionType::CrossDissolve;
+                outgoing.trailOut.duration = incoming.leadIn.duration = 0.5;
+                outgoing.trailOut.alignment = incoming.leadIn.alignment = TransitionAlignment::Center;
+                Camera3DState camera;
+                camera.trueProjection = true;
+                Timeline timeline;
+                timeline.setProjectCamera(camera);
+                timeline.videoTracks().first()->setClips({outgoing, incoming});
+                const auto intervals = timeline.videoOverlapIntervals();
+                *overlaps = !intervals.isEmpty() && intervals[0].size() == 2
+                    && intervals[0][1].timelineStart < intervals[0][0].timelineEnd;
+                if (!*overlaps)
+                    return QImage();
+                return tlrender::renderFrameAt(
+                    &timeline,
+                    qRound64((intervals[0][1].timelineStart + intervals[0][0].timelineEnd) * 0.5 * 1e6),
+                    size3D);
+            };
+            ClipInfo flatKeyed = plain3D;
+            KeyframeTrack flatZ(QStringLiteral("motion.position.z"), 0.0);
+            flatZ.addKeyframe(0.0, 200.0);
+            flatZ.addKeyframe(2.0, 200.0);
+            flatKeyed.keyframes.addTrack(flatZ);
+            ClipInfo staticZ = plain3D;
+            staticZ.layer3D.positionZ = 200.0;
+            bool overlapKeyed = false, overlapStatic = false, overlapZero = false;
+            const QImage keyedOverlap = overlapFrame(flatKeyed, &overlapKeyed);
+            const QImage staticOverlap = overlapFrame(staticZ, &overlapStatic);
+            const QImage zeroOverlap = overlapFrame(plain3D, &overlapZero);
+            ok = ok && overlapKeyed && overlapStatic && overlapZero
+                && sameBytes(keyedOverlap, staticOverlap) && !sameBytes(keyedOverlap, zeroOverlap);
+            parts << QStringLiteral("overlap overlaps=%1 keyed=%2 static=%3 zero=%4")
+                         .arg(overlapKeyed && overlapStatic && overlapZero)
+                         .arg(imageDigest(keyedOverlap), imageDigest(staticOverlap), imageDigest(zeroOverlap));
+            check(9, "3D keyframes drive trueProjection in renderFrameAt", ok,
+                  parts.join(QStringLiteral("; ")));
+        }
+
+        // G10: keyed values reach the lights without trueProjection.
+        {
+            Light3DState point;
+            point.type = LightType::Point;
+            point.position = QVector3D(200.0f, 100.0f, 150.0f);
+            point.intensity = 2.0;
+            point.falloffEnabled = true;
+            const QVector<Light3D> lights{Light3D(point)};
+            ClipInfo lit = plain3D;
+            lit.material.acceptsLights = true;
+
+            bool ok = true;
+            QStringList parts;
+            ok = compareKeyed(lit, posZ, false, false, lights, &parts) && ok;
+            ok = compareKeyed(lit, posZ, false, true, lights, &parts) && ok;
+            ok = compareKeyed(lit, rotY, false, false, lights, &parts) && ok;
+            check(10, "3D keyframes drive the lighting input", ok, parts.join(QStringLiteral("; ")));
+        }
+
+        // G11 (pin): no 3D keyframes = static values; a clip with 3D off never evaluates its track.
+        {
+            bool ok = true;
+            QStringList parts;
+
+            // Compared in the raw log with the base exe's sha (S0-7), not here.
+            const auto sha = [](const QImage &image) {
+                if (image.isNull())
+                    return QStringLiteral("null");
+                const QByteArray bytes(reinterpret_cast<const char *>(image.constBits()),
+                                       static_cast<int>(image.sizeInBytes()));
+                return QStringLiteral("%1:%2x%3:%4")
+                    .arg(static_cast<int>(image.format())).arg(image.width()).arg(image.height())
+                    .arg(QString::fromLatin1(
+                        QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex()));
+            };
+            for (const bool trueProjection : {false, true}) {
+                for (const bool is3D : {true, false}) {
+                    ClipInfo clip = makeClip(clipPath);
+                    clip.is3DLayer = is3D;
+                    if (is3D) {
+                        clip.layer3D.positionZ = 200.0;
+                        clip.layer3D.rotationY = 30.0;
+                    }
+                    const QImage frame = render3D(clip, trueProjection, false, {});
+                    ok = ok && !frame.isNull();
+                    parts << QStringLiteral("sha trueProjection=%1 is3D=%2 %3")
+                                 .arg(trueProjection).arg(is3D).arg(sha(frame));
+                }
+            }
+
+            ClipInfo noTracks = plain3D;
+            noTracks.layer3D.positionZ = 12.0;
+            noTracks.layer3D.rotationX = 1.0;
+            noTracks.layer3D.rotationY = 2.0;
+            noTracks.layer3D.rotationZ = 3.0;
+            noTracks.layer3D.worldX = 4.0;
+            noTracks.layer3D.worldY = 5.0;
+            const Layer3DTransform noTrackValue = clipanim::layer3DAt(noTracks, 1.0);
+            Layer3DTransform nudged = noTracks.layer3D;
+            nudged.worldY += 1e-9;
+            const bool noTrackOk = same3D(noTrackValue, noTracks.layer3D)
+                && same3D(clipanim::layer3DAt(noTracks, 99.0), noTracks.layer3D);
+            const bool comparerOk = !same3D(nudged, noTracks.layer3D);
+            ok = ok && noTrackOk && comparerOk;
+            parts << QStringLiteral("noTrack=%1 %2 comparerRejects=%3")
+                         .arg(noTrackOk).arg(str3D(noTrackValue)).arg(comparerOk);
+
+            // The three-argument form is the four-argument form with base = clip.layer3D.
+            Camera3DState orientCamera;
+            orientCamera.position = QVector3D(300.0f, 200.0f, 800.0f);
+            orientCamera.target = orientCamera.position + QVector3D(0.0f, 0.0f, -1.0f);
+            orientCamera.trueProjection = true;
+            ClipInfo oriented = noTracks;
+            oriented.autoOrientToCamera = true;
+            const QPointF layerPx(150.0, 0.0);
+            const Layer3DTransform orient3 = camera3d::effectiveLayer3DAt(oriented, layerPx, orientCamera);
+            const Layer3DTransform orient4 = camera3d::effectiveLayer3DAt(
+                oriented, oriented.layer3D, layerPx, orientCamera);
+            const Layer3DTransform plain3 = camera3d::effectiveLayer3DAt(noTracks, layerPx, orientCamera);
+            const Layer3DTransform plain4 = camera3d::effectiveLayer3DAt(
+                noTracks, noTracks.layer3D, layerPx, orientCamera);
+            const bool formsOk = same3D(orient3, orient4) && !same3D(orient3, oriented.layer3D)
+                && same3D(plain3, plain4) && same3D(plain3, noTracks.layer3D);
+            // autoOrient replaces keyed rotations X / Y and orients from the base it is given.
+            Layer3DTransform keyedBase = oriented.layer3D;
+            keyedBase.positionZ = 400.0;
+            keyedBase.rotationX = 33.0;
+            keyedBase.rotationY = 44.0;
+            keyedBase.rotationZ = 55.0;
+            const Layer3DTransform orientKeyed = camera3d::effectiveLayer3DAt(
+                oriented, keyedBase, layerPx, orientCamera);
+            ClipInfo staticEquivalent = oriented;
+            staticEquivalent.layer3D = keyedBase;
+            const bool baseOk = same3D(orientKeyed, camera3d::effectiveLayer3DAt(
+                                                        staticEquivalent, layerPx, orientCamera))
+                && orientKeyed.positionZ == 400.0 && orientKeyed.rotationZ == 55.0
+                && orientKeyed.rotationX != 33.0 && orientKeyed.rotationY != 44.0;
+            ok = ok && formsOk && baseOk;
+            parts << QStringLiteral("forms=%1 orient3=%2 base=%3 orientKeyed=%4")
+                         .arg(formsOk).arg(str3D(orient3)).arg(baseOk).arg(str3D(orientKeyed));
+
+            // M-4: 3D off keeps the track and renders without it.
+            ClipInfo off = makeClip(clipPath);
+            const ClipInfo offKeyed = withTrack(off, QStringLiteral("motion.position.z"), 400.0);
+            const QImage offKeyedFrame = render3D(offKeyed, true, false, {});
+            const QImage offPlainFrame = render3D(off, true, false, {});
+            const bool offFrameOk = sameBytes(offKeyedFrame, offPlainFrame);
+            const bool offValueOk = same3D(clipanim::layer3DAt(offKeyed, 1.0), offKeyed.layer3D);
+            ok = ok && offFrameOk && offValueOk;
+            parts << QStringLiteral("3D off with track: frame=%1 value=%2 keyed=%3 plain=%4")
+                         .arg(offFrameOk).arg(offValueOk)
+                         .arg(imageDigest(offKeyedFrame), imageDigest(offPlainFrame));
+            check(11, "no 3D keyframes or 3D off: byte-identical", ok, parts.join(QStringLiteral("; ")));
+        }
+    }
+
     qInfo().noquote()
         << QStringLiteral("KEYFRAME-ANIM-PARITY: %1/%2 PASS")
                .arg(passed)

@@ -28,6 +28,12 @@ const QString kPublicScaleXTrack = QStringLiteral("scaleX");
 const QString kPublicScaleYTrack = QStringLiteral("scaleY");
 const QString kRotationTrack = QStringLiteral("motion.rotation");
 const QString kOpacityTrack = QStringLiteral("motion.opacity");
+const QString kPositionZTrack = QStringLiteral("motion.position.z");
+const QString kRotationXTrack = QStringLiteral("motion.rotation.x");
+const QString kRotationYTrack = QStringLiteral("motion.rotation.y");
+const QString kRotationZTrack = QStringLiteral("motion.rotation.z");
+const QString kWorldXTrack = QStringLiteral("motion.world.x");
+const QString kWorldYTrack = QStringLiteral("motion.world.y");
 const QString kGradeBrightnessTrack = QStringLiteral("grade.brightness");
 const QString kGradeContrastTrack = QStringLiteral("grade.contrast");
 const QString kGradeSaturationTrack = QStringLiteral("grade.saturation");
@@ -701,6 +707,24 @@ double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
     if (!trackHasKeyframes(clip.keyframes, kOpacityTrack))
         return staticOpacity;
     return clip.keyframes.valueAt(kOpacityTrack, clipLocalSeconds, staticOpacity);
+}
+
+Layer3DTransform layer3DAt(const ClipInfo& clip, double clipLocalSeconds)
+{
+    if (!clip.is3DLayer)
+        return clip.layer3D;
+    Layer3DTransform result = clip.layer3D;
+    const auto evaluate = [&](const QString& trackName, double *value) {
+        if (trackHasKeyframes(clip.keyframes, trackName))
+            *value = clip.keyframes.valueAt(trackName, clipLocalSeconds, *value);
+    };
+    evaluate(kPositionZTrack, &result.positionZ);
+    evaluate(kRotationXTrack, &result.rotationX);
+    evaluate(kRotationYTrack, &result.rotationY);
+    evaluate(kRotationZTrack, &result.rotationZ);
+    evaluate(kWorldXTrack, &result.worldX);
+    evaluate(kWorldYTrack, &result.worldY);
+    return result;
 }
 
 bool hasAnyDynamicTransform(const ClipInfo& clip)

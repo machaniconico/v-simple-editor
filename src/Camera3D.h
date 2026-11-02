@@ -207,6 +207,10 @@ namespace camera3d {
 // (canvas px, centre origin, y down) at the camera position (rotationZ is kept).
 Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
                                     const Camera3DState &camera);
+// US-1908: the same with the layer's transform in base (clipanim::layer3DAt at the frame)
+// instead of clip.layer3D; autoOrientToCamera replaces keyed rotations X / Y like static ones.
+Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, const Layer3DTransform &base,
+                                    QPointF layerPosPx, const Camera3DState &camera);
 // US-1813: layer3D for a projection done at uploadSize instead of the canvas: worldX / worldY
 // (canvas px) scale by uploadW / canvasW, Z and the rotations are kept (fov is not scaled).
 // Unchanged when either size is empty.

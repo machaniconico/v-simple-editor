@@ -2464,7 +2464,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             neighbour = applyProjectCameraProjection(
                 neighbour,
                 camera3d::effectiveLayer3DAt(
-                    c, layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
+                    c, clipanim::layer3DAt(c, local),
+                    layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
                 c.is3DLayer, projectCamera, outSize);
         neighbour = prepareTransitionLayer(neighbour, neighbourTransform, outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
@@ -2486,6 +2487,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     double v1EffectiveOpacity = 0.0;
     int v1Idx = -1;
     double v1Start = 0.0;
+    double v1LocalSec = 0.0;
     QImage base;
     QImage v1LayerSource;
     clipgeom::ClipTransform v1Transform;
@@ -2516,7 +2518,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
         // constant held source time used by computePlaybackSequence.
-        const double v1LocalSec = targetSec - v1Start;            // >= 0
+        v1LocalSec = targetSec - v1Start;                     // >= 0
         const bool v1ReverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(
                 v1Clip, sequenceSnapshot);
@@ -2564,7 +2566,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             v1Contained = applyProjectCameraProjection(
                 v1Contained,
                 camera3d::effectiveLayer3DAt(
-                    v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
+                    v1Clip, clipanim::layer3DAt(v1Clip, v1LocalSec),
+                    layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
                 v1Clip.is3DLayer, projectCamera, outSize);
         v1LayerSource = v1Contained;
 
@@ -2638,7 +2641,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
-            v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
+            v1Clip, clipanim::layer3DAt(v1Clip, v1LocalSec),
+            layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
         baseLayer.layer.material = v1Clip.material;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
@@ -2694,7 +2698,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
             renderLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
-                c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+                c, clipanim::layer3DAt(c, localSec),
+                layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
             renderLayer.layer.material = c.material;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
@@ -2727,7 +2732,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
         const Layer3DTransform cLayer3D = camera3d::effectiveLayer3DAt(
-            c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+            c, clipanim::layer3DAt(c, localSec),
+            layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
         renderLayer.layer.layer3D = cLayer3D;
         renderLayer.layer.material = c.material;
         // Scale the overlay source to the shared canvas grid first; the
