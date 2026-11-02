@@ -1990,12 +1990,21 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline)
     // does not.
     if (veditor::parentingEnabledFromEnv() && !timeline->clipParentEntries().isEmpty())
         return false;
+    // An effective blend (the rule of the overlay loop below: VFX footage above
+    // V1) is drawn by the composite, except with a matte source anywhere in the
+    // timeline: that stays on the legacy path. A non-VFX blend is ignored here
+    // as in the export.
+    const bool hasMatteSource = !timeline->trackMatteEntries().isEmpty();
     bool hasBrush = false;
-    for (const auto *track : timeline->videoTracks()) {
+    const auto &videoTracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
+        const auto *track = videoTracks[trackIdx];
         if (!track)
             continue;
         for (const ClipInfo &clip : track->clips()) {
-            if (clip.blendMode != BlendMode::Normal || clip.isAdjustment || clip.hasMask())
+            const bool effectiveBlend = clip.isVfxFootage && trackIdx > 0
+                && clip.blendMode != BlendMode::Normal;
+            if ((effectiveBlend && hasMatteSource) || clip.isAdjustment || clip.hasMask())
                 return false;
             // Nor clips the special composite cannot draw as renderFrameAt does
             // (shape, nested sequence, disabled): those timelines keep their

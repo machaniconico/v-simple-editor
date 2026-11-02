@@ -8590,7 +8590,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
-    // US-1805: a brushed timeline without blend / adjustment / clip mask takes
+    // US-1805: a brushed timeline without adjustment / clip mask (or a matte
+    // source with an effective blend, US-1905) takes
     // this path (paused) and every clip's brush is drawn here; other timelines
     // keep the GL's selected-clip brush on top (tlrender::timelineBrushWantsSpecialPath).
     // Playback keeps the selected-clip brush only (decision B6).
@@ -8859,7 +8860,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.image = frame;
             active.layer.name = clip.displayName;
             active.layer.opacity = layerOpacity;
-            active.layer.blendMode = BlendMode::Normal;
+            // US-1905: the effective blend, renderFrameAt's rule (V1 is always
+            // Normal, overlays blend only as VFX footage).
+            active.layer.blendMode = (clip.isVfxFootage && trackIdx > 0)
+                ? clip.blendMode : BlendMode::Normal;
             // Carry the RAW canonical transform fields (NOT a pixel offset):
             // position = NORMALIZED videoDx/videoDy fractions of the canvas,
             // scale.x() = uniform videoScale, rotation = rotation2DDegrees.
@@ -8975,7 +8979,34 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             layers, layerImages, canvasSize, lightingOffsets, projectLights,
             m_projectCamera.camera().position);
 
-    return trackmatte::composite(layers, layerImages, canvasSize);
+    // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
+    if (hasTrackMatteLayer)
+        return trackmatte::composite(layers, layerImages, canvasSize);
+
+    // US-1905: renderFrameAt's matte-free order: the Normal stack (V1 frontmost),
+    // then the lit blended overlays ascending by track (layers is descending
+    // here) through the same blend equation.
+    QVector<CompositeLayer> normalLayers;
+    QVector<QImage> normalImages;
+    for (int i = 0; i < layers.size(); ++i) {
+        if (layers[i].blendMode == BlendMode::Normal) {
+            normalLayers.append(layers[i]);
+            normalImages.append(layerImages[i]);
+        }
+    }
+    QImage composed = trackmatte::composite(normalLayers, normalImages, canvasSize);
+    if (normalLayers.size() == layers.size())
+        return composed;
+    for (int i = layers.size() - 1; i >= 0; --i) {
+        const CompositeLayer &layer = layers[i];
+        if (layer.blendMode == BlendMode::Normal
+            || layerImages[i].isNull() || layer.opacity <= 0.001) {
+            continue;
+        }
+        composed = LayerCompositor::blendImages(
+            composed, layerImages[i], layer.blendMode, qBound(0.0, layer.opacity, 1.0));
+    }
+    return composed.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 }
 
 void MainWindow::refreshSpecialClipPreview()

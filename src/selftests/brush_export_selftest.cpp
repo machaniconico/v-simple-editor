@@ -11,6 +11,7 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
+#include "../TrackMatteKey.h"
 #include "../VideoEffect.h"
 #include "../VideoPlayer.h"
 #include "../ClipGeometry.h"
@@ -1248,71 +1249,61 @@ int runBrushExportSelftest()
                        "graded brushed special composite differs from renderFrameAt");
         }
 
-        // G14 (negative control): V2 with a non-Normal blend (Multiply) keeps the
-        // legacy path. (1) buildSpecialClipComposite returns {} while the same
-        // timeline with V2 Normal does not (the blend is what routes it away). (2)
-        // The preview upload keeps the HEAD shape of G6: V2 starts after V1 (lead-in
-        // 2 s) so at t the player decodes V1 alone, the GL holds the timeline, and
-        // the bound brush is drawn on the decoded frame (== renderClipSourceAt).
+        // G14 (negative control): timelines the special composite cannot draw keep
+        // the legacy path. (1) With V2 active at t, adjustment / layer style and the
+        // (3) terms below: the helper is false and buildSpecialClipComposite returns
+        // {}, while the same timeline without them does not. (2) V2 parented to V1
+        // (V2 starts after t, so the player decodes V1 alone and the GL holds the
+        // timeline): {} and the bound brush is drawn on the decoded frame
+        // (== renderClipSourceAt, the G6 shape). (4) A VFX Multiply V2 with a matte
+        // source in the timeline: helper false only (the matte makes the composite
+        // non-null). A non-VFX blend is eligible: special-composite G17.
         {
-            ClipInfo blendV2 = v2Clip;
-            blendV2.blendMode = BlendMode::Multiply;
-            ClipInfo lateBlendV2 = blendV2;
-            lateBlendV2.leadInSec = 2.0;
-            ClipInfo lateNormalV2 = lateBlendV2;
-            lateNormalV2.blendMode = BlendMode::Normal;
-            QImage blendComposite, lateBlendComposite, normalComposite;
+            ClipInfo lateNormalV2 = v2Clip;
+            lateNormalV2.leadInSec = 2.0;
+            ClipInfo adjustmentV2 = v2Clip;
+            adjustmentV2.isAdjustment = true;
+            ClipInfo styledV2 = v2Clip;
+            styledV2.layerStyle.dropShadowEnabled = true;
+            QImage activeComposite, normalComposite;
             if (mainTimeline && movieOk) {
-                setTracks({{movieClip}, {blendV2}});
-                blendComposite = window.buildSpecialClipComposite(t);
-                setTracks({{movieClip}, {lateBlendV2}});
-                lateBlendComposite = window.buildSpecialClipComposite(t);
+                setTracks({{v1Clip}, {v2Clip}});
+                activeComposite = window.buildSpecialClipComposite(t);
                 setTracks({{movieClip}, {lateNormalV2}});
                 normalComposite = window.buildSpecialClipComposite(t);
+            }
+            const QHash<QString, QString> parentV2{{QStringLiteral("1:0"), QStringLiteral("0:0")}};
+            QImage parentComposite;
+            if (mainTimeline && movieOk) {
+                setTracks({{movieClip}, {lateNormalV2}});
+                mainTimeline->setClipParentEntries(parentV2);
+                parentComposite = window.buildSpecialClipComposite(t);
+                mainTimeline->setClipParentEntries({});
             }
             QSize decoded;
             bool previewGl = false, baked = true;
             const QImage upload = movieOk
-                ? previewUpload({{movieClip}, {lateBlendV2}}, 1.0, t, QSize(160, 90), &decoded,
-                                &previewGl, true, &baked)
+                ? previewUpload({{movieClip}, {lateNormalV2}}, 1.0, t, QSize(160, 90), &decoded,
+                                &previewGl, true, &baked, parentV2)
                 : QImage();
-            const auto tl = makeTimeline({{movieClip}, {lateBlendV2}});
+            const auto tl = makeTimeline({{movieClip}, {lateNormalV2}});
             const QImage exported = tlrender::renderClipSourceAt(tl.get(), 0, 0, us(t));
-            const auto plainTl = makeTimeline({{movieClipPlain}, {lateBlendV2}});
+            const auto plainTl = makeTimeline({{movieClipPlain}, {lateNormalV2}});
             const qint64 brushVisible = diffPixels(exported,
                 tlrender::renderClipSourceAt(plainTl.get(), 0, 0, us(t)));
             const bool same = samePixels(upload, exported);
-            // (4) A layer style (drop shadow) on V2 and V2 parented to V1: the
-            // special composite applies neither, so both keep the legacy path (the
-            // same timeline without them builds it: lateNormalCompositeNull=0), and
-            // the upload keeps the G6 shape as in (2).
-            ClipInfo styledV2 = lateNormalV2;
-            styledV2.layerStyle.dropShadowEnabled = true;
-            const QHash<QString, QString> parentV2{{QStringLiteral("1:0"), QStringLiteral("0:0")}};
-            bool styleParentLegacy = movieOk && mainTimeline;
-            QString styleParentLog;
-            for (int c = 0; c < 2; ++c) {
-                const ClipInfo &caseV2 = c == 0 ? styledV2 : lateNormalV2;
-                const QHash<QString, QString> caseParents = c == 0 ? QHash<QString, QString>{} : parentV2;
-                QImage caseComposite;
-                if (mainTimeline && movieOk) {
-                    setTracks({{movieClip}, {caseV2}});
-                    mainTimeline->setClipParentEntries(caseParents);
-                    caseComposite = window.buildSpecialClipComposite(t);
-                    mainTimeline->setClipParentEntries({});
-                }
-                QSize caseDecoded;
-                bool caseGl = false, caseBaked = true;
-                const QImage caseUpload = movieOk
-                    ? previewUpload({{movieClip}, {caseV2}}, 1.0, t, QSize(160, 90), &caseDecoded,
-                                    &caseGl, true, &caseBaked, caseParents)
-                    : QImage();
-                const bool caseSame = samePixels(caseUpload, exported);
-                styleParentLegacy = styleParentLegacy && caseComposite.isNull()
-                    && caseDecoded == QSize(160, 90) && !caseBaked && caseSame;
-                styleParentLog += QStringLiteral(" %1/%2/%3").arg(int(caseComposite.isNull()))
-                                      .arg(int(caseSame)).arg(diffPixels(caseUpload, exported));
-            }
+            // (4) The matte source decides: the same VFX Multiply without it is eligible.
+            ClipInfo vfxV2 = v2Clip;
+            vfxV2.isVfxFootage = true;
+            vfxV2.blendMode = BlendMode::Multiply;
+            const auto matteTl = makeTimeline({{v1Clip}, {vfxV2}, {movieClipPlain}});
+            const bool vfxNoMatteSpecial = tlrender::timelineBrushWantsSpecialPath(matteTl.get());
+            TimelineTrackMatteEntry matteEntry;
+            matteEntry.matteType = TrackMatteType::LumaInvertedMatte;
+            matteEntry.matteSourceClipId = trackMatteClipKey(2, 0);
+            matteTl->setTrackMatteEntries(
+                QHash<QString, TimelineTrackMatteEntry>{{trackMatteClipKey(1, 0), matteEntry}});
+            const bool vfxMatteSpecial = tlrender::timelineBrushWantsSpecialPath(matteTl.get());
             // (3) Otherwise-G11-eligible timelines the special composite would
             // misplace keep the legacy path: a keyframed position (it places layers
             // statically), fitContain / fitCover on a square source (it stretches to
@@ -1353,7 +1344,8 @@ int runBrushExportSelftest()
             bool excludedLegacy = squareOk;
             QString excludedLog;
             for (const ClipInfo &excludedV2 : {animatedV2, fitV2, fadeV2, shapeV2, sequenceV2,
-                                                disabledV2, coverV2, trailV2}) {
+                                                disabledV2, coverV2, trailV2, adjustmentV2,
+                                                styledV2}) {
                 const bool special = tlrender::timelineBrushWantsSpecialPath(
                     makeTimeline({{v1Clip}, {excludedV2}}).get());
                 QImage excludedComposite;
@@ -1364,29 +1356,29 @@ int runBrushExportSelftest()
                 excludedLegacy = excludedLegacy && !special && excludedComposite.isNull();
                 excludedLog += QStringLiteral(" %1/%2").arg(int(special)).arg(int(excludedComposite.isNull()));
             }
-            std::cerr << "brush-export G14 blendCompositeNull=" << blendComposite.isNull()
-                      << " lateBlendCompositeNull=" << lateBlendComposite.isNull()
+            std::cerr << "brush-export G14 activeCompositeNull=" << activeComposite.isNull()
                       << " lateNormalCompositeNull=" << normalComposite.isNull()
-                      << " (expect 1 / 1 / 0)"
+                      << " parentCompositeNull=" << parentComposite.isNull()
+                      << " (expect 0 / 0 / 1)"
                       << " gl=" << previewGl << " compositeBaked=" << baked << " decoded="
                       << decoded.width() << "x" << decoded.height()
                       << " uploadEqualsRenderClipSourceAt=" << same
                       << " diffPixels=" << diffPixels(upload, exported)
                       << " brushVisible=" << brushVisible
-                      << " keyframed/fitContain/fadeIn/shape/sequenceRef/disabled/fitCover/trailOut"
-                         " special/compositeNull="
-                      << excludedLog.toStdString() << " (expect 0/1 x8) squareOk=" << squareOk
+                      << " keyframed/fitContain/fadeIn/shape/sequenceRef/disabled/fitCover/trailOut/"
+                         "adjustment/layerStyle special/compositeNull="
+                      << excludedLog.toStdString() << " (expect 0/1 x10) squareOk=" << squareOk
                       << " brushProgressOnlySpecial=" << controlSpecial << " (expect 1)"
                       << " brushProgressOnly=" << brushProgressOnly
-                      << " layerStyle/parent compositeNull/uploadEquals/diffPixels="
-                      << styleParentLog.toStdString() << " (expect 1/1/0 x2)" << '\n';
-            tally.gate(14, movieOk && mainTimeline && blendComposite.isNull()
-                               && lateBlendComposite.isNull() && !normalComposite.isNull() && decoded == QSize(160, 90)
-                               && !baked && same && brushVisible > 100
+                      << " vfxMultiply special noMatte/matte=" << vfxNoMatteSpecial << '/'
+                      << vfxMatteSpecial << " (expect 1/0)" << '\n';
+            tally.gate(14, movieOk && mainTimeline && !activeComposite.isNull()
+                               && !normalComposite.isNull() && parentComposite.isNull()
+                               && decoded == QSize(160, 90) && !baked && same && brushVisible > 100
                                && excludedLegacy && controlSpecial && brushProgressOnly
-                               && styleParentLegacy,
-                       "a blended brushed timeline left the legacy preview path (composite built "
-                       "or the selected-clip brush upload changed)");
+                               && vfxNoMatteSpecial && !vfxMatteSpecial,
+                       "an ineligible brushed timeline left the legacy preview path (composite "
+                       "built or the selected-clip brush upload changed)");
         }
     }
 

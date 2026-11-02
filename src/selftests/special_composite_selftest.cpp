@@ -1,6 +1,7 @@
 // US-708: MainWindow::buildSpecialClipComposite (special-data preview path) must
 // run the same native FX stack (mesh warp / puppet pins / FX pack) as the export
 // path tlrender::renderFrameAt, so preview and export agree.
+#include "../BrushAnimation.h"
 #include "../GLPreview.h"
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
@@ -206,7 +207,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 16; ++g)
+        for (int g = 1; g <= 18; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -1790,6 +1791,171 @@ int runSpecialCompositeSelftest()
                   << " exportTextVsPlainDiffPixels=" << g13Text3D.diffPixels << " (HEAD 0)" << '\n';
         tally.gate(13, varyOk && g13.sizeMatch && g13.maxDiff == 0 && g13Text3D.diffPixels > 100,
                    "3D text preview/export mismatch (see values above)");
+    }
+
+    // US-1905: V1 opaque + V2 overlapping it by 160 x 180, both brushed, paused.
+    // G17: an effective blend (VFX footage above V1) on the brush special path:
+    // buildSpecialClipComposite(t) == renderFrameAt(t) (HEAD: the helper refused
+    // every blend, so the composite was null).
+    // G18: with a matte source a non-VFX blend stays eligible, an effective
+    // blend keeps the legacy path, which draws no brush in the composite.
+    {
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+        timeline->setClipParentEntries({});
+        window.m_timeRemapClipEntries.clear();
+        window.m_projectConfig.fps = kFps;
+        const double bt = 0.5;
+        const auto brushed = [](ClipInfo clip, const QString &text, const QPointF &position) {
+            BrushAnimation brush;
+            brush.setText(text, QFont(QStringLiteral("Arial"), 110), position);
+            brush.setBrushWidth(12.0);
+            clip.brushData = brush.toJson();
+            KeyframeTrack progress(QStringLiteral("brush_progress"), 0.0);
+            progress.addKeyframe(0.0, 1.0);
+            clip.keyframes.addTrack(progress);
+            return clip;
+        };
+        ClipInfo v1Plain = base;
+        v1Plain.filePath = varyPath;
+        v1Plain.videoDx = -0.25;
+        ClipInfo v2Plain = v1Plain;
+        v2Plain.videoDx = 0.25;
+        const ClipInfo v1 = brushed(v1Plain, QStringLiteral("P"), QPointF(50.0, 75.0));
+        const ClipInfo v2 = brushed(v2Plain, QStringLiteral("Q"), QPointF(90.0, 85.0));
+        const auto blendedV2 = [&v2](bool vfx, BlendMode mode) {
+            ClipInfo clip = v2;
+            clip.isVfxFootage = vfx;
+            clip.blendMode = mode;
+            return clip;
+        };
+        const auto setBlendTracks = [&](const QVector<QVector<ClipInfo>> &tracks,
+                                        const QVector<Light3D> &lights = {}) {
+            window.m_projectLights = lights;
+            timeline->setProjectLights(lights);
+            timeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        };
+        const auto exportAt = [&] {
+            return tlrender::renderFrameAt(timeline, qint64(bt * 1000000.0), size);
+        };
+        // The composite against the export of the same timeline, logged.
+        const auto parity = [&](const char *label, QImage *exportOut = nullptr) {
+            const QImage preview = window.buildSpecialClipComposite(bt);
+            const QImage exported = exportAt();
+            const DiffStat stat = compare(preview, exported);
+            std::cerr << "special-composite " << label << " previewNull=" << preview.isNull()
+                      << " sizeMatch=" << stat.sizeMatch << " maxDiff=" << stat.maxDiff
+                      << " diffPixels=" << stat.diffPixels << " formats=" << int(preview.format())
+                      << '/' << int(exported.format()) << " (expect sizeMatch 1, maxDiff 0)\n";
+            if (exportOut)
+                *exportOut = exported;
+            return !preview.isNull() && stat.sizeMatch && stat.maxDiff == 0;
+        };
+
+        setBlendTracks({{v1}, {blendedV2(true, BlendMode::Normal)}});
+        const QImage normalExport = exportAt();
+
+        bool g17ok = varyOk;
+        const QVector<QPair<const char *, BlendMode>> vfxModes{
+            {"G17 VFX Multiply", BlendMode::Multiply},
+            {"G17 VFX Screen", BlendMode::Screen},
+            {"G17 VFX Overlay", BlendMode::Overlay}};
+        for (const auto &vfxMode : vfxModes) {
+            setBlendTracks({{v1}, {blendedV2(true, vfxMode.second)}});
+            QImage blendedExport;
+            const bool same = parity(vfxMode.first, &blendedExport);
+            // Control: the blend shows in the export.
+            const DiffStat blendShows = compare(blendedExport, normalExport);
+            std::cerr << "special-composite " << vfxMode.first << " blend vs Normal export diffPixels="
+                      << blendShows.diffPixels << " (expect > 100)\n";
+            g17ok = g17ok && same && blendShows.diffPixels > 100;
+        }
+
+        // A non-VFX blend is effectively Normal.
+        setBlendTracks({{v1}, {blendedV2(false, BlendMode::Multiply)}});
+        QImage nonVfxExport;
+        const bool nonVfxSame = parity("G17 non-VFX Multiply", &nonVfxExport);
+        const DiffStat nonVfxVsNormal = compare(nonVfxExport, normalExport);
+        std::cerr << "special-composite G17 non-VFX vs Normal export maxDiff=" << nonVfxVsNormal.maxDiff
+                  << " (expect 0)\n";
+        g17ok = g17ok && nonVfxSame && nonVfxVsNormal.maxDiff == 0;
+
+        // V1 is Normal whatever it carries.
+        ClipInfo v1Blended = v1;
+        v1Blended.isVfxFootage = true;
+        v1Blended.blendMode = BlendMode::Multiply;
+        setBlendTracks({{v1Blended}, {blendedV2(true, BlendMode::Normal)}});
+        QImage v1BlendedExport;
+        const bool v1BlendSame = parity("G17 V1 Multiply", &v1BlendedExport);
+        const DiffStat v1VsNormal = compare(v1BlendedExport, normalExport);
+        std::cerr << "special-composite G17 V1 Multiply vs Normal export maxDiff=" << v1VsNormal.maxDiff
+                  << " (expect 0)\n";
+        g17ok = g17ok && v1BlendSame && v1VsNormal.maxDiff == 0;
+
+        // The blended layer is taken out AFTER lighting: it keeps its lit image.
+        // Control: the same timeline without the light composes differently.
+        Light3DState point;
+        point.type = LightType::Point;
+        point.position = QVector3D(200.0f, 100.0f, 150.0f);
+        point.intensity = 2.0;
+        point.falloffEnabled = true;
+        ClipInfo litV1 = v1;
+        litV1.material.acceptsLights = true;
+        ClipInfo litV2 = blendedV2(true, BlendMode::Multiply);
+        litV2.material.acceptsLights = true;
+        setBlendTracks({{litV1}, {litV2}}, {Light3D(point)});
+        const bool litSame = parity("G17 lit VFX Multiply");
+        const QImage litPreview = window.buildSpecialClipComposite(bt);
+        setBlendTracks({{litV1}, {litV2}});
+        const QImage unlitPreview = window.buildSpecialClipComposite(bt);
+        const DiffStat lightShows = compare(litPreview, unlitPreview);
+        std::cerr << "special-composite G17 lit vs unlit composite maxDiff=" << lightShows.maxDiff
+                  << " diffPixels=" << lightShows.diffPixels << " (expect diffPixels > 100)\n";
+        g17ok = g17ok && litSame && lightShows.diffPixels > 100;
+        setBlendTracks({{v1}, {v2}});
+        tally.gate(17, g17ok, "effective-blend special composite != renderFrameAt (see values above)");
+
+        // V2 under a luma matte from V3.
+        ClipInfo v3 = base;
+        const auto matteV2 = [&] {
+            TimelineTrackMatteEntry entry;
+            entry.matteType = TrackMatteType::LumaInvertedMatte;
+            entry.matteSourceClipId = trackMatteClipKey(2, 0);
+            QHash<QString, TimelineTrackMatteEntry> entries;
+            entries.insert(trackMatteClipKey(1, 0), entry);
+            timeline->setTrackMatteEntries(entries);
+        };
+        const auto withoutBrush = [](ClipInfo clip) {
+            clip.brushData = QJsonObject();
+            return clip;
+        };
+
+        setBlendTracks({{v1}, {blendedV2(false, BlendMode::Multiply)}, {v3}});
+        matteV2();
+        const bool nonVfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline);
+        const bool nonVfxMatteSame = parity("G18 matte + non-VFX Multiply");
+
+        setBlendTracks({{v1}, {blendedV2(true, BlendMode::Multiply)}, {v3}});
+        matteV2();
+        const bool vfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline);
+        const QImage vfxPreview = window.buildSpecialClipComposite(bt);
+        const QImage vfxExport = exportAt();
+        setBlendTracks({{withoutBrush(v1)}, {withoutBrush(blendedV2(true, BlendMode::Multiply))}, {v3}});
+        matteV2();
+        const QImage unbrushedPreview = window.buildSpecialClipComposite(bt);
+        const QImage unbrushedExport = exportAt();
+        const DiffStat g18 = compare(vfxPreview, unbrushedPreview);
+        // Control: on this frame a drawn brush would show.
+        const DiffStat g18Brush = compare(vfxExport, unbrushedExport);
+        std::cerr << "special-composite G18 helper nonVfx/vfx=" << nonVfxHelper << '/' << vfxHelper
+                  << " (expect 1/0) vfx previewNull=" << vfxPreview.isNull()
+                  << " vs unbrushed sizeMatch=" << g18.sizeMatch << " maxDiff=" << g18.maxDiff
+                  << " (expect 1 / 0) export brushed vs unbrushed diffPixels=" << g18Brush.diffPixels
+                  << " (expect > 100)\n";
+        tally.gate(18, varyOk && nonVfxHelper && nonVfxMatteSame && !vfxHelper && !vfxPreview.isNull()
+                       && g18.sizeMatch && g18.maxDiff == 0 && g18Brush.diffPixels > 100,
+                   "matte + blend: eligibility or the brushless legacy composite is wrong (see values above)");
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
     }
 
     return tally.finish("special-composite");
