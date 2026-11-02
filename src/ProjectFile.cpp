@@ -2181,10 +2181,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
             p.gain = pt["g"].toDouble(1.0);
             clip.volumeEnvelope.append(p);
         }
-        std::sort(clip.volumeEnvelope.begin(), clip.volumeEnvelope.end(),
-                  [](const AudioGainPoint &a, const AudioGainPoint &b) {
-                      return a.time < b.time;
-                  });
+        std::stable_sort(clip.volumeEnvelope.begin(), clip.volumeEnvelope.end(),
+                         [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                             return a.time < b.time;
+                         });
     }
 
     if (obj.contains("colorCorrection"))

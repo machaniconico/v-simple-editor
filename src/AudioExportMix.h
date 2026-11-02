@@ -33,9 +33,11 @@ void processClipEq(DspEntry &entry, const trackfx::EqSettings &eq);
 QString findFfmpegBinary();
 QString ffmpegNumber(double value);
 QVector<AudioGainPoint> sortedDedupedEnvelope(QVector<AudioGainPoint> env);
-// Auto-ducking: lowers `existing` to `ducking` wherever the latter is lower, then merges
-// points within 1 ms to the minimum gain (the pre-Wave-18 envelope merge, kept so the
-// ducking result stays byte-identical; sortedDedupedEnvelope keeps same-time runs).
+// Auto-ducking: caps every existing point at the ducking curve (at the clamped fallbackGain
+// outside the curve's span) and adds the ducking points. An existing and a ducking point
+// within 1 ms become one point at the earlier time with the lower gain; points from one
+// source stay, except the middle of a same-instant run (sortedDedupedEnvelope's rule).
+// Applying the same curve again changes nothing.
 QVector<AudioGainPoint> mergeDuckingEnvelope(const QVector<AudioGainPoint> &existing,
                                              const QVector<AudioGainPoint> &ducking,
                                              double fallbackGain);

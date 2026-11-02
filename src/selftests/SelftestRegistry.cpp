@@ -749,7 +749,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "atempo-resolve",    "VEDITOR_ATEMPO_RESOLVE_SELFTEST",     runAtempoResolveSelftest,      false,
       "Audio atempo enable resolver truth table: env force OR per-clip flag" },
     { "auto-ducking",      "VEDITOR_AUTO_DUCKING_SELFTEST",        runAutoDuckingSelftest,        false,
-      "AutoDucking: thresholded VO envelope + non-destructive BGM gain keyframes" },
+      "AutoDucking: thresholded VO envelope + non-destructive BGM gain keyframes (21 gates)" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
