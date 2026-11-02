@@ -63,8 +63,21 @@
 //      a gain-3 envelope point likewise). Detects: any consumer still clamping at 2.0 (HEAD:
 //      editor 2.0, setClipVolume 2.0, property range [0, 2], export peak 2x; mutation build
 //      kMaxClipGain = 2.0).
+//   G13 (US-1912) a split continues the wiggle (40 px, 2 Hz, seed 7) and the expression time
+//      (transform.position.x = time * 0.1): renderFrameAt at timeline 1.25 / 1.7 is byte-equal
+//      to before the split at L = 1.0 (splitClipByIndex, and the wiggle through the blade and
+//      playhead paths too), dynamicTimeOffsetSec is 1.0 on the right half and 1.5 after a second
+//      cut 0.5 s into it. Control: the right half with the offset back at 0 differs at 1.25.
+//      Detects: both restarting from local 0 on the right half (HEAD).
+//   G14 (US-1912) transform.opacity = audioLevel() * 100 on a clip linked to a WAV silent at
+//      1.0-1.5 s reads the same level on the right half (timeline 1.25 / 2.25, within 1e-6) as
+//      before the split, 1.25 and 2.25 differing by at least 0.1; the offset round-trips through
+//      JSON, 0 writes no key; the render-in-place replacement and its renderInPlaceOriginal
+//      keep the offset. Detects: audioLevel following the offset time
+//      (mutation build: no `t - offset` wrapper), or copyComposition without the field.
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
+#include "../AudioKeyframes.h"
 #include "../BrushAnimation.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
@@ -74,6 +87,7 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "../clipanim/ClipAnim.h"
 #include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "SelftestGate.h"
@@ -1368,6 +1382,211 @@ int runClipSidecarSelftest()
             tally.skip(12, "ffmpeg unavailable (the export-mix checks did not run)");
         else
             tally.gate(12, ok, detail);
+    }
+
+    // G13 / G14 (US-1912): the wiggle phase and the expression time continue across a split,
+    // audioLevel() stays on the clip's real audio time.
+    {
+        constexpr double kCut = 1.0;
+        const QSize frameSize(640, 360);
+        const QString mediaPath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto mediaUs = libavcore::probeDurationMicroseconds(mediaPath.toStdString());
+        const double mediaSec = mediaUs ? double(*mediaUs) / 1000000.0 : 0.0;
+        const QString mediaMissing = QString::asprintf(
+            "prerequisite: fixture=%s duration=%.3f (run from the repository root)", qPrintable(mediaPath), mediaSec);
+        const bool mediaOk = QFileInfo::exists(mediaPath) && mediaSec >= 4.0;
+        const auto mediaClip = [&]() {
+            ClipInfo clip{};
+            clip.filePath = mediaPath;
+            clip.displayName = QStringLiteral("dynamic");
+            clip.duration = mediaSec;
+            clip.outPoint = 3.0;
+            return clip;
+        };
+        const auto frameAt = [&](const Timeline &tl, double timelineSec) {
+            return tlrender::renderFrameAt(&tl, microsAt(timelineSec), frameSize);
+        };
+        const auto sameImage = [](const QImage &a, const QImage &b) {
+            return !a.isNull() && a.format() == b.format() && a == b;
+        };
+
+        if (!mediaOk) {
+            tally.gate(13, false, mediaMissing.toStdString());
+        } else {
+            bool ok13 = true;
+            QStringList shown13;
+            const auto check13 = [&](const QString &name, bool passed) {
+                ok13 = ok13 && passed;
+                shown13 << QStringLiteral("%1=%2").arg(name).arg(int(passed));
+            };
+            ClipInfo wiggled = mediaClip();
+            wiggled.wiggle.enabled = true;
+            wiggled.wiggle.positionAmplitude = QPointF(40.0, 40.0);
+            wiggled.wiggle.positionFrequency = 2.0;
+            wiggled.wiggle.seed = 7;
+            ClipInfo timed = mediaClip();
+            timed.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("time * 0.1"));
+            struct DynamicCase { const char *name; ClipInfo clip; };
+            for (const DynamicCase &c : {DynamicCase{"wiggle", wiggled}, DynamicCase{"expression", timed}}) {
+                const QString name = QString::fromLatin1(c.name);
+                Timeline tl;
+                loadTimeline(tl, {{c.clip}});
+                const QImage before125 = frameAt(tl, 1.25);
+                const QImage before17 = frameAt(tl, 1.7);
+                QString err;
+                const bool split = tl.splitClipByIndex(false, 0, 0, kCut, &err);
+                const ClipInfo right = tl.trackAt(false, 0)->clips().value(1);
+                check13(name + QStringLiteral("Split"), split);
+                check13(name + QStringLiteral("Offset1"), right.dynamicTimeOffsetSec == kCut);
+                check13(name + QStringLiteral("Left0"),
+                        tl.trackAt(false, 0)->clips().value(0).dynamicTimeOffsetSec == 0.0);
+                check13(name + QStringLiteral("Same1.25"), sameImage(frameAt(tl, 1.25), before125));
+                check13(name + QStringLiteral("Same1.7"), sameImage(frameAt(tl, 1.7), before17));
+                // Control: the same right half without the offset restarts from local 0.
+                {
+                    QVector<ClipInfo> clips = tl.trackAt(false, 0)->clips();
+                    clips[1].dynamicTimeOffsetSec = 0.0;
+                    Timeline control;
+                    loadTimeline(control, {clips});
+                    check13(name + QStringLiteral("ControlDiffers"), !frameAt(control, 1.25).isNull()
+                            && !sameImage(frameAt(control, 1.25), before125));
+                }
+                // A second cut 0.5 s into the right half accumulates.
+                const bool secondSplit = tl.splitClipByIndex(false, 0, 1, kCut + 0.5, &err);
+                check13(name + QStringLiteral("Second"), secondSplit);
+                check13(name + QStringLiteral("Offset1.5"),
+                        tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && tl.trackAt(false, 0)->clips().value(2).dynamicTimeOffsetSec == kCut + 0.5);
+                check13(name + QStringLiteral("SecondSame1.7"), sameImage(frameAt(tl, 1.7), before17));
+            }
+            // The other split paths go through splitClipAt too.
+            {
+                Timeline tl;
+                loadTimeline(tl, {{wiggled}});
+                const QImage before = frameAt(tl, 1.25);
+                tl.setPlayheadPosition(kCut);
+                tl.bladeAllTracksAtPlayhead();
+                check13(QStringLiteral("blade"), tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && sameImage(frameAt(tl, 1.25), before));
+            }
+            {
+                Timeline tl;
+                loadTimeline(tl, {{wiggled}});
+                const QImage before = frameAt(tl, 1.25);
+                QString err;
+                const bool selected = tl.selectClipByIndex(false, 0, 0, &err);
+                tl.setPlayheadPosition(kCut);
+                tl.splitAtPlayhead();
+                check13(QStringLiteral("playhead"), selected
+                        && tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && sameImage(frameAt(tl, 1.25), before));
+            }
+            tally.gate(13, ok13, shown13.join(QLatin1Char(' ')).toStdString());
+        }
+
+        if (!mediaOk) {
+            tally.gate(14, false, mediaMissing.toStdString());
+        } else {
+            bool ok14 = true;
+            QStringList shown14;
+            const auto check14 = [&](const QString &name, bool passed, const QString &value = QString()) {
+                ok14 = ok14 && passed;
+                shown14 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                               .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+            };
+            const auto num = [](double v) { return QString::number(v, 'g', 9); };
+            // A 3 s tone at amplitude 0.5, silent over 1.0-1.5 s.
+            QTemporaryDir audioDir;
+            const QString wavPath = audioDir.filePath(QStringLiteral("g14-gap.wav"));
+            std::vector<float> samples(size_t(3 * 48000) * 2);
+            for (size_t i = 0; i < samples.size() / 2; ++i) {
+                const double sec = double(i) / 48000.0;
+                const double level = sec >= 1.0 && sec < 1.5 ? 0.0 : 0.5;
+                samples[2 * i] = samples[2 * i + 1] =
+                    float(level * std::sin(2.0 * 3.141592653589793 * 1000.0 * sec));
+            }
+            QString wavError;
+            const bool wavOk = audioDir.isValid()
+                && libavcore::writeWavFloatInterleaved(wavPath, samples, 48000, 2, &wavError);
+            check14(QStringLiteral("wav"), wavOk, wavError);
+
+            ClipInfo video = mediaClip();
+            video.linkGroup = 11;
+            video.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel() * 100"));
+            ClipInfo audio{};
+            audio.filePath = wavPath;
+            audio.duration = audio.outPoint = 3.0;
+            audio.linkGroup = 11;
+            Timeline tl;
+            tl.restoreFromProject(QVector<QVector<ClipInfo>>{{video}}, QVector<QVector<ClipInfo>>{{audio}},
+                                  0.0, -1.0, -1.0, 100);
+            // The opacity of `clip` (timeline start clipStart) at a timeline second, read the way
+            // TimelineFrameRenderer's clipEvalEnv does.
+            const auto opacityAt = [&](const ClipInfo &clip, double clipStart, double timelineSec) {
+                tl.setExpressionAudioEnv(tl.buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
+                clipanim::EvalEnv env;
+                env.fps = 30.0;
+                env.canvas = frameSize;
+                env.audioLevelAtTime = tl.expressionAudioLevelSampler(clip, clipStart);
+                return clipanim::effectiveOpacityAt(clip, timelineSec - clipStart, 1.0, env);
+            };
+            const double before125 = opacityAt(tl.videoTracks()[0]->clips()[0], 0.0, 1.25);
+            const double before225 = opacityAt(tl.videoTracks()[0]->clips()[0], 0.0, 2.25);
+            check14(QStringLiteral("fixture"), std::abs(before125 - before225) >= 0.1,
+                    QStringLiteral("level 1.25 = %1, 2.25 = %2").arg(num(before125), num(before225)));
+            QString err;
+            const bool split = tl.splitClipByIndex(false, 0, 0, kCut, &err);
+            check14(QStringLiteral("split"), split, err);
+            const ClipInfo right = tl.videoTracks()[0]->clips().value(1);
+            const double after125 = opacityAt(right, kCut, 1.25);
+            const double after225 = opacityAt(right, kCut, 2.25);
+            check14(QStringLiteral("right1.25"), right.dynamicTimeOffsetSec == kCut
+                    && std::abs(after125 - before125) <= 1e-6, num(after125));
+            check14(QStringLiteral("right2.25"), std::abs(after225 - before225) <= 1e-6, num(after225));
+
+            // JSON: the offset round-trips, 0 writes no key.
+            {
+                ProjectData data;
+                data.videoTracks = {tl.trackAt(false, 0)->clips()};
+                data.audioTracks = {{}};
+                const QString json = ProjectFile::toJsonString(data);
+                const QJsonObject root = rootOf(json);
+                ProjectData loaded;
+                const bool read = ProjectFile::fromJsonString(json, loaded);
+                check14(QStringLiteral("jsonRoundTrip"), read
+                        && loaded.videoTracks.value(0).value(1).dynamicTimeOffsetSec == kCut
+                        && loaded.videoTracks.value(0).value(0).dynamicTimeOffsetSec == 0.0);
+                check14(QStringLiteral("jsonKey"),
+                        !firstClipJson(root, 0).contains(QStringLiteral("dynamicTimeOffsetSec"))
+                        && firstClipJson(root, 1).contains(QStringLiteral("dynamicTimeOffsetSec")));
+            }
+
+            // Render in place: the replacement carries the offset with the wiggle it keeps live.
+            {
+                ClipInfo carrying = mediaClip();
+                carrying.wiggle = wiggle::WiggleParams{};
+                carrying.wiggle.enabled = true;
+                carrying.wiggle.positionAmplitude = QPointF(40.0, 40.0);
+                carrying.dynamicTimeOffsetSec = kCut;
+                Timeline bakeTimeline;
+                loadSingleClip(bakeTimeline, carrying);
+                QTemporaryDir bakeDir;
+                renderinplace::Options options;
+                options.outputSize = frameSize;
+                options.fps = 30;
+                options.handlesSec = 0.0;
+                options.outputDir = bakeDir.filePath(QStringLiteral("g14"));
+                QString bakedPath, bakeError;
+                const bool baked = bakeDir.isValid()
+                    && renderinplace::renderClipInPlace(bakeTimeline, 0, 0, options, &bakedPath, &bakeError);
+                const ClipInfo replacement = baked ? bakeTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+                check14(QStringLiteral("replacement"), baked && replacement.renderInPlaceOriginal
+                        && replacement.filePath != carrying.filePath && replacement.dynamicTimeOffsetSec == kCut
+                        && replacement.renderInPlaceOriginal->dynamicTimeOffsetSec == kCut,
+                        QStringLiteral("%1 %2").arg(num(replacement.dynamicTimeOffsetSec), bakeError));
+            }
+            tally.gate(14, ok14, shown14.join(QLatin1Char(' ')).toStdString());
+        }
     }
 
     return tally.finish("clip-sidecar");

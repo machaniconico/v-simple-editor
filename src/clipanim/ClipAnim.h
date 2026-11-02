@@ -66,8 +66,9 @@ bool hasAnyDynamicTransform(const ClipInfo& clip);
 // The single dynamic overlay applied on top of the keyframed values (in the
 // order keyframes -> autoOrient -> expressions -> wiggle): the expressions
 // replace position x / y, scale, rotation and opacity (as percent) with their
-// value (time = clipLocalSeconds, fps / canvas from env, audioLevel() from
-// env.audioLevelAtTime); then wiggle adds its pixel offset, converted to
+// value (time = clipLocalSeconds + clip.dynamicTimeOffsetSec, fps / canvas from
+// env, audioLevel() from env.audioLevelAtTime, which stays on clip-local seconds);
+// then wiggle, at that same offset time, adds its pixel offset, converted to
 // normalized canvas fractions through env.canvas, its rotation and its scale
 // multiplier. Null pointers are skipped.
 void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,

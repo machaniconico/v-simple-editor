@@ -40,6 +40,7 @@ void copyComposition(const ClipInfo &from, ClipInfo &to)
     to.autoOrientEnabled = from.autoOrientEnabled;
     to.autoOrientToCamera = from.autoOrientToCamera;
     to.wiggle = from.wiggle;
+    to.dynamicTimeOffsetSec = from.dynamicTimeOffsetSec;
     to.expressions = from.expressions;
     to.text3DConfig = from.text3DConfig;
     to.opacity = from.opacity;

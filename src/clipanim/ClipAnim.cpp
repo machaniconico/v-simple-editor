@@ -736,14 +736,19 @@ void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,
                          const EvalEnv& env, double *posX, double *posY,
                          double *scale, double *rotationDeg, double *opacity01)
 {
+    const double dynamicSec = clipLocalSeconds + clip.dynamicTimeOffsetSec;
     if (!clip.expressions.isEmpty()) {
         ExpressionContext ctx;
-        ctx.time = clipLocalSeconds;
+        ctx.time = dynamicSec;
         ctx.fps = env.fps;
         ctx.duration = clip.effectiveDuration();
         ctx.canvasWidth = env.canvas.width();
         ctx.canvasHeight = env.canvas.height();
-        ctx.audioLevelAtTime = env.audioLevelAtTime;
+        // audioLevel() passes ctx.time on to the sampler, which reads clip-local seconds.
+        ctx.audioLevelAtTime = [&](double dynamicAudioSec) {
+            return env.audioLevelAtTime
+                ? env.audioLevelAtTime(dynamicAudioSec - clip.dynamicTimeOffsetSec) : 0.0;
+        };
         const exprbind::ClipExpressionBindings &bindings = clip.expressions;
         if (posX)
             *posX = bindings.resolve(QStringLiteral("transform.position.x"), ctx, *posX);
@@ -760,7 +765,7 @@ void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,
         }
     }
     if (clip.wiggle.enabled) {
-        const wiggle::WiggleOffset off = wiggle::evaluate(clip.wiggle, clipLocalSeconds);
+        const wiggle::WiggleOffset off = wiggle::evaluate(clip.wiggle, dynamicSec);
         // wiggle::positionOffset is in PIXELS; posX/posY are NORMALIZED
         // canvas fractions (canonical clipgeom contract). Convert the pixel
         // offset with the project canvas so wiggle keeps its visual

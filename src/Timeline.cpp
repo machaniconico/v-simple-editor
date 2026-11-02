@@ -2200,6 +2200,8 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
         secondHalf.text3DConfig[QStringLiteral("timeOffsetSec")] =
             std::isfinite(previousOffset) ? previousOffset + cutLocalSec : cutLocalSec;
     }
+    // US-1912: the wiggle phase and the expression time carry on from the cut.
+    secondHalf.dynamicTimeOffsetSec += cutLocalSec;
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);

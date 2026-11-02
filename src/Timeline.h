@@ -260,6 +260,11 @@ struct ClipInfo {
     // US-1505: per-clip expression bindings (propPath -> code), evaluated by
     // clipanim::applyDynamicOverlay after autoOrient and before the wiggle (empty by default).
     exprbind::ClipExpressionBindings expressions;
+    // US-1912: seconds added to the clip-local time of the wiggle and of the expression
+    // `time` variable, so both continue across a split: TimelineTrack::splitClipAt adds the
+    // cut to the right half (cumulative), a trim leaves it. Other clip-local data is shifted
+    // by the split instead. 0 = none.
+    double dynamicTimeOffsetSec = 0.0;
     // US-1706: the clip's 3D extruded text (Text3DLayer::toJson()) and brush animation
     // (BrushAnimation::toJson()), formerly the "track:clip" keyed MainWindow sidecars.
     // Empty = none. A split leaves both on the left half only.
