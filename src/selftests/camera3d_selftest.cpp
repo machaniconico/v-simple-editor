@@ -834,6 +834,22 @@ int runCamera3DSelftest()
         }
     }
 
+    // G16 (US-1907): horizontal field of view of a focal length in px, and its plausibility range.
+    {
+        const double a = camera3d::horizontalFovDegrees(60, 1920);
+        const double b = camera3d::horizontalFovDegrees(1663, 1920);
+        const double zeroF = camera3d::horizontalFovDegrees(0, 1920);
+        const double zeroW = camera3d::horizontalFovDegrees(60, 0);
+        const bool p60 = camera3d::focalIsPlausible(60, 1920);
+        const bool p2304 = camera3d::focalIsPlausible(2304, 1920);
+        const bool p0 = camera3d::focalIsPlausible(0, 1920);
+        std::fprintf(stderr, "camera3d G16: fov(60,1920)=%.4f fov(1663,1920)=%.4f fov(0,1920)=%.1f "
+                     "fov(60,0)=%.1f plausible(60)=%d plausible(2304)=%d plausible(0)=%d\n",
+                     a, b, zeroF, zeroW, int(p60), int(p2304), int(p0));
+        gate(16, std::fabs(a - 172.8) < 0.1 && std::fabs(b - 60.0) < 0.1 && zeroF == 180.0
+                 && zeroW == 180.0 && !p60 && p2304 && !p0);
+    }
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL, %d SKIP\n", passed, failed, skipped);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, skipped);

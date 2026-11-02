@@ -411,7 +411,12 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     auto* scaleRow = new QHBoxLayout;
     scaleRow->addWidget(new QLabel(tr("スケール (px/単位)"), this));
     scaleRow->addWidget(m_featureScaleSpin);
+    m_cameraFovWarning = new QLabel(this);
+    m_cameraFovWarning->setObjectName(QStringLiteral("cameraFovWarningLabel"));
+    m_cameraFovWarning->setWordWrap(true);
+    m_cameraFovWarning->hide();
     rightLayout->addWidget(m_featureSolveButton);
+    rightLayout->addWidget(m_cameraFovWarning);
     rightLayout->addLayout(scaleRow);
     rightLayout->addWidget(m_featureSolveSummary);
     connect(m_featureSolveButton, &QPushButton::clicked, this,
@@ -909,6 +914,15 @@ void PlanarTrackerDialog::setCameraSolveContext(QSize canvas, double fov,
     m_cameraFov = fov;
     m_cameraFps = fps > 0 ? fps : 30.0;
     m_cameraStartSec = startSec;
+    if (camera3d::focalIsPlausible(fov, canvas.width())) {
+        m_cameraFovWarning->hide();
+    } else {
+        m_cameraFovWarning->setText(tr("焦点距離 %1 px は水平画角 %2° に相当し、現実的な範囲 (20°〜120°) を外れています。"
+                                       "解析結果が不安定になることがあります。")
+            .arg(QString::number(fov, 'f', 0))
+            .arg(QString::number(camera3d::horizontalFovDegrees(fov, canvas.width()), 'f', 1)));
+        m_cameraFovWarning->show();
+    }
 }
 
 void PlanarTrackerDialog::onCameraSolveClicked()

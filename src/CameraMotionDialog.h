@@ -33,6 +33,9 @@ public:
     // Store scene layers for preview (optional; falls back to wireframe grid).
     void setSceneLayers(const QVector<CompositeLayer> &layers);
 
+    // Canvas width (px) used for the horizontal field-of-view hint next to the focal length.
+    void setCanvasWidth(int width);
+
 signals:
     void cameraChanged();
 
@@ -58,6 +61,8 @@ private:
     QDoubleSpinBox  *m_tgtY             = nullptr;
     QDoubleSpinBox  *m_tgtZ             = nullptr;
     QDoubleSpinBox  *m_fov              = nullptr;
+    QLabel          *m_fovHint          = nullptr;
+    int              m_canvasWidth      = 1920;
     QDoubleSpinBox  *m_roll             = nullptr;
 
     QCheckBox       *m_trueProjection   = nullptr;

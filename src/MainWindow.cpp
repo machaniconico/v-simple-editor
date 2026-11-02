@@ -15770,6 +15770,7 @@ void MainWindow::openCameraMotionDialog()
     CameraMotionDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("カメラモーション"));
     dialog.setCamera(m_projectCamera);
+    dialog.setCanvasWidth(m_projectConfig.width);
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();

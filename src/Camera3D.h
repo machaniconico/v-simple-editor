@@ -13,6 +13,7 @@
 #include <QVector>
 #include <QVector3D>
 
+#include <cmath>
 #include <optional>
 
 // --- Camera state at a point in time ---
@@ -218,6 +219,23 @@ std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3
 // US-1817: canvas px of the camera's solve point cloud at sec; points at / behind the pinhole
 // are left out, so the result can be shorter than solvePoints().
 QVector<QPointF> projectedSolvePoints(const Camera3D &camera, double sec, const QSize &canvas);
+// US-1907: horizontal field of view (degrees) of a focal length in px over a canvas width in px,
+// 2 * atan((W / 2) / f); 180 when either is not positive.
+inline double horizontalFovDegrees(double focalPx, int canvasWidth)
+{
+    if (focalPx <= 0.0 || canvasWidth <= 0)
+        return 180.0;
+    return 2.0 * std::atan((canvasWidth / 2.0) / focalPx) * 180.0 / 3.14159265358979323846;
+}
+// US-1907: a focal length is plausible when it is positive and its horizontal field of view
+// over the canvas width lies in [20, 120] degrees.
+inline bool focalIsPlausible(double focalPx, int canvasWidth)
+{
+    if (!(focalPx > 0.0) || canvasWidth <= 0)
+        return false;
+    const double deg = horizontalFovDegrees(focalPx, canvasWidth);
+    return deg >= 20.0 && deg <= 120.0;
+}
 } // namespace camera3d
 
 // Shared opt-in compositing step for preview and export.
