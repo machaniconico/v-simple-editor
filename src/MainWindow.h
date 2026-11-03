@@ -271,6 +271,7 @@ class MainWindow : public QMainWindow
     friend int runMediaRelinkSelftest();
     friend int runMainWindowLifecycleSelftest();
     friend int runBrushExportSelftest();
+    friend int runKeyframeAnimParitySelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -879,7 +880,8 @@ private:
     void resolvePreviewProxies(QVector<PlaybackEntry> &entries, bool allowAutoPlanning);
     void queueAutoProxyProbe(const QString &filePath);
 
-    QImage buildSpecialClipComposite(double timelineSeconds) const;
+    // US-1906: `*drewBrush` = the composite built at this time holds the brushes.
+    QImage buildSpecialClipComposite(double timelineSeconds, bool *drewBrush = nullptr) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
     // roto carrier (Timeline::rotoEntries) の唯一の書き手。空 entry なら削除し、
     // 1 回の saveUndoState で 1 undo にする。

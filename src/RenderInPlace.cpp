@@ -40,6 +40,7 @@ void copyComposition(const ClipInfo &from, ClipInfo &to)
     to.autoOrientEnabled = from.autoOrientEnabled;
     to.autoOrientToCamera = from.autoOrientToCamera;
     to.wiggle = from.wiggle;
+    to.dynamicTimeOffsetSec = from.dynamicTimeOffsetSec;
     to.expressions = from.expressions;
     to.text3DConfig = from.text3DConfig;
     to.opacity = from.opacity;
@@ -205,12 +206,6 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
             if (effect.startSec >= 0.0) effect.startSec += handles;
             if (effect.endSec >= 0.0) effect.endSec += handles;
         }
-        auto overlays = isolated.textManager.overlays();
-        for (auto &overlay : overlays) {
-            overlay.startTime += handles;
-            if (overlay.endTime > 0.0) overlay.endTime += handles;
-        }
-        isolated.textManager.setOverlays(overlays);
         // Preserve the nonlinear source map over the retained interval.
         // Sampling at export ticks uses ClipInfo's existing mapping, never a
         // second speed-ramp integrator. Boundary handles hold when exhausted.
@@ -390,6 +385,23 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     // either track so the video source clock and replacement trim agree.
     prefix = snap(prefix);
     suffix = snap(suffix);
+    // Overlays run on the timeline clock, and the renderer draws only the first
+    // track's: a later track's overlays never reached the source picture. Move
+    // the clock from the clip's timeline start to its start in the job. An end
+    // at or below 0 reads as "no end", so an overlay that ends before the job
+    // is dropped instead; a start below 0 stays (elapsed time still counts).
+    QVector<EnhancedTextOverlay> isolatedOverlays;
+    if (trackIndex == 0) {
+        const double overlayShiftTimelineSec = prefix - videoStart;
+        for (auto overlay : original.textManager.overlays()) {
+            if (overlay.endTime > 0.0 && overlay.endTime + overlayShiftTimelineSec <= 0.0)
+                continue;
+            overlay.startTime += overlayShiftTimelineSec;
+            if (overlay.endTime > 0.0) overlay.endTime += overlayShiftTimelineSec;
+            isolatedOverlays.append(overlay);
+        }
+    }
+    isolated.textManager.setOverlays(isolatedOverlays);
     std::sort(linked.begin(), linked.end(), [](const ClipInfo &a, const ClipInfo &b) {
         return a.leadInSec < b.leadInSec;
     });

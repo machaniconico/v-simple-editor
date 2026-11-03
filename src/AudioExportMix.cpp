@@ -35,34 +35,20 @@ namespace {
 std::atomic<int> s_buildMixPlanGuiThreadCalls{0};
 std::atomic<int> s_buildMixPlanOtherThreadCalls{0};
 
-// The envelope merge every ducking apply used before Wave 18 (f924c62's
-// sortedDedupedEnvelope): points within 1 ms collapse to the minimum gain.
-QVector<AudioGainPoint> duckingMergedEnvelope(QVector<AudioGainPoint> env)
-{
-    std::sort(env.begin(), env.end(),
-              [](const AudioGainPoint &a, const AudioGainPoint &b) {
-                  return a.time < b.time;
-              });
-    QVector<AudioGainPoint> out;
-    out.reserve(env.size());
-    for (const AudioGainPoint &point : env) {
-        AudioGainPoint p;
-        p.time = qMax(0.0, point.time);
-        p.gain = qBound(0.0, point.gain, 2.0);
-        if (!out.isEmpty() && std::abs(out.last().time - p.time) <= 0.001) {
-            out.last().gain = qMin(out.last().gain, p.gain);
-        } else {
-            out.append(p);
-        }
-    }
-    return out;
-}
+// One point of mergeDuckingEnvelope's working list. rawGain is a ducking point's own gain
+// before the existing envelope is evaluated at it; a merge across the sources reads it.
+struct DuckMergePoint {
+    double time = 0.0;
+    double gain = 1.0;
+    double rawGain = 1.0;
+    bool fromDucking = false;
+};
 
 QString volumeExpressionForEntry(const PlaybackEntry &entry)
 {
     QVector<AudioGainPoint> env = audioexport::sortedDedupedEnvelope(entry.volumeEnvelope);
     if (env.isEmpty())
-        return audioexport::ffmpegNumber(qBound(0.0, entry.volume, 2.0));
+        return audioexport::ffmpegNumber(audio::clampClipGain(entry.volume));
 
     auto linearExpr = [](const AudioGainPoint &a,
                          const AudioGainPoint &b) {
@@ -144,7 +130,7 @@ QVector<AudioGainPoint> audioexport::sortedDedupedEnvelope(QVector<AudioGainPoin
     for (const AudioGainPoint &point : env) {
         AudioGainPoint p;
         p.time = qMax(0.0, point.time);
-        p.gain = qBound(0.0, point.gain, 2.0);
+        p.gain = audio::clampClipGain(point.gain);
         // The preview (audio::evaluateVolumeEnvelope) interpolates every point,
         // so a fast ramp and a step stay. Only the middle of a run at one instant
         // (within ffmpegNumber's resolution) is dropped: the run's first gain is
@@ -167,15 +153,70 @@ QVector<AudioGainPoint> audioexport::mergeDuckingEnvelope(const QVector<AudioGai
     if (existing.isEmpty())
         return ducking;
 
-    QVector<AudioGainPoint> merged = existing;
-    merged.reserve(existing.size() + ducking.size());
+    const double base = audio::clampClipGain(fallbackGain);
+    const double duckFirst = ducking.first().time;
+    const double duckLast = ducking.last().time;
+    auto duckAt = [&](double t) {
+        if (t < duckFirst || t > duckLast)
+            return base;
+        return audio::evaluateVolumeEnvelope(ducking, t, base);
+    };
+
+    // Existing points come first, so the stable sort keeps them ahead of a ducking point at
+    // the same time and keeps an authored same-time run in order.
+    QVector<DuckMergePoint> points;
+    points.reserve(existing.size() + ducking.size());
+    for (const AudioGainPoint &point : existing) {
+        DuckMergePoint p;
+        p.time = qMax(0.0, point.time);
+        p.gain = audio::clampClipGain(qMin(point.gain, duckAt(point.time)));
+        points.append(p);
+    }
     for (const AudioGainPoint &point : ducking) {
         const double existingGain = audio::evaluateVolumeEnvelope(existing,
                                                                   point.time,
                                                                   fallbackGain);
-        merged.append({point.time, qMin(existingGain, point.gain)});
+        DuckMergePoint p;
+        p.time = qMax(0.0, point.time);
+        p.gain = audio::clampClipGain(qMin(existingGain, point.gain));
+        p.rawGain = audio::clampClipGain(point.gain);
+        p.fromDucking = true;
+        points.append(p);
     }
-    return duckingMergedEnvelope(merged);
+    std::stable_sort(points.begin(), points.end(),
+                     [](const DuckMergePoint &a, const DuckMergePoint &b) {
+                         return a.time < b.time;
+                     });
+
+    QVector<DuckMergePoint> out;
+    out.reserve(points.size());
+    for (const DuckMergePoint &p : points) {
+        const int n = out.size();
+        if (n >= 1 && out[n - 1].fromDucking != p.fromDucking
+            && std::abs(out[n - 1].time - p.time) <= 0.001) {
+            // Across the sources, within 1 ms: one point. The ducking side gives its raw
+            // gain, not the value interpolated on the existing envelope, which would sink
+            // a little further on every re-apply near a ramp.
+            DuckMergePoint &last = out[n - 1];
+            const double existingGain = last.fromDucking ? p.gain : last.gain;
+            const double duckGain = last.fromDucking ? last.rawGain : p.rawGain;
+            last.gain = qMin(existingGain, duckGain);
+            last.fromDucking = false;
+        } else if (n >= 2 && out[n - 1].fromDucking == p.fromDucking
+                   && out[n - 2].fromDucking == p.fromDucking
+                   && p.time - out[n - 2].time <= 0.000001) {
+            // Same source, same instant: sortedDedupedEnvelope's rule, first and last stay.
+            out[n - 1] = p;
+        } else {
+            out.append(p);
+        }
+    }
+
+    QVector<AudioGainPoint> merged;
+    merged.reserve(out.size());
+    for (const DuckMergePoint &p : out)
+        merged.append({p.time, p.gain});
+    return merged;
 }
 
 QString audioexport::nextExportAudioMixPath()

@@ -154,7 +154,7 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.rotation2D = clip.rotation2DDegrees;
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
-    motion.layer3D = clip.layer3D;
+    motion.layer3D = clipanim::layer3DAt(clip, clipLocalSeconds);
     if (clipanim::hasAnyDynamicTransform(clip)) {
         clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
         if (!compositeBaked && timeline && !clip.expressions.isEmpty())
@@ -175,7 +175,8 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
         const Camera3DState camera = timeline->projectCameraAt(clipStartSec + clipLocalSeconds);
         const QSize canvas = timeline->projectOutputSize();
         motion.layer3D = camera3d::effectiveLayer3DAt(
-            clip, QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
+            clip, motion.layer3D,
+            QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
     }
     return motion;
 }
@@ -1220,18 +1221,17 @@ void GLPreview::setBrushAnimation(BrushAnimation *animation)
 // US-1708: the image paintGL uploads before motion / projection: the baked
 // project-camera frame or the decoded frame, with the bound brush drawn on the
 // decoded frame (never on the baked frame, which already holds every track).
-// US-1805: nor on a special composite shown while paused on a timeline that
-// tlrender::timelineBrushWantsSpecialPath routes through it, which already holds
-// every clip's brush. Other composite-baked frames (the player's multi-track
-// compositor, playback, a helper-true timeline's fallback to the ordinary frame)
-// keep the selected-clip brush.
+// US-1906: nor on a composite shown while paused whose mark
+// (tlrender::kSpecialCompositeHoldsBrushProperty) says it drew the brushes; the
+// mark is read alone, the composite was built for the time it shows. Other
+// composite-baked frames (the player's multi-track compositor, playback, a roto or
+// matte composite without brushes) keep the selected-clip brush.
 QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
 {
     QImage frame = cameraBaked ? m_projectCameraFrame : m_currentFrame;
     const VideoPlayer *player = ownerPlayer();
     const bool specialCompositeHoldsBrush = m_compositeBakedMode
         && !(player && player->isPlaying())
-        && tlrender::timelineBrushWantsSpecialPath(m_timeline)
         && property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
     if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush) {
         OverlayRenderer::renderBrushOverlay(frame,
@@ -1265,8 +1265,8 @@ QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, 
 {
     QImage uploadFrame = upload;
     if (!compositeBaked
-        && (std::abs(rotation2D) > 1e-4 || is3DLayer
-            || (projectCamera.trueProjection && !layer3D.isDefault()))) {
+        && (std::abs(rotation2D) > 1e-4
+            || (projectCamera.trueProjection && (is3DLayer || !layer3D.isDefault())))) {
         if (projectCamera.trueProjection) {
             QSize canvas;
             if (const auto *player = ownerPlayer())
@@ -1280,13 +1280,6 @@ QImage GLPreview::projectedUploadFrame(const QImage &upload, double rotation2D, 
             uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
         } else {
             uploadFrame = applyPlanarRotation(uploadFrame, rotation2D);
-            if (is3DLayer) {
-                Camera3DState cameraState;
-                uploadFrame = Camera3D::applyPerspective(uploadFrame,
-                                                         layer3D,
-                                                         cameraState,
-                                                         uploadFrame.size());
-            }
         }
     }
     return uploadFrame;

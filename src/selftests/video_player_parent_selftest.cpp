@@ -43,9 +43,10 @@
 //   G9 each admission path produced records.
 //   G10 offline parent does not change displayed child pixels; a decodable
 //       parent on the same timeline does change them.
-//   G11 (US-1812, characterisation pin) a zero-byte parent file: parentLayerAt
-//       reports it decodable, yet neither renderFrameAt nor VideoPlayer lets
-//       the child follow it (child pixels == parentless, != online-parent).
+//   G11 (US-1812 pin, re-pinned by US-1913) a zero-byte parent file:
+//       parentLayerAt reports it NOT decodable, agreeing with VideoPlayer and
+//       renderFrameAt, neither of which lets the child follow it (child
+//       pixels == parentless, != online-parent).
 
 #include "SelftestGate.h"
 #include "../ClipGeometry.h"
@@ -1034,9 +1035,9 @@ int runVideoPlayerParentSelftest()
                    "offline display differs from parentless reference or online control has no visible parent effect");
     }
 
-    // ── G11: zero-byte parent (characterisation pin, HEAD behaviour) ──────
+    // ── G11: zero-byte parent (re-pinned by US-1913) ──────────────────────
     // A = parent file is an empty .mp4, B = online parent with opacity 0,
-    // C = no parent. parentLayerAt calls the empty file decodable, but
+    // C = no parent. parentLayerAt reports the empty file not decodable,
     // VideoPlayer builds no parent DecodedLayer for it (parentHit false) and
     // renderFrameAt leaves the child unparented: A == C and A != B on both.
     {
@@ -1096,10 +1097,13 @@ int runVideoPlayerParentSelftest()
         const PixelDifference playerAC = comparePixels(a.d.cpuFrame, c.d.cpuFrame);
         const PixelDifference playerAB = comparePixels(a.d.cpuFrame, b.d.cpuFrame);
 
-        // The divergence this gate pins: the existence check says decodable,
-        // the decoded-layer result says there is no parent.
-        const bool aHitDecodable = a.cpu.hit && a.cpu.hit->decodable
-            && a.track.hit && a.track.hit->decodable;
+        // The static check agrees with the decoded-layer result: the empty
+        // file is reported not decodable while the online control's parent
+        // hit is decodable.
+        const bool aHitNotDecodable = a.cpu.hit && !a.cpu.hit->decodable
+            && a.track.hit && !a.track.hit->decodable
+            && b.cpu.hit && b.cpu.hit->decodable
+            && b.track.hit && b.track.hit->decodable;
         auto vpUnparented = [](const PathResult &r) {
             return r.recorded && !r.parentLayerPresent && !r.child.parentHit
                 && !r.child.parentHitDecodable && r.child.parentSourceIndex == -1;
@@ -1111,7 +1115,7 @@ int runVideoPlayerParentSelftest()
         std::cerr << "  G11 fixtureReady=" << fixtureReady
                   << " fixtureError=" << fixtureError.toStdString()
                   << " zeroSize=" << QFileInfo(zeroPath).size()
-                  << " DIVERGENCE parentLayerAt(parent).decodable cpu="
+                  << " parentLayerAt(parent).decodable cpu="
                   << (a.cpu.hit ? int(a.cpu.hit->decodable) : -1) << " track="
                   << (a.track.hit ? int(a.track.hit->decodable) : -1)
                   << " but VideoPlayer parentHit cpu=" << a.cpu.child.parentHit
@@ -1152,8 +1156,8 @@ int runVideoPlayerParentSelftest()
             && playerAC.maxChannel <= 2 && playerAB.maxChannel > 2;
         const bool admissionOk = vpUnparented(a.cpu) && vpUnparented(a.track)
             && vpParented(b.cpu) && vpParented(b.track);
-        tally.gate(11, fixtureReady && aHitDecodable && admissionOk && renderOk && playerOk,
-                   "zero-byte parent no longer behaves as parentless on renderFrameAt / VideoPlayer, or the online-parent control stopped aligning");
+        tally.gate(11, fixtureReady && aHitNotDecodable && admissionOk && renderOk && playerOk,
+                   "zero-byte parent is reported decodable by parentLayerAt or no longer behaves as parentless on renderFrameAt / VideoPlayer, or the online-parent control stopped aligning");
     }
 
     return tally.finish("[video-player-parent]");

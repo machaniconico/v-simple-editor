@@ -9,6 +9,7 @@
 #include <functional>
 
 struct ClipInfo;
+struct Layer3DTransform;
 
 namespace clipanim {
 
@@ -38,6 +39,13 @@ clipgeom::ClipTransform effectiveTransformAt(const ClipInfo& clip,
 double effectiveOpacityAt(const ClipInfo& clip, double clipLocalSeconds,
                           double staticOpacity);
 
+// US-1908: the 3D layer transform at clip-local time from the keyframes only
+// (motion.position.z, motion.rotation.x|y|z in degrees, motion.world.x|y in canvas
+// px): wiggle and expressions do not apply. A property with no keyframe track uses
+// its static clip.layer3D value. A clip that is not a 3D layer returns clip.layer3D:
+// turning 3D off zeroes the static values and keeps the tracks, which stay unevaluated.
+Layer3DTransform layer3DAt(const ClipInfo& clip, double clipLocalSeconds);
+
 // US-1504: what the dynamic (non-keyframe) overlay needs from the caller.
 // canvas is the PROJECT canvas (Timeline::projectOutputSize(); the special
 // composite passes its canvasSize), never the output / display size, so a
@@ -58,8 +66,9 @@ bool hasAnyDynamicTransform(const ClipInfo& clip);
 // The single dynamic overlay applied on top of the keyframed values (in the
 // order keyframes -> autoOrient -> expressions -> wiggle): the expressions
 // replace position x / y, scale, rotation and opacity (as percent) with their
-// value (time = clipLocalSeconds, fps / canvas from env, audioLevel() from
-// env.audioLevelAtTime); then wiggle adds its pixel offset, converted to
+// value (time = clipLocalSeconds + clip.dynamicTimeOffsetSec, fps / canvas from
+// env, audioLevel() from env.audioLevelAtTime, which stays on clip-local seconds);
+// then wiggle, at that same offset time, adds its pixel offset, converted to
 // normalized canvas fractions through env.canvas, its rotation and its scale
 // multiplier. Null pointers are skipped.
 void applyDynamicOverlay(const ClipInfo& clip, double clipLocalSeconds,

@@ -54,7 +54,30 @@
 //      and decompose restores
 //      the brushData and the brush_progress keys. Detects: as G10 (HEAD reversed 46.18),
 //      or progress keys not shifted with the handles.
+//   G12 (US-1901) the clip gain ceiling is one constant, audio::kMaxClipGain = 4.0: clampClipGain
+//      (3 / 5 / -1), a gain-3 envelope through sortedDedupedEnvelope / evaluateVolumeEnvelope,
+//      normalizeAudioClipPeak on a -30 dBFS wav (start 0.5 / 1.0 / 2.0), the gain-3 span-outside
+//      base of mergeDuckingEnvelope, AudioClipEditor (setVolume 3, slider 0..400),
+//      Timeline::setClipVolume through a selected video clip, setClipPropertyByIndex volume 3 / 4.5,
+//      and the export mix of a static volume-3 clip (executeMixPlan peak = 3x the volume-1 peak,
+//      a gain-3 envelope point likewise). Detects: any consumer still clamping at 2.0 (HEAD:
+//      editor 2.0, setClipVolume 2.0, property range [0, 2], export peak 2x; mutation build
+//      kMaxClipGain = 2.0).
+//   G13 (US-1912) a split continues the wiggle (40 px, 2 Hz, seed 7) and the expression time
+//      (transform.position.x = time * 0.1): renderFrameAt at timeline 1.25 / 1.7 is byte-equal
+//      to before the split at L = 1.0 (splitClipByIndex, and the wiggle through the blade and
+//      playhead paths too), dynamicTimeOffsetSec is 1.0 on the right half and 1.5 after a second
+//      cut 0.5 s into it. Control: the right half with the offset back at 0 differs at 1.25.
+//      Detects: both restarting from local 0 on the right half (HEAD).
+//   G14 (US-1912) transform.opacity = audioLevel() * 100 on a clip linked to a WAV silent at
+//      1.0-1.5 s reads the same level on the right half (timeline 1.25 / 2.25, within 1e-6) as
+//      before the split, 1.25 and 2.25 differing by at least 0.1; the offset round-trips through
+//      JSON, 0 writes no key; the render-in-place replacement and its renderInPlaceOriginal
+//      keep the offset. Detects: audioLevel following the offset time
+//      (mutation build: no `t - offset` wrapper), or copyComposition without the field.
+#include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
+#include "../AudioKeyframes.h"
 #include "../BrushAnimation.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
@@ -64,6 +87,8 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "../clipanim/ClipAnim.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "SelftestGate.h"
 
@@ -76,6 +101,8 @@
 #include <QJsonObject>
 #include <QPointF>
 #include <QRect>
+#include <QSlider>
+#include <QStandardPaths>
 #include <QString>
 #include <QTemporaryDir>
 #include <QVector>
@@ -86,6 +113,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -227,6 +255,47 @@ Timeline *loadSingleClip(Timeline &timeline, const ClipInfo &clip)
     timeline.undoManager()->clear();
     timeline.saveUndoState(QStringLiteral("Initial"));
     return &timeline;
+}
+
+// A stereo 1 kHz float WAV of `seconds` at linear `amplitude`.
+bool writeToneWav(const QString &path, double amplitude, double seconds)
+{
+    std::vector<float> samples(size_t(seconds * 48000.0) * 2);
+    for (size_t i = 0; i < samples.size() / 2; ++i)
+        samples[2 * i] = samples[2 * i + 1] =
+            float(amplitude * std::sin(2.0 * 3.141592653589793 * 1000.0 * double(i) / 48000.0));
+    QString error;
+    return libavcore::writeWavFloatInterleaved(path, samples, 48000, 2, &error);
+}
+
+// Peak |sample| (0..1) of a PCM16 WAV; -1 when it cannot be read.
+double wavPeak(const QString &path)
+{
+    std::vector<double> samples;
+    int rate = 0;
+    if (!libavcore::readPcm16WavToMono(path, samples, rate) || samples.empty()) return -1.0;
+    double peak = 0.0;
+    for (double v : samples) peak = std::max(peak, std::abs(v));
+    return peak;
+}
+
+// Export mix peak of one audio clip (static volume, or a two-point envelope at `envGain`).
+double exportPeak(const QString &wav, const QString &outPath, double volume, double envGain)
+{
+    ClipInfo audio;
+    audio.filePath = wav;
+    audio.duration = audio.outPoint = 2.0;
+    audio.volume = volume;
+    if (envGain >= 0.0) audio.volumeEnvelope = {{0.0, envGain}, {2.0, envGain}};
+    AudioMixer mixer;
+    Timeline timeline;
+    timeline.setAudioMixer(&mixer);
+    timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}}, QVector<QVector<ClipInfo>>{{audio}},
+                                0.0, -1.0, -1.0, 10);
+    const audioexport::MixPlan plan = audioexport::buildMixPlan(&timeline, &mixer, {outPath, 1.5});
+    QString error;
+    if (audioexport::executeMixPlan(plan, [] { return false; }, &error) != outPath) return -1.0;
+    return wavPeak(outPath);
 }
 
 } // namespace
@@ -1198,6 +1267,325 @@ int runClipSidecarSelftest()
             tally.gate(11, within(handled) && handled.decomposed && within(backward) && backward.decomposed,
                 QString::asprintf("handles 0.5 + speed 2: %s | reversed: %s (HEAD Step 0 reversed: 46.18)",
                                   qPrintable(shown(handled)), qPrintable(shown(backward))).toStdString());
+        }
+    }
+
+    // G12 (US-1901): the clip gain ceiling is audio::kMaxClipGain = 4.0 everywhere.
+    {
+        bool ok = true;
+        QStringList shown;
+        const auto check = [&](const char *what, bool pass, const QString &value) {
+            ok = ok && pass;
+            shown << QStringLiteral("%1=%2%3").arg(QLatin1String(what), value,
+                                                 pass ? QString() : QStringLiteral("(BAD)"));
+        };
+        const auto num = [](double v) { return QString::number(v, 'f', 4); };
+
+        check("clamp3", audio::clampClipGain(3.0) == 3.0, num(audio::clampClipGain(3.0)));
+        check("clamp5", audio::clampClipGain(5.0) == 4.0, num(audio::clampClipGain(5.0)));
+        check("clamp-1", audio::clampClipGain(-1.0) == 0.0, num(audio::clampClipGain(-1.0)));
+        check("ceiling", audio::kMaxClipGain == 4.0, num(audio::kMaxClipGain));
+
+        const QVector<AudioGainPoint> env3{{0.0, 3.0}, {1.0, 3.0}};
+        const QVector<AudioGainPoint> deduped = audioexport::sortedDedupedEnvelope(env3);
+        const double dedupedGain = deduped.isEmpty() ? -1.0 : deduped.first().gain;
+        check("sortedDeduped", std::abs(dedupedGain - 3.0) <= 1e-9, num(dedupedGain));
+        const double evaluated = audio::clampClipGain(audio::evaluateVolumeEnvelope(env3, 0.5, 1.0));
+        check("evaluate", std::abs(evaluated - 3.0) <= 1e-9, num(evaluated));
+
+        const QVector<AudioGainPoint> merged = audioexport::mergeDuckingEnvelope(
+            {{0.0, 3.0}, {5.0, 3.0}}, {{1.0, 3.0}, {1.05, 3.0}}, 3.0);
+        const double mergedStart = audio::evaluateVolumeEnvelope(merged, 0.0, 3.0);
+        const double mergedEnd = audio::evaluateVolumeEnvelope(merged, 5.0, 3.0);
+        check("mergeSpanOutside", std::abs(mergedStart - 3.0) <= 1e-9 && std::abs(mergedEnd - 3.0) <= 1e-9,
+              num(mergedStart) + QLatin1Char('/') + num(mergedEnd));
+
+        // AudioClipEditor: the widgets and the stored value reach 3.0 (400 % slider).
+        {
+            AudioClipEditor editor;
+            editor.setVolume(3.0);
+            const QSlider *slider = editor.findChild<QSlider *>(QStringLiteral("clipVolumeSlider"));
+            const bool sliderOk = slider && slider->maximum() == 400 && slider->value() == 300;
+            check("editor", editor.volume() == 3.0 && sliderOk,
+                  num(editor.volume()) + QStringLiteral(" slider max/value ")
+                  + (slider ? QString::number(slider->maximum()) + QLatin1Char('/') + QString::number(slider->value())
+                            : QStringLiteral("none")));
+        }
+
+        // Timeline: setClipVolume writes the audio clip at the selected video clip's index; the
+        // MCP volume range is 0..4 and an out-of-range value names the ceiling.
+        {
+            ClipInfo video = sidecarClip(QStringLiteral("v"), 4.0);
+            ClipInfo audioClip = sidecarClip(QStringLiteral("a"), 4.0);
+            Timeline timeline;
+            timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{video}},
+                                        QVector<QVector<ClipInfo>>{{audioClip}}, 0.0, -1.0, -1.0, 100);
+            QString selectError;
+            const bool selected = timeline.selectClipByIndex(false, 0, 0, &selectError);
+            timeline.setClipVolume(3.0, false);
+            const double audioVolume = timeline.audioTracks()[0] && !timeline.audioTracks()[0]->clips().isEmpty()
+                ? timeline.audioTracks()[0]->clips()[0].volume : -1.0;
+            check("setClipVolume", selected && audioVolume == 3.0, num(audioVolume));
+
+            QString okError;
+            const bool set3 = timeline.setClipPropertyByIndex(true, 0, 0, QStringLiteral("volume"), 3.0, &okError);
+            const double after3 = timeline.audioTracks()[0]->clips()[0].volume;
+            QString badError;
+            const bool set45 = timeline.setClipPropertyByIndex(true, 0, 0, QStringLiteral("volume"), 4.5, &badError);
+            check("setClipProperty", set3 && after3 == 3.0 && !set45 && badError.contains(QLatin1Char('4')),
+                  QStringLiteral("3.0 -> %1 (%2), 4.5 -> %3 [%4]").arg(int(set3)).arg(num(after3))
+                      .arg(int(set45)).arg(badError));
+        }
+
+        // normalizeAudioClipPeak: a -30 dBFS tone reaches the ceiling.
+        const QString toneNormalize = tempDir.filePath(QStringLiteral("g12-normalize.wav"));
+        const bool toneWritten = tempDir.isValid() && writeToneWav(toneNormalize, std::pow(10.0, -30.0 / 20.0), 1.0);
+        check("normalizeFixture", toneWritten, QString::number(int(toneWritten)));
+        if (toneWritten) {
+            struct Case { double start; double expect; };
+            for (const Case c : {Case{0.5, 1.99}, Case{1.0, 3.98}, Case{2.0, 4.0}}) {
+                ClipInfo audioClip;
+                audioClip.filePath = toneNormalize;
+                audioClip.duration = audioClip.outPoint = 1.0;
+                audioClip.volume = c.start;
+                Timeline timeline;
+                timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{}},
+                                            QVector<QVector<ClipInfo>>{{audioClip}}, 0.0, -1.0, -1.0, 10);
+                timeline.normalizeAudioClipPeak(0, 0);
+                const double got = timeline.audioTracks()[0]->clips()[0].volume;
+                check(qPrintable(QStringLiteral("normalize%1").arg(c.start)),
+                      std::abs(got - c.expect) <= 0.01, num(got));
+            }
+        }
+
+        // Export mix: a static volume-3 clip and a gain-3 envelope are 3x the volume-1 mix.
+        bool exportRan = false;
+        const bool ffmpegFound = !QStandardPaths::findExecutable(QStringLiteral("ffmpeg")).isEmpty();
+        const QString toneExport = tempDir.filePath(QStringLiteral("g12-export.wav"));
+        const bool exportTone = tempDir.isValid() && writeToneWav(toneExport, 0.1, 2.0);
+        check("exportFixture", exportTone, QString::number(int(exportTone)));
+        if (exportTone && ffmpegFound) {
+            exportRan = true;
+            const double unity = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-unity.wav")), 1.0, -1.0);
+            const double staticThree = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-static3.wav")), 3.0, -1.0);
+            const double envThree = exportPeak(toneExport, tempDir.filePath(QStringLiteral("g12-env3.wav")), 1.0, 3.0);
+            const auto triple = [&](double peak) {
+                return unity > 0.05 && std::abs(peak - 3.0 * unity) <= 0.05 * 3.0 * unity;
+            };
+            check("exportStatic3", triple(staticThree),
+                  QStringLiteral("peak %1 vs unity %2 (x3 expected, HEAD x2)").arg(num(staticThree), num(unity)));
+            check("exportEnvelope3", triple(envThree),
+                  QStringLiteral("peak %1 vs unity %2").arg(num(envThree), num(unity)));
+        }
+        const std::string detail = shown.join(QStringLiteral(", ")).toStdString();
+        if (ok && !exportRan && exportTone)
+            tally.skip(12, "ffmpeg unavailable (the export-mix checks did not run)");
+        else
+            tally.gate(12, ok, detail);
+    }
+
+    // G13 / G14 (US-1912): the wiggle phase and the expression time continue across a split,
+    // audioLevel() stays on the clip's real audio time.
+    {
+        constexpr double kCut = 1.0;
+        const QSize frameSize(640, 360);
+        const QString mediaPath = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        const auto mediaUs = libavcore::probeDurationMicroseconds(mediaPath.toStdString());
+        const double mediaSec = mediaUs ? double(*mediaUs) / 1000000.0 : 0.0;
+        const QString mediaMissing = QString::asprintf(
+            "prerequisite: fixture=%s duration=%.3f (run from the repository root)", qPrintable(mediaPath), mediaSec);
+        const bool mediaOk = QFileInfo::exists(mediaPath) && mediaSec >= 4.0;
+        const auto mediaClip = [&]() {
+            ClipInfo clip{};
+            clip.filePath = mediaPath;
+            clip.displayName = QStringLiteral("dynamic");
+            clip.duration = mediaSec;
+            clip.outPoint = 3.0;
+            return clip;
+        };
+        const auto frameAt = [&](const Timeline &tl, double timelineSec) {
+            return tlrender::renderFrameAt(&tl, microsAt(timelineSec), frameSize);
+        };
+        const auto sameImage = [](const QImage &a, const QImage &b) {
+            return !a.isNull() && a.format() == b.format() && a == b;
+        };
+
+        if (!mediaOk) {
+            tally.gate(13, false, mediaMissing.toStdString());
+        } else {
+            bool ok13 = true;
+            QStringList shown13;
+            const auto check13 = [&](const QString &name, bool passed) {
+                ok13 = ok13 && passed;
+                shown13 << QStringLiteral("%1=%2").arg(name).arg(int(passed));
+            };
+            ClipInfo wiggled = mediaClip();
+            wiggled.wiggle.enabled = true;
+            wiggled.wiggle.positionAmplitude = QPointF(40.0, 40.0);
+            wiggled.wiggle.positionFrequency = 2.0;
+            wiggled.wiggle.seed = 7;
+            ClipInfo timed = mediaClip();
+            timed.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("time * 0.1"));
+            struct DynamicCase { const char *name; ClipInfo clip; };
+            for (const DynamicCase &c : {DynamicCase{"wiggle", wiggled}, DynamicCase{"expression", timed}}) {
+                const QString name = QString::fromLatin1(c.name);
+                Timeline tl;
+                loadTimeline(tl, {{c.clip}});
+                const QImage before125 = frameAt(tl, 1.25);
+                const QImage before17 = frameAt(tl, 1.7);
+                QString err;
+                const bool split = tl.splitClipByIndex(false, 0, 0, kCut, &err);
+                const ClipInfo right = tl.trackAt(false, 0)->clips().value(1);
+                check13(name + QStringLiteral("Split"), split);
+                check13(name + QStringLiteral("Offset1"), right.dynamicTimeOffsetSec == kCut);
+                check13(name + QStringLiteral("Left0"),
+                        tl.trackAt(false, 0)->clips().value(0).dynamicTimeOffsetSec == 0.0);
+                check13(name + QStringLiteral("Same1.25"), sameImage(frameAt(tl, 1.25), before125));
+                check13(name + QStringLiteral("Same1.7"), sameImage(frameAt(tl, 1.7), before17));
+                // Control: the same right half without the offset restarts from local 0.
+                {
+                    QVector<ClipInfo> clips = tl.trackAt(false, 0)->clips();
+                    clips[1].dynamicTimeOffsetSec = 0.0;
+                    Timeline control;
+                    loadTimeline(control, {clips});
+                    check13(name + QStringLiteral("ControlDiffers"), !frameAt(control, 1.25).isNull()
+                            && !sameImage(frameAt(control, 1.25), before125));
+                }
+                // A second cut 0.5 s into the right half accumulates.
+                const bool secondSplit = tl.splitClipByIndex(false, 0, 1, kCut + 0.5, &err);
+                check13(name + QStringLiteral("Second"), secondSplit);
+                check13(name + QStringLiteral("Offset1.5"),
+                        tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && tl.trackAt(false, 0)->clips().value(2).dynamicTimeOffsetSec == kCut + 0.5);
+                check13(name + QStringLiteral("SecondSame1.7"), sameImage(frameAt(tl, 1.7), before17));
+            }
+            // The other split paths go through splitClipAt too.
+            {
+                Timeline tl;
+                loadTimeline(tl, {{wiggled}});
+                const QImage before = frameAt(tl, 1.25);
+                tl.setPlayheadPosition(kCut);
+                tl.bladeAllTracksAtPlayhead();
+                check13(QStringLiteral("blade"), tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && sameImage(frameAt(tl, 1.25), before));
+            }
+            {
+                Timeline tl;
+                loadTimeline(tl, {{wiggled}});
+                const QImage before = frameAt(tl, 1.25);
+                QString err;
+                const bool selected = tl.selectClipByIndex(false, 0, 0, &err);
+                tl.setPlayheadPosition(kCut);
+                tl.splitAtPlayhead();
+                check13(QStringLiteral("playhead"), selected
+                        && tl.trackAt(false, 0)->clips().value(1).dynamicTimeOffsetSec == kCut
+                        && sameImage(frameAt(tl, 1.25), before));
+            }
+            tally.gate(13, ok13, shown13.join(QLatin1Char(' ')).toStdString());
+        }
+
+        if (!mediaOk) {
+            tally.gate(14, false, mediaMissing.toStdString());
+        } else {
+            bool ok14 = true;
+            QStringList shown14;
+            const auto check14 = [&](const QString &name, bool passed, const QString &value = QString()) {
+                ok14 = ok14 && passed;
+                shown14 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                               .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+            };
+            const auto num = [](double v) { return QString::number(v, 'g', 9); };
+            // A 3 s tone at amplitude 0.5, silent over 1.0-1.5 s.
+            QTemporaryDir audioDir;
+            const QString wavPath = audioDir.filePath(QStringLiteral("g14-gap.wav"));
+            std::vector<float> samples(size_t(3 * 48000) * 2);
+            for (size_t i = 0; i < samples.size() / 2; ++i) {
+                const double sec = double(i) / 48000.0;
+                const double level = sec >= 1.0 && sec < 1.5 ? 0.0 : 0.5;
+                samples[2 * i] = samples[2 * i + 1] =
+                    float(level * std::sin(2.0 * 3.141592653589793 * 1000.0 * sec));
+            }
+            QString wavError;
+            const bool wavOk = audioDir.isValid()
+                && libavcore::writeWavFloatInterleaved(wavPath, samples, 48000, 2, &wavError);
+            check14(QStringLiteral("wav"), wavOk, wavError);
+
+            ClipInfo video = mediaClip();
+            video.linkGroup = 11;
+            video.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel() * 100"));
+            ClipInfo audio{};
+            audio.filePath = wavPath;
+            audio.duration = audio.outPoint = 3.0;
+            audio.linkGroup = 11;
+            Timeline tl;
+            tl.restoreFromProject(QVector<QVector<ClipInfo>>{{video}}, QVector<QVector<ClipInfo>>{{audio}},
+                                  0.0, -1.0, -1.0, 100);
+            // The opacity of `clip` (timeline start clipStart) at a timeline second, read the way
+            // TimelineFrameRenderer's clipEvalEnv does.
+            const auto opacityAt = [&](const ClipInfo &clip, double clipStart, double timelineSec) {
+                tl.setExpressionAudioEnv(tl.buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
+                clipanim::EvalEnv env;
+                env.fps = 30.0;
+                env.canvas = frameSize;
+                env.audioLevelAtTime = tl.expressionAudioLevelSampler(clip, clipStart);
+                return clipanim::effectiveOpacityAt(clip, timelineSec - clipStart, 1.0, env);
+            };
+            const double before125 = opacityAt(tl.videoTracks()[0]->clips()[0], 0.0, 1.25);
+            const double before225 = opacityAt(tl.videoTracks()[0]->clips()[0], 0.0, 2.25);
+            check14(QStringLiteral("fixture"), std::abs(before125 - before225) >= 0.1,
+                    QStringLiteral("level 1.25 = %1, 2.25 = %2").arg(num(before125), num(before225)));
+            QString err;
+            const bool split = tl.splitClipByIndex(false, 0, 0, kCut, &err);
+            check14(QStringLiteral("split"), split, err);
+            const ClipInfo right = tl.videoTracks()[0]->clips().value(1);
+            const double after125 = opacityAt(right, kCut, 1.25);
+            const double after225 = opacityAt(right, kCut, 2.25);
+            check14(QStringLiteral("right1.25"), right.dynamicTimeOffsetSec == kCut
+                    && std::abs(after125 - before125) <= 1e-6, num(after125));
+            check14(QStringLiteral("right2.25"), std::abs(after225 - before225) <= 1e-6, num(after225));
+
+            // JSON: the offset round-trips, 0 writes no key.
+            {
+                ProjectData data;
+                data.videoTracks = {tl.trackAt(false, 0)->clips()};
+                data.audioTracks = {{}};
+                const QString json = ProjectFile::toJsonString(data);
+                const QJsonObject root = rootOf(json);
+                ProjectData loaded;
+                const bool read = ProjectFile::fromJsonString(json, loaded);
+                check14(QStringLiteral("jsonRoundTrip"), read
+                        && loaded.videoTracks.value(0).value(1).dynamicTimeOffsetSec == kCut
+                        && loaded.videoTracks.value(0).value(0).dynamicTimeOffsetSec == 0.0);
+                check14(QStringLiteral("jsonKey"),
+                        !firstClipJson(root, 0).contains(QStringLiteral("dynamicTimeOffsetSec"))
+                        && firstClipJson(root, 1).contains(QStringLiteral("dynamicTimeOffsetSec")));
+            }
+
+            // Render in place: the replacement carries the offset with the wiggle it keeps live.
+            {
+                ClipInfo carrying = mediaClip();
+                carrying.wiggle = wiggle::WiggleParams{};
+                carrying.wiggle.enabled = true;
+                carrying.wiggle.positionAmplitude = QPointF(40.0, 40.0);
+                carrying.dynamicTimeOffsetSec = kCut;
+                Timeline bakeTimeline;
+                loadSingleClip(bakeTimeline, carrying);
+                QTemporaryDir bakeDir;
+                renderinplace::Options options;
+                options.outputSize = frameSize;
+                options.fps = 30;
+                options.handlesSec = 0.0;
+                options.outputDir = bakeDir.filePath(QStringLiteral("g14"));
+                QString bakedPath, bakeError;
+                const bool baked = bakeDir.isValid()
+                    && renderinplace::renderClipInPlace(bakeTimeline, 0, 0, options, &bakedPath, &bakeError);
+                const ClipInfo replacement = baked ? bakeTimeline.videoTracks()[0]->clips()[0] : ClipInfo{};
+                check14(QStringLiteral("replacement"), baked && replacement.renderInPlaceOriginal
+                        && replacement.filePath != carrying.filePath && replacement.dynamicTimeOffsetSec == kCut
+                        && replacement.renderInPlaceOriginal->dynamicTimeOffsetSec == kCut,
+                        QStringLiteral("%1 %2").arg(num(replacement.dynamicTimeOffsetSec), bakeError));
+            }
+            tally.gate(14, ok14, shown14.join(QLatin1Char(' ')).toStdString());
         }
     }
 

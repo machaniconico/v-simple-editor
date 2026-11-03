@@ -382,8 +382,9 @@ extern "C" {
 }
 
 // Shared by the file menu and import hub; no persistent widget state needed.
-// US-1805: whether the frame presented next is a special composite. The GL
-// leaves the bound brush off only then (tlrender::kSpecialCompositeHoldsBrushProperty).
+// US-1906: whether the frame presented next is a special composite that drew the
+// brushes. The GL leaves the bound brush off only then
+// (tlrender::kSpecialCompositeHoldsBrushProperty).
 static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
 {
     player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
@@ -652,7 +653,7 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
     const double attackSeconds = qMax(0.0, params.attackMs / 1000.0);
     const double releaseSeconds = qMax(0.0, params.releaseMs / 1000.0);
     const double duckDb = qMin(0.0, params.targetReductionDb);
-    const double baseGain = qBound(0.0, clip.volume, 2.0);
+    const double baseGain = audio::clampClipGain(clip.volume);
     bool hasDucking = false;
 
     auto appendAt = [&](double localSeconds) {
@@ -664,7 +665,7 @@ QVector<AudioGainPoint> buildDuckingEnvelopeForClip(const ClipInfo &clip,
         if (activity > 0.000001)
             hasDucking = true;
         const double gain = baseGain * dbToLinear(duckDb * activity);
-        env.append({localSeconds, qBound(0.0, gain, 2.0)});
+        env.append({localSeconds, audio::clampClipGain(gain)});
     };
 
     for (double t = 0.0; t < duration; t += keyframeIntervalSeconds)
@@ -3162,9 +3163,10 @@ void MainWindow::applyStillCompareConfig()
     }
     if (!m_timeline)
         return;
-    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
+    bool drewBrush = false;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush);
     if (!special.isNull()) {
-        setSpecialCompositeHoldsBrush(m_player, true);
+        setSpecialCompositeHoldsBrush(m_player, drewBrush);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -4036,10 +4038,11 @@ void MainWindow::setupUI()
         const double sec = m_player->hasActiveSequence()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
-        const QImage special = buildSpecialClipComposite(sec);
+        bool drewBrush = false;
+        const QImage special = buildSpecialClipComposite(sec, &drewBrush);
         // US-1805: every paused displayFrame passes here, so an ordinary frame
         // (a null composite) clears the mark a previous composite left.
-        setSpecialCompositeHoldsBrush(m_player, !special.isNull());
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush);
         return special;
     });
 
@@ -4753,7 +4756,9 @@ void MainWindow::setupMenuBar()
     connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
         if (playing)
             setSpecialCompositeHoldsBrush(m_player, false);
-        else if (tlrender::timelineBrushWantsSpecialPath(m_timeline))
+        else if (m_timeline
+                 && tlrender::timelineBrushWantsSpecialPath(m_timeline,
+                                                            m_timeline->playheadPosition()))
             refreshSpecialClipPreview();
     });
     auto *filmstripAction = viewMenu->addAction(QStringLiteral("クリップのサムネイルを表示"));
@@ -8564,8 +8569,10 @@ QImage MainWindow::applyStoredRotoData(const QString &clipId,
     return roto::applyEntryToFrame(it.value(), frame, sourceFrameIndex);
 }
 
-QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
+QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush) const
 {
+    if (drewBrush)
+        *drewBrush = false;
     if (!m_timeline)
         return {};
 
@@ -8590,12 +8597,16 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
-    // US-1805: a brushed timeline without blend / adjustment / clip mask takes
-    // this path (paused) and every clip's brush is drawn here; other timelines
-    // keep the GL's selected-clip brush on top (tlrender::timelineBrushWantsSpecialPath).
+    // US-1805: a brushed frame without adjustment / clip mask (or a matte source
+    // with an effective blend, US-1905) takes this path (paused) and every clip's
+    // brush is drawn here; other frames keep the GL's selected-clip brush on top
+    // (tlrender::timelineBrushWantsSpecialPath, the clips active at this time).
     // Playback keeps the selected-clip brush only (decision B6).
-    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline)
+    const bool brushWantsSpecialPath = tlrender::timelineBrushWantsSpecialPath(m_timeline,
+                                                                              timelineSeconds)
         && !(m_player && m_player->isPlaying());
+    if (drewBrush)
+        *drewBrush = brushWantsSpecialPath;
     // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
     // non-empty V1 with none draws nothing there, so the preview falls back too.
     int v1ExportIdx = -1;
@@ -8859,7 +8870,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.image = frame;
             active.layer.name = clip.displayName;
             active.layer.opacity = layerOpacity;
-            active.layer.blendMode = BlendMode::Normal;
+            // US-1905: the effective blend, renderFrameAt's rule (V1 is always
+            // Normal, overlays blend only as VFX footage).
+            active.layer.blendMode = (clip.isVfxFootage && trackIdx > 0)
+                ? clip.blendMode : BlendMode::Normal;
             // Carry the RAW canonical transform fields (NOT a pixel offset):
             // position = NORMALIZED videoDx/videoDy fractions of the canvas,
             // scale.x() = uniform videoScale, rotation = rotation2DDegrees.
@@ -8873,7 +8887,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.layer.rotation = layerRotation;
             active.layer.anchorPoint = QPointF(0.0, 0.0);
             active.layer.zOrder = trackIdx;
-            active.layer.layer3D = clip.layer3D;
+            active.layer.layer3D = clipanim::layer3DAt(clip, localSeconds);
             active.layer.material = clip.material;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;
@@ -8975,7 +8989,34 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             layers, layerImages, canvasSize, lightingOffsets, projectLights,
             m_projectCamera.camera().position);
 
-    return trackmatte::composite(layers, layerImages, canvasSize);
+    // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
+    if (hasTrackMatteLayer)
+        return trackmatte::composite(layers, layerImages, canvasSize);
+
+    // US-1905: renderFrameAt's matte-free order: the Normal stack (V1 frontmost),
+    // then the lit blended overlays ascending by track (layers is descending
+    // here) through the same blend equation.
+    QVector<CompositeLayer> normalLayers;
+    QVector<QImage> normalImages;
+    for (int i = 0; i < layers.size(); ++i) {
+        if (layers[i].blendMode == BlendMode::Normal) {
+            normalLayers.append(layers[i]);
+            normalImages.append(layerImages[i]);
+        }
+    }
+    QImage composed = trackmatte::composite(normalLayers, normalImages, canvasSize);
+    if (normalLayers.size() == layers.size())
+        return composed;
+    for (int i = layers.size() - 1; i >= 0; --i) {
+        const CompositeLayer &layer = layers[i];
+        if (layer.blendMode == BlendMode::Normal
+            || layerImages[i].isNull() || layer.opacity <= 0.001) {
+            continue;
+        }
+        composed = LayerCompositor::blendImages(
+            composed, layerImages[i], layer.blendMode, qBound(0.0, layer.opacity, 1.0));
+    }
+    return composed.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 }
 
 void MainWindow::refreshSpecialClipPreview()
@@ -8994,22 +9035,25 @@ void MainWindow::refreshSpecialClipPreview()
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
         && m_timeline->trackMatteEntries().isEmpty() && !timelineHasClipText3D(m_timeline)
-        && !(!m_player->isPlaying() && tlrender::timelineBrushWantsSpecialPath(m_timeline))
+        && !(!m_player->isPlaying()
+             && tlrender::timelineBrushWantsSpecialPath(m_timeline, playheadSeconds))
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
+            // US-1906: the mark stays, as below: the provider clears it with the
+            // next ordinary frame, and an undecodable clip presents none.
             s_refreshingPreview = true;
-            setSpecialCompositeHoldsBrush(m_player, false);
             m_player->previewSeek(timelineMs);
             s_refreshingPreview = false;
         }
         return;
     }
 
-    const QImage composed = buildSpecialClipComposite(playheadSeconds);
+    bool drewBrush = false;
+    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         // Built while playing, it holds no brush (decision B6).
-        setSpecialCompositeHoldsBrush(m_player, !m_player->isPlaying());
+        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying());
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
@@ -11731,7 +11775,8 @@ void MainWindow::setClipVolume()
     if (!m_timeline->hasSelection()) return;
     bool ok;
     double vol = QInputDialog::getDouble(this, "Set Clip Volume",
-        "Volume (0% = mute, 100% = normal, 200% = boost):", 100.0, 0.0, 200.0, 0, &ok);
+        "Volume (0% = mute, 100% = normal, 400% = max):", 100.0, 0.0,
+        audio::kMaxClipGain * 100.0, 0, &ok);
     if (ok) {
         m_timeline->setClipVolume(vol / 100.0);
         statusBar()->showMessage(QString("Volume: %1%").arg(static_cast<int>(vol)));
@@ -15770,6 +15815,7 @@ void MainWindow::openCameraMotionDialog()
     CameraMotionDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("カメラモーション"));
     dialog.setCamera(m_projectCamera);
+    dialog.setCanvasWidth(m_projectConfig.width);
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();

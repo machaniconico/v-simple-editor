@@ -168,24 +168,27 @@ quint64 clipLayerSourceCallsForTest();
 // `raw` unchanged.
 QImage applyClipBrushSource(const QImage &raw, const ClipInfo &clip, double localSec,
                             const QString &clipId);
-// US-1805: true when some video clip carries brushData and no video clip has a
-// non-Normal blend, is an adjustment clip or has a clip mask (nor is a shape,
-// nested-sequence or disabled clip, which that composite does not draw, nor has a
-// keyframe track other than brush_progress, fitContain / fitCover, a layer
-// style or a lead-in / trail-out transition, which it places statically or
-// skips, and the timeline has no clip parenting while parenting is enabled).
-// Such a timeline
-// is previewed (paused) through MainWindow's special composite, which draws
-// every clip's brush; any other timeline keeps the GL's selected-clip brush.
-bool timelineBrushWantsSpecialPath(const Timeline *timeline);
+// US-1906: true when, among the clips active at `timelineSec` (one per visible
+// video track, activeClipOnTrack, clampToFirst on V1), some clip carries brushData
+// and none has a non-Normal blend, is an adjustment clip or has a clip mask (nor is
+// a shape, nested-sequence or disabled clip, which that composite does not draw,
+// nor has a keyframe track other than brush_progress, fitContain / fitCover or a
+// layer style, which it places statically, nor is a parent or child while
+// parenting is enabled). A transition excludes only its window: an active clip's
+// own lead-in / trail-out, and the trail-out / lead-in of the clip adjacent on its
+// track (any type, alignment ignored). Such a frame is previewed (paused) through
+// MainWindow's special composite, which draws every clip's brush; any other frame
+// keeps the GL's selected-clip brush.
+bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec);
 // US-1805: one source frame by renderFrameAt's rule: the first frame at or after
 // `sourceSec`, or with `usePreviousSourceFrame` (a reversed source position) the
 // last frame before it, not before `sourceInSec`. Null on any failure.
 QImage decodeClipSourceFrame(const QString &filePath, double sourceSec,
                              bool usePreviousSourceFrame, double sourceInSec);
 // Dynamic bool property on the GLPreview: the frame on screen is a special
-// composite, which already holds every clip's brush. MainWindow sets it with each
-// paused display; a helper-true timeline can also show the ordinary frame.
+// composite that drew the brushes (US-1906: not any composite, a roto or matte one
+// draws none). MainWindow sets it with each paused display and only the next
+// ordinary frame clears it: a clip that decodes to no frame leaves the composite up.
 inline constexpr char kSpecialCompositeHoldsBrushProperty[] = "veditorSpecialCompositeHoldsBrush";
 // The clip on one track active at `targetSec` ([start, end), leadInSec walk),
 // or -1; `clampToFirst` maps a request at/before t=0 onto clip 0 as
@@ -213,7 +216,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
 //                      interval's clipOut inside an overlap, otherwise the
 //                      clip's time-remap / inPoint + local * speed mapping)
 //   decodable        = static check only: null object, sequence reference or
-//                      the file exists. A runtime decode failure (file present
+//                      the file exists and is non-empty (a zero-byte file is
+//                      not decodable). A runtime decode failure (non-empty file
 //                      but unreadable) still drops the layer in renderFrameAt
 //                      and is NOT reported here (known limitation).
 struct ParentLayerHit {

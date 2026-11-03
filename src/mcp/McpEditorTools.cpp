@@ -4,6 +4,7 @@
 #include "../ExportUserPresets.h"
 
 #include "McpToolRegistry.h"
+#include "../BrushAnimation.h"
 #include "../CaptionEditorDialog.h"
 #include "../BeatDetect.h"
 #include "../DynamicZoom.h"
@@ -15,6 +16,7 @@
 #include "../RenderQueue.h"
 #include "../RenderInPlace.h"
 #include "../TimelineFrameRenderer.h"
+#include "../Text3DLayer.h"
 #include "../Timeline.h"
 #include "../TrimOps.h"
 #include "../TrackMatteKey.h"
@@ -30,6 +32,7 @@
 #include <QFont>
 #include <QImage>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QPointer>
 #include <QPair>
 #include <QTimer>
@@ -823,6 +826,171 @@ bool parseWiggleArgument(const QJsonValue& raw, wiggle::WiggleParams* out, QStri
     if (out)
         *out = params;
     return true;
+}
+
+// US-1911: set_clip_text3d の入力。許容するのは Text3DLayer::toJson の全キー (既定値で省略される
+// キーと timeOffsetSec を含む) だけで、ネスト (camera 等) は検査しない。{} は解除。
+// 保存するのは Text3DLayer の fromJson -> toJson を通した正規化後の値。
+bool parseText3DArgument(const QJsonValue& raw, QJsonObject* normalized, QString* err)
+{
+    if (!raw.isObject())
+        return setError(err, QStringLiteral("text3d must be an object ({} clears it)"));
+    const QJsonObject object = raw.toObject();
+    constexpr int kMaxText3DBytes = 64 * 1024;
+    if (QJsonDocument(object).toJson(QJsonDocument::Compact).size() > kMaxText3DBytes)
+        return setError(err, QStringLiteral("text3d must be at most 64 KiB"));
+    static const QStringList kKeys{
+        QStringLiteral("text"), QStringLiteral("fontFamily"), QStringLiteral("fontPointSize"),
+        QStringLiteral("perCharRotation"), QStringLiteral("perCharPosition"),
+        QStringLiteral("perCharScale"), QStringLiteral("cameraDistance"),
+        QStringLiteral("rotationAnimAxis"), QStringLiteral("extrudeEnabled"),
+        QStringLiteral("extrudeDepth"), QStringLiteral("extrudeBevelDepth"),
+        QStringLiteral("extrudeBevelWidth"), QStringLiteral("extrudeBevelSegments"),
+        QStringLiteral("frontColor"), QStringLiteral("sideColor"), QStringLiteral("ambient"),
+        QStringLiteral("lightDir"), QStringLiteral("extrudeBaseYaw"),
+        QStringLiteral("extrudeBasePitch"), QStringLiteral("camera"),
+        QStringLiteral("timeOffsetSec")};
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
+        if (!kKeys.contains(it.key()))
+            return setError(err, QStringLiteral("unknown text3d key: %1").arg(it.key()));
+    }
+    // 押し出しメッシュの分割数は描画時に無上限でループするため、GUI (Text3DExtrusionDialog) と同じ 0..8 の整数だけ受理する。
+    if (object.contains(QStringLiteral("extrudeBevelSegments"))) {
+        const QJsonValue v = object.value(QStringLiteral("extrudeBevelSegments"));
+        const double d = v.toDouble();
+        if (!v.isDouble() || !std::isfinite(d) || d != std::floor(d) || d < 0.0 || d > 8.0)
+            return setError(err, QStringLiteral("text3d.extrudeBevelSegments must be an integer in 0..8"));
+    }
+    if (object.isEmpty()) {
+        *normalized = QJsonObject();
+        return true;
+    }
+    Text3DLayer layer;
+    layer.fromJson(object);
+    // 押し出しメッシュの中間プロファイルは (2*bevelDepth - depth) / (depth / (2*segs+1)) 回ループする (ExtrudedMesh.cpp:209-217)。
+    // 既定値を含む実効値で検査し、extrudeEnabled に関わらず拒否する (後から有効化されうる)。丸めずに拒否する。
+    {
+        const double depth = layer.extrudeDepth();
+        const double bevelDepth = layer.extrudeBevelDepth();
+        const double bevelWidth = layer.extrudeBevelWidth();
+        const int segs = layer.extrudeBevelSegments();
+        const QString tooComplex = QStringLiteral("text3d extrusion is too complex: reduce extrudeBevelDepth or raise extrudeDepth");
+        if (!std::isfinite(depth) || !std::isfinite(bevelDepth) || !std::isfinite(bevelWidth)
+            || depth < 0.0 || depth > 5.0 || bevelDepth < 0.0 || bevelDepth > 1.0
+            || bevelWidth < 0.0 || bevelWidth > 1.0)
+            return setError(err, QStringLiteral("text3d.extrudeDepth must be in 0..5 and extrudeBevelDepth / extrudeBevelWidth in 0..1"));
+        const double span = 2.0 * bevelDepth - depth;
+        if (segs > 0 && bevelDepth > 0.0 && span > 1e-6) {
+            const double steps = depth > 0.0 ? span * (2.0 * segs + 1.0) / depth
+                                             : std::numeric_limits<double>::infinity();
+            const double textLen = qMax(1, object.value(QStringLiteral("text")).toString().size());
+            if (!(steps <= 40000.0) || !(steps * textLen <= 1000000.0))
+                return setError(err, tooComplex);
+        }
+    }
+    *normalized = layer.toJson();
+    return true;
+}
+
+// US-1911: set_clip_brush の brush 引数。null / {} は解除 (*clear = true)。オブジェクトは型付きで検査し、
+// fontSize / progress は get の出力を set に戻せるよう受理して捨てる (描画は keyframe が決める)。
+bool parseBrushArgument(const QJsonValue& raw, QJsonObject* normalized, bool* clear, QString* err)
+{
+    *clear = false;
+    if (raw.isNull()) {
+        *clear = true;
+        return true;
+    }
+    if (!raw.isObject())
+        return setError(err, QStringLiteral("brush must be an object (null or {} clears it)"));
+    QJsonObject object = raw.toObject();
+    if (object.isEmpty()) {
+        *clear = true;
+        return true;
+    }
+    const auto isFinite = [](const QJsonValue& value) {
+        return value.isDouble() && std::isfinite(value.toDouble());
+    };
+    for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
+        const QString& key = it.key();
+        const QJsonValue& value = it.value();
+        if (key == QStringLiteral("text")) {
+            if (!value.isString() || value.toString().isEmpty() || value.toString().size() > 256)
+                return setError(err, QStringLiteral("brush.text must be a non-empty string of at most 256 UTF-16 units"));
+        } else if (key == QStringLiteral("fontFamily")) {
+            if (!value.isString() || value.toString().size() > 128)
+                return setError(err, QStringLiteral("brush.fontFamily must be a string of at most 128 UTF-16 units"));
+        } else if (key == QStringLiteral("fontPointSizeF")) {
+            if (!isFinite(value) || value.toDouble() <= 0.0 || value.toDouble() > 512.0)
+                return setError(err, QStringLiteral("brush.fontPointSizeF must be a number in (0, 512]"));
+        } else if (key == QStringLiteral("fontWeight")) {
+            const double weight = value.toDouble();
+            if (!isFinite(value) || weight != std::floor(weight) || weight < 1.0 || weight > 1000.0)
+                return setError(err, QStringLiteral("brush.fontWeight must be an integer in 1..1000"));
+        } else if (key == QStringLiteral("fontItalic") || key == QStringLiteral("fontUnderline")) {
+            if (!value.isBool())
+                return setError(err, QStringLiteral("brush.%1 must be a boolean").arg(key));
+        } else if (key == QStringLiteral("basePositionX") || key == QStringLiteral("basePositionY")) {
+            if (!isFinite(value))
+                return setError(err, QStringLiteral("brush.%1 must be a finite number").arg(key));
+        } else if (key == QStringLiteral("brushWidth")) {
+            if (!isFinite(value) || value.toDouble() <= 0.0 || value.toDouble() > 512.0)
+                return setError(err, QStringLiteral("brush.brushWidth must be a number in (0, 512]"));
+        } else if (key == QStringLiteral("mode")) {
+            if (!value.isString() || (value.toString() != QStringLiteral("PerCharacter")
+                                      && value.toString() != QStringLiteral("PerStroke")))
+                return setError(err, QStringLiteral("brush.mode must be PerCharacter or PerStroke"));
+        } else if (key == QStringLiteral("fontSize") || key == QStringLiteral("progress")) {
+            if (!isFinite(value))
+                return setError(err, QStringLiteral("brush.%1 must be a finite number").arg(key));
+        } else {
+            return setError(err, QStringLiteral("unknown brush key: %1").arg(key));
+        }
+    }
+    if (!object.contains(QStringLiteral("text")))
+        return setError(err, QStringLiteral("brush.text is required"));
+    object.remove(QStringLiteral("fontSize"));
+    object.remove(QStringLiteral("progress"));
+    BrushAnimation animation;
+    animation.fromJson(object);
+    *normalized = animation.toJson();
+    return true;
+}
+
+// US-1911: get/set_clip_text3d / get/set_clip_brush の schema。registerWriteTools の
+// スタックフレームを太らせないよう、入れ子の QJsonObject は free 関数で組む。
+QJsonObject sidecarGetOutputSchema(const QString& key)
+{
+    return outputSchemaOf(QJsonObject{
+        {key, QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}}},
+        {QStringLiteral("present"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {key, QStringLiteral("present")});
+}
+
+QJsonObject sidecarSetOutputSchema(const QString& key)
+{
+    return outputSchemaOf(QJsonObject{
+        {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {QStringLiteral("changed"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        {key, QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}}},
+        {QStringLiteral("present"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}}
+    }, {QStringLiteral("ok"), QStringLiteral("changed"), key, QStringLiteral("present")});
+}
+
+QJsonObject sidecarSetInputSchema(const QJsonObject& clipProps, bool brush)
+{
+    if (!brush) {
+        return schemaWithRequired(mergedProperties(clipProps, QJsonObject{
+            {QStringLiteral("text3d"), QJsonObject{{QStringLiteral("type"), QStringLiteral("object")}}}
+        }), {QStringLiteral("clipIndex"), QStringLiteral("text3d")});
+    }
+    return schemaWithRequired(mergedProperties(clipProps, QJsonObject{
+        {QStringLiteral("brush"), QJsonObject{
+            {QStringLiteral("type"), QJsonArray{QStringLiteral("object"), QStringLiteral("null")}}}},
+        {QStringLiteral("revealDurationSec"), QJsonObject{
+            {QStringLiteral("type"), QStringLiteral("number")},
+            {QStringLiteral("minimum"), 0.001}}}
+    }), {QStringLiteral("clipIndex"), QStringLiteral("brush")});
 }
 
 QJsonObject wiggleInputSchema()
@@ -4105,7 +4273,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。worldX / worldY ±10000 (3D レイヤーのみ、プロジェクトカメラ (trueProjection) でのみ効く。is3DLayer=false のクリップは拒否)。autoOrientToCamera / is3DLayer / worldX / worldY は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..4、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。worldX / worldY ±10000 (3D レイヤーのみ、プロジェクトカメラ (trueProjection) でのみ効く。is3DLayer=false のクリップは拒否)。autoOrientToCamera / is3DLayer / worldX / worldY は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -4366,6 +4534,175 @@ void McpEditorTools::registerWriteTools()
         {QStringLiteral("expressions"), expressionsOutputSchema()}
     }, {QStringLiteral("is3DLayer"), QStringLiteral("autoOrientToCamera"),
         QStringLiteral("wiggle"), QStringLiteral("expressions")})));
+
+    // US-1911: 3D テキスト / ブラシの MCP。set は既存の undo 付き setter を通し、正規化後が保存値と
+    // 等値なら setter を呼ばず changed:false (undo 点を増やさない)。
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_clip_text3d"),
+        QStringLiteral("映像クリップの 3D テキスト設定 (text3d) を読む (読み取り専用)。未設定なら text3d は {} で present=false。音声クリップは拒否する。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/false, &target, err))
+                return {};
+            const QJsonObject& config = target.track->clips().at(target.clipIndex).text3DConfig;
+            return QJsonObject{
+                {QStringLiteral("text3d"), config},
+                {QStringLiteral("present"), !config.isEmpty()}
+            };
+        }
+    }, sidecarGetOutputSchema(QStringLiteral("text3d"))));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_text3d"),
+        QStringLiteral("映像クリップの 3D テキスト設定を全置換する。text3d は Text3DLayer の JSON (text / fontFamily / fontPointSize / perCharRotation / perCharPosition / perCharScale / cameraDistance / rotationAnimAxis / extrudeEnabled / extrudeDepth / extrudeBevelDepth / extrudeBevelWidth / extrudeBevelSegments / frontColor / sideColor / ambient / lightDir / extrudeBaseYaw / extrudeBasePitch / camera / timeOffsetSec)。{} で解除。サイズは 64 KiB 以下、未知のトップレベルキーは拒否 (camera 等のネストは検査しない)。extrudeBevelSegments は整数 0..8、extrudeDepth は 0..5、extrudeBevelDepth / extrudeBevelWidth は 0..1 で、有効なベベルがあるとき (2*extrudeBevelDepth - extrudeDepth が正) は (その差 × (2*extrudeBevelSegments+1) / extrudeDepth) が 40000 以下かつ文字数との積が 1000000 以下 (extrudeDepth 0 は拒否)。保存は正規化後の値で、保存値と等しければ changed=false で何もしない。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで戻せる。"),
+        sidecarSetInputSchema(clipProperties, /*brush=*/false),
+        guardedWrite(QStringLiteral("set_clip_text3d"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("text3d")},
+                                        err))
+                return {};
+            if (!args.contains(QStringLiteral("text3d")))
+                return setError(err, QStringLiteral("text3d is required")), QJsonObject();
+            QJsonObject normalized;
+            if (!parseText3DArgument(args.value(QStringLiteral("text3d")), &normalized, err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/true, &target, err))
+                return {};
+            const bool changed =
+                target.track->clips().at(target.clipIndex).text3DConfig != normalized;
+            if (changed) {
+                if (!timeline()->setClipText3DConfig(target.trackIndex, target.clipIndex, normalized))
+                    return setError(err, QStringLiteral("clip text3d update failed")), QJsonObject();
+                syncSelectionAfterEdit();
+            }
+            const QJsonObject& stored = target.track->clips().at(target.clipIndex).text3DConfig;
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("changed"), changed},
+                {QStringLiteral("text3d"), stored},
+                {QStringLiteral("present"), !stored.isEmpty()}
+            };
+        })
+    }, sidecarSetOutputSchema(QStringLiteral("text3d"))));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_clip_brush"),
+        QStringLiteral("映像クリップのブラシアニメ設定 (brush) を読む (読み取り専用)。未設定なら brush は {} で present=false。音声クリップは拒否する。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/false, &target, err))
+                return {};
+            const QJsonObject& brush = target.track->clips().at(target.clipIndex).brushData;
+            return QJsonObject{
+                {QStringLiteral("brush"), brush},
+                {QStringLiteral("present"), !brush.isEmpty()}
+            };
+        }
+    }, sidecarGetOutputSchema(QStringLiteral("brush"))));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_brush"),
+        QStringLiteral("映像クリップのブラシアニメを全置換し、描画に使う brush_progress keyframe も置く。brush は null か {} で解除 (brush_progress も削除)、オブジェクトなら text (必須・空不可・256 UTF-16 単位以下) / fontFamily (128 以下) / fontPointSizeF (0 < v <= 512) / fontWeight (整数 1..1000) / fontItalic / fontUnderline / basePositionX / basePositionY / brushWidth (0 < w <= 512) / mode (PerCharacter | PerStroke)。fontSize と progress は受理して捨てる (get の出力をそのまま渡せる)。revealDurationSec (省略可、>= 0.001) を渡した時だけ brush_progress を {0:0, D:1} に置き換え、省略時は track が無いか keyframe 0 個の時だけ {0:1} (全表示) を置き、既にあれば触らない。revealDurationSec と解除の組は拒否。変更が無ければ changed=false で何もしない。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで 1 回で戻せる。"),
+        sidecarSetInputSchema(clipProperties, /*brush=*/true),
+        guardedWrite(QStringLiteral("set_clip_brush"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("brush"),
+                                         QStringLiteral("revealDurationSec")},
+                                        err))
+                return {};
+            if (!args.contains(QStringLiteral("brush")))
+                return setError(err, QStringLiteral("brush is required (null clears it)")), QJsonObject();
+            QJsonObject normalized;
+            bool clear = false;
+            if (!parseBrushArgument(args.value(QStringLiteral("brush")), &normalized, &clear, err))
+                return {};
+            const bool hasReveal = args.contains(QStringLiteral("revealDurationSec"));
+            double revealSec = 0.0;
+            if (hasReveal) {
+                const QJsonValue value = args.value(QStringLiteral("revealDurationSec"));
+                revealSec = value.toDouble();
+                if (!value.isDouble() || !std::isfinite(revealSec) || revealSec < 0.001)
+                    return setError(err, QStringLiteral("revealDurationSec must be a finite number of at least 0.001")),
+                           QJsonObject();
+                if (clear)
+                    return setError(err, QStringLiteral("revealDurationSec cannot be combined with brush null / {}")),
+                           QJsonObject();
+            }
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/true, &target, err))
+                return {};
+
+            const QString progressName = QStringLiteral("brush_progress");
+            const ClipInfo& clip = target.track->clips().at(target.clipIndex);
+            KeyframeManager km = clip.keyframes;
+            const auto setProgressKeys = [&](bool reveal) {
+                ensureBrushProgressTrack(km);
+                KeyframeTrack* progress = km.track(progressName);
+                while (progress->count() > 0)
+                    progress->removeKeyframe(0);
+                progress->addKeyframe(0.0, reveal ? 0.0 : 1.0);
+                if (reveal)
+                    progress->addKeyframe(revealSec, 1.0);
+            };
+            if (clear) {
+                km.removeTrack(progressName);
+            } else if (hasReveal) {
+                setProgressKeys(true);
+            } else if (!km.hasTrack(progressName) || km.track(progressName)->count() == 0) {
+                setProgressKeys(false);
+            }
+            const QJsonObject newBrush = clear ? QJsonObject() : normalized;
+            const bool brushChanged = clip.brushData != newBrush;
+            const bool keysChanged = km.toJson() != clip.keyframes.toJson();
+            const bool changed = brushChanged || keysChanged;
+            if (changed) {
+                // GUI (MainWindow::addBrushAnimation) と同じ順: keyframe を clip に置いてから
+                // setClipBrushData が両方を 1 undo で記録する。brush が等値なら keyframe だけ。
+                bool ok = false;
+                if (!brushChanged) {
+                    ok = timeline()->setClipKeyframes(TrackKind::Video, target.trackIndex,
+                                                      target.clipIndex, km);
+                } else {
+                    QVector<ClipInfo> updated = target.track->clips();
+                    updated[target.clipIndex].keyframes = km;
+                    target.track->setClips(updated);
+                    ok = timeline()->setClipBrushData(target.trackIndex, target.clipIndex, newBrush);
+                }
+                if (!ok)
+                    return setError(err, QStringLiteral("clip brush update failed")), QJsonObject();
+                syncSelectionAfterEdit();
+                // 同値選択ではシグナルが省略されうるので直接結び直す。無条件に呼ぶと非選択クリップの
+                // ブラシが GL に結ばれ、選択クリップのブラシが外れる。
+                if (m_window->selectedVideoTrackIndex() == target.trackIndex
+                    && m_window->selectedVideoClipIndexTracked() == target.clipIndex)
+                    m_window->syncBrushAnimationPreviewForClip(target.trackIndex, target.clipIndex);
+            }
+            const QJsonObject& stored = target.track->clips().at(target.clipIndex).brushData;
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("changed"), changed},
+                {QStringLiteral("brush"), stored},
+                {QStringLiteral("present"), !stored.isEmpty()}
+            };
+        })
+    }, sidecarSetOutputSchema(QStringLiteral("brush"))));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("music_remix"),

@@ -1,4 +1,5 @@
 #include "../PlanarTrackerDialog.h"
+#include "../CameraMotionDialog.h"
 #include "../MainWindow.h"
 #include "../Timeline.h"
 #include "../libavcore/Encode.h"
@@ -848,6 +849,27 @@ int runCamtrackUiSelftest()
                      static_cast<long long>(secondMs));
         gate(10, blocked && emitted && quitMs >= 1500 && quitMs <= 3500 && interrupted
              && stillRunning && stopped && deleted && emittedAgain && secondMs < 500);
+    }
+    // G13 (US-1907): the tracker dialog warns before a solve with an implausible focal length and
+    // the camera dialog accepts a real-pixel focal length and shows its horizontal field of view.
+    {
+        PlanarTrackerDialog d;
+        d.setCameraSolveContext({1920, 1080}, 60, 24, 0);
+        auto* warning = d.findChild<QLabel*>("cameraFovWarningLabel");
+        const bool warnShown = warning && !warning->isHidden() && warning->text().contains("172.8");
+        d.setCameraSolveContext({1920, 1080}, 2304, 24, 0);
+        const bool warnHidden = warning && warning->isHidden();
+
+        CameraMotionDialog cam;
+        cam.setCanvasWidth(1920);
+        auto* spin = cam.findChild<QDoubleSpinBox*>("cameraFovSpin");
+        auto* hint = cam.findChild<QLabel*>("cameraFovHintLabel");
+        if (spin) spin->setValue(2304);
+        const double spinValue = spin ? spin->value() : -1.0;
+        const bool hintOk = hint && hint->text().contains("45.2");
+        std::fprintf(stderr, "G13 warnShown=%d warnHidden=%d spin=%.3f hint=%s\n", int(warnShown),
+                     int(warnHidden), spinValue, hint ? qPrintable(hint->text()) : "(none)");
+        gate(13, warnShown && warnHidden && spinValue == 2304.0 && hintOk);
     }
     return tally.finish();
 }

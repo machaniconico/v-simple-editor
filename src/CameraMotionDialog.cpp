@@ -158,6 +158,13 @@ Camera3D CameraMotionDialog::camera() const
     return result;
 }
 
+void CameraMotionDialog::setCanvasWidth(int width)
+{
+    m_canvasWidth = width;
+    m_fovHint->setText(QStringLiteral("≈ %1° (水平)")
+        .arg(QString::number(camera3d::horizontalFovDegrees(m_fov->value(), m_canvasWidth), 'f', 1)));
+}
+
 void CameraMotionDialog::setSceneLayers(const QVector<CompositeLayer> &layers)
 {
     m_sceneLayers = layers;
@@ -209,7 +216,10 @@ void CameraMotionDialog::buildUi()
         m_tgtX = makeSpinBox(-9999.0, 9999.0, 0.1, 0.0);
         m_tgtY = makeSpinBox(-9999.0, 9999.0, 0.1, 0.0);
         m_tgtZ = makeSpinBox(-9999.0, 9999.0, 0.1, -1.0);
-        m_fov  = makeSpinBox(10.0, 170.0, 1.0, 60.0);
+        m_fov  = makeSpinBox(1.0, 100000.0, 1.0, 60.0);
+        m_fov->setObjectName(QStringLiteral("cameraFovSpin"));
+        m_fovHint = new QLabel(this);
+        m_fovHint->setObjectName(QStringLiteral("cameraFovHintLabel"));
         m_roll = makeSpinBox(-360.0, 360.0, 1.0, 0.0);
 
         fl->addRow(QStringLiteral("位置 X"), m_posX);
@@ -218,7 +228,10 @@ void CameraMotionDialog::buildUi()
         fl->addRow(QStringLiteral("ターゲット X"), m_tgtX);
         fl->addRow(QStringLiteral("ターゲット Y"), m_tgtY);
         fl->addRow(QStringLiteral("ターゲット Z"), m_tgtZ);
-        fl->addRow(QStringLiteral("焦点距離 (px)"), m_fov);
+        auto *fovRow = new QHBoxLayout;
+        fovRow->addWidget(m_fov);
+        fovRow->addWidget(m_fovHint);
+        fl->addRow(QStringLiteral("焦点距離 (px)"), fovRow);
         fl->addRow(QStringLiteral("ロール (度)"), m_roll);
         m_trueProjection = new QCheckBox(
             QStringLiteral("真の透視投影 (回転・注視点・ロールを反映)"), m_baseCameraGroup);
@@ -328,6 +341,9 @@ void CameraMotionDialog::buildUi()
     connectDSB(m_posX); connectDSB(m_posY); connectDSB(m_posZ);
     connectDSB(m_tgtX); connectDSB(m_tgtY); connectDSB(m_tgtZ);
     connectDSB(m_fov);  connectDSB(m_roll);
+    connect(m_fov, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+            this, [this] { setCanvasWidth(m_canvasWidth); });
+    setCanvasWidth(m_canvasWidth);
     connect(m_trueProjection, &QCheckBox::toggled,
             this, &CameraMotionDialog::onBaseCameraEdited);
 
@@ -428,6 +444,7 @@ void CameraMotionDialog::applyStateToWidgets(const Camera3DState &state)
     m_tgtY->setValue(static_cast<double>(state.target.y()));
     m_tgtZ->setValue(static_cast<double>(state.target.z()));
     m_fov->setValue(state.fov);
+    setCanvasWidth(m_canvasWidth);
     m_roll->setValue(state.roll);
     m_trueProjection->setChecked(state.trueProjection);
 }
