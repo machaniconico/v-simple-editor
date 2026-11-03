@@ -234,6 +234,7 @@ int runProjTmplSelftest();
 int runProjectDiffSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
+int runPsdImportSelftest();
 int runPuppetPinSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
@@ -784,6 +785,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation (6 gates)" },
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (12 gates)" },
+    { "psd-import", "VEDITOR_PSD_IMPORT_SELFTEST", runPsdImportSelftest, false,
+      "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G6) (6 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7, G3b) (8 gates)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,

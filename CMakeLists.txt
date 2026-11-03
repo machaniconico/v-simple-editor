@@ -176,6 +176,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp
     src/selftests/log_to_rec709_selftest.cpp
+    src/selftests/psd_import_selftest.cpp
     src/selftests/lens_distort_selftest.cpp
     src/selftests/AeFxDistortSelftest.cpp
     src/selftests/AeFxDistort2Selftest.cpp
