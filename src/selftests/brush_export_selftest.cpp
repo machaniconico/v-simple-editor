@@ -516,8 +516,9 @@ int runBrushExportSelftest()
     // G8: the preview's progress follows the playhead through the real signal path:
     // a 1 s filler, then the brush clip at timeline 1 s with brush_progress 0 -> 1 over
     // its local 0-2 s. Timeline::positionChanged at 2.0 s is local 1 s (the keyframe
-    // value there, not the one at local 2 s); 1.0 s is local 0 and 3.0 s is local 2
-    // (HEAD: the value at time 0 whatever the playhead).
+    // value there, not the one at local 2 s); 1.0 s is local 0 and 2.99 s is local 1.99
+    // (HEAD: the value at time 0 whatever the playhead); 3.0 s is the clip's end,
+    // outside it, so progress 0 (US-2011).
     {
         MainWindow window;
         window.hide();
@@ -536,12 +537,12 @@ int runBrushExportSelftest()
             bound = window.brushPreviewClipIdForTest() == QStringLiteral("0:1");
             const KeyframeManager &keys = mainTimeline->videoTracks().value(0)->clips().at(1).keyframes;
             expected1 = keys.valueAt(QStringLiteral("brush_progress"), 1.0, 0.0);
-            expected2 = keys.valueAt(QStringLiteral("brush_progress"), 2.0, 0.0);
+            expected2 = keys.valueAt(QStringLiteral("brush_progress"), 1.99, 0.0);
             emit mainTimeline->positionChanged(1.0);
             p0 = view->brushAnimationProgressForTest();
             emit mainTimeline->positionChanged(2.0);
             p1 = view->brushAnimationProgressForTest();
-            emit mainTimeline->positionChanged(3.0);
+            emit mainTimeline->positionChanged(2.99);
             p2 = view->brushAnimationProgressForTest();
         }
         // Nested-sequence parent: a 2 s parent clip of two 1 s children emits one playback
@@ -692,7 +693,7 @@ int runBrushExportSelftest()
                   << " firstChildClamp@1.0s=" << nestedFirstChild << '\n';
         std::cerr << "brush-export G8 bound=" << bound << " progress@timeline1s=" << p0
                   << " progress@timeline2s=" << p1 << " keyframe@local1s=" << expected1
-                  << " progress@timeline3s=" << p2 << " keyframe@local2s=" << expected2 << '\n';
+                  << " progress@timeline2.99s=" << p2 << " keyframe@local1.99s=" << expected2 << '\n';
         tally.gate(8, bound && expected1 > 0.3 && expected1 < 0.7 && std::abs(p1 - expected1) < 1e-6
                           && std::abs(p1 - expected2) > 0.3
                           && std::abs(p0) < 1e-6 && std::abs(p2 - expected2) < 1e-6
@@ -1145,7 +1146,13 @@ int runBrushExportSelftest()
                 const QImage lateComposite = window.buildSpecialClipComposite(0.5);
                 const QImage lateUpload = refreshTo(0.5);
                 QImage latePlain;
-                const bool lateShape = ordinaryFrameShape(lateUpload, &latePlain);
+                // The bound V2 clip starts at 1.0, so at 0.5 it is not active: the
+                // ordinary frame carries no brush (US-2011).
+                window.syncBrushAnimationPreviewForClip(-1, -1);
+                latePlain = settledUpload();
+                window.syncBrushAnimationPreviewForClip(1, boundClip);
+                const bool lateShape = samePixels(lateUpload, latePlain)
+                    && view->brushAnimationProgressForTest() == 0.0;
                 view->setCompositeBakedMode(true);
                 const bool bakedKeepsBrush = samePixels(settledUpload(), lateUpload);
                 view->setCompositeBakedMode(false);
@@ -1421,14 +1428,27 @@ int runBrushExportSelftest()
 
         // G15: a clip far from the playhead no longer flips the route (HEAD: the
         // adjustment clip at 10 s made the composite {} at 1.0). Controls: (1) the
-        // selected V1, not active at 10.5, is still drawn by the GL at the clamped
-        // local time's brush_progress; (2) a far layer style changes nothing and a
+        // selected V1, not active at 10.5, is not drawn by the GL (progress 0, the
+        // frame is the plain one), while at t = 0 (before a 0.2 s lead-in, so inside
+        // no clip interval) clip 0 is active only by the V1 clamp and its brush is drawn; (2) a far layer style changes nothing and a
         // far brush is not this frame's brush; (3) negative: a roto composite built
         // with the helper false holds no brush, so the mark is false and the GL
         // draws the selected clip's on it.
         if (!view || !glOn) {
             tally.skip(15, "OpenGL preview unavailable in this environment");
         } else {
+            const auto meanAbsDiffOf = [](const QImage &x, const QImage &y) {
+                if (x.isNull() || x.size() != y.size())
+                    return -1.0;
+                const QImage a = x.convertToFormat(QImage::Format_RGBA8888);
+                const QImage b = y.convertToFormat(QImage::Format_RGBA8888);
+                qint64 sum = 0;
+                for (int row = 0; row < a.height(); ++row) {
+                    for (int col = 0; col < a.bytesPerLine(); ++col)
+                        sum += std::abs(int(a.constScanLine(row)[col]) - int(b.constScanLine(row)[col]));
+                }
+                return double(sum) / (a.height() * a.bytesPerLine());
+            };
             bool farOk = false, positiveOk = false, negativeOk = false;
             QString log;
             if (mainTimeline && longOk && squareMovieOk) {
@@ -1453,15 +1473,31 @@ int runBrushExportSelftest()
                 const bool farMark = marked();
                 const QImage farPlain = unbrushedUpload();
                 const qint64 farBrush = diffPixels(farUpload, farPlain);
-                const bool farShape = samePixels(farUpload, handBrush(farPlain, v1Brush, farProgress));
+                const double farMeanDiff = meanAbsDiffOf(farUpload, farPlain);
+                // An adjustment layer from 0 keeps the composite null at t = 0, so the
+                // bound brush is the GL's to draw (as at 10.5 above). V1 starts after a
+                // 0.2 s lead-in, so t = 0 lies before clip 0 and only the V1 clamp of
+                // activeClipOnTrack (clampToFirst) makes clip 0 active there; the
+                // full-progress keyframe also holds at the clamped local time -0.2 s.
+                ClipInfo earlyAdjustment = lateAdjustment;
+                earlyAdjustment.leadInSec = 0.0;
+                ClipInfo leadV1 = longV1;
+                leadV1.leadInSec = 0.2;
+                setTracks({{leadV1}, {earlyAdjustment}});
+                const QImage zeroUpload = pausedAt(0.0);
+                const double zeroProgress = view->brushAnimationProgressForTest();
+                const QImage zeroPlain = unbrushedUpload();
+                const double zeroMeanDiff = meanAbsDiffOf(zeroUpload, zeroPlain);
                 farOk = drew && compositeSame && nearMark && uploadSame && farComposite.isNull()
-                    && !farMark && farProgress == 1.0 && farShape && farBrush > 100;
+                    && !farMark && farProgress == 0.0 && farMeanDiff >= 0.0 && farMeanDiff <= 0.5
+                    && zeroProgress == 1.0 && zeroMeanDiff > 2.0;
                 log += QStringLiteral(" near drew=%1 sameAsExport=%2 diff=%3 formats=%4/%5 mark=%6 "
-                                      "upload=%7 far null=%8 mark=%9 progress=%10 shape=%11 brushVisible=%12")
+                                      "upload=%7 far null=%8 mark=%9 progress=%10 farMeanAbsDiff=%11 brushVisible=%12 zeroProgress=%13 zeroMeanAbsDiff=%14 zeroLeadIn=%15")
                            .arg(int(drew)).arg(int(compositeSame)).arg(diffPixels(composite, exported))
                            .arg(formatOf(composite)).arg(formatOf(exported)).arg(int(nearMark))
                            .arg(int(uploadSame)).arg(int(farComposite.isNull())).arg(int(farMark))
-                           .arg(farProgress).arg(int(farShape)).arg(farBrush);
+                           .arg(farProgress).arg(farMeanDiff).arg(farBrush)
+                           .arg(zeroProgress).arg(zeroMeanDiff).arg(leadV1.leadInSec);
 
                 ClipInfo lateStyled = v2Plain;
                 lateStyled.leadInSec = 10.0;
@@ -1591,7 +1627,8 @@ int runBrushExportSelftest()
         // mark in the early branch): g1 selected. (a) 0.38 shows the composite. (b)
         // 0.65 has no brush active and a 0-byte clip, so no frame comes: the mark
         // stays and the held composite is not drawn on twice. (c) 2.5 brings an
-        // ordinary frame: the mark is gone and the selected brush is on it.
+        // ordinary frame: the mark is gone, and g1 is not active there (US-2011), so no
+        // brush is drawn on it.
         if (!view || !glOn) {
             tally.skip(17, "OpenGL preview unavailable in this environment");
         } else {
@@ -1621,17 +1658,17 @@ int runBrushExportSelftest()
                 const double staleProgress = view->brushAnimationProgressForTest();
                 const bool staleMark = marked();
                 const qint64 keptDiff = diffPixels(staleUpload, held);
-                const qint64 doubleDiff = diffPixels(staleUpload, handBrush(held, v1Brush, staleProgress));
-                staleOk = staleComposite.isNull() && staleMark && keptDiff == 0 && doubleDiff > 100;
+                const qint64 doubleDiff = diffPixels(staleUpload, handBrush(held, v1Brush, 1.0));
+                staleOk = staleComposite.isNull() && staleMark && keptDiff == 0 && doubleDiff > 100
+                    && staleProgress == 0.0;
                 const QImage ordinaryUpload = pausedAt(2.5);
                 const double ordinaryProgress = view->brushAnimationProgressForTest();
                 const bool ordinaryMark = marked();
                 const QImage ordinaryPlain = unbrushedUpload();
                 const qint64 ordinaryBrush = diffPixels(ordinaryUpload, ordinaryPlain);
-                const bool ordinaryShape = samePixels(ordinaryUpload,
-                    handBrush(ordinaryPlain, v1Brush, ordinaryProgress));
-                ordinaryOk = !ordinaryMark && ordinaryShape && ordinaryBrush > 100
-                    && ordinaryProgress == 1.0;
+                const bool ordinaryShape = samePixels(ordinaryUpload, ordinaryPlain);
+                ordinaryOk = !ordinaryMark && ordinaryShape && ordinaryBrush == 0
+                    && ordinaryProgress == 0.0;
                 log = QStringLiteral(" a null=%1 mark=%2 same=%3 b null=%4 mark=%5 keptDiff=%6 "
                                      "doubleDiff=%7 progress=%8 c mark=%9 shape=%10 brushVisible=%11 "
                                      "progress=%12")

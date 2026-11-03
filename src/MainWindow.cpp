@@ -3519,6 +3519,14 @@ void MainWindow::updateBrushPreviewProgress(double timelineSec)
     const TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
         return;
+    // Outside the selected clip (the paused brush path's active rule, V1 clamping to
+    // its first clip at t <= 0) the GL must not draw its strokes: progress 0.
+    double activeStart = 0.0;
+    if (tlrender::activeClipOnTrack(track->clips(), timelineSec,
+                                    /*clampToFirst=*/trackIdx == 0, &activeStart) != clipIdx) {
+        m_player->glPreview()->setBrushAnimationProgress(0.0);
+        return;
+    }
     double localSec = 0.0;
     if (!tlrender::clipLocalSecAt(m_timeline, trackIdx, clipIdx, timelineSec, &localSec))
         return;
