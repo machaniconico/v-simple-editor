@@ -75,10 +75,16 @@
 //      JSON, 0 writes no key; the render-in-place replacement and its renderInPlaceOriginal
 //      keep the offset. Detects: audioLevel following the offset time
 //      (mutation build: no `t - offset` wrapper), or copyComposition without the field.
+//   G15 (US-2007) the rubber-band row mapping envgeom::gainToY / yToGain keeps unity at the
+//      vertical centre and reaches audio::kMaxClipGain at the top: gainToY(1, 100) = 50, (0) = 100,
+//      (4) = 0, (2) = 100 * 0.5 * (1 - 1/3), (5) clamps to 0; yToGain inverts it for gains
+//      {0, 0.25, 1, 2, 3, 4} and clamps y -10 -> 4, y 200 -> 0, y 50 -> 1. Detects: a linear
+//      0..4 mapping (mutation build: unity at 75 and gain 2 at 50).
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../AudioKeyframes.h"
 #include "../BrushAnimation.h"
+#include "../EnvelopeGeometry.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
 #include "../Text3DExtrusionDialog.h"
@@ -1587,6 +1593,28 @@ int runClipSidecarSelftest()
             }
             tally.gate(14, ok14, shown14.join(QLatin1Char(' ')).toStdString());
         }
+    }
+
+    {
+        bool ok15 = true;
+        QStringList shown15;
+        const auto check15 = [&](const QString &name, double got, double want) {
+            const bool passed = std::abs(got - want) <= 1e-9;
+            ok15 = ok15 && passed;
+            shown15 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(passed ? QString() : QStringLiteral(" (%1 != %2)").arg(got).arg(want));
+        };
+        check15(QStringLiteral("unity"), envgeom::gainToY(1.0, 100), 50.0);
+        check15(QStringLiteral("zero"), envgeom::gainToY(0.0, 100), 100.0);
+        check15(QStringLiteral("max"), envgeom::gainToY(4.0, 100), 0.0);
+        check15(QStringLiteral("two"), envgeom::gainToY(2.0, 100), 100 * 0.5 * (1.0 - 1.0 / 3.0));
+        check15(QStringLiteral("over"), envgeom::gainToY(5.0, 100), 0.0);
+        for (const double g : {0.0, 0.25, 1.0, 2.0, 3.0, 4.0})
+            check15(QStringLiteral("rt%1").arg(g), envgeom::yToGain(envgeom::gainToY(g, 100), 100), g);
+        check15(QStringLiteral("above"), envgeom::yToGain(-10.0, 100), 4.0);
+        check15(QStringLiteral("below"), envgeom::yToGain(200.0, 100), 0.0);
+        check15(QStringLiteral("centre"), envgeom::yToGain(50.0, 100), 1.0);
+        tally.gate(15, ok15, shown15.join(QLatin1Char(' ')).toStdString());
     }
 
     return tally.finish("clip-sidecar");

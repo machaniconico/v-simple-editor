@@ -2,6 +2,7 @@
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
 #include "AudioKeyframes.h"
+#include "EnvelopeGeometry.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
 #include "AudioClipEditor.h"
@@ -261,22 +262,18 @@ inline int transBadgeWidth(double durSec, double pps, int clipWidth) {
 // audio clip interaction (drag, trim, transition badge) is unchanged.
 bool g_envelopeEditMode = false;
 constexpr int kEnvelopePointRadiusPx = 5;
-constexpr double kEnvelopeMaxGain = 2.0;     // rubber band display ceiling (not the ClipInfo::volume cap)
 constexpr double kEnvelopeHitRadiusPx = 5.0; // mouse hit radius for points
 constexpr qint64 kDefaultAdjustmentLayerDurationUs = 5LL * 1000000LL;
 constexpr int kAdjustmentLayerMinPaintWidthPx = 42;
 
 // Map a clip-local time + gain to widget pixel coords. The clipRect's top
-// row is gain=2.0 (max), the bottom row is gain=0.0; gain=1.0 sits at the
+// row is gain=kMaxClipGain, the bottom row is gain=0.0; unity sits at the
 // vertical centre. Time is laid out at the track pps.
 inline double envelopeGainToY(double gain, int rowHeight) {
-    const double clamped = qBound(0.0, gain, kEnvelopeMaxGain);
-    return rowHeight * (1.0 - clamped / kEnvelopeMaxGain);
+    return envgeom::gainToY(gain, rowHeight);
 }
 inline double envelopeYToGain(double y, int rowHeight) {
-    if (rowHeight <= 0) return 1.0;
-    const double t = qBound(0.0, 1.0 - y / static_cast<double>(rowHeight), 1.0);
-    return t * kEnvelopeMaxGain;
+    return envgeom::yToGain(y, rowHeight);
 }
 
 int adjustmentLayerTrackIndex(const Timeline *timeline, const TimelineTrack *track)
