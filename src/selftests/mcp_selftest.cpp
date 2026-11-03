@@ -7792,11 +7792,61 @@ int runMcpSelftest()
                 const QJsonObject r5 = call(QStringLiteral("set_clip_text3d"),
                                             vArgs({{QStringLiteral("text3d"), QJsonValue(QJsonValue::Null)}}));
                 const QJsonObject r6 = call(QStringLiteral("set_clip_text3d"), vArgs({}));
+                // extrudeEnabled を付けない: 検査を欠いた変異体でもメッシュ生成で固まらない。
+                const auto segCall = [&](const QJsonValue& segments) {
+                    return call(QStringLiteral("set_clip_text3d"),
+                        vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"), QStringLiteral("seg")},
+                                {QStringLiteral("extrudeBevelSegments"), segments}}}}));
+                };
+                const QJsonObject s9 = segCall(9);
+                const QJsonObject s1e8 = segCall(100000000);
+                const QJsonObject sNeg = segCall(-1);
+                const QJsonObject sFrac = segCall(2.5);
+                const QJsonObject sStr = segCall(QStringLiteral("3"));
+                // 深さ / ベベルの実効値の検査 (ExtrudedMesh.cpp:209-217 の中間ループ回数)。extrudeEnabled は付けない。
+                const auto extCall = [&](const QString& text, const QJsonObject& extra) {
+                    QJsonObject o = extra;
+                    if (!text.isEmpty())
+                        o.insert(QStringLiteral("text"), text);
+                    return call(QStringLiteral("set_clip_text3d"), vArgs({{QStringLiteral("text3d"), o}}));
+                };
+                const QJsonObject d1 = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 1e-7},
+                    {QStringLiteral("extrudeBevelDepth"), 0.1}, {QStringLiteral("extrudeBevelSegments"), 8}});
+                const QJsonObject d2 = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0},
+                    {QStringLiteral("extrudeBevelDepth"), 0.02}});
+                // 40000 の上限だけが拒否する帯 (steps 約 340000 は積の上限 1000000 以下)。
+                const QJsonObject dMid = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0.00001},
+                    {QStringLiteral("extrudeBevelDepth"), 0.1}, {QStringLiteral("extrudeBevelSegments"), 8}});
+                const QJsonObject dNeg = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), -1}});
+                const QJsonObject dBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 5.01}});
+                const QJsonObject bdBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeBevelDepth"), 1.01}});
+                const QJsonObject bwBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeBevelWidth"), 1.01}});
+                const QJsonObject longText = extCall(QString(100, QLatin1Char('a')), {{QStringLiteral("extrudeDepth"), 0.001},
+                    {QStringLiteral("extrudeBevelDepth"), 1.0}, {QStringLiteral("extrudeBevelSegments"), 8}});
                 const bool unchanged = clipAt(0).text3DConfig == stored && serial() == s0;
                 const QJsonObject exact = toolPayload(call(QStringLiteral("set_clip_text3d"),
                     vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"),
                         QString(65536 - base, QLatin1Char('a'))}}}})));
                 const int storedSize = clipAt(0).text3DConfig.value(QStringLiteral("text")).toString().size();
+                const QJsonObject seg8 = toolPayload(segCall(8));
+                const int stored8 = clipAt(0).text3DConfig.value(QStringLiteral("extrudeBevelSegments")).toInt(-99);
+                const QJsonObject seg0 = toolPayload(segCall(0));
+                const int stored0 = clipAt(0).text3DConfig.value(QStringLiteral("extrudeBevelSegments")).toInt(-99);
+                const QJsonObject edge = toolPayload(extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0.001},
+                    {QStringLiteral("extrudeBevelDepth"), 1.0}, {QStringLiteral("extrudeBevelSegments"), 8}}));
+                const QJsonObject edgeCfg = clipAt(0).text3DConfig;
+                std::fprintf(stderr, "mcp G203 extrusion refusals [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] acceptEdge ok=%d depth=%g bevelDepth=%g segs=%d\n",
+                             qPrintable(toolErrorText(d1)), qPrintable(toolErrorText(d2)), qPrintable(toolErrorText(dMid)), qPrintable(toolErrorText(dNeg)),
+                             qPrintable(toolErrorText(dBig)), qPrintable(toolErrorText(bdBig)), qPrintable(toolErrorText(bwBig)),
+                             qPrintable(toolErrorText(longText)), edge.value(QStringLiteral("ok")).toBool(false),
+                             edgeCfg.value(QStringLiteral("extrudeDepth")).toDouble(-99),
+                             edgeCfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99),
+                             edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99));
+                std::fprintf(stderr, "mcp G203 bevelSegments refusals [%s] | [%s] | [%s] | [%s] | [%s] accept8 ok=%d stored=%d accept0 ok=%d stored=%d\n",
+                             qPrintable(toolErrorText(s9)), qPrintable(toolErrorText(s1e8)), qPrintable(toolErrorText(sNeg)),
+                             qPrintable(toolErrorText(sFrac)), qPrintable(toolErrorText(sStr)),
+                             seg8.value(QStringLiteral("ok")).toBool(false), stored8,
+                             seg0.value(QStringLiteral("ok")).toBool(false), stored0);
                 std::fprintf(stderr, "mcp G203 errs [%s] | [%s] | [%s] | [%s] | [%s] | [%s] unchanged=%d "
                              "exact64KiB ok=%d changed=%d storedTextLen=%d (expect 6 errors, 1, 1, 1, %d)\n",
                              qPrintable(toolErrorText(r1)), qPrintable(toolErrorText(r2)), qPrintable(toolErrorText(r3)),
@@ -7807,11 +7857,32 @@ int runMcpSelftest()
                     && observeTerm(203, "65537-byte object refused", isErr(r2))
                     && observeTerm(203, "string / array / null / missing refused",
                                    isErr(r3) && isErr(r4) && isErr(r5) && isErr(r6))
+                    && observeTerm(203, "extrudeBevelSegments 9 refused", isErr(s9))
+                    && observeTerm(203, "extrudeBevelSegments 100000000 refused", isErr(s1e8))
+                    && observeTerm(203, "extrudeBevelSegments -1 refused", isErr(sNeg))
+                    && observeTerm(203, "extrudeBevelSegments 2.5 refused", isErr(sFrac))
+                    && observeTerm(203, "extrudeBevelSegments \"3\" refused", isErr(sStr))
+                    && observeTerm(203, "depth 1e-7 with bevelDepth 0.1 and 8 segments refused", isErr(d1))
+                    && observeTerm(203, "step count 340000 (over 40000, under the product limit) refused", isErr(dMid))
+                    && observeTerm(203, "depth 0 with an active bevel refused", isErr(d2))
+                    && observeTerm(203, "extrudeDepth -1 / 5.01 refused", isErr(dNeg) && isErr(dBig))
+                    && observeTerm(203, "extrudeBevelDepth 1.01 refused", isErr(bdBig))
+                    && observeTerm(203, "extrudeBevelWidth 1.01 refused", isErr(bwBig))
+                    && observeTerm(203, "100-char text over the step-times-length product limit refused", isErr(longText))
                     && observeTerm(203, "state and saveSerial unchanged after refusals", unchanged)
                     && observeTerm(203, "exactly 65536 bytes is accepted",
                                    exact.value(QStringLiteral("ok")).toBool(false)
                                        && exact.value(QStringLiteral("changed")).toBool(false)
-                                       && storedSize == 65536 - base),
+                                       && storedSize == 65536 - base)
+                    && observeTerm(203, "extrudeBevelSegments 8 accepted and stored exactly",
+                                   seg8.value(QStringLiteral("ok")).toBool(false) && stored8 == 8)
+                    && observeTerm(203, "extrudeBevelSegments 0 accepted and stored exactly",
+                                   seg0.value(QStringLiteral("ok")).toBool(false) && stored0 == 0)
+                    && observeTerm(203, "single-glyph depth 0.001 / bevelDepth 1.0 / 8 segments accepted and stored exactly",
+                                   edge.value(QStringLiteral("ok")).toBool(false)
+                                       && edgeCfg.value(QStringLiteral("extrudeDepth")).toDouble(-99) == 0.001
+                                       && edgeCfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99) == 1.0
+                                       && edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99) == 8),
                     "set_clip_text3d accepted an invalid text3d, changed state on refusal, or mis-measured the 64 KiB limit");
             }
 
