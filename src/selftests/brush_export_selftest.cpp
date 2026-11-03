@@ -320,8 +320,8 @@ int runBrushExportSelftest()
 
     // G2: progress 0 and zero strokes are byte-unchanged; progress 1 is the hand
     // composite (brush on the raw, then VFX / grade / fx), also under an Echo whose
-    // past frames carry no brush; the stage control: grading first then drawing
-    // differs.
+    // past frames carry the brush at their own local time (US-2010, progress 1
+    // here); the stage control: grading first then drawing differs.
     {
         const auto plainTl = makeTimeline({{plain}});
         const QImage reference = frameAt(plainTl.get(), t);
@@ -356,7 +356,8 @@ int runBrushExportSelftest()
         const QImage echoRaw = rawAt(echoPlainTl.get(), t);
         const tlrender::EchoFrameProvider pastFrames =
             [&](double, double sampleLocalSec) -> QImage {
-                return tlrender::prepareClipSourceForEcho(echoRaw, echoBrushed, sampleLocalSec);
+                return tlrender::prepareClipSourceForEcho(handBrush(echoRaw, brush, 1.0),
+                                                          echoBrushed, sampleLocalSec);
             };
         const QImage echoHand = echoRaw.isNull() ? QImage()
             : tlrender::applyClipFxStackWithEchoFromSource(

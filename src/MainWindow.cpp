@@ -8813,7 +8813,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip, brushWantsSpecialPath](
+                    [this, clip, clipId, brushWantsSpecialPath](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         // US-1805: the brush path samples export's source frame
                         // (renderClipSourceFrame), the rest keep grabFrameAt.
@@ -8826,8 +8826,11 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                             : decodeClipFrameAtSourceTime(clip, sampleSourceSec);
                         if (sampleRaw.isNull())
                             return QImage();
+                        // US-2010: export's provider order on both branches:
+                        // the sample's own brush, then VFX / grade (no roto).
                         return tlrender::prepareClipSourceForEcho(
-                            sampleRaw, clip, sampleLocalSec);
+                            tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec, clipId),
+                            clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
                     frame, clip, localSeconds, fxSourceSeconds, echoProvider);

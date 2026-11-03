@@ -764,7 +764,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (18 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (20 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
