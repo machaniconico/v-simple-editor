@@ -2022,6 +2022,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["expressions"] = clip.expressions.toJson();
     if (!clip.text3DConfig.isEmpty())
         obj["text3D"] = clip.text3DConfig;
+    // US-2004: the remap rides on the clip so non-active sequences keep it through the
+    // sequence store; the root timeRemapClipEntries stay the active sequence's legacy copy.
+    if (clip.hasTimeRemap())
+        obj["timeRemapCurve"] = clip.timeRemapCurve.toJson();
     if (!clip.brushData.isEmpty())
         obj["brush"] = clip.brushData;
     if (clip.fitContain)
@@ -2166,6 +2170,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.dynamicTimeOffsetSec = obj["dynamicTimeOffsetSec"].toDouble(0.0);
     clip.expressions.fromJson(obj["expressions"].toObject());
     clip.text3DConfig = obj["text3D"].toObject();
+    if (obj.contains("timeRemapCurve"))
+        clip.timeRemapCurve = timeremap::TimeRemapCurve::fromJson(obj["timeRemapCurve"].toObject());
     clip.brushData = obj["brush"].toObject();
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);

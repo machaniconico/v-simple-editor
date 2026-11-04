@@ -86,6 +86,15 @@
 //      `time * 0.1` at local 1.0 equals the position.x clipanim::effectiveTransformAt resolves
 //      for a clip with dynamicTimeOffsetSec 1.5 (1e-9), and that value is the 0.25 the offset
 //      implies, not the 0.1 of the un-offset time. Detects: the dialog ignoring the offset (HEAD).
+//   G17 (US-2004) a sequence-model Timeline: B (non-active) has a 3-key remap (sourceFps 24) on
+//      V1 clip 0, A is active with no remap, so the root timeRemapClipEntries are empty. After
+//      toJsonString -> fromJsonString the store's B clip 0 JSON carries "timeRemapCurve", and a
+//      restored Timeline switched to B has the same keys and sourceFps on that clip (A's clip and
+//      B's clip 1 stay without one). Detects: clipToJson not writing the key (HEAD; mutation build).
+//   G18 (US-2004) control: clips without a remap have no "timeRemapCurve" key (root and store);
+//      a clip key + root entry project writes both; the HEAD form (clip key removed, root entry
+//      "0:0" only) loads onto V1 clip 0 through applyTimeRemapEntries (HEAD PASS pin); clip key
+//      and an equal root entry give the same curve; a differing root entry wins over the clip key.
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../AudioKeyframes.h"
@@ -1659,6 +1668,196 @@ int runClipSidecarSelftest()
                 QStringLiteral("dialog %1 render %2").arg(result.value, 0, 'g', 9).arg(rendered, 0, 'g', 9));
         check16(QStringLiteral("nonVacuous"), std::abs(rendered - 0.25) <= 1e-9 && std::abs(rendered - 0.1) > 0.1);
         tally.gate(16, ok16, shown16.join(QLatin1Char(' ')).toStdString());
+    }
+
+    // G17 / G18 (US-2004): the time remap curve rides on the clip JSON.
+    {
+        timeremap::TimeRemapCurve curve;
+        curve.sourceFps = 24.0;
+        curve.addKey(0.0, 0.0);
+        curve.addKey(1.0, 2.0);
+        curve.addKey(2.0, 2.5);
+        timeremap::TimeRemapCurve other;
+        other.sourceFps = 30.0;
+        other.addKey(0.0, 1.0);
+        other.addKey(3.0, 0.5);
+        const auto sameCurve = [](const timeremap::TimeRemapCurve &a, const timeremap::TimeRemapCurve &b) {
+            if (a.keys.size() != b.keys.size() || a.sourceFps != b.sourceFps || a.blendMode != b.blendMode)
+                return false;
+            for (int i = 0; i < a.keys.size(); ++i)
+                if (a.keys[i].outTime != b.keys[i].outTime || a.keys[i].srcTime != b.keys[i].srcTime)
+                    return false;
+            return true;
+        };
+        const auto describe = [](const timeremap::TimeRemapCurve &c) {
+            QStringList keys;
+            for (const timeremap::TimeRemapKey &k : c.keys)
+                keys << QStringLiteral("%1>%2").arg(k.outTime).arg(k.srcTime);
+            return QStringLiteral("keys[%1] fps %2").arg(keys.join(QLatin1Char(','))).arg(c.sourceFps);
+        };
+        const auto liveClip = [](Timeline &tl, int clipIndex) {
+            TimelineTrack *v1 = tl.trackAt(false, 0);
+            return v1 ? v1->clips().value(clipIndex) : ClipInfo{};
+        };
+        const auto populate = [](Timeline &tl) {
+            ProjectData data;
+            data.config.width = 640;
+            data.config.height = 360;
+            data.config.fps = 30;
+            data.videoTracks = tl.allVideoTracks();
+            data.audioTracks = tl.allAudioTracks();
+            const QHash<QString, QString> parents = tl.clipParentEntries();
+            for (auto it = parents.cbegin(); it != parents.cend(); ++it)
+                data.clipParentEntries.append(ClipParentEntry{it.key(), it.value()});
+            for (int t = 0; t < data.videoTracks.size(); ++t)
+                for (int c = 0; c < data.videoTracks[t].size(); ++c)
+                    if (data.videoTracks[t][c].hasTimeRemap())
+                        data.timeRemapClipEntries.append(
+                            TimeRemapClipEntry{QStringLiteral("%1:%2").arg(t).arg(c),
+                                               data.videoTracks[t][c].timeRemapCurve});
+            return data;
+        };
+        const auto restore = [](Timeline &tl, const ProjectData &data) {
+            tl.restoreFromProject(data.videoTracks, data.audioTracks, 0.0, -1.0, -1.0, 100);
+            QHash<QString, QString> parents;
+            for (const ClipParentEntry &entry : data.clipParentEntries)
+                parents.insert(entry.clipId, entry.parentClipId);
+            tl.setClipParentEntries(parents);
+            ProjectFile::applyTimeRemapEntries(&tl, data.timeRemapClipEntries);
+        };
+
+        // G17: B (non-active) keeps its remap through the sequence store.
+        bool ok17 = true;
+        QStringList shown17;
+        const auto check17 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok17 = ok17 && passed;
+            shown17 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        Timeline tl;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{sidecarClip(QStringLiteral("a0"), 4.0)}},
+                              QVector<QVector<ClipInfo>>{{}}, 0.0, -1.0, -1.0, 100);
+        TimelineSequence seqB;
+        seqB.id = QStringLiteral("seq-b");
+        seqB.name = QStringLiteral("B");
+        seqB.videoTracks = {{sidecarClip(QStringLiteral("b0"), 4.0), sidecarClip(QStringLiteral("b1"), 2.0)}};
+        seqB.audioTracks = {{}};
+        const bool added = tl.addSequence(seqB);
+        const QString aId = tl.activeSequenceId();
+        QString bId;
+        for (const TimelineSequence &s : tl.sequences())
+            if (s.name == QStringLiteral("B")) bId = s.id;
+        const bool toB = !bId.isEmpty() && tl.setActiveSequence(bId);
+        if (TimelineTrack *v1 = tl.trackAt(false, 0)) {
+            QVector<ClipInfo> clips = v1->clips();
+            if (!clips.isEmpty())
+                clips[0].timeRemapCurve = curve;
+            v1->setClips(clips);
+        }
+        const bool remapOnB = sameCurve(liveClip(tl, 0).timeRemapCurve, curve);
+        const bool toA = tl.setActiveSequence(aId);
+        check17(QStringLiteral("setup"), added && toB && remapOnB && toA && tl.activeSequenceId() == aId
+                    && !liveClip(tl, 0).hasTimeRemap(),
+                QStringLiteral("added %1 toB %2 remapOnB %3 toA %4 aLive %5").arg(int(added)).arg(int(toB))
+                    .arg(int(remapOnB)).arg(int(toA)).arg(int(liveClip(tl, 0).hasTimeRemap())));
+        const ProjectData saved = populate(tl);
+        const QString json17 = ProjectFile::toJsonString(saved);
+        const QJsonObject root17 = rootOf(json17);
+        check17(QStringLiteral("rootEntries0"), root17.value(QStringLiteral("timeRemapClipEntries")).toArray().isEmpty());
+        ProjectData loaded17;
+        const bool parsed17 = ProjectFile::fromJsonString(json17, loaded17);
+        QJsonObject storeB0;
+        QJsonObject storeB1;
+        for (const ClipParentEntry &entry : loaded17.clipParentEntries) {
+            if (entry.clipId != timeline_nesting::sequenceStoreParentKey())
+                continue;
+            const QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+            for (const QJsonValue &value : store.value(QStringLiteral("sequences")).toArray()) {
+                const QJsonObject seq = value.toObject();
+                if (seq.value(QStringLiteral("id")).toString() != bId)
+                    continue;
+                const QJsonArray v1 = seq.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+                storeB0 = v1.at(0).toObject();
+                storeB1 = v1.at(1).toObject();
+            }
+        }
+        const bool storeKey = storeB0.contains(QStringLiteral("timeRemapCurve"));
+        check17(QStringLiteral("storeKey"), parsed17 && storeKey,
+                QStringLiteral("parsed %1 b0 keys %2").arg(int(parsed17)).arg(storeB0.size()));
+        Timeline reopened;
+        restore(reopened, loaded17);
+        const bool aBack = reopened.activeSequenceId() == aId && !liveClip(reopened, 0).hasTimeRemap();
+        const bool backToB = reopened.setActiveSequence(bId);
+        const ClipInfo b0 = liveClip(reopened, 0);
+        check17(QStringLiteral("aBack"), aBack);
+        check17(QStringLiteral("roundTrip"), backToB && b0.hasTimeRemap() && sameCurve(b0.timeRemapCurve, curve)
+                    && b0.timeRemapCurve.keys.size() == 3 && b0.timeRemapCurve.sourceFps == 24.0,
+                QStringLiteral("toB %1 %2").arg(int(backToB)).arg(describe(b0.timeRemapCurve)));
+        check17(QStringLiteral("b1None"), !liveClip(reopened, 1).hasTimeRemap());
+        tally.gate(17, ok17, shown17.join(QLatin1Char(' ')).toStdString());
+
+        // G18: no key without a remap; the HEAD form (root entry only) loads; root wins.
+        bool ok18 = true;
+        QStringList shown18;
+        const auto check18 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok18 = ok18 && passed;
+            shown18 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        check18(QStringLiteral("noKey"), !firstClipJson(root17, 0).isEmpty()
+                    && !firstClipJson(root17, 0).contains(QStringLiteral("timeRemapCurve"))
+                    && !storeB1.isEmpty() && !storeB1.contains(QStringLiteral("timeRemapCurve")));
+        ProjectData plain;
+        plain.config.width = 640;
+        plain.config.height = 360;
+        plain.config.fps = 30;
+        ClipInfo r0 = sidecarClip(QStringLiteral("r0"), 4.0);
+        r0.timeRemapCurve = curve;
+        plain.videoTracks = {{r0, sidecarClip(QStringLiteral("r1"), 2.0)}};
+        plain.audioTracks = {{}};
+        plain.timeRemapClipEntries = {TimeRemapClipEntry{QStringLiteral("0:0"), curve}};
+        const QString bothJson = ProjectFile::toJsonString(plain);
+        QJsonObject headRoot = rootOf(bothJson);
+        const bool bothKeys = firstClipJson(headRoot, 0).contains(QStringLiteral("timeRemapCurve"))
+            && headRoot.value(QStringLiteral("timeRemapClipEntries")).toArray().size() == 1;
+        check18(QStringLiteral("bothWritten"), bothKeys);
+        {
+            QJsonArray tracks = headRoot.value(QStringLiteral("videoTracks")).toArray();
+            QJsonArray v1 = tracks.at(0).toArray();
+            QJsonObject c0 = v1.at(0).toObject();
+            c0.remove(QStringLiteral("timeRemapCurve"));
+            v1[0] = c0;
+            tracks[0] = v1;
+            headRoot[QStringLiteral("videoTracks")] = tracks;
+        }
+        ProjectData headLoaded;
+        const bool headParsed = ProjectFile::fromJsonString(
+            QString::fromUtf8(QJsonDocument(headRoot).toJson()), headLoaded);
+        const bool headClipBare = headParsed && !headLoaded.videoTracks.value(0).value(0).hasTimeRemap();
+        Timeline headTl;
+        restore(headTl, headLoaded);
+        check18(QStringLiteral("headForm"), headClipBare && sameCurve(liveClip(headTl, 0).timeRemapCurve, curve)
+                    && !liveClip(headTl, 1).hasTimeRemap(),
+                QStringLiteral("parsed %1 bare %2 %3").arg(int(headParsed)).arg(int(headClipBare))
+                    .arg(describe(liveClip(headTl, 0).timeRemapCurve)));
+        ProjectData bothLoaded;
+        const bool bothParsed = ProjectFile::fromJsonString(bothJson, bothLoaded);
+        Timeline bothTl;
+        restore(bothTl, bothLoaded);
+        check18(QStringLiteral("bothSame"), bothParsed && sameCurve(liveClip(bothTl, 0).timeRemapCurve, curve)
+                    && sameCurve(liveClip(bothTl, 0).timeRemapCurve, liveClip(headTl, 0).timeRemapCurve)
+                    && !liveClip(bothTl, 1).hasTimeRemap(),
+                describe(liveClip(bothTl, 0).timeRemapCurve));
+        plain.timeRemapClipEntries = {TimeRemapClipEntry{QStringLiteral("0:0"), other}};
+        ProjectData rootWinsLoaded;
+        const bool rootWinsParsed = ProjectFile::fromJsonString(ProjectFile::toJsonString(plain), rootWinsLoaded);
+        const bool clipKeyRead = rootWinsParsed
+            && sameCurve(rootWinsLoaded.videoTracks.value(0).value(0).timeRemapCurve, curve);
+        Timeline rootWinsTl;
+        restore(rootWinsTl, rootWinsLoaded);
+        check18(QStringLiteral("rootWins"), clipKeyRead && sameCurve(liveClip(rootWinsTl, 0).timeRemapCurve, other),
+                QStringLiteral("clipKey %1 %2").arg(int(clipKeyRead)).arg(describe(liveClip(rootWinsTl, 0).timeRemapCurve)));
+        tally.gate(18, ok18, shown18.join(QLatin1Char(' ')).toStdString());
     }
 
     return tally.finish("clip-sidecar");
