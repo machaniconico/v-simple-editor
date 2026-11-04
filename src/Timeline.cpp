@@ -43,6 +43,7 @@
 #include <utility>
 #include <QFileInfo>
 #include <QSignalBlocker>
+#include <QScopedValueRollback>
 #include <QRubberBand>
 #include <QSet>
 #include <QThread>
@@ -4900,10 +4901,11 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         if (headerPtr) headerPtr->setFixedHeight(newH);
     });
 
-    connect(lockBtn, &QPushButton::toggled, this, [trackPtr, lockBtnPtr](bool checked) {
+    connect(lockBtn, &QPushButton::toggled, this, [this, trackPtr, lockBtnPtr](bool checked) {
         if (!trackPtr) return;
         qInfo() << "Timeline: lock toggled =" << checked << "track=" << trackPtr.data();
         trackPtr->setLocked(checked);
+        emit trackFlagsChanged();
         if (lockBtnPtr) {
             lockBtnPtr->setText(checked
                 ? QString::fromUtf8("\xF0\x9F\x94\x92")    // 🔒
@@ -4916,6 +4918,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             if (!trackPtr) return;
             qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setMuted(checked);
+            emit trackFlagsChanged();
             if (muteBtnPtr) {
                 muteBtnPtr->setText(checked
                     ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
@@ -4945,6 +4948,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             if (!trackPtr) return;
             qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setHidden(checked);
+            emit trackFlagsChanged();
             if (hideBtnPtr) {
                 hideBtnPtr->setText(checked
                     ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
@@ -12499,6 +12503,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     auto *track = m_audioTracks[audioTrackIndex];
     track->setMuted(!track->isMuted());
+    emit trackFlagsChanged();
     syncTrackHeaderFlags(track);
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
@@ -12511,6 +12516,7 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
 {
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     bool newSolo = !m_audioTracks[audioTrackIndex]->isSolo();
+    bool anyChanged = false;
     // Clear all solo first, then set the target
     for (int i = 0; i < m_audioTracks.size(); ++i) {
         const bool wasSolo = m_audioTracks[i]->isSolo();
@@ -12519,8 +12525,11 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
             m_audioTracks[i]->setSolo(nowSolo);
             syncTrackHeaderFlags(m_audioTracks[i]);
             emit trackSoloChanged(i, nowSolo);
+            anyChanged = true;
         }
     }
+    if (anyChanged)
+        emit trackFlagsChanged();
     // Solo state lives on the mixer (per-track effectiveGain), so the
     // PlaybackEntry-shaped schedule is unchanged — no audioSequenceChanged
     // re-emit needed. trackSoloChanged carries the only state the mixer
@@ -16705,6 +16714,7 @@ TimelineState Timeline::currentState() const
 
 void Timeline::restoreState(const TimelineState &state)
 {
+    QScopedValueRollback<bool> restoring(m_restoringState, true);
     undotrace::log("restoreState:enter");
     noteClipsChanged();
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
@@ -16868,6 +16878,7 @@ void Timeline::restoreState(const TimelineState &state)
     const QString beforeSequenceCreation = state.externalTrackState
         .value(QStringLiteral("_sequenceCreationActiveId")).toString();
     if (!beforeSequenceCreation.isEmpty()) setActiveSequence(beforeSequenceCreation);
+    emit restoreStateFinished();
     undotrace::log("restoreState:exit");
 }
 

@@ -1031,6 +1031,8 @@ public:
     void redo();
     bool canUndo() const;
     bool canRedo() const;
+    // True while restoreState (undo / redo / history jump) is running.
+    bool isRestoringState() const { return m_restoringState; }
     // External index owners participate in the same undo transaction.
     void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
                                     std::function<void(const QJsonObject&)> apply);
@@ -1646,6 +1648,12 @@ signals:
     // PlaybackEntry struct. AudioMixer applies them via setTrackSolo on
     // receipt; mute and per-clip volume already ride on PlaybackEntry.
     void trackSoloChanged(int trackIdx, bool solo);
+    // A user track mute / solo / lock / hide toggle (header buttons,
+    // toggleMuteTrack, toggleSoloTrack). Once per toggle. These flags are not
+    // undo state, so MainWindow marks the project dirty from this signal.
+    void trackFlagsChanged();
+    // Last statement of restoreState, still inside the restoring scope.
+    void restoreStateFinished();
     // Fired when the user drags a text overlay's edge handle on the
     // timeline text strip so MainWindow can resync the right-panel
     // 開始時間 / 表示時間 spinboxes and re-push the preview overlays.
@@ -1723,6 +1731,7 @@ private:
     std::function<void()> m_exprAudioEnvRebuildHook;
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
+    bool m_restoringState = false;
     void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);

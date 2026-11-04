@@ -298,6 +298,7 @@ int runTransitionExportSelftest();
 int runTransitionParamsSelftest();
 int runTrimOpsSelftest();
 int runTwitchSelftest();
+int runUnsavedPromptSelftest();
 int runVersionedSaveSelftest();
 int runVfxFootageSelftest();
 int runVfxGeneratorsSelftest();
@@ -1097,6 +1098,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Transcript highlighter scaffold smoke" },
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
+    { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (9 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

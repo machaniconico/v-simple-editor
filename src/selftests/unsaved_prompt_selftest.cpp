@@ -1,0 +1,691 @@
+// US-2001: the project's dirty state (the id of the last saved undo entry plus
+// edits outside undo) and the save / discard / cancel prompt before a project
+// is replaced. The gates never call closeEvent (it writes the real QSettings
+// and the real autosave directory); they observe maybeSaveChanges() and the
+// prompt / save-as / failure-dialog / missing-media seams.
+#include "../AudioMixerDock.h"
+#include "../MainWindow.h"
+#include "../MediaPaths.h"
+#include "../ProjectFile.h"
+#include "../Timeline.h"
+#include "../UndoManager.h"
+#include "SelftestGate.h"
+
+#include <QCoreApplication>
+#include <QDir>
+#include <QEvent>
+#include <QFile>
+#include <QFileInfo>
+#include <QHash>
+#include <QLabel>
+#include <QLayout>
+#include <QMetaObject>
+#include <QPushButton>
+#include <QSignalSpy>
+#include <QTemporaryDir>
+#include <QTest>
+
+#include <functional>
+#include <string>
+
+namespace {
+
+using Choice = MainWindow::UnsavedChangesChoice;
+
+std::string b(bool v) { return v ? "1" : "0"; }
+
+bool touchFile(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::WriteOnly) && file.write("media", 5) == 5;
+}
+
+ClipInfo makeClip(const QString &path)
+{
+    ClipInfo clip;
+    clip.filePath = path;
+    clip.duration = 1.0;
+    clip.outPoint = 1.0;
+    return clip;
+}
+
+int clipCount(const Timeline &timeline)
+{
+    int n = 0;
+    for (const auto *tracks : {&timeline.videoTracks(), &timeline.audioTracks()})
+        for (const TimelineTrack *track : *tracks)
+            n += track ? track->clips().size() : 0;
+    return n;
+}
+
+QPushButton *headerButton(Timeline &timeline, const QString &trackName, const QString &objectName)
+{
+    for (auto *label : timeline.findChildren<QLabel *>(QStringLiteral("timelineTrackName"))) {
+        QWidget *header = label->parentWidget();
+        if (label->property("defaultName").toString() != trackName || !header
+            || !header->parentWidget() || !header->parentWidget()->layout()
+            || header->parentWidget()->layout()->indexOf(header) < 0)
+            continue;
+        return header->findChild<QPushButton *>(objectName, Qt::FindDirectChildrenOnly);
+    }
+    return nullptr;
+}
+
+} // namespace
+
+int runUnsavedPromptSelftest()
+{
+    selftest::GateTally tally;
+    QTemporaryDir dir;
+    if (!dir.isValid()) {
+        for (int g = 1; g <= 9; ++g)
+            tally.gate(g, false, "temporary directory unavailable");
+        return tally.finish("unsaved-prompt");
+    }
+    const auto tmp = [&](const char *name) { return QDir(dir.path()).filePath(QString::fromLatin1(name)); };
+
+    // ---- G7 (e): track flags, on a fresh MainWindow ----
+    bool g7e = false;
+    std::string g7eDetail;
+    {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        MainWindow window;
+        Timeline &timeline = *window.m_timeline;
+        auto *dock = window.findChild<AudioMixerDock *>(QStringLiteral("AudioMixerDock"));
+        QPushButton *mixerMute = nullptr;
+        QPushButton *mixerSolo = nullptr;
+        if (dock) {
+            const bool found = QTest::qWaitFor([&]() {
+                QCoreApplication::processEvents();
+                QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+                QWidget *root = dock->widget() ? dock->widget() : static_cast<QWidget *>(dock);
+                mixerMute = root->findChild<QPushButton *>(QStringLiteral("mixerMute0"));
+                mixerSolo = root->findChild<QPushButton *>(QStringLiteral("mixerSolo0"));
+                return mixerMute && mixerSolo;
+            }, 5000);
+            (void)found;
+        }
+        QPushButton *lockV1 = headerButton(timeline, QStringLiteral("V1"), QStringLiteral("timelineTrackLockButton"));
+        QPushButton *hideV1 = headerButton(timeline, QStringLiteral("V1"), QStringLiteral("timelineTrackHideButton"));
+        QPushButton *muteA1 = headerButton(timeline, QStringLiteral("A1"), QStringLiteral("timelineTrackMuteButton"));
+        QPushButton *soloA1 = headerButton(timeline, QStringLiteral("A1"), QStringLiteral("timelineTrackSoloButton"));
+        const bool premise = timeline.videoTrackCount() >= 1 && timeline.audioTrackCount() >= 1
+            && dock && mixerMute && mixerSolo && lockV1 && hideV1 && muteA1 && soloA1;
+        g7eDetail = "premise v=" + std::to_string(timeline.videoTrackCount())
+            + " a=" + std::to_string(timeline.audioTrackCount())
+            + " dock=" + b(dock) + " mixerMute0=" + b(mixerMute) + " mixerSolo0=" + b(mixerSolo)
+            + " lock=" + b(lockV1) + " hide=" + b(hideV1) + " mute=" + b(muteA1) + " solo=" + b(soloA1);
+        g7e = premise;
+        if (premise) {
+            TimelineTrack *v1 = timeline.videoTracks()[0];
+            TimelineTrack *a1 = timeline.audioTracks()[0];
+            struct Leg {
+                const char *name;
+                std::function<void()> act;
+                std::function<bool()> flag;
+            };
+            const QVector<Leg> legs = {
+                {"headerLock", [&] { lockV1->click(); }, [&] { return v1->isLocked(); }},
+                {"headerHide", [&] { hideV1->click(); }, [&] { return v1->isHidden(); }},
+                {"headerMute", [&] { muteA1->click(); }, [&] { return a1->isMuted(); }},
+                {"headerSolo", [&] { soloA1->click(); }, [&] { return a1->isSolo(); }},
+                {"menuMute", [&] { QMetaObject::invokeMethod(&window, "toggleMute"); }, [&] { return a1->isMuted(); }},
+                {"menuSolo", [&] { QMetaObject::invokeMethod(&window, "toggleSolo"); }, [&] { return a1->isSolo(); }},
+                {"mixerMute", [&] { mixerMute->click(); }, [&] { return a1->isMuted(); }},
+                {"mixerSolo", [&] { mixerSolo->click(); }, [&] { return a1->isSolo(); }},
+            };
+            for (const Leg &leg : legs) {
+                window.markProjectClean();
+                const bool before = leg.flag();
+                QSignalSpy spy(&timeline, &Timeline::trackFlagsChanged);
+                leg.act();
+                const bool flipped = leg.flag() != before;
+                const bool dirty = window.isWindowModified();
+                const int emits = spy.count();
+                timeline.saveUndoState(QStringLiteral("x"));
+                timeline.undo();
+                const bool backAtClean = timeline.undoManager()->isClean();
+                const bool stillDirty = window.isWindowModified();
+                window.markProjectClean();
+                const bool cleared = !window.isWindowModified();
+                const bool ok = flipped && dirty && emits == 1 && backAtClean && stillDirty && cleared;
+                g7eDetail += std::string(" | ") + leg.name + " flipped=" + b(flipped) + " dirty=" + b(dirty)
+                    + " emits=" + std::to_string(emits) + " undoClean=" + b(backAtClean)
+                    + " afterUndo=" + b(stillDirty) + " cleared=" + b(cleared);
+                g7e = g7e && ok;
+            }
+        }
+    }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+    MainWindow window;
+    Timeline &timeline = *window.m_timeline;
+    UndoManager *undo = timeline.undoManager();
+    Choice next = Choice::Cancel;
+    const auto count = [&] { return window.unsavedChangesPromptCountForTest(); };
+
+    // ---- G1: the constructed window is clean; an undo-recorded edit is dirty ----
+    {
+        const bool clean0 = undo->isClean();
+        const bool mod0 = window.isWindowModified();
+        window.setUnsavedChangesPromptForTest([&] { return next; });
+        next = Choice::Cancel;
+        const int c0 = count();
+        const bool ask0 = window.maybeSaveChanges();
+        const int c1 = count();
+        timeline.addVideoTrack(true);
+        const bool modAfterAdd = window.isWindowModified();
+        window.markProjectClean();
+        const bool ask1 = window.maybeSaveChanges();
+        const int c2 = count();
+        const bool ok = clean0 && !mod0 && ask0 && c1 == c0 && c0 == 0 && modAfterAdd && ask1 && c2 == 0;
+        tally.gate(1, ok, "isClean=" + b(clean0) + " modified=" + b(mod0) + " ask=" + b(ask0)
+            + " count=" + std::to_string(c1) + " afterAddTrack=" + b(modAfterAdd)
+            + " (b) ask=" + b(ask1) + " count=" + std::to_string(c2));
+    }
+
+    // ---- G2: dirty + Cancel ----
+    {
+        window.markProjectDirty();
+        next = Choice::Cancel;
+        const int clips0 = clipCount(timeline);
+        const int c0 = count();
+        const bool r = window.maybeSaveChanges();
+        const bool ok = !r && count() == c0 + 1 && window.isWindowModified() && clipCount(timeline) == clips0;
+        tally.gate(2, ok, "ret=" + b(r) + " countDelta=" + std::to_string(count() - c0)
+            + " modified=" + b(window.isWindowModified()) + " clips=" + std::to_string(clipCount(timeline))
+            + "/" + std::to_string(clips0));
+    }
+
+    // ---- G3: dirty + Discard ----
+    {
+        next = Choice::Discard;
+        const int c0 = count();
+        const bool r = window.maybeSaveChanges();
+        const bool ok = r && count() == c0 + 1 && window.isWindowModified();
+        tally.gate(3, ok, "ret=" + b(r) + " countDelta=" + std::to_string(count() - c0)
+            + " modified=" + b(window.isWindowModified()));
+    }
+
+    // ---- G4: dirty + Save to the current path ----
+    const QString projectA = tmp("g4.veditor");
+    {
+        window.m_projectFilePath = projectA;
+        next = Choice::Save;
+        const int c0 = count();
+        const bool r = window.maybeSaveChanges();
+        const QFileInfo info(projectA);
+        const bool ok = r && count() == c0 + 1 && info.exists() && info.size() > 0 && !window.isWindowModified();
+        tally.gate(4, ok, "ret=" + b(r) + " exists=" + b(info.exists()) + " size=" + std::to_string(info.size())
+            + " modified=" + b(window.isWindowModified()));
+    }
+
+    // ---- G5: a failed save and save-as ----
+    const QString projectB = tmp("g5c.veditor");
+    {
+        window.setSaveFailureDialogSuppressedForTest(true);
+        window.markProjectDirty();
+        window.m_projectFilePath = QDir(dir.path()).filePath(QStringLiteral("missing-dir/sub/x.veditor"));
+        next = Choice::Save;
+        const int c0 = count();
+        const bool ra = window.maybeSaveChanges();
+        const int countA = count() - c0;
+        const bool okA = !ra && countA == 1 && window.isWindowModified();
+
+        window.m_projectFilePath.clear();
+        int providerCalls = 0;
+        QString provided;
+        window.setSaveAsPathProviderForTest([&] { ++providerCalls; return provided; });
+        const bool rb = window.maybeSaveChanges();
+        const bool okB = !rb && providerCalls == 1 && window.isWindowModified();
+
+        provided = projectB;
+        const bool rc = window.maybeSaveChanges();
+        const bool okC = rc && providerCalls == 2 && QFileInfo::exists(projectB)
+            && window.m_projectFilePath == projectB && !window.isWindowModified();
+        window.setSaveAsPathProviderForTest({});
+        tally.gate(5, okA && okB && okC, "(a) ret=" + b(ra) + " countDelta=" + std::to_string(countA)
+            + " (b) ret=" + b(rb) + " provider=" + std::to_string(providerCalls) + " modified=" + b(okB)
+            + " (c) ret=" + b(rc) + " exists=" + b(QFileInfo::exists(projectB))
+            + " path=" + b(window.m_projectFilePath == projectB));
+    }
+
+    // ---- G6: other paths, autosave restore, relink on load ----
+    {
+        std::string d;
+        const QString mediaPresent = tmp("g6-present.mp4");
+        const QString mediaMissing = tmp("g6-offline.mp4");
+        bool ok = touchFile(mediaPresent);
+        // A state that differs from projectA (which has no clips).
+        timeline.videoTracks()[0]->addClip(makeClip(mediaPresent));
+        timeline.saveUndoState(QStringLiteral("clip"));
+        const int c0 = count();
+        // (a) recent file + Cancel: nothing loaded.
+        next = Choice::Cancel;
+        const QString pathBefore = window.m_projectFilePath;
+        window.openRecentFile(projectA);
+        const bool okA = window.isWindowModified() && count() == c0 + 1 && clipCount(timeline) == 1
+            && window.m_projectFilePath == pathBefore;
+        d += "(a) count=" + std::to_string(count() - c0) + " clips=" + std::to_string(clipCount(timeline));
+        // (b) MCP open: no prompt.
+        QString err;
+        const bool loadedB = window.openProjectFromPath(projectA, &err, false);
+        const bool okB = loadedB && count() == c0 + 1 && clipCount(timeline) == 0
+            && window.m_projectFilePath == projectA && !window.isWindowModified();
+        d += " (b) loaded=" + b(loadedB) + " count=" + std::to_string(count() - c0)
+            + " clips=" + std::to_string(clipCount(timeline)) + " modified=" + b(window.isWindowModified());
+        // (c) recent file + Discard: loaded.
+        timeline.videoTracks()[0]->addClip(makeClip(mediaPresent));
+        timeline.saveUndoState(QStringLiteral("clip"));
+        window.m_projectFilePath = projectB;
+        next = Choice::Discard;
+        window.openRecentFile(projectA);
+        const bool okC = count() == c0 + 2 && clipCount(timeline) == 0 && window.m_projectFilePath == projectA
+            && !window.isWindowModified();
+        d += " (c) count=" + std::to_string(count() - c0) + " clips=" + std::to_string(clipCount(timeline))
+            + " modified=" + b(window.isWindowModified());
+        // (d) autosave restore stays dirty (explicitly, the undo side is clean).
+        window.markProjectClean();
+        QFile fileA(projectA);
+        const QString json = fileA.open(QIODevice::ReadOnly) ? QString::fromUtf8(fileA.readAll()) : QString();
+        fileA.close();
+        const bool restored = window.restoreFromAutosaveJson(json);
+        const bool modD = window.isWindowModified();
+        const bool pathEmpty = window.m_projectFilePath.isEmpty();
+        const bool cleanD = undo->isClean();
+        next = Choice::Cancel;
+        const bool askD = window.maybeSaveChanges();
+        const bool okD = restored && modD && pathEmpty && cleanD && !askD;
+        d += " (d) restored=" + b(restored) + " modified=" + b(modD) + " pathEmpty=" + b(pathEmpty)
+            + " isClean=" + b(cleanD) + " ask=" + b(askD);
+        // (e) unreadable autosave: nothing changes.
+        const bool modE0 = window.isWindowModified();
+        const bool cleanE0 = undo->isClean();
+        const int tracksE0 = timeline.videoTrackCount() + timeline.audioTrackCount();
+        const bool rEmpty = window.restoreFromAutosaveJson(QString());
+        const bool rBrace = window.restoreFromAutosaveJson(QStringLiteral("{"));
+        const bool okE = !rEmpty && !rBrace && window.isWindowModified() == modE0 && undo->isClean() == cleanE0
+            && timeline.videoTrackCount() + timeline.audioTrackCount() == tracksE0;
+        d += " (e) empty=" + b(rEmpty) + " brace=" + b(rBrace) + " unchanged=" + b(okE);
+
+        // (f)-(i) relink on load.
+        const QString relinkProject = tmp("g6-relink.veditor");
+        int missingBefore = -1;
+        {
+            ProjectData data;
+            data.videoTracks = ProjectTrackClips{QVector<ClipInfo>{makeClip(mediaMissing), makeClip(mediaPresent)}};
+            ok = ok && ProjectFile::save(relinkProject, data);
+            ProjectData reread;
+            ok = ok && ProjectFile::load(relinkProject, reread);
+            missingBefore = mediapaths::missingFiles(reread).size();
+        }
+        const auto missingNow = [&] {
+            ProjectData data;
+            window.populateProjectData(data);
+            return int(mediapaths::missingFiles(data).size());
+        };
+        int resolverCalls = 0;
+        // (f) a successful relink stays dirty, even after its undo.
+        window.setMissingMediaResolverForTest([&](const QStringList &missing) {
+            ++resolverCalls;
+            return QHash<QString, QString>{{missing.value(0), mediaPresent}};
+        });
+        int cf = count();
+        const bool loadedF = window.openProjectFromPath(relinkProject, &err, true);
+        const int missingAfter = missingNow();
+        const bool modF = window.isWindowModified();
+        const bool cleanF = undo->isClean();
+        const bool askF = window.maybeSaveChanges();
+        const int countF = count() - cf;
+        timeline.undo();
+        const bool cleanFUndo = undo->isClean();
+        const bool modFUndo = window.isWindowModified();
+        window.markProjectClean();
+        const bool modFCleared = window.isWindowModified();
+        window.setMissingMediaResolverForTest({});
+        const bool okF = missingBefore == 1 && loadedF && resolverCalls == 1 && missingAfter == 0 && modF
+            && !cleanF && !askF && countF == 1 && cleanFUndo && modFUndo && !modFCleared;
+        d += " (f) missingBefore=" + std::to_string(missingBefore) + " loaded=" + b(loadedF)
+            + " resolver=" + std::to_string(resolverCalls) + " missingAfter=" + std::to_string(missingAfter)
+            + " modified=" + b(modF) + " isClean=" + b(cleanF) + " ask=" + b(askF)
+            + " countDelta=" + std::to_string(countF) + " undo:isClean=" + b(cleanFUndo)
+            + " modified=" + b(modFUndo) + " markClean:modified=" + b(modFCleared);
+        // (g) negative control 1: an empty mapping keeps the load clean.
+        resolverCalls = 0;
+        window.setMissingMediaResolverForTest([&](const QStringList &) {
+            ++resolverCalls;
+            return QHash<QString, QString>{};
+        });
+        const bool loadedG = window.openProjectFromPath(relinkProject, &err, true);
+        const bool okG = loadedG && resolverCalls == 1 && !window.isWindowModified() && undo->isClean();
+        d += " (g) loaded=" + b(loadedG) + " resolver=" + std::to_string(resolverCalls)
+            + " modified=" + b(window.isWindowModified()) + " isClean=" + b(undo->isClean());
+        window.setMissingMediaResolverForTest({});
+        // (h) negative control 2: the MCP path never asks the resolver.
+        resolverCalls = 0;
+        window.setMissingMediaResolverForTest([&](const QStringList &missing) {
+            ++resolverCalls;
+            return QHash<QString, QString>{{missing.value(0), mediaPresent}};
+        });
+        window.markProjectDirty();
+        const bool loadedH = window.openProjectFromPath(relinkProject, &err, false);
+        const bool okH = loadedH && resolverCalls == 0 && !window.isWindowModified();
+        d += " (h) loaded=" + b(loadedH) + " resolver=" + std::to_string(resolverCalls)
+            + " modified=" + b(window.isWindowModified());
+        window.setMissingMediaResolverForTest({});
+        // (i) negative control 3: a failed relink keeps the load clean.
+        resolverCalls = 0;
+        const QString nowhere = tmp("g6-nowhere.mp4");
+        window.setMissingMediaResolverForTest([&](const QStringList &missing) {
+            ++resolverCalls;
+            return QHash<QString, QString>{{missing.value(0), nowhere}};
+        });
+        const bool loadedI = window.openProjectFromPath(relinkProject, &err, true);
+        const bool okI = loadedI && resolverCalls == 1 && !window.isWindowModified() && undo->isClean();
+        d += " (i) loaded=" + b(loadedI) + " resolver=" + std::to_string(resolverCalls)
+            + " modified=" + b(window.isWindowModified()) + " isClean=" + b(undo->isClean());
+        window.setMissingMediaResolverForTest({});
+
+        tally.gate(6, ok && okA && okB && okC && okD && okE && okF && okG && okH && okI, d);
+    }
+
+    // ---- G7 (a)-(d), (f): real edits are dirty and an undo back to the save is clean ----
+    {
+        std::string d;
+        next = Choice::Cancel;
+        // (a) structural: the undo restores adjustment layers inside restoreState.
+        window.markProjectClean();
+        timeline.addVideoTrack(true);
+        // The top undo entry was captured from currentState() by saveUndoState.
+        const bool premiseAdj = timeline.currentState().externalTrackState.contains(QStringLiteral("adjustments"));
+        const bool modA = window.isWindowModified();
+        int c0 = count();
+        const bool askA = window.maybeSaveChanges();
+        const int countA = count() - c0;
+        timeline.undo();
+        const bool modAUndo = window.isWindowModified();
+        c0 = count();
+        const bool askAUndo = window.maybeSaveChanges();
+        const int countAUndo = count() - c0;
+        timeline.redo();
+        const bool modARedo = window.isWindowModified();
+        const bool okA = premiseAdj && modA && !askA && countA == 1 && !modAUndo && askAUndo && countAUndo == 0
+            && modARedo;
+        d += "(a) premise adjustments=" + b(premiseAdj) + " add=" + b(modA) + " ask=" + b(askA)
+            + " undo=" + b(modAUndo) + " askAfterUndo=" + b(askAUndo) + " redo=" + b(modARedo);
+        // (a) remap leg: removing V1 remaps the V2 adjustment layer outside undo.
+        window.markProjectClean();
+        if (timeline.videoTrackCount() < 2)
+            timeline.addVideoTrack(true);
+        AdjustmentLayer layer;
+        layer.trackIndex = 1;
+        layer.timelineStartUs = 0;
+        layer.timelineEndUs = 1000000;
+        layer.name = QStringLiteral("adj");
+        timeline.addAdjustmentLayer(layer);
+        window.markProjectClean();
+        const int adjBefore = timeline.adjustmentLayers().size();
+        const bool removed = timeline.removeTrack(false, 0);
+        const bool remapped = timeline.adjustmentLayers().size() == adjBefore && adjBefore > 0
+            && timeline.adjustmentLayers().first().trackIndex == 0;
+        const bool modR = window.isWindowModified();
+        timeline.undo();
+        const bool modRUndo = window.isWindowModified();
+        timeline.redo();
+        const bool modRRedo = window.isWindowModified();
+        const bool okR = removed && remapped && modR && !modRUndo && modRRedo;
+        d += " (a-remap) removed=" + b(removed) + " remapped=" + b(remapped) + " dirty=" + b(modR)
+            + " undo=" + b(modRUndo) + " redo=" + b(modRRedo);
+        // (b) non-structural clip edit.
+        window.markProjectClean();
+        timeline.videoTracks()[0]->addClip(makeClip(tmp("g6-present.mp4")));
+        timeline.saveUndoState(QStringLiteral("clip"));
+        const bool modB = window.isWindowModified();
+        timeline.undo();
+        const bool modBUndo = window.isWindowModified();
+        timeline.redo();
+        const bool modBRedo = window.isWindowModified();
+        const bool okB = modB && !modBUndo && modBRedo;
+        d += " (b) clip=" + b(modB) + " undo=" + b(modBUndo) + " redo=" + b(modBRedo);
+        // (c) marker (no undo entry) stays dirty after an undo back to the save.
+        window.markProjectClean();
+        timeline.addMarker(1000000, QStringLiteral("m"));
+        const bool modC = window.isWindowModified();
+        timeline.saveUndoState(QStringLiteral("x"));
+        timeline.undo();
+        const bool cleanC = undo->isClean();
+        const bool modCUndo = window.isWindowModified();
+        const bool okC = modC && cleanC && modCUndo;
+        d += " (c) marker=" + b(modC) + " undo:isClean=" + b(cleanC) + " modified=" + b(modCUndo);
+        // (d) explicit dirty.
+        window.markProjectClean();
+        window.markProjectDirty();
+        timeline.saveUndoState(QStringLiteral("x"));
+        timeline.undo();
+        const bool cleanD = undo->isClean();
+        const bool modDUndo = window.isWindowModified();
+        const bool okD = cleanD && modDUndo;
+        d += " (d) undo:isClean=" + b(cleanD) + " modified=" + b(modDUndo);
+        // (f) project settings dialog.
+        window.markProjectClean();
+        ProjectConfig fpsOnly = window.m_projectConfig;
+        fpsOnly.fps = fpsOnly.fps == 24 ? 30 : 24;
+        window.applyEditedProjectConfig(fpsOnly);
+        const bool modF1 = window.isWindowModified();
+        const bool cleanF1 = undo->isClean();
+        timeline.saveUndoState(QStringLiteral("x"));
+        timeline.undo();
+        const bool cleanF1Undo = undo->isClean();
+        const bool modF1Undo = window.isWindowModified();
+        window.markProjectClean();
+        const bool modF1Cleared = window.isWindowModified();
+        const bool okF1 = modF1 && cleanF1 && cleanF1Undo && modF1Undo && !modF1Cleared;
+        d += " (f) fps: dirty=" + b(modF1) + " isClean=" + b(cleanF1) + " undo:isClean=" + b(cleanF1Undo)
+            + " modified=" + b(modF1Undo) + " markClean=" + b(modF1Cleared);
+
+        window.markProjectClean();
+        ProjectConfig sizeExplicit = window.m_projectConfig;
+        sizeExplicit.width = sizeExplicit.width == 1280 ? 1920 : 1280;
+        sizeExplicit.height = sizeExplicit.height == 720 ? 1080 : 720;
+        sizeExplicit.explicitOutputResolution = true;
+        window.applyEditedProjectConfig(sizeExplicit);
+        const bool modF2 = window.isWindowModified();
+        const bool cleanF2 = undo->isClean();
+        timeline.undo();
+        const bool modF2Undo = window.isWindowModified();
+        timeline.redo();
+        const bool modF2Redo = window.isWindowModified();
+        const bool okF2 = modF2 && !cleanF2 && !modF2Undo && modF2Redo;
+        d += " size+explicit: dirty=" + b(modF2) + " isClean=" + b(cleanF2) + " undo=" + b(modF2Undo)
+            + " redo=" + b(modF2Redo);
+
+        window.markProjectClean();
+        ProjectConfig sizeImplicit = window.m_projectConfig;
+        sizeImplicit.width = sizeImplicit.width == 1280 ? 1920 : 1280;
+        sizeImplicit.height = sizeImplicit.height == 720 ? 1080 : 720;
+        sizeImplicit.explicitOutputResolution = false;
+        window.applyEditedProjectConfig(sizeImplicit);
+        const bool modF3 = window.isWindowModified();
+        const bool cleanF3 = undo->isClean();
+        timeline.undo();
+        const bool modF3Undo = window.isWindowModified();
+        timeline.redo();
+        const bool modF3Redo = window.isWindowModified();
+        const bool okF3 = modF3 && !cleanF3 && !modF3Undo && modF3Redo;
+        d += " size+implicit: dirty=" + b(modF3) + " isClean=" + b(cleanF3) + " undo=" + b(modF3Undo)
+            + " redo=" + b(modF3Redo);
+
+        // A size change combined with an fps or a name change: the undo puts the size
+        // back but not the fps / name, so the project stays dirty after it.
+        bool okF5 = true;
+        for (int leg = 0; leg < 2; ++leg) {
+            window.markProjectClean();
+            ProjectConfig mixed = window.m_projectConfig;
+            mixed.width = mixed.width == 1280 ? 1920 : 1280;
+            mixed.height = mixed.height == 720 ? 1080 : 720;
+            mixed.explicitOutputResolution = true;
+            if (leg == 0)
+                mixed.fps = mixed.fps == 24 ? 30 : 24;
+            else
+                mixed.name += QStringLiteral("-renamed");
+            window.applyEditedProjectConfig(mixed);
+            const bool modM = window.isWindowModified();
+            timeline.undo();
+            const bool cleanMUndo = undo->isClean();
+            const bool modMUndo = window.isWindowModified();
+            window.markProjectClean();
+            const bool modMCleared = window.isWindowModified();
+            okF5 = okF5 && modM && cleanMUndo && modMUndo && !modMCleared;
+            d += std::string(leg == 0 ? " size+explicit+fps" : " size+explicit+name") + ": dirty=" + b(modM)
+                + " undo:isClean=" + b(cleanMUndo) + " modified=" + b(modMUndo) + " markClean=" + b(modMCleared);
+        }
+
+        // An explicit-output-only change records no undo point: after a save, an edit
+        // and its undo, the restored entry must carry the saved explicit flag, so a
+        // clean window really matches the saved state.
+        window.markProjectClean();
+        ProjectConfig explicitOnly = window.m_projectConfig;
+        explicitOnly.explicitOutputResolution = !explicitOnly.explicitOutputResolution;
+        window.applyEditedProjectConfig(explicitOnly);
+        const bool modF6 = window.isWindowModified();
+        window.markProjectClean();
+        const bool savedF6 = explicitOnly.explicitOutputResolution;
+        const bool cleanF6Saved = undo->isClean() && !window.isWindowModified();
+        timeline.saveUndoState(QStringLiteral("x"));
+        timeline.undo();
+        const bool cleanF6Undo = undo->isClean();
+        const bool explicitF6 = window.m_projectConfig.explicitOutputResolution;
+        const bool modF6Undo = window.isWindowModified();
+        const bool okF6 = modF6 && cleanF6Saved && cleanF6Undo && explicitF6 == savedF6 && !modF6Undo;
+        d += " explicit-only: dirty=" + b(modF6) + " saved=" + b(cleanF6Saved) + " undo:isClean=" + b(cleanF6Undo)
+            + " explicit=" + b(explicitF6) + "/" + b(savedF6) + " modified=" + b(modF6Undo);
+
+        window.markProjectClean();
+        const ProjectConfig same = window.m_projectConfig;
+        window.applyEditedProjectConfig(same);
+        const bool modF4 = window.isWindowModified();
+        c0 = count();
+        const bool askF4 = window.maybeSaveChanges();
+        const bool okF4 = !modF4 && askF4 && count() == c0 && undo->isClean();
+        d += " same: dirty=" + b(modF4) + " ask=" + b(askF4) + " countDelta=" + std::to_string(count() - c0)
+            + " isClean=" + b(undo->isClean());
+
+        d += " (e) " + g7eDetail;
+        tally.gate(7, okA && okR && okB && okC && okD && okF1 && okF2 && okF3 && okF4 && okF5 && okF6 && g7e, d);
+    }
+
+    // ---- G8: New Project resets the timeline, the path and the history ----
+    {
+        timeline.videoTracks()[0]->addClip(makeClip(tmp("g6-present.mp4")));
+        timeline.saveUndoState(QStringLiteral("clip"));
+        window.m_projectFilePath = projectA;
+        timeline.addMarker(2000000, QStringLiteral("g8"));
+        AdjustmentLayer g8Layer;
+        g8Layer.trackIndex = 0;
+        g8Layer.timelineStartUs = 0;
+        g8Layer.timelineEndUs = 1000000;
+        g8Layer.name = QStringLiteral("g8");
+        timeline.addAdjustmentLayer(g8Layer);
+        window.markProjectDirty();
+        const int markersBefore = timeline.markers().size();
+        const int adjBefore = timeline.adjustmentLayers().size();
+        const int clipsBefore = clipCount(timeline);
+        const int vBefore = timeline.videoTrackCount();
+        const int aBefore = timeline.audioTrackCount();
+        ProjectConfig config;
+        config.name = QStringLiteral("g8");
+        config.width = 1280;
+        config.height = 720;
+        config.fps = 24;
+        window.resetProject(config);
+        const bool ok = clipsBefore > 0 && markersBefore > 0 && adjBefore > 0 && clipCount(timeline) == 0
+            && timeline.markers().isEmpty() && timeline.adjustmentLayers().isEmpty() && window.m_projectFilePath.isEmpty()
+            && !window.isWindowModified() && !undo->canUndo() && window.m_projectConfig.width == 1280
+            && window.m_projectConfig.height == 720 && window.m_projectConfig.fps == 24;
+        tally.gate(8, ok, "clips=" + std::to_string(clipsBefore) + "->" + std::to_string(clipCount(timeline))
+            + " pathEmpty=" + b(window.m_projectFilePath.isEmpty()) + " modified=" + b(window.isWindowModified())
+            + " canUndo=" + b(undo->canUndo()) + " config=" + std::to_string(window.m_projectConfig.width) + "x"
+            + std::to_string(window.m_projectConfig.height) + "@" + std::to_string(window.m_projectConfig.fps)
+            + " tracks v " + std::to_string(vBefore) + "->" + std::to_string(timeline.videoTrackCount())
+            + " a " + std::to_string(aBefore) + "->" + std::to_string(timeline.audioTrackCount())
+            + " markers " + std::to_string(markersBefore) + "->" + std::to_string(timeline.markers().size())
+            + " adjustments " + std::to_string(adjBefore) + "->" + std::to_string(timeline.adjustmentLayers().size()));
+    }
+
+    // ---- G9: the clean entry's boundaries ----
+    {
+        std::string d;
+        next = Choice::Cancel;
+        // (i) a full history.
+        window.markProjectClean();
+        for (int i = 0; i < 101; ++i)
+            timeline.saveUndoState(QStringLiteral("fill"));
+        const int indexFull = undo->currentIndex();
+        window.markProjectClean();
+        const bool m1 = window.isWindowModified();
+        timeline.saveUndoState(QStringLiteral("x"));
+        const bool m2 = window.isWindowModified();
+        timeline.undo();
+        const bool m3 = window.isWindowModified();
+        const bool okI = indexFull == UndoManager::MAX_UNDO - 1 && !m1 && m2 && !m3;
+        d += "(i) index=" + std::to_string(indexFull) + " clean=" + b(m1) + " save=" + b(m2) + " undo=" + b(m3);
+        // (ii) a branch after undo.
+        timeline.saveUndoState(QStringLiteral("x"));
+        window.markProjectClean();
+        timeline.undo();
+        const bool b1 = window.isWindowModified();
+        timeline.saveUndoState(QStringLiteral("y"));
+        const bool b2 = window.isWindowModified();
+        timeline.undo();
+        const bool b3 = window.isWindowModified();
+        timeline.redo();
+        const bool b4 = window.isWindowModified();
+        window.markProjectClean();
+        const bool b5 = window.isWindowModified();
+        const bool okII = b1 && b2 && b3 && b4 && !b5;
+        d += " (ii) undo=" + b(b1) + " branch=" + b(b2) + " undo=" + b(b3) + " redo=" + b(b4) + " clean=" + b(b5);
+        // (iii) an absorbed edit makes the clean entry unreachable.
+        timeline.saveUndoState(QStringLiteral("pre"));
+        window.markProjectClean();
+        QHash<QString, TimelineTrackMatteEntry> mattes;
+        mattes.insert(QStringLiteral("0:0"), TimelineTrackMatteEntry{TrackMatteType::AlphaMatte, QStringLiteral("1:0")});
+        timeline.setTrackMatteEntries(mattes);
+        timeline.absorbIntoCurrentUndoPoint();
+        const bool a1 = window.isWindowModified();
+        timeline.undo();
+        const bool a2 = window.isWindowModified();
+        window.markProjectClean();
+        const bool a3 = window.isWindowModified();
+        const bool okIII = a1 && a2 && !a3;
+        d += " (iii) absorb=" + b(a1) + " undo=" + b(a2) + " clean=" + b(a3);
+        // (iv) negative control: an undo back to the clean entry is clean.
+        window.markProjectClean();
+        timeline.saveUndoState(QStringLiteral("x"));
+        timeline.undo();
+        const bool n1 = window.isWindowModified();
+        const bool okIV = !n1 && undo->isClean();
+        d += " (iv) undo=" + b(n1) + " isClean=" + b(undo->isClean());
+        // (v) history jump. Step back first so the three saves below do not hit
+        // MAX_UNDO (a full history keeps the index fixed and jumpTo(c) is a no-op).
+        for (int i = 0; i < 5; ++i)
+            timeline.undo();
+        window.markProjectClean();
+        const int c = undo->currentIndex();
+        for (int i = 0; i < 3; ++i)
+            timeline.saveUndoState(QStringLiteral("j"));
+        undo->jumpTo(c);
+        const bool j1 = window.isWindowModified();
+        const int c0 = count();
+        const bool askJ = window.maybeSaveChanges();
+        const bool countJ = count() == c0;
+        undo->jumpTo(c + 2);
+        const bool j2 = window.isWindowModified();
+        const bool okV = !j1 && askJ && countJ && j2;
+        d += " (v) c=" + std::to_string(c) + " jumpToClean=" + b(j1) + " ask=" + b(askJ) + " jumpAway=" + b(j2);
+        tally.gate(9, okI && okII && okIII && okIV && okV, d);
+    }
+
+    window.setUnsavedChangesPromptForTest({});
+    window.setSaveFailureDialogSuppressedForTest(false);
+    return tally.finish("unsaved-prompt");
+}

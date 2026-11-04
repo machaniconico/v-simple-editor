@@ -272,10 +272,24 @@ class MainWindow : public QMainWindow
     friend int runMainWindowLifecycleSelftest();
     friend int runBrushExportSelftest();
     friend int runKeyframeAnimParitySelftest();
+    friend int runUnsavedPromptSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
+
+    // US-2001: the answer of the unsaved-changes prompt.
+    enum class UnsavedChangesChoice { Save, Discard, Cancel };
+    // Selftest seams (null / false = the HEAD modal or dialog).
+    void setUnsavedChangesPromptForTest(std::function<UnsavedChangesChoice()> prompt);
+    int unsavedChangesPromptCountForTest() const { return m_unsavedChangesPromptCount; }
+    // Replaces QFileDialog::getSaveFileName in saveProjectAs; an empty string cancels.
+    void setSaveAsPathProviderForTest(std::function<QString()> provider);
+    // Suppresses the QMessageBox::critical of saveProject / saveProjectAs.
+    void setSaveFailureDialogSuppressedForTest(bool suppressed);
+    // Replaces MediaRelinkDialog when a load prompts for missing media.
+    void setMissingMediaResolverForTest(
+        std::function<QHash<QString, QString>(const QStringList &)> resolver);
 
     // Apply a file LUT to the selected video clip with one undo step.
     bool applyLutFileToSelectedClip(const QString &path);
@@ -711,6 +725,7 @@ protected:
     void dragEnterEvent(QDragEnterEvent *event) override;
     void dropEvent(QDropEvent *event) override;
     void closeEvent(QCloseEvent *event) override;
+    void changeEvent(QEvent *event) override;
     void showEvent(QShowEvent *event) override;
 
 private:
@@ -807,6 +822,17 @@ private:
     void stopMeshEditTool();
     void stopPuppetPinTool();
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
+    // US-2001: the project's dirty state. Clean = the undo entry that was last
+    // saved is on top and no edit outside undo happened since (m_dirtyOutsideUndo).
+    void markProjectClean();
+    // An edit outside undo; ignored while an undo restores or track indices remap.
+    void markProjectDirty();
+    void syncDirtyFromUndo();
+    // Asks to save / discard / cancel when the project is modified. true = go on.
+    bool maybeSaveChanges();
+    void resetProject(const ProjectConfig &config);
+    bool restoreFromAutosaveJson(const QString &json);
+    void applyEditedProjectConfig(const ProjectConfig &newConfig);
     bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
                           QString *errorOut = nullptr);
     bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
@@ -845,6 +871,14 @@ private:
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;
+    bool m_dirtyOutsideUndo = false;
+    bool m_syncingDirtyFromUndo = false;
+    bool m_remappingTrackIndices = false;
+    std::function<QHash<QString, QString>(const QStringList &)> m_missingMediaResolver;
+    std::function<UnsavedChangesChoice()> m_unsavedChangesPrompt;
+    int m_unsavedChangesPromptCount = 0;
+    std::function<QString()> m_saveAsPathProvider;
+    bool m_saveFailureDialogSuppressed = false;
     static QString brushClipId(int trackIdx, int clipIdx);
     static QString particleClipKey(const ClipInfo &clip);
     bool selectedVideoClipRef(int &trackIdx, int &clipIdx, ClipInfo *clip = nullptr) const;
