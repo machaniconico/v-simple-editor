@@ -80,10 +80,17 @@
 //      (4) = 0, (2) = 100 * 0.5 * (1 - 1/3), (5) clamps to 0; yToGain inverts it for gains
 //      {0, 0.25, 1, 2, 3, 4} and clamps y -10 -> 4, y 200 -> 0, y 50 -> 1. Detects: a linear
 //      0..4 mapping (mutation build: unity at 75 and gain 2 at 50).
+//   G16 (US-2008) the expression binding dialog's sample context adds the clip's
+//      dynamicTimeOffsetSec: setContextHints(4, 30, 1920x1080, 1.5) -> sampleContextForTest(1.0)
+//      has time 2.5 and duration 4; offset 0 keeps time 1.0. The dialog's evaluate of
+//      `time * 0.1` at local 1.0 equals the position.x clipanim::effectiveTransformAt resolves
+//      for a clip with dynamicTimeOffsetSec 1.5 (1e-9), and that value is the 0.25 the offset
+//      implies, not the 0.1 of the un-offset time. Detects: the dialog ignoring the offset (HEAD).
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../AudioKeyframes.h"
 #include "../BrushAnimation.h"
+#include "../ExpressionBindingDialog.h"
 #include "../EnvelopeGeometry.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
@@ -1615,6 +1622,43 @@ int runClipSidecarSelftest()
         check15(QStringLiteral("below"), envgeom::yToGain(200.0, 100), 0.0);
         check15(QStringLiteral("centre"), envgeom::yToGain(50.0, 100), 1.0);
         tally.gate(15, ok15, shown15.join(QLatin1Char(' ')).toStdString());
+    }
+
+    // G16 (US-2008): the expression dialog evaluates at the render's time on a split right half.
+    {
+        bool ok16 = true;
+        QStringList shown16;
+        const auto check16 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok16 = ok16 && passed;
+            shown16 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        ExpressionBindingDialog dialog(nullptr);
+        dialog.setContextHints(4.0, 30.0, QSize(1920, 1080), 1.5);
+        const ExpressionContext shifted = dialog.sampleContextForTest(1.0);
+        check16(QStringLiteral("time"), std::abs(shifted.time - 2.5) <= 1e-9,
+                QString::number(shifted.time, 'g', 9));
+        check16(QStringLiteral("duration"), shifted.duration == 4.0);
+        dialog.setContextHints(4.0, 30.0, QSize(1920, 1080), 0.0);
+        const double plainTime = dialog.sampleContextForTest(1.0).time;
+        check16(QStringLiteral("offset0"), std::abs(plainTime - 1.0) <= 1e-9, QString::number(plainTime, 'g', 9));
+
+        ClipInfo clip{};
+        clip.filePath = QStringLiteral("/selftests/clip-sidecar-g16.mp4");
+        clip.duration = clip.outPoint = 4.0;
+        clip.dynamicTimeOffsetSec = 1.5;
+        clip.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("time * 0.1"));
+        clipanim::EvalEnv env;
+        env.fps = 30.0;
+        env.canvas = QSize(1920, 1080);
+        const double rendered = clipanim::effectiveTransformAt(clip, 1.0, env).videoDx;
+        dialog.setContextHints(clip.effectiveDuration(), 30.0, QSize(1920, 1080), clip.dynamicTimeOffsetSec);
+        const ExpressionResult result = Expression::evaluate(QStringLiteral("time * 0.1"),
+                                                             dialog.sampleContextForTest(1.0));
+        check16(QStringLiteral("parity"), result.success && std::abs(result.value - rendered) <= 1e-9,
+                QStringLiteral("dialog %1 render %2").arg(result.value, 0, 'g', 9).arg(rendered, 0, 'g', 9));
+        check16(QStringLiteral("nonVacuous"), std::abs(rendered - 0.25) <= 1e-9 && std::abs(rendered - 0.1) > 0.1);
+        tally.gate(16, ok16, shown16.join(QLatin1Char(' ')).toStdString());
     }
 
     return tally.finish("clip-sidecar");

@@ -28,7 +28,12 @@ public:
     exprbind::ClipExpressionBindings bindings() const;
 
     // Store context hints used to build sample ExpressionContext for preview.
-    void setContextHints(double durationSeconds, double fps, QSize canvas);
+    // dynamicTimeOffsetSec is added to the sample time, as the render does on a split right half.
+    void setContextHints(double durationSeconds, double fps, QSize canvas,
+                         double dynamicTimeOffsetSec = 0.0);
+
+    // Test seam: the sample context the preview evaluates at local time t.
+    ExpressionContext sampleContextForTest(double t) const { return buildSampleContext(t); }
 
 signals:
     void bindingsChanged();
@@ -71,4 +76,5 @@ private:
     double m_duration     = 0.0;
     double m_fps          = 30.0;
     QSize  m_canvas       = QSize(1920, 1080);
+    double m_dynamicTimeOffsetSec = 0.0;
 };

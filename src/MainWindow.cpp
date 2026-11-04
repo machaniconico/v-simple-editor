@@ -15703,13 +15703,13 @@ void MainWindow::editClipExpressionBindings()
     }
     ExpressionBindingDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("エクスプレッション - %1").arg(clip.displayName));
-    if (!clip.expressions.isEmpty())
-        dialog.setBindings(clip.expressions);
     const double projFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
     const QSize canvas = (m_projectConfig.width > 0 && m_projectConfig.height > 0)
         ? QSize(m_projectConfig.width, m_projectConfig.height)
         : QSize(1920, 1080);
-    dialog.setContextHints(clip.effectiveDuration(), projFps, canvas);
+    dialog.setContextHints(clip.effectiveDuration(), projFps, canvas, clip.dynamicTimeOffsetSec);
+    if (!clip.expressions.isEmpty())
+        dialog.setBindings(clip.expressions);
     if (dialog.exec() != QDialog::Accepted)
         return;
 

@@ -180,11 +180,13 @@ exprbind::ClipExpressionBindings ExpressionBindingDialog::bindings() const
     return m_bindings;
 }
 
-void ExpressionBindingDialog::setContextHints(double durationSeconds, double fps, QSize canvas)
+void ExpressionBindingDialog::setContextHints(double durationSeconds, double fps, QSize canvas,
+                                              double dynamicTimeOffsetSec)
 {
     m_duration = durationSeconds;
     m_fps      = fps;
     m_canvas   = canvas;
+    m_dynamicTimeOffsetSec = dynamicTimeOffsetSec;
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +333,7 @@ void ExpressionBindingDialog::onExpressionTextChanged()
 ExpressionContext ExpressionBindingDialog::buildSampleContext(double t) const
 {
     ExpressionContext ctx;
-    ctx.time         = t;
+    ctx.time         = t + m_dynamicTimeOffsetSec;
     ctx.fps          = m_fps > 0.0 ? m_fps : 30.0;
     ctx.duration     = m_duration;
     ctx.canvasWidth  = m_canvas.width()  > 0 ? m_canvas.width()  : 1920;
