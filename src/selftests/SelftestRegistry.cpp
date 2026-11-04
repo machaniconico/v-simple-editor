@@ -115,6 +115,7 @@ int runE2eSelftest();
 int runEasingPresetsSelftest();
 int runEasingSelftest();
 int runEdlExportSelftest();
+int runOtioExportSelftest();
 int runEdlImportSelftest();
 int runEffectKeyframeParitySelftest();
 int runEffectLibrarySelftest();
@@ -855,6 +856,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CMX3600 import, dissolve, offline media and sequence undo (13 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
+    { "otio-export",       "VEDITOR_OTIO_EXPORT_SELFTEST",        runOtioExportSelftest,         true,
+      "OtioExport: Timeline.1 / Clip.1 / Gap.1 / LinearTimeWarp.1 / Marker.2 schema and values (8 gates)" },
     { "tcburn",            "VEDITOR_TCBURN_SELFTEST",             runTcburnSelftest,             true,
       "Timecode burn-in: disabled no-op, six positions, drop-frame, JSON and HH:MM:SS (9 gates)" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,

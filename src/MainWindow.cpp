@@ -173,6 +173,7 @@ double exporter_loudnessGainDb();
 // ED-3: EdlExport は ED-1 で追加された純粋エンジン (QApplication 不要) なので
 // 常時ビルドに含まれる。HAVE_* ガードは不要で直接 include する。
 #include "EdlExport.h"
+#include "OtioExport.h"
 #include "EdlImport.h"
 #include "FcpxmlImport.h"
 #if __has_include("SmartEditDialog.h")
@@ -6099,6 +6100,38 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::exportEdl);
     m_menuHelpEntries.append({edlExportAction,
         QStringLiteral("Avid / DaVinci / 放送ワークフロー互換の CMX3600 EDL を書き出します。")});
+
+    auto *otioExportAction = toolsMenu->addAction(
+        QStringLiteral("OTIO 書き出し…"));
+    otioExportAction->setObjectName("action_otio_export");
+    connect(otioExportAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("OTIO 書き出し"),
+                QStringLiteral("タイムラインが初期化されていません。"));
+            return;
+        }
+        const QString projectName = m_projectConfig.name.isEmpty()
+            ? QStringLiteral("Untitled") : m_projectConfig.name;
+        const QString outPath = QFileDialog::getSaveFileName(
+            this, QStringLiteral("OTIO 書き出し"),
+            QDir::homePath() + QDir::separator() + projectName + QStringLiteral(".otio"),
+            QStringLiteral("OpenTimelineIO (*.otio);;All Files (*)"));
+        if (outPath.isEmpty())
+            return;
+        QString err;
+        const double fps = m_projectConfig.fps > 0
+            ? static_cast<double>(m_projectConfig.fps) : 30.0;
+        if (!otio::writeOtio(m_timeline, fps, projectName, outPath, &err)) {
+            QMessageBox::warning(this, QStringLiteral("OTIO 書き出し"),
+                QStringLiteral("書き出しに失敗しました: %1").arg(err));
+            return;
+        }
+        if (statusBar())
+            statusBar()->showMessage(
+                QStringLiteral("OTIO を書き出しました: %1").arg(outPath), 5000);
+    });
+    m_menuHelpEntries.append({otioExportAction,
+        QStringLiteral("アクティブなシーケンスを OpenTimelineIO (.otio) として書き出します。")});
 
     // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
     auto *pptxExportAction = toolsMenu->addAction(
