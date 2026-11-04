@@ -2028,6 +2028,20 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["timeRemapCurve"] = clip.timeRemapCurve.toJson();
     if (!clip.brushData.isEmpty())
         obj["brush"] = clip.brushData;
+    // US-2009: stabilizer keyframes (source-time PTS) ride on the clip; omitted when empty.
+    if (!clip.stabilizerKeyframes.isEmpty()) {
+        QJsonArray stabilizer;
+        for (const StabilizerKeyframe &kf : clip.stabilizerKeyframes) {
+            QJsonObject k;
+            k["timeUs"] = static_cast<qint64>(kf.timeUs);
+            k["dx"] = kf.dx;
+            k["dy"] = kf.dy;
+            k["theta"] = kf.theta;
+            k["scale"] = kf.scale;
+            stabilizer.append(k);
+        }
+        obj["stabilizerKeyframes"] = stabilizer;
+    }
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -2173,6 +2187,16 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     if (obj.contains("timeRemapCurve"))
         clip.timeRemapCurve = timeremap::TimeRemapCurve::fromJson(obj["timeRemapCurve"].toObject());
     clip.brushData = obj["brush"].toObject();
+    for (const QJsonValue &v : obj["stabilizerKeyframes"].toArray()) {
+        const QJsonObject k = v.toObject();
+        StabilizerKeyframe kf;
+        kf.timeUs = k["timeUs"].toInteger(0);
+        kf.dx = k["dx"].toDouble(0.0);
+        kf.dy = k["dy"].toDouble(0.0);
+        kf.theta = k["theta"].toDouble(0.0);
+        kf.scale = k["scale"].toDouble(1.0);
+        clip.stabilizerKeyframes.append(kf);
+    }
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();

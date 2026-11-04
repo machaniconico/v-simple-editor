@@ -95,6 +95,15 @@
 //      a clip key + root entry project writes both; the HEAD form (clip key removed, root entry
 //      "0:0" only) loads onto V1 clip 0 through applyTimeRemapEntries (HEAD PASS pin); clip key
 //      and an equal root entry give the same curve; a differing root entry wins over the clip key.
+//   G19 (US-2009) a V1 clip with 3 stabilizer keyframes (timeUs 5e5 / 1.5e6 / 2.5e6, non-zero
+//      dx / dy / theta and a non-1 scale) round-trips through toJsonString -> fromJsonString with
+//      every field equal (doubles to 1e-9, timeUs ==), also inside renderInPlaceOriginal; a clip
+//      without keyframes has no "stabilizerKeyframes" key. Detects: clipToJson not writing the
+//      key (HEAD; mutation build).
+//   G20 (US-2009) a split keeps the source-time keyframes on both halves: clipIn 0 and 4 s
+//      clips split at 2.0 s have the same 3 keyframes on both pieces, the right piece's clipIn is
+//      2.0, and the right half's computePlaybackSequence entry carries the same 3 points at
+//      clipIn 2.0 (the VideoPlayer source-time pull sees the same keys). HEAD PASS pin.
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../AudioKeyframes.h"
@@ -1858,6 +1867,109 @@ int runClipSidecarSelftest()
         check18(QStringLiteral("rootWins"), clipKeyRead && sameCurve(liveClip(rootWinsTl, 0).timeRemapCurve, other),
                 QStringLiteral("clipKey %1 %2").arg(int(clipKeyRead)).arg(describe(liveClip(rootWinsTl, 0).timeRemapCurve)));
         tally.gate(18, ok18, shown18.join(QLatin1Char(' ')).toStdString());
+    }
+
+    // G19 / G20 (US-2009): the clip's stabilizer keyframes ride on the clip JSON and survive a split.
+    {
+        const auto sameKfs = [](const QVector<StabilizerKeyframe> &a, const QVector<StabilizerKeyframe> &b) {
+            if (a.size() != b.size())
+                return false;
+            for (int i = 0; i < a.size(); ++i) {
+                if (a[i].timeUs != b[i].timeUs || std::abs(a[i].dx - b[i].dx) > 1e-9
+                    || std::abs(a[i].dy - b[i].dy) > 1e-9 || std::abs(a[i].theta - b[i].theta) > 1e-9
+                    || std::abs(a[i].scale - b[i].scale) > 1e-9)
+                    return false;
+            }
+            return true;
+        };
+        const auto describeKfs = [](const QVector<StabilizerKeyframe> &kfs) {
+            QStringList parts;
+            for (const StabilizerKeyframe &k : kfs)
+                parts << QStringLiteral("%1:%2,%3,%4,%5").arg(k.timeUs).arg(k.dx).arg(k.dy).arg(k.theta).arg(k.scale);
+            return QStringLiteral("n%1[%2]").arg(kfs.size()).arg(parts.join(QLatin1Char(';')));
+        };
+        QVector<StabilizerKeyframe> kfs;
+        kfs.append(StabilizerKeyframe{500000, 3.25, -1.5, 0.0125, 1.05});
+        kfs.append(StabilizerKeyframe{1500000, -2.75, 4.5, -0.02, 0.97});
+        kfs.append(StabilizerKeyframe{2500000, 1.125, 0.625, 0.03, 1.1});
+
+        // G19
+        bool ok19 = true;
+        QStringList shown19;
+        const auto check19 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok19 = ok19 && passed;
+            shown19 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        ProjectData data;
+        data.config.width = 640;
+        data.config.height = 360;
+        data.config.fps = 30;
+        ClipInfo stab = sidecarClip(QStringLiteral("stab"), 4.0);
+        stab.stabilizerKeyframes = kfs;
+        ClipInfo bare = sidecarClip(QStringLiteral("bare"), 2.0);
+        ClipInfo rip = sidecarClip(QStringLiteral("rip"), 3.0);
+        ClipInfo ripOriginal = sidecarClip(QStringLiteral("rip-original"), 3.0);
+        ripOriginal.stabilizerKeyframes = kfs;
+        rip.renderInPlaceOriginal = std::make_shared<ClipInfo>(ripOriginal);
+        data.videoTracks = {{stab, bare, rip}};
+        data.audioTracks = {{}};
+        const QString json = ProjectFile::toJsonString(data);
+        const QJsonObject root = rootOf(json);
+        ProjectData loaded;
+        const bool parsed = ProjectFile::fromJsonString(json, loaded);
+        const QVector<StabilizerKeyframe> got = loaded.videoTracks.value(0).value(0).stabilizerKeyframes;
+        check19(QStringLiteral("parsed"), parsed);
+        check19(QStringLiteral("keysWritten"), firstClipJson(root, 0).contains(QStringLiteral("stabilizerKeyframes"))
+                    && firstClipJson(root, 0).value(QStringLiteral("stabilizerKeyframes")).toArray().size() == 3);
+        check19(QStringLiteral("roundTrip"), kfs.size() == 3 && sameKfs(got, kfs), describeKfs(got));
+        check19(QStringLiteral("timeUsExact"), got.size() == 3 && got[0].timeUs == 500000
+                    && got[1].timeUs == 1500000 && got[2].timeUs == 2500000);
+        check19(QStringLiteral("noKeyWithout"), !firstClipJson(root, 1).isEmpty()
+                    && !firstClipJson(root, 1).contains(QStringLiteral("stabilizerKeyframes")));
+        check19(QStringLiteral("withoutEmpty"), parsed && loaded.videoTracks.value(0).value(1).stabilizerKeyframes.isEmpty());
+        const std::shared_ptr<ClipInfo> ripLoaded = loaded.videoTracks.value(0).value(2).renderInPlaceOriginal;
+        check19(QStringLiteral("nested"), ripLoaded && sameKfs(ripLoaded->stabilizerKeyframes, kfs),
+                ripLoaded ? describeKfs(ripLoaded->stabilizerKeyframes) : QStringLiteral("no original"));
+        tally.gate(19, ok19, shown19.join(QLatin1Char(' ')).toStdString());
+
+        // G20
+        bool ok20 = true;
+        QStringList shown20;
+        const auto check20 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok20 = ok20 && passed;
+            shown20 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        for (const double clipIn : {0.0, 4.0}) {
+            const QString tag = QStringLiteral("in%1").arg(clipIn);
+            ClipInfo clip = sidecarClip(QStringLiteral("split"), 8.0);
+            clip.inPoint = clipIn;
+            clip.outPoint = clipIn + 4.0;
+            clip.stabilizerKeyframes = kfs;
+            Timeline tl;
+            loadTimeline(tl, {{clip}});
+            QString err;
+            const bool split = tl.splitClipByIndex(false, 0, 0, 2.0, &err);
+            const QVector<ClipInfo> halves = tl.trackAt(false, 0)->clips();
+            check20(tag + QStringLiteral("Split"), split && halves.size() == 2, err);
+            if (halves.size() != 2)
+                continue;
+            check20(tag + QStringLiteral("Left"), sameKfs(halves[0].stabilizerKeyframes, kfs));
+            check20(tag + QStringLiteral("Right"), sameKfs(halves[1].stabilizerKeyframes, kfs));
+            check20(tag + QStringLiteral("RightIn"), halves[1].inPoint == clipIn + 2.0,
+                    QStringLiteral("inPoint %1").arg(halves[1].inPoint));
+            bool entryOk = false;
+            QString entryShown = QStringLiteral("no entry");
+            for (const PlaybackEntry &e : tl.computePlaybackSequence()) {
+                if (e.sourceTrack != 0 || std::abs(e.timelineStart - 2.0) > 1e-9)
+                    continue;
+                entryOk = std::abs(e.clipIn - (clipIn + 2.0)) < 1e-9 && sameKfs(e.stabilizerKeyframes, kfs);
+                entryShown = QStringLiteral("clipIn %1 %2").arg(e.clipIn).arg(describeKfs(e.stabilizerKeyframes));
+            }
+            check20(tag + QStringLiteral("Entry"), entryOk, entryShown);
+        }
+        tally.gate(20, ok20, shown20.join(QLatin1Char(' ')).toStdString());
     }
 
     return tally.finish("clip-sidecar");
