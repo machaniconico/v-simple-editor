@@ -5,12 +5,14 @@
 #include <QJsonArray>
 #include <QImage>
 #include <QMap>
+#include "AdjustmentLayer.h"
 #include "AudioTrackFx.h"
 #include "ProjectSettings.h"
 #include "Timeline.h"
 #include "VideoEffect.h"
 #include "Keyframe.h"
 #include "Overlay.h"
+#include "MarkerData.h"
 #include "MaskSystem.h"
 #include "PlanarTracker.h"
 #include "ParticleSystem.h"
@@ -252,6 +254,11 @@ struct ProjectData {
 
     // US-FEAT-A: overlay persistence
     QList<OverlayItem> overlays;
+
+    // US-2000: project-wide timeline markers and adjustment layers ("markers" /
+    // "adjustmentLayers"; a missing key reads as empty).
+    QVector<Marker> markers;
+    QVector<AdjustmentLayer> adjustmentLayers;
 
     // US-MOCHA-2: planar track persistence
     QVector<planartrack::PlanarTrack> planarTracks;

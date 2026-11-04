@@ -273,6 +273,7 @@ class MainWindow : public QMainWindow
     friend int runBrushExportSelftest();
     friend int runKeyframeAnimParitySelftest();
     friend int runUnsavedPromptSelftest();
+    friend int runProjectPersistSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);

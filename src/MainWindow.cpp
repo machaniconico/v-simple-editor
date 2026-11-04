@@ -9106,6 +9106,8 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
     data.storylineMode = m_timeline->storylineMode();
+    data.markers = m_timeline->markers();
+    data.adjustmentLayers = m_timeline->adjustmentLayers();
     data.rotoClipEntries.clear();
     const auto rotoEntries = m_timeline->rotoEntries();
     for (auto it = rotoEntries.cbegin(); it != rotoEntries.cend(); ++it)
@@ -9421,6 +9423,10 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         // US-1203: the toggle drives Timeline::setStorylineMode.
         if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
         ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        // US-2000: always replace (an empty list clears the previous project's), after the
+        // tracks exist (trackIndex clamp) and before the undo baseline below takes them.
+        m_timeline->setAdjustmentLayers(data.adjustmentLayers);
+        m_timeline->setMarkers(data.markers);
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
     // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).

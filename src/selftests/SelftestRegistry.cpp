@@ -232,6 +232,7 @@ int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
 int runProjectDiffSelftest();
+int runProjectPersistSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runPsdImportSelftest();
@@ -1100,6 +1101,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
       "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (9 gates)" },
+    { "project-persist", nullptr, runProjectPersistSelftest, true,
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (7 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

@@ -229,14 +229,10 @@ QImage decodeGrayscalePngFallback(const QByteArray &png)
 } // namespace
 
 // --- Timeline marker serialization (Premiere/Resolve parity) ---
-// Free, externally-linked helpers so a follow-up story can wire MainWindow
-// to round-trip markers through .veditor save/load without expanding the
-// scope of *this* story (ProjectFile.h is locked, ProjectData currently has
-// no markers field). Each Marker is serialized as
-//   { id, timeUs, label, color: "#RRGGBB", note }
-// per spec acceptance #5. Schema mirrors MarkerData.h's markerToJsonObject /
-// markerFromJsonObject so a future story can swap to those directly with no
-// JSON-format churn.
+// ProjectData::markers round-trips through these helpers in save / load and
+// toJsonString / fromJsonString (US-2000). Each Marker is serialized as
+//   { id, timeUs, label, color: "#RRGGBB", note, durationUs }
+// by MarkerData.h's markerToJsonObject / markerFromJsonObject.
 QJsonArray projectFileMarkersToJson(const QVector<Marker> &markers)
 {
     return markersToJsonArray(markers);
@@ -248,11 +244,8 @@ QVector<Marker> projectFileMarkersFromJson(const QJsonArray &arr)
 }
 
 // --- Adjustment layer serialization (Premiere/Photoshop parity) ---
-// Same rationale as the marker helpers above: ProjectFile.h is locked for
-// this story so ProjectData has no `adjustmentLayers` field yet. The schema
-// key is still reserved in save/toJsonString below so loaders never trip
-// the "missing version" branch on a project that grew the field later.
-// A follow-up MainWindow story will wire the helpers into the round-trip.
+// ProjectData::adjustmentLayers round-trips through these helpers like the
+// markers above (US-2000).
 QJsonArray projectFileAdjustmentLayersToJson(const QVector<AdjustmentLayer> &layers)
 {
     return adjustmentLayersToJsonArray(layers);
@@ -784,19 +777,10 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         root["overlays"] = ovArr;
     }
 
-    // Timeline markers — schema reserved here so loaders never see a
-    // missing key and trip the "unknown project version" branch. ProjectData
-    // does not yet carry a markers field (out of this story's scope), so the
-    // array stays empty until a follow-up wires MainWindow through the
-    // projectFileMarkersToJson helper. Round-trip is verified via the
-    // helper's own tests; reading is tolerant on the load side.
-    root["markers"] = QJsonArray{};
-
-    // Adjustment layers — schema reserved with the same rationale as
-    // markers. ProjectData has no `adjustmentLayers` field yet (ProjectFile.h
-    // is locked for this story); a follow-up will wire MainWindow through
-    // projectFileAdjustmentLayersToJson() once the UI lands.
-    root["adjustmentLayers"] = QJsonArray{};
+    // US-2000: timeline markers and adjustment layers (always written; an
+    // empty project writes empty arrays as before).
+    root["markers"] = projectFileMarkersToJson(data.markers);
+    root["adjustmentLayers"] = projectFileAdjustmentLayersToJson(data.adjustmentLayers);
 
     // US-MOCHA-2: planar tracks — skip empty / all-identity tracks on save
     // to keep project files compact (forward-compat guard).
@@ -1137,6 +1121,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.overlays.append(overlayFromJson(v.toObject()));
     }
 
+    // US-2000: timeline markers and adjustment layers — missing key = empty
+    data.markers = projectFileMarkersFromJson(root.value("markers").toArray());
+    data.adjustmentLayers = projectFileAdjustmentLayersFromJson(root.value("adjustmentLayers").toArray());
+
     // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
     data.planarTracks.clear();
     if (root.contains("planarTracks")) {
@@ -1419,11 +1407,9 @@ QString ProjectFile::toJsonString(const ProjectData &data)
         root["overlays"] = ovArr;
     }
 
-    // Timeline markers — see save() above for rationale (schema reserved).
-    root["markers"] = QJsonArray{};
-
-    // Adjustment layers — see save() above for rationale (schema reserved).
-    root["adjustmentLayers"] = QJsonArray{};
+    // US-2000: timeline markers and adjustment layers — see save() above.
+    root["markers"] = projectFileMarkersToJson(data.markers);
+    root["adjustmentLayers"] = projectFileAdjustmentLayersToJson(data.adjustmentLayers);
 
     // US-MOCHA-2: planar tracks — skip empty / all-identity tracks on save
     {
@@ -1703,6 +1689,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
         for (const auto &v : root["overlays"].toArray())
             data.overlays.append(overlayFromJson(v.toObject()));
     }
+
+    // US-2000: timeline markers and adjustment layers — missing key = empty
+    data.markers = projectFileMarkersFromJson(root.value("markers").toArray());
+    data.adjustmentLayers = projectFileAdjustmentLayersFromJson(root.value("adjustmentLayers").toArray());
 
     // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
     data.planarTracks.clear();

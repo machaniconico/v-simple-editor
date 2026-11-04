@@ -670,6 +670,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/transcript_highlighter_offline_selftest.cpp
     src/selftests/media_relink_selftest.cpp
     src/selftests/unsaved_prompt_selftest.cpp
+    src/selftests/project_persist_selftest.cpp
     src/selftests/reduce_project_selftest.cpp
     src/selftests/mcp_selftest.cpp
     src/MotionTracker.cpp
