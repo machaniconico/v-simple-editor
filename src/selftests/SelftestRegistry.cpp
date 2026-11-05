@@ -115,6 +115,7 @@ int runE2eSelftest();
 int runEasingPresetsSelftest();
 int runEasingSelftest();
 int runEdlExportSelftest();
+int runOtioExportSelftest();
 int runEdlImportSelftest();
 int runEffectKeyframeParitySelftest();
 int runEffectLibrarySelftest();
@@ -182,6 +183,7 @@ int runLight3DSelftest();
 int runLinkedTrimSelftest();
 int runLiveMatteResolveSelftest();
 int runLogToRec709Selftest();
+int runLutImportSelftest();
 int runLoudnessAutoSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
@@ -232,8 +234,10 @@ int runProExtSelftest();
 int runProSelftest();
 int runProjTmplSelftest();
 int runProjectDiffSelftest();
+int runProjectPersistSelftest();
 int runProjectPresetSelftest();
 int runProxySelftestV2();
+int runPsdImportSelftest();
 int runPuppetPinSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
@@ -275,6 +279,7 @@ int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTcburnSelftest();
 int runText3dExportSelftest();
+int runExtrudeMeshSelftest();
 int runBrushExportSelftest();
 int runText3dPreviewSelftest();
 int runTextBasedEditSelftest();
@@ -297,6 +302,7 @@ int runTransitionExportSelftest();
 int runTransitionParamsSelftest();
 int runTrimOpsSelftest();
 int runTwitchSelftest();
+int runUnsavedPromptSelftest();
 int runVersionedSaveSelftest();
 int runVfxFootageSelftest();
 int runVfxGeneratorsSelftest();
@@ -763,7 +769,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (18 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (20 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
@@ -784,6 +790,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation (6 gates)" },
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (12 gates)" },
+    { "psd-import", "VEDITOR_PSD_IMPORT_SELFTEST", runPsdImportSelftest, false,
+      "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G6) (6 gates)" },
+    { "lut-import", "VEDITOR_LUT_IMPORT_SELFTEST", runLutImportSelftest, false,
+      ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (7 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7, G3b) (8 gates)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,
@@ -850,6 +860,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "CMX3600 import, dissolve, offline media and sequence undo (13 gates)" },
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
+    { "otio-export",       "VEDITOR_OTIO_EXPORT_SELFTEST",        runOtioExportSelftest,         true,
+      "OtioExport: Timeline.1 / Clip.1 / Gap.1 / LinearTimeWarp.1 / Marker.2 schema and values (9 gates)" },
     { "tcburn",            "VEDITOR_TCBURN_SELFTEST",             runTcburnSelftest,             true,
       "Timecode burn-in: disabled no-op, six positions, drop-frame, JSON and HH:MM:SS (9 gates)" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,
@@ -858,6 +870,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "TextBasedEdit: transcript search + deletion range merge + kept complement" },
     { "text3d-export", "VEDITOR_TEXT3D_EXPORT_SELFTEST", runText3dExportSelftest, true,
       "3D text export: drawn on the clip layer source after the mask and before placement, empty configs unchanged, z order, transform, time, worker thread, production path, transition neighbour (10 gates)" },
+    { "extrude-mesh", "VEDITOR_EXTRUDE_MESH_SELFTEST", runExtrudeMeshSelftest, true,
+      "Extruded mesh guard: parameters sanitised in the builder, step limit and vertex budget fall back to no bevel, shared cache key and MCP limits (G1-G7) (7 gates)" },
     { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
       "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (17 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
@@ -885,11 +899,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-sidecar", "VEDITOR_CLIP_SIDECAR_SELFTEST", runClipSidecarSelftest, true,
-      "Clip sidecars: the 3D text / brush on ClipInfo, JSON round-trip, legacy root sections migrated on load and never written, track-ops, split right half, empty keys, setter undo, render in place, duplicate / paste (14 gates)" },
+      "Clip sidecars: the 3D text / brush on ClipInfo, JSON round-trip, legacy root sections migrated on load and never written, track-ops, split right half, empty keys, setter undo, render in place, duplicate / paste (20 gates)" },
     { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
       "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (6 gates)" },
     { "connected-clip", "VEDITOR_CONNECTED_CLIP_SELFTEST", runConnectedClipSelftest, true,
-      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (38 gates)" },
+      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (41 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
@@ -1094,6 +1108,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Transcript highlighter scaffold smoke" },
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
+    { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (9 gates)" },
+    { "project-persist", nullptr, runProjectPersistSelftest, true,
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (7 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

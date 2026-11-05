@@ -261,6 +261,7 @@ private:
     // heap Timeline the caller must delete (only when loaded from file);
     // null when job.timeline was used.
     static Timeline *resolveTimeline(const RenderJob &job, Timeline **ownedOut);
+    friend int runProjectPersistSelftest();
 
     QVector<RenderJob> m_jobs;
     int m_nextId = 1;

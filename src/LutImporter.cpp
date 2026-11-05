@@ -55,12 +55,22 @@ LutData LutImporter::loadCubeFile(const QString &filePath)
             lut.size = line.mid(11).trimmed().toInt();
             lut.type = LutType::Cube3D;
             is1D = false;
+            if (lut.size < 2 || lut.size > 256) {
+                lut.size = 0;
+                lut.table.clear();
+                return lut;
+            }
             continue;
         }
         if (line.startsWith("LUT_1D_SIZE")) {
             lut.size = line.mid(11).trimmed().toInt();
             lut.type = LutType::Cube1D;
             is1D = true;
+            if (lut.size < 2 || lut.size > 65536) {
+                lut.size = 0;
+                lut.table.clear();
+                return lut;
+            }
             continue;
         }
 
@@ -84,7 +94,7 @@ LutData LutImporter::loadCubeFile(const QString &filePath)
 
     // Validate table size
     if (lut.type == LutType::Cube3D) {
-        int expected = lut.size * lut.size * lut.size;
+        qint64 expected = qint64(lut.size) * lut.size * lut.size;
         if (lut.table.size() != expected) {
             lut.size = 0;
             lut.table.clear();

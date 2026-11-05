@@ -1031,6 +1031,8 @@ public:
     void redo();
     bool canUndo() const;
     bool canRedo() const;
+    // True while restoreState (undo / redo / history jump) is running.
+    bool isRestoringState() const { return m_restoringState; }
     // External index owners participate in the same undo transaction.
     void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
                                     std::function<void(const QJsonObject&)> apply);
@@ -1180,6 +1182,16 @@ public:
                       const QString &activeSequenceId = QString());
     bool addSequence(const TimelineSequence &sequence);
     bool setActiveSequence(const QString &sequenceId);
+    // US-2005: the roto / matte / parent sidecars of the sequences that are not
+    // active, parked by setActiveSequence and restoreState (never in the store).
+    struct SequenceSidecars {
+        QHash<QString, RotoClipEntry> roto;
+        QHash<QString, TimelineTrackMatteEntry> matte;
+        QHash<QString, QString> parent;
+    };
+    QHash<QString, SequenceSidecars> parkedSidecarsBySequence() const { return m_parkedSidecarsBySequence; }
+    // Replaces the table (project load); the active sequence's entry is dropped.
+    void setParkedSidecarsBySequence(QHash<QString, SequenceSidecars> parked);
     ClipInfo makeSequenceClip(const QString &sequenceId,
                               const QString &displayName = QString()) const;
     bool addSequenceClip(const QString &sequenceId, int videoTrackIndex = 0);
@@ -1637,6 +1649,9 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void sequencesChanged();
+    // US-2005: once per switch of the active sequence (setActiveSequence outside a
+    // restore, or the end of a restoreState that lands in another sequence).
+    void activeSequenceChanged(const QString &oldId, const QString &newId);
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
     // restoreState が、プロジェクト出力ジオメトリを持つ undo/redo スナップショットを
     // 復元したときに発火。MainWindow が canvas + 出力サイズを再適用し、SNS プリセット
@@ -1646,6 +1661,12 @@ signals:
     // PlaybackEntry struct. AudioMixer applies them via setTrackSolo on
     // receipt; mute and per-clip volume already ride on PlaybackEntry.
     void trackSoloChanged(int trackIdx, bool solo);
+    // A user track mute / solo / lock / hide toggle (header buttons,
+    // toggleMuteTrack, toggleSoloTrack). Once per toggle. These flags are not
+    // undo state, so MainWindow marks the project dirty from this signal.
+    void trackFlagsChanged();
+    // Last statement of restoreState, still inside the restoring scope.
+    void restoreStateFinished();
     // Fired when the user drags a text overlay's edge handle on the
     // timeline text strip so MainWindow can resync the right-panel
     // 開始時間 / 表示時間 spinboxes and re-push the preview overlays.
@@ -1723,6 +1744,7 @@ private:
     std::function<void()> m_exprAudioEnvRebuildHook;
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
+    bool m_restoringState = false;
     void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);
@@ -1802,6 +1824,7 @@ private:
     // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
+    QHash<QString, SequenceSidecars> m_parkedSidecarsBySequence;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;

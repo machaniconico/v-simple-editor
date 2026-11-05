@@ -1,5 +1,6 @@
 #include "ExtrudedMesh.h"
 
+#include <QDebug>
 #include <QPainterPath>
 #include <QtMath>
 #include <algorithm>
@@ -122,14 +123,60 @@ QVector<quint32> triangulateRing(const QPolygonF &ring)
 }
 
 // ---------------------------------------------------------------------------
+// Extrusion limits
+// ---------------------------------------------------------------------------
+
+double extrudeMidSteps(const ExtrudeParams &params)
+{
+    const double span = 2.0 * params.bevelDepth - params.depth;
+    if (!(params.bevelSegments > 0 && params.bevelDepth > 0.0 && span > 1e-6))
+        return 0.0;
+    return params.depth > 0.0 ? span * (2.0 * params.bevelSegments + 1.0) / params.depth
+                              : std::numeric_limits<double>::infinity();
+}
+
+ExtrudeParams sanitizeExtrudeParams(const ExtrudeParams &params, bool *changed)
+{
+    const auto finiteOrZero = [](double v) { return std::isfinite(v) ? v : 0.0; };
+    ExtrudeParams p = params;
+    p.depth = qBound(0.0, finiteOrZero(params.depth), kMaxExtrudeDepth);
+    p.bevelDepth = qBound(0.0, finiteOrZero(params.bevelDepth), kMaxBevelSize);
+    p.bevelWidth = qBound(0.0, finiteOrZero(params.bevelWidth), kMaxBevelSize);
+    p.bevelSegments = qBound(0, params.bevelSegments, kMaxBevelSegments);
+    if (extrudeMidSteps(p) > kMaxExtrudeMidSteps)
+        p.bevelSegments = 0;
+    if (changed) {
+        *changed = !(p.depth == params.depth && p.bevelDepth == params.bevelDepth
+                     && p.bevelWidth == params.bevelWidth && p.bevelSegments == params.bevelSegments);
+    }
+    return p;
+}
+
+QString extrudeMeshCacheKey(const QString &text, const QFont &font, const ExtrudeParams &sanitized)
+{
+    return QStringLiteral("%1|%2|%3|%4|%5|%6")
+        .arg(text)
+        .arg(font.toString())
+        .arg(sanitized.depth, 0, 'g', 12)
+        .arg(sanitized.bevelDepth, 0, 'g', 12)
+        .arg(sanitized.bevelWidth, 0, 'g', 12)
+        .arg(sanitized.bevelSegments);
+}
+
+// ---------------------------------------------------------------------------
 // buildExtrudedMesh
 // ---------------------------------------------------------------------------
 
-TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParams &params)
+TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParams &rawParams,
+                          bool *changedOut)
 {
     TriMesh mesh;
+    bool changed = false;
+    if (changedOut) *changedOut = false;
 
     if (contours.isEmpty()) return mesh;
+
+    const ExtrudeParams params = sanitizeExtrudeParams(rawParams, &changed);
 
     // -----------------------------------------------------------------------
     // Phase 1: collect all ring vertices and their triangulation indices.
@@ -144,6 +191,7 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
 
     QVector<RingData> rings;
     quint32 globalVertOffset = 0;
+    qint64 totalContourVertices = 0;
 
     for (const auto &contour : contours) {
         if (contour.size() < 3) continue;
@@ -176,6 +224,7 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
 
         rings.append(rd);
         globalVertOffset += static_cast<quint32>(n + 1); // ring + centroid
+        totalContourVertices += n;
     }
 
     if (rings.isEmpty()) return mesh;
@@ -199,7 +248,7 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
         profile.append({0.0, -params.depth});
     } else {
         const int segs = params.bevelSegments;
-        const double dz = params.depth / (segs * 2 + 1);
+        const double dz = params.depth / (2.0 * segs + 1.0);
         // Front bevel: from z=0 to z=-bevelDepth (inset grows)
         for (int i = 0; i <= segs; ++i) {
             const double t = static_cast<double>(i) / segs;
@@ -209,7 +258,10 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
         const double midZ = -params.bevelDepth;
         const double midEnd = -params.depth + params.bevelDepth;
         if (midEnd > midZ + 1e-6) {
-            const int midSteps = std::max(1, static_cast<int>((midEnd - midZ) / dz));
+            // sanitizeExtrudeParams bounds the step count; clamp again in double so
+            // rounding of the division can never overflow the int conversion.
+            const double midStepsD = std::min((midEnd - midZ) / dz, kMaxExtrudeMidSteps);
+            const int midSteps = std::max(1, static_cast<int>(midStepsD));
             for (int i = 1; i <= midSteps; ++i) {
                 const double t = static_cast<double>(i) / midSteps;
                 profile.append({params.bevelWidth, midZ + (midEnd - midZ) * t});
@@ -221,6 +273,25 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
             const double t = static_cast<double>(i) / segs;
             profile.append({params.bevelWidth * (1.0 - t), backStart - params.bevelDepth * t});
         }
+    }
+
+    // Vertex budget: a profile whose layers would hold more than
+    // kMaxExtrudeVertices contour vertices falls back to the no-bevel profile.
+    if (profile.size() > 2 && qint64(profile.size()) * totalContourVertices > kMaxExtrudeVertices) {
+        profile.clear();
+        profile.append({0.0, 0.0});
+        profile.append({0.0, -params.depth});
+        changed = true;
+    }
+    if (changed) {
+        qWarning("buildExtrudedMesh: extrusion parameters out of range or over the %lld-vertex budget"
+                 " (depth=%g bevelDepth=%g bevelWidth=%g segments=%d); built with depth=%g"
+                 " bevelDepth=%g bevelWidth=%g segments=%d%s",
+                 static_cast<long long>(kMaxExtrudeVertices), rawParams.depth, rawParams.bevelDepth,
+                 rawParams.bevelWidth, rawParams.bevelSegments, params.depth, params.bevelDepth,
+                 params.bevelWidth, params.bevelSegments,
+                 profile.size() == 2 ? " (no bevel)" : "");
+        if (changedOut) *changedOut = true;
     }
 
     // -----------------------------------------------------------------------

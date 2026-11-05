@@ -32,6 +32,15 @@ namespace psd {
 
 namespace {
 
+// A layer side above this is treated as hostile / unallocatable and skipped.
+constexpr int kMaxPsdLayerSide = 30000;
+
+// Layer extent computed in 64 bits so a crafted left/right pair cannot overflow
+// qint32; a reversed rectangle (hi < lo) yields 0.
+qint64 psdLayerSpan(qint32 lo, qint32 hi) {
+    return qMax<qint64>(0, qint64(hi) - qint64(lo));
+}
+
 // -- helpers -----------------------------------------------------------------
 
 bool readBytes(QIODevice& dev, void* dst, qint64 n) {
@@ -83,10 +92,15 @@ bool readPascalString(QIODevice& dev, int pad, QString& out) {
 }
 
 // PSD Unicode string: uint32 char count + UTF-16BE chars (no terminator).
-bool readUnicodeString(QIODevice& dev, QString& out) {
+// `remaining` = bytes left in the enclosing block; a count that cannot fit is
+// rejected before any allocation.
+bool readUnicodeString(QIODevice& dev, QString& out, qint64 remaining) {
     quint32 count = 0;
+    if (remaining < 4) return false;
     if (!readU32(dev, count)) return false;
+    remaining -= 4;
     if (count == 0) { out.clear(); return true; }
+    if (qint64(count) > remaining / 2 || qint64(count) > 0x7fffffffLL / 2) return false;
     QByteArray buf(static_cast<int>(count) * 2, '\0');
     if (!readBytes(dev, buf.data(), buf.size())) return false;
     // Manually decode UTF-16BE → QString to avoid QStringDecoder return-type
@@ -141,7 +155,8 @@ QByteArray decodePackBitsRow(const quint8* src, qint64 srcLen, int dstLen) {
 // channel rather than aborting the whole document.
 QByteArray readChannelPlane(QIODevice& dev, qint64 channelDataLen,
                             int width, int height) {
-    if (width <= 0 || height <= 0 || channelDataLen < 2) {
+    if (width <= 0 || height <= 0 || channelDataLen < 2
+        || width > kMaxPsdLayerSide || height > kMaxPsdLayerSide) {
         skipBytes(dev, channelDataLen);
         return {};
     }
@@ -172,11 +187,12 @@ QByteArray readChannelPlane(QIODevice& dev, qint64 channelDataLen,
         if (plane.size() < planeBytes) plane.append(planeBytes - plane.size(), '\0');
     } else if (comp == 1) {
         // PackBits RLE — first 2*height bytes are per-row byte counts.
-        QByteArray header(2 * height, '\0');
-        if (remaining < header.size()) {
+        const qint64 headerBytes = qint64(2) * height;
+        if (remaining < headerBytes) {
             skipBytes(dev, remaining);
             return {};
         }
+        QByteArray header(static_cast<int>(headerBytes), '\0');
         if (!readBytes(dev, header.data(), header.size())) return {};
         remaining -= header.size();
         QVector<quint16> rowLens(height, 0);
@@ -223,6 +239,7 @@ QImage buildLayerImage(int width, int height,
     if (width <= 0 || height <= 0) return QImage();
 
     QImage img(width, height, QImage::Format_ARGB32);
+    if (img.isNull()) return QImage(); // allocation failed
     img.fill(Qt::transparent);
 
     const QByteArray& r = planes.value(0);
@@ -230,7 +247,7 @@ QImage buildLayerImage(int width, int height,
     const QByteArray& b = planes.value(2);
     const QByteArray& a = planes.value(-1);
     const bool hasA = !a.isEmpty();
-    const int planeBytes = width * height;
+    const qint64 planeBytes = qint64(width) * height;
     const bool rOk = r.size() == planeBytes;
     const bool gOk = g.size() == planeBytes;
     const bool bOk = b.size() == planeBytes;
@@ -238,7 +255,7 @@ QImage buildLayerImage(int width, int height,
     for (int y = 0; y < height; ++y) {
         QRgb* dst = reinterpret_cast<QRgb*>(img.scanLine(y));
         for (int x = 0; x < width; ++x) {
-            const int idx = y * width + x;
+            const qint64 idx = qint64(y) * width + x;
             const quint8 rv = rOk ? quint8(r[idx]) : 0;
             const quint8 gv = gOk ? quint8(g[idx]) : 0;
             const quint8 bv = bOk ? quint8(b[idx]) : 0;
@@ -436,7 +453,8 @@ PsdDocument loadPsd(const QString& path) {
 
             if (k == QByteArray("luni")) {
                 QString uni;
-                if (readUnicodeString(file, uni) && !uni.isEmpty()) {
+                const qint64 blockEnd = std::min<qint64>(aStart + aLen, extraEnd);
+                if (readUnicodeString(file, uni, blockEnd - file.pos()) && !uni.isEmpty()) {
                     L.name = uni;
                 }
             } else if (k == QByteArray("lsct") || k == QByteArray("lsdk")) {
@@ -464,8 +482,11 @@ PsdDocument loadPsd(const QString& path) {
     QVector<QHash<int, QByteArray>> layerPlanes(layerCount);
     for (int i = 0; i < layerCount; ++i) {
         const LayerRec& L = recs[i];
-        const int w = std::max(0, int(L.right  - L.left));
-        const int h = std::max(0, int(L.bottom - L.top));
+        qint64 w64 = psdLayerSpan(L.left, L.right);
+        qint64 h64 = psdLayerSpan(L.top, L.bottom);
+        if (w64 > kMaxPsdLayerSide || h64 > kMaxPsdLayerSide) w64 = h64 = 0;
+        const int w = int(w64);
+        const int h = int(h64);
         for (const auto& ch : L.channels) {
             const qint16 cid = ch.first;
             const quint32 cLen = ch.second;
@@ -491,8 +512,11 @@ PsdDocument loadPsd(const QString& path) {
     int depthCounter = 0;
     for (int i = layerCount - 1; i >= 0; --i) {
         const LayerRec& L = recs[i];
-        const int w = std::max(0, int(L.right  - L.left));
-        const int h = std::max(0, int(L.bottom - L.top));
+        qint64 w64 = psdLayerSpan(L.left, L.right);
+        qint64 h64 = psdLayerSpan(L.top, L.bottom);
+        if (w64 > kMaxPsdLayerSide || h64 > kMaxPsdLayerSide) w64 = h64 = 0;
+        const int w = int(w64);
+        const int h = int(h64);
 
         if (L.sectionType == 1 || L.sectionType == 2) {
             depthCounter += 1;
@@ -507,7 +531,7 @@ PsdDocument loadPsd(const QString& path) {
         out.groupDepth = depthCounter;
 
         if (w > 0 && h > 0) {
-            out.image = buildLayerImage(w, h, layerPlanes[i]);
+            out.image = buildLayerImage(w, h, layerPlanes[i]); // null if unallocatable
         }
         doc.layers.append(out);
 

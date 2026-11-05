@@ -24,7 +24,7 @@ struct LutData {
     QVector<QVector3D> table;        // RGB triplets (0.0-1.0)
     double intensity = 1.0;          // blend strength with original (0.0-1.0)
 
-    bool isValid() const { return size > 0 && !table.isEmpty(); }
+    bool isValid() const { return size >= 2 && !table.isEmpty(); }
     bool isBuiltIn() const { return filePath.isEmpty(); }
 };
 
