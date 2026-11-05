@@ -2783,6 +2783,40 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::syncDirtyFromUndo);
     connect(m_timeline, &Timeline::restoreStateFinished,
             this, &MainWindow::syncDirtyFromUndo);
+    // US-2005: the time-remap entries follow the active sequence like Timeline's sidecars.
+    connect(m_timeline, &Timeline::activeSequenceChanged,
+            this, &MainWindow::onActiveSequenceChanged);
+    connect(m_timeline, &Timeline::restoreStateFinished, this, [this]() {
+        // No activeSequenceChanged fired (the slot clears these first): a restore that
+        // lands on the sequence it left keeps that sequence's live entries and parks
+        // the state's ones under the state's sequence, as Timeline::restoreState does.
+        const QString activeId = m_timeline->activeSequenceId();
+        if (m_hasRestoreLeaving && !m_restoreStateSequenceId.isEmpty()
+            && m_restoreStateSequenceId != activeId) {
+            m_timeRemapEntriesBySequence[m_restoreStateSequenceId] = m_timeRemapClipEntries;
+            m_timeRemapClipEntries = m_restoreLeavingTimeRemaps;
+            ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+            m_timeRemapEntriesBySequence.remove(activeId);
+            m_sidecarClipUidByKey.clear();
+            const auto &tracks = m_timeline->videoTracks();
+            for (int t = 0; t < tracks.size(); ++t) {
+                const auto &clips = tracks[t]->clips();
+                for (int c = 0; c < clips.size(); ++c)
+                    if (!clips[c].uid.isEmpty())
+                        m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+            }
+        }
+        // A restore can remove a sequence without a switch: drop its parked remaps.
+        const auto sequences = m_timeline->sequences();
+        for (auto it = m_timeRemapEntriesBySequence.begin(); it != m_timeRemapEntriesBySequence.end();) {
+            const bool exists = std::any_of(sequences.cbegin(), sequences.cend(),
+                [&](const TimelineSequence &sequence) { return sequence.id == it.key(); });
+            it = exists ? std::next(it) : m_timeRemapEntriesBySequence.erase(it);
+        }
+        m_restoreLeavingTimeRemaps.clear();
+        m_restoreStateSequenceId.clear();
+        m_hasRestoreLeaving = false;
+    });
     connect(m_timeline, &Timeline::markersChanged, this, &MainWindow::markProjectDirty);
     connect(m_timeline, &Timeline::adjustmentLayersChanged, this, &MainWindow::markProjectDirty);
     connect(m_timeline, &Timeline::trackFlagsChanged, this, &MainWindow::markProjectDirty);
@@ -9190,6 +9224,43 @@ void MainWindow::populateProjectData(ProjectData &data)
     }
     std::sort(data.clipParentEntries.begin(), data.clipParentEntries.end(),
               [](const ClipParentEntry &a, const ClipParentEntry &b) { return a.clipId < b.clipId; });
+    // US-2005: the parked sidecars of every stored sequence other than the active one.
+    data.sequenceSidecars.clear();
+    if (m_timeline) {
+        const auto parked = m_timeline->parkedSidecarsBySequence();
+        const QString activeId = m_timeline->activeSequenceId();
+        for (const TimelineSequence &sequence : m_timeline->sequences()) {
+            if (sequence.id == activeId)
+                continue;
+            const Timeline::SequenceSidecars sidecars = parked.value(sequence.id);
+            const QHash<QString, TimeRemapClipEntry> remaps = m_timeRemapEntriesBySequence.value(sequence.id);
+            SequenceSidecarEntries entries;
+            for (auto it = sidecars.roto.cbegin(); it != sidecars.roto.cend(); ++it) {
+                RotoClipEntry entry = it.value();
+                entry.clipId = it.key();
+                entries.rotoClipEntries.append(entry);
+            }
+            for (auto it = sidecars.matte.cbegin(); it != sidecars.matte.cend(); ++it)
+                entries.trackMatteClipEntries.append(
+                    TrackMatteClipEntry{it.key(), it.value().matteType, it.value().matteSourceClipId});
+            for (auto it = sidecars.parent.cbegin(); it != sidecars.parent.cend(); ++it)
+                entries.clipParentEntries.append(ClipParentEntry{it.key(), it.value()});
+            for (auto it = remaps.cbegin(); it != remaps.cend(); ++it) {
+                TimeRemapClipEntry entry = it.value();
+                entry.clipId = it.key();
+                entries.timeRemapClipEntries.append(entry);
+            }
+            if (entries.rotoClipEntries.isEmpty() && entries.trackMatteClipEntries.isEmpty()
+                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty())
+                continue;
+            auto byClipId = [](const auto &a, const auto &b) { return a.clipId < b.clipId; };
+            std::sort(entries.rotoClipEntries.begin(), entries.rotoClipEntries.end(), byClipId);
+            std::sort(entries.trackMatteClipEntries.begin(), entries.trackMatteClipEntries.end(), byClipId);
+            std::sort(entries.clipParentEntries.begin(), entries.clipParentEntries.end(), byClipId);
+            std::sort(entries.timeRemapClipEntries.begin(), entries.timeRemapClipEntries.end(), byClipId);
+            data.sequenceSidecars.insert(sequence.id, entries);
+        }
+    }
 
     // US-3D-11 / US-1706: the 3D text and the brush are saved with the clips.
     data.projectCamera = m_projectCamera.toJson();
@@ -9456,6 +9527,35 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         // US-1203: the toggle drives Timeline::setStorylineMode.
         if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
         ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        // US-2005: the non-active sequences' sidecars (always replaced, the active one's
+        // are the root entries above).
+        QHash<QString, Timeline::SequenceSidecars> parkedSidecars;
+        m_timeRemapEntriesBySequence.clear();
+        const QString activeSequenceId = m_timeline->activeSequenceId();
+        for (auto it = data.sequenceSidecars.cbegin(); it != data.sequenceSidecars.cend(); ++it) {
+            if (it.key() == activeSequenceId)
+                continue;
+            Timeline::SequenceSidecars sidecars;
+            for (const auto &entry : it->rotoClipEntries)
+                if (!entry.clipId.isEmpty())
+                    sidecars.roto.insert(entry.clipId, entry);
+            for (const auto &entry : it->trackMatteClipEntries)
+                if (!entry.clipId.isEmpty())
+                    sidecars.matte.insert(entry.clipId,
+                        TimelineTrackMatteEntry{entry.matteType, entry.matteSourceClipId});
+            for (const auto &entry : it->clipParentEntries)
+                if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
+                    && entry.clipId != entry.parentClipId)
+                    sidecars.parent.insert(entry.clipId, entry.parentClipId);
+            parkedSidecars.insert(it.key(), sidecars);
+            QHash<QString, TimeRemapClipEntry> remaps;
+            for (const auto &entry : it->timeRemapClipEntries)
+                if (!entry.clipId.isEmpty())
+                    remaps.insert(entry.clipId, entry);
+            if (!remaps.isEmpty())
+                m_timeRemapEntriesBySequence.insert(it.key(), remaps);
+        }
+        m_timeline->setParkedSidecarsBySequence(parkedSidecars);
         // US-2000: always replace (an empty list clears the previous project's), after the
         // tracks exist (trackIndex clamp) and before the undo baseline below takes them.
         m_timeline->setAdjustmentLayers(data.adjustmentLayers);
@@ -10055,6 +10155,12 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     // on either side (unique only within a track) is paired by (track, uid), which
     // TimelineTrack::setClips keeps unique. An empty uid leaves its key as it is; a
     // uid with no pair drops its key, whose values are parked under (track, uid).
+    // US-2005: the sequence the state was recorded in and, when the restore crosses
+    // sequences, the live entries of the one being left (onActiveSequenceChanged parks them).
+    m_restoreStateSequenceId = state.value("sequenceId").toString();
+    m_hasRestoreLeaving = m_restoreStateSequenceId != m_timeline->activeSequenceId();
+    m_restoreLeavingTimeRemaps = m_hasRestoreLeaving ? m_timeRemapClipEntries
+                                                     : QHash<QString, TimeRemapClipEntry>{};
     QHash<QString, QString> restoredKeyByUid;
     QHash<QString, QString> restoredKeyById;
     QSet<QString> ambiguous;
@@ -10173,6 +10279,48 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     }
     // US-1706: the 3D text and the brush come back with the clips; the live brush
     // cache rebuilds from them when restoreState re-selects the clip.
+}
+
+void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &newId)
+{
+    if (!m_timeline->isRestoringState()) {
+        m_timeRemapEntriesBySequence[oldId] = m_timeRemapClipEntries;
+        m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
+        // The stored clips may carry an older curve than the parked entries: mirror them.
+        ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+    } else {
+        // Timeline::restoreState's rule: the sequence left keeps its pre-restore live
+        // entries; the live ones are the state's (US-1401), parked under the state's
+        // sequence when that is not the landing one, which then takes its parked ones.
+        // A sequence whose creation was undone is gone: nothing is parked for it, so a
+        // new sequence reusing its id starts empty.
+        bool oldStored = false;
+        for (const TimelineSequence &sequence : m_timeline->sequences())
+            oldStored = oldStored || sequence.id == oldId;
+        if (oldStored)
+            m_timeRemapEntriesBySequence[oldId] = m_hasRestoreLeaving ? m_restoreLeavingTimeRemaps
+                                                                      : m_timeRemapClipEntries;
+        else
+            m_timeRemapEntriesBySequence.remove(oldId);
+        if (!m_restoreStateSequenceId.isEmpty() && m_restoreStateSequenceId != newId) {
+            m_timeRemapEntriesBySequence[m_restoreStateSequenceId] = m_timeRemapClipEntries;
+            m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
+            ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        } else {
+            m_timeRemapEntriesBySequence.remove(newId);
+        }
+        m_restoreLeavingTimeRemaps.clear();
+        m_restoreStateSequenceId.clear();
+        m_hasRestoreLeaving = false;
+    }
+    m_sidecarClipUidByKey.clear();
+    const auto &tracks = m_timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const auto &clips = tracks[t]->clips();
+        for (int c = 0; c < clips.size(); ++c)
+            if (!clips[c].uid.isEmpty())
+                m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+    }
 }
 
 void MainWindow::collectAudioState(ProjectData &data)

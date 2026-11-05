@@ -869,6 +869,15 @@ private:
     // Key -> uid of the placement the last collect / apply saw, rekeyed with the
     // sidecars; a dropped key's clip is already gone when the remap arrives.
     QHash<QString, QString> m_sidecarClipUidByKey;
+    // US-2005: the time-remap entries of the sequences that are not active, parked
+    // on Timeline::activeSequenceChanged by the same rule as Timeline's sidecars.
+    // A restore that crosses sequences keeps the live entries it replaced and the
+    // state's sequence id here until the switch signal (or restoreStateFinished).
+    void onActiveSequenceChanged(const QString &oldId, const QString &newId);
+    QHash<QString, QHash<QString, TimeRemapClipEntry>> m_timeRemapEntriesBySequence;
+    QHash<QString, TimeRemapClipEntry> m_restoreLeavingTimeRemaps;
+    QString m_restoreStateSequenceId;
+    bool m_hasRestoreLeaving = false;
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;

@@ -710,6 +710,62 @@ static void appendSequenceStoreEntryFromRoot(const QJsonObject &root,
         entries.append(entry);
 }
 
+void ProjectFile::writeSequenceSidecarsToRoot(QJsonObject &root, const ProjectData &data)
+{
+    QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+    if (sequences.isEmpty() || data.sequenceSidecars.isEmpty())
+        return;
+    for (int i = 0; i < sequences.size(); ++i) {
+        QJsonObject sequence = sequences[i].toObject();
+        const auto it = data.sequenceSidecars.constFind(sequence.value(QStringLiteral("id")).toString());
+        if (it == data.sequenceSidecars.cend())
+            continue;
+        QJsonArray rotoArr;
+        for (const auto &entry : it->rotoClipEntries)
+            rotoArr.append(rotoClipEntryToJson(entry));
+        QJsonArray matteArr;
+        for (const auto &entry : it->trackMatteClipEntries)
+            matteArr.append(trackMatteClipEntryToJson(entry));
+        QJsonArray parentArr;
+        for (const auto &entry : it->clipParentEntries)
+            parentArr.append(clipParentEntryToJson(entry));
+        QJsonArray timeRemapArr;
+        for (const auto &entry : it->timeRemapClipEntries)
+            timeRemapArr.append(timeRemapClipEntryToJson(entry));
+        if (!rotoArr.isEmpty()) sequence[QStringLiteral("rotoClipEntries")] = rotoArr;
+        if (!matteArr.isEmpty()) sequence[QStringLiteral("trackMatteClipEntries")] = matteArr;
+        if (!parentArr.isEmpty()) sequence[QStringLiteral("clipParentEntries")] = parentArr;
+        if (!timeRemapArr.isEmpty()) sequence[QStringLiteral("timeRemapClipEntries")] = timeRemapArr;
+        sequences[i] = sequence;
+    }
+    root[QStringLiteral("sequences")] = sequences;
+}
+
+void ProjectFile::readSequenceSidecarsFromRoot(const QJsonObject &root, ProjectData &data)
+{
+    // The root arrays are the active sequence's; its entry's arrays are ignored.
+    data.sequenceSidecars.clear();
+    const QString activeId = root.value(QStringLiteral("activeSequenceId")).toString();
+    for (const QJsonValue &value : root.value(QStringLiteral("sequences")).toArray()) {
+        const QJsonObject sequence = value.toObject();
+        const QString id = sequence.value(QStringLiteral("id")).toString();
+        if (id.isEmpty() || id == activeId)
+            continue;
+        SequenceSidecarEntries entries;
+        for (const auto &v : sequence.value(QStringLiteral("rotoClipEntries")).toArray())
+            entries.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
+        for (const auto &v : sequence.value(QStringLiteral("trackMatteClipEntries")).toArray())
+            entries.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
+        for (const auto &v : sequence.value(QStringLiteral("clipParentEntries")).toArray())
+            entries.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
+        for (const auto &v : sequence.value(QStringLiteral("timeRemapClipEntries")).toArray())
+            entries.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
+        if (!entries.rotoClipEntries.isEmpty() || !entries.trackMatteClipEntries.isEmpty()
+            || !entries.clipParentEntries.isEmpty() || !entries.timeRemapClipEntries.isEmpty())
+            data.sequenceSidecars.insert(id, entries);
+    }
+}
+
 bool ProjectFile::save(const QString &filePath, const ProjectData &data)
 {
     const SequenceStoreExtraction sequenceStore =
@@ -900,6 +956,7 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             root["clipParentEntries"] = parentArr;
     }
     writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
+    writeSequenceSidecarsToRoot(root, data);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11 / US-1706: the 3D text is on the clips (clip JSON "text3D"); the legacy
@@ -1222,6 +1279,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
@@ -1523,6 +1581,7 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             root["clipParentEntries"] = parentArr;
     }
     writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
+    writeSequenceSidecarsToRoot(root, data);
     root["vfxState"] = vfxStateToJson(data.vfxState);
 
     // US-3D-11 / US-1706: the 3D text is on the clips (clip JSON "text3D"); the legacy
@@ -1791,6 +1850,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
     }
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())

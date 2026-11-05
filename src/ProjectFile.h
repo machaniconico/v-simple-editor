@@ -152,6 +152,15 @@ struct ClipParentEntry {
     QString parentClipId;
 };
 
+// US-2005: a non-active sequence's sidecars, saved as the same four arrays on its
+// "sequences" entry (the root arrays stay the active sequence's).
+struct SequenceSidecarEntries {
+    QVector<RotoClipEntry> rotoClipEntries;
+    QVector<TrackMatteClipEntry> trackMatteClipEntries;
+    QVector<ClipParentEntry> clipParentEntries;
+    QVector<TimeRemapClipEntry> timeRemapClipEntries;
+};
+
 // US-3D-11: per-clip 3D extruded-text layer config. `config` is a
 // Text3DLayer::toJson() blob (Text3DLayer is a non-copyable QObject so we
 // stash the serialized form rather than the object).
@@ -285,6 +294,7 @@ struct ProjectData {
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
     QVector<ClipParentEntry> clipParentEntries;
+    QHash<QString, SequenceSidecarEntries> sequenceSidecars;  // US-2005: non-active sequence id -> sidecars
     ProjectVfxState vfxState;
 
     // US-3D-11: motion-graphics sprint persistence
@@ -426,6 +436,9 @@ private:
     static TrackMatteClipEntry trackMatteClipEntryFromJson(const QJsonObject &obj);
     static QJsonObject clipParentEntryToJson(const ClipParentEntry &entry);
     static ClipParentEntry clipParentEntryFromJson(const QJsonObject &obj);
+    // US-2005: data.sequenceSidecars on / from the root "sequences" entries.
+    static void writeSequenceSidecarsToRoot(QJsonObject &root, const ProjectData &data);
+    static void readSequenceSidecarsFromRoot(const QJsonObject &root, ProjectData &data);
     static QJsonObject vfxStateToJson(const ProjectVfxState &state);
     static ProjectVfxState vfxStateFromJson(const QJsonObject &obj);
 

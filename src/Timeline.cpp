@@ -16186,6 +16186,9 @@ bool Timeline::createSequence(const QString &name,
     }
     TimelineSequence sequence;
     sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
+    // US-2005: a reused id must not pick up the parked sidecars of a sequence whose
+    // creation was undone.
+    m_parkedSidecarsBySequence.remove(sequence.id);
     sequence.name = name.trimmed();
     sequence.videoTracks = videoTracks;
     sequence.audioTracks = audioTracks;
@@ -16294,6 +16297,8 @@ bool Timeline::addSequence(const TimelineSequence &sequence)
     TimelineSequence normalized = sequence;
     QVector<TimelineSequence> existing = m_sequences;
     normalized.id = uniqueSequenceId(existing, normalized.id, existing.size());
+    // US-2005: a reused id (e.g. a precompose after an undone one) starts without sidecars.
+    m_parkedSidecarsBySequence.remove(normalized.id);
     if (normalized.name.trimmed().isEmpty())
         normalized.name = QStringLiteral("Sequence %1").arg(existing.size() + 1);
     upsertSequenceSnapshot(normalized);
@@ -16318,6 +16323,12 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     if (!target)
         return false;
 
+    // US-2005: a switch parks the sidecars of the sequence it leaves (the parent
+    // map raw, without the store key). Inside restoreState only the clips change;
+    // its end parks and restores once.
+    const QString oldId = m_activeSequenceId;
+    if (!m_restoringState)
+        m_parkedSidecarsBySequence[oldId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
     clearReconcileBaseline();
@@ -16343,6 +16354,12 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
         m_audioTracks[i]->setClips(clips);
     }
     m_generatedCaptionOverlays = targetCopy.generatedCaptionOverlays;
+    if (!m_restoringState) {
+        const SequenceSidecars in = m_parkedSidecarsBySequence.take(sequenceId);
+        commitRotoEntries(in.roto, /*clearMemo=*/true);
+        commitTrackMatteEntries(in.matte);
+        m_clipParentEntries = in.parent;
+    }
 
     m_activeSequenceId = sequenceId;
     m_sequenceModelEnabled = true;
@@ -16354,7 +16371,15 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     scheduleEmitSequenceChanged();
     rebuildTimelineBreadcrumbBar(this);
     emit sequencesChanged();
+    if (!m_restoringState)
+        emit activeSequenceChanged(oldId, sequenceId);
     return true;
+}
+
+void Timeline::setParkedSidecarsBySequence(QHash<QString, SequenceSidecars> parked)
+{
+    parked.remove(m_activeSequenceId);
+    m_parkedSidecarsBySequence = std::move(parked);
 }
 
 ClipInfo Timeline::makeSequenceClip(const QString &sequenceId,
@@ -16715,6 +16740,10 @@ TimelineState Timeline::currentState() const
 void Timeline::restoreState(const TimelineState &state)
 {
     QScopedValueRollback<bool> restoring(m_restoringState, true);
+    // US-2005: the live sidecars of the sequence being left, before the restore replaces them.
+    const QString leavingId = m_sequenceModelEnabled ? m_activeSequenceId
+                                                     : QString::fromLatin1(kDefaultSequenceId);
+    const SequenceSidecars leaving{rotoEntries(), trackMatteEntries(), m_clipParentEntries};
     undotrace::log("restoreState:enter");
     noteClipsChanged();
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
@@ -16758,6 +16787,8 @@ void Timeline::restoreState(const TimelineState &state)
     commitTrackMatteEntries(state.trackMatteEntries);
     commitRotoEntries(state.rotoEntries, true);
     setClipParentEntries(state.clipParentEntries);
+    // The sequence the state was recorded in (its store's active id).
+    const QString stateId = m_activeSequenceId;
     rebuildTimelineBreadcrumbBar(this);
 
     // Clear every track's UI selection (via blockSignals so we don't emit
@@ -16878,6 +16909,34 @@ void Timeline::restoreState(const TimelineState &state)
     const QString beforeSequenceCreation = state.externalTrackState
         .value(QStringLiteral("_sequenceCreationActiveId")).toString();
     if (!beforeSequenceCreation.isEmpty()) setActiveSequence(beforeSequenceCreation);
+    // US-2005: the landing sequence takes the state's sidecars and drops its parked
+    // ones; the sequence left keeps its live ones parked. A state recorded in another
+    // sequence than the landing one is parked there, and the landing one's parked
+    // sidecars become live.
+    if (m_sequenceModelEnabled) {
+        if (leavingId != m_activeSequenceId)
+            m_parkedSidecarsBySequence[leavingId] = leaving;
+        if (stateId != m_activeSequenceId) {
+            m_parkedSidecarsBySequence[stateId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
+            // Leaving == landing: its live sidecars (captured as leaving) stay live.
+            const SequenceSidecars in = (leavingId == m_activeSequenceId)
+                ? leaving : m_parkedSidecarsBySequence.take(m_activeSequenceId);
+            m_parkedSidecarsBySequence.remove(m_activeSequenceId);
+            commitRotoEntries(in.roto, /*clearMemo=*/true);
+            commitTrackMatteEntries(in.matte);
+            m_clipParentEntries = in.parent;
+        } else {
+            m_parkedSidecarsBySequence.remove(m_activeSequenceId);
+        }
+        // Sequences the restore removed must not leave parked sidecars for a reused id.
+        for (auto it = m_parkedSidecarsBySequence.begin(); it != m_parkedSidecarsBySequence.end();) {
+            const bool exists = std::any_of(m_sequences.cbegin(), m_sequences.cend(),
+                [&](const TimelineSequence &sequence) { return sequence.id == it.key(); });
+            it = exists ? std::next(it) : m_parkedSidecarsBySequence.erase(it);
+        }
+        if (leavingId != m_activeSequenceId)
+            emit activeSequenceChanged(leavingId, m_activeSequenceId);
+    }
     emit restoreStateFinished();
     undotrace::log("restoreState:exit");
 }

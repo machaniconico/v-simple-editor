@@ -1182,6 +1182,16 @@ public:
                       const QString &activeSequenceId = QString());
     bool addSequence(const TimelineSequence &sequence);
     bool setActiveSequence(const QString &sequenceId);
+    // US-2005: the roto / matte / parent sidecars of the sequences that are not
+    // active, parked by setActiveSequence and restoreState (never in the store).
+    struct SequenceSidecars {
+        QHash<QString, RotoClipEntry> roto;
+        QHash<QString, TimelineTrackMatteEntry> matte;
+        QHash<QString, QString> parent;
+    };
+    QHash<QString, SequenceSidecars> parkedSidecarsBySequence() const { return m_parkedSidecarsBySequence; }
+    // Replaces the table (project load); the active sequence's entry is dropped.
+    void setParkedSidecarsBySequence(QHash<QString, SequenceSidecars> parked);
     ClipInfo makeSequenceClip(const QString &sequenceId,
                               const QString &displayName = QString()) const;
     bool addSequenceClip(const QString &sequenceId, int videoTrackIndex = 0);
@@ -1639,6 +1649,9 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void sequencesChanged();
+    // US-2005: once per switch of the active sequence (setActiveSequence outside a
+    // restore, or the end of a restoreState that lands in another sequence).
+    void activeSequenceChanged(const QString &oldId, const QString &newId);
     void audioSequenceChanged(const QVector<PlaybackEntry> &entries);
     // restoreState が、プロジェクト出力ジオメトリを持つ undo/redo スナップショットを
     // 復元したときに発火。MainWindow が canvas + 出力サイズを再適用し、SNS プリセット
@@ -1811,6 +1824,7 @@ private:
     // Explicit cross-track carrier remaps (selftest counter, see the getter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
+    QHash<QString, SequenceSidecars> m_parkedSidecarsBySequence;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;
