@@ -861,7 +861,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "edl-export",        "VEDITOR_EDL_EXPORT_SELFTEST",         runEdlExportSelftest,          false,
       "EdlExport: CMX3600 timecode + event lines + drop-frame" },
     { "otio-export",       "VEDITOR_OTIO_EXPORT_SELFTEST",        runOtioExportSelftest,         true,
-      "OtioExport: Timeline.1 / Clip.1 / Gap.1 / LinearTimeWarp.1 / Marker.2 schema and values (8 gates)" },
+      "OtioExport: Timeline.1 / Clip.1 / Gap.1 / LinearTimeWarp.1 / Marker.2 schema and values (9 gates)" },
     { "tcburn",            "VEDITOR_TCBURN_SELFTEST",             runTcburnSelftest,             true,
       "Timecode burn-in: disabled no-op, six positions, drop-frame, JSON and HH:MM:SS (9 gates)" },
     { "workspace",         "VEDITOR_WORKSPACE_SELFTEST",          runWorkspaceSelftest,          false,

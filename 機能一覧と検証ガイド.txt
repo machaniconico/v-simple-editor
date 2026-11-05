@@ -1278,11 +1278,15 @@
     (time_scalar)、マーカーは Stack.1 の markers (Marker.2) に出ます。書かないもの: トランジション、time remap
     曲線、入れ子のシーケンス、アクティブでないシーケンス。OTIO の読み込みと AAF は未対応です。外部の OpenTimelineIO
     ライブラリでの検証は未実施で (Python の opentimelineio が使えませんでした)、LinearTimeWarp の下の source_range
-    の扱いは未確認です (otio-export 8 gates)。
-  ❏ selftest: 新しい suite は psd-import (6 gates)、lut-import (7)、extrude-mesh (7)、otio-export (8)、unsaved-prompt
+    の扱いは未確認です (otio-export 9 gates)。
+    映像トラックは番号の大きい方から先に書くので、V1 が映像トラックの最後 (Stack の最前面) になり、
+    重なり順が合います。音声トラックがあれば Stack は [V2, V1, A1] の順です。
+    他の NLE では番号が逆になることがあります。
+  ❏ selftest: 新しい suite は psd-import (6 gates)、lut-import (7)、extrude-mesh (7)、otio-export (9)、unsaved-prompt
     (9)、project-persist (7) です。gate 数が増えた suite は、clip-sidecar 14 → 20 (G15 = rubber band、G16 =
     式ダイアログ、G17-G18 = クリップの time remap、G19-G20 = スタビライザー)、connected-clip 38 → 41
-    (G39-G41)、special-composite 18 → 20 (G19-G20) です。brush-export は 17 のまま (G15 の対照を再固定し、G2 の Echo
+    (G39-G41)、special-composite 18 → 20 (G19-G20)、
+    otio-export 8 → 9 (G9 = 映像トラックの順) です。brush-export は 17 のまま (G15 の対照を再固定し、G2 の Echo
     の脚の期待を新しい挙動に合わせました)、mcp は 206 のまま (G203 に押し出しの条件を 1 項足しました)。MCP ツールは 61
     本 (G1..G206) のままで、get_project_info の hasUnsavedChanges (従来からある項目) は、Wave 20
     から上記の未保存の定義に従います。
@@ -4234,10 +4238,11 @@
      る。Undo: set_clip_text3d / set_clip_brush は MCP の undo または Ctrl+Z 1 回で戻る。
   □ Wave 20 分 (現行値。registry の説明文 `(N gates)` と一致。SKIP は PASS ではない): 新しい suite は psd-import (6。G1
      = 正常な 2 層の対照、G2 = luni、G3 = RLE、G4 = 巨大な層、G5 = 組み合わせ、G6 = 30000 / 30001 px) / lut-import (7)
-     / extrude-mesh (7) / otio-export (8) / unsaved-prompt (9) / project-persist (7)。ゲートが増えた既存: clip-sidecar
+     / extrude-mesh (7) / otio-export (9) / unsaved-prompt (9) / project-persist (7)。ゲートが増えた既存: clip-sidecar
      (14 → 20。G15 = rubber band の写像、G16 = 式ダイアログのオフセット、G17-G18 = クリップの time remap、G19-G20 =
      スタビライザー) / connected-clip (38 → 41。G39-G41 = シーケンス別サイドカー) / special-composite (18 → 20。G19-G20
-     = Echo の過去サンプルのブラシ) / brush-export (17 のまま。G2 の Echo の脚の期待を変更、G15 を再固定) / mcp (206
+     = Echo の過去サンプルのブラシ) / otio-export (8 → 9。G9 =
+     映像トラックの順) / brush-export (17 のまま。G2 の Echo の脚の期待を変更、G15 を再固定) / mcp (206
      のまま。G203 に押し出しの条件)。render-fixture は基点 1ce03c2 の 15 ファイル、audio-fixture は 23 ファイルが
      IDENTICAL (この fixture には、保存済みプロジェクトからの調整レイヤー付き書き出し、押し出しの範囲外の設定、ブラシ付
      きの Echo クリップが含まれません)。

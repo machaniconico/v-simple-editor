@@ -119,8 +119,11 @@ QJsonObject timelineToOtio(const Timeline *tl, double fps, const QString &name)
 
     QJsonArray tracks;
     if (tl) {
-        for (const TimelineTrack *t : tl->videoTracks())
-            if (t) tracks.append(trackToOtio(t, false, fps));
+        // OTIO composites later Stack children over earlier ones, but V1 is the front layer here,
+        // so write the video tracks highest-first and V1 last; the track names keep their identity.
+        const auto &vt = tl->videoTracks();
+        for (int i = int(vt.size()) - 1; i >= 0; --i)
+            if (vt.at(i)) tracks.append(trackToOtio(vt.at(i), false, fps));
         for (const TimelineTrack *t : tl->audioTracks())
             if (t) tracks.append(trackToOtio(t, true, fps));
     }

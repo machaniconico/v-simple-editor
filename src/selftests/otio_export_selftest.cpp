@@ -71,14 +71,15 @@ int runOtioExportSelftest()
     const QJsonObject doc = otio::timelineToOtio(&tl, 24.0, QStringLiteral("t"));
     const QJsonArray trk = tracksOf(doc);
     const QJsonArray v2c = trk.size() > 1
-        ? trk.at(1).toObject().value(QStringLiteral("children")).toArray()
-        : QJsonArray();
+        ? trk.at(0).toObject().value(QStringLiteral("children")).toArray()
+        : QJsonArray();  // video tracks are written top-last: child 0 = V2, child 1 = V1
 
     gate(1, schema(doc) == QLatin1String("Timeline.1")
         && schema(doc.value(QStringLiteral("tracks"))) == QLatin1String("Stack.1")
         && trk.size() == 3
         && trk.at(0).toObject().value(QStringLiteral("kind")).toString() == QLatin1String("Video")
         && trk.at(1).toObject().value(QStringLiteral("kind")).toString() == QLatin1String("Video")
+        && trk.at(1).toObject().value(QStringLiteral("children")).toArray().size() == 1
         && trk.at(2).toObject().value(QStringLiteral("kind")).toString() == QLatin1String("Audio")
         && v2c.size() == 2 && schema(v2c.at(0)) == QLatin1String("Gap.1")
         && schema(v2c.at(1)) == QLatin1String("Clip.1"),
@@ -198,10 +199,10 @@ int runOtioExportSelftest()
         t8.videoTracks().at(1)->setHidden(true);
         const QJsonArray tr = tracksOf(otio::timelineToOtio(&t8, 24.0, QStringLiteral("h")));
         const bool hiddenOk = tr.size() >= 2
-            && tr.at(1).toObject().contains(QStringLiteral("enabled"))
-            && tr.at(1).toObject().value(QStringLiteral("enabled")).toBool(true) == false
-            && tr.at(1).toObject().value(QStringLiteral("children")).toArray().size() == 2
-            && !tr.at(0).toObject().contains(QStringLiteral("enabled"));
+            && tr.at(0).toObject().contains(QStringLiteral("enabled"))
+            && tr.at(0).toObject().value(QStringLiteral("enabled")).toBool(true) == false
+            && tr.at(0).toObject().value(QStringLiteral("children")).toArray().size() == 2
+            && !tr.at(1).toObject().contains(QStringLiteral("enabled"));
 
         Timeline ts;
         ts.restoreFromProject(QVector<QVector<ClipInfo>>{v1},
@@ -221,6 +222,29 @@ int runOtioExportSelftest()
         const QString inA = firstName();
         gate(8, hiddenOk && created && inB == QLatin1String("only_b.mp4") && inA == QLatin1String("a.mp4"),
             "hidden=" + std::to_string(hiddenOk) + " B=" + inB.toStdString() + " A=" + inA.toStdString());
+    }
+
+    // G9: video tracks are written top-last (V2 first, V1 = last Video child), by name and by content.
+    {
+        Timeline t9;
+        t9.restoreFromProject(QVector<QVector<ClipInfo>>{v1, v2},
+                              QVector<QVector<ClipInfo>>{a1}, 0.0, -1.0, -1.0, 100);
+        t9.videoTracks().at(0)->customName = QStringLiteral("V1");
+        t9.videoTracks().at(1)->customName = QStringLiteral("V2");
+        const QJsonArray t = tracksOf(otio::timelineToOtio(&t9, 24.0, QStringLiteral("o")));
+        QVector<QJsonObject> vids;
+        for (const QJsonValue &v : t)
+            if (v.toObject().value(QStringLiteral("kind")).toString() == QLatin1String("Video"))
+                vids.append(v.toObject());
+        const bool ok = vids.size() == 2 && t.size() == 3
+            && vids.first().value(QStringLiteral("name")).toString() == QLatin1String("V2")
+            && vids.last().value(QStringLiteral("name")).toString() == QLatin1String("V1")
+            && vids.first().value(QStringLiteral("children")).toArray().size() == 2
+            && schema(vids.first().value(QStringLiteral("children")).toArray().at(0)) == QLatin1String("Gap.1")
+            && schema(vids.first().value(QStringLiteral("children")).toArray().at(1)) == QLatin1String("Clip.1")
+            && vids.last().value(QStringLiteral("children")).toArray().size() == 1
+            && t.at(2).toObject().value(QStringLiteral("kind")).toString() == QLatin1String("Audio");
+        gate(9, ok, "videoTracks=" + std::to_string(vids.size()));
     }
 
     return tally.finish("otio-export");
