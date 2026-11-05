@@ -497,13 +497,23 @@ int runSpecialCompositeSelftest()
     const G8Export freezeExport = exportFrame(freezeProject, QStringLiteral("g8-freeze"), g8FreezeTimelineSec);
     ProjectData freezeNoEntry = freezeProject;
     freezeNoEntry.timeRemapClipEntries.clear();
+    // ProjectFile now persists the clip's own curve (0b07da7): the control must drop it as well as the root entry.
+    for (QVector<ClipInfo> &track : freezeNoEntry.videoTracks)
+        for (ClipInfo &clip : track)
+            clip.timeRemapCurve = timeremap::TimeRemapCurve();
     const G8Export freezeHead = exportFrame(freezeNoEntry, QStringLiteral("g8-freeze-head"), g8FreezeTimelineSec);
+    // Clip-only positive: root entries cleared, the clip's own curve kept -> still equals the live freeze.
+    ProjectData freezeClipOnly = freezeProject;
+    freezeClipOnly.timeRemapClipEntries.clear();
+    const G8Export freezeClipOnlyExport = exportFrame(freezeClipOnly, QStringLiteral("g8-freeze-cliponly"), g8FreezeTimelineSec);
     const G8Diff freezeDiff = diffImages(freezeExport.image, liveFreeze);
     const G8Diff freezeHeadDiff = diffImages(freezeHead.image, liveFreeze);
+    const G8Diff freezeClipOnlyDiff = diffImages(freezeClipOnlyExport.image, liveFreeze);
     const int liveFreezeRed = centreRed(liveFreeze);
     const int freezeExportRed = centreRed(freezeExport.image);
     const int freezeHeadRed = centreRed(freezeHead.image);
     const bool freezeOk = freezeEntryPresent && !liveFreeze.isNull() && freezeExport.ok && freezeHead.ok
+        && freezeClipOnlyExport.ok && freezeClipOnlyDiff.equal()
         && freezeDiff.equal() && !freezeHeadDiff.equal()
         && std::abs(freezeHeadRed - liveFreezeRed) > 50;
 
@@ -540,6 +550,7 @@ int runSpecialCompositeSelftest()
               << " noEntryControlRed=" << freezeHeadRed
               << " exportOk=" << freezeExport.ok << " controlOk=" << freezeHead.ok
               << " export[" << diffText(freezeDiff) << "] noEntryControl[" << diffText(freezeHeadDiff)
+              << "] clipOnlyOk=" << freezeClipOnlyExport.ok << " clipOnly[" << diffText(freezeClipOnlyDiff)
               << "] ok=" << freezeOk << '\n';
     std::cerr << "special-composite G8 (4) plain timelineSec=" << g8TimelineSec
               << " localSec=" << g8PlainLocalSec << " sourceSec=" << g8PlainSourceSec

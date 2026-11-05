@@ -3,6 +3,7 @@
 #include "../AudioMixer.h"
 #include "../Exporter.h"
 #include "../ProjectFile.h"
+#include "../ProjectSettings.h"
 #include "../RenderQueue.h"
 #include "../RenderQueueDialog.h"
 #include "../VideoPlayer.h"
@@ -112,12 +113,18 @@ int runLoudnessPersistSelftest()
     normalize(4.0);
     bool acceptedNewProject = false;
     QTimer::singleShot(0, &window, [&] {
-        if (auto *dialog = qobject_cast<QDialog *>(QApplication::activeModalWidget())) {
+        QWidget *modal = QApplication::activeModalWidget();
+        if (auto *dialog = qobject_cast<ProjectSettingsDialog *>(modal)) {
             acceptedNewProject = true;
             dialog->accept();
+        } else if (modal) {
+            modal->close(); // A stray modal (e.g. the unsaved-changes box) must not count as success.
         }
     });
+    // US-2001: normalize(4.0) leaves the window dirty, so newProject asks first.
+    window.setUnsavedChangesPromptForTest([] { return MainWindow::UnsavedChangesChoice::Discard; });
     (window.*member(NewProject{}))();
+    window.setUnsavedChangesPromptForTest({});
     check(otherReset && acceptedNewProject && reset(), "G3");
 
     // Literal schema fixture of the legacy unused loudness block. This is
