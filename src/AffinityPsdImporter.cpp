@@ -34,6 +34,10 @@ namespace {
 
 // A layer side above this is treated as hostile / unallocatable and skipped.
 constexpr int kMaxPsdLayerSide = 30000;
+// Photoshop caps a layer name at 255 characters; 65536 is a generous bound.
+constexpr quint32 kMaxLuniChars = 65536;
+// Bytes the last readUnicodeString call allocated (0 when it rejected the count).
+qint64 g_lastLuniAllocatedBytes = 0;
 
 // Layer extent computed in 64 bits so a crafted left/right pair cannot overflow
 // qint32; a reversed rectangle (hi < lo) yields 0.
@@ -95,12 +99,16 @@ bool readPascalString(QIODevice& dev, int pad, QString& out) {
 // `remaining` = bytes left in the enclosing block; a count that cannot fit is
 // rejected before any allocation.
 bool readUnicodeString(QIODevice& dev, QString& out, qint64 remaining) {
+    g_lastLuniAllocatedBytes = 0;
+    if (!dev.isSequential()) remaining = std::min(remaining, dev.size() - dev.pos());
     quint32 count = 0;
     if (remaining < 4) return false;
     if (!readU32(dev, count)) return false;
     remaining -= 4;
     if (count == 0) { out.clear(); return true; }
-    if (qint64(count) > remaining / 2 || qint64(count) > 0x7fffffffLL / 2) return false;
+    if (qint64(count) > remaining / 2 || qint64(count) > 0x7fffffffLL / 2
+        || count > kMaxLuniChars) return false;
+    g_lastLuniAllocatedBytes = qint64(count) * 2;
     QByteArray buf(static_cast<int>(count) * 2, '\0');
     if (!readBytes(dev, buf.data(), buf.size())) return false;
     // Manually decode UTF-16BE → QString to avoid QStringDecoder return-type
@@ -427,7 +435,7 @@ PsdDocument loadPsd(const QString& path) {
         quint32 extraLen = 0;
         if (!readU32(file, extraLen)) return doc;
         const qint64 extraStart = file.pos();
-        const qint64 extraEnd   = extraStart + extraLen;
+        const qint64 extraEnd   = std::min<qint64>({extraStart + extraLen, lmiEnd, file.size()});
 
         // Layer mask data
         quint32 maskLen = 0;
@@ -542,6 +550,10 @@ PsdDocument loadPsd(const QString& path) {
 
     return doc;
 }
+
+namespace psdtest {
+qint64 lastLuniAllocatedBytes() { return g_lastLuniAllocatedBytes; }
+} // namespace psdtest
 
 } // namespace psd
 } // namespace affinity
