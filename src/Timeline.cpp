@@ -4906,6 +4906,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         qInfo() << "Timeline: lock toggled =" << checked << "track=" << trackPtr.data();
         trackPtr->setLocked(checked);
         emit trackFlagsChanged();
+        saveUndoState(QStringLiteral("トラックをロック"));
         if (lockBtnPtr) {
             lockBtnPtr->setText(checked
                 ? QString::fromUtf8("\xF0\x9F\x94\x92")    // 🔒
@@ -4919,6 +4920,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setMuted(checked);
             emit trackFlagsChanged();
+            saveUndoState(QStringLiteral("トラックをミュート"));
             if (muteBtnPtr) {
                 muteBtnPtr->setText(checked
                     ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
@@ -4949,6 +4951,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setHidden(checked);
             emit trackFlagsChanged();
+            saveUndoState(QStringLiteral("トラックを非表示"));
             if (hideBtnPtr) {
                 hideBtnPtr->setText(checked
                     ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
@@ -12505,6 +12508,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     track->setMuted(!track->isMuted());
     emit trackFlagsChanged();
     syncTrackHeaderFlags(track);
+    saveUndoState(QStringLiteral("トラックをミュート"));
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
     // until the next clip edit triggered a sequence rebuild.
@@ -12528,8 +12532,10 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
             anyChanged = true;
         }
     }
-    if (anyChanged)
+    if (anyChanged) {
         emit trackFlagsChanged();
+        saveUndoState(QStringLiteral("トラックをソロ"));
+    }
     // Solo state lives on the mixer (per-track effectiveGain), so the
     // PlaybackEntry-shaped schedule is unchanged — no audioSequenceChanged
     // re-emit needed. trackSoloChanged carries the only state the mixer
@@ -16716,6 +16722,7 @@ TimelineState Timeline::currentState() const
     state.trackMatteEntries = trackMatteEntries();
     state.rotoEntries = rotoEntries();
     state.trackStructureRevision = m_trackStructureRevision;
+    state.trackFlags = trackFlagsToJson();
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -16783,6 +16790,9 @@ void Timeline::restoreState(const TimelineState &state)
         syncTrackHeaderFlags(m_audioTracks[i]);
         m_audioTracks[i]->update();
     }
+    // US-2106: lock / mute / solo / hide are undo state.
+    if (!state.trackFlags.isEmpty())
+        applyTrackFlagsFromJson(state.trackFlags);
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
     commitTrackMatteEntries(state.trackMatteEntries);
     commitRotoEntries(state.rotoEntries, true);
@@ -16889,7 +16899,7 @@ void Timeline::restoreState(const TimelineState &state)
     scheduleEmitSequenceChanged();
     m_trackStructureRevision = state.trackStructureRevision;
     m_nextTrackStructureRevision = qMax(m_nextTrackStructureRevision, m_trackStructureRevision);
-    // Playback flags and mixer edits are not ordinary timeline undo state.
+    // Mixer edits are not ordinary timeline undo state (track flags are, US-2106).
     // Restore external owners only when crossing a track-structure change.
     if (structureChanged && m_applyExternalTrackState)
         m_applyExternalTrackState(state.externalTrackState);
@@ -16948,8 +16958,11 @@ bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
     TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
     if (!track)
         return false;
+    const bool changed = track->isLocked() != locked;
     track->setLocked(locked);
     syncTrackHeaderFlags(track);
+    if (changed)
+        saveUndoState(QStringLiteral("トラックをロック"));
     return true;
 }
 

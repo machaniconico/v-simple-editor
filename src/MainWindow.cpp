@@ -2822,7 +2822,6 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_timeline, &Timeline::markersChanged, this, &MainWindow::markProjectDirty);
     connect(m_timeline, &Timeline::adjustmentLayersChanged, this, &MainWindow::markProjectDirty);
-    connect(m_timeline, &Timeline::trackFlagsChanged, this, &MainWindow::markProjectDirty);
     // Audio FX docks (EQ / compressor / reverb / NR / de-esser): one catch-all
     // for audio track count changes (import / addClip auto-track, BGM, paste,
     // undo / redo, project load, removal). Reseeds only when the track set
@@ -9857,7 +9856,7 @@ QJsonObject MainWindow::collectExternalTrackState() const
         state["mixer"] = mixerState;
     }
     state["buses"] = m_audioBusRouting.toJson();
-    // Timeline playback flags (muted/solo/hidden) are not undoable.
+    // Timeline track flags are TimelineState::trackFlags (US-2106), not captured here.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
     // Capture live carrier references, including matte edits without an undo entry.
     QJsonArray mattes;
@@ -10275,6 +10274,8 @@ void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &ne
         m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
         // The stored clips may carry an older curve than the parked entries: mirror them.
         ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        // US-2106: the active sequence id is saved; a restore-driven switch is not an edit.
+        markProjectDirty();
     } else {
         // Timeline::restoreState's rule: the sequence left keeps its pre-restore live
         // entries; the live ones are the state's (US-1401), parked under the state's

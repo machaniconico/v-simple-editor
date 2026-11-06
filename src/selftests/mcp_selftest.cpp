@@ -1590,7 +1590,7 @@ int runMcpSelftest()
                 projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
         };
 
-        // US-406 reserved G159-G160: track appearance is one undo; flags are not.
+        // US-406 reserved G159-G160: track appearance is one undo; flags are one undo too (US-2106).
         {
             const QJsonObject original = projectTimeline->trackFlagsToJson();
             saveTestUndoBaseline();
@@ -1622,16 +1622,20 @@ int runMcpSelftest()
                 && observeTerm(159, "projectTimeline->trackFlagsToJson() == original", static_cast<bool>(projectTimeline->trackFlagsToJson() == original));
             g159 ? pass("G159 track name/color readback and single undo")
                  : fail("G159 track name/color readback and single undo", QStringLiteral("appearance/undo mismatch"));
+            // US-2106: from a clean baseline, a flag-only call is one undo point and
+            // its undo is clean again.
+            projectInfoWindow.markProjectClean();
             const quint64 flagSerial = projectTimeline->undoManager()->saveSerial();
             const auto flags = toolPayload(callTrack(QJsonObject{
                 {QStringLiteral("muted"), true}, {QStringLiteral("solo"), true}, {QStringLiteral("hidden"), true}}));
             const auto flagTrack = readTrack();
             bool g160 = observeTerm(160, "flags.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(flags.value(QStringLiteral("ok")).toBool()))
-                && observeTerm(160, "!flags.value(QStringLiteral(\"undoRecorded\")).toBool()", static_cast<bool>(!flags.value(QStringLiteral("undoRecorded")).toBool()))
+                && observeTerm(160, "flags.value(QStringLiteral(\"undoRecorded\")).toBool()", static_cast<bool>(flags.value(QStringLiteral("undoRecorded")).toBool()))
                 && observeTerm(160, "flagTrack.value(QStringLiteral(\"muted\")).toBool()", static_cast<bool>(flagTrack.value(QStringLiteral("muted")).toBool()))
                 && observeTerm(160, "flagTrack.value(QStringLiteral(\"solo\")).toBool()", static_cast<bool>(flagTrack.value(QStringLiteral("solo")).toBool()))
                 && observeTerm(160, "flagTrack.value(QStringLiteral(\"hidden\")).toBool()", static_cast<bool>(flagTrack.value(QStringLiteral("hidden")).toBool()))
-                && observeTerm(160, "projectTimeline->undoManager()->saveSerial() == flagSerial", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == flagSerial));
+                && observeTerm(160, "projectTimeline->undoManager()->saveSerial() == flagSerial + 1", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == flagSerial + 1));
+            const quint64 afterFlagSerial = projectTimeline->undoManager()->saveSerial();
             const auto beforeInvalid = projectTimeline->trackFlagsToJson();
             for (const QJsonObject &invalid : {
                 QJsonObject{{QStringLiteral("trackIndex"), 99999}},
@@ -1644,7 +1648,20 @@ int runMcpSelftest()
                     || toolResult(response).value(QStringLiteral("isError")).toBool())));
             }
             g160 = observeTerm(160, "g160", static_cast<bool>(g160)) && observeTerm(160, "projectTimeline->trackFlagsToJson() == beforeInvalid", static_cast<bool>(projectTimeline->trackFlagsToJson() == beforeInvalid))
-                && observeTerm(160, "projectTimeline->undoManager()->saveSerial() == flagSerial", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == flagSerial));
+                && observeTerm(160, "projectTimeline->undoManager()->saveSerial() == afterFlagSerial", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == afterFlagSerial));
+            const auto flagUndo = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
+            g160 = observeTerm(160, "g160", static_cast<bool>(g160)) && observeTerm(160, "flagUndo.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(flagUndo.value(QStringLiteral("ok")).toBool()))
+                && observeTerm(160, "!projectTimeline->trackAt(false, 0)->isMuted()", static_cast<bool>(!projectTimeline->trackAt(false, 0)->isMuted()))
+                && observeTerm(160, "!projectTimeline->trackAt(false, 0)->isSolo()", static_cast<bool>(!projectTimeline->trackAt(false, 0)->isSolo()))
+                && observeTerm(160, "!projectTimeline->trackAt(false, 0)->isHidden()", static_cast<bool>(!projectTimeline->trackAt(false, 0)->isHidden()))
+                && observeTerm(160, "!projectInfoWindow.isWindowModified() after the flag undo", static_cast<bool>(!projectInfoWindow.isWindowModified()));
+            // Name + flags in one call: one undo point holding both new values.
+            const QString originalAudioName = original.value(QStringLiteral("audio")).toArray().at(0).toObject().value(QStringLiteral("name")).toString();
+            const auto audioNewValues = [&]() {
+                TimelineTrack *a0 = projectTimeline->trackAt(true, 0);
+                return a0 && a0->customName == QStringLiteral("MCP 音声") && a0->isMuted() && a0->isSolo();
+            };
+            const quint64 mixedSerial = projectTimeline->undoManager()->saveSerial();
             const auto mixed = toolPayload(callTrack(QJsonObject{
                 {QStringLiteral("kind"), QStringLiteral("audio")},
                 {QStringLiteral("name"), QStringLiteral("MCP 音声")},
@@ -1656,13 +1673,23 @@ int runMcpSelftest()
             g160 = observeTerm(160, "g160", static_cast<bool>(g160)) && observeTerm(160, "mixed.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(mixed.value(QStringLiteral("ok")).toBool()))
                 && observeTerm(160, "mixed.value(QStringLiteral(\"undoRecorded\")).toBool()", static_cast<bool>(mixed.value(QStringLiteral("undoRecorded")).toBool()))
                 && observeTerm(160, "audioTrack.value(QStringLiteral(\"name\")).toString() == QStringLiteral(\"MCP 音声\")", static_cast<bool>(audioTrack.value(QStringLiteral("name")).toString() == QStringLiteral("MCP 音声")))
-                && observeTerm(160, "audioTrack.value(QStringLiteral(\"color\")).toString() == QStringLiteral(\"#abcdef\")", static_cast<bool>(audioTrack.value(QStringLiteral("color")).toString() == QStringLiteral("#abcdef")));
+                && observeTerm(160, "audioTrack.value(QStringLiteral(\"color\")).toString() == QStringLiteral(\"#abcdef\")", static_cast<bool>(audioTrack.value(QStringLiteral("color")).toString() == QStringLiteral("#abcdef")))
+                && observeTerm(160, "projectTimeline->undoManager()->saveSerial() == mixedSerial + 1", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == mixedSerial + 1))
+                && observeTerm(160, "audioNewValues() after the mixed call", static_cast<bool>(audioNewValues()));
+            // A later undo point's undo keeps both new values (the call's entry holds the new flags).
+            // Each leg is observed on its own so a failing one does not hide the next.
+            projectTimeline->saveUndoState(QStringLiteral("E"));
+            projectTimeline->undo();
+            const bool laterUndoLeg = observeTerm(160, "audioNewValues() after saveUndoState(E) + undo", static_cast<bool>(audioNewValues()));
             const auto mixedUndo = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("undo"), {}));
-            g160 = observeTerm(160, "g160", static_cast<bool>(g160)) && observeTerm(160, "mixedUndo.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(mixedUndo.value(QStringLiteral("ok")).toBool()))
-                && observeTerm(160, "projectTimeline->trackAt(true, 0)->isMuted()", static_cast<bool>(projectTimeline->trackAt(true, 0)->isMuted()))
-                && observeTerm(160, "projectTimeline->trackAt(true, 0)->isSolo()", static_cast<bool>(projectTimeline->trackAt(true, 0)->isSolo()))
-                && observeTerm(160, "projectTimeline->trackAt(true, 0)->customName == original.value(QStringLiteral(\"audio\")).toArray().at(0).toObject().value(QStringLiteral(\"name\")).toString()", static_cast<bool>(projectTimeline->trackAt(true, 0)->customName
-                    == original.value(QStringLiteral("audio")).toArray().at(0).toObject().value(QStringLiteral("name")).toString()));
+            const bool undoLeg = observeTerm(160, "mixedUndo.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(mixedUndo.value(QStringLiteral("ok")).toBool()))
+                & observeTerm(160, "!projectTimeline->trackAt(true, 0)->isMuted()", static_cast<bool>(!projectTimeline->trackAt(true, 0)->isMuted()))
+                & observeTerm(160, "!projectTimeline->trackAt(true, 0)->isSolo()", static_cast<bool>(!projectTimeline->trackAt(true, 0)->isSolo()))
+                & observeTerm(160, "projectTimeline->trackAt(true, 0)->customName == originalAudioName", static_cast<bool>(projectTimeline->trackAt(true, 0)->customName == originalAudioName));
+            const auto mixedRedo = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("redo"), {}));
+            const bool redoLeg = observeTerm(160, "mixedRedo.value(QStringLiteral(\"ok\")).toBool()", static_cast<bool>(mixedRedo.value(QStringLiteral("ok")).toBool()))
+                & observeTerm(160, "audioNewValues() after redo", static_cast<bool>(audioNewValues()));
+            g160 = observeTerm(160, "g160", static_cast<bool>(g160)) && laterUndoLeg && undoLeg && redoLeg;
             g160 ? pass("G160 track flags and invalid arguments")
                  : fail("G160 track flags and invalid arguments", QStringLiteral("flags/validation mismatch"));
             projectTimeline->applyTrackFlagsFromJson(original);
@@ -2085,6 +2112,8 @@ int runMcpSelftest()
             {QStringLiteral("trackIndex"), 0},
             {QStringLiteral("locked"), true}
         });
+        // US-2106: the lock is one undo point; the rejected edits push none.
+        const quint64 serialAfterLock = projectTimeline->undoManager()->saveSerial();
         const QJsonObject lockedSplitResponse = callProjectInfoTool(
             207, QStringLiteral("split_clip"), QJsonObject{
                 {QStringLiteral("kind"), QStringLiteral("video")},
@@ -2114,7 +2143,7 @@ int runMcpSelftest()
             && observeTerm(117, "lockedEditRejected(lockedMoveResponse)", static_cast<bool>(lockedEditRejected(lockedMoveResponse)))
             && observeTerm(117, "video0->clipCount() == 1", static_cast<bool>(video0->clipCount() == 1))
             && observeTerm(117, "video0->clips().first().displayName == QStringLiteral(\"locked-guard\")", static_cast<bool>(video0->clips().first().displayName == QStringLiteral("locked-guard")))
-            && observeTerm(117, "!projectTimeline->undoManager()->canUndo()", static_cast<bool>(!projectTimeline->undoManager()->canUndo()));
+            && observeTerm(117, "projectTimeline->undoManager()->saveSerial() == serialAfterLock", static_cast<bool>(projectTimeline->undoManager()->saveSerial() == serialAfterLock));
         g117 ? pass("G117 locked tracks reject split/delete/move")
              : fail("G117 locked tracks reject split/delete/move",
                     QStringLiteral("a locked edit mutated V1 or added undo state"));

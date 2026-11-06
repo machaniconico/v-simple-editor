@@ -3468,7 +3468,7 @@ void McpEditorTools::registerWriteTools()
     trackPropertyInputs.remove(QStringLiteral("locked"));
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_property"),
-        QStringLiteral("トラックの名前・色・再生フラグを設定。名前と色はまとめて1回のUndo、再生フラグはUndo対象外。空の名前・色で既定に戻す。"),
+        QStringLiteral("トラックの名前・色・再生フラグを設定。名前・色・再生フラグはまとめて 1 回の Undo。空の名前・色で既定に戻す。"),
         schemaWithRequired(mergedProperties(trackSelectorProperties(), trackPropertyInputs),
                            {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
         guardedWrite(QStringLiteral("set_track_property"),
@@ -3498,24 +3498,33 @@ void McpEditorTools::registerWriteTools()
                 if (!valid) return setError(err, QStringLiteral("color must be #RRGGBB or empty")), QJsonObject{};
                 color = text.isEmpty() ? QColor{} : QColor(text);
             }
-            const QJsonObject before = trackPropertiesToJson(target.track, target.trackIndex);
-            const bool undoRecorded = name != target.track->customName || color != target.track->color;
+            // US-2106: flags first, so the appearance undo point holds the new flags.
+            const bool appearanceChanged = name != target.track->customName || color != target.track->color;
+            const bool flagsChanged =
+                (args.contains(QStringLiteral("muted")) && args.value(QStringLiteral("muted")).toBool() != target.track->isMuted())
+                || (args.contains(QStringLiteral("solo")) && args.value(QStringLiteral("solo")).toBool() != target.track->isSolo())
+                || (args.contains(QStringLiteral("hidden")) && args.value(QStringLiteral("hidden")).toBool() != target.track->isHidden());
+            if (flagsChanged) {
+                // The whole set: a track missing from the arrays is reset to defaults.
+                QJsonObject flags = currentTimeline->trackFlagsToJson();
+                const QString kind = target.kindName;
+                QJsonArray items = flags.value(kind).toArray();
+                QJsonObject item = items.at(target.trackIndex).toObject();
+                for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
+                    if (args.contains(key)) item.insert(key, args.value(key));
+                items[target.trackIndex] = item;
+                flags.insert(kind, items);
+                currentTimeline->applyTrackFlagsFromJson(flags);
+            }
             if (!currentTimeline->setTrackAppearance(target.kind == TrackKind::Audio,
                     target.trackIndex, name, color, err)) return {};
-            QJsonObject flags = currentTimeline->trackFlagsToJson();
-            const QString kind = target.kindName;
-            QJsonArray items = flags.value(kind).toArray();
-            QJsonObject item = items.at(target.trackIndex).toObject();
-            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
-                if (args.contains(key)) item.insert(key, args.value(key));
-            items[target.trackIndex] = item;
-            flags.insert(kind, items);
-            currentTimeline->applyTrackFlagsFromJson(flags);
+            if (flagsChanged && !appearanceChanged)
+                currentTimeline->saveUndoState(QStringLiteral("トラック設定 (MCP)"));
             const QJsonObject after = trackPropertiesToJson(target.track, target.trackIndex);
-            if (before != after) m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true},
-                {QStringLiteral("track"), after}, {QStringLiteral("undoRecorded"), undoRecorded}};
+                {QStringLiteral("track"), after},
+                {QStringLiteral("undoRecorded"), appearanceChanged || flagsChanged}};
         })
     }, outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -3527,7 +3536,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_locked"),
-        QStringLiteral("指定トラックの編集ロックを設定する。ロック中は split_clip / delete_clip / move_clip などのクリップ編集を拒否する。ロック変更は Undo 対象外。"),
+        QStringLiteral("指定トラックの編集ロックを設定する。ロック中は split_clip / delete_clip / move_clip などのクリップ編集を拒否する。ロック変更は 1 回の Undo。"),
         schemaWithRequired(mergedProperties(trackSelectorProperties(), QJsonObject{
             {QStringLiteral("locked"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("boolean")},

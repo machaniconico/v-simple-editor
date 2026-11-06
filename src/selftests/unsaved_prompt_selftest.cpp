@@ -78,7 +78,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 9; ++g)
+        for (int g = 1; g <= 11; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -134,24 +134,33 @@ int runUnsavedPromptSelftest()
                 {"mixerMute", [&] { mixerMute->click(); }, [&] { return a1->isMuted(); }},
                 {"mixerSolo", [&] { mixerSolo->click(); }, [&] { return a1->isSolo(); }},
             };
+            // US-2106: each toggle is one named undo point; undo brings the flag and
+            // the clean state back, redo flips it again.
             for (const Leg &leg : legs) {
+                timeline.saveUndoState(QStringLiteral("pre"));
                 window.markProjectClean();
                 const bool before = leg.flag();
+                const quint64 serial0 = timeline.undoManager()->saveSerial();
                 QSignalSpy spy(&timeline, &Timeline::trackFlagsChanged);
                 leg.act();
                 const bool flipped = leg.flag() != before;
                 const bool dirty = window.isWindowModified();
+                const bool notClean = !timeline.undoManager()->isClean();
+                const quint64 pushed = timeline.undoManager()->saveSerial() - serial0;
                 const int emits = spy.count();
-                timeline.saveUndoState(QStringLiteral("x"));
                 timeline.undo();
-                const bool backAtClean = timeline.undoManager()->isClean();
-                const bool stillDirty = window.isWindowModified();
-                window.markProjectClean();
-                const bool cleared = !window.isWindowModified();
-                const bool ok = flipped && dirty && emits == 1 && backAtClean && stillDirty && cleared;
+                const bool restored = leg.flag() == before;
+                const bool undoDirty = window.isWindowModified();
+                timeline.redo();
+                const bool reflipped = leg.flag() != before;
+                const bool redoDirty = window.isWindowModified();
+                const bool ok = flipped && dirty && notClean && pushed == 1 && emits == 1
+                    && restored && !undoDirty && reflipped && redoDirty;
                 g7eDetail += std::string(" | ") + leg.name + " flipped=" + b(flipped) + " dirty=" + b(dirty)
-                    + " emits=" + std::to_string(emits) + " undoClean=" + b(backAtClean)
-                    + " afterUndo=" + b(stillDirty) + " cleared=" + b(cleared);
+                    + " notClean=" + b(notClean) + " pushed=" + std::to_string(pushed)
+                    + " emits=" + std::to_string(emits) + " undoRestored=" + b(restored)
+                    + " afterUndo=" + b(undoDirty) + " (expect 0) redoFlipped=" + b(reflipped)
+                    + " afterRedo=" + b(redoDirty);
                 g7e = g7e && ok;
             }
         }
@@ -683,6 +692,79 @@ int runUnsavedPromptSelftest()
         const bool okV = !j1 && askJ && countJ && j2;
         d += " (v) c=" + std::to_string(c) + " jumpToClean=" + b(j1) + " ask=" + b(askJ) + " jumpAway=" + b(j2);
         tally.gate(9, okI && okII && okIII && okIV && okV, d);
+    }
+
+    // ---- G10 (US-2106): a sequence switch outside restore is unsaved; a restore-driven one is not ----
+    {
+        TimelineSequence seqA;
+        seqA.id = QStringLiteral("seq-a");
+        seqA.name = QStringLiteral("A");
+        seqA.videoTracks = {{makeClip(tmp("g10-a.mp4"))}};
+        seqA.audioTracks = {{}};
+        TimelineSequence seqB = seqA;
+        seqB.id = QStringLiteral("seq-b");
+        seqB.name = QStringLiteral("B");
+        seqB.videoTracks = {{makeClip(tmp("g10-b.mp4"))}};
+        timeline.setSequences({seqA, seqB}, seqA.id);
+        undo->clear();
+        timeline.saveUndoState(QStringLiteral("Initial"));
+        window.markProjectClean();
+        const bool clean0 = !window.isWindowModified();
+        // (a) the dock's direct call.
+        const bool toB = timeline.setActiveSequence(seqB.id);
+        const bool onB = timeline.activeSequenceId() == seqB.id;
+        const bool switchDirty = window.isWindowModified();
+        const bool okA = clean0 && toB && onB && switchDirty;
+        std::string d = "(a) clean0=" + b(clean0) + " switched=" + b(toB) + " onB=" + b(onB)
+            + " modified=" + b(switchDirty) + " (expect 1)";
+        // (b) E1 on A, switch, E2 on B, clean at E2: undo lands on A, redo on B, both restore-driven.
+        const bool toA = timeline.setActiveSequence(seqA.id);
+        timeline.saveUndoState(QStringLiteral("E1"));
+        const bool toB2 = timeline.setActiveSequence(seqB.id);
+        timeline.saveUndoState(QStringLiteral("E2"));
+        window.markProjectClean();
+        timeline.undo();
+        const bool undoOnA = timeline.activeSequenceId() == seqA.id;
+        const bool undoDirty = window.isWindowModified();
+        timeline.redo();
+        const bool redoOnB = timeline.activeSequenceId() == seqB.id;
+        const bool redoDirty = window.isWindowModified();
+        const bool okB = toA && toB2 && undoOnA && undoDirty && redoOnB && !redoDirty && undo->isClean();
+        d += " (b) toA=" + b(toA) + " toB=" + b(toB2) + " undoOnA=" + b(undoOnA) + " undoModified=" + b(undoDirty)
+            + " redoOnB=" + b(redoOnB) + " redoModified=" + b(redoDirty) + " (expect 0) isClean=" + b(undo->isClean());
+        tally.gate(10, okA && okB, d);
+    }
+
+    // ---- G11 (US-2106): a flag undo point across a track-structure change ----
+    {
+        timeline.undoManager()->clear();
+        timeline.saveUndoState(QStringLiteral("Initial"));
+        window.markProjectClean();
+        TimelineTrack *a1 = timeline.audioTrackCount() > 0 ? timeline.audioTracks()[0] : nullptr;
+        const bool premise = a1 && !a1->isMuted();
+        const int aBase = timeline.audioTrackCount();
+        if (a1) timeline.toggleMuteTrack(0);
+        const bool muted = a1 && a1->isMuted();
+        timeline.addAudioTrack(true);
+        const int aAdded = timeline.audioTrackCount();
+        const auto a1Muted = [&] {
+            return timeline.audioTrackCount() > 0 && timeline.audioTracks()[0]->isMuted();
+        };
+        timeline.undo();
+        const int aUndo1 = timeline.audioTrackCount();
+        const bool mutedUndo1 = a1Muted();
+        timeline.undo();
+        const bool mutedUndo2 = a1Muted();
+        timeline.redo();
+        timeline.redo();
+        const int aRedo = timeline.audioTrackCount();
+        const bool mutedRedo = a1Muted();
+        const bool ok = premise && muted && aAdded == aBase + 1 && aUndo1 == aBase && mutedUndo1
+            && !mutedUndo2 && aRedo == aAdded && mutedRedo;
+        tally.gate(11, ok, "premise=" + b(premise) + " muted=" + b(muted) + " tracks " + std::to_string(aBase)
+            + "->" + std::to_string(aAdded) + " undo1 tracks=" + std::to_string(aUndo1) + " muted=" + b(mutedUndo1)
+            + " undo2 muted=" + b(mutedUndo2) + " (expect 0) redo2 tracks=" + std::to_string(aRedo)
+            + " muted=" + b(mutedRedo));
     }
 
     window.setUnsavedChangesPromptForTest({});
