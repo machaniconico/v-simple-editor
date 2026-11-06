@@ -1104,7 +1104,51 @@ void ProjectFile::applyTimeRemapEntries(Timeline *timeline,
         timeline->refreshPlaybackSequence();
 }
 
-bool ProjectFile::load(const QString &filePath, ProjectData &data)
+// US-2103: version gate shared by load and fromJsonString. The version must be
+// an integer in 1..PROJECT_FORMAT_VERSION; anything else is refused with a reason.
+static bool readProjectVersion(const QJsonObject &root, int &version, QString *errorMessage)
+{
+    const QJsonValue v = root.value(QStringLiteral("version"));
+    const double d = v.toDouble(-1);
+    if (!v.isDouble() || d != std::floor(d) || d < 1) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("version が 1..%1 の整数ではありません").arg(PROJECT_FORMAT_VERSION);
+        return false;
+    }
+    if (d > PROJECT_FORMAT_VERSION) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("このファイルは新しい形式 (version %1、対応は %2 まで) です")
+                                .arg(QString::number(d, 'f', 0)).arg(PROJECT_FORMAT_VERSION);
+        return false;
+    }
+    version = int(d);
+    return true;
+}
+
+// US-2103: load-time numeric repair. finiteOr: a non-number / non-finite / below-lo
+// value falls back to def, above-hi is clamped to hi. intOr: a non-number / non-finite
+// value falls back to def, both sides clamp (the double is clamped before the int cast).
+static double finiteOr(const QJsonValue &v, double def, double lo, double hi)
+{
+    if (!v.isDouble())
+        return def;
+    const double d = v.toDouble();
+    if (!std::isfinite(d) || d < lo)
+        return def;
+    return std::min(d, hi);
+}
+
+static int intOr(const QJsonValue &v, int def, int lo, int hi)
+{
+    if (!v.isDouble())
+        return def;
+    const double d = v.toDouble();
+    if (!std::isfinite(d))
+        return def;
+    return int(std::min(std::max(d, double(lo)), double(hi)));
+}
+
+bool ProjectFile::load(const QString &filePath, ProjectData &data, QString *errorMessage)
 {
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly))
@@ -1114,7 +1158,8 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     if (doc.isNull()) return false;
 
     QJsonObject root = doc.object();
-    if (!root.contains("version")) return false;
+    int version = 1;
+    if (!readProjectVersion(root, version, errorMessage)) return false;
 
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
@@ -1126,7 +1171,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
 
     // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
     // config (canvas resolution) and tracks are loaded; no-op for version>=2.
-    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+    migrateClipOffsetsToNormalized(data, version);
 
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
@@ -1679,13 +1724,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
 }
 
-bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
+bool ProjectFile::fromJsonString(const QString &json, ProjectData &data, QString *errorMessage)
 {
     QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
     if (doc.isNull()) return false;
 
     QJsonObject root = doc.object();
-    if (!root.contains("version")) return false;
+    int version = 1;
+    if (!readProjectVersion(root, version, errorMessage)) return false;
 
     data.config = configFromJson(root["config"].toObject());
     data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
@@ -1697,7 +1743,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
 
     // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
     // config (canvas resolution) and tracks are loaded; no-op for version>=2.
-    migrateClipOffsetsToNormalized(data, root["version"].toInt(1));
+    migrateClipOffsetsToNormalized(data, version);
 
     data.playheadPos = root["playheadPos"].toDouble();
     data.markIn = root["markIn"].toDouble(-1.0);
@@ -1986,11 +2032,65 @@ ProjectConfig ProjectFile::configFromJson(const QJsonObject &obj)
 {
     ProjectConfig c;
     c.name = obj["name"].toString("Untitled");
-    c.width = obj["width"].toInt(1920);
-    c.height = obj["height"].toInt(1080);
-    c.fps = obj["fps"].toInt(30);
+    // US-2103: bands envelop every generator (ProjectSettings, EDL, FCPXML), not the dialog spins.
+    c.width = int(finiteOr(obj["width"], 1920, 16, 32768));
+    c.height = int(finiteOr(obj["height"], 1080, 16, 32768));
+    const double fpsRaw = obj["fps"].toDouble(30);
+    c.fps = fpsRaw == std::floor(fpsRaw) ? int(finiteOr(obj["fps"], 30, 1, 1000)) : 30;
     c.explicitOutputResolution = obj["explicitOutputResolution"].toBool(false);
     return c;
+}
+
+// US-2103: a clip's mask tracking result, [x, y, w, h, confidence, frame, cx, cy] per region.
+// Written only when non-empty; a result over kMaxTrackingRegions regions is dropped on load.
+static constexpr int kMaxTrackingRegions = 262144;
+static constexpr int kTrackingIntLimit = 16777216; // 2^24: positionAtTime's int differences stay in range
+
+static QJsonObject trackingResultToJson(const TrackingResult &t)
+{
+    QJsonArray regions;
+    for (const TrackingRegion &r : t.regions) {
+        regions.append(QJsonArray{r.rect.x(), r.rect.y(), r.rect.width(), r.rect.height(),
+                                  r.confidence, r.frameNumber,
+                                  r.subPixelCenter.x(), r.subPixelCenter.y()});
+    }
+    QJsonObject o;
+    o["startFrame"] = t.startFrame;
+    o["endFrame"] = t.endFrame;
+    o["fps"] = t.fps;
+    o["srcWidth"] = t.srcWidth;
+    o["srcHeight"] = t.srcHeight;
+    o["regions"] = regions;
+    return o;
+}
+
+static TrackingResult trackingResultFromJson(const QJsonObject &o)
+{
+    TrackingResult t;
+    const QJsonArray regions = o["regions"].toArray();
+    if (regions.size() > kMaxTrackingRegions) {
+        qWarning("ProjectFile: mask tracking dropped (%d regions, limit %d)",
+                 int(regions.size()), kMaxTrackingRegions);
+        return t;
+    }
+    const auto i = [](const QJsonValue &v) { return intOr(v, 0, -kTrackingIntLimit, kTrackingIntLimit); };
+    const auto d = [](const QJsonValue &v, double hi) { return finiteOr(v, 0.0, -hi, hi); };
+    t.regions.reserve(int(regions.size()));
+    for (const QJsonValue &rv : regions) {
+        const QJsonArray a = rv.toArray();
+        TrackingRegion r;
+        r.rect = QRect(i(a.at(0)), i(a.at(1)), i(a.at(2)), i(a.at(3)));
+        r.confidence = finiteOr(a.at(4), 0.0, 0.0, 1.0);
+        r.frameNumber = i(a.at(5));
+        r.subPixelCenter = QPointF(d(a.at(6), kTrackingIntLimit), d(a.at(7), kTrackingIntLimit));
+        t.regions.append(r);
+    }
+    t.startFrame = i(o["startFrame"]);
+    t.endFrame = i(o["endFrame"]);
+    t.fps = finiteOr(o["fps"], 0.0, 0.0, 1000.0);
+    t.srcWidth = i(o["srcWidth"]);
+    t.srcHeight = i(o["srcHeight"]);
+    return t;
 }
 
 // --- Clip ---
@@ -2092,6 +2192,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         }
         obj["stabilizerKeyframes"] = stabilizer;
     }
+    if (!clip.maskTrackingData.isEmpty())
+        obj["maskTracking"] = trackingResultToJson(clip.maskTrackingData);
     if (clip.fitContain)
         obj["fitContain"] = true;
     if (clip.fitCover)
@@ -2189,15 +2291,23 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.sequenceRefId = obj["sequenceRefId"].toString();
     if (clip.sequenceRefId.isEmpty())
         clip.sequenceRefId = timeline_nesting::sequenceIdFromClipFilePath(clip.filePath);
-    clip.duration = obj["duration"].toDouble();
-    clip.inPoint = obj["inPoint"].toDouble();
-    clip.outPoint = obj["outPoint"].toDouble();
-    clip.leadInSec = obj["leadInSec"].toDouble(0.0);
+    // US-2103: non-finite / negative times are 0; the resolved endpoint (outPoint, or
+    // duration when outPoint is 0 = "use duration") below inPoint pulls outPoint up to
+    // inPoint (a valid outPoint 0 stays the sentinel). 1e9 s keeps
+    // (out - in) / speed finite at the slowest speed in the band.
+    constexpr double kMaxClipSec = 1e9;
+    clip.duration = finiteOr(obj["duration"], 0.0, 0.0, kMaxClipSec);
+    clip.inPoint = finiteOr(obj["inPoint"], 0.0, 0.0, kMaxClipSec);
+    clip.outPoint = finiteOr(obj["outPoint"], 0.0, 0.0, kMaxClipSec);
+    const double resolvedOut = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+    if (resolvedOut < clip.inPoint)
+        clip.outPoint = clip.inPoint;
+    clip.leadInSec = finiteOr(obj["leadInSec"], 0.0, 0.0, kMaxClipSec);
     clip.linkGroup = obj["linkGroup"].toInt(0);
     clip.label = clipLabelFromString(obj["label"].toString());
-    clip.speed = obj["speed"].toDouble(1.0);
+    clip.speed = finiteOr(obj["speed"], 1.0, 1e-7, 1e7);
     clip.reversed = obj["reversed"].toBool(false);
-    clip.volume = obj["volume"].toDouble(1.0);
+    clip.volume = finiteOr(obj["volume"], 1.0, 0.0, 4.0);
     clip.pan = obj["pan"].toDouble(0.0);
     if (obj.contains("clipEq")) {
         QJsonObject chainObj;
@@ -2247,6 +2357,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         kf.scale = k["scale"].toDouble(1.0);
         clip.stabilizerKeyframes.append(kf);
     }
+    if (obj.contains("maskTracking"))
+        clip.maskTrackingData = trackingResultFromJson(obj["maskTracking"].toObject());
     clip.fitContain = obj["fitContain"].toBool(false);
     clip.fitCover = obj["fitCover"].toBool(false);
     clip.lutFilePath = obj["lutFilePath"].toString();

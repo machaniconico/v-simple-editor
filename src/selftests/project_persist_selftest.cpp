@@ -165,7 +165,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 7; ++g)
+        for (int g = 1; g <= 9; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -420,6 +420,174 @@ int runProjectPersistSelftest()
         tally.gate(6, ok, "saved=" + b(saved) + " resolved=" + b(resolved) + " fileLayers=" + std::to_string(fileLayers)
             + " meanAbsDiff(file, noLayer)=" + std::to_string(diff) + " format=" + std::to_string(int(fromFile.format()))
             + "/" + std::to_string(int(inMemory.format())) + " sameAsInMemory=" + b(sameAsMemory));
+    }
+
+    // ---- G8 / G9 (US-2103): load-time numeric repair and the version gate ----
+    // A project document with `clips` clips (10 s each); `config` keys and per-clip
+    // `patches` keys are written over the saved JSON, so the values are the file's, not the model's.
+    const auto docWith = [&](const QJsonObject &config, const QVector<QJsonObject> &patches,
+                             const QJsonValue &version = QJsonValue(QJsonValue::Undefined)) {
+        ProjectData base;
+        QVector<ClipInfo> clips;
+        for (int i = 0; i < patches.size(); ++i) {
+            ClipInfo c;
+            c.filePath = QStringLiteral("/selftests/project-persist-%1.mp4").arg(i);
+            c.displayName = QStringLiteral("c%1").arg(i);
+            c.duration = 10.0;
+            c.outPoint = 10.0;
+            clips.append(c);
+        }
+        base.videoTracks = {clips};
+        base.audioTracks = {{}};
+        QJsonObject root = QJsonDocument::fromJson(ProjectFile::toJsonString(base).toUtf8()).object();
+        QJsonObject cfg = root.value(QStringLiteral("config")).toObject();
+        for (auto it = config.begin(); it != config.end(); ++it)
+            cfg[it.key()] = it.value();
+        root[QStringLiteral("config")] = cfg;
+        QJsonArray track = root.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+        for (int i = 0; i < patches.size(); ++i) {
+            QJsonObject clip = track.at(i).toObject();
+            for (auto it = patches[i].begin(); it != patches[i].end(); ++it) {
+                if (it.value() == QJsonValue(QStringLiteral("<remove>")))
+                    clip.remove(it.key());
+                else
+                    clip[it.key()] = it.value();
+            }
+            track[i] = clip;
+        }
+        QJsonArray tracks;
+        tracks.append(track);
+        root[QStringLiteral("videoTracks")] = tracks;
+        if (!version.isUndefined())
+            root[QStringLiteral("version")] = version;
+        return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    };
+    {
+        bool ok = true;
+        std::string d;
+        const auto check = [&](const std::string &name, bool passed, const std::string &value = std::string()) {
+            ok = ok && passed;
+            d += name + "=" + b(passed) + (value.empty() ? "" : "(" + value + ") ");
+        };
+        const auto closeTo = [](double got, double want) { return std::abs(got - want) <= 1e-9 * std::abs(want); };
+        const QVector<QJsonValue> speeds = {QJsonValue(0), QJsonValue(-2), QJsonValue(QStringLiteral("x")),
+                                            QJsonValue(1e308), QJsonValue(8.0), QJsonValue(0.05),
+                                            QJsonValue(1.2e-7), QJsonValue(8.6e6), QJsonValue(1e-8),
+                                            QJsonValue(QJsonValue::Null)};
+        const double wantSpeed[] = {1.0, 1.0, 1.0, 1e7, 8.0, 0.05, 1.2e-7, 8.6e6, 1.0, 1.0};
+        QVector<QJsonObject> patches;
+        for (const QJsonValue &sp : speeds)
+            patches.append(QJsonObject{{QStringLiteral("speed"), sp}});
+        patches.append(QJsonObject{{QStringLiteral("volume"), -1}, {QStringLiteral("inPoint"), 5},
+                                   {QStringLiteral("outPoint"), 2}});
+        // duration 2 / inPoint 5 with the "use duration" outPoint spellings (0, missing, negative, null),
+        // then the control: inPoint 3, outPoint 0, duration 10 stays valid.
+        const int firstSentinel = patches.size();
+        for (const QJsonValue &op : {QJsonValue(0), QJsonValue(QStringLiteral("<remove>")), QJsonValue(-1),
+                                     QJsonValue(QJsonValue::Null)})
+            patches.append(QJsonObject{{QStringLiteral("duration"), 2}, {QStringLiteral("inPoint"), 5},
+                                       {QStringLiteral("outPoint"), op}});
+        patches.append(QJsonObject{{QStringLiteral("duration"), 10}, {QStringLiteral("inPoint"), 3},
+                                   {QStringLiteral("outPoint"), 0}});
+        const QString hostile = docWith({{QStringLiteral("fps"), 0}, {QStringLiteral("width"), -5},
+                                         {QStringLiteral("height"), QStringLiteral("x")}}, patches);
+        ProjectData got;
+        const bool parsed = ProjectFile::fromJsonString(hostile, got);
+        check("parsed", parsed);
+        check("fps", got.config.fps == 30, std::to_string(got.config.fps));
+        check("width", got.config.width == 1920, std::to_string(got.config.width));
+        check("height", got.config.height == 1080, std::to_string(got.config.height));
+        const QVector<ClipInfo> clips = got.videoTracks.value(0);
+        check("clips", clips.size() == patches.size(), std::to_string(clips.size()));
+        std::string sp;
+        bool speedsOk = clips.size() == patches.size();
+        bool finite = speedsOk;
+        for (int i = 0; i < speeds.size() && i < clips.size(); ++i) {
+            speedsOk = speedsOk && closeTo(clips[i].speed, wantSpeed[i]);
+            sp += std::to_string(clips[i].speed) + "/";
+        }
+        for (const ClipInfo &c : clips) {
+            const double eff = c.effectiveDuration();
+            finite = finite && std::isfinite(eff) && eff >= 0.0;
+        }
+        check("speeds", speedsOk, sp);
+        check("effectiveDurationFinite", finite);
+        if (clips.size() == patches.size()) {
+            const ClipInfo &trim = clips.at(speeds.size());
+            check("volume", trim.volume == 1.0, std::to_string(trim.volume));
+            check("inOut", trim.inPoint == 5.0 && trim.outPoint == 5.0,
+                  std::to_string(trim.inPoint) + "/" + std::to_string(trim.outPoint));
+            const char *const names[] = {"zero", "missing", "negative", "null"};
+            for (int k = 0; k < 4; ++k) {
+                const ClipInfo &c = clips.at(firstSentinel + k);
+                const double eff = c.effectiveDuration();
+                check(std::string("sentinelOut-") + names[k],
+                      c.inPoint == 5.0 && c.outPoint == 5.0 && std::isfinite(eff) && eff >= 0.0,
+                      std::to_string(c.outPoint) + "/" + std::to_string(eff));
+            }
+            const ClipInfo &ctl = clips.last();
+            check("sentinelKept", ctl.outPoint == 0.0 && closeTo(ctl.effectiveDuration(), 7.0),
+                  std::to_string(ctl.outPoint) + "/" + std::to_string(ctl.effectiveDuration()));
+        }
+        // Controls: legitimate values are untouched, only the out-of-band ones move.
+        struct FpsCase { double in; int want; };
+        for (const FpsCase &f : {FpsCase{60, 60}, FpsCase{240, 240}, FpsCase{5000, 1000},
+                                 FpsCase{29.97, 30}, FpsCase{23.976, 30}}) {
+            ProjectData r;
+            const bool p = ProjectFile::fromJsonString(
+                docWith({{QStringLiteral("fps"), f.in}}, {}), r);
+            check("fps" + std::to_string(f.in), p && r.config.fps == f.want, std::to_string(r.config.fps));
+        }
+        for (const int w : {3840, 8192}) {
+            ProjectData r;
+            const bool p = ProjectFile::fromJsonString(
+                docWith({{QStringLiteral("width"), w}}, {}), r);
+            check("width" + std::to_string(w), p && r.config.width == w, std::to_string(r.config.width));
+        }
+        ProjectData ctl;
+        const bool pc = ProjectFile::fromJsonString(
+            docWith({}, {QJsonObject{{QStringLiteral("speed"), 2.0}}, QJsonObject{{QStringLiteral("volume"), 3.5}},
+                         QJsonObject{{QStringLiteral("volume"), 4.0}}}), ctl);
+        const QVector<ClipInfo> cc = ctl.videoTracks.value(0);
+        check("controls", pc && cc.size() == 3 && cc[0].speed == 2.0 && cc[1].volume == 3.5 && cc[2].volume == 4.0);
+        tally.gate(8, ok, d);
+    }
+    {
+        bool ok = true;
+        std::string d;
+        const QVector<QJsonObject> oneClip = {QJsonObject{}};
+        struct VersionCase { const char *name; QJsonValue v; bool accept; bool newer; };
+        const VersionCase cases[] = {
+            {"3", QJsonValue(3), false, true},
+            {"str", QJsonValue(QStringLiteral("x")), false, false},
+            {"2.5", QJsonValue(2.5), false, false},
+            {"0", QJsonValue(0), false, false},
+            {"-1", QJsonValue(-1), false, false},
+            {"2", QJsonValue(2), true, false},
+            {"1", QJsonValue(1), true, false},
+        };
+        for (const VersionCase &c : cases) {
+            const QString json = docWith({}, oneClip, c.v);
+            ProjectData viaString;
+            QString msgString;
+            const bool s = ProjectFile::fromJsonString(json, viaString, &msgString);
+            const QString path = tmp((std::string("version-") + c.name + ".veditor").c_str());
+            QFile f(path);
+            bool wrote = f.open(QIODevice::WriteOnly) && f.write(json.toUtf8()) > 0;
+            f.close();
+            ProjectData viaFile;
+            QString msgFile;
+            const bool l = wrote && ProjectFile::load(path, viaFile, &msgFile);
+            const bool newerOk = !c.newer
+                || (msgString.contains(QStringLiteral("新しい形式")) && msgFile.contains(QStringLiteral("新しい形式")));
+            const bool reasonOk = c.accept ? (msgString.isEmpty() && msgFile.isEmpty())
+                                           : (!msgString.isEmpty() && !msgFile.isEmpty());
+            const bool one = wrote && s == c.accept && l == c.accept && newerOk && reasonOk;
+            ok = ok && one;
+            d += std::string(c.name) + ": string=" + b(s) + " load=" + b(l) + " reason=" + b(reasonOk && newerOk)
+                + (one ? "" : " WRONG") + " ";
+        }
+        tally.gate(9, ok, d);
     }
 
     tally.gate(7, g7, g7Detail);
