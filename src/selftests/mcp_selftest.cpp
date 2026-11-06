@@ -8289,6 +8289,131 @@ int runMcpSelftest()
         sidecarGates();
     }
 
+    // US-2107 reserved G207: an MCP edit marks the project unsaved through its undo
+    // point, so undoing back to the saved state is clean again. set_project_option
+    // changes state outside the undo snapshot and keeps the explicit dirty (pin).
+    if (!projectTimeline) {
+        fail("G207 MCP edits are undoable back to clean", QStringLiteral("Timeline was not available"));
+    } else {
+        struct Leg { const char* tool; QJsonObject args; QString name; bool modified = false, notClean = false, undone = false, afterUndo = true; };
+        QVector<Leg> legs;
+        const auto saveTestUndoBaseline = [&]() {
+            projectTimeline->undoManager()->clear();
+            projectTimeline->undoManager()->saveState(
+                projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+        };
+        const int videoTracksBefore = projectTimeline->videoTrackCount();
+        const TimecodeBurnInSettings burnInBefore = projectInfoWindow.m_tcBurnIn;
+        int requestId = 20700;
+        const auto runLeg = [&](const char* tool, const QJsonObject& args) {
+            Leg leg{tool, args, QString::fromLatin1(tool)};
+            projectInfoWindow.markProjectClean();
+            const auto response = callProjectInfoTool(++requestId, QString::fromLatin1(tool), args);
+            leg.modified = projectInfoWindow.isWindowModified()
+                && !toolResult(response).value(QStringLiteral("isError")).toBool();
+            leg.notClean = !projectTimeline->undoManager()->isClean();
+            leg.undone = projectTimeline->canUndo();
+            projectTimeline->undo();
+            leg.afterUndo = projectInfoWindow.isWindowModified();
+            legs.append(leg);
+        };
+        saveTestUndoBaseline();
+        projectInfoWindow.markProjectClean();
+        runLeg("add_track", {{QStringLiteral("kind"), QStringLiteral("video")}});
+        // Two video tracks again for move_track / remove_track.
+        callProjectInfoTool(++requestId, QStringLiteral("add_track"), {{QStringLiteral("kind"), QStringLiteral("video")}});
+        saveTestUndoBaseline();
+        runLeg("move_track", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0}, {QStringLiteral("newTrackIndex"), 1}});
+        runLeg("remove_track", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 1}});
+        runLeg("set_track_locked", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true}});
+        // The remaining converted tools (import_media, move_clip, connect_clip,
+        // disconnect_clip, replace_clip, relink_media, dynamic_zoom), each from a fixture
+        // already used by its own gate.
+        {
+            const int audioTracksBefore = projectTimeline->audioTrackCount();
+            const auto resetRows = [&](const QVector<QVector<ClipInfo>>& videoRows) {
+                QVector<QVector<ClipInfo>> padded = videoRows;
+                while (padded.size() < videoTracksBefore)
+                    padded.append(QVector<ClipInfo>());
+                projectTimeline->restoreFromProject(
+                    padded, QVector<QVector<ClipInfo>>(audioTracksBefore), 0.0, -1.0, -1.0, 100);
+                projectTimeline->clearSelection();
+                saveTestUndoBaseline();
+            };
+            QTemporaryDir legMediaDir;
+            const QString legMediaPath = QDir(legMediaDir.path()).filePath(QStringLiteral("g207-replacement.mp4"));
+            const bool legMediaReady = importSourceReady && legMediaDir.isValid()
+                && QFile::copy(importSourcePath, legMediaPath);
+            if (legMediaReady) {
+                resetRows({});
+                runLeg("import_media", {{QStringLiteral("filePath"), importSourcePath}, {QStringLiteral("trackIndex"), 0}});
+            }
+            resetRows({{makeTestClip(QStringLiteral("g207-move"), 0)}});
+            runLeg("move_clip", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                                 {QStringLiteral("clipIndex"), 0}, {QStringLiteral("newStartSec"), 2.0}});
+            ClipInfo legAnchor = makeTestClip(QStringLiteral("/selftests/mcp-g207-anchor.mp4"), 0);
+            legAnchor.duration = legAnchor.outPoint = 10.0;
+            ClipInfo legConnected = makeTestClip(QStringLiteral("/selftests/mcp-g207-connected.mp4"), 0);
+            legConnected.duration = legConnected.outPoint = 2.0;
+            legConnected.leadInSec = 4.0;
+            resetRows({{legAnchor}, {legConnected}});
+            runLeg("connect_clip", {{QStringLiteral("trackIndex"), 1}, {QStringLiteral("clipIndex"), 0}, {QStringLiteral("anchorClipIndex"), 0}});
+            // disconnect_clip needs a connected clip: connect it, make that the saved baseline.
+            callProjectInfoTool(++requestId, QStringLiteral("connect_clip"),
+                QJsonObject{{QStringLiteral("trackIndex"), 1}, {QStringLiteral("clipIndex"), 0}, {QStringLiteral("anchorClipIndex"), 0}});
+            saveTestUndoBaseline();
+            runLeg("disconnect_clip", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 1},
+                                       {QStringLiteral("clipIndex"), 0}});
+            if (legMediaReady) {
+                ClipInfo replaceClip = makeTestClip(importSourcePath, 0);
+                replaceClip.inPoint = 1.0;
+                replaceClip.outPoint = 3.0;
+                resetRows({{replaceClip}});
+                runLeg("replace_clip", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                                        {QStringLiteral("clipIndex"), 0}, {QStringLiteral("filePath"), legMediaPath}});
+                const QString relinkOld = QStringLiteral("/selftests/g207-relink-old.mp4");
+                resetRows({{makeTestClip(relinkOld, 0)}});
+                runLeg("relink_media", {{QStringLiteral("mapping"), QJsonArray{QJsonObject{
+                    {QStringLiteral("from"), relinkOld}, {QStringLiteral("to"), legMediaPath}}}}});
+            }
+            resetRows({{makeTestClip(QStringLiteral("g207-zoom"), 0)}});
+            runLeg("dynamic_zoom", {{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                                    {QStringLiteral("clipIndex"), 0}, {QStringLiteral("preset"), QStringLiteral("zoomIn")}});
+            resetRows({});
+        }
+        bool g207 = true;
+        QStringList detail;
+        for (const Leg& leg : legs) {
+            const bool ok = leg.modified && leg.notClean && leg.undone && !leg.afterUndo;
+            detail << QStringLiteral("%1 modified=%2 notClean=%3 undone=%4 modifiedAfterUndo=%5")
+                          .arg(leg.name).arg(leg.modified).arg(leg.notClean).arg(leg.undone).arg(leg.afterUndo);
+            g207 = observeTerm(207, leg.tool, ok) && g207;
+        }
+        g207 = observeTerm(207, "11 converted tools ran (add_track, move_track, remove_track, set_track_locked, import_media, move_clip, connect_clip, disconnect_clip, replace_clip, relink_media, dynamic_zoom)", legs.size() == 11) && g207;
+        // Pin: set_project_option is outside the undo snapshot, so an undo back to the
+        // clean undo point leaves the project unsaved.
+        projectInfoWindow.markProjectClean();
+        const auto pinResponse = callProjectInfoTool(++requestId, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), QJsonObject{{QStringLiteral("enabled"), true}}}});
+        const bool pinSet = projectInfoWindow.isWindowModified()
+            && !toolResult(pinResponse).value(QStringLiteral("isError")).toBool();
+        projectTimeline->saveUndoState(QStringLiteral("E"));
+        const bool pinUndone = projectTimeline->canUndo();
+        projectTimeline->undo();
+        const bool pinStays = projectInfoWindow.isWindowModified() && projectTimeline->undoManager()->isClean();
+        g207 = observeTerm(207, "pin: set_project_option marks unsaved", pinSet) && g207;
+        g207 = observeTerm(207, "pin: modified stays after undo to the clean point (explicit dirty)", pinUndone && pinStays) && g207;
+        // Restore the fixture: the extra video track and the burn-in setting.
+        while (projectTimeline->videoTrackCount() > videoTracksBefore)
+            projectTimeline->removeTrack(false, projectTimeline->videoTrackCount() - 1, nullptr);
+        projectInfoWindow.applyTimecodeBurnInSettings(burnInBefore);
+        projectInfoWindow.markProjectClean();
+        qInfo().noquote() << "[mcp] G207 legs:" << detail.join(QStringLiteral(" | "));
+        tallyObserved(207, g207, "an MCP edit stayed unsaved after undo to the saved state, or the explicit-dirty pin did not hold");
+        saveTestUndoBaseline();
+    }
+
     server.stop();
     qInfo().noquote().nospace() << "[mcp] selftest end";
     return tally.finish("mcp");
