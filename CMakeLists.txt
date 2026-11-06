@@ -378,6 +378,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/OnionSkin.h
     src/OnionSkin.cpp
     src/selftests/subtitle_karaoke_selftest.cpp
+    src/selftests/subtitle_import_selftest.cpp
     # SP (スペクトル編集): iZotope RX 風 STFT/iSTFT 純粋エンジン + スペクトログラム UI。
     src/SpectralEngine.h
     src/SpectralEngine.cpp

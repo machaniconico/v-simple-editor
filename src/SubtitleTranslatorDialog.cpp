@@ -119,6 +119,9 @@ void SubtitleTranslatorDialog::onLoadSrtClicked()
                              tr("SRT を読み込めませんでした: %1").arg(result.error));
         return;
     }
+    if (!result.warnings.isEmpty())
+        QMessageBox::information(this, tr("字幕の取り込み"),
+                                 result.warnings.join(QLatin1Char('\n')));
 
     m_track.clear();
     for (const caption::Clip &c : result.clips)

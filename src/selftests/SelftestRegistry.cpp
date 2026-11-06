@@ -275,6 +275,7 @@ int runSubMovtextSelftest();
 int runSubXlatSelftest();
 int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
+int runSubtitleImportSelftest();
 int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTcburnSelftest();
@@ -932,6 +933,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
+    { "subtitle-import",  "VEDITOR_SUBTITLE_IMPORT_SELFTEST",     runSubtitleImportSelftest,     false,
+      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (6 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
       "snsfit::containGeom/containInAspectCanvas pure geometry (15 gates)" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
