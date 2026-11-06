@@ -2681,6 +2681,9 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
         statusBar()->showMessage("Auto-saved: " + QFileInfo(path).fileName(), 3000);
     });
+    connect(m_autoSave, &AutoSave::saveFailed, this, [this](const QString &, const QString &error) {
+        statusBar()->showMessage(tr("自動保存に失敗: %1").arg(error), 5000);
+    });
     connect(m_autoSave, &AutoSave::recoveryAvailable, this, [this](const QStringList &files) {
         if (files.isEmpty())
             return;
@@ -9306,15 +9309,7 @@ void MainWindow::populateProjectData(ProjectData &data)
         entry.text = seg.text;
         data.subtitleSegments.append(entry);
     }
-    QJsonObject styleJson;
-    styleJson["fontName"] = m_subtitleStyle.font.family();
-    styleJson["fontSize"] = m_subtitleStyle.font.pointSize();
-    styleJson["fontBold"] = m_subtitleStyle.font.bold();
-    styleJson["color"] = m_subtitleStyle.color.name(QColor::HexArgb);
-    styleJson["outlineColor"] = m_subtitleStyle.outlineColor.name(QColor::HexArgb);
-    styleJson["outlineWidth"] = m_subtitleStyle.outlineWidth;
-    styleJson["verticalPos"] = m_subtitleStyle.verticalPos;
-    data.subtitleStyle = styleJson;
+    data.subtitleStyle = m_subtitleStyle.toJson();
 
     QJsonObject loudnessJson;
     const auto *normalizerMixer = m_player ? m_player->audioMixer() : nullptr;
@@ -9596,16 +9591,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         seg.text = entry.text;
         m_subtitleSegments.append(seg);
     }
-    m_subtitleStyle = SubtitleStyle{};
-    if (!data.subtitleStyle.isEmpty()) {
-        m_subtitleStyle.font.setFamily(data.subtitleStyle.value("fontName").toString());
-        m_subtitleStyle.font.setPointSize(data.subtitleStyle.value("fontSize").toInt());
-        m_subtitleStyle.font.setBold(data.subtitleStyle.value("fontBold").toBool());
-        m_subtitleStyle.color = QColor(data.subtitleStyle.value("color").toString());
-        m_subtitleStyle.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString());
-        m_subtitleStyle.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble();
-        m_subtitleStyle.verticalPos = data.subtitleStyle.value("verticalPos").toDouble();
-    }
+    m_subtitleStyle = data.subtitleStyle.isEmpty() ? SubtitleStyle{}
+                                                   : SubtitleStyle::fromJson(data.subtitleStyle);
 
     applyVfxProjectState(data.vfxState);
 

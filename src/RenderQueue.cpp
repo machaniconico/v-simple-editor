@@ -1381,16 +1381,8 @@ void RenderQueue::startRenderPipe(int jobIndex)
                 segment.text = entry.text;
                 segments.append(segment);
             }
-            SubtitleStyle style;
-            if (!data.subtitleStyle.isEmpty()) {
-                style.font.setFamily(data.subtitleStyle.value("fontName").toString());
-                style.font.setPointSize(data.subtitleStyle.value("fontSize").toInt(28));
-                style.font.setBold(data.subtitleStyle.value("fontBold").toBool(true));
-                style.color = QColor(data.subtitleStyle.value("color").toString("#ffffffff"));
-                style.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString("#ff000000"));
-                style.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble(2.0);
-                style.verticalPos = data.subtitleStyle.value("verticalPos").toDouble(0.85);
-            }
+            const SubtitleStyle style = data.subtitleStyle.isEmpty()
+                ? SubtitleStyle{} : SubtitleStyle::fromJson(data.subtitleStyle);
             appendSubtitleTrack(subtitleJob.exportConfig, segments, style, nullptr);
         }
     }

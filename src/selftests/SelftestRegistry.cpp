@@ -56,6 +56,7 @@ int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAudioTrackFxSelftest();
 int runAudioXfadeSelftest();
+int runAutosaveSelftest();
 int runAutoClipGenSelftest();
 int runAutoColorPreserveGradeSelftest();
 int runAutoColorSelftest();
@@ -933,6 +934,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
+    { "autosave",         nullptr,                                runAutosaveSelftest,           true,
+      "Autosave: atomic QSaveFile write, unchanged skip, failure report, UTC name rotation and 12-field subtitle style (5 gates)" },
     { "subtitle-import",  "VEDITOR_SUBTITLE_IMPORT_SELFTEST",     runSubtitleImportSelftest,     false,
       "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (6 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
