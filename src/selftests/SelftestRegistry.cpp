@@ -793,7 +793,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "psd-import", "VEDITOR_PSD_IMPORT_SELFTEST", runPsdImportSelftest, false,
       "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G6) (6 gates)" },
     { "lut-import", "VEDITOR_LUT_IMPORT_SELFTEST", runLutImportSelftest, false,
-      ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (7 gates)" },
+      ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (12 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7, G3b) (8 gates)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,

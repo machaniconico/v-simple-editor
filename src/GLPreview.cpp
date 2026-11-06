@@ -3708,6 +3708,9 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
+    // 1D / non-default-domain LUTs become a 3D grid; a default-domain 3D LUT passes through
+    const LutData grid = LutImporter::toGpuGrid(lut);
+
     undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
     undotrace::log("gl:afterMakeCurrent");
@@ -3719,7 +3722,7 @@ void GLPreview::setLut(const LutData &lut)
 
     // Create 3D texture from LUT table
     m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
-    m_lutTexture->setSize(lut.size, lut.size, lut.size);
+    m_lutTexture->setSize(grid.size, grid.size, grid.size);
     m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
     m_lutTexture->allocateStorage();
     m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
@@ -3728,8 +3731,8 @@ void GLPreview::setLut(const LutData &lut)
 
     // Upload LUT data as float RGB
     QVector<float> data;
-    data.reserve(lut.table.size() * 3);
-    for (const QVector3D &v : lut.table) {
+    data.reserve(grid.table.size() * 3);
+    for (const QVector3D &v : grid.table) {
         data.append(v.x());
         data.append(v.y());
         data.append(v.z());
@@ -3737,7 +3740,7 @@ void GLPreview::setLut(const LutData &lut)
     m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
                           data.constData());
 
-    m_lutIntensity = static_cast<float>(lut.intensity);
+    m_lutIntensity = static_cast<float>(grid.intensity);
     m_lutEnabled = true;
 
     doneCurrent();

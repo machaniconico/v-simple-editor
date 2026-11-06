@@ -32,6 +32,7 @@ LutData LutImporter::loadCubeFile(const QString &filePath)
 
     QTextStream in(&file);
     bool is1D = false;
+    bool badDomain = false;
 
     while (!in.atEnd()) {
         QString line = in.readLine().trimmed();
@@ -74,9 +75,28 @@ LutData LutImporter::loadCubeFile(const QString &filePath)
             continue;
         }
 
-        // Skip DOMAIN_MIN / DOMAIN_MAX and other keywords
-        if (line.startsWith("DOMAIN_MIN") || line.startsWith("DOMAIN_MAX"))
+        // DOMAIN_MIN / DOMAIN_MAX r g b: exactly three finite floats, trailing # comment allowed
+        if (line.startsWith("DOMAIN_MIN") || line.startsWith("DOMAIN_MAX")) {
+            const bool isMin = line.startsWith("DOMAIN_MIN");
+            const int hash = line.indexOf('#');
+            if (hash >= 0)
+                line.truncate(hash);
+            const QStringList parts = line.split(QRegularExpression("\\s+"), Qt::SkipEmptyParts);
+            if (parts.isEmpty() || parts[0] != (isMin ? "DOMAIN_MIN" : "DOMAIN_MAX"))
+                continue;
+            bool ok = parts.size() == 4;
+            float v[3] = {0, 0, 0};
+            for (int i = 0; ok && i < 3; ++i) {
+                bool okv = false;
+                v[i] = parts[i + 1].toFloat(&okv);
+                ok = okv && std::isfinite(v[i]);
+            }
+            if (!ok)
+                badDomain = true;
+            else
+                (isMin ? lut.domainMin : lut.domainMax) = QVector3D(v[0], v[1], v[2]);
             continue;
+        }
         if (line[0].isLetter())
             continue;
 
@@ -90,6 +110,14 @@ LutData LutImporter::loadCubeFile(const QString &filePath)
             if (okR && okG && okB)
                 lut.table.append(QVector3D(r, g, b));
         }
+    }
+
+    // A domain that is malformed or has max <= min on any channel invalidates the LUT
+    if (badDomain || lut.domainMax.x() <= lut.domainMin.x() || lut.domainMax.y() <= lut.domainMin.y()
+        || lut.domainMax.z() <= lut.domainMin.z()) {
+        lut.size = 0;
+        lut.table.clear();
+        return lut;
     }
 
     // Validate table size
@@ -158,6 +186,51 @@ QVector3D LutImporter::trilinearInterpolate(const QVector<QVector3D> &table, int
     return c0 * (1.0f - bFrac) + c1 * bFrac;
 }
 
+QVector3D LutImporter::sample(const LutData &lut, const QVector3D &rgb01)
+{
+    float n[3];
+    for (int c = 0; c < 3; ++c) {
+        const float lo = lut.domainMin[c];
+        n[c] = qBound(0.0f, (rgb01[c] - lo) / (lut.domainMax[c] - lo), 1.0f);
+    }
+    if (lut.type == LutType::Cube3D)
+        return trilinearInterpolate(lut.table, lut.size, n[0], n[1], n[2]);
+
+    // 1D LUT: per-channel linear interpolation; the last row is reached at n == 1
+    const float maxIdx = static_cast<float>(lut.size - 1);
+    QVector3D out;
+    for (int c = 0; c < 3; ++c) {
+        const float idx = qBound(0.0f, n[c] * maxIdx, maxIdx);
+        const int i0 = qMin(static_cast<int>(idx), lut.size - 2);
+        const float frac = idx - i0;
+        out[c] = lut.table[i0][c] * (1.0f - frac) + lut.table[i0 + 1][c] * frac;
+    }
+    return out;
+}
+
+LutData LutImporter::toGpuGrid(const LutData &in, int maxSize)
+{
+    if (!in.isValid() || (in.type == LutType::Cube3D && in.hasDefaultDomain()))
+        return in;
+
+    const int n = in.type == LutType::Cube1D ? qBound(2, in.size, maxSize) : in.size;
+    LutData out;
+    out.name = in.name;
+    out.filePath = in.filePath;
+    out.intensity = in.intensity;
+    out.type = LutType::Cube3D;
+    out.size = n;
+    out.table.resize(qint64(n) * n * n);
+    const float last = static_cast<float>(n - 1);
+    // .cube 3D layout: R changes fastest, then G, then B
+    int i = 0;
+    for (int b = 0; b < n; ++b)
+        for (int g = 0; g < n; ++g)
+            for (int r = 0; r < n; ++r)
+                out.table[i++] = sample(in, QVector3D(r / last, g / last, b / last));
+    return out;
+}
+
 QImage LutImporter::applyLut(const QImage &image, const LutData &lutData)
 {
     if (!lutData.isValid())
@@ -174,7 +247,7 @@ QImage LutImporter::applyLut(const QImage &image, const LutData &lutData)
                 float g = line[x * 3 + 1] / 255.0f;
                 float b = line[x * 3 + 2] / 255.0f;
 
-                QVector3D mapped = trilinearInterpolate(lutData.table, lutData.size, r, g, b);
+                QVector3D mapped = sample(lutData, QVector3D(r, g, b));
 
                 line[x * 3]     = clamp255(static_cast<int>(mapped.x() * 255.0f));
                 line[x * 3 + 1] = clamp255(static_cast<int>(mapped.y() * 255.0f));
@@ -186,22 +259,12 @@ QImage LutImporter::applyLut(const QImage &image, const LutData &lutData)
         for (int y = 0; y < h; ++y) {
             uint8_t *line = img.scanLine(y);
             for (int x = 0; x < w; ++x) {
-                for (int c = 0; c < 3; ++c) {
-                    float val = line[x * 3 + c] / 255.0f;
-                    float idx = qBound(0.0f, val * (lutData.size - 1), static_cast<float>(lutData.size - 2));
-                    int i0 = static_cast<int>(idx);
-                    int i1 = i0 + 1;
-                    float frac = idx - i0;
-
-                    float v0 = (c == 0) ? lutData.table[i0].x()
-                             : (c == 1) ? lutData.table[i0].y()
-                                        : lutData.table[i0].z();
-                    float v1 = (c == 0) ? lutData.table[i1].x()
-                             : (c == 1) ? lutData.table[i1].y()
-                                        : lutData.table[i1].z();
-                    float mapped = v0 * (1.0f - frac) + v1 * frac;
-                    line[x * 3 + c] = clamp255(static_cast<int>(mapped * 255.0f));
-                }
+                const QVector3D mapped = sample(lutData, QVector3D(line[x * 3] / 255.0f,
+                                                                    line[x * 3 + 1] / 255.0f,
+                                                                    line[x * 3 + 2] / 255.0f));
+                line[x * 3]     = clamp255(static_cast<int>(mapped.x() * 255.0f));
+                line[x * 3 + 1] = clamp255(static_cast<int>(mapped.y() * 255.0f));
+                line[x * 3 + 2] = clamp255(static_cast<int>(mapped.z() * 255.0f));
             }
         }
     }
