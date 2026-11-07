@@ -3,27 +3,41 @@
 // is replaced. The gates never call closeEvent (it writes the real QSettings
 // and the real autosave directory); they observe maybeSaveChanges() and the
 // prompt / save-as / failure-dialog / missing-media seams.
+#include "../AudioMixer.h"
 #include "../AudioMixerDock.h"
+#include "../EffectClipboard.h"
+#include "../EffectControlsPanel.h"
 #include "../MainWindow.h"
 #include "../MediaPaths.h"
+#include "../MotionSectionWidget.h"
+#include "../MultiCam.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
 #include "SelftestGate.h"
 
+#include <QApplication>
+#include <QCheckBox>
 #include <QCoreApplication>
 #include <QDir>
 #include <QEvent>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QImage>
 #include <QLabel>
 #include <QLayout>
+#include <QMenu>
+#include <QMessageBox>
 #include <QMetaObject>
+#include <QRegularExpression>
 #include <QPushButton>
+#include <QSettings>
 #include <QSignalSpy>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QTimer>
 
 #include <functional>
 #include <string>
@@ -71,6 +85,44 @@ QPushButton *headerButton(Timeline &timeline, const QString &trackName, const QS
     return nullptr;
 }
 
+// US-2108: answers whatever the leg under test opens, so a dialog never blocks the run. A
+// message box is answered Yes; any other modal dialog gets `prep` and is accepted; a popup
+// menu has its first action triggered, or the action whose text is `actionText`.
+struct DialogDriver {
+    DialogDriver(QObject *context, std::function<void(QWidget *)> prepare = {}, QString actionText = {})
+        : prep(std::move(prepare)), action(std::move(actionText))
+    {
+        timer.setInterval(20);
+        QObject::connect(&timer, &QTimer::timeout, context, [this] {
+            if (auto *menu = qobject_cast<QMenu *>(QApplication::activePopupWidget())) {
+                ++answered;
+                QAction *target = menu->actions().isEmpty() ? nullptr : menu->actions().first();
+                for (QAction *candidate : menu->actions())
+                    if (!action.isEmpty() && candidate->text() == action) target = candidate;
+                if (target) target->trigger();
+                menu->close();
+                return;
+            }
+            QWidget *modal = QApplication::activeModalWidget();
+            if (!modal) return;
+            ++answered;
+            if (auto *box = qobject_cast<QMessageBox *>(modal)) {
+                if (QAbstractButton *yes = box->button(QMessageBox::Yes)) yes->click();
+                else box->reject();
+                return;
+            }
+            if (prep) prep(modal);
+            QMetaObject::invokeMethod(modal, "accept");
+        });
+        timer.start();
+    }
+    ~DialogDriver() { timer.stop(); }
+    QTimer timer;
+    std::function<void(QWidget *)> prep;
+    QString action;
+    int answered = 0;
+};
+
 } // namespace
 
 int runUnsavedPromptSelftest()
@@ -78,7 +130,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 11; ++g)
+        for (int g = 1; g <= 12; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -765,6 +817,304 @@ int runUnsavedPromptSelftest()
             + "->" + std::to_string(aAdded) + " undo1 tracks=" + std::to_string(aUndo1) + " muted=" + b(mutedUndo1)
             + " undo2 muted=" + b(mutedUndo2) + " (expect 0) redo2 tracks=" + std::to_string(aRedo)
             + " muted=" + b(mutedRedo));
+    }
+
+    // ---- G12 (US-2108): a persisted setting that reached the file with neither an undo point nor an
+    // explicit dirty is now unsaved; an undo-point row also undoes to clean and redoes its change ----
+    {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        MainWindow w12;
+        Timeline &tl = *w12.m_timeline;
+        UndoManager *um = tl.undoManager();
+        const QString clipPath = tmp("g12-clip.mp4");
+        const QString stillPath = tmp("g12-still.png");
+        const QString camPath = tmp("g12-cam.mp4");
+        const bool filesOk = touchFile(clipPath) && touchFile(camPath)
+            && ([&] { QImage img(64, 64, QImage::Format_RGB32); img.fill(Qt::gray); return img.save(stillPath); })();
+        const auto v1Clip = [&]() -> ClipInfo {
+            const auto &clips = tl.videoClips();
+            return clips.isEmpty() ? ClipInfo{} : clips.first();
+        };
+        const auto setup = [&](const QString &path) {
+            tl.videoTracks()[0]->setClips({makeClip(path)});
+            tl.videoTracks()[0]->setSelectedClip(0);
+            um->clear();
+            tl.saveUndoState(QStringLiteral("Initial"));
+            w12.markProjectClean();
+            effectctrl::EffectClipboard::instance().capture({}, effectctrl::ClipMotion{});
+        };
+        // `changed` is true on the live state after the edit; `undone` after one undo; `redone` after the redo.
+        struct Leg {
+            const char *name;
+            QString clip;
+            std::function<void()> act;
+            std::function<bool()> changed;
+            std::function<bool()> undone;
+            std::function<bool()> redone;
+            std::function<void(QWidget *)> prep;
+            const char *action = "";   // popup-menu action the driver triggers (default: the first)
+            bool timed = false;        // the edit takes its undo point from a single-shot timer
+            bool driven = false;       // a dialog or popup menu opens: the driver must have answered it
+        };
+        VideoEffect blur;
+        blur.type = VideoEffectType::Blur;
+        const auto clipboardMotion = [] {
+            effectctrl::ClipMotion m;
+            m.scale = 1.5;
+            m.dx = 0.2;
+            return m;
+        };
+        const auto scaleIs = [&](double v) { return std::abs(v1Clip().videoScale - v) < 1e-9; };
+        const auto eqMixer = [&] { return w12.m_player->audioMixer(); };
+        // Audio > Track EQ > A1: the submenu is rebuilt on aboutToShow; trigger the named action
+        // (empty = the first preset).
+        const auto triggerTrackEq = [&](const QString &text) {
+            auto *menu = w12.findChild<QMenu *>(QStringLiteral("trackEqMenu"));
+            if (!menu) return;
+            Q_EMIT menu->aboutToShow();
+            for (QAction *track : menu->actions()) {
+                if (!track->menu() || track->menu()->actions().isEmpty()) continue;
+                QAction *target = track->menu()->actions().first();
+                for (QAction *candidate : track->menu()->actions())
+                    if (!text.isEmpty() && candidate->text() == text) target = candidate;
+                target->trigger();
+                return;
+            }
+        };
+        const auto enableEqClean = [&] {
+            eqMixer()->setTrackEqEnabled(0, true);
+            w12.markProjectClean();
+        };
+        MultiCamProject cam;
+        cam.angles = {MultiCamAngle{1, camPath, 0, QStringLiteral("A")}};
+        cam.switches = {MultiCamSwitch{0, 1}};
+        const QVector<Leg> legs = {
+            {"dragTransform", clipPath,
+             [&] { Q_EMIT w12.m_player->videoSourceTransformChanged(0, 0, 1.5, 0.2, 0.1); },
+             [&] { return scaleIs(1.5); }, [&] { return scaleIs(1.0); }, [&] { return scaleIs(1.5); },
+             nullptr, "", true},
+            {"effectControlsMotion", clipPath,
+             [&] {
+                 Q_EMIT tl.clipSelectedOnTrack(0, 0);
+                 auto *motion = w12.m_effectControlsPanel->findChild<effectctrl::MotionSectionWidget *>();
+                 if (!motion) return;
+                 effectctrl::MotionState state = motion->currentMotion();
+                 state.scale = 1.5;
+                 Q_EMIT motion->motionChanged(state);
+             },
+             [&] { return scaleIs(1.5); }, [&] { return scaleIs(1.0); }, [&] { return scaleIs(1.5); },
+             nullptr, "", true},
+            {"pasteEffects", clipPath,
+             [&] {
+                 effectctrl::EffectClipboard::instance().capture({blur}, clipboardMotion());
+                 w12.pasteEffects();
+             },
+             [&] { return scaleIs(1.5) && v1Clip().effects.size() == 1; },
+             [&] { return scaleIs(1.0) && v1Clip().effects.isEmpty(); },
+             [&] { return scaleIs(1.5) && v1Clip().effects.size() == 1; }, nullptr},
+            {"pasteAttributes", clipPath,
+             [&] {
+                 effectctrl::EffectClipboard::instance().capture({blur}, clipboardMotion());
+                 w12.pasteAttributes();
+             },
+             // Scale only: the effects checkbox is cleared, so no effects setter records the point.
+             [&] { return scaleIs(1.5) && v1Clip().effects.isEmpty(); }, [&] { return scaleIs(1.0); },
+             [&] { return scaleIs(1.5) && v1Clip().effects.isEmpty(); },
+             [](QWidget *dialog) {
+                 for (auto *check : dialog->findChildren<QCheckBox *>())
+                     check->setChecked(check->text() == QStringLiteral("Scale"));
+             }},
+            {"speedAtempo", clipPath,
+             [&] { w12.openSpeedRampDialog(); },
+             [&] { return v1Clip().atempoEnabled; }, [&] { return !v1Clip().atempoEnabled; },
+             [&] { return v1Clip().atempoEnabled; },
+             [](QWidget *dialog) {
+                 for (auto *check : dialog->findChildren<QCheckBox *>()) check->setChecked(true);
+             }},
+            {"stabilizer", stillPath,
+             [&] { w12.runMotionStabilizer(); },
+             [&] { return !v1Clip().stabilizerKeyframes.isEmpty(); },
+             [&] { return v1Clip().stabilizerKeyframes.isEmpty(); },
+             [&] { return !v1Clip().stabilizerKeyframes.isEmpty(); }, nullptr},
+            {"multicamEdl", clipPath,
+             [&] { w12.onMultiCamApplyToTimeline(cam); },
+             [&] { return v1Clip().filePath == camPath; }, [&] { return v1Clip().filePath == clipPath; },
+             [&] { return v1Clip().filePath == camPath; }, nullptr},
+            {"eqAudioMenuPreset", clipPath, [&] { triggerTrackEq({}); },
+             [&] { return eqMixer()->trackEqEnabled(0); }, nullptr, nullptr, nullptr},
+            {"eqAudioMenuBypass", clipPath, [&] { enableEqClean(); triggerTrackEq(QStringLiteral("Bypass / Reset")); },
+             [&] { return !eqMixer()->trackEqEnabled(0); }, nullptr, nullptr, nullptr},
+            {"eqMeterMenuPreset", clipPath, [&] { w12.onMeterRequestEqPresetMenu(0, QPoint(0, 0)); },
+             [&] { return eqMixer()->trackEqEnabled(0); }, nullptr, nullptr, nullptr, "", false, true},
+            {"eqMeterMenuBypass", clipPath,
+             [&] { enableEqClean(); w12.onMeterRequestEqPresetMenu(0, QPoint(0, 0)); },
+             [&] { return !eqMixer()->trackEqEnabled(0); }, nullptr, nullptr, nullptr, "Bypass / Reset", false, true},
+            {"masterCompressor", clipPath, [&] { w12.openMasterCompressor(); }, nullptr, nullptr, nullptr, nullptr, "", false, true},
+            {"autoDuckDialog", clipPath, [&] { w12.onMeterRequestAutoDuckDialog(); }, nullptr, nullptr, nullptr, nullptr, "", false, true},
+            {"loudnessSettings", clipPath, [&] { w12.openLoudnessSettings(); }, nullptr, nullptr, nullptr, nullptr, "", false, true},
+        };
+        bool ok = filesOk;
+        std::string d = "files=" + b(filesOk);
+        for (const Leg &leg : legs) {
+            setup(leg.clip);
+            const bool clean0 = !w12.isWindowModified();
+            // openLoudnessSettings writes the real audio/normalizer* preferences: put them back.
+            QSettings prefs(QStringLiteral("VSimpleEditor"), QStringLiteral("Preferences"));
+            const QStringList prefKeys = {QStringLiteral("audio/normalizerAmount"),
+                                          QStringLiteral("audio/normalizerUniformity")};
+            QHash<QString, QVariant> savedPrefs;
+            for (const QString &key : prefKeys)
+                if (prefs.contains(key)) savedPrefs.insert(key, prefs.value(key));
+            DialogDriver driver(&w12, leg.prep, QString::fromLatin1(leg.action));
+            leg.act();
+            QCoreApplication::processEvents();
+            if (leg.timed) QTest::qWait(500); // past the 300 ms undo-point timer
+            driver.timer.stop();
+            for (const QString &key : prefKeys) {
+                if (savedPrefs.contains(key)) prefs.setValue(key, savedPrefs.value(key));
+                else prefs.remove(key);
+            }
+            prefs.sync();
+            const bool dirty = w12.isWindowModified();
+            const bool changed = !leg.changed || leg.changed();
+            const bool answered = !leg.driven || driver.answered >= 1;
+            bool legOk = clean0 && dirty && changed && answered;
+            std::string detail = std::string(" | ") + leg.name + " clean0=" + b(clean0) + " dirty=" + b(dirty)
+                + " changed=" + b(changed) + " answered=" + b(answered) + " dialogs=" + std::to_string(driver.answered);
+            if (leg.undone) {
+                // An undo-point row: not clean, undo lands back on the clean entry with the change gone,
+                // redo brings the whole change back (a point taken before part of the edit loses it here).
+                const bool notClean = !um->isClean();
+                tl.undo();
+                const bool undone = leg.undone();
+                const bool afterUndo = w12.isWindowModified();
+                tl.redo();
+                const bool redone = leg.redone();
+                legOk = legOk && notClean && undone && !afterUndo && redone;
+                detail += " notClean=" + b(notClean) + " undone=" + b(undone) + " afterUndo=" + b(afterUndo)
+                    + " (expect 0) redone=" + b(redone);
+            }
+            d += detail;
+            ok = ok && legOk;
+        }
+        // The two timer-backed edits (legs 0 and 1: dragTransform, effectControlsMotion) with no wait:
+        // the debounce is still pending when the next step runs.
+        for (size_t i = 0; i < 2; ++i) {
+            const Leg &leg = legs[i];
+            // (a) a prompt-guarded action right after the edit sees an unsaved project and prompts once.
+            setup(leg.clip);
+            int prompts = 0;
+            w12.setUnsavedChangesPromptForTest([&] { ++prompts; return MainWindow::UnsavedChangesChoice::Discard; });
+            const int count0 = w12.unsavedChangesPromptCountForTest();
+            leg.act();
+            QCoreApplication::processEvents();
+            const bool guarded = w12.maybeSaveChanges();
+            const bool counted = w12.unsavedChangesPromptCountForTest() == count0 + 1 && prompts == 1;
+            const bool modified = w12.isWindowModified();
+            const int indexAfter = um->currentIndex();
+            QTest::qWait(500);
+            const bool single = um->currentIndex() == indexAfter; // the flush stopped the timer: no second point
+            w12.setUnsavedChangesPromptForTest({});
+            // (i) undo before the timer fires: the flush takes the point, undo goes back, redo restores the edit.
+            setup(leg.clip);
+            leg.act();
+            QCoreApplication::processEvents();
+            w12.undoAction();
+            QTest::qWait(500);
+            const bool undoneNow = leg.undone();
+            const bool redoKept = um->canRedo();
+            w12.redoAction();
+            const bool redoRestores = leg.redone();
+            // (iv) an undo that bypasses MainWindow (MCP calls Timeline::undo): the pending point is stale and dropped,
+            // so the redo entry survives the timer.
+            setup(leg.clip);
+            tl.saveUndoState(QStringLiteral("pre"));
+            leg.act();
+            QCoreApplication::processEvents();
+            tl.undo();
+            QTest::qWait(500);
+            const bool bypassRedo = um->canRedo() && um->currentIndex() == 0;
+            // (iv-b) an edit, a bypass undo, then a second edit inside the same debounce: the burst is re-based,
+            // so the second edit takes its point, stays unsaved and can be undone (motion leg only).
+            bool rebaseOk = true;
+            std::string rebaseDetail;
+            if (i == 1) {
+                setup(leg.clip);
+                tl.saveUndoState(QStringLiteral("pre"));
+                w12.markProjectClean();
+                leg.act();
+                QCoreApplication::processEvents();
+                tl.undo();
+                Q_EMIT tl.clipSelectedOnTrack(0, 0);
+                auto *motion = w12.m_effectControlsPanel->findChild<effectctrl::MotionSectionWidget *>();
+                if (motion) {
+                    effectctrl::MotionState state = motion->currentMotion();
+                    state.scale = 1.75;
+                    Q_EMIT motion->motionChanged(state);
+                }
+                QCoreApplication::processEvents();
+                QTest::qWait(500);
+                const bool rbModified = w12.isWindowModified();
+                const bool rbNotClean = !um->isClean();
+                const bool rbValue = scaleIs(1.75);
+                tl.undo();
+                const bool rbUndone = !scaleIs(1.75);
+                rebaseOk = rbModified && rbNotClean && rbValue && rbUndone;
+                rebaseDetail = " rebaseAfterBypassUndo: modified=" + b(rbModified) + " notClean=" + b(rbNotClean)
+                    + " value=" + b(rbValue) + " undone=" + b(rbUndone);
+            }
+            // (ii) save before the timer fires: the saved file has the edit and the project stays clean.
+            setup(leg.clip);
+            leg.act();
+            QCoreApplication::processEvents();
+            const QString savePath = tmp(i == 0 ? "g12-save-drag.veditor" : "g12-save-motion.veditor");
+            const bool saved = w12.saveProjectToPath(savePath, nullptr);
+            QTest::qWait(500);
+            QFile saveFile(savePath);
+            const bool fileHasEdit = saveFile.open(QIODevice::ReadOnly)
+                && QString::fromUtf8(saveFile.readAll()).contains(
+                    QRegularExpression(QStringLiteral("\"videoScale\"\\s*:\\s*1\\.5")));
+            const bool cleanAfterSave = !w12.isWindowModified();
+            // (iii) a new project before the timer fires: the old project's point must not land on it.
+            setup(leg.clip);
+            leg.act();
+            QCoreApplication::processEvents();
+            w12.setUnsavedChangesPromptForTest([] { return MainWindow::UnsavedChangesChoice::Discard; });
+            DialogDriver newDriver(&w12);
+            w12.newProject();
+            newDriver.timer.stop();
+            QTest::qWait(500);
+            w12.setUnsavedChangesPromptForTest({});
+            const bool resetClean = !w12.isWindowModified();
+            const bool resetNoUndo = !um->canUndo();
+            const bool legOk = guarded && counted && modified && single && undoneNow && redoKept && redoRestores && bypassRedo
+                && rebaseOk && saved && fileHasEdit && cleanAfterSave && newDriver.answered >= 1 && resetClean && resetNoUndo;
+            ok = ok && legOk;
+            d += std::string(" | ") + leg.name + "-nowait guarded=" + b(guarded) + " prompts+1=" + b(counted)
+                + " modified=" + b(modified) + " single=" + b(single) + " undoBeforeTimer: undone=" + b(undoneNow)
+                + " canRedo=" + b(redoKept) + " redo=" + b(redoRestores) + " mcpUndoKeepsRedo=" + b(bypassRedo) + rebaseDetail
+                + " saveBeforeTimer: saved=" + b(saved)
+                + " fileHasEdit=" + b(fileHasEdit) + " clean=" + b(cleanAfterSave) + " newBeforeTimer: dialogs="
+                + std::to_string(newDriver.answered) + " clean=" + b(resetClean) + " canUndo=" + b(!resetNoUndo)
+                + " (expect 0)";
+        }
+        // Negative sub-leg of dragTransform: a second emission with the values already stored moves
+        // nothing, so it must leave the project clean and push no undo point.
+        {
+            setup(clipPath);
+            Q_EMIT w12.m_player->videoSourceTransformChanged(0, 0, 1.5, 0.2, 0.1);
+            QCoreApplication::processEvents();
+            QTest::qWait(500);
+            w12.markProjectClean();
+            const int idx0 = um->currentIndex();
+            Q_EMIT w12.m_player->videoSourceTransformChanged(0, 0, 1.5, 0.2, 0.1);
+            QCoreApplication::processEvents();
+            QTest::qWait(500);
+            const bool stayedClean = !w12.isWindowModified() && um->isClean() && um->currentIndex() == idx0;
+            ok = ok && stayedClean;
+            d += std::string(" | dragTransform-zeroMove stayedClean=") + b(stayedClean);
+        }
+        tally.gate(12, ok, d);
     }
 
     window.setUnsavedChangesPromptForTest({});

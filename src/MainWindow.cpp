@@ -382,6 +382,46 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// US-2108: the video drag and the effect-controls motion write the timeline without an undo point
+// of their own, so each takes one from a debounce timer (objectName below, label in "undoLabel").
+// A burst records the undo serial / index it started at: an undo, redo or new point from a path
+// that bypasses MainWindow (MCP) makes the pending point stale, and it is dropped.
+static const char *const kPendingUndoTimerNames[] = {"videoDragUndoTimer", "motionUndoTimer"};
+
+static void beginUndoBurst(QTimer *timer, Timeline *timeline)
+{
+    // Also re-based while active: an undo / jump that bypassed MainWindow already replaced the earlier
+    // part of the burst, so the edit that follows must not be dropped as stale.
+    if (timeline && timeline->undoManager()
+        && (!timer->isActive()
+            || timeline->undoManager()->saveSerial() != timer->property("burstSerial").toULongLong()
+            || timeline->undoManager()->currentIndex() != timer->property("burstIndex").toInt())) {
+        timer->setProperty("burstSerial", static_cast<qulonglong>(timeline->undoManager()->saveSerial()));
+        timer->setProperty("burstIndex", timeline->undoManager()->currentIndex());
+    }
+    timer->start();
+}
+
+static void commitUndoBurst(QTimer *timer, Timeline *timeline)
+{
+    if (!timeline || !timeline->undoManager() || timeline->isRestoringState()) return;
+    if (timeline->undoManager()->saveSerial() != timer->property("burstSerial").toULongLong()
+        || timeline->undoManager()->currentIndex() != timer->property("burstIndex").toInt())
+        return;
+    timeline->saveUndoState(timer->property("undoLabel").toString());
+}
+
+// Takes the pending points now, before anything that reads or replaces the undo state.
+static void flushPendingUndoPoints(MainWindow *window, Timeline *timeline)
+{
+    for (const char *name : kPendingUndoTimerNames) {
+        auto *timer = window->findChild<QTimer *>(QLatin1String(name));
+        if (!timer || !timer->isActive()) continue;
+        timer->stop();
+        commitUndoBurst(timer, timeline);
+    }
+}
+
 // Shared by the file menu and import hub; no persistent widget state needed.
 // US-1906: whether the frame presented next is a special composite that drew the
 // brushes. The GL leaves the bound brush off only then
@@ -3816,10 +3856,32 @@ void MainWindow::setupUI()
                     m_player->setTextOverlays(m_timeline->timelineTextOverlays());
             });
     // US-T35 Video source transform drag/resize → persist to owning clip.
+    // A drag emits per move: each emission restarts this timer, so one undo point lands per
+    // finished drag instead of one per move.
+    auto *videoDragUndoTimer = new QTimer(this);
+    videoDragUndoTimer->setObjectName(QStringLiteral("videoDragUndoTimer"));
+    videoDragUndoTimer->setProperty("undoLabel", QStringLiteral("映像の変形"));
+    videoDragUndoTimer->setSingleShot(true);
+    videoDragUndoTimer->setInterval(300);
+    connect(videoDragUndoTimer, &QTimer::timeout, this, [this, videoDragUndoTimer]() {
+        commitUndoBurst(videoDragUndoTimer, m_timeline);
+    });
     connect(m_player, &VideoPlayer::videoSourceTransformChanged, this,
-            [this](int trackIdx, int clipIdx, double scale, double dx, double dy) {
+            [this, videoDragUndoTimer](int trackIdx, int clipIdx, double scale, double dx, double dy) {
                 if (!m_timeline) return;
-                m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy);
+                // A zero-movement emission (same clamped values) must not rewrite the clip nor
+                // mark the project unsaved.
+                const auto &tracks = m_timeline->videoTracks();
+                if (trackIdx >= 0 && trackIdx < tracks.size() && tracks[trackIdx]) {
+                    const auto &stored = tracks[trackIdx]->clips();
+                    if (clipIdx >= 0 && clipIdx < stored.size()
+                        && stored[clipIdx].videoScale == qBound(0.1, scale, 10.0)
+                        && stored[clipIdx].videoDx == qBound(-5.0, dx, 5.0)
+                        && stored[clipIdx].videoDy == qBound(-5.0, dy, 5.0))
+                        return;
+                }
+                if (m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy))
+                    beginUndoBurst(videoDragUndoTimer, m_timeline);
             });
     // Timeline text-strip edge drag → update right-panel spinboxes + preview
     connect(m_timeline, &Timeline::textOverlayTimeChanged, this,
@@ -5314,6 +5376,7 @@ void MainWindow::setupMenuBar()
                     if (mixer) {
                         mixer->setTrackEqEnabled(ti, true);
                         mixer->setTrackEqConfig(ti, cfg);
+                        markProjectDirty();
                     }
                     statusBar()->showMessage(
                         QString("A%1 EQ → %2").arg(ti + 1).arg(presetName),
@@ -5327,6 +5390,7 @@ void MainWindow::setupMenuBar()
                     [this, mixer, ti2]() {
                 if (mixer) {
                     mixer->setTrackEqEnabled(ti2, false);
+                    markProjectDirty();
                 }
                 statusBar()->showMessage(
                     QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
@@ -7313,6 +7377,20 @@ void MainWindow::setupMenuBar()
         this, [this](const QVector<VideoEffect> &effects) {
         m_timeline->setClipEffects(effects);
     });
+    // The panel writes the motion with setClipMotion (no undo point): coalesce a burst of edits
+    // into one point, taken once the edits stop.
+    auto *motionUndoTimer = new QTimer(this);
+    motionUndoTimer->setObjectName(QStringLiteral("motionUndoTimer"));
+    motionUndoTimer->setProperty("undoLabel", QStringLiteral("モーションの変更"));
+    motionUndoTimer->setSingleShot(true);
+    motionUndoTimer->setInterval(300);
+    connect(motionUndoTimer, &QTimer::timeout, this, [this, motionUndoTimer]() {
+        commitUndoBurst(motionUndoTimer, m_timeline);
+    });
+    connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::motionChanged,
+        this, [this, motionUndoTimer](const effectctrl::MotionState &) {
+            beginUndoBurst(motionUndoTimer, m_timeline);
+        });
 
     m_effectLibraryPanel = new EffectLibraryPanel(this);
     m_effectLibraryPanel->setVisible(false);
@@ -9420,6 +9498,9 @@ void MainWindow::stopMeshEditTool()
 void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                         const QString &filePath)
 {
+    // US-2108: a debounced undo point of the old project must not land on the new one.
+    for (const char *name : kPendingUndoTimerNames)
+        if (auto *timer = findChild<QTimer *>(QLatin1String(name))) timer->stop();
     ProjectData data = loadedData;
     QHash<QString, QString> relinkMapping;
     if (m_promptForMissingMedia) {
@@ -10438,6 +10519,8 @@ void MainWindow::newProject()
 {
     if (!maybeSaveChanges())
         return;
+    for (const char *name : kPendingUndoTimerNames)
+        if (auto *timer = findChild<QTimer *>(QLatin1String(name))) timer->stop();
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted)
         resetProject(dialog.config());
@@ -10576,6 +10659,7 @@ void MainWindow::compareSavedProject()
 
 void MainWindow::saveProject()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (m_projectFilePath.isEmpty()) {
         saveProjectAs();
         return;
@@ -10648,6 +10732,7 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
             *errorMessage = QStringLiteral("エディタを利用できません");
         return false;
     }
+    flushPendingUndoPoints(this, m_timeline);
 
     // US-1506: ImportHub PNGs still in the OS temp dir are copied next to the
     // project (<name>_assets/importhub/) before saving. Order: copy (failure
@@ -10854,6 +10939,7 @@ void MainWindow::changeEvent(QEvent *event)
 
 bool MainWindow::maybeSaveChanges()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (!isWindowModified())
         return true;
     ++m_unsavedChangesPromptCount;
@@ -11909,8 +11995,6 @@ void MainWindow::pasteEffects()
         return;
     }
 
-    m_timeline->setClipEffects(clipboard.effects());
-
     effectctrl::MotionState motion;
     motion.scale = clipboard.motion().scale;
     motion.dx = clipboard.motion().dx;
@@ -11925,6 +12009,8 @@ void MainWindow::pasteEffects()
     motion.rotY = 0.0;
     motion.rotZ = 0.0;
     m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+    // The effects setter records the undo point; it goes last so the motion is in it.
+    m_timeline->setClipEffects(clipboard.effects());
 
     statusBar()->showMessage("Effects pasted", 2000);
 }
@@ -11973,6 +12059,9 @@ void MainWindow::pasteAttributes()
         motion.rotZ = srcClip.layer3D.rotationZ;
 
         m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+        // With effects selected too, setClipEffects below records the one undo point.
+        if (sel.effectIndices.isEmpty())
+            m_timeline->saveUndoState(QStringLiteral("属性のペースト"));
     }
 
     if (!sel.effectIndices.isEmpty()) {
@@ -11993,6 +12082,7 @@ void MainWindow::pasteAttributes()
 
 void MainWindow::undoAction()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (!m_projectCameraUndoSlot.isEmpty()
         && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
         && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial) {
@@ -12016,6 +12106,7 @@ void MainWindow::undoAction()
 
 void MainWindow::redoAction()
 {
+    flushPendingUndoPoints(this, m_timeline);
     m_timeline->redo();
     statusBar()->showMessage("Redo");
     updateEditActions();
@@ -14627,6 +14718,7 @@ void MainWindow::openLoudnessSettings()
             setProjectNormalizerAmount(mixer, amount);
             mixer->setNormalizerUniformity(uniformity);
         }
+        markProjectDirty(); // normalizerAmount is saved in the project's loudness settings
     } else {
         // Cancel restores the original values (they were live-applied during
         // slider drag).
@@ -20785,6 +20877,7 @@ void MainWindow::openMasterCompressor()
         params.makeupDb = makeupSpin->value();
         params.enabled = enableCheck->isChecked();
         mixer->setCompressorParams(params);
+        markProjectDirty();
         statusBar()->showMessage(
             QString("Compressor %1 (threshold %2 dB, ratio %3:1)")
                 .arg(params.enabled ? "ON" : "OFF")
@@ -20857,6 +20950,7 @@ void MainWindow::openAutoDuckSettings()
         params.attackMs = attackSpin->value();
         params.releaseMs = releaseSpin->value();
         mixer->setAutoDuckParams(params);
+        markProjectDirty();
         statusBar()->showMessage(
             QString("Auto-Duck: threshold %1 dB, ratio %2:1, attack %3 ms, release %4 ms")
                 .arg(params.thresholdDb, 0, 'f', 1)
@@ -20887,6 +20981,7 @@ void MainWindow::onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos)
             if (mixer) {
                 mixer->setTrackEqEnabled(ti, true);
                 mixer->setTrackEqConfig(ti, cfg);
+                markProjectDirty();
             }
             statusBar()->showMessage(
                 QString("A%1 EQ → %2").arg(ti + 1).arg(presetName), 3000);
@@ -20899,6 +20994,7 @@ void MainWindow::onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos)
             [this, mixer, ti2]() {
         if (mixer) {
             mixer->setTrackEqEnabled(ti2, false);
+            markProjectDirty();
         }
         statusBar()->showMessage(
             QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
@@ -21525,6 +21621,7 @@ void MainWindow::onMultiCamApplyToTimeline(const MultiCamProject &project)
     m_timeline->videoTracks().first()->setClips(v1Clips);
     m_timeline->audioTracks().first()->setClips(a1Clips);
     m_timeline->refreshPlaybackSequence();
+    m_timeline->saveUndoState(QStringLiteral("マルチカム EDL の適用"));
 
     if (skipped > 0) {
         statusBar()->showMessage(
@@ -21633,6 +21730,7 @@ void MainWindow::runMotionStabilizer()
         return;
     }
     m_timeline->setClipStabilizerKeyframes(0, kfs);
+    m_timeline->saveUndoState(QStringLiteral("クリップの手ぶれ補正"));
     statusBar()->showMessage(
         tr("スタビライズ完了: %1 フレーム").arg(kfs.size()), 6000);
 }
@@ -21741,8 +21839,6 @@ void MainWindow::openSpeedRampDialog()
     ramp.clearAndSetIdentity();
     ramp.addKeyframe(0, speedMul);
 
-    m_timeline->setSpeedRamp(clipIdx, ramp);
-
     const auto &vTracks = m_timeline->videoTracks();
     if (!vTracks.isEmpty() && vTracks.first()) {
         auto clips = vTracks.first()->clips();
@@ -21760,6 +21856,8 @@ void MainWindow::openSpeedRampDialog()
             aTracks.first()->setClips(clips);
         }
     }
+    // The ramp setter records the undo point; it goes last so atempo is in it.
+    m_timeline->setSpeedRamp(clipIdx, ramp);
     m_timeline->refreshPlaybackSequence();
     statusBar()->showMessage(
         tr("速度ランプを %1x に設定しました (clip #%2, atempo=%3)")
