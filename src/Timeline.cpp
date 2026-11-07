@@ -5268,6 +5268,14 @@ void reselectByUid(const TrackSelectionUids &selected)
 
 } // namespace
 
+void Timeline::resetTracksToDefault()
+{
+    while (m_videoTracks.size() > kDefaultVideoTracks)
+        removeTrackInternal(false, m_videoTracks.size() - 1);
+    while (m_audioTracks.size() > kDefaultAudioTracks)
+        removeTrackInternal(true, m_audioTracks.size() - 1);
+}
+
 bool Timeline::removeTrack(bool audio, int index, QString *err)
 {
     if (err) err->clear();

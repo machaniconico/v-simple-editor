@@ -1286,6 +1286,11 @@ public:
                                     int *trackIndex = nullptr,
                                     int *clipIndex = nullptr);
     void addAudioTrack(bool recordUndo = true);
+    // New Project: drop the tracks past the construction-time counts, last first, with no
+    // undo point (the caller replaces the whole project right after).
+    static constexpr int kDefaultVideoTracks = 1;
+    static constexpr int kDefaultAudioTracks = 1;
+    void resetTracksToDefault();
     bool removeTrack(bool audio, int index, QString *err = nullptr);
     bool requestRemoveTrack(bool audio, int index);
     int activeVideoTrackIndex() const { return m_activeVideoTrackIndex >= 0

@@ -647,6 +647,13 @@ int runUnsavedPromptSelftest()
         g8Layer.timelineEndUs = 1000000;
         g8Layer.name = QStringLiteral("g8");
         timeline.addAdjustmentLayer(g8Layer);
+        // Extra tracks with non-default flags and names: New Project shrinks back to the defaults.
+        timeline.addVideoTrack();
+        timeline.addVideoTrack();
+        timeline.addAudioTrack();
+        timeline.audioTracks()[0]->setMuted(true);
+        timeline.videoTracks()[1]->customName = QStringLiteral("g8-renamed");
+        timeline.videoTracks()[0]->setLocked(true);
         window.markProjectDirty();
         const int markersBefore = timeline.markers().size();
         const int adjBefore = timeline.adjustmentLayers().size();
@@ -659,7 +666,29 @@ int runUnsavedPromptSelftest()
         config.height = 720;
         config.fps = 24;
         window.resetProject(config);
-        const bool ok = clipsBefore > 0 && markersBefore > 0 && adjBefore > 0 && clipCount(timeline) == 0
+        Timeline probe;
+        auto *g8Dock = window.findChild<AudioMixerDock *>(QStringLiteral("AudioMixerDock"));
+        const auto stripCount = [&] {
+            return g8Dock ? g8Dock->findChildren<QWidget *>(QRegularExpression(QStringLiteral("^mixerStrip\\d+$"))).size() : -1;
+        };
+        (void)QTest::qWaitFor([&] {
+            QCoreApplication::processEvents();
+            return stripCount() == timeline.audioTrackCount();
+        }, 3000);
+        bool flagsDefault = true;
+        bool namesDefault = true;
+        for (const auto *t : timeline.videoTracks()) {
+            flagsDefault = flagsDefault && !t->isLocked() && !t->isMuted() && !t->isSolo() && !t->isHidden();
+            namesDefault = namesDefault && t->customName.isEmpty();
+        }
+        for (const auto *t : timeline.audioTracks()) {
+            flagsDefault = flagsDefault && !t->isLocked() && !t->isMuted() && !t->isSolo() && !t->isHidden();
+            namesDefault = namesDefault && t->customName.isEmpty();
+        }
+        const bool tracksOk = vBefore >= 3 && aBefore >= 2 && timeline.videoTrackCount() == probe.videoTrackCount()
+            && timeline.audioTrackCount() == probe.audioTrackCount() && flagsDefault && namesDefault
+            && stripCount() == timeline.audioTrackCount();
+        const bool ok = tracksOk && clipsBefore > 0 && markersBefore > 0 && adjBefore > 0 && clipCount(timeline) == 0
             && timeline.markers().isEmpty() && timeline.adjustmentLayers().isEmpty() && window.m_projectFilePath.isEmpty()
             && !window.isWindowModified() && !undo->canUndo() && window.m_projectConfig.width == 1280
             && window.m_projectConfig.height == 720 && window.m_projectConfig.fps == 24;
@@ -667,6 +696,9 @@ int runUnsavedPromptSelftest()
             + " pathEmpty=" + b(window.m_projectFilePath.isEmpty()) + " modified=" + b(window.isWindowModified())
             + " canUndo=" + b(undo->canUndo()) + " config=" + std::to_string(window.m_projectConfig.width) + "x"
             + std::to_string(window.m_projectConfig.height) + "@" + std::to_string(window.m_projectConfig.fps)
+            + " probe v " + std::to_string(probe.videoTrackCount()) + " a " + std::to_string(probe.audioTrackCount())
+            + " flagsDefault=" + b(flagsDefault) + " namesDefault=" + b(namesDefault)
+            + " strips=" + std::to_string(stripCount())
             + " tracks v " + std::to_string(vBefore) + "->" + std::to_string(timeline.videoTrackCount())
             + " a " + std::to_string(aBefore) + "->" + std::to_string(timeline.audioTrackCount())
             + " markers " + std::to_string(markersBefore) + "->" + std::to_string(timeline.markers().size())

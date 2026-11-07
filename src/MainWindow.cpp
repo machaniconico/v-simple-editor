@@ -10536,6 +10536,7 @@ void MainWindow::resetProject(const ProjectConfig &config)
     if (m_timeline) {
         m_timeline->setMarkers({});
         m_timeline->setAdjustmentLayers({});
+        m_timeline->resetTracksToDefault();
     }
     applyLoadedProjectData(fresh, QString());
     markProjectClean();
