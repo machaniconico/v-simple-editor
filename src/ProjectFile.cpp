@@ -736,6 +736,8 @@ void ProjectFile::writeSequenceSidecarsToRoot(QJsonObject &root, const ProjectDa
         if (!matteArr.isEmpty()) sequence[QStringLiteral("trackMatteClipEntries")] = matteArr;
         if (!parentArr.isEmpty()) sequence[QStringLiteral("clipParentEntries")] = parentArr;
         if (!timeRemapArr.isEmpty()) sequence[QStringLiteral("timeRemapClipEntries")] = timeRemapArr;
+        if (!it->adjustmentLayers.isEmpty())
+            sequence[QStringLiteral("adjustmentLayers")] = projectFileAdjustmentLayersToJson(it->adjustmentLayers);
         sequences[i] = sequence;
     }
     root[QStringLiteral("sequences")] = sequences;
@@ -760,8 +762,11 @@ void ProjectFile::readSequenceSidecarsFromRoot(const QJsonObject &root, ProjectD
             entries.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
         for (const auto &v : sequence.value(QStringLiteral("timeRemapClipEntries")).toArray())
             entries.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
+        entries.adjustmentLayers =
+            projectFileAdjustmentLayersFromJson(sequence.value(QStringLiteral("adjustmentLayers")).toArray());
         if (!entries.rotoClipEntries.isEmpty() || !entries.trackMatteClipEntries.isEmpty()
-            || !entries.clipParentEntries.isEmpty() || !entries.timeRemapClipEntries.isEmpty())
+            || !entries.clipParentEntries.isEmpty() || !entries.timeRemapClipEntries.isEmpty()
+            || !entries.adjustmentLayers.isEmpty())
             data.sequenceSidecars.insert(id, entries);
     }
 }

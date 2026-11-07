@@ -1184,10 +1184,12 @@ public:
     bool setActiveSequence(const QString &sequenceId);
     // US-2005: the roto / matte / parent sidecars of the sequences that are not
     // active, parked by setActiveSequence and restoreState (never in the store).
+    // US-2110: the adjustment layers are parked with them.
     struct SequenceSidecars {
         QHash<QString, RotoClipEntry> roto;
         QHash<QString, TimelineTrackMatteEntry> matte;
         QHash<QString, QString> parent;
+        QVector<AdjustmentLayer> adjustments;
     };
     QHash<QString, SequenceSidecars> parkedSidecarsBySequence() const { return m_parkedSidecarsBySequence; }
     // Replaces the table (project load); the active sequence's entry is dropped.
@@ -1830,6 +1832,10 @@ private:
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QHash<QString, SequenceSidecars> m_parkedSidecarsBySequence;
+    // US-2110: the sequence whose live adjustment layers a restore last took from the
+    // state; its later non-structural restores keep following the state. Any live edit
+    // or switch outside restoreState clears it.
+    QString m_adjustmentsFollowStateIn;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;

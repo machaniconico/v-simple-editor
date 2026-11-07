@@ -1117,7 +1117,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
       "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (12 gates)" },
     { "project-persist", nullptr, runProjectPersistSelftest, true,
-      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (9 gates)" },
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (11 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

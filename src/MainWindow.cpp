@@ -9330,8 +9330,11 @@ void MainWindow::populateProjectData(ProjectData &data)
                 entry.clipId = it.key();
                 entries.timeRemapClipEntries.append(entry);
             }
+            // US-2110: in the parked order (the live list is unsorted too).
+            entries.adjustmentLayers = sidecars.adjustments;
             if (entries.rotoClipEntries.isEmpty() && entries.trackMatteClipEntries.isEmpty()
-                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty())
+                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty()
+                && entries.adjustmentLayers.isEmpty())
                 continue;
             auto byClipId = [](const auto &a, const auto &b) { return a.clipId < b.clipId; };
             std::sort(entries.rotoClipEntries.begin(), entries.rotoClipEntries.end(), byClipId);
@@ -9622,6 +9625,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                 if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
                     && entry.clipId != entry.parentClipId)
                     sidecars.parent.insert(entry.clipId, entry.parentClipId);
+            sidecars.adjustments = it->adjustmentLayers;
             parkedSidecars.insert(it.key(), sidecars);
             QHash<QString, TimeRemapClipEntry> remaps;
             for (const auto &entry : it->timeRemapClipEntries)
@@ -9939,6 +9943,8 @@ QJsonObject MainWindow::collectExternalTrackState() const
     state["buses"] = m_audioBusRouting.toJson();
     // Timeline track flags are TimelineState::trackFlags (US-2106), not captured here.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
+    // US-2110: the sequence these layers belong to (Timeline::restoreState parks by it).
+    state["adjustmentsSequenceId"] = m_timeline->activeSequenceId();
     // Capture live carrier references, including matte edits without an undo entry.
     QJsonArray mattes;
     const auto entries = m_timeline->trackMatteEntries();

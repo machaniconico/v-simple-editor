@@ -159,6 +159,7 @@ struct SequenceSidecarEntries {
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
     QVector<ClipParentEntry> clipParentEntries;
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
+    QVector<AdjustmentLayer> adjustmentLayers;  // US-2110
 };
 
 // US-3D-11: per-clip 3D extruded-text layer config. `config` is a

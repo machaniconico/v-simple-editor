@@ -165,7 +165,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 9; ++g)
+        for (int g = 1; g <= 11; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -589,6 +589,268 @@ int runProjectPersistSelftest()
         }
         tally.gate(9, ok, d);
     }
+
+    // ---- G10 / G11 (US-2110): adjustment layers are parked per sequence ----
+    // A = the loaded root (2 video tracks, a grey V1), B = createSequence. HEAD keeps one
+    // project-wide list, so L1 follows the switch to B and L2 follows the switch back.
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    {
+        ProjectData data;
+        data.config.width = kW;
+        data.config.height = kH;
+        data.config.fps = 30;
+        data.config.explicitOutputResolution = true;
+        data.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}, QVector<ClipInfo>{}};
+        const QString pathS = tmp("seq.veditor");
+        const bool seeded = ProjectFile::save(pathS, data);
+        MainWindow seqWindow;
+        Timeline &tl = *seqWindow.m_timeline;
+        QString err;
+        const bool opened = seeded && seqWindow.openProjectFromPath(pathS, &err, false);
+        const bool created = tl.createSequence(QStringLiteral("B"),
+            QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}, QVector<ClipInfo>{}},
+            QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}});
+        const QString bId = tl.activeSequenceId();
+        // A single-sequence project has no active id until createSequence enables the model.
+        QString a;
+        for (const TimelineSequence &sequence : tl.sequences())
+            if (sequence.id != bId)
+                a = sequence.id;
+        const bool premise = opened && created && tl.sequences().size() == 2 && !a.isEmpty() && bId != a
+            && tl.setActiveSequence(a)
+            && tl.videoTrackCount() >= 2;
+        const auto layersOf = [](const QVector<AdjustmentLayer> &v) {
+            std::string out = "[";
+            for (const AdjustmentLayer &l : v)
+                out += (out.size() > 1 ? " " : "") + l.name.toStdString() + "#" + std::to_string(l.id);
+            return out + "]";
+        };
+        const qint64 atUs = 1000000;
+        const QSize outSize(kW, kH);
+
+        // ---- G10: the switch parks A's layers, B renders without them, A gets them back ----
+        AdjustmentLayer l1 = layer;
+        l1.name = QStringLiteral("L1");
+        l1.trackIndex = 1;
+        l1.timelineStartUs = 0;
+        l1.timelineEndUs = 2000000;
+        l1.id = tl.addAdjustmentLayer(l1);
+        // Sanity: L1 changes the grey frame of A (otherwise the B comparison is vacuous).
+        const QImage aWith = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({});
+        const QImage aBare = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({l1});
+        const double aDiff = meanAbsDiff(aWith, aBare);
+        const bool toB = tl.setActiveSequence(bId);
+        const QVector<AdjustmentLayer> onB = tl.adjustmentLayers();
+        const QImage bFrame = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({});
+        const QImage bBare = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers(onB);
+        const bool bSame = !bFrame.isNull() && bFrame.format() == bBare.format() && bFrame == bBare;
+        AdjustmentLayer l2 = layer;
+        l2.name = QStringLiteral("L2");
+        l2.trackIndex = 0;
+        l2.lift[0] = 9.0;
+        l2.id = tl.addAdjustmentLayer(l2);
+        const bool toA = tl.setActiveSequence(a);
+        std::string d10 = "premise=" + b(premise) + " A=" + a.toStdString() + " B=" + bId.toStdString()
+            + " sanity meanAbsDiff(A+L1, A)=" + std::to_string(aDiff) + " toB=" + b(toB)
+            + " live@B=" + layersOf(onB) + " render@B==bare=" + b(bSame) + " toA=" + b(toA) + " live@A";
+        const bool backL1 = sameLayers(tl.adjustmentLayers(), {l1}, d10);
+        const QVector<AdjustmentLayer> parkedB = tl.parkedSidecarsBySequence().value(bId).adjustments;
+        const bool parkedBOk = parkedB.size() == 1 && parkedB[0].id == l2.id;
+        d10 += " parked[B]=" + layersOf(parkedB) + " L1.id=" + std::to_string(l1.id)
+            + " L2.id=" + std::to_string(l2.id);
+        tally.gate(10, premise && aDiff > 1.0 && toB && onB.isEmpty() && bSame && toA && backL1
+                           && parkedBOk && l2.id != l1.id, d10);
+
+        // ---- G11: save / open, the old-file control, and undo across a switch ----
+        std::string d11;
+        const bool toB2 = tl.setActiveSequence(bId);
+        const QString pathP = tmp("perseq.veditor");
+        const bool saved = seqWindow.saveProjectToPath(pathP, &err);
+        const QJsonObject root = readJson(pathP);
+        QJsonObject seqA, seqB;
+        for (const QJsonValue &v : root.value(QStringLiteral("sequences")).toArray()) {
+            const QJsonObject o = v.toObject();
+            if (o.value(QStringLiteral("id")).toString() == a) seqA = o;
+            if (o.value(QStringLiteral("id")).toString() == bId) seqB = o;
+        }
+        d11 += "toB=" + b(toB2) + " saved=" + b(saved) + " root.activeSequenceId="
+            + root.value(QStringLiteral("activeSequenceId")).toString().toStdString() + " root";
+        const bool rootOk = sameLayers(adjustmentLayersFromJsonArray(
+            root.value(QStringLiteral("adjustmentLayers")).toArray()), {l2}, d11);
+        d11 += " | sequences[A]";
+        const bool seqAOk = sameLayers(adjustmentLayersFromJsonArray(
+            seqA.value(QStringLiteral("adjustmentLayers")).toArray()), {l1}, d11);
+        const bool seqBNoKey = !seqB.isEmpty() && !seqB.contains(QStringLiteral("adjustmentLayers"));
+        d11 += " | sequences[B] hasKey=" + b(!seqBNoKey);
+        // Open after clearing both lists, so only the file can bring them back.
+        tl.setAdjustmentLayers({});
+        tl.setParkedSidecarsBySequence({});
+        const bool reopened = seqWindow.openProjectFromPath(pathP, &err, false);
+        const QString activeAfterOpen = tl.activeSequenceId();
+        d11 += " | open=" + b(reopened) + " active=" + activeAfterOpen.toStdString() + " live";
+        const bool openB = activeAfterOpen == bId && sameLayers(tl.adjustmentLayers(), {l2}, d11);
+        const bool openToA = tl.setActiveSequence(a);
+        d11 += " toA=" + b(openToA) + " live@A";
+        const bool openA = sameLayers(tl.adjustmentLayers(), {l1}, d11);
+        const int nextId = tl.addAdjustmentLayer(AdjustmentLayer{});
+        const bool nextIdOk = nextId > std::max(l1.id, l2.id);
+        d11 += " nextId=" + std::to_string(nextId);
+        // Old file (no per-sequence key): the root list belongs to the active sequence only.
+        QJsonObject oldRoot = root;
+        QJsonArray oldSequences = oldRoot.value(QStringLiteral("sequences")).toArray();
+        for (int i = 0; i < oldSequences.size(); ++i) {
+            QJsonObject o = oldSequences[i].toObject();
+            o.remove(QStringLiteral("adjustmentLayers"));
+            oldSequences[i] = o;
+        }
+        oldRoot[QStringLiteral("sequences")] = oldSequences;
+        const QString pathOld = tmp("perseq-old.veditor");
+        QFile oldFile(pathOld);
+        const bool oldWritten = oldFile.open(QIODevice::WriteOnly)
+            && oldFile.write(QJsonDocument(oldRoot).toJson()) > 0;
+        oldFile.close();
+        const bool oldOpened = oldWritten && seqWindow.openProjectFromPath(pathOld, &err, false);
+        d11 += " | old: open=" + b(oldOpened) + " active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool oldB = tl.activeSequenceId() == bId && sameLayers(tl.adjustmentLayers(), {l2}, d11);
+        const bool oldToA = tl.setActiveSequence(a);
+        const bool oldA = oldToA && tl.adjustmentLayers().isEmpty();
+        d11 += " live@A=" + layersOf(tl.adjustmentLayers());
+        // Undo across a switch (TimelineState carries no adjustment layers; the external
+        // state does). Leg 1 is non-structural; leg 2 removes a track, so the external state
+        // is applied inside restoreState before its parking runs and must not leak into B.
+        const bool undoOpened = seqWindow.openProjectFromPath(pathP, &err, false);
+        const bool undoToA = tl.setActiveSequence(a);
+        const int tracksBase = tl.videoTrackCount();
+        tl.saveUndoState(QStringLiteral("project-persist A base"));
+        tl.addVideoTrack(true);
+        AdjustmentLayer l3 = layer;
+        l3.name = QStringLiteral("L3");
+        l3.id = tl.addAdjustmentLayer(l3);
+        tl.saveUndoState(QStringLiteral("project-persist L3"));
+        const std::string liveBefore = layersOf(tl.adjustmentLayers());
+        const bool undoToB = tl.setActiveSequence(bId);
+        tl.undo();
+        std::string du1 = " leg1: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool leg1Live = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du1);
+        du1 += " parked[B]";
+        const bool leg1B = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du1);
+        const bool leg1NoA = !tl.parkedSidecarsBySequence().contains(a);
+        const int tracksLeg1 = tl.videoTrackCount();
+        // Navigation away and back keeps A following the redo state, so redo brings L3 back.
+        const bool navToB = tl.setActiveSequence(bId);
+        const bool navToA = tl.setActiveSequence(a);
+        tl.redo();
+        std::string dn = " | nav redo: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool navRedoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, dn);
+        dn += " parked[B]";
+        const bool navRedoB = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, dn);
+        tl.undo();
+        dn += " undo: live";
+        const bool navUndoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, dn);
+        // A layer added in B with no undo point (the GUI add) must not reuse L3's id, which
+        // the reachable redo state still holds; after the redo every id is distinct.
+        const bool idToB = tl.setActiveSequence(bId);
+        AdjustmentLayer l4 = layer;
+        l4.name = QStringLiteral("L4");
+        l4.id = tl.addAdjustmentLayer(l4);
+        const bool idToA = tl.setActiveSequence(a);
+        tl.redo();
+        dn += " | L4 in B: id=" + std::to_string(l4.id) + " L3 id=" + std::to_string(l3.id) + " redo: live="
+            + layersOf(tl.adjustmentLayers());
+        QVector<int> allIds;
+        for (const AdjustmentLayer &l : tl.adjustmentLayers())
+            allIds.append(l.id);
+        const auto parkedAfterRedo = tl.parkedSidecarsBySequence();
+        for (auto it = parkedAfterRedo.cbegin(); it != parkedAfterRedo.cend(); ++it) {
+            dn += " parked[" + it.key().toStdString() + "]=" + layersOf(it->adjustments);
+            for (const AdjustmentLayer &l : it->adjustments)
+                allIds.append(l.id);
+        }
+        bool idsDistinct = allIds.size() == 4;
+        for (int i = 0; i < allIds.size(); ++i)
+            for (int j = i + 1; j < allIds.size(); ++j)
+                idsDistinct = idsDistinct && allIds[i] != allIds[j];
+        dn += " ids=" + std::to_string(allIds.size()) + " distinct=" + b(idsDistinct);
+        const bool idRedoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, dn);
+        // Back to the leg-1 state for the legs below: undo, then drop L4 from B (no undo point).
+        tl.undo();
+        const bool idCleanup = tl.setActiveSequence(bId) && tl.removeAdjustmentLayer(l4.id)
+            && tl.setActiveSequence(a) && sameLayers(tl.adjustmentLayers(), {l1}, dn);
+        const bool navIdOk = navToB && navToA && navRedoLive && navRedoB && navUndoLive && idToB && idToA
+            && l4.id > 0 && l4.id != l3.id && idsDistinct && idRedoLive && idCleanup;
+        // Redo inside the landing sequence brings L3 back (undo + redo is the identity),
+        // and undo again takes it away.
+        tl.redo();
+        du1 += " | redo: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool redoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, du1);
+        du1 += " parked[B]";
+        const bool redoB = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du1);
+        const bool redoNoA = !tl.parkedSidecarsBySequence().contains(a);
+        tl.undo();
+        du1 += " parkedHas(A)=" + b(!redoNoA) + " | undo again: active=" + tl.activeSequenceId().toStdString()
+            + " live";
+        const bool reUndoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du1);
+        const bool undoToB2 = tl.setActiveSequence(bId);
+        tl.undo();
+        const int tracksAfter = tl.videoTrackCount();
+        std::string du2 = " leg2: active=" + tl.activeSequenceId().toStdString() + " tracks "
+            + std::to_string(tracksLeg1) + "->" + std::to_string(tracksAfter) + " (base "
+            + std::to_string(tracksBase) + ") live";
+        const bool leg2Live = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du2);
+        du2 += " parked[B]";
+        const bool leg2B = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du2);
+        d11 += " | undo: open=" + b(undoOpened) + " toA=" + b(undoToA) + " live+L3=" + liveBefore
+            + " toB=" + b(undoToB) + "/" + b(undoToB2) + du1 + " parkedHas(A)=" + b(!leg1NoA) + dn + du2;
+        const bool undoOk = undoOpened && undoToA && undoToB && undoToB2 && leg1Live && leg1B && leg1NoA
+            && navIdOk && redoLive && redoB && redoNoA && reUndoLive
+            && tracksLeg1 == tracksBase + 1 && tracksAfter == tracksBase && leg2Live && leg2B;
+
+        // Undo of the first sequence creation (non-structural: the same track counts on both
+        // sides, the timeline keeps 2 video tracks) gives the original timeline its layers
+        // back; redo parks them under the default id again.
+        ProjectData oneData = data;
+        oneData.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}};
+        oneData.audioTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+        const QString pathOne = tmp("first-create.veditor");
+        const bool oneOpened = ProjectFile::save(pathOne, oneData)
+            && seqWindow.openProjectFromPath(pathOne, &err, false);
+        const bool oneModelOff = tl.sequences().isEmpty();
+        const std::string tracksOne = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        AdjustmentLayer c1 = layer;
+        c1.name = QStringLiteral("L1");
+        c1.id = tl.addAdjustmentLayer(c1);
+        const bool firstCreated = tl.createSequence(QStringLiteral("B"));
+        const QString firstB = tl.activeSequenceId();
+        const std::string tracksCreated = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        tl.undo();
+        const std::string tracksUndone = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        const bool undoneOff = tl.sequences().isEmpty()
+            && (tl.activeSequenceId().isEmpty() || tl.activeSequenceId() == QLatin1String("main"));
+        std::string dc = " | first creation: open=" + b(oneOpened) + " modelOff=" + b(oneModelOff)
+            + " created=" + b(firstCreated) + " B=" + firstB.toStdString() + " tracks " + tracksOne + "->"
+            + tracksCreated + "->" + tracksUndone + " undo: sequences=" + std::to_string(tl.sequences().size())
+            + " active='" + tl.activeSequenceId().toStdString() + "' live";
+        const bool undoneLive = sameLayers(tl.adjustmentLayers(), {c1}, dc);
+        tl.redo();
+        dc += " redo: active=" + tl.activeSequenceId().toStdString() + " live=" + layersOf(tl.adjustmentLayers())
+            + " parked[main]";
+        const bool redoneOk = tl.activeSequenceId() == firstB && !firstB.isEmpty() && tl.adjustmentLayers().isEmpty()
+            && sameLayers(tl.parkedSidecarsBySequence().value(QStringLiteral("main")).adjustments, {c1}, dc);
+        d11 += dc;
+        const bool firstOk = oneOpened && oneModelOff && firstCreated && tracksCreated == tracksOne
+            && tracksUndone == tracksOne && undoneOff && undoneLive && redoneOk;
+        tally.gate(11, premise && toB2 && saved && rootOk && seqAOk && seqBNoKey && reopened && openB
+                           && openToA && openA && nextIdOk && oldOpened && oldB && oldA && undoOk && firstOk,
+                   d11);
+    }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 
     tally.gate(7, g7, g7Detail);
     return tally.finish("project-persist");
