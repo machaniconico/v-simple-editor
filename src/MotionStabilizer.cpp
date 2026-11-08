@@ -458,9 +458,12 @@ QVector<double> MotionStabilizer::buildGaussianKernel(double sigma, int halfWidt
 // scale=1 since MotionStabilizer doesn't estimate rotation/zoom.
 // ---------------------------------------------------------------------------
 
-QVector<StabilizerKeyframe> MotionStabilizer::analyzeFile(const QString &filePath)
+QVector<StabilizerKeyframe> MotionStabilizer::analyzeFile(const QString &filePath,
+                                                          QSize *decodedSize)
 {
     reset();
+    if (decodedSize)
+        *decodedSize = QSize();
 
     AVFormatContext *fmt = nullptr;
     if (avformat_open_input(&fmt, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
@@ -585,6 +588,8 @@ QVector<StabilizerKeyframe> MotionStabilizer::analyzeFile(const QString &filePat
     av_frame_free(&frame);
     avcodec_free_context(&cc);
     avformat_close_input(&fmt);
+    if (decodedSize && frameIndex > 0)
+        *decodedSize = QSize(swsW, swsH);
 
     finalize();
 

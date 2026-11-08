@@ -8318,6 +8318,7 @@ bool Timeline::replaceClipMedia(TrackKind kind, int trackIndex, int clipIndex,
                 clip.outPoint = replacementOut;
                 clip.sequenceRefId.clear();
                 clip.waveform = WaveformData{};
+                clip.stabilizerSourceSize = QSize();
 
                 // ClipKeyId のfilePath も置き換わるため、古い識別子の
                 // まま remap すると位置が変わっていないマット/親子参照が
@@ -13902,6 +13903,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         QVector<AudioGainPoint> volumeEnvelope;
         TransitionAlignment leadInAlignment = TransitionAlignment::Center;
         QVector<StabilizerKeyframe> stabilizerKeyframes;
+        QSize stabilizerSourceSize;
     };
 
     const QVector<TimelineSequence> sequenceSnapshot = sequences();
@@ -14070,6 +14072,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.borderWidth = child.trailOut.borderWidth;
                 iv.borderColor = child.trailOut.borderColor;
                 iv.stabilizerKeyframes = child.stabilizerKeyframes;
+                iv.stabilizerSourceSize = child.stabilizerSourceSize;
                 out.append(iv);
 
                 childAccum += childDur;
@@ -14151,6 +14154,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.borderWidth = c.trailOut.borderWidth;
                 iv.borderColor = c.trailOut.borderColor;
                 iv.stabilizerKeyframes = c.stabilizerKeyframes;
+                iv.stabilizerSourceSize = c.stabilizerSourceSize;
                 ivs.append(iv);
                 accum += clipDur;
             }
@@ -14242,6 +14246,7 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         e.borderWidth = iv.borderWidth;
         e.borderColor = iv.borderColor;
         e.stabilizerKeyframes = iv.stabilizerKeyframes;
+        e.stabilizerSourceSize = iv.stabilizerSourceSize;
         reversedBindings.append({e, iv.reversed});
         // STAGE4B: carry this entry's track-matte assignment (if any) so the
         // live GPU compositor can apply it identically to the export path
@@ -17552,7 +17557,8 @@ void Timeline::updateInfoLabel()
 // vector via clips()/setClips() so the change participates in the normal
 // invalidation/repaint flow.
 void Timeline::setClipStabilizerKeyframes(int clipIndex,
-                                          const QVector<StabilizerKeyframe> &kfs)
+                                          const QVector<StabilizerKeyframe> &kfs,
+                                          const QSize &sourceSize)
 {
     if (m_videoTracks.isEmpty() || !m_videoTracks.first())
         return;
@@ -17561,6 +17567,7 @@ void Timeline::setClipStabilizerKeyframes(int clipIndex,
     if (clipIndex < 0 || clipIndex >= clips.size())
         return;
     clips[clipIndex].stabilizerKeyframes = kfs;
+    clips[clipIndex].stabilizerSourceSize = sourceSize;
     track->setClips(clips);
     track->update();
     scheduleEmitSequenceChanged();

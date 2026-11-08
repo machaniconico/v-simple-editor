@@ -163,7 +163,7 @@ QImage warpClampToEdge(const QImage &src, const QTransform &inverse)
 }
 
 QImage applyForExport(const QImage &frame, const ClipInfo &clip, int trackIdx,
-                      int sequenceDepth, double sourceSec)
+                      int sequenceDepth, double sourceSec, QSize sourceSize)
 {
     // V1 of the top-level sequence only (the preview binds V1's keys alone).
     if (frame.isNull() || sequenceDepth != 0 || trackIdx != 0
@@ -171,9 +171,12 @@ QImage applyForExport(const QImage &frame, const ClipInfo &clip, int trackIdx,
         return frame;
     const StabSample sample =
         sampleAt(clip.stabilizerKeyframes, static_cast<qint64>(sourceSec * 1.0e6));
-    if (isIdentity(sample, frame.width(), frame.height()))
+    if (!sourceSize.isValid())
+        sourceSize = frame.size();
+    if (isIdentity(sample, sourceSize.width(), sourceSize.height()))
         return frame;
-    return warpClampToEdge(frame, inverseTransform(sample, frame.width(), frame.height()));
+    return warpClampToEdge(frame, inverseTransform(sample, sourceSize.width(), sourceSize.height(),
+                                                   frame.width(), frame.height()));
 }
 
 } // namespace stabwarp

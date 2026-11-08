@@ -192,10 +192,17 @@ public:
     // user 3D-rotate matrix is preserved (transforms compose by stacking).
     void setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs);
     void setStabilizerSourceTimeUs(qint64 sourceUs);
+    // US-2202: the size the keys were analysed at (their dx / dy unit); invalid =
+    // the uploaded frame's size. Rebuilds the matrix when keys are set.
+    void setStabilizerSourceSize(const QSize &sourceSize);
     // US-2111 test seam: the nine row-major uStab values (stabwarp::inverseMatrixUv).
     std::array<float, 9> stabMatrixForTest() const;
+    // US-2202 test seam: whether the uStab stage runs on the next paint.
+    bool stabEnabledForTest() const { return m_stabEnabled; }
     // US-2111: V1's stabilizer sample at the time of the special composite shown
-    // next (identity: none) and V1's decoded frame size, the unit of its dx / dy.
+    // next (identity: none) and the size V1's keys were analysed at, the unit of
+    // its dx / dy (ClipInfo::stabilizerSourceSize, falling back to the decoded
+    // frame size when no size is stored, as in old files).
     // The composite's V1 layer is already warped on the CPU and the GL gets no
     // keys, so the bound brush drawn on it gets this warp; the next displayFrame
     // takes it and every later one clears it.
@@ -688,6 +695,10 @@ private:
     qint64 m_stabSourceUs  = 0;
     int   m_stabFrameW     = 0;
     int   m_stabFrameH     = 0;
+    QSize m_stabSourceSize;
+    // US-2202: m_stabMatrix / m_stabEnabled from m_stabKeyframes at m_stabSourceUs,
+    // in m_stabSourceSize when valid, else the uploaded frame's size.
+    void rebuildStabMatrix();
 
     // US-INT-1: non-owning Timeline pointer for adjustment-layer composition.
     Timeline *m_timeline = nullptr;

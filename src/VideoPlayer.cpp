@@ -3685,6 +3685,24 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
+// US-2202: the production compose + present on this player: the layers are
+// composed onto a copy of `canvasBase` (the callers' black canvas, V1 among the
+// layers with sequenceIdx == activeEntry) and the result goes through displayFrame
+// as the SSOT / playback paths hand it over (overlays baked).
+QImage VideoPlayer::composeAndPresentForTest(const QImage &canvasBase,
+                                             const QVector<DecodedLayer> &layers,
+                                             const QVector<PlaybackEntry> &seq,
+                                             int activeEntry, qint64 tlUs)
+{
+    m_sequence = seq;
+    m_activeEntry = activeEntry;
+    m_timelinePositionUs = tlUs;
+    QImage canvas = canvasBase.copy();
+    composeMultiTrackFrameInto(canvas, layers);
+    displayFrame(canvas, /*overlaysAlreadyBaked=*/true, tlUs);
+    return canvas;
+}
+
 QImage VideoPlayer::displayFrameForTest(
     const QImage &composed, const QImage &neighbourLayer,
     const QVector<PlaybackEntry> &sequence, int activeEntry, qint64 timelineUsec,
@@ -3866,6 +3884,28 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     presentDisplay(composed, timelineUsec, special);
 }
 
+// US-2202: the active entry's V1 stabilizer for the GL: its keys, the size they
+// were analysed at (the entry's filePath may be a smaller proxy) and the source
+// time. US-2111: a shown special composite already has V1's layer stabilized on
+// the CPU (buildSpecialClipComposite), so the GL warps nothing.
+void VideoPlayer::pushV1StabilizerToGl(const PlaybackEntry &ae, bool special)
+{
+    if (ae.sourceTrack != 0 || special) {
+        m_glPreview->setStabilizerKeyframes({});
+        return;
+    }
+    m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
+    m_glPreview->setStabilizerSourceSize(ae.stabilizerSourceSize);
+    const double T = static_cast<double>(m_timelinePositionUs)
+                   / static_cast<double>(AV_TIME_BASE);
+    const Timeline *timeline = m_glPreview ? previewTimeline() : nullptr;
+    const double srcSec = playbackEntryIsReversed(timeline, ae, &m_reverseStates)
+        ? static_cast<double>(entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+              / AV_TIME_BASE
+        : ae.clipIn + (T - ae.timelineStart) * ae.speed;
+    m_glPreview->setStabilizerSourceTimeUs(static_cast<qint64>(srcSec * 1.0e6));
+}
+
 void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
                                  const QImage &special)
 {
@@ -3910,29 +3950,10 @@ void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
         // higher-track stabilization is a follow-up) and the current source
         // time so GLPreview's binary-search lookup can pick the matching
         // keyframe and bake the inverse 2D affine pre-warp.
-        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-            const auto &ae = m_sequence[m_activeEntry];
-            // US-2111: a shown special composite already has V1's layer stabilized
-            // on the CPU (buildSpecialClipComposite), so the GL warps nothing.
-            if (ae.sourceTrack == 0 && special.isNull()) {
-                m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
-                const double T = static_cast<double>(m_timelinePositionUs)
-                               / static_cast<double>(AV_TIME_BASE);
-                const Timeline *timeline = m_glPreview
-                    ? previewTimeline() : nullptr;
-                const double srcSec = playbackEntryIsReversed(
-                                          timeline, ae, &m_reverseStates)
-                    ? static_cast<double>(entryLocalPositionUs(
-                          m_activeEntry, m_timelinePositionUs)) / AV_TIME_BASE
-                    : ae.clipIn + (T - ae.timelineStart) * ae.speed;
-                m_glPreview->setStabilizerSourceTimeUs(
-                    static_cast<qint64>(srcSec * 1.0e6));
-            } else {
-                m_glPreview->setStabilizerKeyframes({});
-            }
-        } else {
+        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size())
+            pushV1StabilizerToGl(m_sequence[m_activeEntry], !special.isNull());
+        else
             m_glPreview->setStabilizerKeyframes({});
-        }
         // A clip-local CPU stack already includes each clip's grade/LUT and
         // ordered FX. Running the GL branch on that frame would reorder or
         // duplicate the stack and no longer match export.

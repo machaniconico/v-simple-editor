@@ -611,6 +611,15 @@ public:
         double parentLocalSeconds = 0.0;
         double parentSourceSeconds = 0.0;
     };
+    // US-2202: composes `layers` onto a copy of `canvasBase` with the private
+    // compositor and presents it on THIS player (its GLPreview), with `seq` /
+    // `activeEntry` / `tlUs` as the playback state; returns the composed canvas.
+    // Call it the way production does: a black ARGB32_Premultiplied canvas and V1
+    // as a layer whose sequenceIdx is `activeEntry`.
+    QImage composeAndPresentForTest(const QImage &canvasBase,
+                                    const QVector<DecodedLayer> &layers,
+                                    const QVector<PlaybackEntry> &seq, int activeEntry,
+                                    qint64 tlUs);
 
 private:
     void recordParentAdmissionForTest(const char *path,
@@ -995,6 +1004,7 @@ private:
     QImage bakeTextOverlaysForDisplay(const QImage &source, qint64 timelineUsec) const;
     QImage finishSpecialComposite(const QImage &frame, qint64 timelineUsec) const;
     void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special);
+    void pushV1StabilizerToGl(const PlaybackEntry &entry, bool special);
     void setCompositeBakedModeForDisplay(bool baked);
     void endSpecialDisplayLatch();
     void beginStillCompareGlBypass();

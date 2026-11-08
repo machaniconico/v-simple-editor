@@ -8999,12 +8999,16 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                 if (v1Stab)
                     *v1Stab = stabwarp::sampleAt(clip.stabilizerKeyframes,
                                                  static_cast<qint64>(fxSourceSeconds * 1.0e6));
+                // US-2202: the analysed size (dx / dy's unit) when stored, since
+                // the frame may be a smaller proxy decode.
                 if (v1StabSourceSize)
-                    *v1StabSourceSize = frame.size();
+                    *v1StabSourceSize = clip.stabilizerSourceSize.isValid()
+                        ? clip.stabilizerSourceSize : frame.size();
                 if (v1StabClipId)
                     *v1StabClipId = clipId;
             }
-            frame = stabwarp::applyForExport(frame, clip, trackIdx, 0, fxSourceSeconds);
+            frame = stabwarp::applyForExport(frame, clip, trackIdx, 0, fxSourceSeconds,
+                                             clip.stabilizerSourceSize);
 
             // US-708: run the same native FX stage as export (VFX footage
             // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
@@ -9036,7 +9040,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                             stabwarp::applyForExport(
                                 tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec,
                                                                clipId),
-                                clip, trackIdx, 0, sampleSourceSec),
+                                clip, trackIdx, 0, sampleSourceSec, clip.stabilizerSourceSize),
                             clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
@@ -21783,13 +21787,14 @@ void MainWindow::runMotionStabilizer()
 
     MotionStabilizer stab;
     stab.setSmoothness(smoothPct / 100.0);
-    QVector<StabilizerKeyframe> kfs = stab.analyzeFile(target.filePath);
+    QSize analysedSize;
+    QVector<StabilizerKeyframe> kfs = stab.analyzeFile(target.filePath, &analysedSize);
     if (kfs.isEmpty()) {
         statusBar()->showMessage(
             tr("スタビライズ失敗: フレームを解析できませんでした"), 6000);
         return;
     }
-    m_timeline->setClipStabilizerKeyframes(0, kfs);
+    m_timeline->setClipStabilizerKeyframes(0, kfs, analysedSize);
     m_timeline->saveUndoState(QStringLiteral("クリップの手ぶれ補正"));
     statusBar()->showMessage(
         tr("スタビライズ完了: %1 フレーム").arg(kfs.size()), 6000);

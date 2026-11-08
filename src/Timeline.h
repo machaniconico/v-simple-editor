@@ -393,6 +393,10 @@ struct ClipInfo {
     // looks up the active source-time via std::lower_bound and applies the
     // INVERSE 2D affine, composed with the user 3D-rotate matrix.
     QVector<StabilizerKeyframe> stabilizerKeyframes;
+    // US-2202: the frame size the keyframes were analysed at (the unit of their
+    // dx / dy); invalid for files saved before it was recorded. The preview
+    // builds the matrix from it, since it may decode a smaller proxy.
+    QSize stabilizerSourceSize;
 
     // US-307: absent for ordinary clips; persistence retains one level only.
     std::shared_ptr<ClipInfo> renderInPlaceOriginal;
@@ -1476,7 +1480,9 @@ public:
             return kEmpty;
         return clips[clipIndex].stabilizerKeyframes;
     }
-    void setClipStabilizerKeyframes(int clipIndex, const QVector<StabilizerKeyframe> &kfs);
+    // US-2202: `sourceSize` = the size the keys were analysed at.
+    void setClipStabilizerKeyframes(int clipIndex, const QVector<StabilizerKeyframe> &kfs,
+                                    const QSize &sourceSize = QSize());
     // Add a text overlay to V1's first clip, writing back via setClips so
     // the mutation actually persists. Used by MainWindow's Adobe-style text
     // tool. Returns true if an overlay was added.

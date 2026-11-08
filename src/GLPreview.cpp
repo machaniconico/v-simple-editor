@@ -1867,8 +1867,14 @@ void GLPreview::displayFrame(const QImage &frame)
     m_compositeBrushStabSize = m_pendingCompositeBrushStabSize;
     m_pendingCompositeBrushStab = {};
     m_pendingCompositeBrushStabSize = QSize();
+    // US-2202: a new frame size changes the UV unit of the keys' dx / dy, so the
+    // matrix is rebuilt here instead of waiting for the next source-time push.
+    const bool stabFrameSizeChanged =
+        m_stabFrameW != frame.width() || m_stabFrameH != frame.height();
     m_stabFrameW = frame.width();
     m_stabFrameH = frame.height();
+    if (stabFrameSizeChanged && !m_stabKeyframes.isEmpty())
+        rebuildStabMatrix();
     const QImage::Format inFmt = frame.format();
     const bool is16 = (inFmt == QImage::Format_RGBA64
                        || inFmt == QImage::Format_RGBA64_Premultiplied);
@@ -4057,13 +4063,27 @@ void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
         m_stabEnabled = false;
         return;
     }
-
-    const stabwarp::StabSample sample = stabwarp::sampleAt(m_stabKeyframes, sourceUs);
-    const std::array<float, 9> matrix =
-        stabwarp::inverseMatrixUv(sample, m_stabFrameW, m_stabFrameH);
-    std::copy(matrix.begin(), matrix.end(), m_stabMatrix);
-    m_stabEnabled = !stabwarp::isIdentity(sample, m_stabFrameW, m_stabFrameH);
+    rebuildStabMatrix();
     update();
+}
+
+void GLPreview::setStabilizerSourceSize(const QSize &sourceSize)
+{
+    if (m_stabSourceSize == sourceSize)
+        return;
+    m_stabSourceSize = sourceSize;
+    if (!m_stabKeyframes.isEmpty())
+        rebuildStabMatrix();
+}
+
+void GLPreview::rebuildStabMatrix()
+{
+    const int w = m_stabSourceSize.isValid() ? m_stabSourceSize.width() : m_stabFrameW;
+    const int h = m_stabSourceSize.isValid() ? m_stabSourceSize.height() : m_stabFrameH;
+    const stabwarp::StabSample sample = stabwarp::sampleAt(m_stabKeyframes, m_stabSourceUs);
+    const std::array<float, 9> matrix = stabwarp::inverseMatrixUv(sample, w, h);
+    std::copy(matrix.begin(), matrix.end(), m_stabMatrix);
+    m_stabEnabled = !stabwarp::isIdentity(sample, w, h);
 }
 
 void GLPreview::setSpecialCompositeBrushStabilizer(const stabwarp::StabSample &sample,

@@ -10,6 +10,7 @@
 #include "../Keyframe.h"
 #include "../MainWindow.h"
 #include "../StabilizerWarp.h"
+#include "../StillCompare.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../VideoPlayer.h"
@@ -686,6 +687,350 @@ int runStabilizerExportSelftest()
             }
         }
         tally.gate(6, plainOk && aOk && bOk && cOk && (dOk || !dRan), d.str());
+    }
+
+    // US-2202 G7: dx / dy are pixels of the analysed size (128x96) while the preview
+    // shows a 64x48 proxy, so dx +4 is 2 pixels there: (a) the GL matrix, (b) the CPU
+    // warp, (c) control: no stored size -> the frame's (+4 px, -0.0625; the export
+    // passes none), (d) an entry built by the flatten whose filePath is the proxy,
+    // presented on the player, (e) the special composite's layer and brush size.
+    {
+        std::ostringstream d;
+        const QSize analysed(128, 96);
+        constexpr int kProxyW = 64;
+        constexpr int kProxyH = 48;
+        const QImage proxyFrame = dotFrame({QPoint(10, 10)}, kProxyW, kProxyH);
+        const auto m2Near = [](const std::array<float, 9> &m, double v) {
+            return std::abs(double(m[2]) - v) <= 1e-7;
+        };
+
+        // (a) GL: a 64x48 upload, keys of the 128x96 analysis.
+        GLPreview glA;
+        glA.displayFrame(proxyFrame);
+        glA.setStabilizerKeyframes({key(0.0, 4.0)});
+        glA.setStabilizerSourceSize(analysed);
+        glA.setStabilizerSourceTimeUs(0);
+        const auto ma = glA.stabMatrixForTest();
+        const bool aOk = m2Near(ma, -0.03125) && matrixNear(ma, {1, 0, -0.03125, 0, 1, 0, 0, 0, 1})
+            && glA.stabEnabledForTest();
+        d << "(a) gl m=" << matrixText(ma) << " enabled=" << glA.stabEnabledForTest()
+          << " ok=" << aOk;
+
+        // (b) CPU, and (c) the control without a stored size.
+        ClipInfo sized = withKeys(seqClip(seqA), {key(0.0, 4.0)});
+        sized.stabilizerSourceSize = analysed;
+        const Box bBox = whiteBox(
+            stabwarp::applyForExport(proxyFrame, sized, 0, 0, t, sized.stabilizerSourceSize));
+        const bool bOk = bBox.n == 4 && bBox.rect == QRect(12, 10, 2, 2);
+        const Box cBox = whiteBox(stabwarp::applyForExport(proxyFrame, sized, 0, 0, t));
+        GLPreview glC;
+        glC.displayFrame(proxyFrame);
+        glC.setStabilizerKeyframes({key(0.0, 4.0)});
+        glC.setStabilizerSourceSize(QSize());
+        glC.setStabilizerSourceTimeUs(0);
+        const auto mc = glC.stabMatrixForTest();
+        const bool cOk = cBox.n == 4 && cBox.rect == QRect(14, 10, 2, 2) && m2Near(mc, -0.0625);
+        d << " (b) cpu stored 128x96 white " << boxText(bBox) << " ok=" << bOk
+          << " (c) pin: no size white " << boxText(cBox) << " gl m=" << matrixText(mc)
+          << " ok=" << cOk;
+
+        // (d) the flatten's entry (top-level V1), its filePath swapped to the 64x48
+        // proxy as MainWindow's proxy pass does, composed and presented on `player`.
+        bool dOk = false;
+        bool dRan = false;
+        {
+            const QString proxySeq =
+                writeSequence(dir, QStringLiteral("proxy48"), proxyFrame);
+            const auto timeline = makeTimeline({{sized}});
+            QVector<PlaybackEntry> seq = timeline->computePlaybackSequence();
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            if (!(view && player.isGLAccelerated())) {
+                d << " (d) not run: GL preview unavailable (environment)";
+            } else if (seq.size() != 1 || proxySeq.isEmpty()) {
+                dRan = true;
+                d << " (d) entries=" << seq.size() << " proxyOk=" << !proxySeq.isEmpty()
+                  << " ok=0";
+            } else {
+                dRan = true;
+                seq[0].filePath = proxySeq;
+                QImage canvasBase(kProxyW, kProxyH, QImage::Format_ARGB32_Premultiplied);
+                canvasBase.fill(Qt::black);
+                // V1 the way populateLayerMetadata fills it (no style, fit, matte or
+                // parent here).
+                VideoPlayer::DecodedLayer v1;
+                v1.rgb = proxyFrame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                v1.sourceTrack = seq[0].sourceTrack;
+                v1.sourceClipIndex = seq[0].sourceClipIndex;
+                v1.sequenceIdx = 0;
+                v1.fitContain = seq[0].fitContain;
+                v1.fitCover = seq[0].fitCover;
+                const QImage shown =
+                    player.composeAndPresentForTest(canvasBase, {v1}, seq, 0, us(t));
+                const auto md = view->stabMatrixForTest();
+                const Box shownBox = whiteBox(shown, QRect(0, 0, kProxyW, kProxyH));
+                dOk = seq[0].stabilizerSourceSize == analysed && m2Near(md, -0.03125)
+                    && view->stabEnabledForTest() && shownBox.rect == QRect(10, 10, 2, 2);
+                d << " (d) entry sourceSize=" << seq[0].stabilizerSourceSize.width() << 'x'
+                  << seq[0].stabilizerSourceSize.height() << " track=" << seq[0].sourceTrack
+                  << " composed white " << boxText(shownBox) << " player gl m="
+                  << matrixText(md) << " enabled=" << view->stabEnabledForTest()
+                  << " ok=" << dOk;
+            }
+        }
+
+        // (e) the special composite on a 64x48 project decoding the 64x48 file with
+        // keys of the 128x96 analysis (a brush puts it on the special path).
+        bool eOk = false;
+        {
+            const QString seq48 = writeSequence(dir, QStringLiteral("e48"), proxyFrame);
+            MainWindow window;
+            window.hide();
+            Timeline *mainTimeline =
+                window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            if (mainTimeline && !seq48.isEmpty()) {
+                emit mainTimeline->projectOutputConfigRestored(kProxyW, kProxyH, false);
+                ClipInfo eClip = withBrush(withKeys(seqClip(seq48), {key(0.0, 4.0)}),
+                                           QPointF(40.0, 30.0));
+                const auto build = [&](const ClipInfo &clip, QSize *size) {
+                    mainTimeline->setProjectOutputConfig(kProxyW, kProxyH, false, kFps);
+                    mainTimeline->restoreFromProject({{clip}}, QVector<QVector<ClipInfo>>{}, 0.0,
+                                                     -1.0, -1.0, 100);
+                    mainTimeline->refreshPlaybackSequence();
+                    stabwarp::StabSample stab;
+                    QString id;
+                    return window.buildSpecialClipComposite(t, nullptr, &stab, size, &id);
+                };
+                QSize plainSize;
+                QSize storedSize;
+                const QImage ePlain = build(eClip, &plainSize);
+                eClip.stabilizerSourceSize = analysed;
+                const QImage eStored = build(eClip, &storedSize);
+                const QRect dotArea(0, 0, kProxyW, 20);
+                const Box plainDot = whiteBox(ePlain, dotArea);
+                const Box storedDot = whiteBox(eStored, dotArea);
+                eOk = plainSize == QSize(kProxyW, kProxyH) && plainDot.rect == QRect(14, 10, 2, 2)
+                    && storedSize == analysed && storedDot.n == 4
+                    && storedDot.rect == QRect(12, 10, 2, 2);
+                d << " (e) no stored size: brushSize=" << plainSize.width() << 'x'
+                  << plainSize.height() << " dot " << boxText(plainDot) << "; stored 128x96: "
+                  << "brushSize=" << storedSize.width() << 'x' << storedSize.height()
+                  << " dot " << boxText(storedDot) << " ok=" << eOk;
+            } else {
+                d << " (e) mainTimeline=" << (mainTimeline != nullptr)
+                  << " seqOk=" << !seq48.isEmpty() << " ok=0";
+            }
+        }
+        // Without GL only (d) is not run: the gate is a SKIP when the other legs
+        // pass and a FAIL when one of them does not.
+        if (!dRan && aOk && bOk && cOk && eOk)
+            tally.skip(7, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(7, aOk && bOk && cOk && dOk && eOk, d.str());
+    }
+
+    // US-2202 G8: a size change rebuilds the matrix in displayFrame: 64x64 upload +
+    // key dx +4 / time -> -0.0625, then a 128x96 frame -> -0.03125 with no new time.
+    // Replacement leg: replaceClipMedia with a 64x48 file clears the clip's 128x96
+    // stabilizerSourceSize, so the flattened entry has none and the GL preview falls
+    // back to the frame size like stabwarp::applyForExport (+4 px, m[2] -0.0625);
+    // undo restores 128x96 and redo clears it again.
+    {
+        GLPreview glView;
+        glView.displayFrame(dotFrame({}));
+        glView.setStabilizerKeyframes({key(0.0, 4.0)});
+        glView.setStabilizerSourceTimeUs(0);
+        const auto before = glView.stabMatrixForTest();
+        glView.displayFrame(dotFrame({}, 128, 96));
+        const auto after = glView.stabMatrixForTest();
+        std::ostringstream d;
+        d << "64x64 m=" << matrixText(before) << " after 128x96 displayFrame m="
+          << matrixText(after) << " enabled=" << glView.stabEnabledForTest();
+        bool ok = std::abs(double(before[2]) - -0.0625) <= 1e-7
+            && std::abs(double(after[2]) - -0.03125) <= 1e-7 && glView.stabEnabledForTest();
+
+        const QSize analysed(128, 96);
+        const QImage frame48 = dotFrame({QPoint(10, 10)}, 64, 48);
+        const QString movie48 = dir + QStringLiteral("/replace48.mp4");
+        ClipInfo sized = withKeys(seqClip(seqA), {key(0.0, 4.0)});
+        sized.stabilizerSourceSize = analysed;
+        const auto timeline = makeTimeline({{sized}});
+        const auto clipSize = [&] {
+            return timeline->videoTracks().at(0)->clips().at(0).stabilizerSourceSize;
+        };
+        const auto sizeText = [](const QSize &size) {
+            return size.isValid() ? std::to_string(size.width()) + 'x'
+                    + std::to_string(size.height())
+                                  : std::string("invalid");
+        };
+        QString message;
+        const bool movieOk = writeMovie(movie48, frame48);
+        const bool replaced = movieOk
+            && timeline->replaceClipMedia(TrackKind::Video, 0, 0, movie48, QString(),
+                                          kDuration, &message);
+        const QSize afterReplace = clipSize();
+        const bool r1 = replaced && !afterReplace.isValid();
+        d << "; replace: movieOk=" << movieOk << " replaced=" << replaced << " msg="
+          << message.toStdString() << " (1) clip size=" << sizeText(afterReplace)
+          << " ok=" << r1;
+
+        QVector<PlaybackEntry> seq = timeline->computePlaybackSequence();
+        const QSize entrySize = seq.size() == 1 ? seq[0].stabilizerSourceSize : analysed;
+        const Box cpuBox = seq.size() == 1
+            ? whiteBox(stabwarp::applyForExport(frame48, timeline->videoTracks().at(0)
+                                                             ->clips().at(0),
+                                                0, 0, t))
+            : Box{};
+        bool r2 = seq.size() == 1 && !entrySize.isValid() && cpuBox.n == 4
+            && cpuBox.rect == QRect(14, 10, 2, 2);
+        bool glRan = false;
+        {
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            if (view && player.isGLAccelerated() && seq.size() == 1) {
+                glRan = true;
+                QImage canvasBase(64, 48, QImage::Format_ARGB32_Premultiplied);
+                canvasBase.fill(Qt::black);
+                VideoPlayer::DecodedLayer v1;
+                v1.rgb = frame48.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                v1.sourceTrack = seq[0].sourceTrack;
+                v1.sourceClipIndex = seq[0].sourceClipIndex;
+                v1.sequenceIdx = 0;
+                v1.fitContain = seq[0].fitContain;
+                v1.fitCover = seq[0].fitCover;
+                player.composeAndPresentForTest(canvasBase, {v1}, seq, 0, us(t));
+                const auto m = view->stabMatrixForTest();
+                r2 = r2 && view->stabEnabledForTest()
+                    && std::abs(double(m[2]) - -0.0625) <= 1e-7;
+                d << " (2) entry size=" << sizeText(entrySize) << " export white "
+                  << boxText(cpuBox) << " gl m=" << matrixText(m)
+                  << " enabled=" << view->stabEnabledForTest() << " ok=" << r2;
+            } else {
+                d << " (2) entry size=" << sizeText(entrySize) << " export white "
+                  << boxText(cpuBox) << " gl not run: GL preview unavailable (environment)"
+                  << " cpuOk=" << r2;
+            }
+        }
+
+        timeline->undo();
+        const QSize afterUndo = clipSize();
+        timeline->redo();
+        const QSize afterRedo = clipSize();
+        const bool r3 = afterUndo == analysed && !afterRedo.isValid();
+        d << " (3) undo size=" << sizeText(afterUndo) << " redo size=" << sizeText(afterRedo)
+          << " ok=" << r3;
+        ok = ok && r1 && r2 && r3;
+        // Without GL only the GL m[2] check of (2) is not run: a SKIP when the other
+        // checks pass and a FAIL when one of them does not.
+        if (!glRan && ok)
+            tally.skip(8, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(8, ok && glRan, d.str());
+    }
+
+    // US-2202 G9 (pin: (12) not reproducible at HEAD, F14 / F24): the GL stabilizer
+    // state around a still compare, (a) on a player whose provider shows a special
+    // composite (no keys throughout), (c) then on that same player once the provider
+    // returns no image (keys and -0.0625 on the next present, none while comparing,
+    // back after), and (b) on a fresh player showing the ordinary frame (keys and
+    // -0.0625 from the first present, none while comparing, back after).
+    {
+        std::ostringstream d;
+        d << "pin: (12) not reproducible at HEAD (F14/F24)";
+        const QImage v1Frame = dotFrame({QPoint(10, 10)});
+        const QImage stillImage = dotFrame({QPoint(50, 40)});
+        const QImage specialImage = dotFrame({QPoint(30, 30)});
+        bool ran = false;
+        bool ok = true;
+        for (int providerSpecial = 1; providerSpecial >= 0; --providerSpecial) {
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            if (!(view && player.isGLAccelerated()))
+                break;
+            ran = true;
+            int calls = 0;
+            player.setSpecialCompositeProvider([&](qint64) {
+                ++calls;
+                return providerSpecial ? specialImage : QImage();
+            });
+            PlaybackEntry e;
+            e.filePath = seqA;
+            e.clipIn = 0.0;
+            e.clipOut = kDuration;
+            e.timelineStart = 0.0;
+            e.timelineEnd = kDuration;
+            e.speed = 1.0;
+            e.sourceTrack = 0;
+            e.sourceClipIndex = 0;
+            e.stabilizerKeyframes = {key(0.0, 4.0)};
+            QImage canvasBase(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            canvasBase.fill(Qt::black);
+            VideoPlayer::DecodedLayer v1;
+            v1.rgb = v1Frame.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            v1.sequenceIdx = 0;
+            const auto identity = [&] {
+                return matrixNear(view->stabMatrixForTest(), {1, 0, 0, 0, 1, 0, 0, 0, 1});
+            };
+            const auto keyed = [&] {
+                return view->stabEnabledForTest()
+                    && matrixNear(view->stabMatrixForTest(), {1, 0, -0.0625, 0, 1, 0, 0, 0, 1});
+            };
+            const char *leg = providerSpecial ? "(a)" : "(b)";
+            const auto state = [&](const char *tag) {
+                d << ' ' << leg << ' ' << tag
+                  << ": enabled=" << view->stabEnabledForTest()
+                  << " m=" << matrixText(view->stabMatrixForTest()) << " calls=" << calls;
+            };
+            stillcompare::Config on;
+            on.enabled = true;
+            on.still = stillImage;
+            stillcompare::Config off;
+            const QImage shown = player.composeAndPresentForTest(canvasBase, {v1}, {e}, 0, us(t));
+            state("present 1");
+            const bool composedOk = whiteBox(shown).rect == QRect(10, 10, 2, 2);
+            bool legOk = composedOk && calls == 1;
+            if (providerSpecial) {
+                legOk = legOk && !view->stabEnabledForTest() && identity();
+                player.setStillCompare(on);
+                state("compare on");
+                legOk = legOk && calls == 2 && !view->stabEnabledForTest() && identity();
+                player.setStillCompare(off);
+                state("compare off");
+                legOk = legOk && calls == 3 && !view->stabEnabledForTest() && identity();
+                // (c) the same player, the provider now returning no image.
+                leg = "(c)";
+                player.setSpecialCompositeProvider([&](qint64) {
+                    ++calls;
+                    return QImage();
+                });
+                player.composeAndPresentForTest(canvasBase, {v1}, {e}, 0, us(t));
+                state("present");
+                legOk = legOk && calls == 4 && keyed();
+                player.setStillCompare(on);
+                state("compare on");
+                legOk = legOk && calls == 5 && !view->stabEnabledForTest() && identity();
+                player.setStillCompare(off);
+                state("compare off");
+                legOk = legOk && calls == 6 && keyed();
+            } else {
+                legOk = legOk && keyed();
+                player.composeAndPresentForTest(canvasBase, {v1}, {e}, 0, us(t));
+                state("present 2");
+                legOk = legOk && keyed();
+                player.setStillCompare(on);
+                state("compare on");
+                legOk = legOk && calls == 3 && !view->stabEnabledForTest() && identity();
+                player.setStillCompare(off);
+                state("compare off");
+                legOk = legOk && calls == 4 && keyed();
+            }
+            d << " composedOk=" << composedOk << " legOk=" << legOk;
+            ok = ok && legOk;
+        }
+        if (!ran)
+            tally.skip(9, "GL preview unavailable (environment)");
+        else
+            tally.gate(9, ok, d.str());
     }
 
     return tally.finish("stabilizer-export");

@@ -2196,6 +2196,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
             stabilizer.append(k);
         }
         obj["stabilizerKeyframes"] = stabilizer;
+        // US-2202: the size the keys were analysed at; omitted when unknown.
+        if (clip.stabilizerSourceSize.isValid())
+            obj["stabilizerSourceSize"] = QJsonArray{clip.stabilizerSourceSize.width(),
+                                                     clip.stabilizerSourceSize.height()};
     }
     if (!clip.maskTrackingData.isEmpty())
         obj["maskTracking"] = trackingResultToJson(clip.maskTrackingData);
@@ -2361,6 +2365,15 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         kf.theta = k["theta"].toDouble(0.0);
         kf.scale = k["scale"].toDouble(1.0);
         clip.stabilizerKeyframes.append(kf);
+    }
+    // US-2202: [w, h] of whole numbers in 1..32768, else unknown (the frame size).
+    if (!clip.stabilizerKeyframes.isEmpty()) {
+        const QJsonArray size = obj["stabilizerSourceSize"].toArray();
+        const double w = size.size() == 2 ? size.at(0).toDouble(0.0) : 0.0;
+        const double h = size.size() == 2 ? size.at(1).toDouble(0.0) : 0.0;
+        if (w >= 1.0 && h >= 1.0 && w <= 32768.0 && h <= 32768.0
+            && w == std::floor(w) && h == std::floor(h))
+            clip.stabilizerSourceSize = QSize(int(w), int(h));
     }
     if (obj.contains("maskTracking"))
         clip.maskTrackingData = trackingResultFromJson(obj["maskTracking"].toObject());
