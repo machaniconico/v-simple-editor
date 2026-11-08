@@ -18,6 +18,7 @@
 #include "../ClipGeometry.h"
 #include "../libavcore/Encode.h"
 #include "SelftestGate.h"
+#include "SelftestGl.h"
 
 #include <QColor>
 #include <QCoreApplication>
@@ -758,7 +759,7 @@ int runBrushExportSelftest()
 
         VideoPlayer player;
         GLPreview *view = player.glPreview();
-        const bool glOn = player.isGLAccelerated();
+        const bool glOn = player.isGLAccelerated() && selftest::glContextUsable(view);
         if (!view || !glOn) {
             tally.skip(10, "OpenGL preview unavailable in this environment");
         } else {

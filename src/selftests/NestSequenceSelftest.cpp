@@ -2,12 +2,14 @@
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
+#include "SelftestGate.h"
 
 #include <cstddef>
 #include <cstring>
 
 #include <QApplication>
 #include <QColor>
+#include <QCryptographicHash>
 #include <QDebug>
 #include <QImage>
 #include <QJsonArray>
@@ -385,36 +387,29 @@ bool doublePrecomposeUndoClearsSequenceStore(const ClipInfo &media, QString *det
 
 int runNestSequenceSelftest()
 {
-    int passed = 0;
-    int failed = 0;
+    selftest::GateTally tally;
     auto check = [&](int gate, const char *name, bool ok,
                      const QString &detail = QString()) {
-        if (ok) {
-            ++passed;
-            qInfo().noquote() << QStringLiteral("[nest-sequence] PASS G%1 %2")
-                .arg(gate).arg(QString::fromLatin1(name));
-        } else {
-            ++failed;
-            qCritical().noquote() << QStringLiteral("[nest-sequence] FAIL G%1 %2%3")
-                .arg(gate).arg(QString::fromLatin1(name))
-                .arg(detail.isEmpty() ? QString() : QStringLiteral(": ") + detail);
-        }
+        std::string message = name;
+        if (!detail.isEmpty())
+            message += ": " + detail.toStdString();
+        tally.gate(gate, ok, message);
     };
 
     check(1, "QApplication is available", QApplication::instance() != nullptr);
-    if (failed)
-        return failed;
+    if (tally.failed)
+        return tally.finish("nest-sequence");
 
     QTemporaryDir tmpDir;
     check(2, "temporary directory", tmpDir.isValid());
     if (!tmpDir.isValid())
-        return failed;
+        return tally.finish("nest-sequence");
 
     QString error;
     const QString mediaPath = tmpDir.filePath(QStringLiteral("nest_sequence_src.mp4"));
     check(3, "synthetic media", writeSyntheticClip(mediaPath, &error), error);
-    if (failed)
-        return failed;
+    if (tally.failed)
+        return tally.finish("nest-sequence");
 
     const ClipInfo media = makeMediaClip(mediaPath, QStringLiteral("media"));
     const double duration = media.duration;
@@ -516,8 +511,14 @@ int runNestSequenceSelftest()
     const QImage decoded =
         tlrender::detail::decodeClipFrameNativeForTest(mediaPath, 0.25)
             .scaled(outSize, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+    const QString identitySha = direct.isNull() ? QString()
+        : QString::fromLatin1(QCryptographicHash::hash(
+              QByteArray::fromRawData(reinterpret_cast<const char *>(direct.constBits()),
+                                      static_cast<qsizetype>(direct.sizeInBytes())),
+              QCryptographicHash::Sha256).toHex());
     check(12, "legacy no-nest render remains decode-byte-identical",
-          !direct.isNull() && equalRgbaBytes(direct, decoded));
+          !direct.isNull() && equalRgbaBytes(direct, decoded),
+          QStringLiteral("identity frame sha256=%1").arg(identitySha));
 
     QString precomposeUndoDetail;
     check(13, "single precompose undo clears sequence store",
@@ -529,7 +530,5 @@ int runNestSequenceSelftest()
           doublePrecomposeUndoClearsSequenceStore(media, &precomposeUndoDetail),
           precomposeUndoDetail);
 
-    qInfo().noquote() << QStringLiteral("[nest-sequence] summary: %1 PASS, %2 FAIL")
-        .arg(passed).arg(failed);
-    return failed == 0 ? 0 : failed;
+    return tally.finish("nest-sequence");
 }

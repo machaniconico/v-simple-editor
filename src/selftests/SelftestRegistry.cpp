@@ -1055,7 +1055,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
       "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
-      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
+      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity (14 gates)" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
