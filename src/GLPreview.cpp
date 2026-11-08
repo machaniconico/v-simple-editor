@@ -327,6 +327,9 @@ uniform bool uHueSatWarpEnabled;
 
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
+uniform float uLutSize = 1.0;                 // texels per axis; < 2 skips the lookup
+uniform vec3 uLutDomainMin = vec3(0.0);       // DOMAIN_MIN of a 3D LUT (0 for a 1D grid)
+uniform vec3 uLutDomainMax = vec3(1.0);       // DOMAIN_MAX of a 3D LUT (1 for a 1D grid)
 uniform float uLutIntensity;  // 0.0 to 1.0
 uniform bool uLutEnabled;
 
@@ -994,9 +997,13 @@ R"(
             color.rgb = clamp(color.rgb * factor, 0.0, 1.0);
         }
 
-        // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity
-        if (uLutEnabled) {
-            vec3 lutColor = texture(uLut3D, clamp(color, 0.0, 1.0)).rgb;
+        // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity.
+        // Domain remap and texel-centre address as LutImporter::gpuDomainRemap /
+        // gpuTexelCoord: n = clamp((c - min) / (max - min), 0, 1), t = (n * (N - 1) + 0.5) / N.
+        if (uLutEnabled && uLutSize >= 2.0) {
+            vec3 lutN = clamp((color - uLutDomainMin) / (uLutDomainMax - uLutDomainMin), 0.0, 1.0);
+            vec3 lutT = (lutN * (uLutSize - 1.0) + 0.5) / uLutSize;
+            vec3 lutColor = texture(uLut3D, lutT).rgb;
             color = mix(color, lutColor, uLutIntensity);
         }
 
@@ -1725,6 +1732,9 @@ void GLPreview::createShaderProgram()
     m_locLut3D         = m_program->uniformLocation("uLut3D");
     m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
     m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
+    m_locLutSize       = m_program->uniformLocation("uLutSize");
+    m_locLutDomainMin  = m_program->uniformLocation("uLutDomainMin");
+    m_locLutDomainMax  = m_program->uniformLocation("uLutDomainMax");
 
     // US-CG-1: RGB curves
     m_locCurveLut       = m_program->uniformLocation("uCurveLut");
@@ -2663,6 +2673,9 @@ void GLPreview::paintGL()
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
     m_program->setUniformValue(m_locLutIntensity, m_lutIntensity);
+    m_program->setUniformValue(m_locLutSize, static_cast<float>(m_lutN));
+    m_program->setUniformValue(m_locLutDomainMin, m_lutDomainMin);
+    m_program->setUniformValue(m_locLutDomainMax, m_lutDomainMax);
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->bind();
@@ -3733,7 +3746,8 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
-    // 1D / non-default-domain LUTs become a 3D grid; a default-domain 3D LUT passes through
+    // A 1D LUT becomes a 3D grid with the default domain; a 3D LUT passes through with its
+    // own table and domain, which the shader applies before the texel-centre lookup.
     const LutData grid = LutImporter::toGpuGrid(lut);
 
     undotrace::log("gl:beforeMakeCurrent");
@@ -3766,83 +3780,9 @@ void GLPreview::setLut(const LutData &lut)
                           data.constData());
 
     m_lutIntensity = static_cast<float>(grid.intensity);
-    m_lutEnabled = true;
-
-    doneCurrent();
-    update();
-}
-
-// US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
-// with auto-detection of cube layout (32^3, 64^3 horizontal/vertical strip, HALD).
-void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
-{
-    if (lutGrid.isNull())
-        return;
-
-    const int w = lutGrid.width();
-    const int h = lutGrid.height();
-    int cubeSize = 0;
-    bool horizontal = true; // true = N*N wide × N tall (HALD), false = N wide × N*N tall
-
-    // Auto-detect cube size from grid dimensions
-    if (w == 32 && h == 1024)        { cubeSize = 32; horizontal = false; }
-    else if (w == 1024 && h == 32)   { cubeSize = 32; horizontal = true; }
-    else if (w == 64 && h == 4096)   { cubeSize = 64; horizontal = false; }
-    else if (w == 4096 && h == 64)   { cubeSize = 64; horizontal = true; }
-    else {
-        qWarning() << "GLPreview::setLutTexture: unsupported LUT grid size" << w << "x" << h;
-        return;
-    }
-
-    // Convert to 8-bit RGBA for consistent pixel access
-    QImage img = lutGrid.convertToFormat(QImage::Format_RGBA8888);
-
-    // Build 3D float-RGB data: cubeSize × cubeSize × cubeSize × 3
-    QVector<float> data;
-    data.resize(cubeSize * cubeSize * cubeSize * 3);
-
-    for (int b = 0; b < cubeSize; ++b) {
-        for (int g = 0; g < cubeSize; ++g) {
-            for (int r = 0; r < cubeSize; ++r) {
-                int px, py;
-                if (horizontal) {
-                    // HALD layout: width = cubeSize*cubeSize, height = cubeSize
-                    px = g * cubeSize + r;
-                    py = b;
-                } else {
-                    // Transposed: width = cubeSize, height = cubeSize*cubeSize
-                    px = b;
-                    py = g * cubeSize + r;
-                }
-                const QRgb pixel = img.pixel(px, py);
-                const int idx = (b * cubeSize * cubeSize + g * cubeSize + r) * 3;
-                data[idx + 0] = qRed(pixel)   / 255.0f;
-                data[idx + 1] = qGreen(pixel) / 255.0f;
-                data[idx + 2] = qBlue(pixel)  / 255.0f;
-            }
-        }
-    }
-
-    undotrace::log("gl:beforeMakeCurrent");
-    makeCurrent();
-    undotrace::log("gl:afterMakeCurrent");
-
-    if (m_lutTexture) {
-        delete m_lutTexture;
-        m_lutTexture = nullptr;
-    }
-
-    m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
-    m_lutTexture->setSize(cubeSize, cubeSize, cubeSize);
-    m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
-    m_lutTexture->allocateStorage();
-    m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setMagnificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
-    m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
-                          data.constData());
-
-    m_lutIntensity = qBound(0.0f, intensity, 1.0f);
+    m_lutN = grid.size;
+    m_lutDomainMin = grid.domainMin;
+    m_lutDomainMax = grid.domainMax;
     m_lutEnabled = true;
 
     doneCurrent();
@@ -4175,6 +4115,7 @@ void GLPreview::clearLut()
         m_lutTexture = nullptr;
     }
     m_lutEnabled = false;
+    m_lutN = 0;
     // US-FEAT-B: zero intensity so LUT has no residual effect if re-enabled
     m_lutIntensity = 0.0f;
     doneCurrent();

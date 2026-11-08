@@ -53,9 +53,16 @@ public:
     static QVector3D sample(const LutData &lut, const QVector3D &rgb01);
 
     // Grid for the GL preview (a 3D texture of size^3). A 1D LUT is expanded to an n^3 grid
-    // (n = clamp(size, 2, maxSize)) and a 3D LUT with a non-default domain is resampled at its
-    // own size, both through sample(); a default-domain 3D LUT is returned unchanged.
+    // (n = clamp(size, 2, maxSize)) through sample(); a 3D LUT is returned unchanged, whatever
+    // its domain (the shader remaps by DOMAIN_MIN / DOMAIN_MAX before the lookup).
     static LutData toGpuGrid(const LutData &in, int maxSize = 65);
+
+    // CPU twins of the GL preview's 3D LUT lookup (GLPreview's fragment shader uses the same
+    // formulas): the domain normalisation (rgb01 - domainMin) / (domainMax - domainMin) clamped
+    // to 0..1 per channel, then the texture coordinate (clamp(x, 0, 1) * (n - 1) + 0.5) / n that
+    // puts knot 0 .. n - 1 at the centre of texel 0 .. n - 1 of an n-texel axis.
+    static QVector3D gpuDomainRemap(const LutData &lut, const QVector3D &rgb01);
+    static float gpuTexelCoord(int n, float x);
 
     // Generate a preview image showing the LUT effect on a colour gradient
     static QImage generatePreview(const LutData &lutData, int previewSize = 128);

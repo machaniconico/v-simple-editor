@@ -188,11 +188,7 @@ QVector3D LutImporter::trilinearInterpolate(const QVector<QVector3D> &table, int
 
 QVector3D LutImporter::sample(const LutData &lut, const QVector3D &rgb01)
 {
-    float n[3];
-    for (int c = 0; c < 3; ++c) {
-        const float lo = lut.domainMin[c];
-        n[c] = qBound(0.0f, (rgb01[c] - lo) / (lut.domainMax[c] - lo), 1.0f);
-    }
+    const QVector3D n = gpuDomainRemap(lut, rgb01);
     if (lut.type == LutType::Cube3D)
         return trilinearInterpolate(lut.table, lut.size, n[0], n[1], n[2]);
 
@@ -208,14 +204,28 @@ QVector3D LutImporter::sample(const LutData &lut, const QVector3D &rgb01)
     return out;
 }
 
+QVector3D LutImporter::gpuDomainRemap(const LutData &lut, const QVector3D &rgb01)
+{
+    QVector3D n;
+    for (int c = 0; c < 3; ++c) {
+        const float lo = lut.domainMin[c];
+        n[c] = qBound(0.0f, (rgb01[c] - lo) / (lut.domainMax[c] - lo), 1.0f);
+    }
+    return n;
+}
+
+float LutImporter::gpuTexelCoord(int n, float x)
+{
+    return (qBound(0.0f, x, 1.0f) * static_cast<float>(n - 1) + 0.5f) / static_cast<float>(n);
+}
+
 LutData LutImporter::toGpuGrid(const LutData &in, int maxSize)
 {
-    if (!in.isValid() || (in.type == LutType::Cube3D && in.hasDefaultDomain()))
+    // A 3D table is uploaded as is; the shader applies its domain before the lookup.
+    if (!in.isValid() || in.type == LutType::Cube3D)
         return in;
 
-    // A non-default 3D domain is resampled densely so its knots and clamp edge stay
-    // within one grid step of the default-domain grid points.
-    const int n = in.type == LutType::Cube1D ? qBound(2, in.size, maxSize) : qMax(in.size, maxSize);
+    const int n = qBound(2, in.size, maxSize);
     LutData out;
     out.name = in.name;
     out.filePath = in.filePath;

@@ -74,8 +74,6 @@ public:
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
     void setLut(const LutData &lut);
-    // US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
-    void setLutTexture(const QImage &lutGrid, float intensity);
     void setLutIntensity(double intensity);
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
@@ -514,7 +512,13 @@ private:
     int m_locLut3D = -1;
     int m_locLutIntensity = -1;
     int m_locLutEnabled = -1;
+    int m_locLutSize = -1;
+    int m_locLutDomainMin = -1;
+    int m_locLutDomainMax = -1;
     QOpenGLTexture *m_lutTexture = nullptr;
+    int m_lutN = 0;                               // texels per axis of m_lutTexture (0 = none)
+    QVector3D m_lutDomainMin{0.0f, 0.0f, 0.0f};   // uLutDomainMin / uLutDomainMax
+    QVector3D m_lutDomainMax{1.0f, 1.0f, 1.0f};
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
 

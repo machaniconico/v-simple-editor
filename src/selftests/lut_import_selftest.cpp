@@ -325,17 +325,23 @@ int runLutImportSelftest()
         const bool anchor = bigg.table.size() == 65 * 65 * 65
             && std::abs(bigg.table[32 + 32 * 65 + 32 * 65 * 65].x() - 0.125f) < 1e-3f;
 
-        // (c) 3D LUT with DOMAIN_MAX 2 -> default-domain 3D grid; white matches the original.
+        // (c) 3D LUT with DOMAIN_MAX 2 passes through toGpuGrid unchanged (US-2200: the GL
+        // shader applies the domain), so its table, size and domain reach the GL texture as is.
+        const auto passThrough = [](const LutData &in, const LutData &out) {
+            return in.isValid() && out.type == LutType::Cube3D && out.size == in.size
+                && out.table == in.table && out.domainMin == in.domainMin
+                && out.domainMax == in.domainMax && out.intensity == in.intensity;
+        };
         bool cok = false;
         const LutData dom = loadText(dir, "g12c.cube", "DOMAIN_MAX 2 2 2\n" + g1Body(), &cok);
         const LutData domg = LutImporter::toGpuGrid(dom);
         const QColor w0 = LutImporter::applyLut(pixel(255, 255, 255), dom).pixelColor(0, 0);
         const QColor w1 = LutImporter::applyLut(pixel(255, 255, 255), domg).pixelColor(0, 0);
-        bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && domg.type == LutType::Cube3D
-            && domg.size == 65 && domg.hasDefaultDomain() && near(w1, w0.red(), w0.green(), w0.blue());
-        // Narrow (0..0.5, row v^2) and shifted (0.1..0.6, row v^2 / 2) 3-point domains: the
-        // grid tracks the original on the diagonal and an off-axis line within 2/255.
-        std::string domDetail;
+        bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && passThrough(dom, domg)
+            && domg.domainMax == QVector3D(2.0f, 2.0f, 2.0f) && near(w1, w0.red(), w0.green(), w0.blue());
+        std::string domDetail = " c_size=" + std::to_string(domg.size);
+        // (c2)(c3) Narrow (0..0.5, row v^2) and shifted (0.1..0.6, row v^2 / 2) 3-point domains
+        // pass through the same way.
         const char *domHeads[2] = {"DOMAIN_MIN 0 0 0\nDOMAIN_MAX 0.5 0.5 0.5\n",
                                    "DOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.6 0.6 0.6\n"};
         const char *domNames[2] = {"g12c2.cube", "g12c3.cube"};
@@ -351,22 +357,13 @@ int runLutImportSelftest()
             bool lok = false;
             const LutData orig = loadText(dir, domNames[d], text, &lok);
             const LutData grid = LutImporter::toGpuGrid(orig);
-            const bool valid = lok && orig.isValid() && grid.isValid();
-            float maxErr = valid ? 0.0f : 1.0f;
-            for (int k = 0; valid && k <= 255; ++k) {
-                const float t = k / 255.0f;
-                const QVector3D xs[2] = {QVector3D(t, t, t), QVector3D(t, 0.25f, 0.75f)};
-                for (const QVector3D &x : xs) {
-                    const QVector3D e = LutImporter::sample(grid, x) - LutImporter::sample(orig, x);
-                    maxErr = qMax(maxErr, qMax(std::abs(e.x()), qMax(std::abs(e.y()), std::abs(e.z()))));
-                }
-            }
-            okC = okC && valid && orig.size == 3 && !orig.hasDefaultDomain()
-                && grid.hasDefaultDomain() && maxErr <= 2.0f / 255.0f;
-            domDetail += " dom" + std::to_string(d) + "_err255=" + std::to_string(maxErr * 255.0f);
+            const bool pt = lok && orig.size == 3 && !orig.hasDefaultDomain() && passThrough(orig, grid);
+            okC = okC && pt;
+            domDetail += " dom" + std::to_string(d) + "_passThrough=" + std::to_string(pt)
+                       + "_size=" + std::to_string(grid.size);
         }
-        // Logged only, not part of the gate (Wave 22 carryover C-02-residual): a domain narrower
-        // than one 1/64 grid step (0.1..0.101, row 0 / 0.25 / 1) cannot be tracked by a uniform grid.
+        // (c4) A domain narrower than any grid step (0.1..0.101, row 0 / 0.25 / 1) passes through
+        // too, and the GL domain remap (CPU twin) sends 26/255 to 1 like sample(); 13/255 to 0.
         {
             const double row[3] = {0.0, 0.25, 1.0};
             QByteArray text("LUT_3D_SIZE 3\nDOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.101 0.101 0.101\n");
@@ -378,16 +375,17 @@ int runLutImportSelftest()
             bool rok = false;
             const LutData orig = loadText(dir, "g12c4.cube", text, &rok);
             const LutData grid = LutImporter::toGpuGrid(orig);
-            if (rok && orig.isValid() && grid.isValid()) {
-                const float t = 26.0f / 255.0f;
-                const float ov = LutImporter::sample(orig, QVector3D(t, t, t)).x();
-                const float gv = LutImporter::sample(grid, QVector3D(t, t, t)).x();
-                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual (logged, not a pass): loaded="
-                          << rok << " DOMAIN 0.1..0.101 x=26/255 orig=" << ov << " grid=" << gv
-                          << " err255=" << std::abs(gv - ov) * 255.0f << "\n";
-            } else {
-                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual: fixture not loaded\n";
-            }
+            const float t26 = 26.0f / 255.0f, t13 = 13.0f / 255.0f;
+            const bool valid = rok && orig.isValid();
+            const QVector3D r26 = valid ? LutImporter::gpuDomainRemap(orig, QVector3D(t26, t26, t26)) : QVector3D();
+            const QVector3D r13 = valid ? LutImporter::gpuDomainRemap(orig, QVector3D(t13, t13, t13)) : QVector3D(1, 1, 1);
+            const QVector3D s26 = valid ? LutImporter::sample(orig, QVector3D(t26, t26, t26)) : QVector3D();
+            const bool ok4 = valid && passThrough(orig, grid) && r26 == QVector3D(1.0f, 1.0f, 1.0f)
+                && r13 == QVector3D(0.0f, 0.0f, 0.0f) && s26 == QVector3D(1.0f, 1.0f, 1.0f);
+            okC = okC && ok4;
+            domDetail += " narrow_passThrough=" + std::to_string(valid && passThrough(orig, grid))
+                       + " remap26=" + std::to_string(r26.x()) + " remap13=" + std::to_string(r13.x())
+                       + " sample26=" + std::to_string(s26.x());
         }
 
         // (d) default-domain 3D LUT is returned unchanged.
