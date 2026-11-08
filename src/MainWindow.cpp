@@ -103,6 +103,7 @@ double exporter_loudnessGainDb();
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
+#include "StabilizerWarp.h"
 #include "StillGalleryDock.h"
 #include "SequenceListDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
@@ -425,10 +426,20 @@ static void flushPendingUndoPoints(MainWindow *window, Timeline *timeline)
 // Shared by the file menu and import hub; no persistent widget state needed.
 // US-1906: whether the frame presented next is a special composite that drew the
 // brushes. The GL leaves the bound brush off only then
-// (tlrender::kSpecialCompositeHoldsBrushProperty).
-static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
+// (tlrender::kSpecialCompositeHoldsBrushProperty). US-2111: `v1Stab` is the
+// stabilizer sample of its V1 layer (decoded at `v1StabSourceSize`), which the GL
+// gives the brush it draws there only when that brush is the V1 clip's own
+// (`boundBrushIsV1Stab`); any other clip's brush stays unwarped as in export.
+static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush,
+                                          const stabwarp::StabSample &v1Stab,
+                                          const QSize &v1StabSourceSize,
+                                          bool boundBrushIsV1Stab)
 {
     player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
+    if (boundBrushIsV1Stab)
+        player->glPreview()->setSpecialCompositeBrushStabilizer(v1Stab, v1StabSourceSize);
+    else
+        player->glPreview()->setSpecialCompositeBrushStabilizer({}, {});
 }
 
 static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
@@ -3251,9 +3262,15 @@ void MainWindow::applyStillCompareConfig()
     if (!m_timeline)
         return;
     bool drewBrush = false;
-    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush);
+    stabwarp::StabSample v1Stab;
+    QSize v1StabSourceSize;
+    QString v1StabClipId;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush,
+                                                     &v1Stab, &v1StabSourceSize, &v1StabClipId);
     if (!special.isNull()) {
-        setSpecialCompositeHoldsBrush(m_player, drewBrush);
+        setSpecialCompositeHoldsBrush(m_player, drewBrush, v1Stab, v1StabSourceSize,
+                                      !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -4156,10 +4173,17 @@ void MainWindow::setupUI()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
         bool drewBrush = false;
-        const QImage special = buildSpecialClipComposite(sec, &drewBrush);
+        stabwarp::StabSample v1Stab;
+        QSize v1StabSourceSize;
+        QString v1StabClipId;
+        const QImage special = buildSpecialClipComposite(sec, &drewBrush, &v1Stab,
+                                                         &v1StabSourceSize, &v1StabClipId);
         // US-1805: every paused displayFrame passes here, so an ordinary frame
         // (a null composite) clears the mark a previous composite left.
-        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush);
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush, v1Stab,
+                                      v1StabSourceSize,
+                                      !special.isNull() && !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         return special;
     });
 
@@ -4874,7 +4898,7 @@ void MainWindow::setupMenuBar()
     // Playback frames replace the composite without passing the provider.
     connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
         if (playing)
-            setSpecialCompositeHoldsBrush(m_player, false);
+            setSpecialCompositeHoldsBrush(m_player, false, {}, {}, false);
         else if (m_timeline
                  && tlrender::timelineBrushWantsSpecialPath(m_timeline,
                                                             m_timeline->playheadPosition()))
@@ -8741,10 +8765,19 @@ QImage MainWindow::applyStoredRotoData(const QString &clipId,
     return roto::applyEntryToFrame(it.value(), frame, sourceFrameIndex);
 }
 
-QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush) const
+QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush,
+                                             stabwarp::StabSample *v1Stab,
+                                             QSize *v1StabSourceSize,
+                                             QString *v1StabClipId) const
 {
     if (drewBrush)
         *drewBrush = false;
+    if (v1Stab)
+        *v1Stab = {};
+    if (v1StabSourceSize)
+        *v1StabSourceSize = QSize();
+    if (v1StabClipId)
+        v1StabClipId->clear();
     if (!m_timeline)
         return {};
 
@@ -8965,6 +8998,18 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             // (78), renderClipLayerSource's order and cache key).
             if (brushWantsSpecialPath)
                 frame = tlrender::applyClipBrushSource(frame, clip, localSeconds, clipId);
+            // US-2111: V1's stabilizer after the brush, before FX, as export does
+            // (renderClipLayerSource); the GL gets no keys while this is shown.
+            if (trackIdx == 0 && !clip.stabilizerKeyframes.isEmpty()) {
+                if (v1Stab)
+                    *v1Stab = stabwarp::sampleAt(clip.stabilizerKeyframes,
+                                                 static_cast<qint64>(fxSourceSeconds * 1.0e6));
+                if (v1StabSourceSize)
+                    *v1StabSourceSize = frame.size();
+                if (v1StabClipId)
+                    *v1StabClipId = clipId;
+            }
+            frame = stabwarp::applyForExport(frame, clip, trackIdx, 0, fxSourceSeconds);
 
             // US-708: run the same native FX stage as export (VFX footage
             // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
@@ -8977,7 +9022,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip, clipId, brushWantsSpecialPath](
+                    [this, clip, clipId, trackIdx, brushWantsSpecialPath](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         // US-1805: the brush path samples export's source frame
                         // (renderClipSourceFrame), the rest keep grabFrameAt.
@@ -8993,7 +9038,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                         // US-2010: export's provider order on both branches:
                         // the sample's own brush, then VFX / grade (no roto).
                         return tlrender::prepareClipSourceForEcho(
-                            tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec, clipId),
+                            stabwarp::applyForExport(
+                                tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec,
+                                                               clipId),
+                                clip, trackIdx, 0, sampleSourceSec),
                             clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
@@ -9224,11 +9272,18 @@ void MainWindow::refreshSpecialClipPreview()
     }
 
     bool drewBrush = false;
-    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush);
+    stabwarp::StabSample v1Stab;
+    QSize v1StabSourceSize;
+    QString v1StabClipId;
+    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush, &v1Stab,
+                                                      &v1StabSourceSize, &v1StabClipId);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         // Built while playing, it holds no brush (decision B6).
-        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying());
+        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying(), v1Stab,
+                                      v1StabSourceSize,
+                                      !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {

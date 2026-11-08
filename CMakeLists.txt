@@ -187,6 +187,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/puppet_pin_selftest.cpp
     src/selftests/mesh_warp_selftest.cpp
     src/selftests/special_composite_selftest.cpp
+    src/selftests/stabilizer_export_selftest.cpp
     src/selftests/filejob_parity_selftest.cpp
     src/selftests/clip_sidecar_selftest.cpp
     src/selftests/surface_tool_selftest.cpp
@@ -684,6 +685,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MotionTrackerDialog.h
     src/MotionTrackerDialog.cpp
     src/MotionStabilizer.cpp
+    src/StabilizerWarp.cpp
     src/TrackerLink.cpp
     src/TrackerPreset.h
     src/TrackerPreset.cpp

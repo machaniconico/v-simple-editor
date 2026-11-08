@@ -270,6 +270,7 @@ int runSpatialPathSelftest();
 int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
 int runSpectrumSelftest();
+int runStabilizerExportSelftest();
 int runStereoPanSelftest();
 int runStillCompareSelftest();
 int runSubMovtextSelftest();
@@ -720,6 +721,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AIHighlight config defaults / Highlight struct helpers (singleton-free) (6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
+    { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
+      "V1 stabilizer keyframes on export (StabilizerWarp) after the brush, before FX: identity, translation, interpolation, edge fill, V1 only / nested / matrix, brush order and the special composite (6 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,

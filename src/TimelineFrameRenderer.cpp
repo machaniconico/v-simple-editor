@@ -23,6 +23,7 @@
 #include "VfxFootageLibrary.h"  // VFX-C source-side black level + intensity
 #include "ShapeLayer.h"         // SHAPE-CLIP generated source-frame SSOT
 #include "Text3DLayer.h"        // US-1707 — clip 3D text on the layer source
+#include "StabilizerWarp.h"     // US-2111 — V1 stabilizer shared with the preview
 #include <cstring>              // std::memcpy (decode row copy)
 #include "playback/TrackMatteCompose16.h"
 #include "playback/TlrCompose16.h"
@@ -2102,7 +2103,10 @@ QImage renderClipLayerSource(const Timeline *timeline,
         return QImage();
     // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
     // that image feeds both the echo and the plain branch.
-    const QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
+    QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
+    // US-2111: V1's stabilizer on the brushed source, before VFX / grade, at the
+    // export's source time and the decoded size (stabwarp::applyForExport decides).
+    raw = stabwarp::applyForExport(raw, clip, trackIdx, sequenceDepth, sourceSec);
     if (stopAfterBrush)
         return raw;
     QImage fx;
@@ -2119,7 +2123,9 @@ QImage renderClipLayerSource(const Timeline *timeline,
                 // US-2010: each past sample carries the brush at its own local
                 // time, before VFX / grade like the current frame (no roto).
                 return prepareClipSourceForEcho(
-                    applyClipBrushSource(sampleRaw, clip, sampleLocalSec, scopedClipId),
+                    stabwarp::applyForExport(
+                        applyClipBrushSource(sampleRaw, clip, sampleLocalSec, scopedClipId),
+                        clip, trackIdx, sequenceDepth, sampleSourceSec),
                     clip, sampleLocalSec);
             };
         fx = applyClipFxStackWithEchoFromSource(

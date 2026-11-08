@@ -110,6 +110,7 @@ class PuppetPinTool;
 #include "StillCompare.h"
 
 class VideoPlayer;
+namespace stabwarp { struct StabSample; }
 bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env);
 class Timeline;
 class TimelineTrack;
@@ -274,6 +275,7 @@ class MainWindow : public QMainWindow
     friend int runKeyframeAnimParitySelftest();
     friend int runUnsavedPromptSelftest();
     friend int runProjectPersistSelftest();
+    friend int runStabilizerExportSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -925,7 +927,13 @@ private:
     void queueAutoProxyProbe(const QString &filePath);
 
     // US-1906: `*drewBrush` = the composite built at this time holds the brushes.
-    QImage buildSpecialClipComposite(double timelineSeconds, bool *drewBrush = nullptr) const;
+    // US-2111: `*v1Stab` = the stabilizer sample its V1 layer was warped with,
+    // `*v1StabSourceSize` = that layer's decoded frame size (the unit of dx / dy) and
+    // `*v1StabClipId` = brushClipId of the V1 clip it was sampled from.
+    QImage buildSpecialClipComposite(double timelineSeconds, bool *drewBrush = nullptr,
+                                     stabwarp::StabSample *v1Stab = nullptr,
+                                     QSize *v1StabSourceSize = nullptr,
+                                     QString *v1StabClipId = nullptr) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
     // roto carrier (Timeline::rotoEntries) の唯一の書き手。空 entry なら削除し、
     // 1 回の saveUndoState で 1 undo にする。
