@@ -6,6 +6,56 @@
 #include <QTextLayout>
 #include <QTextLine>
 
+QJsonObject SubtitleStyle::toJson() const
+{
+    QJsonObject o;
+    o["fontName"] = font.family();
+    o["fontSize"] = font.pointSize();
+    o["fontBold"] = font.bold();
+    o["color"] = color.name(QColor::HexArgb);
+    o["outlineColor"] = outlineColor.name(QColor::HexArgb);
+    o["outlineWidth"] = outlineWidth;
+    o["verticalPos"] = verticalPos;
+    o["boxEnabled"] = boxEnabled;
+    o["boxColor"] = boxColor.name(QColor::HexArgb);
+    o["boxOpacity"] = boxOpacity;
+    o["maxWidthFraction"] = maxWidthFraction;
+    o["alignment"] = alignment;
+    o["karaokeEnabled"] = karaokeEnabled;
+    o["karaokeHighlightColor"] = karaokeHighlightColor.name(QColor::HexArgb);
+    return o;
+}
+
+SubtitleStyle SubtitleStyle::fromJson(const QJsonObject &obj)
+{
+    SubtitleStyle st;
+    auto colorOr = [&obj](const char *key, const QColor &def) {
+        const QColor c(obj.value(key).toString());
+        return c.isValid() ? c : def;
+    };
+    const QString family = obj.value("fontName").toString();
+    if (!family.isEmpty())
+        st.font.setFamily(family);
+    const int pt = obj.value("fontSize").toInt(st.font.pointSize());
+    if (pt > 0)
+        st.font.setPointSize(pt);
+    st.font.setBold(obj.value("fontBold").toBool(st.font.bold()));
+    st.color = colorOr("color", st.color);
+    st.outlineColor = colorOr("outlineColor", st.outlineColor);
+    st.outlineWidth = obj.value("outlineWidth").toDouble(st.outlineWidth);
+    st.verticalPos = obj.value("verticalPos").toDouble(st.verticalPos);
+    st.boxEnabled = obj.value("boxEnabled").toBool(st.boxEnabled);
+    st.boxColor = colorOr("boxColor", st.boxColor);
+    st.boxOpacity = obj.value("boxOpacity").toDouble(st.boxOpacity);
+    st.maxWidthFraction = obj.value("maxWidthFraction").toDouble(st.maxWidthFraction);
+    const int al = obj.value("alignment").toInt(st.alignment);
+    if (al == Qt::AlignLeft || al == Qt::AlignHCenter || al == Qt::AlignRight)
+        st.alignment = al;
+    st.karaokeEnabled = obj.value("karaokeEnabled").toBool(st.karaokeEnabled);
+    st.karaokeHighlightColor = colorOr("karaokeHighlightColor", st.karaokeHighlightColor);
+    return st;
+}
+
 SubtitleTrackRenderer::SubtitleTrackRenderer(QObject *parent)
     : QObject(parent)
 {

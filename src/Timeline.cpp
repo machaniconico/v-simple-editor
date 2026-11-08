@@ -4906,6 +4906,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         qInfo() << "Timeline: lock toggled =" << checked << "track=" << trackPtr.data();
         trackPtr->setLocked(checked);
         emit trackFlagsChanged();
+        saveUndoState(QStringLiteral("トラックをロック"));
         if (lockBtnPtr) {
             lockBtnPtr->setText(checked
                 ? QString::fromUtf8("\xF0\x9F\x94\x92")    // 🔒
@@ -4919,6 +4920,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setMuted(checked);
             emit trackFlagsChanged();
+            saveUndoState(QStringLiteral("トラックをミュート"));
             if (muteBtnPtr) {
                 muteBtnPtr->setText(checked
                     ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
@@ -4949,6 +4951,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setHidden(checked);
             emit trackFlagsChanged();
+            saveUndoState(QStringLiteral("トラックを非表示"));
             if (hideBtnPtr) {
                 hideBtnPtr->setText(checked
                     ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
@@ -5264,6 +5267,14 @@ void reselectByUid(const TrackSelectionUids &selected)
 }
 
 } // namespace
+
+void Timeline::resetTracksToDefault()
+{
+    while (m_videoTracks.size() > kDefaultVideoTracks)
+        removeTrackInternal(false, m_videoTracks.size() - 1);
+    while (m_audioTracks.size() > kDefaultAudioTracks)
+        removeTrackInternal(true, m_audioTracks.size() - 1);
+}
 
 bool Timeline::removeTrack(bool audio, int index, QString *err)
 {
@@ -12505,6 +12516,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     track->setMuted(!track->isMuted());
     emit trackFlagsChanged();
     syncTrackHeaderFlags(track);
+    saveUndoState(QStringLiteral("トラックをミュート"));
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
     // until the next clip edit triggered a sequence rebuild.
@@ -12528,8 +12540,10 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
             anyChanged = true;
         }
     }
-    if (anyChanged)
+    if (anyChanged) {
         emit trackFlagsChanged();
+        saveUndoState(QStringLiteral("トラックをソロ"));
+    }
     // Solo state lives on the mixer (per-track effectiveGain), so the
     // PlaybackEntry-shaped schedule is unchanged — no audioSequenceChanged
     // re-emit needed. trackSoloChanged carries the only state the mixer
@@ -16194,7 +16208,11 @@ bool Timeline::createSequence(const QString &name,
     sequence.audioTracks = audioTracks;
     if (sequence.videoTracks.isEmpty()) sequence.videoTracks.append(QVector<ClipInfo>{});
     if (sequence.audioTracks.isEmpty()) sequence.audioTracks.append(QVector<ClipInfo>{});
-    if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
+    if (!addSequence(sequence)) return false;
+    {
+        QScopedValueRollback<bool> covered(m_switchingInsideUndoPoint, true);
+        if (!setActiveSequence(sequence.id)) return false;
+    }
     // Sequence navigation preserves the existing carrier keys; remapping is
     // only valid for clip mutations within the same sequence.
     saveUndoState(QStringLiteral("新規シーケンス"));
@@ -16328,7 +16346,8 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     // its end parks and restores once.
     const QString oldId = m_activeSequenceId;
     if (!m_restoringState)
-        m_parkedSidecarsBySequence[oldId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
+        m_parkedSidecarsBySequence[oldId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries,
+                                             m_adjustmentLayers};
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
     clearReconcileBaseline();
@@ -16359,6 +16378,14 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
         commitRotoEntries(in.roto, /*clearMemo=*/true);
         commitTrackMatteEntries(in.matte);
         m_clipParentEntries = in.parent;
+        // US-2110: clamps trackIndex to the landing tracks; ids stay above the parked ones.
+        // Navigation neither drops the followed sequence nor lowers the id counter that
+        // reachable redo states may already use.
+        const QString follow = m_adjustmentsFollowStateIn;
+        const int keepNextAdjustmentId = m_nextAdjustmentLayerId;
+        setAdjustmentLayers(in.adjustments);
+        m_adjustmentsFollowStateIn = follow;
+        m_nextAdjustmentLayerId = qMax(m_nextAdjustmentLayerId, keepNextAdjustmentId);
     }
 
     m_activeSequenceId = sequenceId;
@@ -16380,6 +16407,12 @@ void Timeline::setParkedSidecarsBySequence(QHash<QString, SequenceSidecars> park
 {
     parked.remove(m_activeSequenceId);
     m_parkedSidecarsBySequence = std::move(parked);
+    // US-2110: a load replaces every sequence's layers, so none follows a restore anymore.
+    m_adjustmentsFollowStateIn.clear();
+    // US-2110: adjustment layer ids are unique across sequences.
+    for (const SequenceSidecars &sidecars : std::as_const(m_parkedSidecarsBySequence))
+        for (const AdjustmentLayer &l : sidecars.adjustments)
+            m_nextAdjustmentLayerId = qMax(m_nextAdjustmentLayerId, l.id + 1);
 }
 
 ClipInfo Timeline::makeSequenceClip(const QString &sequenceId,
@@ -16716,6 +16749,7 @@ TimelineState Timeline::currentState() const
     state.trackMatteEntries = trackMatteEntries();
     state.rotoEntries = rotoEntries();
     state.trackStructureRevision = m_trackStructureRevision;
+    state.trackFlags = trackFlagsToJson();
 
     if (m_audioMixer) {
         const int n = audioTrackCount();
@@ -16743,7 +16777,11 @@ void Timeline::restoreState(const TimelineState &state)
     // US-2005: the live sidecars of the sequence being left, before the restore replaces them.
     const QString leavingId = m_sequenceModelEnabled ? m_activeSequenceId
                                                      : QString::fromLatin1(kDefaultSequenceId);
-    const SequenceSidecars leaving{rotoEntries(), trackMatteEntries(), m_clipParentEntries};
+    const bool leavingModelEnabled = m_sequenceModelEnabled;
+    // US-2110: taken before the external state (applied below on a structural restore)
+    // replaces the live adjustment layers.
+    const SequenceSidecars leaving{rotoEntries(), trackMatteEntries(), m_clipParentEntries,
+                                   m_adjustmentLayers};
     undotrace::log("restoreState:enter");
     noteClipsChanged();
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
@@ -16783,6 +16821,9 @@ void Timeline::restoreState(const TimelineState &state)
         syncTrackHeaderFlags(m_audioTracks[i]);
         m_audioTracks[i]->update();
     }
+    // US-2106: lock / mute / solo / hide are undo state.
+    if (!state.trackFlags.isEmpty())
+        applyTrackFlagsFromJson(state.trackFlags);
     m_generatedCaptionOverlays = state.generatedCaptionOverlays;
     commitTrackMatteEntries(state.trackMatteEntries);
     commitRotoEntries(state.rotoEntries, true);
@@ -16889,7 +16930,7 @@ void Timeline::restoreState(const TimelineState &state)
     scheduleEmitSequenceChanged();
     m_trackStructureRevision = state.trackStructureRevision;
     m_nextTrackStructureRevision = qMax(m_nextTrackStructureRevision, m_trackStructureRevision);
-    // Playback flags and mixer edits are not ordinary timeline undo state.
+    // Mixer edits are not ordinary timeline undo state (track flags are, US-2106).
     // Restore external owners only when crossing a track-structure change.
     if (structureChanged && m_applyExternalTrackState)
         m_applyExternalTrackState(state.externalTrackState);
@@ -16914,10 +16955,22 @@ void Timeline::restoreState(const TimelineState &state)
     // sequence than the landing one is parked there, and the landing one's parked
     // sidecars become live.
     if (m_sequenceModelEnabled) {
+        // US-2110: adjustment layers ride in the external state, which a structural
+        // restore has already applied to the live list above; the parked ones are
+        // therefore never read from the live list here. The state's layers count only
+        // for the sequence they were captured in (the top entry is re-captured after
+        // navigation), otherwise that sequence's parked layers are used.
+        const QString stateAdjustmentsId = state.externalTrackState
+            .value(QStringLiteral("adjustmentsSequenceId")).toString();
+        const QVector<AdjustmentLayer> stateAdjustments = adjustmentLayersFromJsonArray(
+            state.externalTrackState.value(QStringLiteral("adjustments")).toArray());
         if (leavingId != m_activeSequenceId)
             m_parkedSidecarsBySequence[leavingId] = leaving;
         if (stateId != m_activeSequenceId) {
-            m_parkedSidecarsBySequence[stateId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
+            const QVector<AdjustmentLayer> stateParked = stateAdjustmentsId == stateId
+                ? stateAdjustments : m_parkedSidecarsBySequence.value(stateId).adjustments;
+            m_parkedSidecarsBySequence[stateId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries,
+                                                   stateParked};
             // Leaving == landing: its live sidecars (captured as leaving) stay live.
             const SequenceSidecars in = (leavingId == m_activeSequenceId)
                 ? leaving : m_parkedSidecarsBySequence.take(m_activeSequenceId);
@@ -16925,8 +16978,20 @@ void Timeline::restoreState(const TimelineState &state)
             commitRotoEntries(in.roto, /*clearMemo=*/true);
             commitTrackMatteEntries(in.matte);
             m_clipParentEntries = in.parent;
+            const bool fromState = stateAdjustmentsId == m_activeSequenceId;
+            setAdjustmentLayers(fromState ? stateAdjustments : in.adjustments);
+            m_adjustmentsFollowStateIn = fromState ? m_activeSequenceId : QString();
         } else {
-            m_parkedSidecarsBySequence.remove(m_activeSequenceId);
+            const SequenceSidecars in = m_parkedSidecarsBySequence.take(m_activeSequenceId);
+            const bool fromState = stateAdjustmentsId == m_activeSequenceId;
+            if (leavingId != m_activeSequenceId) {
+                setAdjustmentLayers(fromState ? stateAdjustments : in.adjustments);
+                m_adjustmentsFollowStateIn = fromState ? m_activeSequenceId : QString();
+            } else if (fromState && m_adjustmentsFollowStateIn == m_activeSequenceId) {
+                // Redo / undo inside the sequence a crossing restore landed in: its live
+                // layers already came from the state, so they keep following it.
+                setAdjustmentLayers(stateAdjustments);
+            }
         }
         // Sequences the restore removed must not leave parked sidecars for a reused id.
         for (auto it = m_parkedSidecarsBySequence.begin(); it != m_parkedSidecarsBySequence.end();) {
@@ -16936,6 +17001,21 @@ void Timeline::restoreState(const TimelineState &state)
         }
         if (leavingId != m_activeSequenceId)
             emit activeSequenceChanged(leavingId, m_activeSequenceId);
+    } else if (leavingModelEnabled) {
+        // US-2110: back before the first sequence creation. The original timeline's
+        // layers are the state's when it recorded them there, else its parked ones.
+        const QString stateAdjustmentsId = state.externalTrackState
+            .value(QStringLiteral("adjustmentsSequenceId")).toString();
+        const bool fromState = state.externalTrackState.contains(QStringLiteral("adjustments"))
+            && (stateAdjustmentsId.isEmpty()
+                || stateAdjustmentsId == QLatin1String(kDefaultSequenceId));
+        setAdjustmentLayers(fromState
+            ? adjustmentLayersFromJsonArray(
+                  state.externalTrackState.value(QStringLiteral("adjustments")).toArray())
+            : m_parkedSidecarsBySequence.value(QString::fromLatin1(kDefaultSequenceId)).adjustments);
+        // No sequences remain to park for.
+        m_parkedSidecarsBySequence.clear();
+        m_adjustmentsFollowStateIn.clear();
     }
     emit restoreStateFinished();
     undotrace::log("restoreState:exit");
@@ -16948,8 +17028,11 @@ bool Timeline::setTrackLocked(TrackKind kind, int trackIndex, bool locked)
     TimelineTrack *track = trackAt(kind == TrackKind::Audio, trackIndex);
     if (!track)
         return false;
+    const bool changed = track->isLocked() != locked;
     track->setLocked(locked);
     syncTrackHeaderFlags(track);
+    if (changed)
+        saveUndoState(QStringLiteral("トラックをロック"));
     return true;
 }
 
@@ -17294,6 +17377,8 @@ int Timeline::addAdjustmentLayer(const AdjustmentLayer &layer)
     const int maxTrackIndex = qMax(0, static_cast<int>(m_videoTracks.size()) - 1);
     copy.trackIndex = qBound(0, copy.trackIndex, maxTrackIndex);
     m_adjustmentLayers.append(copy);
+    if (!m_restoringState && m_adjustmentsFollowStateIn == m_activeSequenceId)
+        m_adjustmentsFollowStateIn.clear();  // US-2110
     for (auto *track : m_videoTracks)
         if (track) track->setPixelsPerSecond(m_zoomLevel);
     emit adjustmentLayersChanged();
@@ -17306,6 +17391,8 @@ bool Timeline::removeAdjustmentLayer(int id)
     for (int i = 0; i < m_adjustmentLayers.size(); ++i) {
         if (m_adjustmentLayers[i].id == id) {
             m_adjustmentLayers.removeAt(i);
+            if (!m_restoringState && m_adjustmentsFollowStateIn == m_activeSequenceId)
+                m_adjustmentsFollowStateIn.clear();  // US-2110
             for (auto *track : m_videoTracks)
                 if (track) track->setPixelsPerSecond(m_zoomLevel);
             emit adjustmentLayersChanged();
@@ -17328,6 +17415,8 @@ bool Timeline::updateAdjustmentLayer(int id, const AdjustmentLayer &layer)
             const int maxTrackIndex = qMax(0, static_cast<int>(m_videoTracks.size()) - 1);
             copy.trackIndex = qBound(0, copy.trackIndex, maxTrackIndex);
             m_adjustmentLayers[i] = copy;
+            if (!m_restoringState && m_adjustmentsFollowStateIn == m_activeSequenceId)
+                m_adjustmentsFollowStateIn.clear();  // US-2110
             for (auto *track : m_videoTracks)
                 if (track) track->setPixelsPerSecond(m_zoomLevel);
             emit adjustmentLayersChanged();
@@ -17348,6 +17437,9 @@ AdjustmentLayer Timeline::adjustmentLayerById(int id) const
 void Timeline::setAdjustmentLayers(const QVector<AdjustmentLayer> &layers)
 {
     m_adjustmentLayers = layers;
+    // US-2110: an edit outside restoreState of the followed sequence.
+    if (!m_restoringState && m_adjustmentsFollowStateIn == m_activeSequenceId)
+        m_adjustmentsFollowStateIn.clear();
     // Restore the monotonic id counter so newly-added layers don't collide
     // with serialized ids from a loaded project.
     int maxId = 0;
@@ -17358,7 +17450,12 @@ void Timeline::setAdjustmentLayers(const QVector<AdjustmentLayer> &layers)
         l.trackIndex = qBound(0, l.trackIndex, maxTrackIndex);
         maxId = qMax(maxId, l.id);
     }
-    m_nextAdjustmentLayerId = maxId + 1;
+    // US-2110: and above the layers parked with the other sequences.
+    for (const SequenceSidecars &sidecars : std::as_const(m_parkedSidecarsBySequence))
+        for (const AdjustmentLayer &l : sidecars.adjustments)
+            maxId = qMax(maxId, l.id);
+    // A restore never lowers the counter: redo states may hold the ids above maxId.
+    m_nextAdjustmentLayerId = m_restoringState ? qMax(m_nextAdjustmentLayerId, maxId + 1) : maxId + 1;
     for (auto *track : m_videoTracks)
         if (track) track->setPixelsPerSecond(m_zoomLevel);
     emit adjustmentLayersChanged();

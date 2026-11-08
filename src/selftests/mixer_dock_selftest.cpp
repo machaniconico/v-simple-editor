@@ -266,7 +266,8 @@ int runMixerDockSelftest()
             ok = ok && !button(dock, "Solo")->isChecked()
                 && timeline.trackAt(true, 1)->isSolo();
         }
-        gate(3, ok && timeline.undoManager()->saveSerial() == serial);
+        // US-2106: each of the five toggles above is one undo point.
+        gate(3, ok && timeline.undoManager()->saveSerial() == serial + 5);
     }
     {
         auto mixer = std::make_unique<AudioMixer>();

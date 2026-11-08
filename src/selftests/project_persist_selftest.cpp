@@ -165,7 +165,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 7; ++g)
+        for (int g = 1; g <= 11; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -421,6 +421,436 @@ int runProjectPersistSelftest()
             + " meanAbsDiff(file, noLayer)=" + std::to_string(diff) + " format=" + std::to_string(int(fromFile.format()))
             + "/" + std::to_string(int(inMemory.format())) + " sameAsInMemory=" + b(sameAsMemory));
     }
+
+    // ---- G8 / G9 (US-2103): load-time numeric repair and the version gate ----
+    // A project document with `clips` clips (10 s each); `config` keys and per-clip
+    // `patches` keys are written over the saved JSON, so the values are the file's, not the model's.
+    const auto docWith = [&](const QJsonObject &config, const QVector<QJsonObject> &patches,
+                             const QJsonValue &version = QJsonValue(QJsonValue::Undefined)) {
+        ProjectData base;
+        QVector<ClipInfo> clips;
+        for (int i = 0; i < patches.size(); ++i) {
+            ClipInfo c;
+            c.filePath = QStringLiteral("/selftests/project-persist-%1.mp4").arg(i);
+            c.displayName = QStringLiteral("c%1").arg(i);
+            c.duration = 10.0;
+            c.outPoint = 10.0;
+            clips.append(c);
+        }
+        base.videoTracks = {clips};
+        base.audioTracks = {{}};
+        QJsonObject root = QJsonDocument::fromJson(ProjectFile::toJsonString(base).toUtf8()).object();
+        QJsonObject cfg = root.value(QStringLiteral("config")).toObject();
+        for (auto it = config.begin(); it != config.end(); ++it)
+            cfg[it.key()] = it.value();
+        root[QStringLiteral("config")] = cfg;
+        QJsonArray track = root.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+        for (int i = 0; i < patches.size(); ++i) {
+            QJsonObject clip = track.at(i).toObject();
+            for (auto it = patches[i].begin(); it != patches[i].end(); ++it) {
+                if (it.value() == QJsonValue(QStringLiteral("<remove>")))
+                    clip.remove(it.key());
+                else
+                    clip[it.key()] = it.value();
+            }
+            track[i] = clip;
+        }
+        QJsonArray tracks;
+        tracks.append(track);
+        root[QStringLiteral("videoTracks")] = tracks;
+        if (!version.isUndefined())
+            root[QStringLiteral("version")] = version;
+        return QString::fromUtf8(QJsonDocument(root).toJson(QJsonDocument::Compact));
+    };
+    {
+        bool ok = true;
+        std::string d;
+        const auto check = [&](const std::string &name, bool passed, const std::string &value = std::string()) {
+            ok = ok && passed;
+            d += name + "=" + b(passed) + (value.empty() ? "" : "(" + value + ") ");
+        };
+        const auto closeTo = [](double got, double want) { return std::abs(got - want) <= 1e-9 * std::abs(want); };
+        const QVector<QJsonValue> speeds = {QJsonValue(0), QJsonValue(-2), QJsonValue(QStringLiteral("x")),
+                                            QJsonValue(1e308), QJsonValue(8.0), QJsonValue(0.05),
+                                            QJsonValue(1.2e-7), QJsonValue(8.6e6), QJsonValue(1e-8),
+                                            QJsonValue(QJsonValue::Null)};
+        const double wantSpeed[] = {1.0, 1.0, 1.0, 1e7, 8.0, 0.05, 1.2e-7, 8.6e6, 1.0, 1.0};
+        QVector<QJsonObject> patches;
+        for (const QJsonValue &sp : speeds)
+            patches.append(QJsonObject{{QStringLiteral("speed"), sp}});
+        patches.append(QJsonObject{{QStringLiteral("volume"), -1}, {QStringLiteral("inPoint"), 5},
+                                   {QStringLiteral("outPoint"), 2}});
+        // duration 2 / inPoint 5 with the "use duration" outPoint spellings (0, missing, negative, null),
+        // then the control: inPoint 3, outPoint 0, duration 10 stays valid.
+        const int firstSentinel = patches.size();
+        for (const QJsonValue &op : {QJsonValue(0), QJsonValue(QStringLiteral("<remove>")), QJsonValue(-1),
+                                     QJsonValue(QJsonValue::Null)})
+            patches.append(QJsonObject{{QStringLiteral("duration"), 2}, {QStringLiteral("inPoint"), 5},
+                                       {QStringLiteral("outPoint"), op}});
+        patches.append(QJsonObject{{QStringLiteral("duration"), 10}, {QStringLiteral("inPoint"), 3},
+                                   {QStringLiteral("outPoint"), 0}});
+        const QString hostile = docWith({{QStringLiteral("fps"), 0}, {QStringLiteral("width"), -5},
+                                         {QStringLiteral("height"), QStringLiteral("x")}}, patches);
+        ProjectData got;
+        const bool parsed = ProjectFile::fromJsonString(hostile, got);
+        check("parsed", parsed);
+        check("fps", got.config.fps == 30, std::to_string(got.config.fps));
+        check("width", got.config.width == 1920, std::to_string(got.config.width));
+        check("height", got.config.height == 1080, std::to_string(got.config.height));
+        const QVector<ClipInfo> clips = got.videoTracks.value(0);
+        check("clips", clips.size() == patches.size(), std::to_string(clips.size()));
+        std::string sp;
+        bool speedsOk = clips.size() == patches.size();
+        bool finite = speedsOk;
+        for (int i = 0; i < speeds.size() && i < clips.size(); ++i) {
+            speedsOk = speedsOk && closeTo(clips[i].speed, wantSpeed[i]);
+            sp += std::to_string(clips[i].speed) + "/";
+        }
+        for (const ClipInfo &c : clips) {
+            const double eff = c.effectiveDuration();
+            finite = finite && std::isfinite(eff) && eff >= 0.0;
+        }
+        check("speeds", speedsOk, sp);
+        check("effectiveDurationFinite", finite);
+        if (clips.size() == patches.size()) {
+            const ClipInfo &trim = clips.at(speeds.size());
+            check("volume", trim.volume == 1.0, std::to_string(trim.volume));
+            check("inOut", trim.inPoint == 5.0 && trim.outPoint == 5.0,
+                  std::to_string(trim.inPoint) + "/" + std::to_string(trim.outPoint));
+            const char *const names[] = {"zero", "missing", "negative", "null"};
+            for (int k = 0; k < 4; ++k) {
+                const ClipInfo &c = clips.at(firstSentinel + k);
+                const double eff = c.effectiveDuration();
+                check(std::string("sentinelOut-") + names[k],
+                      c.inPoint == 5.0 && c.outPoint == 5.0 && std::isfinite(eff) && eff >= 0.0,
+                      std::to_string(c.outPoint) + "/" + std::to_string(eff));
+            }
+            const ClipInfo &ctl = clips.last();
+            check("sentinelKept", ctl.outPoint == 0.0 && closeTo(ctl.effectiveDuration(), 7.0),
+                  std::to_string(ctl.outPoint) + "/" + std::to_string(ctl.effectiveDuration()));
+        }
+        // Controls: legitimate values are untouched, only the out-of-band ones move.
+        struct FpsCase { double in; int want; };
+        for (const FpsCase &f : {FpsCase{60, 60}, FpsCase{240, 240}, FpsCase{5000, 1000},
+                                 FpsCase{29.97, 30}, FpsCase{23.976, 30}}) {
+            ProjectData r;
+            const bool p = ProjectFile::fromJsonString(
+                docWith({{QStringLiteral("fps"), f.in}}, {}), r);
+            check("fps" + std::to_string(f.in), p && r.config.fps == f.want, std::to_string(r.config.fps));
+        }
+        for (const int w : {3840, 8192}) {
+            ProjectData r;
+            const bool p = ProjectFile::fromJsonString(
+                docWith({{QStringLiteral("width"), w}}, {}), r);
+            check("width" + std::to_string(w), p && r.config.width == w, std::to_string(r.config.width));
+        }
+        ProjectData ctl;
+        const bool pc = ProjectFile::fromJsonString(
+            docWith({}, {QJsonObject{{QStringLiteral("speed"), 2.0}}, QJsonObject{{QStringLiteral("volume"), 3.5}},
+                         QJsonObject{{QStringLiteral("volume"), 4.0}}}), ctl);
+        const QVector<ClipInfo> cc = ctl.videoTracks.value(0);
+        check("controls", pc && cc.size() == 3 && cc[0].speed == 2.0 && cc[1].volume == 3.5 && cc[2].volume == 4.0);
+        tally.gate(8, ok, d);
+    }
+    {
+        bool ok = true;
+        std::string d;
+        const QVector<QJsonObject> oneClip = {QJsonObject{}};
+        struct VersionCase { const char *name; QJsonValue v; bool accept; bool newer; };
+        const VersionCase cases[] = {
+            {"3", QJsonValue(3), false, true},
+            {"str", QJsonValue(QStringLiteral("x")), false, false},
+            {"2.5", QJsonValue(2.5), false, false},
+            {"0", QJsonValue(0), false, false},
+            {"-1", QJsonValue(-1), false, false},
+            {"2", QJsonValue(2), true, false},
+            {"1", QJsonValue(1), true, false},
+        };
+        for (const VersionCase &c : cases) {
+            const QString json = docWith({}, oneClip, c.v);
+            ProjectData viaString;
+            QString msgString;
+            const bool s = ProjectFile::fromJsonString(json, viaString, &msgString);
+            const QString path = tmp((std::string("version-") + c.name + ".veditor").c_str());
+            QFile f(path);
+            bool wrote = f.open(QIODevice::WriteOnly) && f.write(json.toUtf8()) > 0;
+            f.close();
+            ProjectData viaFile;
+            QString msgFile;
+            const bool l = wrote && ProjectFile::load(path, viaFile, &msgFile);
+            const bool newerOk = !c.newer
+                || (msgString.contains(QStringLiteral("新しい形式")) && msgFile.contains(QStringLiteral("新しい形式")));
+            const bool reasonOk = c.accept ? (msgString.isEmpty() && msgFile.isEmpty())
+                                           : (!msgString.isEmpty() && !msgFile.isEmpty());
+            const bool one = wrote && s == c.accept && l == c.accept && newerOk && reasonOk;
+            ok = ok && one;
+            d += std::string(c.name) + ": string=" + b(s) + " load=" + b(l) + " reason=" + b(reasonOk && newerOk)
+                + (one ? "" : " WRONG") + " ";
+        }
+        tally.gate(9, ok, d);
+    }
+
+    // ---- G10 / G11 (US-2110): adjustment layers are parked per sequence ----
+    // A = the loaded root (2 video tracks, a grey V1), B = createSequence. HEAD keeps one
+    // project-wide list, so L1 follows the switch to B and L2 follows the switch back.
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    {
+        ProjectData data;
+        data.config.width = kW;
+        data.config.height = kH;
+        data.config.fps = 30;
+        data.config.explicitOutputResolution = true;
+        data.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}, QVector<ClipInfo>{}};
+        const QString pathS = tmp("seq.veditor");
+        const bool seeded = ProjectFile::save(pathS, data);
+        MainWindow seqWindow;
+        Timeline &tl = *seqWindow.m_timeline;
+        QString err;
+        const bool opened = seeded && seqWindow.openProjectFromPath(pathS, &err, false);
+        const bool created = tl.createSequence(QStringLiteral("B"),
+            QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}, QVector<ClipInfo>{}},
+            QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}});
+        const QString bId = tl.activeSequenceId();
+        // A single-sequence project has no active id until createSequence enables the model.
+        QString a;
+        for (const TimelineSequence &sequence : tl.sequences())
+            if (sequence.id != bId)
+                a = sequence.id;
+        const bool premise = opened && created && tl.sequences().size() == 2 && !a.isEmpty() && bId != a
+            && tl.setActiveSequence(a)
+            && tl.videoTrackCount() >= 2;
+        const auto layersOf = [](const QVector<AdjustmentLayer> &v) {
+            std::string out = "[";
+            for (const AdjustmentLayer &l : v)
+                out += (out.size() > 1 ? " " : "") + l.name.toStdString() + "#" + std::to_string(l.id);
+            return out + "]";
+        };
+        const qint64 atUs = 1000000;
+        const QSize outSize(kW, kH);
+
+        // ---- G10: the switch parks A's layers, B renders without them, A gets them back ----
+        AdjustmentLayer l1 = layer;
+        l1.name = QStringLiteral("L1");
+        l1.trackIndex = 1;
+        l1.timelineStartUs = 0;
+        l1.timelineEndUs = 2000000;
+        l1.id = tl.addAdjustmentLayer(l1);
+        // Sanity: L1 changes the grey frame of A (otherwise the B comparison is vacuous).
+        const QImage aWith = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({});
+        const QImage aBare = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({l1});
+        const double aDiff = meanAbsDiff(aWith, aBare);
+        const bool toB = tl.setActiveSequence(bId);
+        const QVector<AdjustmentLayer> onB = tl.adjustmentLayers();
+        const QImage bFrame = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers({});
+        const QImage bBare = tlrender::renderFrameAt(&tl, atUs, outSize);
+        tl.setAdjustmentLayers(onB);
+        const bool bSame = !bFrame.isNull() && bFrame.format() == bBare.format() && bFrame == bBare;
+        AdjustmentLayer l2 = layer;
+        l2.name = QStringLiteral("L2");
+        l2.trackIndex = 0;
+        l2.lift[0] = 9.0;
+        l2.id = tl.addAdjustmentLayer(l2);
+        const bool toA = tl.setActiveSequence(a);
+        std::string d10 = "premise=" + b(premise) + " A=" + a.toStdString() + " B=" + bId.toStdString()
+            + " sanity meanAbsDiff(A+L1, A)=" + std::to_string(aDiff) + " toB=" + b(toB)
+            + " live@B=" + layersOf(onB) + " render@B==bare=" + b(bSame) + " toA=" + b(toA) + " live@A";
+        const bool backL1 = sameLayers(tl.adjustmentLayers(), {l1}, d10);
+        const QVector<AdjustmentLayer> parkedB = tl.parkedSidecarsBySequence().value(bId).adjustments;
+        const bool parkedBOk = parkedB.size() == 1 && parkedB[0].id == l2.id;
+        d10 += " parked[B]=" + layersOf(parkedB) + " L1.id=" + std::to_string(l1.id)
+            + " L2.id=" + std::to_string(l2.id);
+        tally.gate(10, premise && aDiff > 1.0 && toB && onB.isEmpty() && bSame && toA && backL1
+                           && parkedBOk && l2.id != l1.id, d10);
+
+        // ---- G11: save / open, the old-file control, and undo across a switch ----
+        std::string d11;
+        const bool toB2 = tl.setActiveSequence(bId);
+        const QString pathP = tmp("perseq.veditor");
+        const bool saved = seqWindow.saveProjectToPath(pathP, &err);
+        const QJsonObject root = readJson(pathP);
+        QJsonObject seqA, seqB;
+        for (const QJsonValue &v : root.value(QStringLiteral("sequences")).toArray()) {
+            const QJsonObject o = v.toObject();
+            if (o.value(QStringLiteral("id")).toString() == a) seqA = o;
+            if (o.value(QStringLiteral("id")).toString() == bId) seqB = o;
+        }
+        d11 += "toB=" + b(toB2) + " saved=" + b(saved) + " root.activeSequenceId="
+            + root.value(QStringLiteral("activeSequenceId")).toString().toStdString() + " root";
+        const bool rootOk = sameLayers(adjustmentLayersFromJsonArray(
+            root.value(QStringLiteral("adjustmentLayers")).toArray()), {l2}, d11);
+        d11 += " | sequences[A]";
+        const bool seqAOk = sameLayers(adjustmentLayersFromJsonArray(
+            seqA.value(QStringLiteral("adjustmentLayers")).toArray()), {l1}, d11);
+        const bool seqBNoKey = !seqB.isEmpty() && !seqB.contains(QStringLiteral("adjustmentLayers"));
+        d11 += " | sequences[B] hasKey=" + b(!seqBNoKey);
+        // Open after clearing both lists, so only the file can bring them back.
+        tl.setAdjustmentLayers({});
+        tl.setParkedSidecarsBySequence({});
+        const bool reopened = seqWindow.openProjectFromPath(pathP, &err, false);
+        const QString activeAfterOpen = tl.activeSequenceId();
+        d11 += " | open=" + b(reopened) + " active=" + activeAfterOpen.toStdString() + " live";
+        const bool openB = activeAfterOpen == bId && sameLayers(tl.adjustmentLayers(), {l2}, d11);
+        const bool openToA = tl.setActiveSequence(a);
+        d11 += " toA=" + b(openToA) + " live@A";
+        const bool openA = sameLayers(tl.adjustmentLayers(), {l1}, d11);
+        const int nextId = tl.addAdjustmentLayer(AdjustmentLayer{});
+        const bool nextIdOk = nextId > std::max(l1.id, l2.id);
+        d11 += " nextId=" + std::to_string(nextId);
+        // Old file (no per-sequence key): the root list belongs to the active sequence only.
+        QJsonObject oldRoot = root;
+        QJsonArray oldSequences = oldRoot.value(QStringLiteral("sequences")).toArray();
+        for (int i = 0; i < oldSequences.size(); ++i) {
+            QJsonObject o = oldSequences[i].toObject();
+            o.remove(QStringLiteral("adjustmentLayers"));
+            oldSequences[i] = o;
+        }
+        oldRoot[QStringLiteral("sequences")] = oldSequences;
+        const QString pathOld = tmp("perseq-old.veditor");
+        QFile oldFile(pathOld);
+        const bool oldWritten = oldFile.open(QIODevice::WriteOnly)
+            && oldFile.write(QJsonDocument(oldRoot).toJson()) > 0;
+        oldFile.close();
+        const bool oldOpened = oldWritten && seqWindow.openProjectFromPath(pathOld, &err, false);
+        d11 += " | old: open=" + b(oldOpened) + " active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool oldB = tl.activeSequenceId() == bId && sameLayers(tl.adjustmentLayers(), {l2}, d11);
+        const bool oldToA = tl.setActiveSequence(a);
+        const bool oldA = oldToA && tl.adjustmentLayers().isEmpty();
+        d11 += " live@A=" + layersOf(tl.adjustmentLayers());
+        // Undo across a switch (TimelineState carries no adjustment layers; the external
+        // state does). Leg 1 is non-structural; leg 2 removes a track, so the external state
+        // is applied inside restoreState before its parking runs and must not leak into B.
+        const bool undoOpened = seqWindow.openProjectFromPath(pathP, &err, false);
+        const bool undoToA = tl.setActiveSequence(a);
+        const int tracksBase = tl.videoTrackCount();
+        tl.saveUndoState(QStringLiteral("project-persist A base"));
+        tl.addVideoTrack(true);
+        AdjustmentLayer l3 = layer;
+        l3.name = QStringLiteral("L3");
+        l3.id = tl.addAdjustmentLayer(l3);
+        tl.saveUndoState(QStringLiteral("project-persist L3"));
+        const std::string liveBefore = layersOf(tl.adjustmentLayers());
+        const bool undoToB = tl.setActiveSequence(bId);
+        tl.undo();
+        std::string du1 = " leg1: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool leg1Live = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du1);
+        du1 += " parked[B]";
+        const bool leg1B = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du1);
+        const bool leg1NoA = !tl.parkedSidecarsBySequence().contains(a);
+        const int tracksLeg1 = tl.videoTrackCount();
+        // Navigation away and back keeps A following the redo state, so redo brings L3 back.
+        const bool navToB = tl.setActiveSequence(bId);
+        const bool navToA = tl.setActiveSequence(a);
+        tl.redo();
+        std::string dn = " | nav redo: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool navRedoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, dn);
+        dn += " parked[B]";
+        const bool navRedoB = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, dn);
+        tl.undo();
+        dn += " undo: live";
+        const bool navUndoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, dn);
+        // A layer added in B with no undo point (the GUI add) must not reuse L3's id, which
+        // the reachable redo state still holds; after the redo every id is distinct.
+        const bool idToB = tl.setActiveSequence(bId);
+        AdjustmentLayer l4 = layer;
+        l4.name = QStringLiteral("L4");
+        l4.id = tl.addAdjustmentLayer(l4);
+        const bool idToA = tl.setActiveSequence(a);
+        tl.redo();
+        dn += " | L4 in B: id=" + std::to_string(l4.id) + " L3 id=" + std::to_string(l3.id) + " redo: live="
+            + layersOf(tl.adjustmentLayers());
+        QVector<int> allIds;
+        for (const AdjustmentLayer &l : tl.adjustmentLayers())
+            allIds.append(l.id);
+        const auto parkedAfterRedo = tl.parkedSidecarsBySequence();
+        for (auto it = parkedAfterRedo.cbegin(); it != parkedAfterRedo.cend(); ++it) {
+            dn += " parked[" + it.key().toStdString() + "]=" + layersOf(it->adjustments);
+            for (const AdjustmentLayer &l : it->adjustments)
+                allIds.append(l.id);
+        }
+        bool idsDistinct = allIds.size() == 4;
+        for (int i = 0; i < allIds.size(); ++i)
+            for (int j = i + 1; j < allIds.size(); ++j)
+                idsDistinct = idsDistinct && allIds[i] != allIds[j];
+        dn += " ids=" + std::to_string(allIds.size()) + " distinct=" + b(idsDistinct);
+        const bool idRedoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, dn);
+        // Back to the leg-1 state for the legs below: undo, then drop L4 from B (no undo point).
+        tl.undo();
+        const bool idCleanup = tl.setActiveSequence(bId) && tl.removeAdjustmentLayer(l4.id)
+            && tl.setActiveSequence(a) && sameLayers(tl.adjustmentLayers(), {l1}, dn);
+        const bool navIdOk = navToB && navToA && navRedoLive && navRedoB && navUndoLive && idToB && idToA
+            && l4.id > 0 && l4.id != l3.id && idsDistinct && idRedoLive && idCleanup;
+        // Redo inside the landing sequence brings L3 back (undo + redo is the identity),
+        // and undo again takes it away.
+        tl.redo();
+        du1 += " | redo: active=" + tl.activeSequenceId().toStdString() + " live";
+        const bool redoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1, l3}, du1);
+        du1 += " parked[B]";
+        const bool redoB = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du1);
+        const bool redoNoA = !tl.parkedSidecarsBySequence().contains(a);
+        tl.undo();
+        du1 += " parkedHas(A)=" + b(!redoNoA) + " | undo again: active=" + tl.activeSequenceId().toStdString()
+            + " live";
+        const bool reUndoLive = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du1);
+        const bool undoToB2 = tl.setActiveSequence(bId);
+        tl.undo();
+        const int tracksAfter = tl.videoTrackCount();
+        std::string du2 = " leg2: active=" + tl.activeSequenceId().toStdString() + " tracks "
+            + std::to_string(tracksLeg1) + "->" + std::to_string(tracksAfter) + " (base "
+            + std::to_string(tracksBase) + ") live";
+        const bool leg2Live = tl.activeSequenceId() == a && sameLayers(tl.adjustmentLayers(), {l1}, du2);
+        du2 += " parked[B]";
+        const bool leg2B = sameLayers(tl.parkedSidecarsBySequence().value(bId).adjustments, {l2}, du2);
+        d11 += " | undo: open=" + b(undoOpened) + " toA=" + b(undoToA) + " live+L3=" + liveBefore
+            + " toB=" + b(undoToB) + "/" + b(undoToB2) + du1 + " parkedHas(A)=" + b(!leg1NoA) + dn + du2;
+        const bool undoOk = undoOpened && undoToA && undoToB && undoToB2 && leg1Live && leg1B && leg1NoA
+            && navIdOk && redoLive && redoB && redoNoA && reUndoLive
+            && tracksLeg1 == tracksBase + 1 && tracksAfter == tracksBase && leg2Live && leg2B;
+
+        // Undo of the first sequence creation (non-structural: the same track counts on both
+        // sides, the timeline keeps 2 video tracks) gives the original timeline its layers
+        // back; redo parks them under the default id again.
+        ProjectData oneData = data;
+        oneData.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{greyClip()}};
+        oneData.audioTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+        const QString pathOne = tmp("first-create.veditor");
+        const bool oneOpened = ProjectFile::save(pathOne, oneData)
+            && seqWindow.openProjectFromPath(pathOne, &err, false);
+        const bool oneModelOff = tl.sequences().isEmpty();
+        const std::string tracksOne = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        AdjustmentLayer c1 = layer;
+        c1.name = QStringLiteral("L1");
+        c1.id = tl.addAdjustmentLayer(c1);
+        const bool firstCreated = tl.createSequence(QStringLiteral("B"));
+        const QString firstB = tl.activeSequenceId();
+        const std::string tracksCreated = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        tl.undo();
+        const std::string tracksUndone = std::to_string(tl.videoTrackCount()) + "V/"
+            + std::to_string(tl.audioTrackCount()) + "A";
+        const bool undoneOff = tl.sequences().isEmpty()
+            && (tl.activeSequenceId().isEmpty() || tl.activeSequenceId() == QLatin1String("main"));
+        std::string dc = " | first creation: open=" + b(oneOpened) + " modelOff=" + b(oneModelOff)
+            + " created=" + b(firstCreated) + " B=" + firstB.toStdString() + " tracks " + tracksOne + "->"
+            + tracksCreated + "->" + tracksUndone + " undo: sequences=" + std::to_string(tl.sequences().size())
+            + " active='" + tl.activeSequenceId().toStdString() + "' live";
+        const bool undoneLive = sameLayers(tl.adjustmentLayers(), {c1}, dc);
+        tl.redo();
+        dc += " redo: active=" + tl.activeSequenceId().toStdString() + " live=" + layersOf(tl.adjustmentLayers())
+            + " parked[main]";
+        const bool redoneOk = tl.activeSequenceId() == firstB && !firstB.isEmpty() && tl.adjustmentLayers().isEmpty()
+            && sameLayers(tl.parkedSidecarsBySequence().value(QStringLiteral("main")).adjustments, {c1}, dc);
+        d11 += dc;
+        const bool firstOk = oneOpened && oneModelOff && firstCreated && tracksCreated == tracksOne
+            && tracksUndone == tracksOne && undoneOff && undoneLive && redoneOk;
+        tally.gate(11, premise && toB2 && saved && rootOk && seqAOk && seqBNoKey && reopened && openB
+                           && openToA && openA && nextIdOk && oldOpened && oldB && oldA && undoOk && firstOk,
+                   d11);
+    }
+    QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
 
     tally.gate(7, g7, g7Detail);
     return tally.finish("project-persist");

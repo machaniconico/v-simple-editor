@@ -4,6 +4,7 @@
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "SelftestGate.h"
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -2329,6 +2330,153 @@ int runFcpxmlImportSelftest()
             !g40Shape ? "?" : g40ImpB->anchorUid == g40ImpA->uid ? "a" : g40ImpB->anchorUid == g40ImpA2->uid ? "a2" : "other",
             g40Shape ? g40ImpB->anchorOffsetSec : -99.0);
         gate(40, g40Ok);
+    }
+
+    // G41: element nesting is capped at 128 levels in readSpine, readMulticamClip and warnDescendants: a
+    // 2000-level nest (gap, an invalid clip's descendants, alternating mc-clip lane children) fails fast with
+    // an error naming the nesting instead of exhausting the stack; 64 levels still import.
+    {
+        auto g41Nest = [](const QString &open, const QString &close, int levels, const QString &core = QString()) {
+            QString x;
+            x.reserve(levels * (open.size() + close.size()) + core.size());
+            for (int i = 0; i < levels; ++i) x += open;
+            x += core;
+            for (int i = 0; i < levels; ++i) x += close;
+            return x;
+        };
+        const QString gapOpen = QStringLiteral("<gap offset=\"0s\" duration=\"10s\">"), gapClose = QStringLiteral("</gap>");
+        const QString mcOpen = QStringLiteral("<mc-clip ref=\"m\" name=\"MCC\" lane=\"1\" offset=\"0s\" start=\"0s\" duration=\"10s\">");
+        QElapsedTimer g41Timer;
+        g41Timer.start();
+        const auto g41Gap = fcpx::xml::parseXml(document(g41Nest(gapOpen, gapClose, 2000)), dir.path());
+        const qint64 g41GapMs = g41Timer.restart();
+        const auto g41Ctl = fcpx::xml::parseXml(document(g41Nest(gapOpen, gapClose, 64, QStringLiteral(
+            "<asset-clip ref=\"a\" offset=\"0s\" duration=\"1s\"/>"))), dir.path());
+        const qint64 g41CtlMs = g41Timer.restart();
+        const auto g41Desc = fcpx::xml::parseXml(document(QStringLiteral("<asset-clip ref=\"a\" offset=\"0s\" duration=\"1/0s\">")
+            + g41Nest(gapOpen, gapClose, 2000) + QStringLiteral("</asset-clip>")), dir.path());
+        const qint64 g41DescMs = g41Timer.restart();
+        QString g41McInner;
+        for (int i = 0; i < 2000; ++i) g41McInner += mcOpen;
+        for (int i = 0; i < 2000; ++i) g41McInner += QStringLiteral("</mc-clip>");
+        const auto g41Mc = fcpx::xml::parseXml(document(QStringLiteral(
+            "<mc-clip ref=\"m\" name=\"MCC\" offset=\"0s\" start=\"0s\" duration=\"10s\">") + g41McInner
+            + QStringLiteral("</mc-clip>"), multicamMedia(singleAngle1, singleAngle2)), dir.path());
+        const qint64 g41McMs = g41Timer.elapsed();
+        const QString nestWord = QStringLiteral("入れ子");
+        const bool g41CtlOk = g41Ctl.error.isEmpty() && g41Ctl.videoTracks.size() >= 1
+            && !g41Ctl.videoTracks[0].isEmpty();
+        const bool g41Ok = !g41Gap.error.isEmpty() && g41Gap.error.contains(nestWord)
+            && g41CtlOk
+            && !g41Desc.error.isEmpty() && g41Desc.error.contains(nestWord)
+            && !g41Mc.error.isEmpty() && g41Mc.error.contains(nestWord)
+            && g41GapMs <= 5000 && g41CtlMs <= 5000 && g41DescMs <= 5000 && g41McMs <= 5000;
+        std::fprintf(stderr, "G41 gap2000 error=[%s] %lldms | ctl64 error=[%s] clips=%d %lldms | desc2000 error=[%s] %lldms | "
+            "mc2000 error=[%s] %lldms expected errors naming 入れ子, ctl clips >= 1, each <= 5000ms\n",
+            g41Gap.error.toUtf8().constData(), static_cast<long long>(g41GapMs),
+            g41Ctl.error.toUtf8().constData(), g41Ctl.videoTracks.isEmpty() ? -1 : int(g41Ctl.videoTracks[0].size()),
+            static_cast<long long>(g41CtlMs), g41Desc.error.toUtf8().constData(), static_cast<long long>(g41DescMs),
+            g41Mc.error.toUtf8().constData(), static_cast<long long>(g41McMs));
+        gate(41, g41Ok);
+    }
+
+    // G42: UNC and file://host media never reach the network: the clip gets an offline-<ref> sentinel path
+    // (no host in it), the original goes into the warning and offlineSources. Local files, file://localhost,
+    // a relative src and a \\?\C:\ long path stay local.
+    {
+        const QString g42Real = dir.filePath(QStringLiteral("g42-real.mov"));
+        { QFile f(g42Real); f.open(QIODevice::WriteOnly); f.write("x"); }
+        auto g42Read = [&](const QString &src, const QString &fcpxmlDir, qint64 *ms = nullptr) {
+            QElapsedTimer t;
+            t.start();
+            const auto r = fcpx::xml::parseXml(QStringLiteral("<fcpxml><resources><asset id=\"u\" src=\"%1\"/></resources>"
+                "<project name=\"u\"><sequence><spine><asset-clip ref=\"u\" offset=\"0s\" duration=\"1s\"/></spine></sequence>"
+                "</project></fcpxml>").arg(src.toHtmlEscaped()), fcpxmlDir);
+            if (ms) *ms = t.elapsed();
+            return r;
+        };
+        const QStringList g42Forms{
+            QStringLiteral("file://veditor-nohost/share/x.mov"),
+            QStringLiteral("\\\\veditor-nohost\\share\\x.mov"),
+            QStringLiteral("//veditor-nohost/share/x.mov"),
+            QStringLiteral("/\\veditor-nohost\\share\\x.mov"),
+            QStringLiteral("\\/veditor-nohost/share/x.mov")};
+        bool g42Unc = true;
+        qint64 g42TotalMs = 0;
+        QStringList g42Detail;
+        for (const QString &src : g42Forms) {
+            qint64 ms = 0;
+            const auto r = g42Read(src, dir.path(), &ms);
+            g42TotalMs += ms;
+            const ClipInfo *c = r.videoTracks.size() == 1 && r.videoTracks[0].size() == 1 ? &r.videoTracks[0][0] : nullptr;
+            bool warned = false;
+            for (const QString &w : r.warnings)
+                warned |= w.contains(QStringLiteral("オフライン素材")) && w.contains(src);
+            const bool ok = r.error.isEmpty() && c && warned
+                && QFileInfo(c->filePath).fileName().startsWith(QStringLiteral("offline-"))
+                && !c->filePath.contains(QStringLiteral("veditor-nohost"))
+                && r.offlineSources.value(c->filePath) == src;
+            g42Unc &= ok;
+            g42Detail << QStringLiteral("%1 ok=%2 path=%3").arg(src).arg(int(ok)).arg(c ? c->filePath : QString());
+        }
+        const auto g42Local = g42Read(QUrl::fromLocalFile(g42Real).toString(), dir.path());
+        const auto g42Host = g42Read(QStringLiteral("file://localhost/") + (g42Real.startsWith(QLatin1Char('/')) ? g42Real.mid(1) : g42Real), dir.path());
+        const auto g42Rel = g42Read(QStringLiteral("g42-real.mov"), dir.path());
+        auto g42IsLocal = [&](const fcpx::xml::ImportResult &r) {
+            return r.error.isEmpty() && r.videoTracks.size() == 1 && r.videoTracks[0].size() == 1
+                && QDir::fromNativeSeparators(r.videoTracks[0][0].filePath) == g42Real
+                && r.offlineSources.isEmpty() && r.unresolvedFiles == 0 && r.resolvedFiles == 1;
+        };
+        bool g42Long = true;
+#ifdef Q_OS_WIN
+        const auto g42LongRead = g42Read(QStringLiteral("\\\\?\\") + QDir::toNativeSeparators(g42Real), dir.path());
+        g42Long = g42IsLocal(g42LongRead);
+        std::fprintf(stderr, "G42 long path local=%d warnings=[%s]\n", int(g42Long), g42LongRead.warnings.join('|').toUtf8().constData());
+#else
+        std::fprintf(stderr, "G42 long path leg not evaluated off Windows\n");
+#endif
+        // A UNC asset used only inside a compound (one level, then two levels deep): the sentinel sits on the
+        // nested sequence's clip and the top-level offlineSources still maps it back to the original src.
+        const QString g42CompSrc = QStringLiteral("\\\\veditor-nohost\\share\\c.mov");
+        auto g42Compound = [&](const QString &spine, const QString &media) {
+            return fcpx::xml::parseXml(QStringLiteral("<fcpxml><resources><asset id=\"cu\" src=\"%1\"/>%2</resources>"
+                "<project name=\"c\"><sequence><spine>%3</spine></sequence></project></fcpxml>")
+                .arg(g42CompSrc.toHtmlEscaped(), media, spine), dir.path());
+        };
+        auto g42NestedOk = [&](const fcpx::xml::ImportResult &r, int sequenceCount) {
+            QStringList sentinels;
+            for (const TimelineSequence &sq : r.sequences)
+                for (const auto &track : sq.videoTracks)
+                    for (const ClipInfo &c : track)
+                        if (QFileInfo(c.filePath).fileName().startsWith(QStringLiteral("offline-"))) sentinels << c.filePath;
+            bool topDirect = false;
+            for (const auto &track : r.videoTracks)
+                for (const ClipInfo &c : track) topDirect |= c.filePath.contains(QStringLiteral("offline-"));
+            bool warned = false;
+            for (const QString &w : r.warnings)
+                warned |= w.contains(QStringLiteral("オフライン素材")) && w.contains(g42CompSrc);
+            return r.error.isEmpty() && r.sequences.size() == sequenceCount && sentinels.size() == 1 && !topDirect
+                && !sentinels[0].contains(QStringLiteral("veditor-nohost"))
+                && r.offlineSources.value(sentinels[0]) == g42CompSrc && warned;
+        };
+        const auto g42OneLevel = g42Compound(QStringLiteral("<ref-clip ref=\"m1\" duration=\"2s\"/>"),
+            QStringLiteral("<media id=\"m1\"><sequence><spine><asset-clip ref=\"cu\" duration=\"2s\"/></spine></sequence></media>"));
+        const auto g42TwoLevel = g42Compound(QStringLiteral("<ref-clip ref=\"outer\" duration=\"2s\"/>"),
+            QStringLiteral("<media id=\"outer\"><sequence><spine><ref-clip ref=\"inner\" duration=\"2s\"/></spine></sequence></media>"
+                "<media id=\"inner\"><sequence><spine><asset-clip ref=\"cu\" duration=\"2s\"/></spine></sequence></media>"));
+        const bool g42CompoundOk = g42NestedOk(g42OneLevel, 1) && g42NestedOk(g42TwoLevel, 2);
+        std::fprintf(stderr, "G42 compound oneLevel=%d (offline=%d seq=%d err=[%s]) twoLevel=%d (offline=%d seq=%d err=[%s]) expected both 1\n",
+            int(g42NestedOk(g42OneLevel, 1)), int(g42OneLevel.offlineSources.size()), int(g42OneLevel.sequences.size()), g42OneLevel.error.toUtf8().constData(),
+            int(g42NestedOk(g42TwoLevel, 2)), int(g42TwoLevel.offlineSources.size()), int(g42TwoLevel.sequences.size()), g42TwoLevel.error.toUtf8().constData());
+        const bool g42Ok = g42Unc && g42TotalMs <= 1000 && g42IsLocal(g42Local) && g42IsLocal(g42Host)
+            && g42IsLocal(g42Rel) && g42Long && g42CompoundOk;
+        std::fprintf(stderr, "G42 localhost path=[%s] error=[%s] warnings=[%s]\n",
+            g42Host.videoTracks.size() == 1 && g42Host.videoTracks[0].size() == 1 ? g42Host.videoTracks[0][0].filePath.toUtf8().constData() : "?",
+            g42Host.error.toUtf8().constData(), g42Host.warnings.join('|').toUtf8().constData());
+        std::fprintf(stderr, "G42 unc=%d totalMs=%lld local=%d localhost=%d relative=%d long=%d expected (all 1, <= 1000ms) detail=[%s]\n",
+            int(g42Unc), static_cast<long long>(g42TotalMs), int(g42IsLocal(g42Local)), int(g42IsLocal(g42Host)),
+            int(g42IsLocal(g42Rel)), int(g42Long), g42Detail.join(QStringLiteral(" ; ")).toUtf8().constData());
+        gate(42, g42Ok);
     }
 
     return tally.finish();

@@ -2,9 +2,20 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QCryptographicHash>
 #include <QDateTime>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <algorithm>
+
+namespace {
+QString g_fixedBackupName;
+}
+
+void autosavetest::setFixedBackupNameForTest(const QString &fileName)
+{
+    g_fixedBackupName = fileName;
+}
 
 AutoSave::AutoSave(QObject *parent)
     : QObject(parent)
@@ -26,6 +37,8 @@ void AutoSave::start(const AutoSaveConfig &config)
     QDir dir(m_config.backupDir);
     if (!dir.exists())
         dir.mkpath(".");
+
+    seedLastSavedHashFromNewestBackup();
 
     // Remove clean shutdown marker (session is now active)
     QFile::remove(cleanShutdownMarkerPath());
@@ -62,17 +75,56 @@ void AutoSave::performAutoSave()
     if (!dir.exists())
         dir.mkpath(".");
 
-    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString fileName = QString("project_autosave_%1.veditor").arg(timestamp);
-    QString filePath = dir.filePath(fileName);
+    const QByteArray bytes = json.toUtf8();
+    const QByteArray hash = QCryptographicHash::hash(bytes, QCryptographicHash::Sha1);
+    if (hash == m_lastSavedHash)
+        return;
 
-    QFile file(filePath);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(json.toUtf8());
-        file.close();
+    QString fileName;
+    if (!g_fixedBackupName.isEmpty()) {
+        fileName = g_fixedBackupName;
+        g_fixedBackupName.clear();
+    } else {
+        // UTC ms stamp plus a zero-padded max-plus-one counter: names stay unique
+        // within one ms and always sort after the old local-time names ('u' > '2').
+        const QString prefix = QString("project_autosave_utc_%1_")
+            .arg(QDateTime::currentDateTimeUtc().toString("yyyyMMdd_HHmmss_zzz"));
+        int next = 0;
+        const QStringList same = dir.entryList({prefix + "*.veditor"}, QDir::Files);
+        for (const QString &name : same) {
+            const QString base = name.left(name.size() - 8);
+            bool ok = false;
+            const int n = base.mid(prefix.size()).toInt(&ok);
+            if (ok && n + 1 > next)
+                next = n + 1;
+        }
+        fileName = QString("%1%2.veditor").arg(prefix).arg(next, 3, 10, QChar('0'));
+    }
+    const QString filePath = dir.filePath(fileName);
+
+    QSaveFile file(filePath);
+    if (file.open(QIODevice::WriteOnly)
+        && file.write(bytes) == bytes.size()
+        && file.commit()) {
+        m_lastSavedHash = hash;
         cleanOldBackups();
         emit autoSaved(filePath);
+    } else {
+        emit saveFailed(filePath, file.errorString());
     }
+}
+
+void AutoSave::seedLastSavedHashFromNewestBackup()
+{
+    m_lastSavedHash.clear();
+    QDir dir(m_config.backupDir);
+    const QFileInfoList entries = dir.entryInfoList({"project_autosave_*.veditor"}, QDir::Files,
+                                                    QDir::Name | QDir::Reversed);
+    if (entries.isEmpty())
+        return;
+    QFile file(entries.first().absoluteFilePath());
+    if (file.open(QIODevice::ReadOnly))
+        m_lastSavedHash = QCryptographicHash::hash(file.readAll(), QCryptographicHash::Sha1);
 }
 
 void AutoSave::cleanOldBackups()
@@ -80,9 +132,10 @@ void AutoSave::cleanOldBackups()
     QDir dir(m_config.backupDir);
     QStringList filters;
     filters << "project_autosave_*.veditor";
-    QFileInfoList entries = dir.entryInfoList(filters, QDir::Files, QDir::Time);
+    QFileInfoList entries = dir.entryInfoList(filters, QDir::Files,
+                                           QDir::Name | QDir::Reversed);
 
-    // entries sorted newest first by QDir::Time
+    // entries sorted newest first by name (utc_ names sort after the old local-time names)
     while (entries.size() > m_config.maxBackups) {
         QFile::remove(entries.takeLast().absoluteFilePath());
     }
@@ -120,14 +173,15 @@ QStringList AutoSave::recoveryFiles()
 
     QStringList filters;
     filters << "project_autosave_*.veditor";
-    QFileInfoList entries = dir.entryInfoList(filters, QDir::Files, QDir::Time);
+    QFileInfoList entries = dir.entryInfoList(filters, QDir::Files,
+                                           QDir::Name | QDir::Reversed);
 
     QStringList result;
     result.reserve(entries.size());
     for (const QFileInfo &info : entries)
         result.append(info.absoluteFilePath());
 
-    return result;  // already sorted newest first by QDir::Time
+    return result;  // sorted newest first by name
 }
 
 QString AutoSave::recoverFromFile(const QString &filePath)

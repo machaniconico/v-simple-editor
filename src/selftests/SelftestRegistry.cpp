@@ -56,6 +56,7 @@ int runAudioMixerSelftest();
 int runAudioRestoreSelftest();
 int runAudioTrackFxSelftest();
 int runAudioXfadeSelftest();
+int runAutosaveSelftest();
 int runAutoClipGenSelftest();
 int runAutoColorPreserveGradeSelftest();
 int runAutoColorSelftest();
@@ -269,12 +270,14 @@ int runSpatialPathSelftest();
 int runSpecialCompositeSelftest();
 int runSpectralEditSelftest();
 int runSpectrumSelftest();
+int runStabilizerExportSelftest();
 int runStereoPanSelftest();
 int runStillCompareSelftest();
 int runSubMovtextSelftest();
 int runSubXlatSelftest();
 int runSubtitleCpsSelftest();
 int runSubtitleKaraokeSelftest();
+int runSubtitleImportSelftest();
 int runSurfaceToolSelftest();
 int runSwsColorSelftest();
 int runTcburnSelftest();
@@ -718,6 +721,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AIHighlight config defaults / Highlight struct helpers (singleton-free) (6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
+    { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
+      "V1 stabilizer keyframes on export (StabilizerWarp) after the brush, before FX: identity, translation, interpolation, edge fill, V1 only / nested / matrix, brush order and the special composite (6 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
@@ -791,9 +796,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (12 gates)" },
     { "psd-import", "VEDITOR_PSD_IMPORT_SELFTEST", runPsdImportSelftest, false,
-      "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G6) (6 gates)" },
+      "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G7) (7 gates)" },
     { "lut-import", "VEDITOR_LUT_IMPORT_SELFTEST", runLutImportSelftest, false,
-      ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (7 gates)" },
+      ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (12 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7, G3b) (8 gates)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,
@@ -873,7 +878,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "extrude-mesh", "VEDITOR_EXTRUDE_MESH_SELFTEST", runExtrudeMeshSelftest, true,
       "Extruded mesh guard: parameters sanitised in the builder, step limit and vertex budget fall back to no bevel, shared cache key and MCP limits (G1-G7) (7 gates)" },
     { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
-      "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (17 gates)" },
+      "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (18 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
       "Text3D preview camera persistence and proxy policy checks" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,
@@ -899,11 +904,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-sidecar", "VEDITOR_CLIP_SIDECAR_SELFTEST", runClipSidecarSelftest, true,
-      "Clip sidecars: the 3D text / brush on ClipInfo, JSON round-trip, legacy root sections migrated on load and never written, track-ops, split right half, empty keys, setter undo, render in place, duplicate / paste (20 gates)" },
+      "Clip sidecars: the 3D text / brush on ClipInfo, JSON round-trip, legacy root sections migrated on load and never written, track-ops, split right half, empty keys, setter undo, render in place, duplicate / paste (21 gates)" },
     { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
       "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (6 gates)" },
     { "connected-clip", "VEDITOR_CONNECTED_CLIP_SELFTEST", runConnectedClipSelftest, true,
-      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (41 gates)" },
+      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (45 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
@@ -932,6 +937,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Subtitle CPS readability helper: visible character counting, zero-duration sentinel, strict threshold" },
     { "subtitle-karaoke", "VEDITOR_SUBTITLE_KARAOKE_SELFTEST",    runSubtitleKaraokeSelftest,    false,
       "SubtitleKaraoke: active word half-open interval + spoken count boundaries (8 gates)" },
+    { "autosave",         nullptr,                                runAutosaveSelftest,           true,
+      "Autosave: atomic QSaveFile write, unchanged skip, failure report, UTC name rotation and 12-field subtitle style (5 gates)" },
+    { "subtitle-import",  "VEDITOR_SUBTITLE_IMPORT_SELFTEST",     runSubtitleImportSelftest,     false,
+      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (6 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
       "snsfit::containGeom/containInAspectCanvas pure geometry (15 gates)" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
@@ -1109,13 +1118,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
-      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (9 gates)" },
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (12 gates)" },
     { "project-persist", nullptr, runProjectPersistSelftest, true,
-      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (7 gates)" },
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (11 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (206 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (207 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
@@ -1157,7 +1166,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
       "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
     { "fcpxml-import", "VEDITOR_FCPXML_IMPORT_SELFTEST", runFcpxmlImportSelftest, true,
-      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (40 gates)" },
+      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (42 gates)" },
     { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
       "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
     { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,

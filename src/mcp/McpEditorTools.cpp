@@ -3298,7 +3298,6 @@ void McpEditorTools::registerWriteTools()
                        importResult.durationSec);
 
             m_window->hideWelcomeScreen();
-            m_window->setWindowModified(true);
             m_window->updateStatusInfo();
             m_window->updateEditActions();
             QJsonObject response{
@@ -3402,7 +3401,6 @@ void McpEditorTools::registerWriteTools()
             if (audio) currentTimeline->addAudioTrack();
             else currentTimeline->addVideoTrack();
             const int count = audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount();
-            m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true},
                 {QStringLiteral("trackIndex"), count - 1}, {QStringLiteral("trackCount"), count}};
@@ -3425,7 +3423,6 @@ void McpEditorTools::registerWriteTools()
             if (!readTrackTarget(args, m_window, currentTimeline, &target, err)) return {};
             const bool audio = target.kind == TrackKind::Audio;
             if (!currentTimeline->removeTrack(audio, target.trackIndex, err)) return {};
-            m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackCount"),
                 audio ? currentTimeline->audioTrackCount() : currentTimeline->videoTrackCount()}};
@@ -3454,7 +3451,6 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("newTrackIndex is required")), QJsonObject{};
             if (!nonNegativeInteger(args, QStringLiteral("newTrackIndex"), -1, &destination, err)) return {};
             if (!currentTimeline->moveTrack(target.kind == TrackKind::Audio, target.trackIndex, destination, err)) return {};
-            if (target.trackIndex != destination) m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true}, {QStringLiteral("trackIndex"), destination}};
         })
@@ -3468,7 +3464,7 @@ void McpEditorTools::registerWriteTools()
     trackPropertyInputs.remove(QStringLiteral("locked"));
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_property"),
-        QStringLiteral("トラックの名前・色・再生フラグを設定。名前と色はまとめて1回のUndo、再生フラグはUndo対象外。空の名前・色で既定に戻す。"),
+        QStringLiteral("トラックの名前・色・再生フラグを設定。名前・色・再生フラグはまとめて 1 回の Undo。空の名前・色で既定に戻す。"),
         schemaWithRequired(mergedProperties(trackSelectorProperties(), trackPropertyInputs),
                            {QStringLiteral("kind"), QStringLiteral("trackIndex")}),
         guardedWrite(QStringLiteral("set_track_property"),
@@ -3498,24 +3494,33 @@ void McpEditorTools::registerWriteTools()
                 if (!valid) return setError(err, QStringLiteral("color must be #RRGGBB or empty")), QJsonObject{};
                 color = text.isEmpty() ? QColor{} : QColor(text);
             }
-            const QJsonObject before = trackPropertiesToJson(target.track, target.trackIndex);
-            const bool undoRecorded = name != target.track->customName || color != target.track->color;
+            // US-2106: flags first, so the appearance undo point holds the new flags.
+            const bool appearanceChanged = name != target.track->customName || color != target.track->color;
+            const bool flagsChanged =
+                (args.contains(QStringLiteral("muted")) && args.value(QStringLiteral("muted")).toBool() != target.track->isMuted())
+                || (args.contains(QStringLiteral("solo")) && args.value(QStringLiteral("solo")).toBool() != target.track->isSolo())
+                || (args.contains(QStringLiteral("hidden")) && args.value(QStringLiteral("hidden")).toBool() != target.track->isHidden());
+            if (flagsChanged) {
+                // The whole set: a track missing from the arrays is reset to defaults.
+                QJsonObject flags = currentTimeline->trackFlagsToJson();
+                const QString kind = target.kindName;
+                QJsonArray items = flags.value(kind).toArray();
+                QJsonObject item = items.at(target.trackIndex).toObject();
+                for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
+                    if (args.contains(key)) item.insert(key, args.value(key));
+                items[target.trackIndex] = item;
+                flags.insert(kind, items);
+                currentTimeline->applyTrackFlagsFromJson(flags);
+            }
             if (!currentTimeline->setTrackAppearance(target.kind == TrackKind::Audio,
                     target.trackIndex, name, color, err)) return {};
-            QJsonObject flags = currentTimeline->trackFlagsToJson();
-            const QString kind = target.kindName;
-            QJsonArray items = flags.value(kind).toArray();
-            QJsonObject item = items.at(target.trackIndex).toObject();
-            for (const QString &key : {QStringLiteral("muted"), QStringLiteral("solo"), QStringLiteral("hidden")})
-                if (args.contains(key)) item.insert(key, args.value(key));
-            items[target.trackIndex] = item;
-            flags.insert(kind, items);
-            currentTimeline->applyTrackFlagsFromJson(flags);
+            if (flagsChanged && !appearanceChanged)
+                currentTimeline->saveUndoState(QStringLiteral("トラック設定 (MCP)"));
             const QJsonObject after = trackPropertiesToJson(target.track, target.trackIndex);
-            if (before != after) m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{{QStringLiteral("ok"), true},
-                {QStringLiteral("track"), after}, {QStringLiteral("undoRecorded"), undoRecorded}};
+                {QStringLiteral("track"), after},
+                {QStringLiteral("undoRecorded"), appearanceChanged || flagsChanged}};
         })
     }, outputSchemaOf(QJsonObject{
         {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -3527,7 +3532,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_track_locked"),
-        QStringLiteral("指定トラックの編集ロックを設定する。ロック中は split_clip / delete_clip / move_clip などのクリップ編集を拒否する。ロック変更は Undo 対象外。"),
+        QStringLiteral("指定トラックの編集ロックを設定する。ロック中は split_clip / delete_clip / move_clip などのクリップ編集を拒否する。ロック変更は 1 回の Undo。"),
         schemaWithRequired(mergedProperties(trackSelectorProperties(), QJsonObject{
             {QStringLiteral("locked"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("boolean")},
@@ -3554,14 +3559,11 @@ void McpEditorTools::registerWriteTools()
             if (!readTrackTarget(args, m_window, currentTimeline, &target, err))
                 return {};
             const bool locked = lockedValue.toBool();
-            const bool changed = target.track->isLocked() != locked;
             if (!currentTimeline->setTrackLocked(target.kind, target.trackIndex,
                                                  locked)) {
                 return setError(err, QStringLiteral("track index is out of range")),
                        QJsonObject();
             }
-            if (changed)
-                m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
@@ -3883,8 +3885,6 @@ void McpEditorTools::registerWriteTools()
                     {QStringLiteral("trackIndex"), newTrackIndex}
                 };
             }
-            if (moveResult.moved)
-                m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
@@ -3957,7 +3957,6 @@ void McpEditorTools::registerWriteTools()
             if (!currentTimeline->connectClip(target.audio ? TrackKind::Audio : TrackKind::Video,
                                               target.trackIndex, target.clipIndex, anchorUid, err))
                 return {};
-            m_window->setWindowModified(true);
             // Report the offset of the same clip by uid (its index may change).
             double anchorOffsetSec = 0.0;
             for (const ClipInfo& clip : target.track->clips())
@@ -3995,7 +3994,6 @@ void McpEditorTools::registerWriteTools()
             if (!currentTimeline->disconnectClip(target.audio ? TrackKind::Audio : TrackKind::Video,
                                                  target.trackIndex, target.clipIndex, err))
                 return {};
-            m_window->setWindowModified(true);
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("warnings"),
@@ -4091,7 +4089,6 @@ void McpEditorTools::registerWriteTools()
                        QJsonObject();
             }
 
-            m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             QJsonObject response{{QStringLiteral("ok"), true}};
             if (!message.isEmpty())
@@ -4161,7 +4158,6 @@ void McpEditorTools::registerWriteTools()
             if (!m_window->relinkMediaPaths(mapping, &relinkError))
                 return setError(err, relinkError), QJsonObject();
 
-            m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), true},
@@ -4974,7 +4970,6 @@ void McpEditorTools::registerWriteTools()
                        QJsonObject();
             }
 
-            m_window->setWindowModified(true);
             syncSelectionAfterEdit();
             const KeyframeManager& keyframes =
                 target.track->clips().at(target.clipIndex).keyframes;

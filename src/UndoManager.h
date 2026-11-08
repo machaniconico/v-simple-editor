@@ -41,6 +41,9 @@ struct TimelineState {
     QVector<double> audioTrackGains;
     QVector<double> audioTrackPans;
     QJsonObject externalTrackState;
+    // US-2106: Timeline::trackFlagsToJson (lock / mute / solo / hide). Empty =
+    // not captured: restore leaves the live flags alone.
+    QJsonObject trackFlags;
     // Bus routing snapshot (MainWindow::m_audioBusRouting stays the SSOT) taken
     // through Timeline::setBusRoutingBridge. Empty = not captured: restore skips it.
     QJsonObject audioBusRouting;
