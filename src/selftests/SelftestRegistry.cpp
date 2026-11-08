@@ -940,7 +940,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "autosave",         nullptr,                                runAutosaveSelftest,           true,
       "Autosave: atomic QSaveFile write, unchanged skip, failure report, UTC name rotation and 12-field subtitle style (5 gates)" },
     { "subtitle-import",  "VEDITOR_SUBTITLE_IMPORT_SELFTEST",     runSubtitleImportSelftest,     false,
-      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (6 gates)" },
+      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (9 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
       "snsfit::containGeom/containInAspectCanvas pure geometry (15 gates)" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
