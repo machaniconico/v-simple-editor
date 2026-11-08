@@ -2009,6 +2009,19 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
     const bool hasMatteSource = !timeline->trackMatteEntries().isEmpty();
     QSet<QString> activeClipIds;
     bool hasBrush = false;
+    // US-2113: a borrowed overlap window (two active clips on a track) is a
+    // transition frame: it keeps the GL path.
+    {
+        QSet<int> seenTracks;
+        for (const auto &pair : brushActiveClipsAt(timeline, timelineSec)) {
+            if (seenTracks.contains(pair.first)) {
+                const auto *t = timeline->videoTracks().value(pair.first, nullptr);
+                if (t && !t->isHidden())
+                    return false;
+            }
+            seenTracks.insert(pair.first);
+        }
+    }
     const auto &videoTracks = timeline->videoTracks();
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
         const auto *track = videoTracks[trackIdx];
@@ -3547,6 +3560,34 @@ bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
     const ClipInfo &c = tracks[trackIdx].clips[clipIdx];
     *localSec = qBound(0.0, timelineSec - (cursor + c.leadInSec), c.effectiveDuration());
     return true;
+}
+
+QVector<QPair<int, int>> brushActiveClipsAt(const Timeline *timeline, double timelineSec)
+{
+    QVector<QPair<int, int>> active;
+    if (!timeline)
+        return active;
+    const QVector<RenderTrackSnapshot> tracks = snapshotsFromTimeline(timeline);
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, /*applyTimelineGlobals=*/true, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, timelineSec, overlapA, overlapB);
+    for (int t = 0; t < tracks.size(); ++t) {
+        if (overlapA[t] >= 0) {
+            active.append({t, intervals[t][overlapA[t]].clipIdx});
+            active.append({t, intervals[t][overlapB[t]].clipIdx});
+            continue;
+        }
+        double start = 0.0;
+        const int idx = selectClipOnTrack(tracks, intervals, overlapA, overlapB, t,
+                                          timelineSec, /*clamp=*/t == 0, &start,
+                                          /*countDisabled=*/false);
+        if (idx >= 0)
+            active.append({t, idx});
+    }
+    return active;
 }
 
 QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx, int clipIdx,

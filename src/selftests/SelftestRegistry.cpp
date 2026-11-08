@@ -878,7 +878,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "extrude-mesh", "VEDITOR_EXTRUDE_MESH_SELFTEST", runExtrudeMeshSelftest, true,
       "Extruded mesh guard: parameters sanitised in the builder, step limit and vertex budget fall back to no bevel, shared cache key and MCP limits (G1-G7) (7 gates)" },
     { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
-      "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (17 gates)" },
+      "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (18 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
       "Text3D preview camera persistence and proxy policy checks" },
     { "transcript-highlighter-offline", "VEDITOR_TRANSCRIPT_HIGHLIGHTER_OFFLINE_SELFTEST", runTranscriptHighlighterOfflineSelftest, false,

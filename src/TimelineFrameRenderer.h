@@ -158,6 +158,11 @@ QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx,
 // placement start clamped into [0, effectiveDuration]. False on a bad index.
 bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
                     double timelineSec, double *localSec);
+// US-2113: the (trackIdx, clipIdx) pairs the brush preview treats as active at
+// `timelineSec`: export's per-track choice (overlapPairsAt + selectClipOnTrack,
+// clampToFirst on V1), and inside a borrowed overlap window both the outgoing and
+// the incoming clip of that track. Hidden tracks are not filtered here.
+QVector<QPair<int, int>> brushActiveClipsAt(const Timeline *timeline, double timelineSec);
 // Number of clip layer sources built so far (V1, upper layers, transition
 // neighbours, renderClipSourceAt), for tests.
 quint64 clipLayerSourceCallsForTest();

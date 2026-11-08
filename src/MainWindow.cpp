@@ -3623,11 +3623,11 @@ void MainWindow::updateBrushPreviewProgress(double timelineSec)
     const TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
         return;
-    // Outside the selected clip (the paused brush path's active rule, V1 clamping to
-    // its first clip at t <= 0) the GL must not draw its strokes: progress 0.
-    double activeStart = 0.0;
-    if (tlrender::activeClipOnTrack(track->clips(), timelineSec,
-                                    /*clampToFirst=*/trackIdx == 0, &activeStart) != clipIdx) {
+    // Outside the clips export shows (US-2113: the exporter's overlap-window and
+    // selectClipOnTrack rule, both members inside a borrowed window; V1 clamping to its
+    // first clip at t <= 0) the GL must not draw its strokes: progress 0.
+    if (!tlrender::brushActiveClipsAt(m_timeline, timelineSec)
+             .contains(qMakePair(trackIdx, clipIdx))) {
         m_player->glPreview()->setBrushAnimationProgress(0.0);
         return;
     }
@@ -8814,14 +8814,15 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
         *drewBrush = brushWantsSpecialPath;
     // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
     // non-empty V1 with none draws nothing there, so the preview falls back too.
-    int v1ExportIdx = -1;
+    QVector<QPair<int, int>> exportClips;
     if (brushWantsSpecialPath) {
+        exportClips = tlrender::brushActiveClipsAt(m_timeline, timelineSeconds);
         const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
         if (v1 && !v1->isHidden() && !v1->clips().isEmpty()) {
-            double v1Start = 0.0;
-            v1ExportIdx = tlrender::activeClipOnTrack(
-                v1->clips(), timelineSeconds, /*clampToFirst=*/true, &v1Start);
-            if (v1ExportIdx < 0)
+            bool v1Active = false;
+            for (const auto &pair : exportClips)
+                v1Active = v1Active || pair.first == 0;
+            if (!v1Active)
                 return {};
         }
     }
@@ -8832,7 +8833,6 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
 
         const auto &clips = track->clips();
         double cursor = 0.0;
-        bool trackHasExportClip = false;
         for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
             const ClipInfo &clip = clips[clipIdx];
             cursor += qMax(0.0, clip.leadInSec);
@@ -8841,15 +8841,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             cursor = clipEnd;
 
             if (brushWantsSpecialPath) {
-                // Export's [start, end) interval, at most one clip per track
-                // (activeClipOnTrack), so a cut matches renderFrameAt.
-                if (trackHasExportClip)
-                    break;
-                if (trackIdx == 0 && v1ExportIdx >= 0
-                        ? clipIdx != v1ExportIdx
-                        : (timelineSeconds < clipStart || timelineSeconds >= clipEnd))
+                // The clips export draws (brushActiveClipsAt), one per track
+                // outside a transition window, so a cut matches renderFrameAt.
+                if (!exportClips.contains(qMakePair(trackIdx, clipIdx)))
                     continue;
-                trackHasExportClip = true;
             } else if (timelineSeconds + 1.0 / 120.0 < clipStart
                 || timelineSeconds > clipEnd + 1.0 / 120.0) {
                 continue;
