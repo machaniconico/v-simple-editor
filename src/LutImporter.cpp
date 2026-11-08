@@ -213,7 +213,9 @@ LutData LutImporter::toGpuGrid(const LutData &in, int maxSize)
     if (!in.isValid() || (in.type == LutType::Cube3D && in.hasDefaultDomain()))
         return in;
 
-    const int n = in.type == LutType::Cube1D ? qBound(2, in.size, maxSize) : in.size;
+    // A non-default 3D domain is resampled densely so its knots and clamp edge stay
+    // within one grid step of the default-domain grid points.
+    const int n = in.type == LutType::Cube1D ? qBound(2, in.size, maxSize) : qMax(in.size, maxSize);
     LutData out;
     out.name = in.name;
     out.filePath = in.filePath;

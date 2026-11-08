@@ -331,8 +331,64 @@ int runLutImportSelftest()
         const LutData domg = LutImporter::toGpuGrid(dom);
         const QColor w0 = LutImporter::applyLut(pixel(255, 255, 255), dom).pixelColor(0, 0);
         const QColor w1 = LutImporter::applyLut(pixel(255, 255, 255), domg).pixelColor(0, 0);
-        const bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && domg.type == LutType::Cube3D
-            && domg.size == 2 && domg.hasDefaultDomain() && near(w1, w0.red(), w0.green(), w0.blue());
+        bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && domg.type == LutType::Cube3D
+            && domg.size == 65 && domg.hasDefaultDomain() && near(w1, w0.red(), w0.green(), w0.blue());
+        // Narrow (0..0.5, row v^2) and shifted (0.1..0.6, row v^2 / 2) 3-point domains: the
+        // grid tracks the original on the diagonal and an off-axis line within 2/255.
+        std::string domDetail;
+        const char *domHeads[2] = {"DOMAIN_MIN 0 0 0\nDOMAIN_MAX 0.5 0.5 0.5\n",
+                                   "DOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.6 0.6 0.6\n"};
+        const char *domNames[2] = {"g12c2.cube", "g12c3.cube"};
+        for (int d = 0; d < 2; ++d) {
+            const double scale = d == 0 ? 1.0 : 0.5;
+            QByteArray text = QByteArray("LUT_3D_SIZE 3\n") + domHeads[d];
+            for (int b = 0; b < 3; ++b)
+                for (int gg = 0; gg < 3; ++gg)
+                    for (int r = 0; r < 3; ++r)
+                        text += QByteArray::number(scale * r * r / 4.0) + " "
+                              + QByteArray::number(scale * gg * gg / 4.0) + " "
+                              + QByteArray::number(scale * b * b / 4.0) + "\n";
+            bool lok = false;
+            const LutData orig = loadText(dir, domNames[d], text, &lok);
+            const LutData grid = LutImporter::toGpuGrid(orig);
+            const bool valid = lok && orig.isValid() && grid.isValid();
+            float maxErr = valid ? 0.0f : 1.0f;
+            for (int k = 0; valid && k <= 255; ++k) {
+                const float t = k / 255.0f;
+                const QVector3D xs[2] = {QVector3D(t, t, t), QVector3D(t, 0.25f, 0.75f)};
+                for (const QVector3D &x : xs) {
+                    const QVector3D e = LutImporter::sample(grid, x) - LutImporter::sample(orig, x);
+                    maxErr = qMax(maxErr, qMax(std::abs(e.x()), qMax(std::abs(e.y()), std::abs(e.z()))));
+                }
+            }
+            okC = okC && valid && orig.size == 3 && !orig.hasDefaultDomain()
+                && grid.hasDefaultDomain() && maxErr <= 2.0f / 255.0f;
+            domDetail += " dom" + std::to_string(d) + "_err255=" + std::to_string(maxErr * 255.0f);
+        }
+        // Logged only, not part of the gate (Wave 22 carryover C-02-residual): a domain narrower
+        // than one 1/64 grid step (0.1..0.101, row 0 / 0.25 / 1) cannot be tracked by a uniform grid.
+        {
+            const double row[3] = {0.0, 0.25, 1.0};
+            QByteArray text("LUT_3D_SIZE 3\nDOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.101 0.101 0.101\n");
+            for (int b = 0; b < 3; ++b)
+                for (int gg = 0; gg < 3; ++gg)
+                    for (int r = 0; r < 3; ++r)
+                        text += QByteArray::number(row[r]) + " " + QByteArray::number(row[gg]) + " "
+                              + QByteArray::number(row[b]) + "\n";
+            bool rok = false;
+            const LutData orig = loadText(dir, "g12c4.cube", text, &rok);
+            const LutData grid = LutImporter::toGpuGrid(orig);
+            if (rok && orig.isValid() && grid.isValid()) {
+                const float t = 26.0f / 255.0f;
+                const float ov = LutImporter::sample(orig, QVector3D(t, t, t)).x();
+                const float gv = LutImporter::sample(grid, QVector3D(t, t, t)).x();
+                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual (logged, not a pass): loaded="
+                          << rok << " DOMAIN 0.1..0.101 x=26/255 orig=" << ov << " grid=" << gv
+                          << " err255=" << std::abs(gv - ov) * 255.0f << "\n";
+            } else {
+                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual: fixture not loaded\n";
+            }
+        }
 
         // (d) default-domain 3D LUT is returned unchanged.
         bool dok = false;
@@ -344,7 +400,7 @@ int runLutImportSelftest()
         tally.gate(12, okA && bok && idOk && b2ok && bigOk && anchor && okC && okD,
                    "a=" + std::to_string(okA) + cornerDetail + " b=" + std::to_string(bok && idOk)
                    + " b'=" + std::to_string(b2ok && bigOk) + " anchor=" + std::to_string(anchor)
-                   + " c=" + std::to_string(okC) + " w0=" + rgb(w0) + " w1=" + rgb(w1)
+                   + " c=" + std::to_string(okC) + " w0=" + rgb(w0) + " w1=" + rgb(w1) + domDetail
                    + " d=" + std::to_string(okD));
     }
 
