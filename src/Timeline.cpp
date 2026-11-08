@@ -16208,7 +16208,11 @@ bool Timeline::createSequence(const QString &name,
     sequence.audioTracks = audioTracks;
     if (sequence.videoTracks.isEmpty()) sequence.videoTracks.append(QVector<ClipInfo>{});
     if (sequence.audioTracks.isEmpty()) sequence.audioTracks.append(QVector<ClipInfo>{});
-    if (!addSequence(sequence) || !setActiveSequence(sequence.id)) return false;
+    if (!addSequence(sequence)) return false;
+    {
+        QScopedValueRollback<bool> covered(m_switchingInsideUndoPoint, true);
+        if (!setActiveSequence(sequence.id)) return false;
+    }
     // Sequence navigation preserves the existing carrier keys; remapping is
     // only valid for clip mutations within the same sequence.
     saveUndoState(QStringLiteral("新規シーケンス"));

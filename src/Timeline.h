@@ -1033,6 +1033,8 @@ public:
     bool canRedo() const;
     // True while restoreState (undo / redo / history jump) is running.
     bool isRestoringState() const { return m_restoringState; }
+    // True while createSequence switches to the new sequence: its undo point covers the switch.
+    bool isSwitchingInsideUndoPoint() const { return m_switchingInsideUndoPoint; }
     // External index owners participate in the same undo transaction.
     void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
                                     std::function<void(const QJsonObject&)> apply);
@@ -1752,6 +1754,7 @@ private:
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
     bool m_restoringState = false;
+    bool m_switchingInsideUndoPoint = false;
     void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);

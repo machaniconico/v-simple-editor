@@ -10969,7 +10969,10 @@ void MainWindow::markProjectClean()
 
 void MainWindow::markProjectDirty()
 {
-    if ((m_timeline && m_timeline->isRestoringState()) || m_remappingTrackIndices)
+    // createSequence's switch (and the adjustment layers it swaps) is in its undo point,
+    // so undoing the creation returns clean.
+    if ((m_timeline && (m_timeline->isRestoringState() || m_timeline->isSwitchingInsideUndoPoint()))
+        || m_remappingTrackIndices)
         return;
     m_dirtyOutsideUndo = true;
     setWindowModified(true);

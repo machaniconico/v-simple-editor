@@ -816,7 +816,22 @@ int runUnsavedPromptSelftest()
         const bool okB = toA && toB2 && undoOnA && undoDirty && redoOnB && !redoDirty && undo->isClean();
         d += " (b) toA=" + b(toA) + " toB=" + b(toB2) + " undoOnA=" + b(undoOnA) + " undoModified=" + b(undoDirty)
             + " redoOnB=" + b(redoOnB) + " redoModified=" + b(redoDirty) + " (expect 0) isClean=" + b(undo->isClean());
-        tally.gate(10, okA && okB, d);
+        // (c) createSequence switches inside its own undo point: undoing it returns clean.
+        timeline.setSequences({seqA, seqB}, seqA.id);
+        undo->clear();
+        timeline.saveUndoState(QStringLiteral("Initial"));
+        window.markProjectClean();
+        const bool cleanC = !window.isWindowModified();
+        const bool created = timeline.createSequence(QStringLiteral("C"));
+        const bool onNew = created && timeline.activeSequenceId() != seqA.id;
+        const bool createDirty = window.isWindowModified();
+        timeline.undo();
+        const bool undoCreateOnA = timeline.activeSequenceId() == seqA.id && timeline.sequences().size() == 2;
+        const bool undoCreateDirty = window.isWindowModified();
+        const bool okC = cleanC && created && onNew && createDirty && undoCreateOnA && !undoCreateDirty;
+        d += " (c) clean0=" + b(cleanC) + " created=" + b(created) + " onNew=" + b(onNew) + " createModified="
+            + b(createDirty) + " undoOnA=" + b(undoCreateOnA) + " undoModified=" + b(undoCreateDirty) + " (expect 0)";
+        tally.gate(10, okA && okB && okC, d);
     }
 
     // ---- G11 (US-2106): a flag undo point across a track-structure change ----

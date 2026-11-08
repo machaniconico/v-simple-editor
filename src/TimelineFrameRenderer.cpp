@@ -1355,13 +1355,12 @@ QImage applyClipMask(const QImage &frame, const ClipInfo &clip, double sourceSec
 // comp.gradingEnabled=false (AdjustmentLayer.cpp:134-148); we then return
 // the input UNTOUCHED so a clip with no adjustment layer stays byte-identical
 // to S2/S3/S4/S5 (no format round-trip, no rounding).
-QImage applyAdjustmentLayers(const QImage &composited, const Timeline *timeline,
+QImage applyAdjustmentLayers(const QImage &composited,
+                             const QVector<AdjustmentLayer> &layers,
                              qint64 usec)
 {
-    if (!timeline)
-        return composited;
     const AdjustmentLayerComposite comp =
-        composeAdjustmentLayersAt(timeline->adjustmentLayers(), usec);
+        composeAdjustmentLayersAt(layers, usec);
     if (!comp.gradingEnabled)
         return composited;                   // strict no-op == S2..S5 byte path
 
@@ -1380,6 +1379,34 @@ QImage applyAdjustmentLayers(const QImage &composited, const Timeline *timeline,
     // the canvas format the caller/contract expects (S2's RGBA8888).
     const QImage graded = VideoEffectProcessor::applyColorCorrection(composited, cc);
     return graded.convertToFormat(QImage::Format_RGBA8888);
+}
+
+// US-2110 / US-2112: a nested pass's grade. Its composite is a layer of the parent
+// stack, so the grade above (whose RGB888 round trip makes every pixel opaque) must
+// keep the child's alpha: the colour is graded straight (RGBA8888) and each pixel
+// takes back its alpha; a fully transparent pixel stays the original pixel.
+QImage applyAdjustmentLayersKeepingAlpha(const QImage &composited,
+                                         const QVector<AdjustmentLayer> &layers,
+                                         qint64 usec)
+{
+    const QImage straight = composited.convertToFormat(QImage::Format_RGBA8888);
+    QImage graded = applyAdjustmentLayers(straight, layers, usec);
+    if (graded.cacheKey() == straight.cacheKey())
+        return composited;                    // no grade: the input untouched
+    if (graded.format() != QImage::Format_RGBA8888 || graded.size() != straight.size())
+        return graded;
+    for (int y = 0; y < straight.height(); ++y) {
+        const uchar *src = straight.constScanLine(y);
+        uchar *dst = graded.scanLine(y);
+        for (int x = 0; x < straight.width(); ++x) {
+            const uchar alpha = src[4 * x + 3];
+            if (alpha == 0)
+                std::memcpy(dst + 4 * x, src + 4 * x, 4);
+            else
+                dst[4 * x + 3] = alpha;
+        }
+    }
+    return graded;
 }
 
 // S6 — TEXT-OVERLAY stage. Bake the V1 active clip's text overlays exactly
@@ -2483,6 +2510,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         (sequenceDepth == 0 && timeline) ? timeline->rotoEntries()
         : nestedSidecars                 ? nestedSidecars->roto
                                          : QHash<QString, RotoClipEntry>();
+    // S6 adjustment grade: the active timeline's layers, or (US-2110 / US-2112)
+    // a nested pass's own parked layers at its sequence-local time, so a nested
+    // sequence keeps the grade it shows when active and the parent's layers
+    // still grade the parent composite exactly once.
+    const QVector<AdjustmentLayer> passAdjustments =
+        (applyTimelineGlobals && timeline) ? timeline->adjustmentLayers()
+        : nestedSidecars                   ? nestedSidecars->adjustments
+                                           : QVector<AdjustmentLayer>();
     // US-1707: every top-level clip layer source of this composition.
     auto layerSource = [&](int t, int clipIdx, const ClipInfo &c,
                            double sourceSec, double localSec,
@@ -3089,8 +3124,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             styledBase = composed.convertToFormat(QImage::Format_RGBA8888);
         }
         const QImage adj = applyTimelineGlobals
-            ? applyAdjustmentLayers(styledBase, timeline, sampledUsec)
-            : styledBase;
+            ? applyAdjustmentLayers(styledBase, passAdjustments, sampledUsec)
+            : applyAdjustmentLayersKeepingAlpha(styledBase, passAdjustments, sampledUsec);
         return finishTransitions(applyTextOverlays(
             adj, sampledUsec, &v1Clip, generatedCaptions));
     }
@@ -3423,8 +3458,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     // adjustment layer / the V1 clip has no text, preserving S3 multi-track
     // parity exactly.
     const QImage adj = applyTimelineGlobals
-        ? applyAdjustmentLayers(stacked, timeline, sampledUsec)
-        : stacked;
+        ? applyAdjustmentLayers(stacked, passAdjustments, sampledUsec)
+        : applyAdjustmentLayersKeepingAlpha(stacked, passAdjustments, sampledUsec);
     return finishTransitions(applyTextOverlays(
         adj, sampledUsec, &v1Clip, generatedCaptions));
 }

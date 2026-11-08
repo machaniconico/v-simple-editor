@@ -239,6 +239,13 @@ extern "C" {
 //        inline timeRemapCurve maps local 1 s like the live clip (and unlike no remap), (b) a
 //        file with only the legacy sequences[C].timeRemapClipEntries gives the same value,
 //        (c) with both, the inline curve wins.
+//   G45 (US-2110 / US-2112): C's enabled gain adjustment layer [0, 1 s) covering its V1 clip,
+//        parked by the switch to P (P's own list empty), grades the nested layer in P at local
+//        0.5 s byte-identical to C rendered active with it (which differs from C without it),
+//        and leaves local 1.5 s (outside the layer) and the layer disabled byte-identical to C
+//        without it; (d) with C's V1 scaled to 0.5 the graded nested layer keeps C's alpha exactly
+//        and, over a background on P's V2, changes no pixel outside C's coverage. Detects: a
+//        nested pass that drops its sequence's parked adjustments or makes the child opaque.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -3868,6 +3875,141 @@ void nestedFileBackedGate(selftest::GateTally &tally, Timeline &tl, SequenceSide
 
 // G6: carriers follow by uid (in its own function to keep the runConnectedClipSelftest frame
 // small: US-1504 made ClipInfo larger and that frame overflowed the main thread stack).
+// G45: a nested sequence grades with its own parked adjustment layers.
+void nestedAdjustmentGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g45.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(45, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(45, false, "the G45 fixture media could not be written");
+        return;
+    }
+    tl.setAdjustmentLayers({});
+    ClipInfo v1 = clipFor("g45-v1", 2.0);
+    v1.filePath = videoPath;
+    const QPair<QString, QString> ids = setupNestedSidecars(tl, view, {{v1}});
+    const QString p = ids.first;
+    const QString c = ids.second;
+    const QSize outSize(40, 24);
+    const qint64 inside = 500000;
+    const qint64 outside = 1500000;
+    const bool activeC = tl.activeSequenceId() == c && !c.isEmpty() && !p.isEmpty();
+    const QImage cleanIn = tlrender::renderFrameAt(&tl, inside, outSize);
+    const QImage cleanOut = tlrender::renderFrameAt(&tl, outside, outSize);
+    AdjustmentLayer layer;
+    layer.timelineStartUs = 0;
+    layer.timelineEndUs = 1000000;
+    layer.trackIndex = 0;
+    layer.gradingEnabled = true;
+    for (int ch = 0; ch < 3; ++ch)
+        layer.gain[ch] = 0.5;
+    tl.setAdjustmentLayers({layer});
+    const QImage gradedC = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toP = tl.setActiveSequence(p);
+    const QVector<AdjustmentLayer> parked = tl.parkedSidecarsBySequence().value(c).adjustments;
+    const bool parkedOk = parked.size() == 1 && parked.first().gradingEnabled
+        && tl.adjustmentLayers().isEmpty();
+    const QImage nestedIn = tlrender::renderFrameAt(&tl, inside, outSize);
+    const QImage nestedOut = tlrender::renderFrameAt(&tl, outside, outSize);
+    QHash<QString, Timeline::SequenceSidecars> disabled = tl.parkedSidecarsBySequence();
+    if (!disabled[c].adjustments.isEmpty())
+        disabled[c].adjustments.first().gradingEnabled = false;
+    tl.setParkedSidecarsBySequence(disabled);
+    const QImage nestedDisabled = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    const int graded = differingPixels(gradedC, cleanIn);
+    const bool gradeOk = sameImage(nestedIn, gradedC);
+    const bool outsideOk = sameImage(nestedOut, cleanOut);
+    const bool disabledOk = sameImage(nestedDisabled, cleanIn);
+    std::fprintf(stderr, "connected-clip G45 active C %d, toP %d, parked[C].adjustments=%lld ok=%d | C clean %s, "
+                 "C graded %s (differ in %d px) | P nested @0.5s %s == C graded %d | P nested @1.5s %s == "
+                 "C clean @1.5s %s %d | P nested, layer disabled %s == C clean %d\n",
+                 activeC, toP, static_cast<long long>(parked.size()), parkedOk,
+                 qPrintable(imageSha(cleanIn)), qPrintable(imageSha(gradedC)), graded,
+                 qPrintable(imageSha(nestedIn)), gradeOk, qPrintable(imageSha(nestedOut)),
+                 qPrintable(imageSha(cleanOut)), outsideOk, qPrintable(imageSha(nestedDisabled)),
+                 disabledOk);
+    // (d) C's V1 scaled to 0.5 (transparent around it), referenced by Q (V1 only) and by R (V1 the
+    // reference over a full-frame V2 background): the nested grade keeps C's alpha byte-exact and
+    // changes no R pixel outside C's coverage.
+    ClipInfo small = v1;
+    small.videoScale = 0.5;
+    TimelineSequence child;
+    child.id = QStringLiteral("seq-c");
+    child.name = QStringLiteral("C");
+    child.videoTracks = {{small}};
+    child.audioTracks = {{}};
+    ClipInfo ref = clipFor("g45-ref", child.duration());
+    ref.sequenceRefId = child.id;
+    ref.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+    ClipInfo bg = clipFor("g45-bg", 2.0);
+    bg.filePath = videoPath;
+    TimelineSequence q;
+    q.id = QStringLiteral("seq-q");
+    q.name = QStringLiteral("Q");
+    q.videoTracks = {{ref}};
+    q.audioTracks = {{}};
+    TimelineSequence r = q;
+    r.id = QStringLiteral("seq-r");
+    r.name = QStringLiteral("R");
+    r.videoTracks = {{ref}, {bg}};
+    tl.setParkedSidecarsBySequence({});
+    tl.setSequences({q, r, child}, child.id);
+    const QImage smallClean = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setAdjustmentLayers({layer});
+    const QImage smallGradedC = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toQ = tl.setActiveSequence(q.id);
+    const QImage qGraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toR = tl.setActiveSequence(r.id);
+    const QImage rGraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    QHash<QString, Timeline::SequenceSidecars> off = tl.parkedSidecarsBySequence();
+    const bool parked2 = off.value(child.id).adjustments.size() == 1;
+    if (!off[child.id].adjustments.isEmpty())
+        off[child.id].adjustments.first().gradingEnabled = false;
+    tl.setParkedSidecarsBySequence(off);
+    const QImage rUngraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    int transparent = 0, alphaMismatch = -1, outsideChanged = -1, insideChanged = -1, colorChanged = -1;
+    if (!smallClean.isNull() && !qGraded.isNull() && !rGraded.isNull() && !rUngraded.isNull()
+        && smallClean.size() == outSize && qGraded.size() == outSize && rGraded.size() == outSize
+        && rUngraded.size() == outSize) {
+        const QImage a = smallClean.convertToFormat(QImage::Format_ARGB32);
+        const QImage gq = qGraded.convertToFormat(QImage::Format_ARGB32);
+        const QImage gr = rGraded.convertToFormat(QImage::Format_ARGB32);
+        const QImage ur = rUngraded.convertToFormat(QImage::Format_ARGB32);
+        alphaMismatch = outsideChanged = insideChanged = colorChanged = 0;
+        for (int y = 0; y < outSize.height(); ++y)
+            for (int x = 0; x < outSize.width(); ++x) {
+                const QRgb clean = a.pixel(x, y);
+                const bool covered = qAlpha(clean) > 0;
+                transparent += covered ? 0 : 1;
+                alphaMismatch += qAlpha(gq.pixel(x, y)) != qAlpha(clean) ? 1 : 0;
+                colorChanged += qAlpha(clean) == 255 && gq.pixel(x, y) != clean ? 1 : 0;
+                const bool changed = gr.pixel(x, y) != ur.pixel(x, y);
+                (covered ? insideChanged : outsideChanged) += changed ? 1 : 0;
+            }
+    }
+    const bool smallGradedOk = differingPixels(smallGradedC, smallClean) > 0;
+    const bool alphaOk = toQ && toR && parked2 && smallGradedOk && transparent > 0 && alphaMismatch == 0
+        && colorChanged > 0 && insideChanged > 0 && outsideChanged == 0;
+    std::fprintf(stderr, "connected-clip G45 (d) toQ %d toR %d parked %d C scaled graded active differs %d | "
+                 "transparent px %d, Q nested alpha mismatches %d (expect 0), Q opaque px graded %d | R vs R "
+                 "with layer disabled: changed inside C %d, outside C %d (expect 0) | ok=%d\n",
+                 toQ, toR, parked2, smallGradedOk, transparent, alphaMismatch, colorChanged, insideChanged,
+                 outsideChanged, alphaOk);
+    tally.gate(45, activeC && toP && parkedOk && graded > 0 && gradeOk && outsideOk && disabledOk && alphaOk,
+               "a nested sequence's parked adjustment layer did not grade it in the parent's render (or "
+               "graded outside its local range, or graded while disabled, or flattened the child's alpha "
+               "over the parent's background)");
+}
+
 static void carriersByUidGate(selftest::GateTally &tally, Timeline *mainTimeline)
 {
     // (a) X (connected, roto + parent -> Y) overtakes Y (unconnected, roto).
@@ -6458,6 +6600,7 @@ int runConnectedClipSelftest()
         tally.gate(42, false, "MainWindow has no mainTimeline");
         tally.gate(43, false, "MainWindow has no mainTimeline");
         tally.gate(44, false, "MainWindow has no mainTimeline");
+        tally.gate(45, false, "MainWindow has no mainTimeline");
     } else {
         SequenceSidecarView view;
         view.liveRemap = &window.m_timeRemapClipEntries;
@@ -6473,6 +6616,8 @@ int runConnectedClipSelftest()
         nestedRotoGate(tally, *mainTimeline, view);
         nestedMatteParentGate(tally, *mainTimeline, view);
         nestedFileBackedGate(tally, *mainTimeline, view);
+        // G45 (US-2110 / US-2112): a nested sequence's parked adjustment layers.
+        nestedAdjustmentGate(tally, *mainTimeline, view);
     }
 
     return tally.finish("connected-clip");
