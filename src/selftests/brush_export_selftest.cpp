@@ -25,6 +25,7 @@
 #include <QDir>
 #include <QElapsedTimer>
 #include <QFont>
+#include <QFontDatabase>
 #include <QImage>
 #include <QJsonObject>
 #include <QSettings>
@@ -42,6 +43,18 @@
 #include <memory>
 
 namespace {
+
+// True when at least one smoothly scalable font family resolves. The offscreen
+// platform has none (QT_QPA_FONTDIR unset), so text glyphs are not drawn there.
+bool hasScalableFontFamily()
+{
+    const QStringList families = QFontDatabase::families();
+    for (const QString &family : families) {
+        if (QFontDatabase::isSmoothlyScalable(family))
+            return true;
+    }
+    return false;
+}
 
 constexpr int kW = 320;
 constexpr int kH = 180;
@@ -415,8 +428,11 @@ int runBrushExportSelftest()
             frameAt(withoutTl.get(), t), QRect(kW / 2, 0, kW - kW / 2, kH));
         std::cerr << "brush-export G4 leftHalfDiff=" << leftHalf << " rightHalfDiff=" << rightHalf
                   << " rightHalfWithoutV2Brush=" << rightWithoutV2Brush << '\n';
-        tally.gate(4, leftHalf > 100 && rightHalf > 100 && rightWithoutV2Brush == 0,
-                   "the brush of one of two clips on different tracks is missing");
+        if (!hasScalableFontFamily())
+            tally.skip(4, "no scalable font family (the text brush is not drawn)");
+        else
+            tally.gate(4, leftHalf > 100 && rightHalf > 100 && rightWithoutV2Brush == 0,
+                       "the brush of one of two clips on different tracks is missing");
     }
 
     // G5: dx / scale move the brush with its clip (frame == hand placement of the

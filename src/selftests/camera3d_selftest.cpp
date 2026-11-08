@@ -7,6 +7,7 @@
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "SelftestGl.h"
 #include "SelftestRegistry.h"
 
 #include <QCryptographicHash>
@@ -797,7 +798,7 @@ int runCamera3DSelftest()
 
             if (!scaleOk || !previewOk) {
                 gate(15, false);
-            } else if (!player.isGLAccelerated()) {
+            } else if (!player.isGLAccelerated() || !selftest::glContextUsable(view)) {
                 std::fprintf(stderr, "SKIP G15 (OpenGL preview unavailable in this environment)\n");
                 ++skipped;
             } else {
