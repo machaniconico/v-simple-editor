@@ -2611,7 +2611,82 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         if (!child.isEmpty() && !parent.isEmpty() && child != parent)
             parentEntries.insert(child, parent);
     }
+    // US-2112: a non-active sequence's legacy time-remap entries go onto its store clips that
+    // carry no inline timeRemapCurve (files saved before the curve rode on the clip); an inline
+    // curve wins.
+    if (const auto storeIt = parentEntries.find(timeline_nesting::sequenceStoreParentKey());
+        storeIt != parentEntries.end()) {
+        QJsonObject store = timeline_nesting::decodeSequenceStoreObject(storeIt.value());
+        const QString activeId = store.value(QStringLiteral("activeSequenceId")).toString();
+        QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+        bool storeChanged = false;
+        for (int si = 0; si < sequences.size(); ++si) {
+            QJsonObject sequence = sequences.at(si).toObject();
+            const QString id = sequence.value(QStringLiteral("id")).toString();
+            const auto sidecarIt = data.sequenceSidecars.constFind(id);
+            if (id == activeId || sidecarIt == data.sequenceSidecars.cend()
+                || sidecarIt->timeRemapClipEntries.isEmpty())
+                continue;
+            QHash<QString, timeremap::TimeRemapCurve> curves;
+            for (const TimeRemapClipEntry &entry : sidecarIt->timeRemapClipEntries)
+                if (!entry.clipId.isEmpty())
+                    curves.insert(canonicalKey(entry.clipId), entry.curve);
+            QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+            bool sequenceChanged = false;
+            for (int ti = 0; ti < tracks.size(); ++ti) {
+                QJsonArray clips = tracks.at(ti).toArray();
+                bool trackChanged = false;
+                for (int ci = 0; ci < clips.size(); ++ci) {
+                    QJsonObject clip = clips.at(ci).toObject();
+                    const auto curveIt = curves.constFind(trackMatteClipKey(ti, ci));
+                    if (curveIt == curves.cend() || clip.contains(QStringLiteral("timeRemapCurve")))
+                        continue;
+                    clip[QStringLiteral("timeRemapCurve")] = curveIt->toJson();
+                    clips.replace(ci, clip);
+                    trackChanged = true;
+                }
+                if (trackChanged) {
+                    tracks.replace(ti, clips);
+                    sequenceChanged = true;
+                }
+            }
+            if (sequenceChanged) {
+                sequence[QStringLiteral("videoTracks")] = tracks;
+                sequences.replace(si, sequence);
+                storeChanged = true;
+            }
+        }
+        if (storeChanged) {
+            store[QStringLiteral("sequences")] = sequences;
+            storeIt.value() = timeline_nesting::encodeSequenceStoreObject(store);
+        }
+    }
     tl->setClipParentEntries(parentEntries);
+    // US-2112: the non-active sequences' parked sidecars (MainWindow::applyProjectData's
+    // table), after the store set the active sequence, so a nested sequence draws its own
+    // roto / matte / parent in the file job too.
+    QHash<QString, Timeline::SequenceSidecars> parkedSidecars;
+    for (auto it = data.sequenceSidecars.cbegin(); it != data.sequenceSidecars.cend(); ++it) {
+        if (it.key() == tl->activeSequenceId())
+            continue;
+        Timeline::SequenceSidecars sidecars;
+        for (const RotoClipEntry &entry : it->rotoClipEntries)
+            if (!entry.clipId.isEmpty())
+                sidecars.roto.insert(canonicalKey(entry.clipId), entry);
+        for (const TrackMatteClipEntry &entry : it->trackMatteClipEntries)
+            if (!entry.clipId.isEmpty())
+                sidecars.matte.insert(canonicalKey(entry.clipId),
+                    TimelineTrackMatteEntry{entry.matteType, canonicalKey(entry.matteSourceClipId)});
+        for (const ClipParentEntry &entry : it->clipParentEntries) {
+            const QString child = canonicalKey(entry.clipId);
+            const QString parent = canonicalKey(entry.parentClipId);
+            if (!child.isEmpty() && !parent.isEmpty() && child != parent)
+                sidecars.parent.insert(child, parent);
+        }
+        sidecars.adjustments = it->adjustmentLayers;
+        parkedSidecars.insert(it.key(), sidecars);
+    }
+    tl->setParkedSidecarsBySequence(parkedSidecars);
     // The saved time-remap / freeze-frame curves live only in the sidecar
     // section, so the file-path export has to put them back on the clips.
     ProjectFile::applyTimeRemapEntries(tl, data.timeRemapClipEntries);

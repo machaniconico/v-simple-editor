@@ -1603,6 +1603,10 @@ struct RenderTrackSnapshot {
 
 constexpr int kMaxNestedSequenceDepth = 8;
 
+// US-2112: the non-active sequences' parked roto / matte / parent sidecars, taken once per
+// frame (a COW snapshot, like the matte table); a nested pass draws its own sequence's.
+using ParkedSidecars = QHash<QString, Timeline::SequenceSidecars>;
+
 QImage transparentFrame(QSize size)
 {
     if (size.isEmpty())
@@ -1664,7 +1668,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector3D &projectLightViewPosition,
                              bool applyTimelineGlobals,
                              bool applyProjectLighting,
-                             bool sampleFromLeftBoundary);
+                             bool sampleFromLeftBoundary,
+                             const ParkedSidecars &parkedSidecars,
+                             const Timeline::SequenceSidecars *nestedSidecars);
 
 QString resolveSequenceRefIdForRender(const ClipInfo &clip)
 {
@@ -1730,7 +1736,8 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
                                     QVector<QString> &sequenceStack,
                                     const QVector<Light3DState> &projectLights,
                                     const QVector3D &projectLightViewPosition,
-                                    bool sampleFromLeftBoundary)
+                                    bool sampleFromLeftBoundary,
+                                    const ParkedSidecars &parkedSidecars)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
@@ -1751,6 +1758,7 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
     sequenceStack.append(refId);
     const qint64 childUsec = qMax<qint64>(
         0, qRound64(qMax(0.0, sourceSec) * 1'000'000.0));
+    const Timeline::SequenceSidecars nestedSidecars = parkedSidecars.value(refId);
     const QImage rendered = renderFrameFromTracks(
         timeline,
         snapshotsFromSequence(*sequence),
@@ -1766,7 +1774,9 @@ QImage renderSequenceReferenceFrame(const Timeline *timeline,
         // The nested result is lit once as the sequence-reference layer in
         // the parent stack. Applying it in both stacks would double-light it.
         /*applyProjectLighting=*/false,
-        sampleFromLeftBoundary);
+        sampleFromLeftBoundary,
+        parkedSidecars,
+        &nestedSidecars);
     sequenceStack.removeLast();
 
     return rendered.isNull() ? transparentFrame(outSize) : rendered;
@@ -1782,7 +1792,8 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              QVector<QString> &sequenceStack,
                              const QVector<Light3DState> &projectLights,
                              const QVector3D &projectLightViewPosition,
-                             bool sampleFromLeftBoundary)
+                             bool sampleFromLeftBoundary,
+                             const ParkedSidecars &parkedSidecars)
 {
     if (!clip.shapes.isEmpty())
         return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
@@ -1802,7 +1813,7 @@ QImage renderClipSourceFrame(const Timeline *timeline,
         return renderSequenceReferenceFrame(
             timeline, clip, sourceSec, outSize, sequenceDepth, sequenceSnapshot,
             sequenceStack, projectLights, projectLightViewPosition,
-            resolvedSampleFromLeft);
+            resolvedSampleFromLeft, parkedSidecars);
     }
     // A still has one decoded frame, not footage handles with later PTS.
     // Transition-bearing stills must hold that frame throughout the borrowed
@@ -2087,6 +2098,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
                              const QVector<Light3DState> &projectLights,
                              const QVector3D &projectLightViewPosition,
                              bool sampleFromLeftBoundary,
+                             const ParkedSidecars &parkedSidecars,
                              bool promoteMaskTo16,
                              bool stopAfterBrush = false)
 {
@@ -2097,7 +2109,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
         renderClipSourceFrame(
             timeline, clip, sourceSec, localSec, outSize, sequenceDepth,
             sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition, sampleFromLeftBoundary),
+            projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars),
         sourceSec, localSec);
     if (roto.isNull())
         return QImage();
@@ -2117,7 +2129,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
                     timeline, clip, sampleSourceSec, sampleLocalSec,
                     outSize, sequenceDepth,
                     sequenceSnapshot, sequenceStack, projectLights,
-                    projectLightViewPosition, sampleFromLeftBoundary);
+                    projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars);
                 if (sampleRaw.isNull())
                     return QImage();
                 // US-2010: each past sample carries the brush at its own local
@@ -2397,7 +2409,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                              const QVector3D &projectLightViewPosition,
                              bool applyTimelineGlobals,
                              bool applyProjectLighting,
-                             bool sampleFromLeftBoundary)
+                             bool sampleFromLeftBoundary,
+                             const ParkedSidecars &parkedSidecars,
+                             const Timeline::SequenceSidecars *nestedSidecars)
 {
     if (outSize.isEmpty())
         return QImage();
@@ -2450,9 +2464,11 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                                    /*countDisabled=*/true);
     };
     // US-908: roto stage (applyRotoForRender, inside renderClipLayerSource).
-    // Echo samples and nested-sequence layers get none, as in the preview.
+    // Echo samples get none, as in the preview. US-2112: a nested pass takes its
+    // sequence's parked roto (sequence-local "t:c" ids).
     const QHash<QString, RotoClipEntry> rotoEntries =
         (sequenceDepth == 0 && timeline) ? timeline->rotoEntries()
+        : nestedSidecars                 ? nestedSidecars->roto
                                          : QHash<QString, RotoClipEntry>();
     // US-1707: every top-level clip layer source of this composition.
     auto layerSource = [&](int t, int clipIdx, const ClipInfo &c,
@@ -2461,7 +2477,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         return renderClipLayerSource(
             timeline, rotoEntries, t, clipIdx, c, sourceSec, localSec, outSize,
             sequenceDepth, sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition, sampleFromLeftBoundary, promoteMaskTo16);
+            projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars,
+            promoteMaskTo16);
     };
 
     // The preview applies transitions to its primary playback entry only,
@@ -2835,13 +2852,19 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayers.append(renderLayer);
     }
 
-    if (applyTimelineGlobals && veditor::parentingEnabledFromEnv()) {
-        if (const QHash<QString, QString> parentEntries =
-                clipParentEntriesForTimeline(timeline);
+    // US-2112: the root pass reads the Timeline's tables, a nested pass its sequence's
+    // parked ones, keyed by the sequence-local "t:c" id of this pass's layers.
+    const auto localClipId = [&](int i) {
+        return renderClipId(renderLayers[i].trackIndex, renderLayers[i].clipIndex);
+    };
+    if (veditor::parentingEnabledFromEnv()) {
+        if (const QHash<QString, QString> parentEntries = applyTimelineGlobals
+                ? clipParentEntriesForTimeline(timeline)
+                : nestedSidecars ? nestedSidecars->parent : QHash<QString, QString>();
             !parentEntries.isEmpty()) {
             QHash<QString, int> indexByClipId;
             for (int i = 0; i < renderLayers.size(); ++i)
-                indexByClipId.insert(renderLayers[i].clipId, i);
+                indexByClipId.insert(localClipId(i), i);
 
             QVector<clipgeom::ClipTransform> rawTransforms;
             QVector<clipgeom::ClipTransform> effectiveTransforms(renderLayers.size());
@@ -2865,7 +2888,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
 
                     stack.append(idx);
                     clipgeom::ClipTransform effective = rawTransforms[idx];
-                    const auto it = parentEntries.constFind(renderLayers[idx].clipId);
+                    const auto it = parentEntries.constFind(localClipId(idx));
                     if (it != parentEntries.cend() && !it.value().isEmpty()) {
                         const int parentIdx = indexByClipId.value(it.value(), -1);
                         if (parentIdx <= 0 || parentIdx == idx) {
@@ -2934,16 +2957,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     // RM-3: bind the carrier snapshot to a LOCAL value (Timeline::
     // trackMatteEntries() now returns by value) so this worker thread
     // never aliases a hash the GUI thread may be reassigning.
-    if (applyTimelineGlobals) {
-        if (const QHash<QString, TimelineTrackMatteEntry> trackMatteEntries =
-                trackMatteClipEntriesForTimeline(timeline);
+    {
+        if (const QHash<QString, TimelineTrackMatteEntry> trackMatteEntries = applyTimelineGlobals
+                ? trackMatteClipEntriesForTimeline(timeline)
+                : nestedSidecars ? nestedSidecars->matte : QHash<QString, TimelineTrackMatteEntry>();
             !trackMatteEntries.isEmpty()) {
             QHash<QString, int> indexByClipId;
             for (int i = 0; i < renderLayers.size(); ++i)
-                indexByClipId.insert(renderLayers[i].clipId, i);
+                indexByClipId.insert(localClipId(i), i);
 
             for (int i = 0; i < renderLayers.size(); ++i) {
-                const auto it = trackMatteEntries.constFind(renderLayers[i].clipId);
+                const auto it = trackMatteEntries.constFind(localClipId(i));
                 if (it == trackMatteEntries.cend())
                     continue;
                 const int srcIdx =
@@ -3396,7 +3420,8 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
     const Timeline *timeline,
     qint64 usec,
     QSize outSize,
-    const QVector<TimelineSequence> &sequenceSnapshot)
+    const QVector<TimelineSequence> &sequenceSnapshot,
+    const ParkedSidecars &parkedSidecars)
 {
     if (!timeline)
         return QImage();
@@ -3421,7 +3446,9 @@ QImage renderFrameAtSingleWithSequenceSnapshot(
                                  timeline->projectLightViewPosition(),
                                  /*applyTimelineGlobals=*/true,
                                  /*applyProjectLighting=*/true,
-                                 /*sampleFromLeftBoundary=*/false);
+                                 /*sampleFromLeftBoundary=*/false,
+                                 parkedSidecars,
+                                 /*nestedSidecars=*/nullptr);
 }
 
 } // namespace
@@ -3471,7 +3498,8 @@ static QImage renderClipSourceAtStage(const Timeline *timeline, int trackIdx, in
         timeline, timeline->rotoEntries(), trackIdx, clipIdx, c, sourceSec,
         localSec, outSize, /*sequenceDepth=*/0, sequenceSnapshot, sequenceStack,
         projectLights, timeline->projectLightViewPosition(),
-        /*sampleFromLeftBoundary=*/false, /*promoteMaskTo16=*/true, stopAfterBrush);
+        /*sampleFromLeftBoundary=*/false, timeline->parkedSidecarsBySequence(),
+        /*promoteMaskTo16=*/true, stopAfterBrush);
 }
 
 QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
@@ -3557,7 +3585,7 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
         outSize, /*sequenceDepth=*/0,
         sequenceSnapshot, sequenceStack, projectLights,
         timeline->projectLightViewPosition(),
-        /*sampleFromLeftBoundary=*/false);
+        /*sampleFromLeftBoundary=*/false, timeline->parkedSidecarsBySequence());
     if (source.isNull())
         return QImage();
     return prepareClipSourceForEcho(source, clip, clipLocalSeconds);
@@ -3601,7 +3629,8 @@ QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize 
         return QImage();
     const QVector<TimelineSequence> sequenceSnapshot = timeline->sequences();
     return renderFrameAtSingleWithSequenceSnapshot(timeline, usec, outSize,
-                                                   sequenceSnapshot);
+                                                   sequenceSnapshot,
+                                                   timeline->parkedSidecarsBySequence());
 }
 
 QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize)
@@ -3625,6 +3654,8 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
 
     const QVector<TimelineSequence> sequenceSnapshot =
         timeline ? timeline->sequences() : QVector<TimelineSequence>();
+    const ParkedSidecars parkedSidecars =
+        timeline ? timeline->parkedSidecarsBySequence() : ParkedSidecars();
     const double windowUs = (shutterAngle / 360.0) * frameDurationUs;
 
     QVector<QImage> samples;
@@ -3635,13 +3666,13 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
         const qint64 sampleUsec =
             usec + qRound64(centered * windowUs / static_cast<double>(n));
         samples.append(renderFrameAtSingleWithSequenceSnapshot(
-            timeline, sampleUsec, outSize, sequenceSnapshot));
+            timeline, sampleUsec, outSize, sequenceSnapshot, parkedSidecars));
     }
 
     const QImage averaged = motionblur::averagePremultiplied(samples);
     return averaged.isNull()
         ? renderFrameAtSingleWithSequenceSnapshot(timeline, usec, outSize,
-                                                  sequenceSnapshot)
+                                                  sequenceSnapshot, parkedSidecars)
         : averaged;
 }
 
