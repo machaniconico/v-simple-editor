@@ -438,6 +438,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlImport.cpp
     src/FcpxmlImport.h
     src/FcpxmlImport.cpp
+    src/UncProbe.cpp
     src/selftests/export_pro_selftest.cpp
     src/selftests/img_sequence_selftest.cpp
     src/selftests/exr_writer_selftest.cpp

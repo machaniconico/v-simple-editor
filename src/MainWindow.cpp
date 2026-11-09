@@ -177,6 +177,7 @@ double exporter_loudnessGainDb();
 #include "OtioExport.h"
 #include "EdlImport.h"
 #include "FcpxmlImport.h"
+#include "UncProbe.h"
 #if __has_include("SmartEditDialog.h")
   #include "SmartEditDialog.h"
   #define HAVE_SMARTEDIT 1
@@ -470,6 +471,8 @@ static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const 
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), result.error);
         return;
     }
+    const bool probedUnc = !result.offlineSources.isEmpty();
+    const int relinked = probedUnc ? uncprobe::relinkOfflineSources(result) : 0;
     QStringList warnings;
     if (!fcpx::xml::applyImport(*timeline, result, &warnings)) {
         QMessageBox::warning(parent, QStringLiteral("FCPXML 読み込み"), QStringLiteral("シーケンスを作成できません。"));
@@ -478,7 +481,8 @@ static void importFcpxmlIntoTimeline(QWidget *parent, Timeline *timeline, const 
     QMessageBox report(QMessageBox::Information, QStringLiteral("FCPXML 読み込み"),
         QStringLiteral("新規シーケンスに読み込みました。\n解決済み: %1 ファイル\nオフライン: %2 ファイル\n警告: %3 件\nフレームレート: %4 fps（プロジェクト設定）")
             .arg(result.resolvedFiles).arg(result.unresolvedFiles).arg(warnings.size())
-            .arg(timeline->projectFrameRate()), QMessageBox::Ok, parent);
+            .arg(timeline->projectFrameRate())
+            + (probedUnc ? QStringLiteral("\n再リンク: %1 件").arg(relinked) : QString()), QMessageBox::Ok, parent);
     if (!warnings.isEmpty()) report.setDetailedText(warnings.join(QLatin1Char('\n')));
     report.exec();
 }

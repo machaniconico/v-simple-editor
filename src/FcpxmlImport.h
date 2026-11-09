@@ -14,7 +14,8 @@ struct ImportResult {
     // media id; ref-clips become ClipInfo::sequenceRefId to it.
     QVector<TimelineSequence> sequences;
     QStringList warnings;
-    // Offline sentinel path -> original UNC / file://host path (never probed).
+    // Offline sentinel path -> original UNC / file://host path (never probed by the importer;
+    // uncprobe::relinkOfflineSources resolves it afterwards).
     QHash<QString, QString> offlineSources;
     QString error;
     int resolvedFiles = 0;
