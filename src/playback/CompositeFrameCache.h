@@ -56,10 +56,16 @@ public:
     // Returns true on hit and fills outImage; promotes entry to most-recently-used.
     // Returns false on miss.
     bool tryGet(const CompositeFrameKey& key, QImage& outImage);
+    // US-2203: the same, also filling *v1StabBaked (when non-null) with the flag
+    // the image was put with.
+    bool tryGet(const CompositeFrameKey& key, QImage& outImage, bool *v1StabBaked);
 
     // Inserts image into cache. Evicts LRU entries until budget is satisfied.
     // If a single image exceeds the budget it is silently dropped (graceful).
     void put(const CompositeFrameKey& key, const QImage& image);
+    // US-2203: the same, storing with the image whether V1's stabilizer is
+    // already baked into it (the two-argument put stores false).
+    void put(const CompositeFrameKey& key, const QImage& image, bool v1StabBaked);
 
     // Removes all entries whose timelineRevision differs from currentRevision.
     void invalidateRevision(quint64 currentRevision);
@@ -78,7 +84,11 @@ private:
 
     // LRU order: front = least-recently-used, back = most-recently-used.
     QList<CompositeFrameKey>            m_lruOrder;
-    QHash<CompositeFrameKey, QImage>    m_cache;
+    struct Entry {
+        QImage image;
+        bool v1StabBaked;
+    };
+    QHash<CompositeFrameKey, Entry>     m_cache;
 
     // Stats
     qint64 m_hits;

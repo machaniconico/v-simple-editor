@@ -116,6 +116,10 @@ QImage prepareEchoClipForComposite(
     double sourceSeconds,
     const std::function<QImage(double, double)> &frameProvider,
     const QVector<Mask> &masks);
+// US-2203: V1's layer stabilized for a CPU composite with other layers: `entry`'s
+// stabilizer keys at `sourceUs` (source time), dx / dy in pixels of
+// `entry.stabilizerSourceSize`, through stabwarp::applyForExport.
+QImage warpV1LayerForPreview(const QImage &v1, const PlaybackEntry &entry, qint64 sourceUs);
 }
 
 extern "C" {
@@ -473,8 +477,10 @@ private:
     // `overlaysAlreadyBaked` is used only by the nested-sequence SSOT path:
     // tlrender::renderFrameAt has already applied the parent timeline's text,
     // so composing m_textOverlays again would darken/double every caption.
+    // US-2203: `v1StabBaked`: V1's stabilizer is already in `image` (a CPU
+    // composite with other layers, or renderFrameAt), so the GL warps nothing.
     void displayFrame(const QImage &image, bool overlaysAlreadyBaked,
-                      qint64 displayTimelineUsec);
+                      qint64 displayTimelineUsec, bool v1StabBaked);
     void displaySeekFrameConformed(const QImage &v1Image,
                                    qint64 displayTimelineUsec);
 
@@ -620,6 +626,9 @@ public:
                                     const QVector<DecodedLayer> &layers,
                                     const QVector<PlaybackEntry> &seq, int activeEntry,
                                     qint64 tlUs);
+    // US-2203 G10 (f) drives the nested-sequence SSOT present
+    // (displayNestedSequenceFrameAt) on its own player.
+    friend int runStabilizerExportSelftest();
 
 private:
     void recordParentAdmissionForTest(const char *path,
@@ -820,6 +829,10 @@ private:
     // text. A paused overlay edit must re-render that timeline frame instead
     // of treating this cache as a raw image.
     bool m_lastSourceFrameHasBakedText = false;
+    // US-2203: whether V1's stabilizer is baked into m_lastSourceFrame. displayFrame
+    // sets it and the raw V1 frame writers (VideoPlayer.cpp ~5530, ~5651) clear it
+    // to false, so a re-present of a baked frame does not warp V1 again on the GL.
+    bool m_lastSourceFrameV1StabBaked = false;
     // Phase 1d compositor base: a never-composed copy of the latest V1
     // frame. m_lastSourceFrame may end up holding the post-composite image
     // through displayFrame's caching path; the compositor reads this
@@ -938,7 +951,7 @@ private:
     // ADAPTIVE-1: 合成済みプレビューフレームを現在の (timelineRevision, playhead,
     // size, tier) キーでキャッシュへ put する純ヘルパー。displayFrame は呼ばない。
     // m_adaptivePreviewEnabled=false 時は no-op。
-    void cachePreviewComposite(const QImage &composed);
+    void cachePreviewComposite(const QImage &composed, bool v1StabBaked);
 
     // ---- STAGE3-GPU: マルチトラックプレビュー GPU 合成 (既定 OFF) -------------
     // 既定 (VEDITOR_GPU_COMPOSITE 未設定 or "1"以外) では m_gpuCompositeEnabled=false
@@ -1003,8 +1016,16 @@ private:
     QImage finalizeDisplayLocalCopy(QImage display) const;
     QImage bakeTextOverlaysForDisplay(const QImage &source, qint64 timelineUsec) const;
     QImage finishSpecialComposite(const QImage &frame, qint64 timelineUsec) const;
-    void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special);
-    void pushV1StabilizerToGl(const PlaybackEntry &entry, bool special);
+    void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special,
+                        bool v1StabBaked);
+    void pushV1StabilizerToGl(const PlaybackEntry &entry, bool special, bool v1StabBaked);
+    // US-2203: the source time the active V1 entry's stabilizer is sampled at.
+    qint64 v1StabilizerSourceUs(const PlaybackEntry &entry) const;
+    // US-2203: when `layers` holds a layer besides V1 (sequenceIdx != m_activeEntry),
+    // stabilizes V1's layer (sequenceIdx == m_activeEntry) in place and returns
+    // true; the canvas is never warped. V1 alone (or no active entry) is left to
+    // the GL and returns false.
+    bool warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const;
     void setCompositeBakedModeForDisplay(bool baked);
     void endSpecialDisplayLatch();
     void beginStillCompareGlBypass();
