@@ -369,6 +369,10 @@ public:
     static void applyTimeRemapEntries(Timeline *timeline,
                                       const QVector<TimeRemapClipEntry> &entries);
 
+    // US-2207: puts a non-active sequence's legacy time-remap entries (sequenceSidecars) onto
+    // its sequence-store clips that have no inline timeRemapCurve; load / fromJsonString call it.
+    static void applyLegacyTimeRemapToStores(ProjectData &data);
+
     static QString toJsonString(const ProjectData &data);
     static bool fromJsonString(const QString &json, ProjectData &data, QString *errorMessage = nullptr);
     // US-2215: the one JSON entry point of load / fromJsonString. Number literals

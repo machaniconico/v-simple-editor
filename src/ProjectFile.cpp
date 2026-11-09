@@ -1073,6 +1073,62 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     return file.commit();
 }
 
+// US-2207: a non-active sequence's legacy time-remap entries go onto its store clips that
+// carry no inline timeRemapCurve (files saved before the curve rode on the clip); an inline
+// curve wins. Called at the end of load / fromJsonString so every consumer sees the same data.
+void ProjectFile::applyLegacyTimeRemapToStores(ProjectData &data)
+{
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (ClipParentEntry &entry : data.clipParentEntries) {
+        if (entry.clipId != storeKey)
+            continue;
+        QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+        const QString activeId = store.value(QStringLiteral("activeSequenceId")).toString();
+        QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+        bool storeChanged = false;
+        for (int si = 0; si < sequences.size(); ++si) {
+            QJsonObject sequence = sequences.at(si).toObject();
+            const QString id = sequence.value(QStringLiteral("id")).toString();
+            const auto sidecarIt = data.sequenceSidecars.constFind(id);
+            if (id == activeId || sidecarIt == data.sequenceSidecars.cend()
+                || sidecarIt->timeRemapClipEntries.isEmpty())
+                continue;
+            QHash<QString, timeremap::TimeRemapCurve> curves;
+            for (const TimeRemapClipEntry &remap : sidecarIt->timeRemapClipEntries)
+                if (!remap.clipId.isEmpty())
+                    curves.insert(canonicalClipKey(remap.clipId), remap.curve);
+            QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+            bool sequenceChanged = false;
+            for (int ti = 0; ti < tracks.size(); ++ti) {
+                QJsonArray clips = tracks.at(ti).toArray();
+                bool trackChanged = false;
+                for (int ci = 0; ci < clips.size(); ++ci) {
+                    QJsonObject clip = clips.at(ci).toObject();
+                    const auto curveIt = curves.constFind(trackMatteClipKey(ti, ci));
+                    if (curveIt == curves.cend() || clip.contains(QStringLiteral("timeRemapCurve")))
+                        continue;
+                    clip[QStringLiteral("timeRemapCurve")] = curveIt->toJson();
+                    clips.replace(ci, clip);
+                    trackChanged = true;
+                }
+                if (trackChanged) {
+                    tracks.replace(ti, clips);
+                    sequenceChanged = true;
+                }
+            }
+            if (sequenceChanged) {
+                sequence[QStringLiteral("videoTracks")] = tracks;
+                sequences.replace(si, sequence);
+                storeChanged = true;
+            }
+        }
+        if (storeChanged) {
+            store[QStringLiteral("sequences")] = sequences;
+            entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+        }
+    }
+}
+
 void ProjectFile::applyTimeRemapEntries(Timeline *timeline,
                                         const QVector<TimeRemapClipEntry> &entries)
 {
@@ -1464,6 +1520,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data, QString *erro
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
+    applyLegacyTimeRemapToStores(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -2036,6 +2093,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data, QString
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
+    applyLegacyTimeRemapToStores(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
