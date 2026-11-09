@@ -20,9 +20,12 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QSignalSpy>
 #include <QStringList>
 #include <QTemporaryDir>
+
+#include <cfloat>
 
 #include <algorithm>
 #include <cmath>
@@ -165,7 +168,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 11; ++g)
+        for (int g = 1; g <= 13; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -851,6 +854,98 @@ int runProjectPersistSelftest()
                    d11);
     }
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+    // ---- G12 / G13 (US-2215): out-of-range number literals and positioned parse errors ----
+    {
+        const QByteArray overflowing = QByteArrayLiteral(
+            "{\"version\":2,\"config\":{\"name\":\"1e400\",\"width\":-1e400,\"height\":1080,\"fps\":30},"
+            "\"videoTracks\":[[{\"filePath\":\"a.mp4\",\"displayName\":\"1e400\",\"duration\":2,\"speed\":1e400},"
+            "{\"filePath\":\"b.mp4\",\"displayName\":\"b\\\"1e400\",\"duration\":2,\"volume\":1e-400}]],"
+            "\"audioTracks\":[]}");
+        // Without the clamp QJsonDocument::fromJson refuses the whole document (error 7).
+        QJsonParseError rawError;
+        QJsonDocument::fromJson(overflowing, &rawError);
+
+        ProjectData viaString;
+        QString errString;
+        const bool stringOk = ProjectFile::fromJsonString(QString::fromUtf8(overflowing), viaString, &errString);
+        auto clipAt = [](const ProjectData &pd, int clip) -> ClipInfo {
+            return pd.videoTracks.size() > 0 && pd.videoTracks[0].size() > clip ? pd.videoTracks[0][clip] : ClipInfo();
+        };
+        const double speed = clipAt(viaString, 0).speed;
+        const double volume = clipAt(viaString, 1).volume;
+        const QString nameA = clipAt(viaString, 0).displayName;
+        const QString nameB = clipAt(viaString, 1).displayName;
+
+        QJsonDocument parsed;
+        int clamped = -1;
+        QString parseErr;
+        const bool parsedOk = ProjectFile::parseProjectJson(overflowing, parsed, &parseErr, &clamped);
+
+        const QString pathBig = tmp("overflow.veditor");
+        QFile bigFile(pathBig);
+        const bool bigWritten = bigFile.open(QIODevice::WriteOnly) && bigFile.write(overflowing) == overflowing.size();
+        bigFile.close();
+        ProjectData viaFile;
+        QString errFile;
+        const bool fileOk = ProjectFile::load(pathBig, viaFile, &errFile);
+
+        // Negative controls: in-range literals are not rewritten, strings are never touched.
+        const QByteArray inRange = QByteArrayLiteral(
+            "{\"a\":[1e308,5e-324,-0,0e-400,2.5e-308,1.2345678901234567890123456,\"1e400\",\"q\\\"1e400\"]}");
+        QJsonDocument inDoc;
+        int inClamped = -1;
+        QString inErr;
+        const bool inOk = ProjectFile::parseProjectJson(inRange, inDoc, &inErr, &inClamped);
+        const QJsonArray inArr = inDoc.object().value(QStringLiteral("a")).toArray();
+
+        // Tokens that are not JSON numbers must stay untouched so Qt reports the syntax error.
+        bool badGrammarRejected = true;
+        std::string badDetail;
+        for (const char *bad : {"{\"a\":01e400}", "{\"a\":1.e400}", "{\"a\":-.1e400}"}) {
+            QJsonDocument badDoc;
+            int badClamped = -1;
+            QString badErr;
+            const bool badOk = ProjectFile::parseProjectJson(QByteArray(bad), badDoc, &badErr, &badClamped);
+            badGrammarRejected = badGrammarRejected && !badOk && badErr.contains(QLatin1String("byte")) && badClamped == 0;
+            badDetail += std::string(" ") + bad + "->" + b(badOk) + "/" + std::to_string(badClamped);
+        }
+        const double configWidth = parsed.object().value(QStringLiteral("config")).toObject().value(QStringLiteral("width")).toDouble();
+
+        std::string d = "rawFromJsonError=" + std::to_string(int(rawError.error)) + " stringOk=" + b(stringOk)
+            + " err='" + errString.toStdString() + "' speed=" + std::to_string(speed)
+            + " volume=" + std::to_string(volume) + " nameA=" + nameA.toStdString()
+            + " nameB=" + nameB.toStdString() + " parsedOk=" + b(parsedOk) + " clamped=" + std::to_string(clamped)
+            + " fileWritten=" + b(bigWritten) + " fileOk=" + b(fileOk) + " fileSpeed=" + std::to_string(clipAt(viaFile, 0).speed)
+            + " fileVolume=" + std::to_string(clipAt(viaFile, 1).volume) + " configWidth=" + std::to_string(configWidth) + " | bad-grammar:" + badDetail
+            + " | in-range: ok=" + b(inOk)
+            + " clamped=" + std::to_string(inClamped) + " items=" + std::to_string(inArr.size());
+        const bool inRangeOk = inOk && inClamped == 0 && inArr.size() == 8 && inArr.at(0).toDouble() == 1e308
+            && inArr.at(1).toDouble() > 0.0 && inArr.at(3).toDouble() == 0.0
+            && inArr.at(6).toString() == QLatin1String("1e400") && inArr.at(7).toString() == QLatin1String("q\"1e400");
+        tally.gate(12, rawError.error == QJsonParseError::IllegalNumber && stringOk && speed == 1e7 && volume == 0.0
+                           && nameA == QLatin1String("1e400") && nameB == QLatin1String("b\"1e400") && parsedOk
+                           && clamped == 3 && configWidth == -DBL_MAX && badGrammarRejected && bigWritten && fileOk && clipAt(viaFile, 0).speed == 1e7
+                           && clipAt(viaFile, 1).volume == 0.0 && inRangeOk,
+                   d);
+
+        const QString pathCut = tmp("cut.veditor");
+        QFile cutFile(pathCut);
+        const bool cutWritten = cutFile.open(QIODevice::WriteOnly) && cutFile.write("{\"a\":") == 5;
+        cutFile.close();
+        ProjectData cutData;
+        QString cutErr;
+        const bool cutLoaded = ProjectFile::load(pathCut, cutData, &cutErr);
+        // The offset is reported in the original file even after a clamp rewrote an earlier literal.
+        QJsonDocument shiftDoc;
+        QString shiftErr;
+        const bool shiftOk = ProjectFile::parseProjectJson(QByteArrayLiteral("{\"a\":1e400,\"b\":"), shiftDoc, &shiftErr);
+        tally.gate(13, cutWritten && !cutLoaded && cutErr.contains(QLatin1String("byte"))
+                           && cutErr.contains(QLatin1String("byte 5:")) && !shiftOk
+                           && shiftErr.contains(QLatin1String("byte 15:")),
+                   "written=" + b(cutWritten) + " loaded=" + b(cutLoaded) + " errorMessage='" + cutErr.toStdString()
+                       + "' clampedPrefix: ok=" + b(shiftOk) + " err='" + shiftErr.toStdString() + "'");
+    }
 
     tally.gate(7, g7, g7Detail);
     return tally.finish("project-persist");

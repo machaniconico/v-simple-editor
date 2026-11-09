@@ -3,6 +3,7 @@
 #include <QString>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QJsonDocument>
 #include <QImage>
 #include <QMap>
 #include "AdjustmentLayer.h"
@@ -370,6 +371,13 @@ public:
 
     static QString toJsonString(const ProjectData &data);
     static bool fromJsonString(const QString &json, ProjectData &data, QString *errorMessage = nullptr);
+    // US-2215: the one JSON entry point of load / fromJsonString. Number literals
+    // outside double range (which QJsonDocument::fromJson refuses, losing the whole
+    // document) are clamped first: overflow to +-DBL_MAX, underflow to 0; strings are
+    // skipped. clampedCount (optional) receives how many were rewritten. A parse
+    // failure returns false with "JSON parse error at byte N: reason" in err.
+    static bool parseProjectJson(const QByteArray &json, QJsonDocument &doc, QString *err = nullptr,
+                                 int *clampedCount = nullptr);
 
     static const QString fileFilter() { return "V Editor Project (*.veditor);;All Files (*)"; }
 
