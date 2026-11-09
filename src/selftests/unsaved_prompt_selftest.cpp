@@ -13,8 +13,11 @@
 #include "../MultiCam.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../TimelineFrameRenderer.h"
+#include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 
 #include <QApplication>
@@ -26,6 +29,9 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
 #include <QMenu>
@@ -52,6 +58,31 @@ bool touchFile(const QString &path)
 {
     QFile file(path);
     return file.open(QIODevice::WriteOnly) && file.write("media", 5) == 5;
+}
+
+// A 64x64, 1 s solid mpeg4 clip (no alpha) for the G13 matte render comparison.
+bool writeSolidClip(const QString &path, const QColor &color)
+{
+    libavcore::EncodeRequest req;
+    req.width = 64;
+    req.height = 64;
+    req.fps = 12;
+    req.fpsNum = 12;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req))
+        return false;
+    QImage frame(64, 64, QImage::Format_RGB888);
+    frame.fill(color);
+    for (int i = 0; i < 12; ++i)
+        if (!encoder.pushFrame(frame, i))
+            return false;
+    return !encoder.finalize();
 }
 
 ClipInfo makeClip(const QString &path)
@@ -130,7 +161,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 12; ++g)
+        for (int g = 1; g <= 13; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -1162,6 +1193,172 @@ int runUnsavedPromptSelftest()
             d += std::string(" | dragTransform-zeroMove stayedClean=") + b(stayedClean);
         }
         tally.gate(12, ok, d);
+    }
+
+    // ---- G13 (US-2208): opening a file starts from the default track count, so a previous
+    // session's extra tracks are not kept; the file's own tracks, flags and per-track sidecars survive ----
+    {
+        QString whyNot;
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(13, qPrintable(whyNot));
+        } else {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        const QString redPath = tmp("g13-red.mp4");
+        const QString halfPath = tmp("g13-black.mp4");
+        const QString mediaA = tmp("g13-a.mp3");
+        const bool filesOk = touchFile(mediaA) && writeSolidClip(redPath, QColor(200, 0, 0))
+            && writeSolidClip(halfPath, QColor(0, 0, 0));
+        // The probed ClipInfo of a real file, like a clip read back from a project.
+        const auto imageClip = [&](const QString &path) {
+            Timeline prober;
+            prober.addClip(path);
+            return prober.videoClips().isEmpty() ? makeClip(path) : prober.videoClips().first();
+        };
+        ProjectConfig cfg;
+        cfg.name = QStringLiteral("g13");
+        cfg.width = 64;
+        cfg.height = 64;
+        cfg.fps = 24;
+        // Builds a file with `videos` video tracks (one clip each) and one audio track.
+        const auto makeData = [&](int videos, bool flagged, bool matte) {
+            ProjectData data;
+            data.config = cfg;
+            QVector<QVector<ClipInfo>> v;
+            for (int i = 0; i < videos; ++i)
+                {
+                ClipInfo clip = imageClip(i == 2 ? redPath : halfPath);
+                clip.uid = QStringLiteral("g13-v%1").arg(i + 1);
+                if (i == 0)
+                    clip.opacity = 0.0; // the V1 base stays out of the comparison
+                v.append({clip});
+            }
+            data.videoTracks = v;
+            data.audioTracks = QVector<QVector<ClipInfo>>{{makeClip(mediaA)}};
+            if (flagged) {
+                QJsonObject v2;
+                v2.insert(QStringLiteral("locked"), true);
+                v2.insert(QStringLiteral("muted"), false);
+                v2.insert(QStringLiteral("solo"), false);
+                v2.insert(QStringLiteral("hidden"), false);
+                v2.insert(QStringLiteral("name"), QStringLiteral("B"));
+                data.trackFlags = QJsonObject{
+                    {QStringLiteral("video"), QJsonArray{QJsonObject{}, v2}},
+                    {QStringLiteral("audio"), QJsonArray{QJsonObject{}}}};
+                data.videoTracks.trackFlagsSnapshot = data.trackFlags;
+                data.audioTracks.trackFlagsSnapshot = data.trackFlags;
+            }
+            if (matte) {
+                data.trackMatteClipEntries.append(TrackMatteClipEntry{
+                    trackMatteClipKey(2, 0), TrackMatteType::LumaMatte, trackMatteClipKey(1, 0)});
+                // V2 clip matted by V1 (the renderer ignores a V1 source, so this one is a carrier-only check).
+                data.trackMatteClipEntries.append(TrackMatteClipEntry{
+                    trackMatteClipKey(1, 0), TrackMatteType::LumaMatte, trackMatteClipKey(0, 0)});
+            }
+            return data;
+        };
+        const auto grow = [&](MainWindow &w) {
+            w.m_timeline->addVideoTrack();
+            w.m_timeline->addVideoTrack();
+            w.m_timeline->addAudioTrack();
+        };
+        const auto savedFlags = [](const QString &path) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly))
+                return QString();
+            return QString::fromUtf8(QJsonDocument(QJsonDocument::fromJson(file.readAll()).object()
+                .value(QStringLiteral("trackFlags")).toObject()).toJson(QJsonDocument::Compact));
+        };
+        bool okA = false, okB = false, okC = false, okD = false, okE = false;
+        std::string d = "files=" + b(filesOk);
+        {
+            MainWindow w13;
+            Timeline &tl = *w13.m_timeline;
+            Timeline probe;
+            grow(w13);
+            const int v0 = tl.videoTrackCount(), a0 = tl.audioTrackCount();
+            w13.applyLoadedProjectData(makeData(1, false, false), QString());
+            okA = filesOk && v0 == 3 && a0 == 2 && tl.videoTrackCount() == 1 && tl.audioTrackCount() == 1
+                && tl.videoTrackCount() == probe.videoTrackCount() && tl.audioTrackCount() == probe.audioTrackCount()
+                && !tl.undoManager()->canUndo() && !w13.isWindowModified();
+            d += " (a) before v=" + std::to_string(v0) + " a=" + std::to_string(a0) + " after v="
+                + std::to_string(tl.videoTrackCount()) + " a=" + std::to_string(tl.audioTrackCount())
+                + " canUndo=" + b(tl.undoManager()->canUndo()) + " modified=" + b(w13.isWindowModified());
+        }
+        {
+            MainWindow w13;
+            Timeline &tl = *w13.m_timeline;
+            grow(w13);
+            const ProjectData fileB = makeData(2, true, false);
+            w13.applyLoadedProjectData(fileB, QString());
+            const bool shape = tl.videoTrackCount() == 2 && tl.audioTrackCount() == 1;
+            const bool flags = shape && tl.videoTracks()[1]->isLocked() && tl.videoTracks()[1]->customName == QStringLiteral("B")
+                && !tl.videoTracks()[0]->isLocked();
+            okB = flags;
+            d += " | (b) v=" + std::to_string(tl.videoTrackCount()) + " locked=" + b(shape && tl.videoTracks()[1]->isLocked())
+                + " name=" + (shape ? tl.videoTracks()[1]->customName.toStdString() : std::string("?"));
+            // (d) round trip: save, open, the saved track flags equal the original's.
+            const QString origPath = tmp("g13-orig.veditor");
+            const QString savedPath = tmp("g13-roundtrip.veditor");
+            ProjectData reread;
+            const bool wrote = ProjectFile::save(origPath, fileB) && ProjectFile::load(origPath, reread);
+            w13.applyLoadedProjectData(reread, origPath);
+            ProjectData first;
+            w13.populateProjectData(first);
+            const bool saved = ProjectFile::save(savedPath, first);
+            ProjectData second;
+            const bool loaded = saved && ProjectFile::load(savedPath, second);
+            grow(w13);
+            w13.applyLoadedProjectData(second, savedPath);
+            const QString origFlags = savedFlags(origPath);
+            const bool same = !origFlags.isEmpty() && origFlags == savedFlags(savedPath);
+            okD = wrote && saved && loaded && flags && same
+                && tl.videoTrackCount() == 2 && tl.videoTracks()[1]->isLocked()
+                && tl.videoTracks()[1]->customName == QStringLiteral("B");
+            d += " (d) saved=" + b(saved) + " flagsSame=" + b(same)
+                + " reopenedLocked=" + b(tl.videoTrackCount() == 2 && tl.videoTracks()[1]->isLocked());
+        }
+        {
+            // (c) the per-track matte sidecar survives; the result equals a one-track session's.
+            MainWindow grown;
+            MainWindow baseline;
+            grow(grown);
+            grown.m_timeline->addVideoTrack();
+            const ProjectData fileC = makeData(3, false, true);
+            grown.applyLoadedProjectData(fileC, QString());
+            baseline.applyLoadedProjectData(fileC, QString());
+            const auto grownMatte = grown.m_timeline->trackMatteEntries();
+            const auto baseMatte = baseline.m_timeline->trackMatteEntries();
+            const QString key = trackMatteClipKey(2, 0);
+            const QString keyV2 = trackMatteClipKey(1, 0);
+            const bool keptV2 = grownMatte.contains(keyV2) && baseMatte.contains(keyV2)
+                && grownMatte.value(keyV2).matteType == TrackMatteType::LumaMatte
+                && grownMatte.value(keyV2).matteType == baseMatte.value(keyV2).matteType
+                && grownMatte.value(keyV2).matteSourceClipId == trackMatteClipKey(0, 0)
+                && grownMatte.value(keyV2).matteSourceClipId == baseMatte.value(keyV2).matteSourceClipId;
+            const bool kept = keptV2 && grownMatte.contains(key) && baseMatte.contains(key)
+                && grownMatte.value(key).matteType == baseMatte.value(key).matteType
+                && grownMatte.value(key).matteSourceClipId == baseMatte.value(key).matteSourceClipId
+                && grownMatte.size() == baseMatte.size();
+            const QImage gImg = tlrender::renderFrameAt(grown.m_timeline, 0, QSize(64, 64));
+            const QImage bImg = tlrender::renderFrameAt(baseline.m_timeline, 0, QSize(64, 64));
+            MainWindow plain;
+            plain.applyLoadedProjectData(makeData(3, false, false), QString());
+            const QImage pImg = tlrender::renderFrameAt(plain.m_timeline, 0, QSize(64, 64));
+            okC = filesOk && kept && !gImg.isNull() && gImg == bImg && gImg != pImg
+                && grown.m_timeline->videoTrackCount() == 3;
+            d += " | (c) keptEntry=" + b(kept) + " renderSameAsBaseline=" + b(!gImg.isNull() && gImg == bImg)
+                + " matteChangesRender=" + b(gImg != pImg);
+        }
+        {
+            // (e) negative control: growth still works when the file has more tracks than the session.
+            MainWindow w13;
+            const bool grew = w13.m_timeline->videoTrackCount() == 1;
+            w13.applyLoadedProjectData(makeData(3, false, false), QString());
+            okE = filesOk && grew && w13.m_timeline->videoTrackCount() == 3;
+            d += " | (e) before1=" + b(grew) + " after=" + std::to_string(w13.m_timeline->videoTrackCount());
+        }
+        tally.gate(13, okA && okB && okC && okD && okE, d);
+        }
     }
 
     window.setUnsavedChangesPromptForTest({});

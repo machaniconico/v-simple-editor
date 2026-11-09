@@ -9558,6 +9558,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     // US-2108: a debounced undo point of the old project must not land on the new one.
     for (const char *name : kPendingUndoTimerNames)
         if (auto *timer = findChild<QTimer *>(QLatin1String(name))) timer->stop();
+    // US-2208: drop a previous session's extra tracks before any sidecar of the
+    // incoming file reaches the carrier (no undo; restoreFromProject regrows).
+    if (m_timeline) m_timeline->resetTracksToDefault();
     ProjectData data = loadedData;
     QHash<QString, QString> relinkMapping;
     if (m_promptForMissingMedia) {
