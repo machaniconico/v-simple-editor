@@ -10268,8 +10268,11 @@ QJsonObject MainWindow::collectSidecarState()
     syncTimeRemapEntriesToClips(m_timeRemapClipEntries, tracks);
     for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
         timeRemaps.insert(it.key(), it.value().curve.toJson());
+    // The burn-in settings are project state outside the clips: an undo point carries them.
+    const QJsonObject projectOptions{{"timecodeBurnIn", m_tcBurnIn.toJson()}};
     return QJsonObject{{"clipUids", clipUids},
                        {"timeRemaps", timeRemaps},
+                       {"projectOptions", projectOptions},
                        {"sequenceId", m_timeline->activeSequenceId()},
                        {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
 }
@@ -10406,6 +10409,10 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     }
     // US-1706: the 3D text and the brush come back with the clips; the live brush
     // cache rebuilds from them when restoreState re-selects the clip.
+    // A snapshot without the key (recorded before it existed) leaves the settings as they are.
+    const QJsonValue burnIn = state.value("projectOptions").toObject().value("timecodeBurnIn");
+    if (burnIn.isObject())
+        applyTimecodeBurnInSettings(TimecodeBurnInSettings::fromJson(burnIn.toObject()));
 }
 
 void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &newId)
@@ -16643,13 +16650,19 @@ void MainWindow::onTimecodeBurnInSettings()
     if (dlg.exec() != QDialog::Accepted)
         return;
 
-    applyTimecodeBurnInSettings(dlg.settings());
-    setWindowModified(true);
+    commitTimecodeBurnInSettings(dlg.settings(), QStringLiteral("タイムコード焼き込み"));
     statusBar()->showMessage(
         m_tcBurnIn.enabled
             ? QStringLiteral("タイムコード焼き込みを有効にしました。")
             : QStringLiteral("タイムコード焼き込みを無効にしました。"),
         4000);
+}
+
+void MainWindow::commitTimecodeBurnInSettings(
+    const TimecodeBurnInSettings &settings, const QString &label)
+{
+    applyTimecodeBurnInSettings(settings);
+    m_timeline->saveUndoState(label);
 }
 
 void MainWindow::applyTimecodeBurnInSettings(

@@ -346,6 +346,9 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    // Applies the burn-in settings and records a named undo point (the settings ride in
+    // the sidecarState); the MCP tool and the dialog both commit through here.
+    void commitTimecodeBurnInSettings(const TimecodeBurnInSettings &settings, const QString &label);
     void convertAudioToKeyframes(int trackIndex, int clipIndex);
     // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
     int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
