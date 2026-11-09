@@ -74,6 +74,11 @@ public:
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
     void setLut(const LutData &lut);
+    // Test-only: caps the width of the N x 1 texture a 1D LUT is uploaded as, so the
+    // resample branch (N above GL_MAX_TEXTURE_SIZE) runs on any GPU; 0 = the context's limit.
+    void setLut1DMaxTextureWidthForTest(int width) { m_lut1DMaxWidthOverride = width; }
+    // Width of the uploaded 1D LUT texture (0 = no 1D LUT).
+    int lut1DTextureWidthForTest() const { return m_lut1DTexture ? m_lut1DN : 0; }
     void setLutIntensity(double intensity);
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
@@ -522,7 +527,13 @@ private:
     int m_locLutSize = -1;
     int m_locLutDomainMin = -1;
     int m_locLutDomainMax = -1;
+    int m_locLut1D = -1;
+    int m_locLutIs1D = -1;
+    int m_locLut1DSize = -1;
     QOpenGLTexture *m_lutTexture = nullptr;
+    QOpenGLTexture *m_lut1DTexture = nullptr;     // N x 1 RGB32F table of a 1D LUT (unit 4)
+    int m_lut1DN = 0;                             // texels of m_lut1DTexture
+    int m_lut1DMaxWidthOverride = 0;
     int m_lutN = 0;                               // texels per axis of m_lutTexture (0 = none)
     QVector3D m_lutDomainMin{0.0f, 0.0f, 0.0f};   // uLutDomainMin / uLutDomainMax
     QVector3D m_lutDomainMax{1.0f, 1.0f, 1.0f};

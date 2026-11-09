@@ -219,30 +219,6 @@ float LutImporter::gpuTexelCoord(int n, float x)
     return (qBound(0.0f, x, 1.0f) * static_cast<float>(n - 1) + 0.5f) / static_cast<float>(n);
 }
 
-LutData LutImporter::toGpuGrid(const LutData &in, int maxSize)
-{
-    // A 3D table is uploaded as is; the shader applies its domain before the lookup.
-    if (!in.isValid() || in.type == LutType::Cube3D)
-        return in;
-
-    const int n = qBound(2, in.size, maxSize);
-    LutData out;
-    out.name = in.name;
-    out.filePath = in.filePath;
-    out.intensity = in.intensity;
-    out.type = LutType::Cube3D;
-    out.size = n;
-    out.table.resize(qint64(n) * n * n);
-    const float last = static_cast<float>(n - 1);
-    // .cube 3D layout: R changes fastest, then G, then B
-    int i = 0;
-    for (int b = 0; b < n; ++b)
-        for (int g = 0; g < n; ++g)
-            for (int r = 0; r < n; ++r)
-                out.table[i++] = sample(in, QVector3D(r / last, g / last, b / last));
-    return out;
-}
-
 QImage LutImporter::applyLut(const QImage &image, const LutData &lutData)
 {
     if (!lutData.isValid())

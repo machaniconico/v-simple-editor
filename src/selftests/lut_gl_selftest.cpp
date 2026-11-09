@@ -14,7 +14,16 @@
 //    (HEAD resampled the domain onto a 65-point grid: 33).
 // G3 sweep: 33-point identity, 17-point v^2 and 65-point identity on bands 0
 //    and 1 match applyLut within 2/255 (HEAD 5 / 15 / 3).
-// GL unavailable (invalid context or null grab): G1-G3 are skipped.
+// US-2201: a 1D LUT is an N x 1 RGB32F texture sampled per channel at texel centres.
+// G4 1D sine: 1024 points, 8 cycles, amplitude 0.45, default domain; bands 0 and 1 match
+//    applyLut within 2/255 (HEAD's 65-point grid erred by 44). Band 1 is a red-only ramp, so a
+//    lookup that used the red coordinate for every channel fails it.
+// G5 1D domain: LUT_1D_SIZE 3 rows 0 / 0.25 / 1, DOMAIN 0.1..0.6: (26) follows sample(),
+//    (153) -> 255, (255) -> 255 (HEAD's 3^3 grid gave 219 for 153).
+// G6 1D resample: 65536 points with setLut1DMaxTextureWidthForTest(1024) uploads a 1024-wide
+//    texture whose bands 0 and 1 match applyLut within 2/255. The context's real
+//    GL_MAX_TEXTURE_SIZE shows as the width of an unforced upload (INFO line, not a gate).
+// GL unavailable (invalid context or null grab): G1-G6 are skipped.
 #include "SelftestGate.h"
 #include "../GLPreview.h"
 #include "../LutImporter.h"
@@ -67,6 +76,20 @@ LutData make3D(int n, const std::function<float(float)> &f)
         for (int g = 0; g < n; ++g)
             for (int r = 0; r < n; ++r)
                 l.table[i++] = QVector3D(f(r / float(n - 1)), f(g / float(n - 1)), f(b / float(n - 1)));
+    return l;
+}
+
+LutData make1D(int n, const std::function<float(float)> &f)
+{
+    LutData l;
+    l.type = LutType::Cube1D;
+    l.size = n;
+    l.name = QStringLiteral("lut-gl-1d");
+    l.table.resize(n);
+    for (int i = 0; i < n; ++i) {
+        const float v = f(i / float(n - 1));
+        l.table[i] = QVector3D(v, v, v);
+    }
     return l;
 }
 
@@ -136,7 +159,7 @@ int runLutGlSelftest()
         }
     }
     if (!glOk) {
-        for (int g = 1; g <= 3; ++g)
+        for (int g = 1; g <= 6; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
         return tally.finish("lut-gl");
     }
@@ -246,6 +269,56 @@ int runLutGlSelftest()
             detail += std::string(detail.empty() ? "" : " | ") + leg.tag + " " + d.str();
         }
         tally.gate(3, ok, detail + " sizeOk=" + std::to_string(sizeOk));
+    }
+
+    // G4: 1024-point 8-cycle sine on bands 0 / 1 against applyLut.
+    {
+        const float kTwoPi = 6.28318530718f;
+        const LutData sine = make1D(1024, [kTwoPi](float x) { return 0.5f + 0.45f * std::sin(kTwoPi * 8.0f * x); });
+        const QImage g = render(in, &sine);
+        const Diff d = compareBands(g, LutImporter::applyLut(in, sine), 0, 1);
+        const int w = gl->lut1DTextureWidthForTest();
+        gl->clearLut();
+        tally.gate(4, sizeOk && w == 1024 && d.maxErr <= kTol,
+                   "1024pt 8-cycle sine bands0-1 " + d.str() + " width=" + std::to_string(w)
+                   + " sizeOk=" + std::to_string(sizeOk));
+    }
+
+    // G5: 1D LUT with DOMAIN 0.1..0.6.
+    {
+        LutData dom = make1D(3, [](float x) { return x < 0.25f ? 0.0f : (x < 0.75f ? 0.25f : 1.0f); });
+        dom.domainMin = QVector3D(0.1f, 0.1f, 0.1f);
+        dom.domainMax = QVector3D(0.6f, 0.6f, 0.6f);
+        const float t26 = 26.0f / 255.0f;
+        const int want26 = qRound(LutImporter::sample(dom, QVector3D(t26, t26, t26)).x() * 255.0f);
+        const QImage g26 = render(filled(26), &dom);
+        const Diff d26 = compareBands(g26, filled(want26), 0, 3);
+        const QImage g153 = render(filled(153), &dom);
+        const Diff d153 = compareBands(g153, filled(255), 0, 3);
+        const QImage g255 = render(filled(255), &dom);
+        const Diff d255 = compareBands(g255, filled(255), 0, 3);
+        gl->clearLut();
+        tally.gate(5, sizeOk && d26.maxErr <= kTol && d153.maxErr <= kTol && d255.maxErr <= kTol,
+                   "(26)->" + std::to_string(want26) + " " + d26.str() + " | (153)->255 " + d153.str()
+                   + " | (255)->255 " + d255.str() + " sizeOk=" + std::to_string(sizeOk));
+    }
+
+    // G6: 65536 points forced through a 1024-wide texture.
+    {
+        const float kTwoPi = 6.28318530718f;
+        const LutData big = make1D(65536, [kTwoPi](float x) { return 0.5f + 0.5f * std::sin(kTwoPi * x); });
+        gl->setLut1DMaxTextureWidthForTest(1024);
+        const QImage g = render(in, &big);
+        const int w = gl->lut1DTextureWidthForTest();
+        const Diff d = compareBands(g, LutImporter::applyLut(in, big), 0, 1);
+        gl->setLut1DMaxTextureWidthForTest(0);
+        gl->setLut(big);
+        std::cout << "lut-gl INFO: 65536-point 1D LUT without override uploads a texture of width "
+                  << gl->lut1DTextureWidthForTest() << " (min(65536, GL_MAX_TEXTURE_SIZE))\n";
+        gl->clearLut();
+        tally.gate(6, sizeOk && w == 1024 && d.maxErr <= kTol,
+                   "65536pt -> width=" + std::to_string(w) + " bands0-1 " + d.str()
+                   + " sizeOk=" + std::to_string(sizeOk));
     }
 
     return tally.finish("lut-gl");

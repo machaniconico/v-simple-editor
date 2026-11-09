@@ -48,14 +48,9 @@ public:
     static QImage applyLutWithIntensity(const QImage &image, const LutData &lutData,
                                         double intensity);
 
-    // Float sampler shared by applyLut and toGpuGrid: normalises rgb01 by the LUT domain
+    // Float sampler shared by applyLut and the GL preview's 1D resample: normalises rgb01 by the LUT domain
     // (clamped to 0..1 per channel), then 1D linear / 3D trilinear lookup. lut must be valid.
     static QVector3D sample(const LutData &lut, const QVector3D &rgb01);
-
-    // Grid for the GL preview (a 3D texture of size^3). A 1D LUT is expanded to an n^3 grid
-    // (n = clamp(size, 2, maxSize)) through sample(); a 3D LUT is returned unchanged, whatever
-    // its domain (the shader remaps by DOMAIN_MIN / DOMAIN_MAX before the lookup).
-    static LutData toGpuGrid(const LutData &in, int maxSize = 65);
 
     // CPU twins of the GL preview's 3D LUT lookup (GLPreview's fragment shader uses the same
     // formulas): the domain normalisation (rgb01 - domainMin) / (domainMax - domainMin) clamped
