@@ -104,15 +104,40 @@ QImage prepareClipForCpuComposite(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds,
     const std::function<QImage(double, double)> &frameProvider,
-    const QVector<Mask> &masks)
+    const QVector<Mask> &masks,
+    const PlaybackEntry *v1Entry = nullptr, int trackIdx = -1)
 {
+    // US-2204: V1's stabilizer goes on the source before the clip-local FX, and on
+    // every echo sample at its own source time, as tlrender::renderClipSource does.
+    // `v1Entry` null (the selftest seams) = no stabilizer.
+    ClipInfo stabClip;
+    if (v1Entry)
+        stabClip.stabilizerKeyframes = v1Entry->stabilizerKeyframes;
+    const auto stabilize = [&](const QImage &frame, double sourceSec) {
+        return v1Entry ? stabwarp::applyForExport(frame, stabClip, trackIdx,
+                                                  /*sequenceDepth=*/0, sourceSec,
+                                                  v1Entry->stabilizerSourceSize)
+                       : frame;
+    };
+    std::function<QImage(double, double)> sampleProvider = frameProvider;
+    if (v1Entry && frameProvider) {
+        // The caller hands over the raw sample (prepare=false): stabilize, then
+        // VFX / grade, the export provider's order.
+        sampleProvider = [&](double sampleSourceSec, double sampleLocalSec) {
+            return tlrender::prepareClipSourceForEcho(
+                stabilize(frameProvider(sampleSourceSec, sampleLocalSec),
+                          sampleSourceSec),
+                clip, sampleLocalSec);
+        };
+    }
+    const QImage stabilized = stabilize(source, sourceSeconds);
     const QImage effected = (tlrender::hasActiveEcho(clip, clipLocalSeconds)
         || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds)
         || tlrender::hasActiveMeshWarp(clip) || clip.hasPuppetPins())
         ? tlrender::applyClipFxStackWithEchoFromSource(
-              source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
+              stabilized, clip, clipLocalSeconds, sourceSeconds, sampleProvider)
         : tlrender::applyClipFxStackFromSource(
-              source, clip, clipLocalSeconds);
+              stabilized, clip, clipLocalSeconds);
     if (effected.isNull() || masks.isEmpty())
         return effected;
     return clipmask::applyRasterAlphaMask(effected, masks);
@@ -3565,20 +3590,24 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
 {
     const qint64 timelineUsec =
         resolvedDisplayTimelineUsec(displayTimelineUsec);
-    if (!m_projectOutputSize.isValid()) {
-        displayFrame(v1Image, false, timelineUsec, false);
-        return;
-    }
-
-    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
-    canvas.fill(Qt::black);
-
     const PlaybackEntry *entry = nullptr;
     if (sequenceActive()
         && m_activeEntry >= 0
         && m_activeEntry < m_sequence.size()) {
         entry = &m_sequence[m_activeEntry];
     }
+    // V1 alone: the GL stabilizes it, unless the clip-local CPU FX path already
+    // stabilized it before the FX (US-2204, preparePreviewClipFrame).
+    const ClipInfo *seekClip = entry ? clipForPlaybackEntry(previewTimeline(), *entry) : nullptr;
+    const bool v1StabBaked = seekClip && !seekClip->isAdjustment && entry->sourceTrack == 0
+        && hasClipLocalCpuFxAt(timelineUsec);
+    if (!m_projectOutputSize.isValid()) {
+        displayFrame(v1Image, false, timelineUsec, v1StabBaked);
+        return;
+    }
+
+    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::black);
 
     const bool fitContain = entry ? entry->fitContain : false;
     const bool fitCover = entry ? entry->fitCover : false;
@@ -3612,8 +3641,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
     if (m_glPreview)
         setCompositeBakedModeForDisplay(true);
     m_lastFrameOdtApplied = false;
-    // V1 alone: the GL stabilizes it.
-    displayFrame(canvas, false, timelineUsec, false);
+    displayFrame(canvas, false, timelineUsec, v1StabBaked);
 }
 
 bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
@@ -3934,6 +3962,14 @@ bool VideoPlayer::warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const
 {
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return false;
+    // US-2204: a frame with clip-local CPU FX has V1 stabilized before the FX in
+    // preparePreviewClipFrame (the layer is already warped, alone or not).
+    const PlaybackEntry &activeEntry = m_sequence[m_activeEntry];
+    const ClipInfo *activeClip = clipForPlaybackEntry(previewTimeline(), activeEntry);
+    if (activeEntry.sourceTrack == 0 && activeClip && !activeClip->isAdjustment
+        && hasClipLocalCpuFxAt(m_timelinePositionUs)) {
+        return true;
+    }
     const bool overlay = std::any_of(
         layers.cbegin(), layers.cend(),
         [this](const DecodedLayer &L) { return L.sequenceIdx != m_activeEntry; });
@@ -4216,22 +4252,29 @@ QImage VideoPlayer::preparePreviewClipFrame(
             // for the composited frame. Bake every active clip independently
             // so [GPU FX, CPU FX] order, masks, and track isolation are kept.
             const QSize echoRenderSize = source.size();
+            // US-2204: V1's stabilizer goes before the clip-local FX; the caller
+            // hands the frame on as baked (clipFxApplied) so the GL warps nothing.
+            // A stabilized V1 echo sample is raw here: prepareClipForCpuComposite
+            // warps it, then applies VFX / grade (export order).
+            const bool stabV1 = entryIndex == m_activeEntry && entry.sourceTrack == 0;
             tlrender::EchoFrameProvider echoFrameProvider;
             if (hasEcho) {
                 const ClipInfo sourceClipSnapshot = *sourceClip;
                 echoFrameProvider =
-                    [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
+                    [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec, stabV1](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         return tlrender::renderClipSourceFrameForEcho(
                             timeline, sourceClipSnapshot, sampleSourceSec,
-                            sampleLocalSec, echoRenderSize, timelineUsec);
+                            sampleLocalSec, echoRenderSize, timelineUsec,
+                            /*prepare=*/!stabV1);
                     };
             }
             const QVector<Mask> masks = previewMasksForFrame(
                 *sourceClip, sourceSeconds, sourceSize, source.size());
             prepared = videopreview::prepareClipForCpuComposite(
                 source, previewClip, clipLocalSec, sourceSeconds,
-                echoFrameProvider, masks);
+                echoFrameProvider, masks, stabV1 ? &entry : nullptr,
+                entry.sourceTrack);
             if (clipFxApplied)
                 *clipFxApplied = true;
             return prepared;
@@ -6057,7 +6100,7 @@ void VideoPlayer::refreshDisplayedFrame()
                     if (m_glPreview)
                         setCompositeBakedModeForDisplay(true);
                     m_lastFrameOdtApplied = false;
-                    displayFrame(canvas, false, m_timelinePositionUs, false);
+                    displayFrame(canvas, false, m_timelinePositionUs, clipFxApplied);
                     return;
                 }
             }
@@ -6067,7 +6110,7 @@ void VideoPlayer::refreshDisplayedFrame()
             // composeFrameWithOverlays intentionally skips it.
             if (clipFxApplied) {
                 m_lastFrameOdtApplied = false;
-                displayFrame(prepared, false, m_timelinePositionUs, false);
+                displayFrame(prepared, false, m_timelinePositionUs, true);  // US-2204
                 return;
             }
         }
@@ -6997,6 +7040,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (traceTick)
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
                 QImage fallbackFrame = m_lastV1RawFrame;
+                bool fallbackBaked = false;  // US-2204: clip-local CPU FX stabilized V1
                 if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                     const auto &entry = m_sequence[m_activeEntry];
                     const QSize sourceSize =
@@ -7009,9 +7053,9 @@ void VideoPlayer::handlePlaybackTick()
                         / AV_TIME_BASE;
                     fallbackFrame = preparePreviewClipFrame(
                         m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
-                        sourceSize, m_timelinePositionUs);
+                        sourceSize, m_timelinePositionUs, &fallbackBaked);
                 }
-                displayFrame(fallbackFrame, false, m_timelinePositionUs, false);
+                displayFrame(fallbackFrame, false, m_timelinePositionUs, fallbackBaked);
             } else {
                 if (traceTick) {
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -7129,6 +7173,7 @@ void VideoPlayer::handlePlaybackTick()
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
             QImage fallbackFrame = m_lastV1RawFrame;
+            bool fallbackBaked = false;  // US-2204: clip-local CPU FX stabilized V1
             if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                 const auto &entry = m_sequence[m_activeEntry];
                 const QSize sourceSize =
@@ -7141,9 +7186,9 @@ void VideoPlayer::handlePlaybackTick()
                     / AV_TIME_BASE;
                 fallbackFrame = preparePreviewClipFrame(
                     m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
-                    sourceSize, m_timelinePositionUs);
+                    sourceSize, m_timelinePositionUs, &fallbackBaked);
             }
-            displayFrame(fallbackFrame, false, m_timelinePositionUs, false);
+            displayFrame(fallbackFrame, false, m_timelinePositionUs, fallbackBaked);
         }
       } // ADAPTIVE-1: close `if (!servedFromCache)`
     }

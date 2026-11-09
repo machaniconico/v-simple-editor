@@ -1184,12 +1184,6 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
 
 namespace {
 
-struct ActiveAdjustmentClip {
-    int trackIndex = 0;
-    const ClipInfo *clip = nullptr;
-    double localSec = 0.0;
-};
-
 QImage applyAdjustmentClipStack(const QImage &lowerComposite,
                                 const ActiveAdjustmentClip &adjustment)
 {
@@ -1210,6 +1204,25 @@ QImage applyAdjustmentClipStack(const QImage &lowerComposite,
     }
     return out.convertToFormat(QImage::Format_RGBA8888);
 }
+
+} // namespace
+
+QImage applyAdjustmentClipsAtTrack(const QImage &input,
+                                   const QVector<ActiveAdjustmentClip> &adjustments,
+                                   int trackIndex)
+{
+    QImage out = input;
+    for (const ActiveAdjustmentClip &adjustment : adjustments) {
+        if (adjustment.trackIndex != trackIndex)
+            continue;
+        out = applyAdjustmentClipStack(
+            out.convertToFormat(QImage::Format_RGBA8888),
+            adjustment);
+    }
+    return out;
+}
+
+namespace {
 
 // S7 — PER-CLIP MASK stage (driven by motion-tracker data for animation).
 // Apply the clip's genuine AE/Premiere-style compositing mask to its
@@ -1315,6 +1328,8 @@ QImage applyClipMask(const QImage &frame, const ClipInfo &clip, double sourceSec
     return masked.convertToFormat(QImage::Format_RGBA8888);
 }
 
+} // namespace
+
 // S6 — ADJUSTMENT-LAYER stage. Apply the cumulative grade of every
 // adjustment layer covering `usec` exactly where the GPU preview applies it.
 //
@@ -1380,6 +1395,8 @@ QImage applyAdjustmentLayers(const QImage &composited,
     const QImage graded = VideoEffectProcessor::applyColorCorrection(composited, cc);
     return graded.convertToFormat(QImage::Format_RGBA8888);
 }
+
+namespace {
 
 // US-2110 / US-2112: a nested pass's grade. Its composite is a layer of the parent
 // stack, so the grade above (whose RGB888 round trip makes every pixel opaque) must
@@ -3085,15 +3102,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
 
     auto applyAdjustmentClipsAtTrack =
         [&](const QImage &input, int trackIndex) -> QImage {
-            QImage out = input;
-            for (const ActiveAdjustmentClip &adjustment : activeAdjustments) {
-                if (adjustment.trackIndex != trackIndex)
-                    continue;
-                out = applyAdjustmentClipStack(
-                    out.convertToFormat(QImage::Format_RGBA8888),
-                    adjustment);
-            }
-            return out;
+            return tlrender::applyAdjustmentClipsAtTrack(input, activeAdjustments, trackIndex);
         };
 
     // No overlays -> the multi-track stack reduces to the V1 base. S6 still
@@ -3642,7 +3651,8 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
                                     double sourceSeconds,
                                     double clipLocalSeconds,
                                     QSize outSize,
-                                    qint64 timelineUsec)
+                                    qint64 timelineUsec,
+                                    bool prepare)
 {
     if (!timeline || outSize.isEmpty())
         return QImage();
@@ -3664,7 +3674,7 @@ QImage renderClipSourceFrameForEcho(const Timeline *timeline,
         /*sampleFromLeftBoundary=*/false, timeline->parkedSidecarsBySequence());
     if (source.isNull())
         return QImage();
-    return prepareClipSourceForEcho(source, clip, clipLocalSeconds);
+    return prepare ? prepareClipSourceForEcho(source, clip, clipLocalSeconds) : source;
 }
 
 QImage prepareClipSourceForEcho(const QImage &source, const ClipInfo &clip,

@@ -1250,5 +1250,142 @@ int runStabilizerExportSelftest()
         }
     }
 
+    // US-2204 G12: a V1 clip with a clip-local CPU FX (Echo, 2 samples 0.25 s apart) is
+    // stabilized before the FX in the ordinary preview, each echo sample at its own
+    // source time like renderFrameAt: keys t0 dx 0, t1 dx +8 at t = 1 s put the dot at
+    // x 18 and its trail at x 16 and 14 (a box (14,10)-(19,11)); HEAD warped the
+    // finished echo once (+8: the whole trail at x 18..). The prepared layer goes
+    // through the production compose + present, which must not warp it again and
+    // must leave the GL no keys. Negative control (pin): without keys the preview is
+    // byte-identical to the export.
+    {
+        std::ostringstream d;
+        VideoPlayer player;
+        GLPreview *view = player.glPreview();
+        if (!(view && player.isGLAccelerated())) {
+            tally.skip(12, "GL preview unavailable (environment)");
+        } else {
+            const double tEcho = 1.0;
+            ClipInfo base = seqClip(seqA);
+            base.effects = {VideoEffect::createEcho(0.25, 2, 0.5, 2)};
+            const QImage raw = dotFrame({QPoint(10, 10)});
+            QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            black.fill(Qt::black);
+            const auto maxDiff = [](const QImage &a, const QImage &b) {
+                if (a.isNull() || b.isNull() || a.size() != b.size())
+                    return 255;
+                const QImage x = a.convertToFormat(QImage::Format_RGBA8888);
+                const QImage y = b.convertToFormat(QImage::Format_RGBA8888);
+                int worst = 0;
+                for (int row = 0; row < x.height(); ++row)
+                    for (int col = 0; col < x.width() * 4; ++col)
+                        worst = qMax(worst, std::abs(int(x.constScanLine(row)[col])
+                                                     - int(y.constScanLine(row)[col])));
+                return worst;
+            };
+            struct Shown {
+                QImage prepared, composed, exported;
+                bool applied = false, glKeysOff = false;
+            };
+            const auto run = [&](const ClipInfo &clip) {
+                Shown out;
+                auto timeline = makeTimeline({{clip}});
+                view->setTimeline(timeline.get());
+                PlaybackEntry e;
+                e.filePath = seqA;
+                e.clipIn = 0.0;
+                e.clipOut = kDuration;
+                e.timelineStart = 0.0;
+                e.timelineEnd = kDuration;
+                e.speed = 1.0;
+                e.sourceTrack = 0;
+                e.sourceClipIndex = 0;
+                e.stabilizerKeyframes = clip.stabilizerKeyframes;
+                player.m_sequence = {e};
+                player.m_activeEntry = 0;
+                player.m_timelinePositionUs = us(tEcho);
+                out.prepared = player.preparePreviewClipFrame(
+                    raw, e, 0, tEcho, QSize(kSize, kSize), us(tEcho), &out.applied);
+                VideoPlayer::DecodedLayer v1;
+                v1.rgb = out.prepared.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                v1.sourceTrack = 0;
+                v1.sequenceIdx = 0;
+                out.composed = player.composeAndPresentForTest(black, {v1}, {e}, 0, us(tEcho));
+                out.glKeysOff = !view->stabEnabledForTest();
+                view->setTimeline(nullptr);
+                out.exported = tlrender::renderFrameAt(timeline.get(), us(tEcho),
+                                                       QSize(kSize, kSize));
+                return out;
+            };
+            const Shown keyed =
+                run(withKeys(base, {key(0.0, 0.0), key(1.0, 8.0)}));
+            const Shown plainRun = run(base);
+            // Fractional key (+7.5 at t1) and a non-default grade: each echo sample is
+            // warped raw, then graded (export order). Warping the graded sample
+            // blends the dot's edge pixels with a different black, > 2 levels apart.
+            ClipInfo gradedBase = base;
+            gradedBase.colorCorrection.brightness = -30.0;
+            const Shown gradedRun =
+                run(withKeys(gradedBase, {key(0.0, 0.0), key(1.0, 7.5)}));
+            const Shown gradedNoKeys = run(gradedBase);
+            const int gradedDiff = maxDiff(gradedRun.composed, gradedRun.exported);
+            const int gradeShows = maxDiff(gradedNoKeys.exported, plainRun.exported);
+            const int warpShows = maxDiff(gradedRun.exported, gradedNoKeys.exported);
+            const bool gradedOk = gradedRun.applied && gradedRun.glKeysOff && gradedDiff <= 2
+                && gradeShows > 8 && warpShows > 8;
+            const QRect full(0, 0, kSize, kSize);
+            const Box expBox = nonBlackBox(keyed.exported, full);
+            const Box prevBox = nonBlackBox(keyed.composed, full);
+            const int keyedDiff = maxDiff(keyed.composed, keyed.exported);
+            const int plainDiff = maxDiff(plainRun.composed, plainRun.exported);
+            const bool keyedOk = gradedOk && keyed.applied && keyed.glKeysOff
+                && expBox.rect == QRect(14, 10, 6, 2) && prevBox.rect == expBox.rect
+                && keyedDiff <= 2;
+            const bool plainOk2 = plainRun.applied && plainDiff == 0
+                && nonBlackBox(plainRun.exported, full).rect == QRect(10, 10, 2, 2)
+                && maxDiff(keyed.exported, plainRun.exported) > 8;  // the control can see a warp
+            // Seek-conformed present of the same prepared (already stabilized) frame, with
+            // an invalid (automatic) and a set project output size: the GL gets no keys.
+            bool seekOk = true;
+            std::ostringstream sd;
+            {
+                const ClipInfo keyedClip = withKeys(base, {key(0.0, 0.0), key(1.0, 8.0)});
+                auto timeline = makeTimeline({{keyedClip}});
+                view->setTimeline(timeline.get());
+                PlaybackEntry e;
+                e.filePath = seqA;
+                e.clipIn = 0.0;
+                e.clipOut = kDuration;
+                e.timelineStart = 0.0;
+                e.timelineEnd = kDuration;
+                e.speed = 1.0;
+                e.sourceTrack = 0;
+                e.sourceClipIndex = 0;
+                e.stabilizerKeyframes = keyedClip.stabilizerKeyframes;
+                player.m_sequence = {e};
+                player.m_activeEntry = 0;
+                player.m_timelinePositionUs = us(tEcho);
+                for (const QSize outSize : {QSize(), QSize(kSize, kSize)}) {
+                    player.m_projectOutputSize = outSize;
+                    player.displaySeekFrameConformed(keyed.prepared, us(tEcho));
+                    const bool off = !view->stabEnabledForTest();
+                    sd << " seek(" << (outSize.isValid() ? "set" : "auto") << ") glKeysOff=" << off;
+                    seekOk = seekOk && off;
+                }
+                player.m_projectOutputSize = QSize();
+                view->setTimeline(nullptr);
+            }
+            d << "graded fractional: maxDiff=" << gradedDiff << " gradeShows=" << gradeShows
+              << " warpShows=" << warpShows << " ok=" << gradedOk
+              << "; keyed: applied=" << keyed.applied << " glKeysOff=" << keyed.glKeysOff
+              << " export " << boxText(expBox) << " preview " << boxText(prevBox)
+              << " maxDiff=" << keyedDiff << " ok=" << keyedOk << "; key-less pin: applied="
+              << plainRun.applied << " maxDiff=" << plainDiff << " export "
+              << boxText(nonBlackBox(plainRun.exported, full)) << " ok=" << plainOk2
+              << ";" << sd.str() << " ok=" << seekOk;
+            tally.gate(12, keyedOk && plainOk2 && seekOk, d.str());
+        }
+    }
+
     return tally.finish("stabilizer-export");
 }

@@ -14,6 +14,7 @@
 #include <optional>
 
 class Timeline;
+struct AdjustmentLayer;
 struct ClipInfo;
 struct VideoEffect;
 struct OverlapInterval;
@@ -62,6 +63,25 @@ namespace clipanim { struct EvalEnv; }
 // fall back gracefully; an upper track that fails to decode is skipped
 // rather than failing the whole frame.
 namespace tlrender {
+
+// US-2206: an adjustment clip active at a frame (renderFrameAt's activeAdjustments,
+// also collected by MainWindow::buildSpecialClipComposite): it grades the partial
+// composite at its track's z position at clip-local `localSec`.
+struct ActiveAdjustmentClip {
+    int trackIndex = 0;
+    const ClipInfo *clip = nullptr;
+    double localSec = 0.0;
+};
+// The adjustment clips on `trackIndex`, in order, over `input` (each through the clip's
+// FX pack, keeping the input's alpha); `input` untouched when none is on that track.
+QImage applyAdjustmentClipsAtTrack(const QImage &input,
+                                   const QVector<ActiveAdjustmentClip> &adjustments,
+                                   int trackIndex);
+// The top-level adjustment-layer grade (lift / gain) at `usec`; the input untouched when
+// the composite is identity, otherwise an opaque Format_RGBA8888 image.
+QImage applyAdjustmentLayers(const QImage &composited,
+                             const QVector<AdjustmentLayer> &layers,
+                             qint64 usec);
 
 // Timeless source for transition-bearing stills; null for video/animation.
 QImage readTransitionStillFrame(const QString &filePath);
@@ -128,12 +148,15 @@ QImage applyClipFxStackWithEchoFromSource(
 
 // Random-access source-frame path shared with preview Echo. It mirrors the
 // export provider's source decode/nested render -> VFX controls -> grade order.
+// `prepare` false returns the raw sample (before prepareClipSourceForEcho) so the
+// caller can put a stage between decode and VFX / grade (US-2204: V1 stabilizer).
 QImage renderClipSourceFrameForEcho(const Timeline *timeline,
                                     const ClipInfo &clip,
                                     double sourceSeconds,
                                     double clipLocalSeconds,
                                     QSize outSize,
-                                    qint64 timelineUsec);
+                                    qint64 timelineUsec,
+                                    bool prepare = true);
 
 // US-1707: the native layer source renderFrameAt builds for clip `clipIdx` on
 // video track `trackIdx` at `usec` (roto -> VFX -> grade -> FX -> clip mask ->
