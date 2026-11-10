@@ -1004,6 +1004,8 @@ private:
         QJsonObject audioFx; // audiofxui::undoState of the mixer at this entry
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
+    // US-2220: the sidecars of each pending undo burst, captured with its snapshot.
+    QHash<QTimer *, MediaRelinkSidecarState> m_undoBurstSidecars;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
     bool m_offlineRefreshQueued = false; // US-1408: coalesces mediaImported refreshes
     int m_mediaRelinkObservedUndoIndex = -1;

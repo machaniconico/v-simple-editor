@@ -181,6 +181,21 @@ int runSubtitleImportSelftest()
         const bool oddOk = wo && two(o) && o.warnings.size() == 1
             && o.warnings[0].contains(QString::fromUtf8("末尾 1 byte を無視"))
             && o.warnings[0].contains(QString::fromUtf8("として読みました"));
+        // US-2220: only the first line is probed. Here the cue text falls inside the first 64
+        // bytes (LF, a 1-digit fraction, `-->` without spaces); 日 is E5 65 in LE, so a fixed
+        // 64-byte window fails both parities and the file falls through to UTF-8 / Shift_JIS.
+        const QString shortText = QString::fromUtf8("1\n00:00:01.0-->00:00:02.0\n日本語\n");
+        auto shortOk = [&](const subtitle::ImportResult &r, const char *enc) {
+            return r.success && r.clips.size() == 1 && r.clips[0].text == QString::fromUtf8("日本語")
+                && r.clips[0].startMs == 1000 && r.clips[0].endMs == 2000
+                && r.encodingUsed == QString::fromUtf8(enc);
+        };
+        const bool wsl = writeBytes(dir, "g7shortle.srt", le(shortText), &path);
+        const subtitle::ImportResult shl = subtitle::importSrt(path);
+        const bool shortLeOk = wsl && shortOk(shl, "UTF-16LE (BOM なし)");
+        const bool wsb = writeBytes(dir, "g7shortbe.srt", be(shortText), &path);
+        const subtitle::ImportResult shb = subtitle::importSrt(path);
+        const bool shortBeOk = wsb && shortOk(shb, "UTF-16BE (BOM なし)");
         // Negative control (pin): the Shift_JIS fixture of G2 stays Shift_JIS.
         const QByteArray sjis("\x82\xB1\x82\xF1\x82\xC9\x82\xBF\x82\xCD");
         const bool ws = writeBytes(dir, "g7sj.srt",
@@ -189,11 +204,15 @@ int runSubtitleImportSelftest()
         QStringDecoder sjc("Shift_JIS");
         const bool sjOk = ws && sj.clips.size() == 1 && sj.warnings.size() == 1
             && (!sjc.isValid() || sj.encodingUsed == "Shift_JIS");
-        tally.gate(7, leOk && beOk && oddOk && sjOk,
+        tally.gate(7, leOk && beOk && oddOk && sjOk && shortLeOk && shortBeOk,
                    "le=" + std::to_string(leOk) + " enc=" + s(l.encodingUsed) + " clips=" + std::to_string(l.clips.size())
                    + " w=" + std::to_string(l.warnings.size()) + " be=" + std::to_string(beOk)
                    + " enc=" + s(b.encodingUsed) + " odd=" + std::to_string(oddOk) + " oddW=" + s(o.warnings.join('|'))
-                   + " sjis=" + std::to_string(sjOk) + " enc=" + s(sj.encodingUsed));
+                   + " sjis=" + std::to_string(sjOk) + " enc=" + s(sj.encodingUsed)
+                   + " shortLe=" + std::to_string(shortLeOk) + " enc=" + s(shl.encodingUsed)
+                   + " clips=" + std::to_string(shl.clips.size())
+                   + " shortBe=" + std::to_string(shortBeOk) + " enc=" + s(shb.encodingUsed)
+                   + " clips=" + std::to_string(shb.clips.size()));
     }
 
     // G8: 1-3 fraction digits on import (right-padded); the public parsers stay strict.

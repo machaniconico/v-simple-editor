@@ -199,7 +199,16 @@ static QString decodeSubtitleBytes(const QByteArray &raw, QString *encodingUsed)
     // BOM-less UTF-16: an ASCII first line has NULs on one byte parity only (a strict
     // UTF-8 / Shift_JIS read would accept those bytes silently). Decode an even length.
     {
-        const int n = int(qMin<qsizetype>(raw.size(), 64));
+        int n = int(qMin<qsizetype>(raw.size(), 64));
+        // Only the first line: a cue's text may follow within 64 bytes (kanji such as
+        // U+65E5 have a byte >= 0x80, U+3000 a NUL on the other parity). The pair that
+        // holds the LF is kept.
+        for (int i = 0; i < n; ++i) {
+            if (raw[i] == '\n') {
+                n = qMin(n, (i + 2) & ~1);
+                break;
+            }
+        }
         int nul[2] = {0, 0};
         bool ascii[2] = {true, true};
         for (int i = 0; i < n; ++i) {

@@ -411,6 +411,11 @@ void MainWindow::captureUndoBurst(QTimer *timer)
     if (!m_timeline) return;
     if (!timer->isActive()) timer->setProperty("burstSeq", static_cast<qulonglong>(++m_undoBurstSeq));
     m_undoBurstSnapshots.insert(timer, std::make_shared<TimelineState>(m_timeline->captureUndoSnapshot()));
+    // US-2220: the sidecars go with the snapshot; at commit time they may already hold a
+    // later edit (relink rewrites them before its save, an FX dock saves after the mixer).
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    m_undoBurstSidecars.insert(timer, {m_projectOverlays, m_particleClipConfigs,
+                                       mixer ? audiofxui::undoState(mixer) : QJsonObject{}});
 }
 
 // The one commit routine of the burst timers' timeouts and of the flush: the stored snapshot
@@ -419,6 +424,7 @@ void MainWindow::captureUndoBurst(QTimer *timer)
 void MainWindow::commitUndoBurst(QTimer *timer)
 {
     const std::shared_ptr<TimelineState> snapshot = m_undoBurstSnapshots.take(timer);
+    const MediaRelinkSidecarState sidecars = m_undoBurstSidecars.take(timer);
     UndoManager *undo = m_timeline ? m_timeline->undoManager() : nullptr;
     if (!snapshot || !undo || m_timeline->isRestoringState()) return;
     const quint64 serial = undo->saveSerial();
@@ -427,6 +433,9 @@ void MainWindow::commitUndoBurst(QTimer *timer)
         || index != timer->property("burstIndex").toInt())
         return;
     m_timeline->saveUndoSnapshot(*snapshot, timer->property("undoLabel").toString());
+    // The history handler recorded the live sidecars at the new entry; the burst's own replace them.
+    if (undo->currentIndex() >= 0 && undo->currentIndex() < m_mediaRelinkSidecarHistory.size())
+        m_mediaRelinkSidecarHistory[undo->currentIndex()] = sidecars;
     // A sibling that was fresh just before this push is still fresh after it; one that an
     // undo / redo / new point from a path bypassing MainWindow made stale stays stale.
     for (const char *name : kPendingUndoTimerNames) {
@@ -5502,6 +5511,7 @@ void MainWindow::setupMenuBar()
                 // the current entry also takes the live chains, since legacy EQ
                 // writes record no undo (as applyAudioState refreshes on load).
                 const QString key = QString::number(ti2);
+                flushPendingUndoPoints();
                 UndoManager *undo = m_timeline->undoManager();
                 int index = undo->currentIndex();
                 if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()) {

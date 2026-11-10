@@ -5,6 +5,7 @@
 // prompt / save-as / failure-dialog / missing-media seams.
 #include "../AudioMixer.h"
 #include "../AudioMixerDock.h"
+#include "../CompressorPanel.h"
 #include "../EffectClipboard.h"
 #include "../EffectControlsPanel.h"
 #include "../MainWindow.h"
@@ -41,6 +42,7 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QStatusBar>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
@@ -162,7 +164,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 13; ++g)
+        for (int g = 1; g <= 14; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -1381,13 +1383,16 @@ int runUnsavedPromptSelftest()
             w14.markProjectClean();
         };
         // The content of the V1 clip: motion writes the rotation, a drag writes scale / dx / dy.
+        // US-2220: legs (h) / (i) add the sidecars a burst must carry (empty for the others).
+        std::function<QString()> sidecarSig;
         const auto sig = [&]() -> QString {
+            const QString extra = sidecarSig ? sidecarSig() : QString();
             const auto &clips = tl.videoClips();
-            if (clips.isEmpty()) return QStringLiteral("none");
+            if (clips.isEmpty()) return QStringLiteral("none") + extra;
             const ClipInfo &c = clips.first();
             return QStringLiteral("s%1 x%2 y%3 r%4 e%5")
                 .arg(c.videoScale, 0, 'f', 2).arg(c.videoDx, 0, 'f', 2).arg(c.videoDy, 0, 'f', 2)
-                .arg(c.rotation2DDegrees, 0, 'f', 1).arg(c.effects.size());
+                .arg(c.rotation2DDegrees, 0, 'f', 1).arg(c.effects.size()) + extra;
         };
         const auto expect = [](double scale, double dx, double dy, double rot, int effects) {
             return QStringLiteral("s%1 x%2 y%3 r%4 e%5")
@@ -1472,6 +1477,129 @@ int runUnsavedPromptSelftest()
             motionWrite(); wait(30);       // t = 120: re-bases the motion burst only
             edit(); wait(500);             // t = 150: flush in capture order
         });
+        // US-2220 (h): a relink within the burst rewrites the overlay before its save; the burst's
+        // point keeps the overlay it captured, so each step has clip and overlay on the same path.
+        // Detects: commitUndoBurst leaving the live (already relinked) overlay on the burst's entry.
+        {
+            const QString newPath = tmp("g14-relinked.mp4");
+            const bool newOk = touchFile(newPath);
+            OverlayItem overlay;
+            overlay.id = 1;
+            overlay.type = QStringLiteral("image");
+            overlay.text = clipPath;
+            const auto pathTag = [&](const QString &p) {
+                return p == clipPath ? QStringLiteral("old") : p == newPath ? QStringLiteral("new") : p;
+            };
+            sidecarSig = [&]() -> QString {
+                const auto &clips = tl.videoClips();
+                const QString clip = clips.isEmpty() ? QStringLiteral("-") : pathTag(clips.first().filePath);
+                const QString ov = w14.m_projectOverlays.isEmpty() ? QStringLiteral("-")
+                                                                   : pathTag(w14.m_projectOverlays.first().text);
+                return QStringLiteral(" clip=%1 overlay=%2").arg(clip, ov);
+            };
+            const QString oldSide = QStringLiteral(" clip=old overlay=old");
+            const QString newSide = QStringLiteral(" clip=new overlay=new");
+            w14.m_projectOverlays = {overlay};
+            bool relinked = false;
+            leg("(h) motion,relink", {M + newSide, M + oldSide, base + oldSide}, [&] {
+                motionWrite(); wait(50);
+                relinked = w14.relinkMediaPaths({{clipPath, newPath}});
+                wait(500);
+            });
+            ok = ok && newOk && relinked;
+            d += " relinked=" + b(relinked) + " newFile=" + b(newOk);
+            sidecarSig = nullptr;
+            w14.m_projectOverlays.clear();
+        }
+        // US-2220 (i): an audio FX dock saves after the mixer changed; the burst's point keeps the FX it
+        // captured, so undoing the FX step reverts the FX and keeps the motion.
+        // Detects: commitUndoBurst leaving the live (post-gesture) FX on the burst's entry.
+        {
+            w14.openCompressorPanel();
+            auto *panel = w14.m_compressorDock ? qobject_cast<CompressorPanel *>(w14.m_compressorDock->widget())
+                                               : nullptr;
+            AudioMixer *mixer = w14.m_player->audioMixer();
+            QJsonObject fxBefore, fxAfter;
+            sidecarSig = [&]() -> QString {
+                const QJsonObject fx = mixer ? audiofxui::undoState(mixer) : QJsonObject{};
+                return fx == fxBefore ? QStringLiteral(" fx=before")
+                    : fx == fxAfter  ? QStringLiteral(" fx=after") : QStringLiteral(" fx=other");
+            };
+            leg("(i) motion,fx gesture", {M + QStringLiteral(" fx=after"), M + QStringLiteral(" fx=before"),
+                                          base + QStringLiteral(" fx=before")}, [&] {
+                if (!panel || !mixer) return;
+                fxBefore = audiofxui::undoState(mixer);
+                motionWrite(); wait(50);
+                AudioMixer::CompressorSettings c = mixer->compressorForTrack(0);
+                c.enabled = true;
+                c.thresholdDb = -20.0;
+                c.ratio = 4.0;
+                mixer->setCompressorForTrack(0, c);
+                fxAfter = audiofxui::undoState(mixer);
+                Q_EMIT panel->gestureFinished(0);
+                wait(500);
+            });
+            const bool fxChanged = panel && mixer && !fxAfter.isEmpty() && fxAfter != fxBefore;
+            ok = ok && fxChanged;
+            d += " panel=" + b(panel != nullptr) + " fxChanged=" + b(fxChanged);
+            sidecarSig = nullptr;
+        }
+        // US-2220 (j): the EQ migration within a burst commits the burst first, so the pre-migration
+        // legacy EQ pin lands on the burst's entry and undoing the migration re-enables the legacy EQ.
+        // Detects: the pin landing on the entry before the burst, so undo to the burst loses track EQ.
+        {
+            AudioMixer *mixer = w14.m_player->audioMixer();
+            QAction *migrate = nullptr;
+            if (auto *trackEqMenu = w14.findChild<QMenu *>(QStringLiteral("trackEqMenu"))) {
+                Q_EMIT trackEqMenu->aboutToShow();
+                for (QAction *action : trackEqMenu->actions())
+                    if (action->menu() && action->text() == QStringLiteral("A1"))
+                        migrate = action->menu()->findChild<QAction *>(QStringLiteral("trackEqMigrateTo4Band"));
+            }
+            AudioEQConfig legacy;
+            legacy.bands.resize(2);
+            legacy.bands[1] = EQBand{1000.0, -12.0, 1.0};
+            QJsonObject chainPre, chainMigrated;
+            QString migrateMessage;
+            sidecarSig = [&]() -> QString {
+                if (!mixer) return QStringLiteral(" mixer=-");
+                const AudioEQConfig cfg = mixer->trackEqConfig(0);
+                const bool on = mixer->trackEqEnabled(0) && cfg.bands.size() == 2
+                    && cfg.bands[1].frequency == 1000.0 && cfg.bands[1].gain == -12.0;
+                const bool off = !mixer->trackEqEnabled(0) && cfg.bands.isEmpty();
+                const QJsonObject chain = mixer->trackChain(0).toJson();
+                return QStringLiteral(" eq=%1 chain=%2")
+                    .arg(on ? QStringLiteral("on") : off ? QStringLiteral("off") : QStringLiteral("other"),
+                         chain == chainPre ? QStringLiteral("pre")
+                             : chain == chainMigrated ? QStringLiteral("migrated") : QStringLiteral("other"));
+            };
+            const QString on = QStringLiteral(" eq=on chain=pre");
+            const QString migrated = QStringLiteral(" eq=off chain=migrated");
+            // (i) left a compressor, which refuses the migration; clear it before setup() records the base.
+            if (mixer) mixer->setTrackChain(0, trackfx::Chain{});
+            leg("(j) motion,eq migration", {M + migrated, M + on, base + on}, [&] {
+                if (!mixer || !migrate) return;
+                mixer->setTrackEqEnabled(0, true);
+                mixer->setTrackEqConfig(0, legacy);
+                chainPre = mixer->trackChain(0).toJson();
+                motionWrite(); wait(50);
+                migrate->trigger();
+                migrateMessage = w14.statusBar()->currentMessage();
+                chainMigrated = mixer->trackChain(0).toJson();
+                wait(500);
+            });
+            const bool migratedOk = mixer && migrate && !chainMigrated.isEmpty() && chainMigrated != chainPre
+                && mixer->trackChain(0).eqEnabled;
+            ok = ok && migratedOk;
+            d += " migrateAction=" + b(migrate != nullptr) + " chainMigrated=" + b(migratedOk)
+                + " message=" + migrateMessage.toStdString();
+            sidecarSig = nullptr;
+            if (mixer) {
+                mixer->setTrackChain(0, trackfx::Chain{});
+                mixer->setTrackEqEnabled(0, false);
+                mixer->setTrackEqConfig(0, AudioEQConfig{});
+            }
+        }
         // (e) a flush while the timeline restores takes no point, even with the burst live.
         {
             setup();
