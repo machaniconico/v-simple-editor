@@ -5,7 +5,7 @@
 
 このファイルは 3 部構成です。
   第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
-  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 21 = 実装済み / Wave 22 候補)
+  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 22 = 実装済み / Wave 23 候補)
   第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
 
 凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加  ◇=Wave 4 追加  ◈=Wave 5 追加  ✦=Wave 6 追加  ✧=Wave 7 追加  ❖=Wave 8 追加  ❂=Wave 9 追加  ❃=Wave 10 追加 (今回)
@@ -210,8 +210,10 @@
   ✧ 書き出しファイルへのメタデータ埋め込み (タイトル / 作成者 / 著作権 / コメント。MCP export_video の metadata)  [P][R]
   ✧ CMX3600 EDL / FCPXML の読み込みと新規シーケンス化 (MCP import_edl / import_fcpxml)  [P][R]
     Wave 21 から、要素の入れ子が 128 段を超える FCPXML は「FCPXML の入れ子が深すぎます (上限 128 段)」で読み込みを止めます。
-    UNC (\\サーバー\共有\…) の素材は存在を確認せず、オフライン素材 (offline-<参照> の placeholder) として取り込んで警告を
-    出します。回避: NAS を共有のドライブ文字に割り当ててから、FCPXML を書き出し直してください (詳細は README の「Wave 21 の
+    UNC (\\サーバー\共有\…) の素材は、取り込みの後に共有ごとに 1 回 (全体で 3 秒まで) 確認し、応答する共有にあるファイル
+    は自動で再リンクします (Wave 22)。応答しない共有の素材は、オフライン素材 (offline-<参照> の placeholder) として取り
+    込んで警告を出します。回避: NAS を共有のドライブ文字に割り当ててから、FCPXML を書き出し直してください (詳細は README
+    の「Wave 21 の
     変更」の US-2101)。
   ○ Premiere XML / FCPXML / DaVinci XML / EDL / PPTX / Remotion 形式
   ○ OTIO (.otio、ツールメニューの「OTIO 書き出し…」、Wave 20、書き出しのみ)
@@ -247,7 +249,8 @@
     57 ツール (set_clip_wiggle / set_clip_expression / get_clip_dynamics)、G1..G199。❊Wave 18 も追加なし = 57 ツール、
     G1..G200 (set_clip_property の worldX / worldY と get_timeline の任意の worldX / worldY)。❍Wave 19 で 4 ツール追加 =
     61 ツール (get_clip_text3d / set_clip_text3d / get_clip_brush / set_clip_brush)、G1..G206。Wave 20 も追加なし = 61
-    ツール、G1..G206。Wave 21 も追加なし = 61 ツール、G1..G207 (MCP の編集の undo で未保存が消える))
+    ツール、G1..G206。Wave 21 も追加なし = 61 ツール、G1..G207 (MCP の編集の undo で未保存が消える)。Wave 22 も追加なし
+    = 61 ツール、G1..G208 (タイムコード焼き込みの undo))
     + AI チャット Dock (Claude Code / Codex CLI)
      → 競合 3 製品には無い、本アプリ独自の機能
 
@@ -372,8 +375,10 @@
   ✧ 字幕を mov_text の独立ストリームとして埋め込む書き出し  [P][R]
   ✧ CMX3600 EDL / FCPXML の読み込みと新規シーケンス化 (MCP import_edl / import_fcpxml)  [P][R]
     Wave 21 から、要素の入れ子が 128 段を超える FCPXML は「FCPXML の入れ子が深すぎます (上限 128 段)」で読み込みを止めます。
-    UNC (\\サーバー\共有\…) の素材は存在を確認せず、オフライン素材 (offline-<参照> の placeholder) として取り込んで警告を
-    出します。回避: NAS を共有のドライブ文字に割り当ててから、FCPXML を書き出し直してください (詳細は README の「Wave 21 の
+    UNC (\\サーバー\共有\…) の素材は、取り込みの後に共有ごとに 1 回 (全体で 3 秒まで) 確認し、応答する共有にあるファイル
+    は自動で再リンクします (Wave 22)。応答しない共有の素材は、オフライン素材 (offline-<参照> の placeholder) として取り
+    込んで警告を出します。回避: NAS を共有のドライブ文字に割り当ててから、FCPXML を書き出し直してください (詳細は README
+    の「Wave 21 の
     変更」の US-2101)。
   ✧ ディエッサー (トラック FX チェーン、既定 OFF)  [P][R][AE]
   ✧ チャンネルストリップ型オーディオミキサー Dock (フェーダー + メーター、既定 非表示)  [P][R]
@@ -821,8 +826,8 @@
      ・キーヤー後の alpha の運搬 (US-1211) は tlrender の描画経路 (書き出しと CPU プレビュー) の変更です。
        Exporter::doExport が applyEffectStack を直接呼ぶ旧書き出し経路との一致は、Wave 11 の roto の alpha (US-1004)
        と同じ扱いで、揃えていません。
-       VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:706 と、
-       プレビューの FX スタック VideoPlayer.cpp:4221) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで
+       VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:741 と、
+       プレビューの FX スタック VideoPlayer.cpp:4330) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで
        揃えていません。
      ・MainWindow が位置で持つサイドカーのうち 3 種 (3D テキストの設定、タイムリマップ、ライブブラシのアニメーション) と
        ブラシのアニメーションの項目は、roto と同じ張り替え (編集 1 回につき 1 回) に乗り、undo / redo の各段でも追従しま
@@ -1103,19 +1108,19 @@
        を mask で切ります (3D テキストはどちらでも mask で切られません)。プレビューの 3D テキストが proxy で描かれるの
        は、押し出し (extrusion) を有効にした 3D テキストだけです (Text3DLayer.cpp:390)。proxy になるのはフレームの長辺が
        しきい値を超えたときで (Text3DLayer.cpp:394)、しきい値は QSettings の preview/text3dProxyThreshold (既定 1280。
-       MainWindow.cpp:8788) です。proxy は縦横比を保ったまま min(1/2, 640 / 長辺) の倍率で縮小されるため、長辺は 640 以
+       MainWindow.cpp:8845) です。proxy は縦横比を保ったまま min(1/2, 640 / 長辺) の倍率で縮小されるため、長辺は 640 以
        下になり (Text3DLayer.cpp:382)、16:9 で長辺が 1280 を超えるフレーム (例: 1920 x 1080 や 3840 x 2160) では 640 x
        360 になります。書き出しはフル解像度で描くため、プレビューと書き出しが画素まで一致するのは、押し出しを無効にした
        3D テキストか、長辺がしきい値以下のフレームだけです。Echo の過去フレームには 3D テキストが入りません
        (US-1707)。 (Wave 20 で変更) ブラシは Echo / rolling shutter の過去フレームにも入ります
        (US-2010。Wave 20 の変更を参照)。
        プレビューの特殊合成経路 (buildSpecialClipComposite) は上位のトラックを手前に重ねます
-        (zOrder = トラック番号。MainWindow.cpp:9107、MainWindow.cpp:9150 で昇順に並べる)。
-        書き出しは V1 を手前にする V1-wins の重なり順です (TimelineFrameRenderer.cpp:3172)。このため、
+        (zOrder = トラック番号。MainWindow.cpp:9192、MainWindow.cpp:9235 で昇順に並べる)。
+        書き出しは V1 を手前にする V1-wins の重なり順です (TimelineFrameRenderer.cpp:3216)。このため、
        複数のトラックで不透明なレイヤーが重なる所ではプレビューと書き出しが異なります (3D テキストの有無によらず。US-1
        707 の run2 で maxDiff 117 を計測)。G13 の一致検証が確かめるのは、重ならない配置だけです。 (Wave 18 で変更) マッ
-       トが無いフレームでは V1 を手前に並べ替え、書き出しと同じ重なり順になります (MainWindow.cpp:9186-9198。zOrder = ト
-       ラック番号は MainWindow.cpp:9107 / :9150。US-1804。Wave 18 の変更を参照)。
+       トが無いフレームでは V1 を手前に並べ替え、書き出しと同じ重なり順になります (MainWindow.cpp:9271-9283。zOrder = ト
+       ラック番号は MainWindow.cpp:9192 / :9235。US-1804。Wave 18 の変更を参照)。
      ・書き出し例外: ブラシ (ブラシアニメーション) を持つクリップの書き出しにブラシが乗ります (全クリップ分。経路は 3D
        テキストと同じ)。従来はプレビューだけに乗り、書き出しには乗りませんでした。ブラシを設定していた既存プロジェクトの
        書き出し結果が変わります。ブラシは roto の後、grade / vfx / fx の前の素材段階で描かれるため、grade / fx を持つク
@@ -1125,8 +1130,8 @@
      ・プレビューのブラシは、通常のプレビューでは選択中のクリップ 1 本だけで、合成済みキャンバス (特殊合成) では全トラッ
        クの上に描かれます (HEAD の制限。書き出しは全クリップのブラシを素材段階で描くため異なります)。プ
        ロジェクトカメラの焼き込み (trueProjection) では、プレビューも書き出しと同じレンダラー (tlrender::renderFrameAt、
-       GLPreview.cpp:2171) で全クリップのブラシを素材段階で描き、選択中のクリップのブラシを重ねて描くことはしません
-       (GLPreview.cpp:1237。US-1708)。シェーダの grade と CPU の grade の画素一致は、平坦な入力での水準の確認
+       GLPreview.cpp:2208) で全クリップのブラシを素材段階で描き、選択中のクリップのブラシを重ねて描くことはしません
+       (GLPreview.cpp:1258。US-1708)。シェーダの grade と CPU の grade の画素一致は、平坦な入力での水準の確認
        (GradeKeyframeSelftest / offset_wheel_selftest) だけで、画素ごとの一致は確認していません。
        (Wave 18 で変更) 一時停止中は、条件を満たすタイムラインで特殊合成経路が全クリップのブラシを素材段階で描きます (条
        件と制限は Wave 18 の変更を参照。再生中は従来どおり選択クリップのみ。US-1805)。
@@ -1189,35 +1194,170 @@
      ・旧ビルドで Wave 17 のプロジェクトを開いて再保存すると、クリップの text3D / brush のキーが失われます (旧ビルドでも
        開けますが、新ビルドで保存した 3D テキストの設定とブラシのアニメーションは読み込まれず、再保存すると消えます)。
 
-■ Wave 21 (今回実装)  — 検証は 3.11 の Wave 21 分と、各機能の selftest 行
+■ Wave 22 (今回実装)  — 検証は 3.11 の Wave 22 分と、各機能の selftest 行
+  ❏ Wave 22 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記します。書き出し例外
+    は US-2207 の 1 つだけで、ほかは保存形式・操作の結果・プレビュー・UI・入力・開発用 selftest の変更です。
+    US-2200..US-2204 と US-2206..US-2216 の 16 story を実装し、US-2205 (上位トラックと入れ子の中の安定化) は実装せず
+    Wave 23 へ送りました。ほかに累積レビュー (US-2220) と、この文書 (US-2221) があります。MCP ツールは 61 本 (G1..G208)
+    のままです):
+  ❏ 書き出し例外 (US-2207): 非アクティブなシーケンスの旧形式の time remap の表 (クリップに inline のカーブが無い旧ファイ
+    ル) を、読込時に store clip の inline カーブ (timeRemapCurve) へ補完します
+    (ProjectFile::applyLegacyTimeRemapToStores 1 本を load と fromJsonString の末尾で呼びます。書き出しキューが持ってい
+    た私的な補完は削除しました)。ライブのタイムラインの書き出しでも旧形式の表が効くようになり、書き出しキューの file job
+    と一致します (Wave 21 では、開いた後に保存しないで行うライブの書き出しには効きませんでした)。変わるケースは、旧形式
+    の time remap の表を持つ非アクティブなシーケンス (入れ子で参照されるものなど) を含む旧ファイルのライブの書き出しだけ
+    です。保存形式 (版 2 のまま): そのような旧ファイルは、開いた後の最初の保存で store clip に timeRemapCurve が書かれ、
+    旧形式の表も残ります (旧 exe は新しいキーを無視します)。書き出しキューの file job と、旧形式の表を持たないプロジェク
+    トは変わりません (project-persist 14 gates: G14)。
+  ❏ プレビュー変更 (US-2200 / US-2201。書き出しは変わりません): GL のプレビューの LUT を書き出し (applyLut) と ±2/255 以
+    内で一致させます。3D LUT は texel 中心 ((c*(N-1)+0.5)/N) で標本化し、DOMAIN_MIN / DOMAIN_MAX は shader が色を domain
+    で変換してから引くので、元の 3D の表をそのまま texture に上げます。1D LUT は全点を N x 1 の RGB32F texture に上げ、
+    チャンネルごとに texel 中心で引きます。Wave 21 の toGpuGrid (1D と非既定 domain の LUT を 3D 格子に畳む処理) と
+    setLutTexture は削除しました。宣言した制限: 1D LUT の点数がその環境の GL_MAX_TEXTURE_SIZE を超えると、プレビューだけ
+    その幅に再標本化します (書き出しは全表を使います)。(lut-gl 6 gates: G1-G3 = 3D の texel 中心と DOMAIN、G4-G6 = 1D の
+    全点と再標本化。実 GL が必要。lut-import 12 gates: G12 を書き直し)
+  ❏ プレビュー変更 (US-2202。書き出しは変わりません): stabilizer の GL の行列と CPU の揺れを、プロキシなどのアップロード
+    した寸法でなく、解析時の source 寸法で作ります。解析時の寸法は ClipInfo の stabilizerSourceSize に持ち
+    (MotionStabilizer::analyzeFile が返す復号寸法)、PlaybackEntry で GL まで運びます。保存形式 (版 2 のまま): キーを持つ
+    クリップだけ、プロジェクトに任意のキー stabilizerSourceSize ([幅, 高さ]) を書きます (旧 exe は未知のキーとして無視し
+    ます)。プロキシで再生しても揺れの量が書き出しと一致し、フレーム寸法が変わった時はその表示の中で行列を作り直すので、
+    変わった直後のフレームから正しい行列です。特殊合成の層とブラシの寸法も同じ寸法を使います。宣言した制限: (1)
+    stabilizerSourceSize を持たない旧ファイルは、クリップを再解析するまで、通常のプレビューも特殊合成も復号した寸法で近
+    似します (書き出しは従来どおり)。(2) プロキシは常に 640x360 なので、16:9 以外の素材をプロキシで再生すると、縦横の移
+    動量の比が書き出しと違います。素材を差し替えると stabilizerSourceSize は消え、再リンクと trim では変わりません。比較
+    表示 (still-compare) を抜けた直後の二重の揺れは、調査の結果 Wave 21 の HEAD では再現しませんでした (コードは変えず、
+    stabilizer-export G9 で固定しています。stabilizer-export 12 gates: G7-G9)。
+  ❏ プレビュー変更 (US-2203。書き出しは変わりません): 通常のプレビューで V2 以上の層または文字 / 字幕のオーバーレイがあ
+    る時は、V1 の層 (sequenceIdx が active entry の層) のコピーだけを CPU で安定化し、黒い canvas と上の層は揺らしません
+    (Wave 21 までは、焼き込んだ合成全体を V1 の行列で揺らしていました)。「V1 の安定化は焼き込み済み」という事実は画像と
+    一緒に運び (displayFrame → 最後のソースフレーム → 合成フレームの cache)、GL には CPU で揺らしたフレームの時だけ空の
+    キーを渡します。V1 だけの時は従来どおり GL が書き出しと等価に揺らします。無効化した clip を含むタイムラインなどで通
+    る一括描画 (SSOT) 経路で、キー付きの V1 が二重に揺れていたのも解消しました。宣言: V1 の層を fit / VFX の後に揺らすの
+    で、contain / cover の枠は近似です。参考値 (gate にしません): 1920x1080 の V1 の warp (warpClampToEdge、
+    ARGB32_Premultiplied) は 5 回平均 28.4 ms です。(stabilizer-export G10-G11)
+  ❏ プレビュー変更 (US-2204。書き出しは変わりません): V1 のクリップが clip-local の CPU FX (エコーなど) を持つ時、プレ
+    ビューも書き出しと同じ安定化 → FX の順にします。Echo は各 sample をその sample 自身のソース時刻の行列で揺らし、この
+    時 GL には空のキーを渡します。Echo は常に clip-local の CPU 経路を通る (gpuPreviewSupportsEffect が除外する) ので、
+    GL 側の Echo は対象外です。(stabilizer-export G12)
+  ❏ プレビュー変更 (US-2206。書き出しは変わりません): 一時停止中の特殊合成 (ブラシ / マット / ブレンドの表示) にも、書き
+    出しと同じ関数 (tlrender::applyAdjustmentClipsAtTrack と tlrender::applyAdjustmentLayers) と同じ z 順で、調整 clip
+    と調整レイヤーを当てます。マット無しの Normal の重なりはトラックを後ろから 1 本ずつ描き、各トラックの z 位置で調整
+    clip を当て、global の調整レイヤーを最後に当てます (マットのある時は合成の後に当てます)。特殊合成の表示中は GL の
+    grade が切れているので、grade は CPU で当てます。調整 clip の grade は effects だけです (ClipInfo の colorCorrection
+    の値は、調整 clip では書き出しでも効きません。既存の挙動です)。global の調整レイヤーが有効な時刻は、書き出しと同じく
+    透明域が不透明になります。調整 clip が無いフレームは単一の合成のままです。特殊合成を使うかどうかの判定は変えていませ
+    ん。書き出しは closure を free 関数に委譲しただけで、render-fixture は IDENTICAL です。宣言: clip mask のある特殊合
+    成と、マット + 実効ブレンドの併用は従来経路のままです。(special-composite 22 gates: G21-G22)
+  ❏ 操作の結果が変わる (US-2208): ファイルを開く・自動保存の復元・最近使ったファイル・.veditor のドロップは、ファイルを
+    適用する前にトラックを既定の本数 (映像 1 本・音声 1 本) に戻してから始めます (MainWindow::applyLoadedProjectData の
+    先頭。ファイルの sidecar が Timeline に入る前です)。前のセッションの余りのトラックは残りません (Wave 21 は新規プロジ
+    ェクトだけ既定に戻しました)。ファイルにあるトラックの本数・名前・色・mute / solo / lock / hide とトラックごとの
+    sidecar (マットなど) は保たれます。(unsaved-prompt 14 gates: G13)
+  ❏ 操作の結果が変わる (US-2209): SRT / VTT の取り込みで、(1) BOM 無しの UTF-16 を、1 行目の ASCII の NUL バイトの並びで
+    判定し (厳密な UTF-8 と Shift_JIS の前)、encodingUsed を「UTF-16LE (BOM なし)」または「UTF-16BE (BOM なし)」にして、
+    既存の警告「文字コードを %1 として読みました」を出します (バイト数が奇数なら「。末尾 1 byte を無視しました」を足しま
+    す)。(2) 時刻の小数部は 1〜3 桁で、右を 0 で詰めます。(3) 時刻行の矢印 (-->) の前後は、空白無し・タブ・全角空白で
+    も構
+    いません。取り込み専用の寛容な解析で、公開の厳密な parseSrtTimestamp と SRT の書き出しは変わりません。宣言: 時刻行が
+    無く、本文に空白無しの矢印だけ (10-->20) がある block は、読み飛ばし警告「N ブロックを読み飛ばしました」に数えます
+    (従来は黙って捨てていました)。メニューの「字幕をインポート (SRT/VTT)...」は従来どおり UTF-8 のみです。
+    (subtitle-import 9 gates: G7-G9)
+  ❏ 操作の結果が変わる (US-2210): タイムコード焼き込みの設定が undo 点になります。ファイル > タイムコード焼き込み設定…
+    の OK は「タイムコード焼き込み」、MCP の set_project_option (option=timecodeBurnIn) は「タイムコード焼き込み (MCP)」
+    で、undo すると exporter とプレビューの設定が戻ります (既存の sidecarState の undo bridge の projectOptions キー。
+    MainWindow::commitTimecodeBurnInSettings 1 本)。MCP のツールにもダイアログにも明示的な未保存の設定は無くなり
+    (McpEditorTools.cpp の setWindowModified は 0 件)、undo で保存点に戻せば未保存が消えます。これで MCP の編集は全て
+    undo で clean に戻ります (明示的な未保存の残りはありません)。open_project は従来どおり確認しません。(mcp G208)
+  ❏ 操作の結果が変わる (US-2211): FCPXML の取り込みの後、オフラインの UNC 素材 (offline-<参照> の placeholder) を share
+    ごとに 1 回、UI スレッドの外の専用 pool で確認し、全体で 3 秒の期限内に答えた share の素材を再リンクします。応答した
+    share にあるファイルは正規化した \\server\share\... の実パスに再リンクし、警告を「再リンク: <パス>」に、取り込み完了
+    のダイアログに「再リンク: N 件」を出します。共有は応答するがファイルが無い素材は、通常の欠損素材 (placeholder でなく
+    実パス) として取り込み、警告は「見つかりません: <パス> (共有は応答)」です。応答しない share は従来どおり offline の
+    placeholder で、警告「オフライン素材 (ネットワークパスは確認しません): …」のままです。\\?\UNC\、//server、
+    file://host の形は正規化して確認し、\\.\ のデバイスパスは確認せず常にオフラインです (宣言)。応答しない host の最初の
+    確認は Windows で 20 秒程度かかり得ますが、取り込みは最大 3 秒で戻り、眠っている確認は後続を塞ぎません。取り込み
+    (importer) の結果自体は決定的で、確認は取り込みの後にだけ行います。保存形式の変更: 再リンクした素材の filePath は実
+    パスで保存されます。(fcpxml-import 43 gates: G43)
+  ❏ 入力 (US-2215): プロジェクトの JSON は ProjectFile::parseProjectJson 1 本で読みます (load と fromJsonString の両方
+    )。倍精度に収まらない数値は、Qt の JSON パーサに渡す前に読込時に clamp します (1e400 は ±DBL_MAX、1e-400 は 0。判定
+    は std::from_chars で locale に依存しません。clamp した個数はログに警告 (qWarning) を出します)。Wave 21 までは 1 つ
+    でもあるとファイル全体が読めなかったファイルが開けます (HEAD で開けなかったファイルが開けるだけで、既存の出力は変わ
+    りません)。clamp した値は Wave 21 の帯 (speed 1e-7..1e7 など) でさらに矯正されます。読めないファイルは、元のファイル
+    のバイト位置を付けた理由 (errorMessage の「JSON parse error at byte %1: %2」) で開けません。宣言: 他の 3 箇所の
+    fromJson (共同編集の共有、テンプレート、MainWindow の 1 箇所) と、sequence store の中の数値は対象外です。
+    (project-persist 14 gates: G12-G13)
+  ❏ 操作の結果が変わる (US-2216): ドラッグ変形 (「映像の変形」) と Effect Controls のモーション (「モーションの変更」)
+    の undo 点 (ドラッグを止めて 300 ms 後に確定する burst) は、書込みごとにその時点の Timeline の snapshot を捕まえ
+    (Timeline::captureUndoSnapshot)、burst の確定で Timeline::saveUndoSnapshot が積みます。ほかの編集の saveUndoState の
+    直前に、生きている burst を書込み順に確定します (Timeline::aboutToSaveUndoState)。時間切れの確定と同じ 1 本の
+    commitUndoBurst を通ります。300 ms 以内の続けての編集で、burst の点が落ちたり、2 つの編集が 1 段に混ざったり、重なっ
+    た 2 本の burst の 2 本目が落ちたりすることは無くなりました (undo 1 段ごとの内容で確かめています)。MCP の undo のよ
+    うな bypass で既に古くなった burst の点は、従来どおり積みません。宣言: (1) 交互の書込み (変形 → モーション → 変形)
+    では、各 burst の点はその burst の最後の snapshot で、最初の書込みの順に並びます。(2) absorbIntoCurrentUndoPoint の
+    吸収の窓に、burst への hook はありません。(unsaved-prompt 14 gates: G14)
+  ❏ 開発用 (US-2212 / US-2213 / US-2214。製品の挙動は変わりません): selftest::glContextUsable() (SelftestGl.h) を足し、
+    clip-lut は GL の context が無いと gate 10 を skip して異常終了しなくなりました。special-composite は GL を使わない
+    gate 10-13 / 17-20 を GL 無しでも実行し (GL の節だけを守ります)、nest-sequence は「(14 gates)」を宣言して件数を検証
+    できます。offscreen だけの FAIL は、font が解決しない時の text-spacing G2・caption-overlay-builder の check 8・
+    brush-export G4 のテキストのブラシを skip し、camera3d G15 の GL の比較を context の確認の後ろへ移して、閾値を変えず
+    に直しました (caption-overlay-builder の重複した check 番号は 0..18 に直しました)。connected-clip の G26 は snap 線
+    が消えるのを待って安定した窓で判定し、G45 に offset した入れ子の脚を足しました (45 gates のまま)。offscreen の実行は
+    引き続き参考で、合否には使いません (受け入れの証拠は実 GL の windows platform です)。
+  ❏ OTIO (Wave 21 の US-2012 の書き出しは Wave 22 で変えていません): DaVinci Resolve 18 以降での .otio の直接の読み込み
+    と、Premiere Pro での adapter 経由の読み込みは未検証です (外部アプリが手元に無いため)。検証済みなのは、
+    scripts/otio_validate.py (opentimelineio) が読めた結果だけです。
+  ❏ selftest: 新しい suite は lut-gl (6 gates) です。gate 数が増えた suite は、stabilizer-export 6 → 12 (G7-G9 = 解析時
+    の寸法、G10-G11 = V1 の層だけ、G12 = FX の順序と Echo)、special-composite 20 → 22 (G21-G22)、project-persist 11 → 14
+    (G12-G13 = 範囲外の数値と読めない理由、G14 = 旧形式の time remap)、unsaved-prompt 12 → 14 (G13 = 開く時の既定本数、
+    G14 = undo burst)、subtitle-import 6 → 9 (G7-G9)、fcpxml-import 42 → 43 (G43)、mcp 207 → 208 (G208 = タイムコード焼
+    き込みの undo) です。nest-sequence は 14 gates を宣言するようになりました (gate 数は変わりません)。lut-import は 12
+    のまま (G12 を書き直し)。clip-lut (10)、brush-export (18)、camera3d (17)、connected-clip (45)、clip-sidecar (21)、
+    still-compare (5)、track-ops (32)、autosave (5)、tcburn (9)、gate-tally (14) の gate 数は変わりません。
+    render-fixture は基点 77598aa の 15 ファイル、audio-fixture は 23 ファイルが IDENTICAL です (この fixture には、
+    stabilizer のキー・旧形式の time remap の表・調整レイヤー・UNC の素材が含まれません)。
+  ❏ Wave 22 で行わなかったもの (実装済みではありません。Wave 23 へ送ります): 上位トラックと入れ子の中の安定化 (US-2205。
+    書き出しの stabilizer は V1 限定、入れ子の中は安定化しない、という Wave 21 の挙動のままです。特殊合成とプレビューも
+    同じです)、マット + 実効ブレンドを持つ特殊合成経路 (プレビューも書き出しもブレンドを捨てていて一致しています)、GL プ
+    レビューの入れ子のサイドカー (PlaybackEntry にシーケンス id が無いため)、保存と読み込みの本体の重複、Echo の過去フレ
+    ームへの 3D テキスト、再生中のブラシの全クリップ描画、ブレンドの CPU 負荷、ヌルの子の 3D 追従、MOGRT、ジェネレーター
+    / OTIO の読み込み / AAF、長い文字列の押し出しの頂点予算、Resolve / Premiere での OTIO の読み込みの検証です。clip
+    mask のある特殊合成は従来経路のままです。
+  ❏ Wave 22 で宣言した制限 (一覧): 旧ファイルの stabilizer 寸法の近似 (再解析まで)、16:9 以外の素材をプロキシで再生した
+    時の stabilizer の縦横比、1D LUT の再標本化 (GL_MAX_TEXTURE_SIZE 超のプレビューだけ)、V1 の層を fit / VFX の後に揺ら
+    す近似、特殊合成の調整 clip は effects だけ、時刻行の無い block の 10-->20 の警告、\\.\ のデバイスパスは常にオフライ
+    ン、共有は応答するがファイルが無い素材は通常の欠損素材、範囲外の数値の clamp の対象外 (他の 3 箇所の fromJson と
+    sequence store の中)、交互の undo burst、absorbIntoCurrentUndoPoint の窓、offscreen は参考値です。
+
+■ Wave 21  — 検証は 3.11 の Wave 21 分と、各機能の selftest 行
   ❏ Wave 21 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記します。書き出し
     例外は US-2102 / US-2103 / US-2105 / US-2110 / US-2111 / US-2112 の 6
     つだけで、ほかは保存形式・操作の結果・プレビュー・UI・入力上限・新機能の変更です。US-2100..US-2113 の 14 story
-    を実装し、deferOrder で Wave 22 へ送った story はありません。MCP ツールは 61 本 (G1..G207) のままです):
+    を実装し、deferOrder で送った story はありません。MCP ツールは 61 本 (G1..G207) のままです):
   ❏ 書き出し例外 (US-2102): .cube の 1D LUT は最後の区間 (最後の 2 行の間) も補間し、白が最後の行に届きます。1D LUT
     を持つ全プロジェクトの白付近の書き出しが変わります (意図した描画変更で、Wave 20
     の既知の制限「最後の区間は補間されない」を解消します)。DOMAIN_MIN / DOMAIN_MAX も読み、入力を domain
     で正規化してから引きます (max が min 以下の domain は拒否します)。非既定の DOMAIN を持つ .cube
     の書き出しも変わります。3D で既定の domain の LUT は変わりません。プレビュー変更: GL のプレビューは 1D LUT
     と非既定 domain の LUT を、書き出しと同じサンプラーで標本化した 3D 格子 (toGpuGrid) にして渡します (従来は 1D
-    の表を size の 3 乗の 3D として読み、結果が不定でした)。既知の制限 (Wave 22): 1D LUT のプレビューは軸あたり最大
-    65 標本の格子に畳むので、細かい 1D の表は標本の間が補間されます (書き出しは全表を使います)。domain が約 1/64
-    より狭い 3D LUT は、domain の端でプレビューが大きくずれます (書き出しは元の LUT を使うので正しい)。プレビューの
-    3D LUT の標本化は、既存のすべての 3D LUT で texel 中心の補正が無く、書き出しと半 texel 分ずれます (lut-import 12
+    の表を size の 3 乗の 3D として読み、結果が不定でした)。Wave 22 で変更: GL のプレビューの LUT は texel 中心の補正と
+    DOMAIN の変換を shader で行い、1D LUT は全点を texture に上げます。toGpuGrid の 3D 格子は無くなり、細かい 1D の表と
+    狭い domain の 3D LUT のプレビューのずれも解消しました (「Wave 22 の変更」の US-2200 / US-2201) (lut-import 12
     gates: G7 を変更、G8-G12)。
   ❏ 入力の上限 (US-2100): PSD (AffinityPsdImporter) の取り込みで、luni (Unicode のレイヤー名)
     と付加データのブロックの終わりを実ファイルサイズとレイヤー情報の終わりで抑え、Unicode の層名は 65536
     文字までにします (超える名前は読まず、層は Pascal 名のままです)。長さを偽った壊れた PSD
     で巨大なメモリを確保しません (psd-import 7 gates)。
   ❏ 入力の上限 (US-2101): NAS など UNC の素材を含む FCPXML は、先に NAS を共有のドライブ文字に割り当ててから FCPXML
-    を書き出し直してください (UNC のままだとオフライン素材になります。詳細は後述)。FCPXML の要素の入れ子は 128
+    を書き出し直してください (UNC のままだと、応答する共有は Wave 22 から自動で再リンクされ、応答しない共有はオフライン
+    素材になります。詳細は後述)。FCPXML の要素の入れ子は 128
     段までで、超えると「FCPXML の入れ子が深すぎます (上限 128 段)」で読み込みを止めます (従来は 1000 段以上の gap /
     lane の入れ子でクラッシュしました)。ネットワーク上の素材 (UNC の \\server\share\... と file://host/...。区切りが
-    / や混在の形も同じ。\\?\UNC\ と \\.\ の形もオフライン扱いで、\\?\C:\ はローカル扱い) は存在を確認せず
-    (応答しない共有では 20 秒以上固まっていました)、オフライン素材 (offline-<参照> の placeholder)
+    / や混在の形も同じ。\\?\UNC\ と \\.\ の形もオフライン扱いで、\\?\C:\ はローカル扱い) は取り込みの中では存在を確認せ
+    ず (応答しない共有では 20 秒以上固まっていました)、オフライン素材 (offline-<参照> の placeholder)
     として取り込み、警告「オフライン素材 (ネットワークパスは確認しません): <元のパス> →
-    <placeholder>」に元のパスを出します。自動の再リンクはありません (手動で再リンクします)。保存形式の変更: UNC
-    の素材の filePath は placeholder だけが保存され、元のパスは保存ファイルに残りません
+    <placeholder>」に元のパスを出します。Wave 22 (US-2211) から、取り込みの後に share ごとに確認して自動で再リンクします
+    (「Wave 22 の変更」)。応答しない share は placeholder のままで、手動で再リンクします。保存形式の変更: 応答しない
+    share の UNC の素材の filePath は placeholder だけが保存され、元のパスは保存ファイルに残りません
     (警告にだけ出ます)。(fcpxml-import 42 gates: G41 = 2000 段の入れ子、G42 = UNC の 5 形)。
   ❏ 書き出し例外 (US-2103): 保存済み・手編集のプロジェクトを読み込むとき、数値を不変条件の帯に収めます
     (非数・無限・帯の外は既定値か帯の端)。speed は 1e-7..1e7 (EDL が作れる 1.16e-7..8.64e6
@@ -1227,9 +1367,9 @@
     tracking の結果はクリップごとに maskTracking として保存します (空なら省略、1 クリップ 262144
     領域まで、超えると読み込み時に捨てます)。従来は保存して再読み込みすると tracking が消えて mask
     が静止しましたが、プレビューも書き出し (書き出しキューの file job を含む) も保存した tracking で動きます。版は 2
-    のまま、旧ファイルは読め、旧 exe は maskTracking を未知のキーとして落とします。既知の制限 (Wave 22): 1e-400 や
-    1e400 のように倍精度に収まらない数値が 1 つでもあると、Qt の JSON パーサがファイル全体を読めません
-    (従来どおり)。(project-persist G8-G9 (最終 11 gates)、clip-sidecar 21 gates: G21)
+    のまま、旧ファイルは読め、旧 exe は maskTracking を未知のキーとして落とします。Wave 22 で変更: 1e-400 や 1e400 のよ
+    うに倍精度に収まらない数値は、読込時に 0 / ±DBL_MAX にして読み込めます (「Wave 22 の変更」の US-2215)。
+    (project-persist G8-G9 (最終 11 gates)、clip-sidecar 21 gates: G21)
   ❏ 操作の結果が変わる (US-2104): SRT / VTT の取り込みはバイト列として読み、文字コードを BOM (UTF-8 / UTF-16) →
     厳密な UTF-8 → Shift_JIS → システムのコードの順に判定します。SRT の取り込みは時刻のミリ秒の区切りに「,」のほか「.
     」も受け付け (SRT の書き出しと厳密な parseSrtTimestamp は変わりません)、VTT の cue
@@ -1240,9 +1380,9 @@
     した」)、ブロックを読み飛ばした時 (「N ブロックを読み飛ばしました」)、VTT に WEBVTT ヘッダが無い時 (「WEBVTT ヘッダ
     がありません」) に、「字幕の取り込み」の情報ダイアログを 1 回出します (BOM 付きの UTF-8 / UTF-16 と、BOM 無しの正し
     い UTF-8 では、文字コードを理由とする警告は出ません。ブロックの読み飛ばしや WEBVTT ヘッダの欠落による警告は出ま
-    す)。既知の制限 (Wave 22): BOM 無しの UTF-16 (UTF-16 として判定されず、文字化けや字幕 0 件になることがあり、警告
-    も保証されません)、ミリ秒 2 桁、矢印 (-->) の前後のタブには対応していません。メニューの「字幕をインポート (SRT/VTT)...」
-    は従来どおり UTF-8 のみを読みます (subtitle-import 6 gates)。
+    す)。Wave 22 で変更: BOM 無しの UTF-16 と、ミリ秒が 1〜3 桁の時刻、矢印 (-->) の前後のタブにも対応しました (「Wave
+    22 の変更」の US-2209)。メニューの「字幕をインポート (SRT/VTT)...」
+    は従来どおり UTF-8 のみを読みます (subtitle-import 6 gates。Wave 22 で 9 gates)。
   ❏ 操作の結果が変わる (US-2105): 自動保存は原子的に書き (QSaveFile。書き終えてから古い物を整理します)、直前に書いた
     内容か起動時の最新の自動保存と同じなら書きません。ファイル名は project_autosave_utc_<UTC の
     yyyyMMdd_HHmmss_zzz>_<3 桁の連番>.veditor で、整理と復元は名前順 (最新が最後)
@@ -1268,8 +1408,9 @@
     (従来は明示的に未保存にしていて、undo で戻しても確認が出ました)。対象は import_media / add_track / remove_track
     / move_track / set_track_locked / set_track_property / move_clip / connect_clip / disconnect_clip / replace_clip /
     relink_media / dynamic_zoom の 12 ツールで、これらのツールは従来から undo 点を積み (set_track_locked と
-    set_track_property は US-2106 のトラックの undo 点)、明示的な未保存の設定を外しました。undo に入らない状態を変える
-    set_project_option (option=timecodeBurnIn) だけは明示的に未保存にし、undo で戻しても未保存のままです。open_project
+    set_track_property は US-2106 のトラックの undo 点)、明示的な未保存の設定を外しました。set_project_option
+    (option=timecodeBurnIn) も、Wave 22 (US-2210) から undo 点「タイムコード焼き込み (MCP)」を積み、undo で保存点に戻せ
+    ば未保存が消えます (Wave 21 では undo の外の状態として扱い、undo で戻しても未保存が残りました)。open_project
     は従来どおり未保存の確認をしません。(mcp G207)
   ❏ 操作の結果が変わる (US-2108): 未保存になる (undo 点を積むか未保存にする)
     操作を足しました。映像ソースのドラッグ変形 (「映像の変形」)、Effect Controls のモーション
@@ -1282,8 +1423,9 @@
     12 gates: G12)
   ❏ 操作の結果が変わる (US-2109): ファイル > 新規プロジェクト... は、トラックを既定の本数 (映像 1 本・音声 1 本)
     に戻し、名前・色・mute / solo / lock / hide も既定にします (Timeline::resetTracksToDefault。Wave 20
-    では前のプロジェクトのトラックが残りました)。プロジェクトを開くときはファイルにあるトラックを読み込むだけで、フ
-    ァイルの本数より多い余りのトラックは縮めません (Wave 22)。(unsaved-prompt G8)
+    では前のプロジェクトのトラックが残りました)。プロジェクトを開くときも、Wave 22 (US-2208) からファイルを適用する前に
+    トラックを既定の本数に戻すので、前のプロジェクトの余りのトラックは残りません (「Wave 22 の変更」)。(unsaved-prompt
+    G8)
   ❏ 書き出し例外 (US-2110): 調整レイヤーをシーケンスごとに持ちます。シーケンスの切り替えと、切り替えをまたぐ undo
     で、離れるシーケンスの調整レイヤーを roto / matte / parent のサイドカーと同じく退避して戻し、層の id
     はシーケンスをまたいでも重ならないようにします。保存では、アクティブでないシーケンスの層をそのシーケンスの項目
@@ -1300,25 +1442,20 @@
     StabilizerWarp (stabwarp::inverseMatrixUv) の 1 か所にあり、GL のプレビューはその 9 値をコピーします。プレビュー変
     更: 特殊合成 (一時停止中のブラシ / マット / ブレンド) の表示中は、合成全体を GL で揺らす代わりに V1 の層だけを CPU
     で同じ段階 (ブラシの後・FX の前) に安定化します。キーの無いクリップ、通常のプレビューの行列、V2 以上のキーは変わりま
-    せん (stabilizer-export 6 gates)。
-  ❏ 宣言した差 (US-2111): プレビューと書き出しの安定化は同じではありません。(1) 通常のプレビューは、V2
-    以上の層または文字 / 字幕のオーバーレイがある時、焼き込んだ合成全体を V1 の行列で揺らします
-    (従来と同じ)。書き出しは V1 の層だけを安定化するので、上の層と字幕は、プレビューでは動いて書き出しでは動きません。
-    (2) 特殊合成の表示中だけ、プレビューも V1 の層だけを安定化するので、同じフレームでも、一時停止中の特殊合成の表示
-    と再生中で見え方が違うことがあります。(3) V1 のクリップの CPU 専用 FX は、プレビューが FX →
-    安定化、書き出しが安定化 → FX の順で、位置に依存する FX (ビネットなど) で差が出ます。(4) Echo
-    は、プレビューが現在時刻の 1 つの行列を結果全体に掛け、書き出しは各 sample 時刻の行列を各 sample に掛けます。(5)
-    寸法が変わった最初の 1 フレームは、GL の行列が前のフレームの寸法で作られます。(6) 比較表示 (still-compare)
-    を抜けた直後、特殊合成が表示されている間は、V1 が二重に揺れることがあります。(7)
-    プロキシで復号したプレビューでは、揺れがプロキシの縮小率の倍に大きくなります (既定のプロキシ 1/2 で 2
-    倍。書き出しは原寸で正しい)。いずれも Wave 22 の課題で、gate では揃いを主張していません。
+    せん (stabilizer-export 6 gates。Wave 22 で 12 gates)。
+  ❏ 宣言した差 (US-2111): Wave 22 の前は、プレビューと書き出しの安定化に次の差がありました。(1) V2 以上の層がある時の合
+    成全体の安定化、(2) 特殊合成の表示中との見え方の違い、(3) V1 の CPU 専用 FX の順序、(4) Echo の行列、(5) 寸法が変わ
+    った直後のフレーム、(7) プロキシの縮小率の倍の揺れは、Wave 22 で解消しました (US-2202 / US-2203 / US-2204。「Wave 22
+    の変更」)。(6) 比較表示 (still-compare) を抜けた直後の二重の揺れは、調査の結果 Wave 21 の HEAD では再現しませんでし
+    た (stabilizer-export G9 で固定)。残る差は、上位トラックと入れ子の中が書き出しでもプレビューでも安定化されないこと
+    (Wave 23 へ送りました)、旧ファイルの寸法の近似、16:9 以外のプロキシ再生です。
   ❏ 書き出し例外 (US-2112): 入れ子のシーケンスの描画が、参照先のシーケンスの退避した roto / matte / parent
     のサイドカーを使います (ライブの書き出しも書き出しキューの file job
     も。従来は無視していました)。退避表はフレームごとに 1 回取り込み、file job は time remap の旧形式のエントリ
-    (クリップに inline のカーブが無い旧ファイル) も復元します。サイドカーの無い入れ子は変わりません。制限 (Wave 22):
-    GL のプレビュー (平坦化した computePlaybackSequence) は入れ子のサイドカーを使いません。旧形式の time remap
-    のエントリは、ファイルを開いて保存せずに直後に行うライブの書き出しには効かず、書き出しキューの file job
-    でだけ効きます (connected-clip 44 gates: G42-G44)。
+    (クリップに inline のカーブが無い旧ファイル) も復元します。サイドカーの無い入れ子は変わりません。制限 (Wave 23 へ送
+    りました): GL のプレビュー (平坦化した computePlaybackSequence) は入れ子のサイドカーを使いません (PlaybackEntry にシ
+    ーケンス id が無いため)。旧形式の time remap のエントリは、Wave 22 (US-2207) から開いた時に補完され、ライブの書き出
+    しにも効きます (connected-clip 44 gates: G42-G44)。
   ❏ プレビュー変更 (US-2113。書き出しは変わりません): トランジションの重なり区間で、ブラシのプレビュー (GL の
     progress と一時停止中の特殊合成) が、書き出しと同じ規則 (tlrender::brushActiveClipsAt = 重なり区間と
     selectClipOnTrack) でそのトラックの有効なクリップを選びます (従来はプレビューと書き出しで食い違うことがありまし
@@ -1339,14 +1476,18 @@
     <パス>: <理由>」を 1 行出し、gate は増えません。未設定か空なら何も残さず、gate は増えません。otio-export 9 gates)。
   ❏ 新機能 (開発用スクリプト): scripts/selftest_offscreen.ps1 は、QT_QPA_PLATFORM=offscreen で selftest の suite を 1 本
     ずつ別のプロセスで実行し、suite・終了コード・PASS / FAIL / SKIP の行数・秒数の表 (OutDir の results.tsv。行数は行頭
-    が PASS / FAIL / SKIP の行だけを数えるので、[INFO] [x] PASS … の形で出す suite (aces-color など) は 0 になります) を
-    出します。offscreen では clip-lut が GL texture で異常終了するため --selftest=all は使えません。
+    の [INFO] [x] のような角括弧の前置きをいくつでも飛ばして、PASS / FAIL / SKIP で始まる行を数えます。Wave 21 の時点
+    では行頭がその語の行だけを数えていたので、[INFO] [x] PASS … の形で出す suite (aces-color など) は 0 でした (Wave
+    22 の US-2212 で変更)) を出します。Wave 21 の時点では、offscreen で clip-lut が GL texture で異常終了するため
+    --selftest=all は使えませんでした (Wave 22 の US-2212 で clip-lut は GL の context が無いと
+    gate 10 を skip するようになりました)。
     引数は -ExePath (既定 build\Release\v-simple-editor.exe)、-OutDir (既定 .omc\state\offscreen)、-Filter (suite 名をカンマで区切る。空なら plain な suite を全部)、-TimeoutSec (10〜86400、既定 300)、-McpPort (0 より大きいと VEDITOR_MCP_PORT に設定) です。基点 68621db での測
     定 (279 suite): 269 が PASS、4 が SKIP 付きの PASS、3 が FAIL、3 が終了コード非 0 (うち 1 つは異常終了)。この分類は
     終了コードと各 suite の最後の集計行によるもので、表の PASS の列からは出していません。この表は参考で、合否には使いま
-    せん (受け入れの証拠は実 GL の windows プラットフォームでの実行です)。offscreen の FAIL / SKIP の修正は行っていませ
-    ん (Wave 22)。
-  ❏ selftest: 新しい suite は subtitle-import (6 gates)、autosave (5)、stabilizer-export (6) です。gate 数が増えた
+    せん (受け入れの証拠は実 GL の windows プラットフォームでの実行です)。offscreen だけの FAIL の修正は Wave 22 で行い
+    ました (「Wave 22 の変更」の開発用の項)。
+  ❏ selftest: 新しい suite は subtitle-import (6 gates。Wave 22 で 9)、autosave (5)、stabilizer-export (6 gates。
+    Wave 22 で 12) です。gate 数が増えた
     suite は、psd-import 6 → 7 (G7)、fcpxml-import 40 → 42 (G41-G42)、lut-import 7 → 12 (G7
     を変更、G8-G12)、project-persist 7 → 11 (G8-G9 = 数値と version と tracking、G10-G11 =
     シーケンス別の調整レイヤー)、clip-sidecar 20 → 21 (G21)、unsaved-prompt 9 → 12 (G7 を変更、G8 を assert
@@ -1357,14 +1498,15 @@
     68621db の 15 ファイル、audio-fixture は 23 ファイルがIDENTICAL です (この fixture には、1D LUT /
     DOMAIN・保存を経由する字幕スタイル・複数シーケンスの調整レイヤー・stabilizer
     のキー・入れ子のサイドカーが含まれません)。
-  ❏ Wave 21 で行わなかったもの (実装済みではありません。Wave 22 へ送ります): 通常のプレビューでの V1
-    の層だけの安定化 (合成全体を揺らしたまま)、V2 以上と入れ子の安定化、GL プレビューの入れ子のサイドカー、Open
-    Project の余りのトラックの縮小、UNC 素材の自動再リンク、プレビューの LUT の texel 補正と細かい 1D LUT / 狭い
-    domain の精度、BOM 無しの UTF-16 の字幕、倍精度に収まらない数値で文書全体が読めない件、offscreen の FAIL
-    の修正、Resolve / Premiere での OTIO の読み込みの検証、保存と読み込みの本体の重複、および Wave 20 から持ち越した
-    Echo の過去フレームへの 3D テキスト、再生中のブラシの全クリップ描画、調整レイヤー / clip mask / マット +
-    実効ブレンドを持つ特殊合成経路、ブレンドの CPU 負荷、ヌルの子の 3D 追従、MOGRT、ジェネレーター / OTIO の読み込み
-    / AAF、長い文字列の押し出しの頂点予算です。
+  ❏ Wave 21 で行わなかったもの (当時は実装済みではありませんでした。Wave 22 の結果: 解消したのは、通常のプレビューでの
+    V1 の層だけの安定化 (US-2203)、Open Project の余りのトラックの縮小 (US-2208)、UNC 素材の自動再リンク (US-2211)、プレ
+    ビューの LUT の texel 補正と細かい 1D LUT / 狭い domain の精度 (US-2200 / US-2201)、BOM 無しの UTF-16 の字幕
+    (US-2209)、倍精度に収まらない数値で文書全体が読めない件 (US-2215)、offscreen の FAIL の修正 (US-2212 / US-2213)。残
+    りは Wave 23 へ送ります): V2 以上と入れ子の安定化 (US-2205)、GL プレビューの入れ子のサイドカー、Resolve / Premiere
+    での OTIO の読み込みの検証 (手元に無く未検証)、保存と読み込みの本体の重複、および Wave 20 から持ち越した Echo の過去
+    フレームへの 3D テキスト、再生中のブラシの全クリップ描画、clip mask / マット + 実効ブレンドを持つ特殊合成経路 (調整
+    レイヤーと調整 clip は Wave 22 で対応しました)、ブレンドの CPU 負荷、ヌルの子の 3D 追従、MOGRT、ジェネレーター /
+    OTIO の読み込み / AAF、長い文字列の押し出しの頂点予算です。
 
 ■ Wave 20 (実装済み)  — 検証は 3.11 の Wave 20 分と、各機能の selftest 行
   ❏ Wave 20 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記します。書き出し例外
@@ -1394,9 +1536,10 @@
     調整レイヤー、プロジェクト設定ダイアログで何かを変
     えて OK した時 (何も変えずに OK しても未保存になりません。サイズの変更は undo 側に積まれます)、ダッキング・HDR・AI・
     ACES・Dolby Vision・放送字幕・planar / motion tracker・カメラモーション・メディアプール取り込み・ラウドネス正規化・
-    smart reframe・storyline 切替・VFX プレビューの各設定とダイアログ、MCP の set_project_option (timecodeBurnIn)
-    です (Wave 21 で変更: ほかの MCP の編集は undo 点を積むので、undo で保存点に戻せば未保存が消えます。トラックの
-    mute / solo / lock / hide も undo に入りました)。自動保存から復元した直後は未保存です。メディアを再リンクして開
+    smart reframe・storyline 切替・VFX プレビューの各設定とダイアログです (Wave 21 で変更: MCP の編集は undo 点を積むの
+    で、undo で保存点に戻せば未保存が消えます。トラックの
+    mute / solo / lock / hide も undo に入りました。Wave 22 で、MCP の set_project_option (timecodeBurnIn) とタイムコー
+    ド焼き込み設定のダイアログも undo に入りました)。自動保存から復元した直後は未保存です。メディアを再リンクして開
     いた直後は未保存
     で、再リンクを「元に戻す」で戻しても保存するまで未保存のままです。シーケンスの切替は、Wave 21
     から未保存になります。undo はトラックの mute / solo / lock / hide を戻します (Wave 21
@@ -1464,7 +1607,7 @@
     は通りません。変わるのは、ブラシを持つクリップに Echo / ローリングシャッター補正を掛けた書き出しと一時停止中のプレビ
     ューだけで、ブラシの無いクリップは変わりません (render-fixture 15 ファイルと audio-fixture 23 ファイルが
     IDENTICAL)。コストは、1 フレームあたり applyClipBrushSource が (1 + 標本数) 回走り、1080p で 1 回あたり約 5 ms
-    です。3D テキストは Echo の過去サンプルに写りません。再生中の VideoPlayer の Echo (VideoPlayer.cpp:4153)
+    です。3D テキストは Echo の過去サンプルに写りません。再生中の VideoPlayer の Echo (VideoPlayer.cpp:4260)
     は対象外で、再生中のブラシは従来どおり GL オーバーレイの選択クリップだけです (special-composite 18 → 20
     gates、G19-G20。brush-export の G2 の Echo の脚は新しい挙動に合わせて期待を書き換え、gate 数 17 は不変)。
   ❏ 解消 (US-2011。プレビューだけの変更で、書き出しは変わりません): 一時停止中のブラシのプレビューは、再生ヘッドが選択ク
@@ -1497,29 +1640,29 @@
     追従、ジェネレーター (bars / solid / slate / countdown)・OTIO の読み込み・AAF、監査の Medium (FCPXML
     の再帰の深さ、AutoSave の非 atomic な書き込み、字幕スタイルの 7 項目、
     maskTrackingData が保存されない)、監査の Low 全件 (AUDIT-REPORT.md)、スタビライザーの局所時刻。
-  ❏ Wave 21 の持ち越しにしたもの (Wave 20 の持ち越し。Wave 21 で対応したのは「Wave 21 の変更」の項目で、残りは Wave 22
-    へ送りました): 上の「行わなかったもの」のうち、監査の Medium (FCPXML の再帰の深さ = US-2101、AutoSave の非 atomic な
+  ❏ Wave 21 の持ち越しにしたもの (Wave 20 の持ち越し。Wave 21 で対応したのは「Wave 21 の変更」の項目で、残りの扱いは
+    「Wave 22 の変更」にあります): 上の「行わなかったもの」のうち、監査の Medium (FCPXML の再帰の深さ = US-2101、
+    AutoSave の非 atomic な
     書き込み = US-2105、字幕スタイルの 7 項目 = US-2105 で今は 12 項目、maskTrackingData が保存されない = US-2103) と、
     監査の Low のうち SRT の文字コードと時刻 (US-2104)、.cube の DOMAIN_MIN / MAX (US-2102)、数値の検証と version > 2 の
-    拒否 (US-2103)、UNC の素材パス (US-2101) は Wave 21 で解消しました。Wave 22 へ送るのは、監査の残りの Low (未知のキー
+    拒否 (US-2103)、UNC の素材パス (US-2101) は Wave 21 で解消しました。Wave 23 へ送るのは、監査の残りの Low (未知のキー
     を保存で落とす件、保存と読込の本体の複製) と、その他の未解決の項目 (MOGRT、ブレンドの CPU 負荷 (1080p の Multiply が
     約 20.55 ms。24 バンド並列の試作は 4.15 ms)、再生中のブラシ (1080p で 1 フレーム約 252.5 ms)、長い文字列が押し出しの
-    頂点予算でベベル無しになる件、offscreen の FAIL / SKIP の修正 (表を出すスクリプトは Wave 21 で追加。上の「行わなかっ
-    たもの」))。
+    頂点予算でベベル無しになる件。offscreen の FAIL の修正は Wave 22 で行いました)。
 
 ■ Wave 19 (実装済み)  — 検証は 3.11 の Wave 19 分と、各機能の selftest 行
   ❍ MCP ツールを 4 本追加 (61 ツール)。mcp selftest は G1..G206 (G201-G206 が追加)。後回し: なし (全 story
     が受け入れ済み。deferOrder で Wave 20 へ送った story は無い)。書き出し例外は US-1901 / US-1903 / US-1908
     の 3 つだけ。
   ❍ 書き出し例外 (US-1901): クリップ音量の上限 (静的な volume とエンベロープ点) を、プレビューと同じ 4.0
-    (+12 dB) に統一しました (audio::kMaxClipGain、PlaybackTypes.h:30)。従来のプレビューは 4.0 まででしたが、
+    (+12 dB) に統一しました (audio::kMaxClipGain、PlaybackTypes.h:31)。従来のプレビューは 4.0 まででしたが、
     書き出しは 2.0 で頭打ちでした (書き出しの静的 volume は AudioExportMix.cpp:51、エンベロープ点は
     AudioExportMix.cpp:133 が clampClipGain で上限を掛けます)。変わるのは、静的な volume またはエンベロー
     プ点が 2.0 を超えるクリップ (ノーマライズ +12 dB、ネスト 2x2、手編集) の書き出し音量だけで、プレビューと
     同じ最大 4 倍になります。すべて 2.0 以下のプロジェクトの書き出しは変わりません (render-fixture 15 ファイ
     ルと audio-fixture 23 ファイルが基点 5d7b69e と IDENTICAL。clip-sidecar G12)。クリップ音量のスライダー
     (AudioClipEditor の「音量」) は 0〜400 %、スピンは 0〜4、MainWindow の「Set Clip Volume」ダイアログ
-    (MainWindow.cpp:12255) は 400 % まで、MCP の set_clip_property の volume は 0..4 (4 を超えると「volume
+    (MainWindow.cpp:12410) は 400 % まで、MCP の set_clip_property の volume は 0..4 (4 を超えると「volume
     out of range [0, 4]」で拒否) で、プレビュー / 書き出し / MCP / 音量ダイアログがすべて 4.0 で一致します。
   ❍ 操作の結果が変わる (US-1900、書き出し例外ではない): 自動ダッキングを適用 (再適用を含む) したとき、クリッ
     プが持っている既存のエンベロープ点がダッキング曲線で下げられ、ダッキングの格子の外にある既存点も、
@@ -1553,9 +1696,9 @@
     の元があるタイムラインで VFX のブレンドが実効のクリップが再生ヘッド時刻にあるときは、従来経路のままです
     (マットのあるフレームは書き出しもブレンドを無視します)。書き出しとの一致は 8-bit (RGBA8888) のバイト比較
     で確かめています (special-composite G17-G18、brush-export G14)。1080p の Multiply でブレンド 1 レイヤー
-    あたり約 22 ms の CPU ブレンドが増えます (GPU やタイル化は Wave 22 候補)。
+    あたり約 22 ms の CPU ブレンドが増えます (GPU やタイル化は Wave 23 候補)。
   ❍ プレビュー (US-1906。書き出しは変わりません): 一時停止中に特殊合成経路を使うかどうかの判定
-    (timelineBrushWantsSpecialPath(timeline, timelineSec)、TimelineFrameRenderer.cpp:1997) は、タイムライ
+    (timelineBrushWantsSpecialPath(timeline, timelineSec)、TimelineFrameRenderer.cpp:2041) は、タイムライ
     ン全体ではなく再生ヘッド時刻に有効なクリップだけで行います。10 秒以降にだけ調整クリップがあっても 1 秒の
     時点の経路は変わりません (従来は全体を見て従来経路に倒れていました)。トランジションの窓 (クリップ自身の
     leadIn / trailOut の窓と、隣のクリップのトランジションが重なる窓) では、トランジションの種類・クリップの
@@ -1583,7 +1726,7 @@
     ますが評価されません。wiggle と式は 3D には掛かりません。「カメラへ自動回転」(autoOrientToCamera) はキー
     フレームした回転も静的な回転と同じく上書きします。ワールド X / Y のキーフレームの単位は静的な値と同じキ
     ャンバス px です。プレビューでは、一時停止中の GL プレビュー (静的な経路とカメラへ自動回転の経路。
-    GLPreview.cpp:158) と特殊合成のライティング入力 (MainWindow.cpp:9108) が評価値を使い、書き出しと一致
+    GLPreview.cpp:158) と特殊合成のライティング入力 (MainWindow.cpp:9193) が評価値を使い、書き出しと一致
     します (keyframe-anim-parity G12)。モーションセクションの位置 Z / 回転のツールチップは「プロジェクトカメ
     ラ (trueProjection) が ON の時だけ描画されます」です (MotionSectionWidget.cpp:108-111)。
   ❍ プレビュー (US-1910。書き出しは変わりません): プロジェクトカメラの真の透視投影 (trueProjection) が OFF
@@ -1626,14 +1769,15 @@
     は、クリップ局所時刻にこのオフセットを足した時刻で評価されるので (applyDynamicOverlay、ClipAnim.cpp:739、1
     か所)、分割の前後で位相と time が続きます (分割の全経路。もう一度分割すると 1.0 → 1.5 のように加算されます)。式の
     audioLevel() はクリップ局所時刻のままで、リンク音声のレベルはずれません。オフセットは 0 以外のときだけプロジェクトに
-    "dynamicTimeOffsetSec" として保存され (ProjectFile.cpp:2174)、コピー / 複製と render-in-place
+    "dynamicTimeOffsetSec" として保存され (ProjectFile.cpp:2365)、コピー / 複製と render-in-place
     の差し替えクリップに引き継がれます (isolated は 0)。続かないもの: 式の duration 系 (ctx.duration は右片自身の長さ)
     は分割で続きません。ExpressionBindingDialog のプレビューも、Wave 20 (US-2008) からこのオフセットを標本の時刻に足しま
-    す (分割した右片でもレンダリングと同じ time で評価します。clip-sidecar G16)。スタビライザーの局所時刻は Wave 20
-    では扱っておらず、Wave 22 以降の候補です。保存済みのプロジェクトはオフセット 0 のまま変わらず、新しい分割だけが対象
+    す (分割した右片でもレンダリングと同じ time で評価します。clip-sidecar G16)。スタビライザーの局所時刻は Wave 20 でも
+    Wave 22 でも扱っておらず、Wave 23 以降の候補です。保存済みのプロジェクトはオフセット 0 のまま変わらず、新しい分割だ
+    けが対象
     です (clip-sidecar G13-G14)。
   ❍ 修正 (US-1913。書き出しは変わりません): 親素材が 0 バイトのとき、parentLayerAt が decodable=false を返す
-    ようになりました (TimelineFrameRenderer.cpp:2407-2409。ヌルオブジェクトとシーケンス参照は従来どおり
+    ようになりました (TimelineFrameRenderer.cpp:2451-2453。ヌルオブジェクトとシーケンス参照は従来どおり
     decodable、ファイルは存在して 1 バイト以上のときだけ decodable)。VideoPlayer は従来から親を採用せず
     (parentHit = 0、parentHitDecodable = 0、parentSourceIndex = -1)、書き出しも親無しと同じに描いていたので、
     整列 / サーフェスツール / 親ゲートも「親なし」と同じになり、プレビュー・書き出し・整列が一致します
@@ -1668,8 +1812,9 @@
      ・解消 (Wave 20、US-2007): Wave 19 で制限としていたタイムラインのエンベロープ (rubber band) の表示上限 0..2
        は、0..4 (audio::kMaxClipGain) になりました。unity (1.0) は縦の中央のままで、1..4 は上半分に区分的な線形で割り当
        てます。2.0 を超える点も丸めずに表示され、ドラッグしても 0..4 の範囲に入ります (詳細は「Wave 20 の変更」)。
-     ・制限 (Wave 22 候補): 再生中のプレビューは従来どおり選択クリップのブラシだけです。調整レイヤー・clip mask
-       のあるフレームの特殊合成、マット + 実効ブレンドの併用も従来経路のままです。一時停止中に再生ヘッドが選択クリップの
+     ・制限 (Wave 23 候補): 再生中のプレビューは従来どおり選択クリップのブラシだけです。clip mask のあるフレームの特殊合
+     成、マット + 実効ブレンドの併用も従来経路のままです (調整レイヤーと調整 clip は、Wave 22 から特殊合成にも書き出しと
+     同じに当たります。US-2206)。一時停止中に再生ヘッドが選択クリップの
        外にあるときは、Wave 20 (US-2011) からブラシのプレビューを描きません (従来は選択クリップのブラシをクランプした局
        所時刻で描いていました。「Wave 20 の変更」を参照)。
      ・解消 (Wave 20、US-1920 の既知の制限): 押し出しの上限は、MCP の入口 (set_clip_text3d) に加えて、メッシュを作る入口
@@ -1698,7 +1843,7 @@
   ※ Wave 18 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記):
      ・書き出し例外 (バイトのみ、画素は同一): ブラシ (brushData) を持つクリップをスマートレンダーがストリームコピーせ
        ず、再エンコードします (SmartRender.cpp:450 / :478、拒否理由 "clip has brush strokes")。ブラシは brush_progress
-       が 0 より大きいときだけ描かれ (TimelineFrameRenderer.cpp:1968-1975 の applyClipBrushSource)、brush_progress のキ
+       が 0 より大きいときだけ描かれ (TimelineFrameRenderer.cpp:2012-2020 の applyClipBrushSource)、brush_progress のキ
        ーフレームを持つクリップは従来からキーフレーム有りとしてストリームコピーされません。従って、従来ストリームコピー
        されていたのは進行度 0 (= 描かれない) のブラシだけで、この変更で絵が変わるクリップはなく、出力のバイト列だけが変
        わります (smart-render G29。US-1801)。
@@ -1727,8 +1872,8 @@
        は極端です。本 Wave は幾何を設定された f に対して正しくするだけで、fov の妥当性を確認する UI はありませんでした (Wave 19 で入りました。下の「Wave 19 の変更」の UI。US-1907)。Wave 18 の時点で、カメラモーションダイアログの fov スピンは [10, 170] (Wave 19 から [1, 100000])、位置 / 注視点のスピンは ±9999 にクランプされるため(CameraMotionDialog.cpp:213-219)、範囲外の fov のカメラや、大きな S で位置が ±9999 を超えるカメラをダイアログで開
        いて書き戻すとクランプされます。焦点距離が 0 以下、または S が非有限か 0 以下の解析は適用されず、カメラと undo は変
        わりません (ステータスバーに「3D カメラ解析を適用できませんでした（焦点距離またはスケールが不正です）」。
-       MainWindow.cpp:16820-16828)。有効な姿勢が無い解析も適用されず、カメラと undo は変わりませんが、この場合はステータ
-       スバーに何も表示されません (MainWindow.cpp:16805-16808。通常は解析ダイアログ側で止まり、適用に進みません)。
+       MainWindow.cpp:16978-16986)。有効な姿勢が無い解析も適用されず、カメラと undo は変わりませんが、この場合はステータ
+       スバーに何も表示されません (MainWindow.cpp:16963-16966。通常は解析ダイアログ側で止まり、適用に進みません)。
      ・Wave 18 で書き出しの結果が変わるのは、この 4 項目 (ブラシ付きクリップのスマートレンダー (バイトのみ) / ブラシの焼
        き込み / 新しい解析写像とそのプロジェクトの既存 3D レイヤー / 音量エンベロープの 1 ms 以内の点 (US-1807 の欠陥修
        正)) だけです。書き出しは従来、1 ms 以内に並ぶ音量エンベロープの点を最小ゲインの 1 点にまとめていましたが、プレビ
@@ -1738,12 +1883,16 @@
        fixture には 1 ms 以内に並ぶエンベロープの点がありません (render-fixture の audio.json は volumeEnvelope が空、
        audio-fixture はエンベロープを置きません)。
      ・プレビューの特殊合成経路 (buildSpecialClipComposite) は、そのフレームにトラックマットが無いときは V1 を手前に並べ
-       替え、書き出し (renderFrameAt) と同じ重なり順になります (MainWindow.cpp:9186-9198)。マットがあるフレームは従来ど
-       おり上位トラックが手前で、並べ替えはフレーム単位で決まります (マット元が終わったフレームでは V1 が手前)。Normal 以外のブレンドと調整レイヤーはこの経路の対象外でした (Wave 19 で変更: VFX 素材の実効ブレンドは対象になりました。調整レイヤーは対象外のままです。「Wave 19 の変更」を参照) (special-composite G14-G16。プレビューだけの変更で、書き
+       替え、書き出し (renderFrameAt) と同じ重なり順になります (MainWindow.cpp:9271-9283)。マットがあるフレームは従来ど
+       おり上位トラックが手前で、並べ替えはフレーム単位で決まります (マット元が終わったフレームでは V1 が手前)。Normal
+        以外のブレンドと調整レイヤーはこの経路の対象外でした (Wave 19 で変更: VFX 素材の実効ブレンドは対象になりました。
+       調整レイヤーは対象外のままです。「Wave 19 の変更」を参照。Wave 22 で変更: 調整クリップと調整レイヤーも renderFr
+       ameAt と同じに効きます (US-2206、special-composite G21-G22)) (special-composite G14-G16。プレビューだけの変更で、
+       書き
        出しは変わりません。US-1804)。
      ・一時停止中のプレビューで、ブラシを持つタイムラインは特殊合成経路を通り、全クリップのブラシを書き出しと同じ素材段
        階 (roto の後、grade / fx の前) で描き、選択中のクリップのブラシを重ねて描きません
-       (TimelineFrameRenderer.cpp:1997 の timelineBrushWantsSpecialPath、MainWindow.cpp:8810 / :9257)。通る条件は、ブラ
+       (TimelineFrameRenderer.cpp:2041 の timelineBrushWantsSpecialPath、MainWindow.cpp:8868 / :9399)。通る条件は、ブラ
        シを持つクリップがあり、かつタイムラインに Normal 以外のブレンド / 調整クリップ / clip mask / 親子付け (有効時) /
        シェイプクリップ / シーケンス参照 / 無効クリップ / brush_progress 以外のキーフレーム / fitContain・fitCover / レ
        イヤースタイル / トランジション (leadIn / trailOut) のどれも無いことです。判定はタイムライン全体のクリップで行い、再生ヘッドの時刻に無いクリップも数えていました (Wave 19 で変更: 再生ヘッド時刻に有効なクリップだけで判定します。「Wave 19 の変更」を参照。US-1906)。再生中は従来どおり選択クリップのブラシだけです (判断 B6。書き出しは
@@ -1752,7 +1901,8 @@
        スタイル・トランジションを含む Timeline は、一時停止プレビューで選択クリップのブラシのみ (書き出しは全ブラシ) で
        す。Normal 以外のブレンド / 調整クリップ / clip mask を含む Timeline も同じです。(Wave 19 で変更: 再生ヘッド時刻に有効なクリップだけで判定し、Normal 以外のブレンドは VFX 素材の実効ブレンドが対象。「Wave 19 の変更」を参照)再生中は常に選択クリップのブラシ
        のみです。判定を再生ヘッド時刻のクリップに限ることは Wave 19 で行いました (「Wave 19 の変更」を参照)。特殊合成を
-       renderFrameAt と同等にすること (調整クリップ・clip mask) は Wave 22 候補です (US-1805)。
+       renderFrameAt と同等にすること: 調整クリップと調整レイヤーは Wave 22 で行いました (US-2206)。clip mask は Wave 23
+       候補です (US-1805)。
      ・分割の新規則: クリップの分割で右片にも 3D テキストの設定とブラシのデータが残り (従来は左片だけ)、右片のクリップ局
        所時刻を持つ 4 種 (キーフレーム / string track、エフェクトの時間窓 startSec / endSec、音量エンベロープ
        volumeEnvelope、3D テキストのアニメ時刻 timeOffsetSec) を分割位置 L (タイムライン秒) だけずらすため、分割後も分割
@@ -1786,15 +1936,15 @@
        ときは返さない) を返します。ツール数 57 は不変、既存ツールの required は不変、set は undo 1 段です (mcp G200。
        US-1815)。
      ・解析点群の表示 (表示メニュー「解析点群を表示」、既定 OFF): 特徴点のカメラ解析で保存した点群をプロジェクトカメラの
-       再生ヘッド時刻の姿勢で射影し、プレビューに十字で重ねます (プレビュー専用。GLPreview.cpp:2893。アップロードされる
+       再生ヘッド時刻の姿勢で射影し、プレビューに十字で重ねます (プレビュー専用。GLPreview.cpp:2947。アップロードされる
        フレームと書き出しには乗りません)。ピンホールの後ろの点は描きません。シーク / スクラブ / 再生 / カメラ同期で追従
        します。プラナー解析と旧 solve には点群が無いので何も出ません (solve-points G4-G6。US-1817)。
      ・3D ヌルの作成: 点群を表示中にプレビューの十字 (8 px 以内、最も近い点) を左クリックすると、その解析点のワールド X
        / Y と位置 Z を持つ非表示の 3D ヌルオブジェクト (opacity 0、visible false) を新しい映像トラックに、解析の時間範囲
        (`solveMapping` の startSec / sampleCount / fps。古い解析ではキーフレームから推定) で作ります
-       (MainWindow.cpp:15918 の createNullAtSolvePoint、undo 1 段「解析点にヌルオブジェクトを作成」)。座標が ±10000 を超
+       (MainWindow.cpp:16073 の createNullAtSolvePoint、undo 1 段「解析点にヌルオブジェクトを作成」)。座標が ±10000 を超
        える点は拒否してステータスバーに表示します。ヌルに親子付けした子はヌルの 3D 射影位置には追従しません (親子付けは
-       2D の当たり判定で整列するため。Wave 22 候補) (solve-points G7-G8。US-1818)。
+       2D の当たり判定で整列するため。Wave 23 候補) (solve-points G7-G8。US-1818)。
      ・修正: RenderInPlace の焼き込みの一時タイムラインがプロジェクトの fps を使うようになり (RenderInPlace.cpp:454)、素
        材の fps を読めない roto クリップのマスクのフレーム番号が 30 fps 固定ではなくなりました (render-in-place G12。
        US-1802)。実素材では probe が fps を返すため、出力は変わりません。
@@ -1838,7 +1988,7 @@
      ・ワールド X / Y は真の透視投影のときだけ効き、legacy (真の透視投影 OFF) の 3D では無視される。ワールド X / Y・位置
        Z・回転のキーフレームは UI だけで描画では評価されなかった (Wave 19 で変更: is3DLayer が ON のクリップのキーフレームは描画に使われる。US-1813 / US-1814 / US-1908 / US-1909)。・解析点に作った 3D ヌルに親子付けした子は、ヌルの 3D 射影位置には追従しない (US-1818)。
      ・0 バイトの親素材は、プレビューも書き出しも親無しと同じ (Wave 18 では parentLayerAt の decodable とは食い違いましたが、Wave 19 で parentLayerAt も decodable=false を返すようになり解消。US-1812 / US-1913)。
-■ Wave 22 候補 (大型・要検討)
+■ Wave 23 候補 (大型・要検討)
   △ 複数クリップ / 複数ショットを跨いだカメラトラッキングの統合 (Wave 7 は 1 クリップの範囲内。フルシーンの多視点統合は未着手)  [AE]
   × RenderInPlace / レンダーキューダイアログの手動追加での自動ラウドネス正規化 (Wave 10 で MCP export_video は対応済み。この 2 経路は設計として未対応)
   × シーケンス単位の解像度 / fps (US-603 で見送り。現状は全シーケンスがプロジェクト共通の解像度・fps)
@@ -1855,8 +2005,9 @@
   × カメラ解析の続き: 解析点に作ったヌルの子の 3D 追従 (判断 C3)、プラナー経路の幾何 (旧写像のまま)、legacy (真の透視投影 OFF)
     でのワールド X / Y (判断 C9。legacy 3D はプレビューも書き出しもフラット) (点群の表示と 3D ヌルの配置は Wave 18 で、3D keyframe
     の描画評価・legacy 3D のプレビュー / 書き出しの一致・fov 確認 UI は Wave 19 で対応済み)
-  × プロジェクト比較への 3D テキスト / ブラシの差分、再生中のブラシの全クリップ描画 (判断 B2)、特殊合成経路の調整レイヤー / clip
-    mask とマット + 実効ブレンドの併用、ブレンドの CPU 負荷 (0 バイト親の decodable 判定、ブラシの特殊合成の適格判定の局所化、実効
+  × プロジェクト比較への 3D テキスト / ブラシの差分、再生中のブラシの全クリップ描画 (判断 B2)、特殊合成経路の clip mask
+    とマット + 実効ブレンドの併用 (調整レイヤーと調整 clip は Wave 22 で対応済み)、ブレンドの CPU 負荷 (0 バイト親の
+    decodable 判定、ブラシの特殊合成の適格判定の局所化、実効
     ブレンドは Wave 19 で対応済み)
   × Wave 20 から持ち越した項目: Echo の過去フレームへの 3D テキスト (ブラシは Wave 20 で対応済み)、スタビライザーの局所
     時刻、MOGRT、ジェネレーター・OTIO の読み込み・AAF、監査の残りの Low (未知のキーを保存で落とす件、保存と読込の本体の
@@ -1865,9 +2016,11 @@
     だ押し出し設定の上限、監査 C1 / H1-H4 は Wave 20 で対応済み。MCP の 3D テキスト / ブラシのツール、render-in-place の
     overlay、wiggle / 式の局所時刻、gain > 2 のクランプ統一、auto-ducking の GateTally は Wave 19 で対応済み。US-1702 案
     (a) は対象素材が無いため拒否のまま)
-  × Wave 21 で行わなかったもの (一覧は「Wave 21 の変更」の「Wave 21 で行わなかったもの」): 通常のプレビューでの V1 の層
-    だけの安定化、GL プレビューの入れ子のサイドカー、Open Project の余りのトラック、UNC 素材の自動再リンク、BOM 無しの
-    UTF-16 の字幕、offscreen の FAIL / SKIP の修正など
+  × Wave 22 で行わなかったもの (一覧は「Wave 22 の変更」の「Wave 22 で行わなかったもの」): 上位トラックと入れ子の中の安
+    定化 (US-2205)、GL プレビューの入れ子のサイドカー、マット + 実効ブレンドを持つ特殊合成経路、保存と読込の本体の複製、
+    Resolve / Premiere での OTIO の読み込みの検証など (Wave 21 で行わなかったもののうち、V1 の層だけの安定化、Open
+    Project の余りのトラック、UNC 素材の自動再リンク、BOM 無しの UTF-16 の字幕、offscreen の FAIL の修正は Wave 22 で行
+    いました)
   × GLPreview のブレンドが paintGL 内の QPainter が残す GL 状態に依存している件、VPP の decodable-output gate
     (W12-VPP-DECODABLE-GATE)
 
@@ -2016,9 +2169,10 @@
                      (linkedApplied:true ならリンクした音声クリップにも反転が適用済み)
 
   ▼ (6) タイムコード焼き込み
-     手動:  ファイル > タイムコード焼き込み設定... → 有効、位置=下中央、フレーム表示 ON
+     手動:  ファイル > タイムコード焼き込み設定… → 有効、位置=下中央、フレーム表示 ON
             プレビュー右下/下中央に「00:00:05:12」のような TC。29.97fps + ドロップフレームで「;」区切り
-            書き出した動画にも同じ位置に焼き込まれる。無効に戻すと消える。
+            書き出した動画にも同じ位置に焼き込まれる。無効に戻すと消える。Wave 22 から設定は Ctrl+Z で戻る (undo の名前
+            は「タイムコード焼き込み」、MCP は「タイムコード焼き込み (MCP)」)。
      LLM:   「タイムコード焼き込みを有効にして左上に出して」→ set_project_option
             「プロジェクト情報」で timecodeBurnIn.enabled:true
             「5 秒のフレームを見せて」→ get_frame に TC が写っている
@@ -2516,7 +2670,8 @@
      mcp selftest は G163..G170 が追加 (G1..G170。その後 Wave 7 で G171..G177、Wave 10 で G178..G187、
      Wave 11 で G188、Wave 12 で G189、Wave 13 で G190..G192、Wave 14 で G193..G194、Wave 17 で G195..G199、
      Wave 18 で G200、Wave 19 で G201..G206 (get_clip_text3d / set_clip_text3d / get_clip_brush / set_clip_brush の 4 ツール =
-     61 ツール) が追加され、Wave 21 で G207 (MCP 編集の undo) が加わって現行は G1..G207)。
+     61 ツール) が追加され、Wave 21 で G207 (MCP 編集の undo)、Wave 22 で G208 (タイムコード焼き込みの undo) が加わって
+     現行は G1..G208)。
   ※ 3 件は既存欠陥の修正で結果が変わる:
      (1) メニューの「LUT適用 (.cube)…」。これまでプレビューにしか効かず書き出しには乗らなかったが、Wave 6 からは
          選択クリップの LUT として保存され書き出しにも反映される。メニュー LUT を使っていたプロジェクトは
@@ -4080,8 +4235,8 @@
      ・キーヤー後の alpha の運搬 (US-1211) は tlrender の描画経路 (書き出しと CPU プレビュー) の変更です。
        Exporter::doExport が applyEffectStack を直接呼ぶ旧書き出し経路との一致は、Wave 11 の roto の alpha (US-1004)
        と同じ扱いで、揃えていません。
-       VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:706 と、
-       プレビューの FX スタック VideoPlayer.cpp:4221) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで
+       VideoPlayer がプレビューで applyEffectStack を直接呼ぶ経路 (調整レイヤーの適用 VideoPlayer.cpp:741 と、
+       プレビューの FX スタック VideoPlayer.cpp:4330) もキーヤー後の alpha の運搬は行わず、US-1004 と同じ扱いで
        揃えていません。
      ・MainWindow が位置で持つサイドカーのうち 3 種 (3D テキストの設定、タイムリマップ、ライブブラシのアニメーション) と
        ブラシのアニメーションの項目は、roto と同じ張り替え (編集 1 回につき 1 回) に乗り、undo / redo の各段でも追従しま
@@ -4445,8 +4600,34 @@
      直すと 0 秒から 2 秒かけて現れる。brush: null で解除できる。set_clip_text3d は extrudeBevelSegments 9
      や extrudeDepth 6 を拒否し、状態は変わらない。set_clip_property の volume は 4 まで受理し、4.5 は拒否す
      る。Undo: set_clip_text3d / set_clip_brush は MCP の undo または Ctrl+Z 1 回で戻る。
-  □ Wave 21 分 (現行値。registry の説明文 `(N gates)` と一致。SKIP は PASS ではない): 新しい suite は
-     subtitle-import (6 gates)、autosave (5)、stabilizer-export (6) です。gate 数が増えた suite は、psd-import 6 → 7
+  □ Wave 22 分 (現行値。registry の説明文 `(N gates)` と一致。SKIP は PASS ではない): 新しい suite は lut-gl (6 gates。
+     G1-G3 = 3D の texel 中心と DOMAIN、G4-G6 = 1D の全点と再標本化。実 GL が必要) です。gate 数が増えた suite は、
+     stabilizer-export 6 → 12 (G7-G9 = 解析時の寸法、G10-G11 = V1 の層だけ、G12 = FX の順序と Echo)、special-composite
+     20 → 22 (G21-G22 = 調整 clip と調整レイヤー)、project-persist 11 → 14 (G12-G13 = 範囲外の数値と読めない理由、G14 =
+     旧形式の time remap)、unsaved-prompt 12 → 14 (G13 = 開く時の既定本数、G14 = undo burst)、subtitle-import 6 → 9
+     (G7-G9)、fcpxml-import 42 → 43 (G43 = UNC の再リンク)、mcp 207 → 208 (G208 = タイムコード焼き込みの undo) です。
+     nest-sequence は 14 gates を宣言するようになりました (gate 数は変わりません)。lut-import は 12 のまま (G12 を書き直
+     し)。clip-lut (10)、brush-export (18)、camera3d (17)、connected-clip (45)、clip-sidecar (21)、still-compare (5)、
+     track-ops (32)、autosave (5)、tcburn (9)、gate-tally (14) の gate 数は変わりません。render-fixture は基点 77598aa
+     の 15 ファイル、audio-fixture は 23 ファイルが IDENTICAL です (この fixture には、stabilizer のキー・旧形式の time
+     remap の表・調整レイヤー・UNC の素材が含まれません)。offscreen は参考値で、合否には使いません。
+  □ Wave 22 の機能確認 (実機 + LLM): 手動: 3D の .cube LUT を V1 に当て、プレビューと書き出した動画の同じフレームの色を
+     比べる。期待: 一致する (texel 中心。細かい 1D LUT も全点が効く)。期待: V1 に stabilizer のキーを付け、V2 に画像を置
+     くと、プレビューで V1 だけが揺れ、V2 は動かない。期待: V1 に輝度のトラックマットを掛け、V3 に調整クリップ (Invert)
+     を置く (任意でグローバルの調整レイヤーの gain も足す)。一時停止中のプレビューが、書き出したフレームと色で一致する
+      (special-composite G21-G22)。期待: トラックを 3 本に増やした状態でトラックが 1 本のファイルを開く (自動
+     保存の復元・最近使ったファイル・.veditor のドロップも同じ)と、ファイルのトラックだけになる。期待: BOM 無しの UTF-16
+     の .srt を字幕エディタで取り込むと、「文字コードを UTF-16LE (BOM なし) として読みました」が出る。期待: ファイル >
+     タイムコード焼き込み設定… で OK した後、Ctrl+Z で設定が戻る (「タイムコード焼き込み」)。期待: 映像の変形をドラッ
+     グした直後 (300 ms 以内) に別の編集をすると、Ctrl+Z 2 回で別々に戻る。期待: 応答する共有の UNC の素材を含む FCPXML
+     を取り込むと、完了のダイアログに「再リンク: N 件」が出る。LLM: set_project_option {"option":"timecodeBurnIn", ...}
+     の後に Ctrl+Z で保存点に戻ると、get_project_info の hasUnsavedChanges が false になる。開発用: `powershell -File
+     scripts\selftest_offscreen.ps1 -OutDir <フォルダ>` は参考値の表を出す。OTIO を Resolve 18 以降と Premiere Pro で読
+     み込んだ結果は未検証 (検証済みなのは `python scripts/otio_validate.py <フォルダ>` の結果だけ)。
+  □ Wave 21 分 (Wave 21 時点の値。Wave 22 で変わったものの現行値は上の Wave 22 分。SKIP は PASS ではない): 新しい suit
+    e は
+     subtitle-import (6 gates。Wave 22 で 9)、autosave (5)、stabilizer-export (6 gates。Wave 22 で 12) です。gate 数が
+     増えた suite は、psd-import 6 → 7
      (G7)、fcpxml-import 40 → 42 (G41-G42)、lut-import 7 → 12 (G7 を変更、G8-G12)、project-persist 7 → 11 (G8-G9 =
      数値と version と tracking、G10-G11 = シーケンス別の調整レイヤー)、clip-sidecar 20 → 21 (G21)、unsaved-prompt 9
      → 12 (G7 を変更、G8 を assert 化、G10-G11 = シーケンスの切り替えとフラグの undo、G12 = 未保存になる操作)、mcp
@@ -4461,14 +4642,17 @@
      1 本になり、名前・色・フラグが既定に戻る。期待: シーケンスを切り替えるとタイトルバーに * が付く。期待:
      Shift_JIS の .srt を字幕エディタで取り込むと、「字幕の取り込み」に「文字コードを Shift_JIS
      として読みました」が出る。期待: 自動保存先を書き込めなくすると、ステータスバーに「自動保存に失敗:
-     <理由>」が出る。期待: UNC の素材を含む FCPXML を取り込むと、オフライン素材の警告が出て、素材は offline-<参照>
+     <理由>」が出る。期待: 応答しない共有の UNC の素材を含む FCPXML を取り込むと (応答する共有なら Wave 22 から再リンク
+     されます)、オフライン素材の警告が出て、素材は offline-<参照>
      の placeholder になる。LLM: add_track の後に Ctrl+Z で保存点に戻ると、get_project_info の hasUnsavedChanges が
-     false になる。set_project_option {"option":"timecodeBurnIn", ...} の後は Ctrl+Z で戻しても true のまま。開発用:
+     false になる。set_project_option {"option":"timecodeBurnIn", ...} の後は、Wave 21 では Ctrl+Z で戻しても true のま
+     までしたが、Wave 22 からは戻すと false になる。開発用:
      `powershell -File scripts\selftest_offscreen.ps1 -OutDir <フォルダ>` で suite ごとの表 (results.tsv) が出る
      (他の引数: -ExePath (既定 build\Release\v-simple-editor.exe)、-Filter (suite 名をカンマで区切る。空なら plain な suite
      を全部)、-TimeoutSec (10〜86400、既定 300)、-McpPort。-OutDir の既定は .omc\state\offscreen)
-     (参考。合否には使わない。表の PASS / FAIL / SKIP の列は行頭がその語の行だけの数で、分類は終了コードと各 suite の集
-     計による。基点 68621db は 269 PASS、4 PASS + SKIP、3 FAIL、3 非 0終了)。`VEDITOR_OTIO_SELFTEST_KEEP=<フォルダ>` を
+     (参考。合否には使わない。表の PASS / FAIL / SKIP の列は、行頭の [INFO] [x] のような角括弧の前置きを飛ばして
+     その語で始まる行の数 (Wave 22 から。Wave 21 は行頭がその語の行だけ) で、分類は終了コードと各 suite の集計による。基
+     点 68621db は 269 PASS、4 PASS + SKIP、3 FAIL、3 非 0終了)。`VEDITOR_OTIO_SELFTEST_KEEP=<フォルダ>` を
      付けた --selftest=otio-export の後に `python scripts/otio_validate.py <フォルダ>` (フォルダの *.otio を読む)
      (opentimelineio が必要) を 実行すると、3ファイルの表が出て終了コード 0 になる。
   □ Wave 20 分 (現行値。registry の説明文 `(N gates)` と一致。SKIP は PASS ではない): 新しい suite は psd-import (6。G1
@@ -4540,6 +4724,10 @@
      で字幕スタイルを既定以外にしたもの (US-2105)、複数のシーケンスで非アクティブ側に調整レイヤーを置いて保存した
      もの (US-2110)、V1 に stabilizer のキーを持つクリップの書き出し (US-2111)、退避したサイドカーを持つシーケンス
      を入れ子にしたもの (US-2112) です。いずれも Wave 21 以降の exe で変わるのが正しい (Wave 21 の変更)。
+     Wave 22 の書き出し例外 1 つ (US-2207) の変わるケースは、旧形式の time remap の表 (クリップに inline のカーブが無い
+     旧ファイル) を持つ非アクティブなシーケンスを含む旧ファイルの ライブのタイムラインの書き出しです (書き出しキューの
+     file job と、旧形式の表を持たないプロジェクトは変わりません)。Wave 22 以降の exe で変わるのが正しい (Wave 22 の変
+     更)。
      Wave 9 以降の exe では、バッチ書き出しキューの音声 (現在のプロジェクトのタスク) がタイムラインのミックスになり、音声ビットレート
      を 192 kbps 以外にした書き出しの音声が変わり、親付きクリップの整列結果、gap の子 / J カットを含む FCPXML と
      EDL の取り込み結果 (dissolve の描画を含む。長さが正のディゾルブは素材の有無に関係なく変わる) が変わるのが正しい (3.10b)。
