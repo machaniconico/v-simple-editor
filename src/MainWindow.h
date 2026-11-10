@@ -47,6 +47,7 @@ class PuppetPinTool;
 #include "playback/AutoProxyPolicy.h"  // マルチトラック自動プロキシ判定エンジン (プレビュー専用)
 #include <QSet>
 #include <optional>
+#include <memory>
 #include "PlaybackTypes.h"
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
@@ -113,6 +114,8 @@ class VideoPlayer;
 namespace stabwarp { struct StabSample; }
 bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env);
 class Timeline;
+class QTimer;
+struct TimelineState;
 class TimelineTrack;
 class SourceMonitorDock;
 class StillGalleryDock;
@@ -885,6 +888,15 @@ private:
     bool m_hasRestoreLeaving = false;
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
+    // US-2216: the drag / motion undo bursts. Each write stores the state it left (captured
+    // after the write) and numbers the burst by its first write; the point is taken from
+    // that state, in capture order, by the one commit routine the timers and the flush share.
+    void captureUndoBurst(QTimer *timer);
+    void commitUndoBurst(QTimer *timer);
+    void flushPendingUndoPoints();
+    QHash<QTimer *, std::shared_ptr<TimelineState>> m_undoBurstSnapshots;
+    quint64 m_undoBurstSeq = 0;
+    bool m_flushingUndoBursts = false;
     bool m_promptForMissingMedia = true;
     bool m_dirtyOutsideUndo = false;
     bool m_syncingDirtyFromUndo = false;

@@ -1066,6 +1066,12 @@ public:
     // reconcileConnectedClips() runs first, then the post-edit state is saved and
     // the connection baseline is taken.
     void saveUndoState(const QString &description);
+    // US-2216: an undo burst (video drag / motion) keeps the state its last write left and takes
+    // its point later. captureUndoSnapshot() is that state (pending key remap emitted, no
+    // reconcile); saveUndoSnapshot() pushes it as a point without reconcile and without
+    // aboutToSaveUndoState, so the push cannot re-enter the flush that calls it.
+    TimelineState captureUndoSnapshot();
+    void saveUndoSnapshot(const TimelineState &snapshot, const QString &label);
 
     // US-1201 primary-storyline connections. connectClip gives every member of
     // the target's link group the same anchorUid (a clip on videoTracks()[0])
@@ -1649,6 +1655,9 @@ signals:
     // redo or load, which keep the keys valid for the restored layout).
     void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
+    // US-2216: at the top of saveUndoState, before the edit's own point is taken, so a
+    // pending burst point lands first with the state the burst left.
+    void aboutToSaveUndoState();
     // US-1408: at the success return of importMedia() (every GUI / MCP / drop
     // import) and of createSequence(name, tracks, tracks) with clips (GUI / MCP
     // EDL and FCPXML); MainWindow refreshes the offline cache.

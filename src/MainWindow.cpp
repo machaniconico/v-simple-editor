@@ -404,24 +404,61 @@ static void beginUndoBurst(QTimer *timer, Timeline *timeline)
     timer->start();
 }
 
-static void commitUndoBurst(QTimer *timer, Timeline *timeline)
+// US-2216: each write stores the state it left (after the write, so a later edit inside the
+// debounce cannot swallow the point). A burst is numbered by its first write.
+void MainWindow::captureUndoBurst(QTimer *timer)
 {
-    if (!timeline || !timeline->undoManager() || timeline->isRestoringState()) return;
-    if (timeline->undoManager()->saveSerial() != timer->property("burstSerial").toULongLong()
-        || timeline->undoManager()->currentIndex() != timer->property("burstIndex").toInt())
-        return;
-    timeline->saveUndoState(timer->property("undoLabel").toString());
+    if (!m_timeline) return;
+    if (!timer->isActive()) timer->setProperty("burstSeq", static_cast<qulonglong>(++m_undoBurstSeq));
+    m_undoBurstSnapshots.insert(timer, std::make_shared<TimelineState>(m_timeline->captureUndoSnapshot()));
 }
 
-// Takes the pending points now, before anything that reads or replaces the undo state.
-static void flushPendingUndoPoints(MainWindow *window, Timeline *timeline)
+// The one commit routine of the burst timers' timeouts and of the flush: the stored snapshot
+// is pushed (not saveUndoState: no hook, no state read later), only while the undo state is
+// still the one the burst started at.
+void MainWindow::commitUndoBurst(QTimer *timer)
 {
+    const std::shared_ptr<TimelineState> snapshot = m_undoBurstSnapshots.take(timer);
+    UndoManager *undo = m_timeline ? m_timeline->undoManager() : nullptr;
+    if (!snapshot || !undo || m_timeline->isRestoringState()) return;
+    const quint64 serial = undo->saveSerial();
+    const int index = undo->currentIndex();
+    if (serial != timer->property("burstSerial").toULongLong()
+        || index != timer->property("burstIndex").toInt())
+        return;
+    m_timeline->saveUndoSnapshot(*snapshot, timer->property("undoLabel").toString());
+    // A sibling that was fresh just before this push is still fresh after it; one that an
+    // undo / redo / new point from a path bypassing MainWindow made stale stays stale.
     for (const char *name : kPendingUndoTimerNames) {
-        auto *timer = window->findChild<QTimer *>(QLatin1String(name));
-        if (!timer || !timer->isActive()) continue;
-        timer->stop();
-        commitUndoBurst(timer, timeline);
+        auto *other = findChild<QTimer *>(QLatin1String(name));
+        if (!other || other == timer || !other->isActive()) continue;
+        if (other->property("burstSerial").toULongLong() != serial
+            || other->property("burstIndex").toInt() != index)
+            continue;
+        other->setProperty("burstSerial", static_cast<qulonglong>(undo->saveSerial()));
+        other->setProperty("burstIndex", undo->currentIndex());
     }
+}
+
+// Takes the pending points now, before anything that reads or replaces the undo state, in
+// the order the bursts began.
+void MainWindow::flushPendingUndoPoints()
+{
+    if (m_flushingUndoBursts) return;
+    QVector<QTimer *> live;
+    for (const char *name : kPendingUndoTimerNames) {
+        auto *timer = findChild<QTimer *>(QLatin1String(name));
+        if (timer && timer->isActive()) live.append(timer);
+    }
+    std::sort(live.begin(), live.end(), [](QTimer *a, QTimer *b) {
+        return a->property("burstSeq").toULongLong() < b->property("burstSeq").toULongLong();
+    });
+    m_flushingUndoBursts = true;
+    for (QTimer *timer : live) {
+        timer->stop();
+        commitUndoBurst(timer);
+    }
+    m_flushingUndoBursts = false;
 }
 
 // Shared by the file menu and import hub; no persistent widget state needed.
@@ -2958,6 +2995,9 @@ MainWindow::MainWindow(QWidget *parent)
     m_timeline->setSidecarStateHooks(
         [this]() { return collectSidecarState(); },
         [this](const QJsonObject &state) { applySidecarState(state); });
+    // US-2216: a pending drag / motion point lands before any other point is taken.
+    connect(m_timeline, &Timeline::aboutToSaveUndoState,
+            this, &MainWindow::flushPendingUndoPoints, Qt::DirectConnection);
 
     rebuildAudioMeters();
 
@@ -3885,7 +3925,7 @@ void MainWindow::setupUI()
     videoDragUndoTimer->setSingleShot(true);
     videoDragUndoTimer->setInterval(300);
     connect(videoDragUndoTimer, &QTimer::timeout, this, [this, videoDragUndoTimer]() {
-        commitUndoBurst(videoDragUndoTimer, m_timeline);
+        commitUndoBurst(videoDragUndoTimer);
     });
     connect(m_player, &VideoPlayer::videoSourceTransformChanged, this,
             [this, videoDragUndoTimer](int trackIdx, int clipIdx, double scale, double dx, double dy) {
@@ -3901,8 +3941,10 @@ void MainWindow::setupUI()
                         && stored[clipIdx].videoDy == qBound(-5.0, dy, 5.0))
                         return;
                 }
-                if (m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy))
+                if (m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy)) {
+                    captureUndoBurst(videoDragUndoTimer);
                     beginUndoBurst(videoDragUndoTimer, m_timeline);
+                }
             });
     // Timeline text-strip edge drag → update right-panel spinboxes + preview
     connect(m_timeline, &Timeline::textOverlayTimeChanged, this,
@@ -7413,10 +7455,11 @@ void MainWindow::setupMenuBar()
     motionUndoTimer->setSingleShot(true);
     motionUndoTimer->setInterval(300);
     connect(motionUndoTimer, &QTimer::timeout, this, [this, motionUndoTimer]() {
-        commitUndoBurst(motionUndoTimer, m_timeline);
+        commitUndoBurst(motionUndoTimer);
     });
     connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::motionChanged,
         this, [this, motionUndoTimer](const effectctrl::MotionState &) {
+            captureUndoBurst(motionUndoTimer);
             beginUndoBurst(motionUndoTimer, m_timeline);
         });
 
@@ -10815,7 +10858,7 @@ void MainWindow::compareSavedProject()
 
 void MainWindow::saveProject()
 {
-    flushPendingUndoPoints(this, m_timeline);
+    flushPendingUndoPoints();
     if (m_projectFilePath.isEmpty()) {
         saveProjectAs();
         return;
@@ -10888,7 +10931,7 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
             *errorMessage = QStringLiteral("エディタを利用できません");
         return false;
     }
-    flushPendingUndoPoints(this, m_timeline);
+    flushPendingUndoPoints();
 
     // US-1506: ImportHub PNGs still in the OS temp dir are copied next to the
     // project (<name>_assets/importhub/) before saving. Order: copy (failure
@@ -11098,7 +11141,7 @@ void MainWindow::changeEvent(QEvent *event)
 
 bool MainWindow::maybeSaveChanges()
 {
-    flushPendingUndoPoints(this, m_timeline);
+    flushPendingUndoPoints();
     if (!isWindowModified())
         return true;
     ++m_unsavedChangesPromptCount;
@@ -12241,7 +12284,7 @@ void MainWindow::pasteAttributes()
 
 void MainWindow::undoAction()
 {
-    flushPendingUndoPoints(this, m_timeline);
+    flushPendingUndoPoints();
     if (!m_projectCameraUndoSlot.isEmpty()
         && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
         && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial) {
@@ -12265,7 +12308,7 @@ void MainWindow::undoAction()
 
 void MainWindow::redoAction()
 {
-    flushPendingUndoPoints(this, m_timeline);
+    flushPendingUndoPoints();
     m_timeline->redo();
     statusBar()->showMessage("Redo");
     updateEditActions();

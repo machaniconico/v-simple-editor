@@ -14684,8 +14684,21 @@ void Timeline::absorbIntoCurrentUndoPoint()
     captureReconcileBaseline();
 }
 
+TimelineState Timeline::captureUndoSnapshot()
+{
+    flushPendingKeyRemap();
+    return currentState();
+}
+
+void Timeline::saveUndoSnapshot(const TimelineState &snapshot, const QString &label)
+{
+    m_undoManager->saveState(snapshot, label);
+    updateConnectionOverlay();
+}
+
 void Timeline::saveUndoState(const QString &description)
 {
+    emit aboutToSaveUndoState();
     // An emptied history (load / new project: UndoManager::clear) starts from
     // an empty baseline, so its first reconcile only re-derives offsets.
     if (m_undoManager->currentIndex() < 0)
