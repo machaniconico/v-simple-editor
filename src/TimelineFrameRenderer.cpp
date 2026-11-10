@@ -3634,6 +3634,31 @@ QVector<QPair<int, int>> brushActiveClipsAt(const Timeline *timeline, double tim
     return active;
 }
 
+bool exportSelectedClipAt(const Timeline *timeline, int trackIdx, double timelineSec,
+                          int *clipIdx, double *selectedStartSec)
+{
+    if (!timeline || !clipIdx || !selectedStartSec)
+        return false;
+    const QVector<RenderTrackSnapshot> tracks = snapshotsFromTimeline(timeline);
+    if (trackIdx < 0 || trackIdx >= tracks.size())
+        return false;
+    bool hasTransitions = false;
+    const QVector<QVector<OverlapInterval>> intervals = overlapIntervalsForTracks(
+        timeline, tracks, /*applyTimelineGlobals=*/true, &hasTransitions);
+    QVector<int> overlapA;
+    QVector<int> overlapB;
+    overlapPairsAt(tracks, intervals, timelineSec, overlapA, overlapB);
+    double start = 0.0;
+    const int idx = selectClipOnTrack(tracks, intervals, overlapA, overlapB, trackIdx,
+                                      timelineSec, /*clamp=*/trackIdx == 0, &start,
+                                      /*countDisabled=*/false);
+    if (idx < 0)
+        return false;
+    *clipIdx = idx;
+    *selectedStartSec = start;
+    return true;
+}
+
 QImage renderClipLayerSourceStageForTest(const Timeline *timeline, int trackIdx, int clipIdx,
                                          qint64 usec, Stage stage, QSize outSize)
 {

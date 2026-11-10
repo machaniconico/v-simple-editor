@@ -8805,6 +8805,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
     const auto rotoEntries = m_timeline->rotoEntries();
     const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
+    QVector<tlrender::ActiveAdjustmentClip> activeAdjustments;
     bool hasActiveSpecialData = false;
     // US-1805: a brushed frame without adjustment / clip mask (or a matte source
     // with an effective blend, US-1905) takes this path (paused) and every clip's
@@ -8837,12 +8838,35 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
 
         const auto &clips = track->clips();
         double cursor = 0.0;
+        bool adjustmentSelectionReady = false;
+        int adjustmentSelectedIdx = -1;
+        double adjustmentSelectedStart = 0.0;
         for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
             const ClipInfo &clip = clips[clipIdx];
             cursor += qMax(0.0, clip.leadInSec);
             const double clipStart = cursor;
             const double clipEnd = clipStart + clip.effectiveDuration();
             cursor = clipEnd;
+
+            // US-2206: an adjustment clip is no layer; it grades the composite at its
+            // track's z position, collected like renderFrameAt's activeAdjustments:
+            // only export's single selected clip of the track
+            // (tlrender::exportSelectedClipAt, one even inside an overlap), never the
+            // tolerance window, at export's local time from the selected start.
+            if (clip.isAdjustment) {
+                if (!adjustmentSelectionReady) {
+                    if (!tlrender::exportSelectedClipAt(m_timeline, trackIdx, timelineSeconds,
+                                                        &adjustmentSelectedIdx,
+                                                        &adjustmentSelectedStart))
+                        adjustmentSelectedIdx = -1;
+                    adjustmentSelectionReady = true;
+                }
+                if (clipIdx == adjustmentSelectedIdx
+                    && (clip.visible || clipgeom::isNullObjectFilePath(clip.filePath)))
+                    activeAdjustments.append(tlrender::ActiveAdjustmentClip{
+                        trackIdx, &clip, timelineSeconds - adjustmentSelectedStart});
+                continue;
+            }
 
             if (brushWantsSpecialPath) {
                 // The clips export draws (brushActiveClipsAt), one per track
@@ -9215,34 +9239,91 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             layers, layerImages, canvasSize, lightingOffsets, projectLights,
             m_projectCamera.camera().position);
 
-    // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
-    if (hasTrackMatteLayer)
-        return trackmatte::composite(layers, layerImages, canvasSize);
+    const int trackCount = m_timeline->videoTracks().size();
+    QImage composed;
+    bool regraded = false;
+    if (hasTrackMatteLayer) {
+        // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
+        composed = trackmatte::composite(layers, layerImages, canvasSize);
+        // US-2206: renderFrameAt's matte branch grades the composite with the
+        // adjustment clips of tracks 1.. ascending (not track 0), straight RGBA.
+        if (!activeAdjustments.isEmpty()) {
+            QImage stacked = composed.convertToFormat(QImage::Format_RGBA8888);
+            for (int t = 1; t < trackCount; ++t)
+                stacked = tlrender::applyAdjustmentClipsAtTrack(stacked, activeAdjustments, t);
+            composed = stacked;
+            regraded = true;
+        }
+    } else {
+        // US-1905: renderFrameAt's matte-free order: the Normal stack (V1 frontmost),
+        // then the lit blended overlays ascending by track (layers is descending
+        // here) through the same blend equation.
+        QVector<CompositeLayer> normalLayers;
+        QVector<QImage> normalImages;
+        for (int i = 0; i < layers.size(); ++i) {
+            if (layers[i].blendMode == BlendMode::Normal) {
+                normalLayers.append(layers[i]);
+                normalImages.append(layerImages[i]);
+            }
+        }
+        if (activeAdjustments.isEmpty()) {
+            composed = trackmatte::composite(normalLayers, normalImages, canvasSize);
+        } else {
+            // US-2206: renderFrameAt's adjustment order: one track at a time from the
+            // back, each track's adjustment clips right after its Normal layers, so
+            // the tracks in front (V1 last) stay ungraded. trackmatte::composite
+            // paints SourceOver on a transparent canvas, so the split is byte-equal.
+            composed = QImage(canvasSize, QImage::Format_ARGB32_Premultiplied);
+            composed.fill(Qt::transparent);
+            for (int t = trackCount - 1; t >= 0; --t) {
+                QVector<CompositeLayer> trackLayers;
+                QVector<QImage> trackImages;
+                for (int i = 0; i < normalLayers.size(); ++i) {
+                    if (normalLayers[i].zOrder == t) {
+                        trackLayers.append(normalLayers[i]);
+                        trackImages.append(normalImages[i]);
+                    }
+                }
+                if (!trackLayers.isEmpty()) {
+                    const QImage part = trackmatte::composite(trackLayers, trackImages, canvasSize);
+                    QPainter painter(&composed);
+                    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                    painter.drawImage(0, 0, part);
+                }
+                composed = tlrender::applyAdjustmentClipsAtTrack(composed, activeAdjustments, t)
+                               .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            }
+        }
+        if (normalLayers.size() != layers.size()) {
+            for (int i = layers.size() - 1; i >= 0; --i) {
+                const CompositeLayer &layer = layers[i];
+                if (layer.blendMode == BlendMode::Normal
+                    || layerImages[i].isNull() || layer.opacity <= 0.001) {
+                    continue;
+                }
+                composed = LayerCompositor::blendImages(
+                    composed, layerImages[i], layer.blendMode, qBound(0.0, layer.opacity, 1.0));
+            }
+            composed = composed.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        }
+    }
 
-    // US-1905: renderFrameAt's matte-free order: the Normal stack (V1 frontmost),
-    // then the lit blended overlays ascending by track (layers is descending
-    // here) through the same blend equation.
-    QVector<CompositeLayer> normalLayers;
-    QVector<QImage> normalImages;
-    for (int i = 0; i < layers.size(); ++i) {
-        if (layers[i].blendMode == BlendMode::Normal) {
-            normalLayers.append(layers[i]);
-            normalImages.append(layerImages[i]);
+    // US-2206: the top-level adjustment layers last, renderFrameAt's
+    // applyAdjustmentLayers on straight RGBA (opaque result, as in export); the GL
+    // grade is off while a special composite is shown. Identity leaves it untouched.
+    const QVector<AdjustmentLayer> &globalLayers = m_timeline->adjustmentLayers();
+    if (!globalLayers.isEmpty()) {
+        const QImage straight = composed.convertToFormat(QImage::Format_RGBA8888);
+        const QImage graded = tlrender::applyAdjustmentLayers(
+            straight, globalLayers, qRound64(timelineSeconds * 1000000.0));
+        if (graded.cacheKey() != straight.cacheKey()) {
+            composed = graded;
+            regraded = true;
         }
     }
-    QImage composed = trackmatte::composite(normalLayers, normalImages, canvasSize);
-    if (normalLayers.size() == layers.size())
-        return composed;
-    for (int i = layers.size() - 1; i >= 0; --i) {
-        const CompositeLayer &layer = layers[i];
-        if (layer.blendMode == BlendMode::Normal
-            || layerImages[i].isNull() || layer.opacity <= 0.001) {
-            continue;
-        }
-        composed = LayerCompositor::blendImages(
-            composed, layerImages[i], layer.blendMode, qBound(0.0, layer.opacity, 1.0));
-    }
-    return composed.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    if (regraded)
+        composed = composed.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    return composed;
 }
 
 void MainWindow::refreshSpecialClipPreview()

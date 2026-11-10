@@ -28,6 +28,7 @@
 
 #include <QApplication>
 #include <QColor>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFont>
 #include <QPainter>
@@ -229,7 +230,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 20; ++g)
+        for (int g = 1; g <= 22; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -271,7 +272,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 20; ++g)
+        for (int g = 5; g <= 22; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -685,6 +686,57 @@ int runSpecialCompositeSelftest()
     };
     clipanim::EvalEnv env1080;
     env1080.canvas = QSize(1920, 1080);
+    // US-2206 (G21, G22): adjustment clips grade only through their `effects` (here an
+    // Invert), the global adjustment layer is a gain 0.5; V1 is shown at half size with an
+    // identity time remap (special path) and no background, so its border is transparent.
+    const QString adjV1Path = dir.filePath(QStringLiteral("special-composite-adj-v1.mp4"));
+    const QString adjBackPath = dir.filePath(QStringLiteral("special-composite-adj-back.mp4"));
+    const QString adjWhitePath = dir.filePath(QStringLiteral("special-composite-adj-white.mp4"));
+    const bool adjFixturesOk = writeClip(adjV1Path, false, QColor(200, 180, 160))
+        && writeClip(adjBackPath, false, QColor(60, 120, 180))
+        && writeClip(adjWhitePath, false, QColor(255, 255, 255));
+    const auto adjSolid = [&](const QString &clipPath) {
+        ClipInfo clip = base;
+        clip.filePath = clipPath;
+        return clip;
+    };
+    ClipInfo adjV1Half = adjSolid(adjV1Path);
+    adjV1Half.videoScale = 0.5;
+    adjV1Half.timeRemapCurve.sourceFps = kFps;
+    adjV1Half.timeRemapCurve.addKey(0.0, 0.0);
+    adjV1Half.timeRemapCurve.addKey(1.0, 1.0);
+    ClipInfo adjInvert;
+    adjInvert.isAdjustment = true;
+    adjInvert.duration = adjInvert.outPoint = 1.0;
+    adjInvert.speed = 1.0;
+    adjInvert.effects = {VideoEffect::createInvert()};
+    AdjustmentLayer adjGain;
+    adjGain.id = 1;
+    adjGain.trackIndex = 3;
+    adjGain.timelineStartUs = 0;
+    adjGain.timelineEndUs = 1000000;
+    adjGain.name = QStringLiteral("US-2206 gain");
+    adjGain.gradingEnabled = true;
+    for (int ch = 0; ch < 3; ++ch)
+        adjGain.gain[ch] = 0.5;
+    // Tracks, then (matteV1) V1 under a luma matte from V2, then the global layer or none.
+    const auto setAdjTracks = [&](const QVector<QVector<ClipInfo>> &tracks, bool matteV1, bool global) {
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        timeline->setClipParentEntries({});
+        window.m_timeRemapClipEntries.clear();
+        timeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        QHash<QString, TimelineTrackMatteEntry> mattes;
+        if (matteV1) {
+            TimelineTrackMatteEntry entry;
+            entry.matteType = TrackMatteType::LumaMatte;
+            entry.matteSourceClipId = trackMatteClipKey(1, 0);
+            mattes.insert(trackMatteClipKey(0, 0), entry);
+        }
+        timeline->setTrackMatteEntries(mattes);
+        timeline->setAdjustmentLayers(global ? QVector<AdjustmentLayer>{adjGain} : QVector<AdjustmentLayer>{});
+    };
+    const QVector<QVector<ClipInfo>> adjMatteTracks{{adjV1Half}, {adjSolid(adjWhitePath)}, {adjInvert}};
+    const double adjT = 0.5;
     if (glOk) {
         // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
         // frame texture is sampled Nearest, so each frame pixel is read back from
@@ -1346,10 +1398,59 @@ int runSpecialCompositeSelftest()
         tally.gate(9, g9ok1 && g9ok2 && g9ok3 && g9ok4 && g9ok5 && g9ok6,
                    "the clip wiggle is missing from the export or a preview, applied twice on the baked frame, "
                    "written back by arrange, or normalized by the output size (see values above)");
+
+        // G22 (US-2206): the G21 (a) frame (V1 at half size under a luma matte, so a
+        // transparent border, + a V3 Invert adjustment clip + the global gain layer)
+        // shown through displaySpecialComposite: the GL grade is off on a special
+        // composite, so the grab must equal renderFrameAt (graded once, the border opaque
+        // as in export) over the frame minus the 2 px canvas-frame ring; the upload stays
+        // ARGB32_Premultiplied. HEAD: the grab is the ungraded composite on the clear grey.
+        // The adjustment-bearing timeline is bound to the GL preview, so a GL grade on
+        // the baked composite would grade it a second time and fail the same comparison.
+        setAdjTracks(adjMatteTracks, true, true);
+        const QImage g22Special = window.buildSpecialClipComposite(adjT);
+        const QImage g22Export = tlrender::renderFrameAt(timeline, qint64(adjT * 1000000.0), size);
+        const Timeline *g22PrevTimeline = gl->timeline();
+        gl->setTimeline(timeline);
+        const bool g22Bound = gl->timeline() == timeline;
+        player.displaySpecialComposite(g22Special);
+        const QImage::Format g22Upload = gl->lastUploadFormatForTest();
+        const QImage g22Grab = grab();
+        gl->setTimeline(const_cast<Timeline *>(g22PrevTimeline));
+        const QRect g22Rect(2, 2, kW - 4, kH - 4);
+        const QRect g22Border(4, 4, 60, 30);
+        const QRect g22V1(100, 60, 120, 60);
+        const int g22All = rgbMaxDiff(g22Grab, g22Export, g22Rect);
+        const int g22BorderDiff = rgbMaxDiff(g22Grab, g22Export, g22Border);
+        const int g22V1Diff = rgbMaxDiff(g22Grab, g22Export, g22V1);
+        const QRgb g22GrabV1 = g22Grab.isNull() ? 0 : g22Grab.pixel(kW / 2, kH / 2);
+        const QRgb g22GrabBorder = g22Grab.isNull() ? 0 : g22Grab.pixel(10, 10);
+        const QImage g22ExportRgba = g22Export.convertToFormat(QImage::Format_RGBA8888);
+        const QColor g22ExpV1 = g22ExportRgba.isNull() ? QColor() : g22ExportRgba.pixelColor(kW / 2, kH / 2);
+        const QColor g22ExpBorder = g22ExportRgba.isNull() ? QColor() : g22ExportRgba.pixelColor(10, 10);
+        const bool g22ok = adjFixturesOk && glGrab.rawSizeOk && !g22Grab.isNull() && !g22Special.isNull()
+            && g22Bound && g22Upload == QImage::Format_ARGB32_Premultiplied && g22All <= 2;
+        std::cerr << "special-composite G22 gl->setTimeline(adjustment timeline) bound=" << g22Bound
+                  << " (expect 1, prior binding " << (g22PrevTimeline ? "set" : "null")
+                  << ", restored after the grab) specialNull=" << g22Special.isNull() << " specialFormat="
+                  << int(g22Special.format()) << " uploadFormat=" << int(g22Upload) << " (expect 6) rawSizeOk="
+                  << glGrab.rawSizeOk << " grab vs renderFrameAt rgb maxDiff(2..W-3 x 2..H-3)=" << g22All
+                  << " (expect <= 2) border(4,4 60x30)=" << g22BorderDiff << " V1(100,60 120x60)=" << g22V1Diff
+                  << " grab px(160,90)=" << qRed(g22GrabV1) << ',' << qGreen(g22GrabV1) << ',' << qBlue(g22GrabV1)
+                  << " export=" << g22ExpV1.red() << ',' << g22ExpV1.green() << ',' << g22ExpV1.blue() << ",a"
+                  << g22ExpV1.alpha() << " grab px(10,10)=" << qRed(g22GrabBorder) << ',' << qGreen(g22GrabBorder)
+                  << ',' << qBlue(g22GrabBorder) << " export=" << g22ExpBorder.red() << ',' << g22ExpBorder.green()
+                  << ',' << g22ExpBorder.blue() << ",a" << g22ExpBorder.alpha() << " ok=" << g22ok << '\n';
+        tally.gate(22, g22ok,
+                   "the displayed special composite with adjustment clips and layers differs from renderFrameAt "
+                   "(see values above)");
+        setAdjTracks(adjMatteTracks, false, false);
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
     } else {
         for (int g = 5; g <= 7; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
         tally.skip(9, "no usable QOpenGLWidget context");
+        tally.skip(22, "no usable QOpenGLWidget context");
     }
     // The GL section ends with no roto entries; the CPU gates start from that state in both paths.
     timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
@@ -2139,6 +2240,208 @@ int runSpecialCompositeSelftest()
                   << " mean=" << cCompositeMean << " (expect > 2.0) ok=" << g20c << '\n';
         tally.gate(20, echoFixturesOk && g20a && g20c,
                    "the paused special composite's echo samples do not match renderFrameAt's brushed samples (see values above)");
+    }
+
+    // G21 (US-2206): buildSpecialClipComposite grades like renderFrameAt (RGB within 1/255):
+    //   (a) matte: V1 (half size) under a luma matte from V2 (white), a V3 Invert adjustment
+    //       clip and the global gain layer (HEAD: neither is applied);
+    //   (b) matte-free z order: V1 (half size), a V2 Invert adjustment clip, a V3 background:
+    //       the visible V3 is inverted, V1 in front of the adjustment is not (HEAD: no
+    //       invert; an adjustment applied after the whole stack would invert V1 too);
+    //   (c) the (b) tracks with no adjustment clip and no layer: the fast path, its sha
+    //       (compared with the base exe's in the raw log) and its parity with renderFrameAt.
+    {
+        const auto shaOf = [](const QImage &image, bool rgba) {
+            const QImage bytes = rgba ? image.convertToFormat(QImage::Format_RGBA8888) : image;
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            for (int y = 0; y < bytes.height(); ++y)
+                hash.addData(QByteArrayView(reinterpret_cast<const char *>(bytes.constScanLine(y)),
+                                            rgba ? bytes.width() * 4 : bytes.bytesPerLine()));
+            return bytes.isNull() ? std::string("null") : hash.result().toHex().toStdString();
+        };
+        const auto rgbAt = [](const QImage &image, int x, int y) {
+            if (image.isNull())
+                return std::string("null");
+            const QColor c = image.convertToFormat(QImage::Format_RGBA8888).pixelColor(x, y);
+            std::ostringstream out;
+            out << c.red() << ',' << c.green() << ',' << c.blue() << ",a" << c.alpha();
+            return out.str();
+        };
+        const QRect whole(0, 0, kW, kH);
+        const auto exportAt = [&] {
+            return tlrender::renderFrameAt(timeline, qint64(adjT * 1000000.0), size);
+        };
+
+        setAdjTracks(adjMatteTracks, true, true);
+        const QImage aSpecial = window.buildSpecialClipComposite(adjT);
+        const QImage aExport = exportAt();
+        setAdjTracks({{adjV1Half}, {adjSolid(adjWhitePath)}}, true, false);
+        const QImage aPlainExport = exportAt();
+        const int aDiff = rgbMaxDiff(aSpecial, aExport, whole);
+        const int aGraded = rgbMaxDiff(aExport, aPlainExport, QRect(kW / 2 - 10, kH / 2 - 10, 20, 20));
+        const bool g21a = !aSpecial.isNull() && aSpecial.format() == QImage::Format_ARGB32_Premultiplied
+            && aDiff <= 1 && aGraded > 40;
+        std::cerr << "special-composite G21 (a) matte + V3 Invert clip + global gain: specialNull=" << aSpecial.isNull()
+                  << " format=" << int(aSpecial.format()) << " (expect 6) special vs renderFrameAt rgb maxDiff="
+                  << aDiff << " (expect <= 1) special px(160,90)=" << rgbAt(aSpecial, kW / 2, kH / 2)
+                  << " px(10,10)=" << rgbAt(aSpecial, 10, 10) << " export px(160,90)=" << rgbAt(aExport, kW / 2, kH / 2)
+                  << " px(10,10)=" << rgbAt(aExport, 10, 10) << " | sanity export graded vs ungraded V1 maxDiff="
+                  << aGraded << " (expect > 40) ok=" << g21a << '\n';
+
+        setAdjTracks({{adjV1Half}, {adjInvert}, {adjSolid(adjBackPath)}}, false, false);
+        const QImage bSpecial = window.buildSpecialClipComposite(adjT);
+        const QImage bExport = exportAt();
+        const int bDiff = rgbMaxDiff(bSpecial, bExport, whole);
+        const QImage bSpecialRgba = bSpecial.convertToFormat(QImage::Format_RGBA8888);
+        const QColor bBack = bSpecialRgba.isNull() ? QColor() : bSpecialRgba.pixelColor(10, 10);
+        const QColor bV1 = bSpecialRgba.isNull() ? QColor() : bSpecialRgba.pixelColor(kW / 2, kH / 2);
+        // V3 (60,120,180) inverted is about (195,135,75); V1 (200,180,160) stays ungraded.
+        const bool bBackInverted = std::abs(bBack.red() - 195) <= 8 && std::abs(bBack.blue() - 75) <= 8;
+        const bool bV1Ungraded = std::abs(bV1.red() - 200) <= 8 && std::abs(bV1.blue() - 160) <= 8;
+        const bool g21b = !bSpecial.isNull() && bSpecial.format() == QImage::Format_ARGB32_Premultiplied
+            && bDiff <= 1 && bBackInverted && bV1Ungraded;
+        std::cerr << "special-composite G21 (b) V1 + V2 Invert clip + V3 back (matte-free z order): specialNull="
+                  << bSpecial.isNull() << " format=" << int(bSpecial.format())
+                  << " special vs renderFrameAt rgb maxDiff=" << bDiff << " (expect <= 1) special V3 px(10,10)="
+                  << rgbAt(bSpecial, 10, 10) << " (expect ~195,135,75) V1 px(160,90)=" << rgbAt(bSpecial, kW / 2, kH / 2)
+                  << " (expect ~200,180,160) export V3=" << rgbAt(bExport, 10, 10) << " V1="
+                  << rgbAt(bExport, kW / 2, kH / 2) << " ok=" << g21b << '\n';
+
+        setAdjTracks({{adjV1Half}, {}, {adjSolid(adjBackPath)}}, false, false);
+        const QImage cSpecial = window.buildSpecialClipComposite(adjT);
+        const QImage cExport = exportAt();
+        const int cDiff = rgbMaxDiff(cSpecial, cExport, whole);
+        const bool g21c = !cSpecial.isNull() && cSpecial.format() == QImage::Format_ARGB32_Premultiplied
+            && cDiff <= 1;
+        std::cerr << "special-composite G21 (c) no adjustment (fast path): specialNull=" << cSpecial.isNull()
+                  << " format=" << int(cSpecial.format()) << " sha(rgba)=" << shaOf(cSpecial, true)
+                  << " sha(raw)=" << shaOf(cSpecial, false) << " (compare with the base exe in the raw log)"
+                  << " special vs renderFrameAt rgb maxDiff=" << cDiff << " (expect <= 1) ok=" << g21c << '\n';
+
+        // (d) boundaries: two abutting V2 Invert adjustment clips [0,1) and [1,2) over a
+        // 3 s matte-free special-path V1 (half size) and a 3 s V3 background. Export
+        // picks one clip per track by [start,end): graded once at 1 - 1/fps, 1.0 and
+        // 1 + 1/fps (not twice, which cancels), ungraded at and after the end 2.0.
+        const QString adjV1LongPath = dir.filePath(QStringLiteral("special-composite-adj-v1-long.mp4"));
+        const QString adjBackLongPath = dir.filePath(QStringLiteral("special-composite-adj-back-long.mp4"));
+        const bool dFixturesOk = writeClip(adjV1LongPath, false, QColor(200, 180, 160), 3 * kFps)
+            && writeClip(adjBackLongPath, false, QColor(60, 120, 180), 3 * kFps);
+        ClipInfo dV1 = adjSolid(adjV1LongPath);
+        dV1.duration = dV1.outPoint = 3.0;
+        dV1.videoScale = 0.5;
+        dV1.timeRemapCurve.sourceFps = kFps;
+        dV1.timeRemapCurve.addKey(0.0, 0.0);
+        dV1.timeRemapCurve.addKey(3.0, 3.0);
+        ClipInfo dBack = adjSolid(adjBackLongPath);
+        dBack.duration = dBack.outPoint = 3.0;
+        setAdjTracks({{dV1}, {adjInvert, adjInvert}, {dBack}}, false, false);
+        std::string dFailures;
+        for (const double sec : {1.0 - 1.0 / kFps, 1.0, 1.0 + 1.0 / kFps, 2.0, 2.0 + 1.0 / 240.0}) {
+            const QImage dSpecial = window.buildSpecialClipComposite(sec);
+            const QImage dExport = tlrender::renderFrameAt(timeline, qint64(sec * 1000000.0), size);
+            const int dDiff = rgbMaxDiff(dSpecial, dExport, whole);
+            const QImage dExportRgba = dExport.convertToFormat(QImage::Format_RGBA8888);
+            const QColor dBackPx = dExportRgba.isNull() ? QColor() : dExportRgba.pixelColor(10, 10);
+            // Export's expected V3 pixel: inverted (~195,135,75) before 2.0, else (60,120,180).
+            const bool graded = sec < 2.0;
+            const bool dExportOk = std::abs(dBackPx.red() - (graded ? 195 : 60)) <= 8
+                && std::abs(dBackPx.blue() - (graded ? 75 : 180)) <= 8;
+            const bool dOk = !dSpecial.isNull() && dDiff <= 1 && dExportOk;
+            std::cerr << "special-composite G21 (d) abutting V2 Invert clips t=" << sec
+                      << ": specialNull=" << dSpecial.isNull() << " special vs renderFrameAt rgb maxDiff="
+                      << dDiff << " (expect <= 1) special V3 px(10,10)=" << rgbAt(dSpecial, 10, 10)
+                      << " export V3=" << rgbAt(dExport, 10, 10) << " (expect "
+                      << (graded ? "~195,135,75 graded once" : "~60,120,180 ungraded") << ") ok=" << dOk << '\n';
+            if (!dOk) {
+                std::ostringstream at;
+                at << ' ' << sec;
+                dFailures += at.str();
+            }
+        }
+        // (d-overlap) two trimmed V2 adjustment clips [0,1) and [1,2) with a 0.4 s centred
+        // dissolve (borrowed overlap [0.8,1.2)). Export grades with ONE clip per track
+        // (selectClipOnTrack): at t = 0.9 the outgoing Invert (inverted once, not restored
+        // by a second Invert); with the outgoing clip disabled, the incoming Invert +
+        // Exposure keyed by local time at export's interval-relative 0.1 (0.9 - 0.8), not
+        // the clip-start based 0.0. The clips carry a media path because an empty one is
+        // a null object, which visible = false does not disable.
+        const QString adjDummyPath = dir.filePath(QStringLiteral("special-composite-adj-overlap"));
+        ClipInfo oOut = adjInvert;
+        oOut.filePath = adjDummyPath;
+        oOut.duration = 2.0;
+        oOut.inPoint = 0.0;
+        oOut.outPoint = 1.0;
+        oOut.trailOut.type = TransitionType::CrossDissolve;
+        oOut.trailOut.duration = 0.4;
+        ClipInfo oIn = adjInvert;
+        oIn.filePath = adjDummyPath;
+        oIn.duration = 2.0;
+        oIn.inPoint = 0.5;
+        oIn.outPoint = 1.5;
+        oIn.leadIn.type = TransitionType::CrossDissolve;
+        oIn.leadIn.duration = 0.4;
+        oIn.effects = {VideoEffect::createInvert(), VideoEffect::createExposure(0.0)};
+        KeyframeTrack oStops(QStringLiteral("effect.1.stops"), 0.0);
+        oStops.addKeyframe(0.0, -2.0);
+        oStops.addKeyframe(0.2, 0.0);
+        oIn.keyframes.addTrack(oStops);
+        const double oSec = 0.9;
+        // Sanity: the incoming clip's grade differs between local 0.1 and 0.0.
+        QImage oProbe(kW, kH, QImage::Format_RGBA8888);
+        oProbe.fill(QColor(60, 120, 180));
+        const QImage oAtInterval = tlrender::applyAdjustmentClipsAtTrack(
+            oProbe, {tlrender::ActiveAdjustmentClip{1, &oIn, oSec - 0.8}}, 1);
+        const QImage oAtClipStart = tlrender::applyAdjustmentClipsAtTrack(
+            oProbe, {tlrender::ActiveAdjustmentClip{1, &oIn, 0.0}}, 1);
+        const int oLocalSensitivity = rgbMaxDiff(oAtInterval, oAtClipStart, whole);
+        std::string oFailures;
+        for (const bool outgoingDisabled : {false, true}) {
+            ClipInfo out = oOut;
+            out.visible = !outgoingDisabled;
+            setAdjTracks({{dV1}, {out, oIn}, {dBack}}, false, false);
+            int selIdx = -1;
+            double selStart = -1.0;
+            const bool selOk = tlrender::exportSelectedClipAt(timeline, 1, oSec, &selIdx, &selStart);
+            const QImage oSpecial = window.buildSpecialClipComposite(oSec);
+            const QImage oExport = tlrender::renderFrameAt(timeline, qint64(oSec * 1000000.0), size);
+            const int oDiff = rgbMaxDiff(oSpecial, oExport, whole);
+            const QImage oExportRgba = oExport.convertToFormat(QImage::Format_RGBA8888);
+            const QColor oBackPx = oExportRgba.isNull() ? QColor() : oExportRgba.pixelColor(10, 10);
+            const QColor oExpected = outgoingDisabled ? oAtInterval.pixelColor(10, 10) : QColor(195, 135, 75);
+            const bool oExportOk = std::abs(oBackPx.red() - oExpected.red()) <= 8
+                && std::abs(oBackPx.blue() - oExpected.blue()) <= 8;
+            const bool oSelOk = selOk && selIdx == (outgoingDisabled ? 1 : 0)
+                && std::abs(selStart - (outgoingDisabled ? 0.8 : 0.0)) < 1e-6;
+            const bool oOk = !oSpecial.isNull() && oDiff <= 1 && oExportOk && oSelOk
+                && oLocalSensitivity > 10;
+            std::cerr << "special-composite G21 (d-overlap-" << (outgoingDisabled ? 2 : 1)
+                      << ") overlapping V2 adjustment clips, 0.4 s dissolve, t=" << oSec
+                      << (outgoingDisabled ? " outgoing disabled" : " both enabled")
+                      << ": exportSelectedClipAt ok=" << selOk << " clip=" << selIdx << " start=" << selStart
+                      << " (expect " << (outgoingDisabled ? "1 / 0.8" : "0 / 0") << ") specialNull="
+                      << oSpecial.isNull() << " special vs renderFrameAt rgb maxDiff=" << oDiff
+                      << " (expect <= 1) special V3 px(10,10)=" << rgbAt(oSpecial, 10, 10)
+                      << " export V3=" << rgbAt(oExport, 10, 10) << " (expect ~" << oExpected.red() << ','
+                      << oExpected.green() << ',' << oExpected.blue()
+                      << (outgoingDisabled ? " incoming at interval-relative local 0.1"
+                                           : " inverted once")
+                      << ") | sanity incoming grade local 0.1 px=" << rgbAt(oAtInterval, 10, 10)
+                      << " vs local 0.0 px=" << rgbAt(oAtClipStart, 10, 10) << " maxDiff=" << oLocalSensitivity
+                      << " (expect > 10) ok=" << oOk << '\n';
+            if (!oOk)
+                oFailures += outgoingDisabled ? " d-overlap-2" : " d-overlap-1";
+        }
+        const bool g21d = dFixturesOk && dFailures.empty() && oFailures.empty();
+        dFailures += oFailures;
+        const bool g21 = adjFixturesOk && g21a && g21b && g21c && g21d;
+        if (g21)
+            tally.gate(21, true);
+        else
+            tally.gate(21, false,
+                       std::string("the special composite does not grade adjustment clips / layers like "
+                                   "renderFrameAt (see values above); (d) failing sample times:")
+                           + (dFailures.empty() ? std::string(" none") : dFailures));
+        setAdjTracks({{adjV1Half}}, false, false);
     }
 
     return tally.finish("special-composite");

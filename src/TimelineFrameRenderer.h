@@ -186,6 +186,14 @@ bool clipLocalSecAt(const Timeline *timeline, int trackIdx, int clipIdx,
 // clampToFirst on V1), and inside a borrowed overlap window both the outgoing and
 // the incoming clip of that track. Hidden tracks are not filtered here.
 QVector<QPair<int, int>> brushActiveClipsAt(const Timeline *timeline, double timelineSec);
+// US-2206: the single clip export draws on track `trackIdx` at `timelineSec`
+// (overlapPairsAt + selectClipOnTrack, clampToFirst on V1: inside an overlap the
+// outgoing member unless it is disabled, then the incoming one) and the start
+// export measures its local time from (the selected overlap interval's start, or
+// the clip's placement start). False when the track draws no clip there or on a
+// bad index. Hidden tracks and disabled clips are not filtered here.
+bool exportSelectedClipAt(const Timeline *timeline, int trackIdx, double timelineSec,
+                          int *clipIdx, double *selectedStartSec);
 // Number of clip layer sources built so far (V1, upper layers, transition
 // neighbours, renderClipSourceAt), for tests.
 quint64 clipLayerSourceCallsForTest();
