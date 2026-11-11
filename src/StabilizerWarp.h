@@ -59,7 +59,10 @@ QImage warpClampToEdge(const QImage &src, const QTransform &inverse);
 // clip's stabilizer keyframes at `sourceSec` when the clip lies on V1
 // (`trackIdx` 0) of the top-level sequence (`sequenceDepth` 0) and has keys;
 // otherwise, or when the sample is the identity, returns `frame` unchanged.
+// US-2202: a valid `sourceSize` is the size the keys were analysed at (dx / dy are
+// its pixels) when `frame` is a smaller decode such as a proxy; invalid (the
+// export) = `frame`'s own size.
 QImage applyForExport(const QImage &frame, const ClipInfo &clip, int trackIdx,
-                      int sequenceDepth, double sourceSec);
+                      int sequenceDepth, double sourceSec, QSize sourceSize = QSize());
 
 } // namespace stabwarp

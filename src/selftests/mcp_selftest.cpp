@@ -8290,8 +8290,7 @@ int runMcpSelftest()
     }
 
     // US-2107 reserved G207: an MCP edit marks the project unsaved through its undo
-    // point, so undoing back to the saved state is clean again. set_project_option
-    // changes state outside the undo snapshot and keeps the explicit dirty (pin).
+    // point, so undoing back to the saved state is clean again (set_project_option: G208).
     if (!projectTimeline) {
         fail("G207 MCP edits are undoable back to clean", QStringLiteral("Timeline was not available"));
     } else {
@@ -8390,20 +8389,6 @@ int runMcpSelftest()
             g207 = observeTerm(207, leg.tool, ok) && g207;
         }
         g207 = observeTerm(207, "11 converted tools ran (add_track, move_track, remove_track, set_track_locked, import_media, move_clip, connect_clip, disconnect_clip, replace_clip, relink_media, dynamic_zoom)", legs.size() == 11) && g207;
-        // Pin: set_project_option is outside the undo snapshot, so an undo back to the
-        // clean undo point leaves the project unsaved.
-        projectInfoWindow.markProjectClean();
-        const auto pinResponse = callProjectInfoTool(++requestId, QStringLiteral("set_project_option"), QJsonObject{
-            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
-            {QStringLiteral("value"), QJsonObject{{QStringLiteral("enabled"), true}}}});
-        const bool pinSet = projectInfoWindow.isWindowModified()
-            && !toolResult(pinResponse).value(QStringLiteral("isError")).toBool();
-        projectTimeline->saveUndoState(QStringLiteral("E"));
-        const bool pinUndone = projectTimeline->canUndo();
-        projectTimeline->undo();
-        const bool pinStays = projectInfoWindow.isWindowModified() && projectTimeline->undoManager()->isClean();
-        g207 = observeTerm(207, "pin: set_project_option marks unsaved", pinSet) && g207;
-        g207 = observeTerm(207, "pin: modified stays after undo to the clean point (explicit dirty)", pinUndone && pinStays) && g207;
         // Restore the fixture: the extra video track and the burn-in setting.
         while (projectTimeline->videoTrackCount() > videoTracksBefore)
             projectTimeline->removeTrack(false, projectTimeline->videoTrackCount() - 1, nullptr);
@@ -8412,6 +8397,71 @@ int runMcpSelftest()
         qInfo().noquote() << "[mcp] G207 legs:" << detail.join(QStringLiteral(" | "));
         tallyObserved(207, g207, "an MCP edit stayed unsaved after undo to the saved state, or the explicit-dirty pin did not hold");
         saveTestUndoBaseline();
+    }
+
+    // US-2210 reserved G208: the timecode burn-in rides in the sidecarState, so the MCP
+    // option and the dialog's commit are named undo points that return clean.
+    if (!projectTimeline) {
+        fail("G208 timecode burn-in commits are undo points", QStringLiteral("Timeline was not available"));
+    } else {
+        auto *undo = projectTimeline->undoManager();
+        const auto burnInEnabled = [&]() { return projectInfoWindow.m_tcBurnIn.enabled; };
+        const auto resetBaseline = [&]() {
+            undo->clear();
+            undo->saveState(projectTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+            projectInfoWindow.markProjectClean();
+        };
+        const TimecodeBurnInSettings burnInBefore208 = projectInfoWindow.m_tcBurnIn;
+        int requestId = 20800;
+        bool g208 = true;
+        // MCP leg.
+        resetBaseline();
+        const bool before = burnInEnabled();
+        const auto response = callProjectInfoTool(++requestId, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("timecodeBurnIn")},
+            {QStringLiteral("value"), QJsonObject{{QStringLiteral("enabled"), !before}}}});
+        g208 = observeTerm(208, "mcp: set_project_option ok", !toolResult(response).value(QStringLiteral("isError")).toBool()) && g208;
+        g208 = observeTerm(208, "mcp: setting flipped", burnInEnabled() == !before) && g208;
+        g208 = observeTerm(208, "mcp: window modified", projectInfoWindow.isWindowModified()) && g208;
+        g208 = observeTerm(208, "mcp: canUndo", projectTimeline->canUndo()) && g208;
+        projectTimeline->undo();
+        const QJsonObject infoUndone = toolPayload(callProjectInfoTool(++requestId, QStringLiteral("get_project_info"), QJsonObject{}));
+        g208 = observeTerm(208, "mcp: undo restores the setting", burnInEnabled() == before
+            && infoUndone.value(QStringLiteral("timecodeBurnIn")).toObject().value(QStringLiteral("enabled")).toBool() == before) && g208;
+        g208 = observeTerm(208, "mcp: undo returns clean", !projectInfoWindow.isWindowModified()) && g208;
+        projectTimeline->redo();
+        g208 = observeTerm(208, "mcp: redo re-applies the setting", burnInEnabled() == !before) && g208;
+        // Dialog leg: the dialog's commit, without opening the modal dialog.
+        resetBaseline();
+        TimecodeBurnInSettings dialogSettings = projectInfoWindow.m_tcBurnIn;
+        const bool beforeDialog = dialogSettings.enabled;
+        dialogSettings.enabled = !beforeDialog;
+        projectInfoWindow.commitTimecodeBurnInSettings(dialogSettings, QStringLiteral("タイムコード焼き込み"));
+        g208 = observeTerm(208, "dialog: setting flipped", burnInEnabled() == !beforeDialog) && g208;
+        g208 = observeTerm(208, "dialog: window modified", projectInfoWindow.isWindowModified()) && g208;
+        projectTimeline->undo();
+        g208 = observeTerm(208, "dialog: undo restores the setting", burnInEnabled() == beforeDialog) && g208;
+        g208 = observeTerm(208, "dialog: undo returns clean", !projectInfoWindow.isWindowModified()) && g208;
+        // Negative control: a rejected option adds no undo point.
+        resetBaseline();
+        const int indexBefore = undo->currentIndex();
+        callProjectInfoTool(++requestId, QStringLiteral("set_project_option"), QJsonObject{
+            {QStringLiteral("option"), QStringLiteral("g208NoSuchOption")},
+            {QStringLiteral("value"), QJsonObject{{QStringLiteral("enabled"), true}}}});
+        g208 = observeTerm(208, "control: a rejected option adds no undo point", undo->currentIndex() == indexBefore) && g208;
+        // Negative control: a snapshot recorded without projectOptions leaves the settings alone.
+        QJsonObject oldSnapshot = projectInfoWindow.collectSidecarState();
+        g208 = observeTerm(208, "control: the sidecarState carries projectOptions.timecodeBurnIn", oldSnapshot.value(QStringLiteral("projectOptions")).toObject()
+            .value(QStringLiteral("timecodeBurnIn")).isObject()) && g208;
+        oldSnapshot.remove(QStringLiteral("projectOptions"));
+        TimecodeBurnInSettings changed = projectInfoWindow.m_tcBurnIn;
+        changed.enabled = !changed.enabled;
+        projectInfoWindow.applyTimecodeBurnInSettings(changed);
+        projectInfoWindow.applySidecarState(oldSnapshot);
+        g208 = observeTerm(208, "control: an old snapshot leaves the settings as they are", burnInEnabled() == changed.enabled) && g208;
+        projectInfoWindow.applyTimecodeBurnInSettings(burnInBefore208);
+        resetBaseline();
+        tallyObserved(208, g208, "a burn-in commit was not an undo point back to clean, or a control did not hold");
     }
 
     server.stop();

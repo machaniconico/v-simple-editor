@@ -184,6 +184,7 @@ int runLight3DSelftest();
 int runLinkedTrimSelftest();
 int runLiveMatteResolveSelftest();
 int runLogToRec709Selftest();
+int runLutGlSelftest();
 int runLutImportSelftest();
 int runLoudnessAutoSelftest();
 int runLoudnessExportWireSelftest();
@@ -722,7 +723,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
-      "V1 stabilizer keyframes on export (StabilizerWarp) after the brush, before FX: identity, translation, interpolation, edge fill, V1 only / nested / matrix, brush order and the special composite (6 gates)" },
+      "V1 stabilizer keyframes on export (StabilizerWarp) after the brush, before FX: identity, translation, interpolation, edge fill, V1 only / nested / matrix, brush order and the special composite (12 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
@@ -774,7 +775,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (20 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (22 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
@@ -797,6 +798,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (12 gates)" },
     { "psd-import", "VEDITOR_PSD_IMPORT_SELFTEST", runPsdImportSelftest, false,
       "PSD importer hostile-input bounds: luni count, layer side cap, unallocatable layers (G1-G7) (7 gates)" },
+    { "lut-gl", "VEDITOR_LUT_GL_SELFTEST", runLutGlSelftest, true,
+      "GL preview 3D LUT read-back vs applyLut: texel centres, DOMAIN remap, 33 / 17 v^2 / 65-point sweeps (G1-G3), fresh-preview 1D-first draw without GL error or sampler-unit clash (G7) (7 gates)" },
     { "lut-import", "VEDITOR_LUT_IMPORT_SELFTEST", runLutImportSelftest, false,
       ".cube size bounds: LUT_3D_SIZE 2..256 / LUT_1D_SIZE 2..65536, 64-bit expected row count, isValid size >= 2 (G1-G7) (12 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
@@ -940,7 +943,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "autosave",         nullptr,                                runAutosaveSelftest,           true,
       "Autosave: atomic QSaveFile write, unchanged skip, failure report, UTC name rotation and 12-field subtitle style (5 gates)" },
     { "subtitle-import",  "VEDITOR_SUBTITLE_IMPORT_SELFTEST",     runSubtitleImportSelftest,     false,
-      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (6 gates)" },
+      "SRT / VTT byte decoding (BOM, UTF-8, Shift_JIS), dot milliseconds, all-invalid error, import warnings (9 gates)" },
     { "sns-fit",          "VEDITOR_SNS_FIT_SELFTEST",            runSnsFitSelftest,             false,
       "snsfit::containGeom/containInAspectCanvas pure geometry (15 gates)" },
     { "sns-cover",        "VEDITOR_SNS_COVER_SELFTEST",          runSnsCoverSelftest,           false,
@@ -1052,7 +1055,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
       "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
-      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity" },
+      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity (14 gates)" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
@@ -1118,13 +1121,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
-      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (12 gates)" },
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (14 gates)" },
     { "project-persist", nullptr, runProjectPersistSelftest, true,
-      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (11 gates)" },
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (14 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (207 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (208 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
@@ -1166,7 +1169,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
       "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
     { "fcpxml-import", "VEDITOR_FCPXML_IMPORT_SELFTEST", runFcpxmlImportSelftest, true,
-      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (42 gates)" },
+      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (43 gates)" },
     { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
       "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
     { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,

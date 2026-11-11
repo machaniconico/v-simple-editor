@@ -327,6 +327,12 @@ uniform bool uHueSatWarpEnabled;
 
 // 3D LUT uniforms
 uniform sampler3D uLut3D;
+uniform sampler2D uLut1D;                     // N x 1 RGB32F table of a 1D LUT (texture unit 4)
+uniform int uLutIs1D = 0;                     // 1: sample uLut1D per channel instead of uLut3D
+uniform float uLut1DSize = 1.0;               // texels of uLut1D; < 2 skips the lookup
+uniform float uLutSize = 1.0;                 // texels per axis; < 2 skips the lookup
+uniform vec3 uLutDomainMin = vec3(0.0);       // DOMAIN_MIN of a 3D LUT (0 for a 1D grid)
+uniform vec3 uLutDomainMax = vec3(1.0);       // DOMAIN_MAX of a 3D LUT (1 for a 1D grid)
 uniform float uLutIntensity;  // 0.0 to 1.0
 uniform bool uLutEnabled;
 
@@ -994,9 +1000,24 @@ R"(
             color.rgb = clamp(color.rgb * factor, 0.0, 1.0);
         }
 
-        // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity
-        if (uLutEnabled) {
-            vec3 lutColor = texture(uLut3D, clamp(color, 0.0, 1.0)).rgb;
+        // US-FEAT-B: LUT 3D-texture blend — sample 3D LUT and mix with intensity.
+        // Domain remap and texel-centre address as LutImporter::gpuDomainRemap /
+        // gpuTexelCoord: n = clamp((c - min) / (max - min), 0, 1), t = (n * (N - 1) + 0.5) / N.
+        // A 1D LUT looks each channel up in its own column of the N x 1 table at the same
+        // texel-centre address.
+        if (uLutEnabled && uLutIs1D != 0) {
+            if (uLut1DSize >= 2.0) {
+                vec3 lutN = clamp((color - uLutDomainMin) / (uLutDomainMax - uLutDomainMin), 0.0, 1.0);
+                vec3 lutT = (lutN * (uLut1DSize - 1.0) + 0.5) / uLut1DSize;
+                vec3 lutColor = vec3(texture(uLut1D, vec2(lutT.r, 0.5)).r,
+                                     texture(uLut1D, vec2(lutT.g, 0.5)).g,
+                                     texture(uLut1D, vec2(lutT.b, 0.5)).b);
+                color = mix(color, lutColor, uLutIntensity);
+            }
+        } else if (uLutEnabled && uLutSize >= 2.0) {
+            vec3 lutN = clamp((color - uLutDomainMin) / (uLutDomainMax - uLutDomainMin), 0.0, 1.0);
+            vec3 lutT = (lutN * (uLutSize - 1.0) + 0.5) / uLutSize;
+            vec3 lutColor = texture(uLut3D, lutT).rgb;
             color = mix(color, lutColor, uLutIntensity);
         }
 
@@ -1399,6 +1420,10 @@ void GLPreview::cleanupGL()
         delete m_lutTexture;
         m_lutTexture = nullptr;
     }
+    if (m_lut1DTexture) {
+        delete m_lut1DTexture;
+        m_lut1DTexture = nullptr;
+    }
     if (m_curveLutTex) {
         delete m_curveLutTex;
         m_curveLutTex = nullptr;
@@ -1725,6 +1750,12 @@ void GLPreview::createShaderProgram()
     m_locLut3D         = m_program->uniformLocation("uLut3D");
     m_locLutIntensity  = m_program->uniformLocation("uLutIntensity");
     m_locLutEnabled    = m_program->uniformLocation("uLutEnabled");
+    m_locLutSize       = m_program->uniformLocation("uLutSize");
+    m_locLutDomainMin  = m_program->uniformLocation("uLutDomainMin");
+    m_locLutDomainMax  = m_program->uniformLocation("uLutDomainMax");
+    m_locLut1D         = m_program->uniformLocation("uLut1D");
+    m_locLutIs1D       = m_program->uniformLocation("uLutIs1D");
+    m_locLut1DSize     = m_program->uniformLocation("uLut1DSize");
 
     // US-CG-1: RGB curves
     m_locCurveLut       = m_program->uniformLocation("uCurveLut");
@@ -1857,8 +1888,14 @@ void GLPreview::displayFrame(const QImage &frame)
     m_compositeBrushStabSize = m_pendingCompositeBrushStabSize;
     m_pendingCompositeBrushStab = {};
     m_pendingCompositeBrushStabSize = QSize();
+    // US-2202: a new frame size changes the UV unit of the keys' dx / dy, so the
+    // matrix is rebuilt here instead of waiting for the next source-time push.
+    const bool stabFrameSizeChanged =
+        m_stabFrameW != frame.width() || m_stabFrameH != frame.height();
     m_stabFrameW = frame.width();
     m_stabFrameH = frame.height();
+    if (stabFrameSizeChanged && !m_stabKeyframes.isEmpty())
+        rebuildStabMatrix();
     const QImage::Format inFmt = frame.format();
     const bool is16 = (inFmt == QImage::Format_RGBA64
                        || inFmt == QImage::Format_RGBA64_Premultiplied);
@@ -1935,6 +1972,22 @@ void GLPreview::setFrameTextureNearestForTest(bool nearest)
     // paintGL applies it to an already allocated m_texture (context current).
     m_frameTextureFilterDirty = true;
     update();
+}
+
+int GLPreview::samplerUnitForTest(const char *name)
+{
+    if (!m_program || !context())
+        return -1;
+    makeCurrent();
+    int unit = -1;
+    const int loc = m_program->uniformLocation(name);
+    if (loc >= 0) {
+        GLint v = -1;
+        glGetUniformiv(m_program->programId(), loc, &v);
+        unit = v;
+    }
+    doneCurrent();
+    return unit;
 }
 
 void GLPreview::setHdrTransfer(int transfer)
@@ -2663,10 +2716,26 @@ void GLPreview::paintGL()
     // LUT
     m_program->setUniformValue(m_locLutEnabled, m_lutEnabled);
     m_program->setUniformValue(m_locLutIntensity, m_lutIntensity);
+    m_program->setUniformValue(m_locLutSize, static_cast<float>(m_lutN));
+    m_program->setUniformValue(m_locLutDomainMin, m_lutDomainMin);
+    m_program->setUniformValue(m_locLutDomainMax, m_lutDomainMax);
+    m_program->setUniformValue(m_locLutIs1D, m_lut1DTexture ? 1 : 0);
+    m_program->setUniformValue(m_locLut1DSize, m_lut1DTexture ? static_cast<float>(m_lut1DN) : 1.0f);
+    // The 3D sampler always points at unit 1, even before any 3D LUT exists:
+    // left at its default unit 0 it would share the unit with the sampler2D
+    // uTexture, and samplers of different types on one unit make the draw
+    // fail with GL_INVALID_OPERATION (a fresh session showing a 1D LUT first).
+    m_program->setUniformValue(m_locLut3D, 1);
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->bind();
-        m_program->setUniformValue(m_locLut3D, 1);
+    }
+    // The 1D sampler always points at unit 4, which no other sampler uses.
+    m_program->setUniformValue(m_locLut1D, 4);
+    if (m_lutEnabled && m_lut1DTexture) {
+        glActiveTexture(GL_TEXTURE4);
+        m_lut1DTexture->bind();
+        glActiveTexture(GL_TEXTURE0);
     }
 
     // US-CG-1: RGB Curves LUT — bind on texture unit 2 when enabled.
@@ -2757,6 +2826,11 @@ void GLPreview::paintGL()
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->release();
+        glActiveTexture(GL_TEXTURE0);
+    }
+    if (m_lutEnabled && m_lut1DTexture) {
+        glActiveTexture(GL_TEXTURE4);
+        m_lut1DTexture->release();
         glActiveTexture(GL_TEXTURE0);
     }
 
@@ -3733,9 +3807,6 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
-    // 1D / non-default-domain LUTs become a 3D grid; a default-domain 3D LUT passes through
-    const LutData grid = LutImporter::toGpuGrid(lut);
-
     undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
     undotrace::log("gl:afterMakeCurrent");
@@ -3744,105 +3815,77 @@ void GLPreview::setLut(const LutData &lut)
         delete m_lutTexture;
         m_lutTexture = nullptr;
     }
-
-    // Create 3D texture from LUT table
-    m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
-    m_lutTexture->setSize(grid.size, grid.size, grid.size);
-    m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
-    m_lutTexture->allocateStorage();
-    m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setMagnificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+    if (m_lut1DTexture) {
+        delete m_lut1DTexture;
+        m_lut1DTexture = nullptr;
+    }
+    m_lutN = 0;
+    m_lut1DN = 0;
 
     // Upload LUT data as float RGB
     QVector<float> data;
-    data.reserve(grid.table.size() * 3);
-    for (const QVector3D &v : grid.table) {
-        data.append(v.x());
-        data.append(v.y());
-        data.append(v.z());
-    }
-    m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
-                          data.constData());
-
-    m_lutIntensity = static_cast<float>(grid.intensity);
-    m_lutEnabled = true;
-
-    doneCurrent();
-    update();
-}
-
-// US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
-// with auto-detection of cube layout (32^3, 64^3 horizontal/vertical strip, HALD).
-void GLPreview::setLutTexture(const QImage &lutGrid, float intensity)
-{
-    if (lutGrid.isNull())
-        return;
-
-    const int w = lutGrid.width();
-    const int h = lutGrid.height();
-    int cubeSize = 0;
-    bool horizontal = true; // true = N*N wide × N tall (HALD), false = N wide × N*N tall
-
-    // Auto-detect cube size from grid dimensions
-    if (w == 32 && h == 1024)        { cubeSize = 32; horizontal = false; }
-    else if (w == 1024 && h == 32)   { cubeSize = 32; horizontal = true; }
-    else if (w == 64 && h == 4096)   { cubeSize = 64; horizontal = false; }
-    else if (w == 4096 && h == 64)   { cubeSize = 64; horizontal = true; }
-    else {
-        qWarning() << "GLPreview::setLutTexture: unsupported LUT grid size" << w << "x" << h;
-        return;
-    }
-
-    // Convert to 8-bit RGBA for consistent pixel access
-    QImage img = lutGrid.convertToFormat(QImage::Format_RGBA8888);
-
-    // Build 3D float-RGB data: cubeSize × cubeSize × cubeSize × 3
-    QVector<float> data;
-    data.resize(cubeSize * cubeSize * cubeSize * 3);
-
-    for (int b = 0; b < cubeSize; ++b) {
-        for (int g = 0; g < cubeSize; ++g) {
-            for (int r = 0; r < cubeSize; ++r) {
-                int px, py;
-                if (horizontal) {
-                    // HALD layout: width = cubeSize*cubeSize, height = cubeSize
-                    px = g * cubeSize + r;
-                    py = b;
-                } else {
-                    // Transposed: width = cubeSize, height = cubeSize*cubeSize
-                    px = b;
-                    py = g * cubeSize + r;
-                }
-                const QRgb pixel = img.pixel(px, py);
-                const int idx = (b * cubeSize * cubeSize + g * cubeSize + r) * 3;
-                data[idx + 0] = qRed(pixel)   / 255.0f;
-                data[idx + 1] = qGreen(pixel) / 255.0f;
-                data[idx + 2] = qBlue(pixel)  / 255.0f;
+    int uploaded = 0;
+    if (lut.type == LutType::Cube1D) {
+        // A 1D LUT is an N x 1 texture sampled per channel; a table wider than the context's
+        // texture limit is resampled onto that many points over the normalised 0..1 axis (the
+        // shader applies the LUT's own domain before the lookup).
+        GLint maxTexture = 0;
+        glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
+        const int maxW = qMax(2, m_lut1DMaxWidthOverride > 0 ? m_lut1DMaxWidthOverride
+                                                              : static_cast<int>(maxTexture));
+        QVector<QVector3D> resampled;
+        const QVector<QVector3D> *table = &lut.table;
+        if (lut.size > maxW) {
+            LutData unit = lut;
+            unit.domainMin = QVector3D(0.0f, 0.0f, 0.0f);
+            unit.domainMax = QVector3D(1.0f, 1.0f, 1.0f);
+            resampled.resize(maxW);
+            for (int i = 0; i < maxW; ++i) {
+                const float t = static_cast<float>(i) / static_cast<float>(maxW - 1);
+                resampled[i] = LutImporter::sample(unit, QVector3D(t, t, t));
             }
+            table = &resampled;
         }
+        uploaded = table->size();
+        data.reserve(uploaded * 3);
+        for (const QVector3D &v : *table) {
+            data.append(v.x());
+            data.append(v.y());
+            data.append(v.z());
+        }
+        m_lut1DTexture = new QOpenGLTexture(QOpenGLTexture::Target2D);
+        m_lut1DTexture->setSize(uploaded, 1);
+        m_lut1DTexture->setFormat(QOpenGLTexture::RGB32F);
+        m_lut1DTexture->setMipLevels(1);
+        m_lut1DTexture->allocateStorage();
+        m_lut1DTexture->setMinificationFilter(QOpenGLTexture::Linear);
+        m_lut1DTexture->setMagnificationFilter(QOpenGLTexture::Linear);
+        m_lut1DTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        m_lut1DTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32, data.constData());
+        m_lut1DN = uploaded;
+    } else {
+        // A 3D LUT passes through with its own table and domain, which the shader applies
+        // before the texel-centre lookup.
+        m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
+        m_lutTexture->setSize(lut.size, lut.size, lut.size);
+        m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
+        m_lutTexture->allocateStorage();
+        m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
+        m_lutTexture->setMagnificationFilter(QOpenGLTexture::Linear);
+        m_lutTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
+        data.reserve(lut.table.size() * 3);
+        for (const QVector3D &v : lut.table) {
+            data.append(v.x());
+            data.append(v.y());
+            data.append(v.z());
+        }
+        m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32, data.constData());
+        m_lutN = lut.size;
     }
 
-    undotrace::log("gl:beforeMakeCurrent");
-    makeCurrent();
-    undotrace::log("gl:afterMakeCurrent");
-
-    if (m_lutTexture) {
-        delete m_lutTexture;
-        m_lutTexture = nullptr;
-    }
-
-    m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
-    m_lutTexture->setSize(cubeSize, cubeSize, cubeSize);
-    m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
-    m_lutTexture->allocateStorage();
-    m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setMagnificationFilter(QOpenGLTexture::Linear);
-    m_lutTexture->setWrapMode(QOpenGLTexture::ClampToEdge);
-    m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
-                          data.constData());
-
-    m_lutIntensity = qBound(0.0f, intensity, 1.0f);
+    m_lutIntensity = static_cast<float>(lut.intensity);
+    m_lutDomainMin = lut.domainMin;
+    m_lutDomainMax = lut.domainMax;
     m_lutEnabled = true;
 
     doneCurrent();
@@ -4117,13 +4160,27 @@ void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
         m_stabEnabled = false;
         return;
     }
-
-    const stabwarp::StabSample sample = stabwarp::sampleAt(m_stabKeyframes, sourceUs);
-    const std::array<float, 9> matrix =
-        stabwarp::inverseMatrixUv(sample, m_stabFrameW, m_stabFrameH);
-    std::copy(matrix.begin(), matrix.end(), m_stabMatrix);
-    m_stabEnabled = !stabwarp::isIdentity(sample, m_stabFrameW, m_stabFrameH);
+    rebuildStabMatrix();
     update();
+}
+
+void GLPreview::setStabilizerSourceSize(const QSize &sourceSize)
+{
+    if (m_stabSourceSize == sourceSize)
+        return;
+    m_stabSourceSize = sourceSize;
+    if (!m_stabKeyframes.isEmpty())
+        rebuildStabMatrix();
+}
+
+void GLPreview::rebuildStabMatrix()
+{
+    const int w = m_stabSourceSize.isValid() ? m_stabSourceSize.width() : m_stabFrameW;
+    const int h = m_stabSourceSize.isValid() ? m_stabSourceSize.height() : m_stabFrameH;
+    const stabwarp::StabSample sample = stabwarp::sampleAt(m_stabKeyframes, m_stabSourceUs);
+    const std::array<float, 9> matrix = stabwarp::inverseMatrixUv(sample, w, h);
+    std::copy(matrix.begin(), matrix.end(), m_stabMatrix);
+    m_stabEnabled = !stabwarp::isIdentity(sample, w, h);
 }
 
 void GLPreview::setSpecialCompositeBrushStabilizer(const stabwarp::StabSample &sample,
@@ -4174,7 +4231,13 @@ void GLPreview::clearLut()
         delete m_lutTexture;
         m_lutTexture = nullptr;
     }
+    if (m_lut1DTexture) {
+        delete m_lut1DTexture;
+        m_lut1DTexture = nullptr;
+    }
     m_lutEnabled = false;
+    m_lutN = 0;
+    m_lut1DN = 0;
     // US-FEAT-B: zero intensity so LUT has no residual effect if re-enabled
     m_lutIntensity = 0.0f;
     doneCurrent();

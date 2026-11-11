@@ -10,6 +10,7 @@
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../UndoManager.h"
+#include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 
 #include <QCoreApplication>
@@ -20,9 +21,12 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QSignalSpy>
 #include <QStringList>
 #include <QTemporaryDir>
+
+#include <cfloat>
 
 #include <algorithm>
 #include <cmath>
@@ -158,6 +162,31 @@ ClipInfo greyClip()
     return clip;
 }
 
+// 40x24 10 fps mpeg4 clip of `frames` frames whose colour changes every frame, so a time remap
+// shows in the pixels.
+bool writeVideoFile(const QString &path, int frames)
+{
+    libavcore::EncodeRequest req;
+    req.width = 40;
+    req.height = 24;
+    req.fps = 10;
+    req.fpsNum = 10;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req)) return false;
+    for (int i = 0; i < frames; ++i) {
+        QImage frame(40, 24, QImage::Format_RGB888);
+        frame.fill(QColor((i * 23) & 255, 90, 160));
+        if (!encoder.pushFrame(frame, i)) return false;
+    }
+    return !encoder.finalize();
+}
+
 } // namespace
 
 int runProjectPersistSelftest()
@@ -165,7 +194,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 11; ++g)
+        for (int g = 1; g <= 14; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -851,6 +880,312 @@ int runProjectPersistSelftest()
                    d11);
     }
     QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+    // ---- G12 / G13 (US-2215): out-of-range number literals and positioned parse errors ----
+    {
+        const QByteArray overflowing = QByteArrayLiteral(
+            "{\"version\":2,\"config\":{\"name\":\"1e400\",\"width\":-1e400,\"height\":1080,\"fps\":30},"
+            "\"videoTracks\":[[{\"filePath\":\"a.mp4\",\"displayName\":\"1e400\",\"duration\":2,\"speed\":1e400},"
+            "{\"filePath\":\"b.mp4\",\"displayName\":\"b\\\"1e400\",\"duration\":2,\"volume\":1e-400}]],"
+            "\"audioTracks\":[]}");
+        // Without the clamp QJsonDocument::fromJson refuses the whole document (error 7).
+        QJsonParseError rawError;
+        QJsonDocument::fromJson(overflowing, &rawError);
+
+        ProjectData viaString;
+        QString errString;
+        const bool stringOk = ProjectFile::fromJsonString(QString::fromUtf8(overflowing), viaString, &errString);
+        auto clipAt = [](const ProjectData &pd, int clip) -> ClipInfo {
+            return pd.videoTracks.size() > 0 && pd.videoTracks[0].size() > clip ? pd.videoTracks[0][clip] : ClipInfo();
+        };
+        const double speed = clipAt(viaString, 0).speed;
+        const double volume = clipAt(viaString, 1).volume;
+        const QString nameA = clipAt(viaString, 0).displayName;
+        const QString nameB = clipAt(viaString, 1).displayName;
+
+        QJsonDocument parsed;
+        int clamped = -1;
+        QString parseErr;
+        const bool parsedOk = ProjectFile::parseProjectJson(overflowing, parsed, &parseErr, &clamped);
+
+        const QString pathBig = tmp("overflow.veditor");
+        QFile bigFile(pathBig);
+        const bool bigWritten = bigFile.open(QIODevice::WriteOnly) && bigFile.write(overflowing) == overflowing.size();
+        bigFile.close();
+        ProjectData viaFile;
+        QString errFile;
+        const bool fileOk = ProjectFile::load(pathBig, viaFile, &errFile);
+
+        // Negative controls: in-range literals are not rewritten, strings are never touched.
+        const QByteArray inRange = QByteArrayLiteral(
+            "{\"a\":[1e308,5e-324,-0,0e-400,2.5e-308,1.2345678901234567890123456,\"1e400\",\"q\\\"1e400\"]}");
+        QJsonDocument inDoc;
+        int inClamped = -1;
+        QString inErr;
+        const bool inOk = ProjectFile::parseProjectJson(inRange, inDoc, &inErr, &inClamped);
+        const QJsonArray inArr = inDoc.object().value(QStringLiteral("a")).toArray();
+
+        // Tokens that are not JSON numbers must stay untouched so Qt reports the syntax error.
+        bool badGrammarRejected = true;
+        std::string badDetail;
+        for (const char *bad : {"{\"a\":01e400}", "{\"a\":1.e400}", "{\"a\":-.1e400}"}) {
+            QJsonDocument badDoc;
+            int badClamped = -1;
+            QString badErr;
+            const bool badOk = ProjectFile::parseProjectJson(QByteArray(bad), badDoc, &badErr, &badClamped);
+            badGrammarRejected = badGrammarRejected && !badOk && badErr.contains(QLatin1String("byte")) && badClamped == 0;
+            badDetail += std::string(" ") + bad + "->" + b(badOk) + "/" + std::to_string(badClamped);
+        }
+        const double configWidth = parsed.object().value(QStringLiteral("config")).toObject().value(QStringLiteral("width")).toDouble();
+
+        std::string d = "rawFromJsonError=" + std::to_string(int(rawError.error)) + " stringOk=" + b(stringOk)
+            + " err='" + errString.toStdString() + "' speed=" + std::to_string(speed)
+            + " volume=" + std::to_string(volume) + " nameA=" + nameA.toStdString()
+            + " nameB=" + nameB.toStdString() + " parsedOk=" + b(parsedOk) + " clamped=" + std::to_string(clamped)
+            + " fileWritten=" + b(bigWritten) + " fileOk=" + b(fileOk) + " fileSpeed=" + std::to_string(clipAt(viaFile, 0).speed)
+            + " fileVolume=" + std::to_string(clipAt(viaFile, 1).volume) + " configWidth=" + std::to_string(configWidth) + " | bad-grammar:" + badDetail
+            + " | in-range: ok=" + b(inOk)
+            + " clamped=" + std::to_string(inClamped) + " items=" + std::to_string(inArr.size());
+        const bool inRangeOk = inOk && inClamped == 0 && inArr.size() == 8 && inArr.at(0).toDouble() == 1e308
+            && inArr.at(1).toDouble() > 0.0 && inArr.at(3).toDouble() == 0.0
+            && inArr.at(6).toString() == QLatin1String("1e400") && inArr.at(7).toString() == QLatin1String("q\"1e400");
+        tally.gate(12, rawError.error == QJsonParseError::IllegalNumber && stringOk && speed == 1e7 && volume == 0.0
+                           && nameA == QLatin1String("1e400") && nameB == QLatin1String("b\"1e400") && parsedOk
+                           && clamped == 3 && configWidth == -DBL_MAX && badGrammarRejected && bigWritten && fileOk && clipAt(viaFile, 0).speed == 1e7
+                           && clipAt(viaFile, 1).volume == 0.0 && inRangeOk,
+                   d);
+
+        const QString pathCut = tmp("cut.veditor");
+        QFile cutFile(pathCut);
+        const bool cutWritten = cutFile.open(QIODevice::WriteOnly) && cutFile.write("{\"a\":") == 5;
+        cutFile.close();
+        ProjectData cutData;
+        QString cutErr;
+        const bool cutLoaded = ProjectFile::load(pathCut, cutData, &cutErr);
+        // The offset is reported in the original file even after a clamp rewrote an earlier literal.
+        QJsonDocument shiftDoc;
+        QString shiftErr;
+        const bool shiftOk = ProjectFile::parseProjectJson(QByteArrayLiteral("{\"a\":1e400,\"b\":"), shiftDoc, &shiftErr);
+        tally.gate(13, cutWritten && !cutLoaded && cutErr.contains(QLatin1String("byte"))
+                           && cutErr.contains(QLatin1String("byte 5:")) && !shiftOk
+                           && shiftErr.contains(QLatin1String("byte 15:")),
+                   "written=" + b(cutWritten) + " loaded=" + b(cutLoaded) + " errorMessage='" + cutErr.toStdString()
+                       + "' clampedPrefix: ok=" + b(shiftOk) + " err='" + shiftErr.toStdString() + "'");
+    }
+
+    // ---- G14 (US-2207): a non-active sequence's legacy time-remap table is applied at load ----
+    // P (active) nests C (non-active, one clip with a speed-2 curve). The legacy variant has the
+    // curve only in sequences[C].timeRemapClipEntries; the rendered colour changes every frame,
+    // so a remap that is not applied shows in the pixels.
+    {
+        QString whyNot;
+        const QString videoPath = tmp("g14.mp4");
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(14, qPrintable(whyNot));
+        } else if (!writeVideoFile(videoPath, 20)) {
+            tally.gate(14, false, "the G14 fixture media could not be written");
+        } else {
+            timeremap::TimeRemapCurve fast;
+            fast.sourceFps = 10.0;
+            fast.addKey(0.0, 0.0);
+            fast.addKey(1.0, 2.0);
+            timeremap::TimeRemapCurve other;
+            other.sourceFps = 10.0;
+            other.addKey(0.0, 0.0);
+            other.addKey(2.0, 0.5);
+            const QSize outSize(40, 24);
+            const qint64 at = 500000;
+            const QString cId = QStringLiteral("seq-c");
+
+            ClipInfo cClip;
+            cClip.filePath = videoPath;
+            cClip.displayName = QStringLiteral("g14-c");
+            cClip.duration = cClip.outPoint = 2.0;
+            cClip.timeRemapCurve = fast;
+            TimelineSequence child;
+            child.id = cId;
+            child.name = QStringLiteral("C");
+            child.videoTracks = {{cClip}};
+            child.audioTracks = {{}};
+            ClipInfo ref;
+            ref.displayName = QStringLiteral("g14-ref");
+            ref.duration = ref.outPoint = child.duration();
+            ref.sequenceRefId = cId;
+            ref.filePath = timeline_nesting::sequenceClipFilePath(cId);
+            TimelineSequence parent;
+            parent.id = QStringLiteral("seq-p");
+            parent.name = QStringLiteral("P");
+            parent.videoTracks = {{ref}};
+            parent.audioTracks = {{}};
+
+            const QString savedPath = tmp("g14-saved.veditor");
+            bool saved = false;
+            {
+                MainWindow writer;
+                writer.m_timeline->setSequences({parent, child}, parent.id);
+                QString err;
+                saved = writer.saveProjectToPath(savedPath, &err);
+            }
+            const QJsonObject savedRoot = readJson(savedPath);
+            // The saved file with C's clip curve replaced by `inlineCurve` (none when empty) and
+            // C's legacy table holding `legacy` (none when empty).
+            const auto variant = [&](const char *name, const QJsonValue &inlineCurve,
+                                     const QJsonValue &legacy) {
+                QJsonObject root = savedRoot;
+                QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+                for (int i = 0; i < sequences.size(); ++i) {
+                    QJsonObject sequence = sequences.at(i).toObject();
+                    if (sequence.value(QStringLiteral("id")).toString() != cId)
+                        continue;
+                    QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+                    QJsonArray clips = tracks.at(0).toArray();
+                    QJsonObject clip = clips.at(0).toObject();
+                    clip.remove(QStringLiteral("timeRemapCurve"));
+                    if (!inlineCurve.isNull())
+                        clip[QStringLiteral("timeRemapCurve")] = inlineCurve;
+                    clips.replace(0, clip);
+                    tracks.replace(0, clips);
+                    sequence[QStringLiteral("videoTracks")] = tracks;
+                    sequence.remove(QStringLiteral("timeRemapClipEntries"));
+                    if (!legacy.isNull())
+                        sequence[QStringLiteral("timeRemapClipEntries")] = QJsonArray{QJsonObject{
+                            {QStringLiteral("clipId"), QStringLiteral("0:0")}, {QStringLiteral("curve"), legacy}}};
+                    sequences.replace(i, sequence);
+                }
+                root[QStringLiteral("sequences")] = sequences;
+                const QString path = tmp(name);
+                QFile file(path);
+                const bool written = file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+                    && file.write(QJsonDocument(root).toJson()) > 0;
+                file.close();
+                return written ? path : QString();
+            };
+            const QString legacyPath = variant("g14-legacy.veditor", QJsonValue(), fast.toJson());
+            const QString plainPath = variant("g14-plain.veditor", QJsonValue(), QJsonValue());
+            const QString bothPath = variant("g14-both.veditor", fast.toJson(), other.toJson());
+
+            const auto storeClipCurve = [&](const ProjectData &data, QJsonValue *curve) {
+                for (const ClipParentEntry &entry : data.clipParentEntries) {
+                    if (entry.clipId != timeline_nesting::sequenceStoreParentKey())
+                        continue;
+                    const QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+                    for (const QJsonValue &sv : store.value(QStringLiteral("sequences")).toArray()) {
+                        if (sv.toObject().value(QStringLiteral("id")).toString() != cId)
+                            continue;
+                        *curve = sv.toObject().value(QStringLiteral("videoTracks")).toArray().at(0).toArray()
+                                     .at(0).toObject().value(QStringLiteral("timeRemapCurve"));
+                        return entry.parentClipId;
+                    }
+                }
+                return QString();
+            };
+            const auto queueImage = [&](const QString &path) {
+                RenderJob job;
+                job.projectFilePath = path;
+                Timeline *owned = nullptr;
+                Timeline *queued = RenderQueue::resolveTimeline(job, &owned);
+                const QImage image = queued ? tlrender::renderFrameAt(queued, at, outSize) : QImage();
+                delete owned;
+                return image;
+            };
+            const auto liveImage = [&](const QString &path, QString *activeOut) {
+                MainWindow live;
+                QString err;
+                if (!live.openProjectFromPath(path, &err, false))
+                    return QImage();
+                if (activeOut)
+                    *activeOut = live.m_timeline->activeSequenceId();
+                return tlrender::renderFrameAt(live.m_timeline, at, outSize);
+            };
+            const auto same = [](const QImage &x, const QImage &y) {
+                return !x.isNull() && x.format() == y.format() && x == y;
+            };
+            const auto readAll = [](const QString &path) {
+                QFile file(path);
+                return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+            };
+
+            // (a) load puts the curve on the store clip; live == queue, and the remap shows.
+            ProjectData legacyData;
+            const bool legacyLoaded = !legacyPath.isEmpty() && ProjectFile::load(legacyPath, legacyData);
+            QJsonValue legacyCurve;
+            storeClipCurve(legacyData, &legacyCurve);
+            QString liveActive;
+            const QImage liveLegacy = liveImage(legacyPath, &liveActive);
+            const QImage queueLegacy = queueImage(legacyPath);
+            const QImage queuePlain = queueImage(plainPath);
+            const QImage queueInline = queueImage(savedPath);
+            const bool aOk = legacyLoaded && legacyCurve.isObject() && legacyCurve == fast.toJson()
+                && liveActive == parent.id && same(liveLegacy, queueLegacy) && same(queueLegacy, queueInline)
+                && !same(queueLegacy, queuePlain);
+
+            // (b) an inline curve wins over the legacy table, and load leaves the store string alone.
+            // The file holds the store as root "sequences"; the string load must hand back is the
+            // encoding of exactly that raw content, read here without going through load.
+            QString rawStore;
+            {
+                const QJsonObject rawRoot = QJsonDocument::fromJson(readAll(bothPath)).object();
+                QJsonObject rawObj;
+                rawObj[QStringLiteral("version")] = 1;
+                rawObj[QStringLiteral("activeSequenceId")] = rawRoot.value(QStringLiteral("activeSequenceId")).toString();
+                rawObj[QStringLiteral("sequences")] = rawRoot.value(QStringLiteral("sequences")).toArray();
+                rawStore = timeline_nesting::encodeSequenceStoreObject(rawObj);
+            }
+            ProjectData bothData;
+            const bool bothLoaded = !bothPath.isEmpty() && ProjectFile::load(bothPath, bothData);
+            QJsonValue bothCurve;
+            const QString bothStore = storeClipCurve(bothData, &bothCurve);
+            ProjectData bothAgain = bothData;
+            ProjectFile::applyLegacyTimeRemapToStores(bothAgain);
+            QJsonValue ignored;
+            const bool bOk = bothLoaded && !rawStore.isEmpty() && bothStore == rawStore
+                && bothCurve == fast.toJson() && bothCurve != other.toJson()
+                && storeClipCurve(bothAgain, &ignored) == bothStore
+                && same(liveImage(bothPath, nullptr), queueImage(bothPath))
+                && same(queueImage(bothPath), queueInline);
+
+            // (c) open, save, open, save: the clip carries the curve, the legacy table stays, the
+            // second file equals the first and renders like (a).
+            const QString save1 = tmp("g14-save1.veditor");
+            const QString save2 = tmp("g14-save2.veditor");
+            bool cSaved1 = false, cSaved2 = false;
+            {
+                MainWindow w1;
+                QString err;
+                cSaved1 = w1.openProjectFromPath(legacyPath, &err, false) && w1.saveProjectToPath(save1, &err);
+            }
+            {
+                MainWindow w2;
+                QString err;
+                cSaved2 = cSaved1 && w2.openProjectFromPath(save1, &err, false) && w2.saveProjectToPath(save2, &err);
+            }
+            bool storedCurve = false, legacyKept = false;
+            for (const QJsonValue &sv : readJson(save1).value(QStringLiteral("sequences")).toArray()) {
+                const QJsonObject o = sv.toObject();
+                if (o.value(QStringLiteral("id")).toString() != cId)
+                    continue;
+                storedCurve = o.value(QStringLiteral("videoTracks")).toArray().at(0).toArray().at(0).toObject()
+                                  .value(QStringLiteral("timeRemapCurve")) == fast.toJson();
+                legacyKept = o.value(QStringLiteral("timeRemapClipEntries")).toArray().size() == 1;
+            }
+            const QByteArray bytes1 = readAll(save1);
+            const bool cOk = cSaved1 && cSaved2 && storedCurve && legacyKept && !bytes1.isEmpty()
+                && bytes1 == readAll(save2) && same(liveImage(save2, nullptr), queueLegacy)
+                && same(queueImage(save2), queueLegacy);
+
+            // (d) fromJsonString does the same store rewrite.
+            ProjectData stringData;
+            const bool stringLoaded = ProjectFile::fromJsonString(QString::fromUtf8(readAll(legacyPath)), stringData);
+            QJsonValue stringCurve;
+            storeClipCurve(stringData, &stringCurve);
+            const bool dOk = stringLoaded && stringCurve == fast.toJson();
+
+            tally.gate(14, saved && !legacyPath.isEmpty() && !plainPath.isEmpty() && aOk && bOk && cOk && dOk,
+                       "saved=" + b(saved) + " (a)=" + b(aOk) + " liveActive=" + liveActive.toStdString()
+                           + " (b)=" + b(bOk) + " (c)=" + b(cOk) + " storedCurve=" + b(storedCurve)
+                           + " legacyKept=" + b(legacyKept) + " (d)=" + b(dOk));
+        }
+    }
 
     tally.gate(7, g7, g7Detail);
     return tally.finish("project-persist");

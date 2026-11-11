@@ -99,7 +99,10 @@ public:
     // packed as StabilizerKeyframe (timeUs from the frame's PTS, dx/dy from
     // smoothTx/smoothTy; theta=0, scale=1.0 — translation-only model).
     // Resets internal state on entry. Returns empty vector on open failure.
-    QVector<StabilizerKeyframe> analyzeFile(const QString &filePath);
+    // US-2202: `*decodedSize` (when given) gets the decoded frame size, the unit
+    // of the keyframes' dx / dy (invalid when nothing was decoded).
+    QVector<StabilizerKeyframe> analyzeFile(const QString &filePath,
+                                            QSize *decodedSize = nullptr);
 
 signals:
     void progressUpdated(int currentFrame, int totalFrames);

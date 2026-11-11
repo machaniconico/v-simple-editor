@@ -99,11 +99,13 @@
 //      dx / dy / theta and a non-1 scale) round-trips through toJsonString -> fromJsonString with
 //      every field equal (doubles to 1e-9, timeUs ==), also inside renderInPlaceOriginal; a clip
 //      without keyframes has no "stabilizerKeyframes" key. Detects: clipToJson not writing the
-//      key (HEAD; mutation build).
+//      key (HEAD; mutation build). US-2202: the analysed size [1280, 720] is written next to
+//      the keys as "stabilizerSourceSize" and round-trips; keys without a size write no key.
 //   G20 (US-2009) a split keeps the source-time keyframes on both halves: clipIn 0 and 4 s
 //      clips split at 2.0 s have the same 3 keyframes on both pieces, the right piece's clipIn is
 //      2.0, and the right half's computePlaybackSequence entry carries the same 3 points at
 //      clipIn 2.0 (the VideoPlayer source-time pull sees the same keys). HEAD PASS pin.
+//      US-2202: the 1280x720 stabilizerSourceSize rides on both halves and the entry too.
 //   G21 (US-2103) a clip's mask tracking result (3 regions + the 5 scalars) is written under
 //      "maskTracking" and round-trips (rect / confidence / frameNumber / subPixelCenter and the
 //      scalars); an empty result writes no key; 262145 regions (about 12 MB) load as an empty result
@@ -1914,6 +1916,9 @@ int runClipSidecarSelftest()
         data.config.fps = 30;
         ClipInfo stab = sidecarClip(QStringLiteral("stab"), 4.0);
         stab.stabilizerKeyframes = kfs;
+        // US-2202: the analysed size rides next to the keys ([w, h]); the original
+        // below has keys and no size, so the key is omitted there.
+        stab.stabilizerSourceSize = QSize(1280, 720);
         ClipInfo bare = sidecarClip(QStringLiteral("bare"), 2.0);
         ClipInfo rip = sidecarClip(QStringLiteral("rip"), 3.0);
         ClipInfo ripOriginal = sidecarClip(QStringLiteral("rip-original"), 3.0);
@@ -1938,6 +1943,15 @@ int runClipSidecarSelftest()
         const std::shared_ptr<ClipInfo> ripLoaded = loaded.videoTracks.value(0).value(2).renderInPlaceOriginal;
         check19(QStringLiteral("nested"), ripLoaded && sameKfs(ripLoaded->stabilizerKeyframes, kfs),
                 ripLoaded ? describeKfs(ripLoaded->stabilizerKeyframes) : QStringLiteral("no original"));
+        const QJsonArray sizeJson = firstClipJson(root, 0).value(QStringLiteral("stabilizerSourceSize")).toArray();
+        const QSize gotSize = loaded.videoTracks.value(0).value(0).stabilizerSourceSize;
+        check19(QStringLiteral("sizeWritten"), sizeJson.size() == 2 && sizeJson.at(0).toInt() == 1280
+                    && sizeJson.at(1).toInt() == 720);
+        check19(QStringLiteral("sizeRoundTrip"), gotSize == QSize(1280, 720),
+                QStringLiteral("%1x%2").arg(gotSize.width()).arg(gotSize.height()));
+        check19(QStringLiteral("noSizeWithout"), !firstClipJson(root, 1).contains(QStringLiteral("stabilizerSourceSize"))
+                    && !loaded.videoTracks.value(0).value(1).stabilizerSourceSize.isValid()
+                    && ripLoaded && !ripLoaded->stabilizerSourceSize.isValid());
         tally.gate(19, ok19, shown19.join(QLatin1Char(' ')).toStdString());
 
         // G20
@@ -1954,6 +1968,7 @@ int runClipSidecarSelftest()
             clip.inPoint = clipIn;
             clip.outPoint = clipIn + 4.0;
             clip.stabilizerKeyframes = kfs;
+            clip.stabilizerSourceSize = QSize(1280, 720); // US-2202
             Timeline tl;
             loadTimeline(tl, {{clip}});
             QString err;
@@ -1962,8 +1977,10 @@ int runClipSidecarSelftest()
             check20(tag + QStringLiteral("Split"), split && halves.size() == 2, err);
             if (halves.size() != 2)
                 continue;
-            check20(tag + QStringLiteral("Left"), sameKfs(halves[0].stabilizerKeyframes, kfs));
-            check20(tag + QStringLiteral("Right"), sameKfs(halves[1].stabilizerKeyframes, kfs));
+            check20(tag + QStringLiteral("Left"), sameKfs(halves[0].stabilizerKeyframes, kfs)
+                        && halves[0].stabilizerSourceSize == QSize(1280, 720));
+            check20(tag + QStringLiteral("Right"), sameKfs(halves[1].stabilizerKeyframes, kfs)
+                        && halves[1].stabilizerSourceSize == QSize(1280, 720));
             check20(tag + QStringLiteral("RightIn"), halves[1].inPoint == clipIn + 2.0,
                     QStringLiteral("inPoint %1").arg(halves[1].inPoint));
             bool entryOk = false;
@@ -1971,8 +1988,11 @@ int runClipSidecarSelftest()
             for (const PlaybackEntry &e : tl.computePlaybackSequence()) {
                 if (e.sourceTrack != 0 || std::abs(e.timelineStart - 2.0) > 1e-9)
                     continue;
-                entryOk = std::abs(e.clipIn - (clipIn + 2.0)) < 1e-9 && sameKfs(e.stabilizerKeyframes, kfs);
-                entryShown = QStringLiteral("clipIn %1 %2").arg(e.clipIn).arg(describeKfs(e.stabilizerKeyframes));
+                entryOk = std::abs(e.clipIn - (clipIn + 2.0)) < 1e-9 && sameKfs(e.stabilizerKeyframes, kfs)
+                    && e.stabilizerSourceSize == QSize(1280, 720);
+                entryShown = QStringLiteral("clipIn %1 %2 size %3x%4").arg(e.clipIn)
+                                 .arg(describeKfs(e.stabilizerKeyframes))
+                                 .arg(e.stabilizerSourceSize.width()).arg(e.stabilizerSourceSize.height());
             }
             check20(tag + QStringLiteral("Entry"), entryOk, entryShown);
         }

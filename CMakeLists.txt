@@ -179,6 +179,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/log_to_rec709_selftest.cpp
     src/selftests/psd_import_selftest.cpp
     src/selftests/lut_import_selftest.cpp
+    src/selftests/lut_gl_selftest.cpp
     src/selftests/lens_distort_selftest.cpp
     src/selftests/AeFxDistortSelftest.cpp
     src/selftests/AeFxDistort2Selftest.cpp
@@ -437,6 +438,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EdlImport.cpp
     src/FcpxmlImport.h
     src/FcpxmlImport.cpp
+    src/UncProbe.cpp
     src/selftests/export_pro_selftest.cpp
     src/selftests/img_sequence_selftest.cpp
     src/selftests/exr_writer_selftest.cpp

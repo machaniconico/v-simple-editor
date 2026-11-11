@@ -7,6 +7,7 @@
 #include "LayerStyle.h"
 #include "UndoTrace.h"
 #include "ProxyManager.h"
+#include "StabilizerWarp.h"    // US-2203: stabwarp::applyForExport for V1's layer
 #include "TextOverlayBake.h"   // textbake::bakeOverlays (shared text baker SSOT)
 #include "ClipGeometry.h"      // clipgeom::renderLayer (shared clip-placement SSOT)
 #include "clipanim/ClipAnim.h" // S1 — motion/opacity keyframe evaluation
@@ -103,15 +104,40 @@ QImage prepareClipForCpuComposite(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
     double sourceSeconds,
     const std::function<QImage(double, double)> &frameProvider,
-    const QVector<Mask> &masks)
+    const QVector<Mask> &masks,
+    const PlaybackEntry *v1Entry = nullptr, int trackIdx = -1)
 {
+    // US-2204: V1's stabilizer goes on the source before the clip-local FX, and on
+    // every echo sample at its own source time, as tlrender::renderClipSource does.
+    // `v1Entry` null (the selftest seams) = no stabilizer.
+    ClipInfo stabClip;
+    if (v1Entry)
+        stabClip.stabilizerKeyframes = v1Entry->stabilizerKeyframes;
+    const auto stabilize = [&](const QImage &frame, double sourceSec) {
+        return v1Entry ? stabwarp::applyForExport(frame, stabClip, trackIdx,
+                                                  /*sequenceDepth=*/0, sourceSec,
+                                                  v1Entry->stabilizerSourceSize)
+                       : frame;
+    };
+    std::function<QImage(double, double)> sampleProvider = frameProvider;
+    if (v1Entry && frameProvider) {
+        // The caller hands over the raw sample (prepare=false): stabilize, then
+        // VFX / grade, the export provider's order.
+        sampleProvider = [&](double sampleSourceSec, double sampleLocalSec) {
+            return tlrender::prepareClipSourceForEcho(
+                stabilize(frameProvider(sampleSourceSec, sampleLocalSec),
+                          sampleSourceSec),
+                clip, sampleLocalSec);
+        };
+    }
+    const QImage stabilized = stabilize(source, sourceSeconds);
     const QImage effected = (tlrender::hasActiveEcho(clip, clipLocalSeconds)
         || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds)
         || tlrender::hasActiveMeshWarp(clip) || clip.hasPuppetPins())
         ? tlrender::applyClipFxStackWithEchoFromSource(
-              source, clip, clipLocalSeconds, sourceSeconds, frameProvider)
+              stabilized, clip, clipLocalSeconds, sourceSeconds, sampleProvider)
         : tlrender::applyClipFxStackFromSource(
-              source, clip, clipLocalSeconds);
+              stabilized, clip, clipLocalSeconds);
     if (effected.isNull() || masks.isEmpty())
         return effected;
     return clipmask::applyRasterAlphaMask(effected, masks);
@@ -154,6 +180,15 @@ bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
     if (!sequencePlayback)
         return true;
     return !stackRequiresClipLocalCpu(evaluated, gpuAvailable);
+}
+
+QImage warpV1LayerForPreview(const QImage &v1, const PlaybackEntry &entry, qint64 sourceUs)
+{
+    ClipInfo clip;
+    clip.stabilizerKeyframes = entry.stabilizerKeyframes;
+    return stabwarp::applyForExport(v1, clip, entry.sourceTrack, /*sequenceDepth=*/0,
+                                    static_cast<double>(sourceUs) / 1.0e6,
+                                    entry.stabilizerSourceSize);
 }
 } // namespace videopreview
 
@@ -2095,7 +2130,7 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
                     m_canvasHeight > 0 ? m_canvasHeight : 16);
         QImage blank(blankSize, QImage::Format_ARGB32_Premultiplied);
         blank.fill(Qt::black);
-        displayFrame(blank, false, m_timelinePositionUs);
+        displayFrame(blank, false, m_timelinePositionUs, false);
         undotrace::log("setSeq:exit");
         return;
     }
@@ -2506,9 +2541,10 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
         return false;
     if (m_glPreview)
         setCompositeBakedModeForDisplay(true);
-    cachePreviewComposite(ssotFrame);
+    // US-2203: renderFrameAt has stabilized V1 (stabwarp::applyForExport).
+    cachePreviewComposite(ssotFrame, true);
     m_lastFrameTransitionsApplied = true;
-    displayFrame(ssotFrame, true, timelineUs);
+    displayFrame(ssotFrame, true, timelineUs, true);
     return true;
 }
 
@@ -3554,20 +3590,24 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
 {
     const qint64 timelineUsec =
         resolvedDisplayTimelineUsec(displayTimelineUsec);
-    if (!m_projectOutputSize.isValid()) {
-        displayFrame(v1Image, false, timelineUsec);
-        return;
-    }
-
-    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
-    canvas.fill(Qt::black);
-
     const PlaybackEntry *entry = nullptr;
     if (sequenceActive()
         && m_activeEntry >= 0
         && m_activeEntry < m_sequence.size()) {
         entry = &m_sequence[m_activeEntry];
     }
+    // V1 alone: the GL stabilizes it, unless the clip-local CPU FX path already
+    // stabilized it before the FX (US-2204, preparePreviewClipFrame).
+    const ClipInfo *seekClip = entry ? clipForPlaybackEntry(previewTimeline(), *entry) : nullptr;
+    const bool v1StabBaked = seekClip && !seekClip->isAdjustment && entry->sourceTrack == 0
+        && hasClipLocalCpuFxAt(timelineUsec);
+    if (!m_projectOutputSize.isValid()) {
+        displayFrame(v1Image, false, timelineUsec, v1StabBaked);
+        return;
+    }
+
+    QImage canvas(m_projectOutputSize, QImage::Format_ARGB32_Premultiplied);
+    canvas.fill(Qt::black);
 
     const bool fitContain = entry ? entry->fitContain : false;
     const bool fitCover = entry ? entry->fitCover : false;
@@ -3601,7 +3641,7 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
     if (m_glPreview)
         setCompositeBakedModeForDisplay(true);
     m_lastFrameOdtApplied = false;
-    displayFrame(canvas, false, timelineUsec);
+    displayFrame(canvas, false, timelineUsec, v1StabBaked);
 }
 
 bool VideoPlayer::pushActiveClipColorCorrectionToGlPreview()
@@ -3685,6 +3725,28 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
+// US-2202: the production compose + present on this player: the layers are
+// composed onto a copy of `canvasBase` (the callers' black canvas, V1 among the
+// layers with sequenceIdx == activeEntry) and the result goes through displayFrame
+// as the SSOT / playback paths hand it over (overlays baked). US-2203: V1's layer
+// is stabilized before the composite as the playback tick and the paused refresh
+// do (warpV1ForCpuComposite on their layers, before the fit).
+QImage VideoPlayer::composeAndPresentForTest(const QImage &canvasBase,
+                                             const QVector<DecodedLayer> &layers,
+                                             const QVector<PlaybackEntry> &seq,
+                                             int activeEntry, qint64 tlUs)
+{
+    m_sequence = seq;
+    m_activeEntry = activeEntry;
+    m_timelinePositionUs = tlUs;
+    QVector<DecodedLayer> composed = layers;
+    const bool v1StabBaked = warpV1ForCpuComposite(composed);
+    QImage canvas = canvasBase.copy();
+    composeMultiTrackFrameInto(canvas, composed);
+    displayFrame(canvas, /*overlaysAlreadyBaked=*/true, tlUs, v1StabBaked);
+    return canvas;
+}
+
 QImage VideoPlayer::displayFrameForTest(
     const QImage &composed, const QImage &neighbourLayer,
     const QVector<PlaybackEntry> &sequence, int activeEntry, qint64 timelineUsec,
@@ -3696,7 +3758,8 @@ QImage VideoPlayer::displayFrameForTest(
     player.m_timelinePositionUs = timelineUsec;
     player.m_transitionNeighbourForTest = neighbourLayer;
     player.m_lastFrameTransitionsApplied = transitionsAlreadyApplied;
-    player.displayFrame(composed, /*overlaysAlreadyBaked=*/true, timelineUsec);
+    player.displayFrame(composed, /*overlaysAlreadyBaked=*/true, timelineUsec,
+                        /*v1StabBaked=*/false);
     return player.m_currentFrameImage;
 }
 
@@ -3773,7 +3836,7 @@ QImage VideoPlayer::finalizeDisplayLocalCopy(QImage display) const
 }
 
 void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
-                               qint64 displayTimelineUsec)
+                               qint64 displayTimelineUsec, bool v1StabBaked)
 {
     const bool transitionsAlreadyApplied = m_lastFrameTransitionsApplied;
     m_lastFrameTransitionsApplied = false;
@@ -3782,6 +3845,7 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
         resolvedDisplayTimelineUsec(displayTimelineUsec);
     m_lastSourceFrame = image;
     m_lastSourceFrameHasBakedText = overlaysAlreadyBaked;
+    m_lastSourceFrameV1StabBaked = v1StabBaked;
     QImage composed = composeFrameWithOverlays(image, overlaysAlreadyBaked);
 
     // Edge-attached transitions: FadeIn / FadeOut alpha-ramp against black.
@@ -3863,11 +3927,67 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
         QScopedValueRollback<bool> guard(m_inSpecialCompositeProvider, true);
         special = m_specialCompositeProvider(timelineUsec);
     }
-    presentDisplay(composed, timelineUsec, special);
+    presentDisplay(composed, timelineUsec, special, v1StabBaked);
+}
+
+// US-2202: the active entry's V1 stabilizer for the GL: its keys, the size they
+// were analysed at (the entry's filePath may be a smaller proxy) and the source
+// time. US-2111: a shown special composite already has V1's layer stabilized on
+// the CPU (buildSpecialClipComposite), so the GL warps nothing. US-2203: neither
+// does a frame whose V1 stabilizer is baked (`v1StabBaked`).
+void VideoPlayer::pushV1StabilizerToGl(const PlaybackEntry &ae, bool special,
+                                       bool v1StabBaked)
+{
+    if (ae.sourceTrack != 0 || special || v1StabBaked) {
+        m_glPreview->setStabilizerKeyframes({});
+        return;
+    }
+    m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
+    m_glPreview->setStabilizerSourceSize(ae.stabilizerSourceSize);
+    m_glPreview->setStabilizerSourceTimeUs(v1StabilizerSourceUs(ae));
+}
+
+qint64 VideoPlayer::v1StabilizerSourceUs(const PlaybackEntry &ae) const
+{
+    const double T = static_cast<double>(m_timelinePositionUs)
+                   / static_cast<double>(AV_TIME_BASE);
+    const double srcSec = playbackEntryIsReversed(previewTimeline(), ae, &m_reverseStates)
+        ? static_cast<double>(entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
+              / AV_TIME_BASE
+        : ae.clipIn + (T - ae.timelineStart) * ae.speed;
+    return static_cast<qint64>(srcSec * 1.0e6);
+}
+
+bool VideoPlayer::warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const
+{
+    if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
+        return false;
+    // US-2204: a frame with clip-local CPU FX has V1 stabilized before the FX in
+    // preparePreviewClipFrame (the layer is already warped, alone or not).
+    const PlaybackEntry &activeEntry = m_sequence[m_activeEntry];
+    const ClipInfo *activeClip = clipForPlaybackEntry(previewTimeline(), activeEntry);
+    if (activeEntry.sourceTrack == 0 && activeClip && !activeClip->isAdjustment
+        && hasClipLocalCpuFxAt(m_timelinePositionUs)) {
+        return true;
+    }
+    const bool overlay = std::any_of(
+        layers.cbegin(), layers.cend(),
+        [this](const DecodedLayer &L) { return L.sequenceIdx != m_activeEntry; });
+    if (!overlay)
+        return false;
+    // The GL would warp the whole composite (the other layers too), so V1's layer
+    // is warped here and the GL gets no keys.
+    const PlaybackEntry &entry = m_sequence[m_activeEntry];
+    const qint64 sourceUs = v1StabilizerSourceUs(entry);
+    for (DecodedLayer &L : layers) {
+        if (L.sequenceIdx == m_activeEntry && !L.rgb.isNull())
+            L.rgb = videopreview::warpV1LayerForPreview(L.rgb, entry, sourceUs);
+    }
+    return true;
 }
 
 void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
-                                 const QImage &special)
+                                 const QImage &special, bool v1StabBaked)
 {
     // EXP-AID: 露出/フォーカス確認エイド (フォルスカラー / ゼブラ / フォーカスピーキング)。
     // これは画面確認専用のオーバーレイなので「表示用の一時コピー」にだけ適用し、
@@ -3910,29 +4030,11 @@ void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
         // higher-track stabilization is a follow-up) and the current source
         // time so GLPreview's binary-search lookup can pick the matching
         // keyframe and bake the inverse 2D affine pre-warp.
-        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
-            const auto &ae = m_sequence[m_activeEntry];
-            // US-2111: a shown special composite already has V1's layer stabilized
-            // on the CPU (buildSpecialClipComposite), so the GL warps nothing.
-            if (ae.sourceTrack == 0 && special.isNull()) {
-                m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
-                const double T = static_cast<double>(m_timelinePositionUs)
-                               / static_cast<double>(AV_TIME_BASE);
-                const Timeline *timeline = m_glPreview
-                    ? previewTimeline() : nullptr;
-                const double srcSec = playbackEntryIsReversed(
-                                          timeline, ae, &m_reverseStates)
-                    ? static_cast<double>(entryLocalPositionUs(
-                          m_activeEntry, m_timelinePositionUs)) / AV_TIME_BASE
-                    : ae.clipIn + (T - ae.timelineStart) * ae.speed;
-                m_glPreview->setStabilizerSourceTimeUs(
-                    static_cast<qint64>(srcSec * 1.0e6));
-            } else {
-                m_glPreview->setStabilizerKeyframes({});
-            }
-        } else {
+        if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size())
+            pushV1StabilizerToGl(m_sequence[m_activeEntry], !special.isNull(),
+                                 v1StabBaked);
+        else
             m_glPreview->setStabilizerKeyframes({});
-        }
         // A clip-local CPU stack already includes each clip's grade/LUT and
         // ordered FX. Running the GL branch on that frame would reorder or
         // duplicate the stack and no longer match export.
@@ -4150,22 +4252,29 @@ QImage VideoPlayer::preparePreviewClipFrame(
             // for the composited frame. Bake every active clip independently
             // so [GPU FX, CPU FX] order, masks, and track isolation are kept.
             const QSize echoRenderSize = source.size();
+            // US-2204: V1's stabilizer goes before the clip-local FX; the caller
+            // hands the frame on as baked (clipFxApplied) so the GL warps nothing.
+            // A stabilized V1 echo sample is raw here: prepareClipForCpuComposite
+            // warps it, then applies VFX / grade (export order).
+            const bool stabV1 = entryIndex == m_activeEntry && entry.sourceTrack == 0;
             tlrender::EchoFrameProvider echoFrameProvider;
             if (hasEcho) {
                 const ClipInfo sourceClipSnapshot = *sourceClip;
                 echoFrameProvider =
-                    [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec](
+                    [timeline, sourceClipSnapshot, echoRenderSize, timelineUsec, stabV1](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         return tlrender::renderClipSourceFrameForEcho(
                             timeline, sourceClipSnapshot, sampleSourceSec,
-                            sampleLocalSec, echoRenderSize, timelineUsec);
+                            sampleLocalSec, echoRenderSize, timelineUsec,
+                            /*prepare=*/!stabV1);
                     };
             }
             const QVector<Mask> masks = previewMasksForFrame(
                 *sourceClip, sourceSeconds, sourceSize, source.size());
             prepared = videopreview::prepareClipForCpuComposite(
                 source, previewClip, clipLocalSec, sourceSeconds,
-                echoFrameProvider, masks);
+                echoFrameProvider, masks, stabV1 ? &entry : nullptr,
+                entry.sourceTrack);
             if (clipFxApplied)
                 *clipFxApplied = true;
             return prepared;
@@ -4589,7 +4698,7 @@ void VideoPlayer::displaySpecialComposite(const QImage &frame)
 {
     if (frame.isNull())
         return;
-    presentDisplay(QImage(), m_timelinePositionUs, frame);
+    presentDisplay(QImage(), m_timelinePositionUs, frame, /*v1StabBaked=*/false);
 }
 
 const Timeline *VideoPlayer::previewTimeline() const
@@ -5461,6 +5570,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
             m_lastV1RawFrame = image;
             m_lastSourceFrame = image;
             m_lastSourceFrameHasBakedText = false;
+            m_lastSourceFrameV1StabBaked = false; // US-2203: a raw V1 frame
         }
         // This path displays a non-baked frame.
         QImage displayImage = image;
@@ -5581,6 +5691,7 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
         m_lastV1RawFrame = image;
         m_lastSourceFrame = image;
         m_lastSourceFrameHasBakedText = false;
+        m_lastSourceFrameV1StabBaked = false; // US-2203: a raw V1 frame
         if (!m_deferDisplayThisTick) {
             const qint64 displayTimelineUs =
                 sequenceActive()
@@ -5869,6 +5980,8 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     if (m_parentAdmissionObservation)
         recordParentAdmissionForTest("cpu-composite", layers, canvasSize);
 
+    // US-2203: with other layers V1's layer is stabilized here, before the fit.
+    const bool v1StabBaked = warpV1ForCpuComposite(layers);
     for (DecodedLayer &layer : layers) {
         layer.rgb = snsfit::maybeFit(
             layer.rgb, layer.fitContain, layer.fitCover, canvasSize);
@@ -5886,7 +5999,7 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     if (m_glPreview)
         setCompositeBakedModeForDisplay(true);
     m_lastFrameOdtApplied = false;
-    displayFrame(canvas, false, m_timelinePositionUs);
+    displayFrame(canvas, false, m_timelinePositionUs, v1StabBaked);
     return true;
 }
 
@@ -5919,7 +6032,7 @@ void VideoPlayer::refreshDisplayedFrame()
             if (!refreshed.isNull()) {
                 m_lastFrameOdtApplied = false;
                 m_lastFrameTransitionsApplied = true;
-                displayFrame(refreshed, true, m_timelinePositionUs);
+                displayFrame(refreshed, true, m_timelinePositionUs, true);
                 return;
             }
         }
@@ -5928,7 +6041,8 @@ void VideoPlayer::refreshDisplayedFrame()
         // it a second time.
         m_lastFrameOdtApplied = false;
         m_lastFrameTransitionsApplied = true;
-        displayFrame(m_lastSourceFrame, true, m_timelinePositionUs);
+        displayFrame(m_lastSourceFrame, true, m_timelinePositionUs,
+                     m_lastSourceFrameV1StabBaked);
         return;
     }
     undotrace::log("refresh:conform");
@@ -5986,7 +6100,7 @@ void VideoPlayer::refreshDisplayedFrame()
                     if (m_glPreview)
                         setCompositeBakedModeForDisplay(true);
                     m_lastFrameOdtApplied = false;
-                    displayFrame(canvas, false, m_timelinePositionUs);
+                    displayFrame(canvas, false, m_timelinePositionUs, clipFxApplied);
                     return;
                 }
             }
@@ -5996,7 +6110,7 @@ void VideoPlayer::refreshDisplayedFrame()
             // composeFrameWithOverlays intentionally skips it.
             if (clipFxApplied) {
                 m_lastFrameOdtApplied = false;
-                displayFrame(prepared, false, m_timelinePositionUs);
+                displayFrame(prepared, false, m_timelinePositionUs, true);  // US-2204
                 return;
             }
         }
@@ -6027,7 +6141,7 @@ void VideoPlayer::refreshDisplayedFrame()
     m_lastFrameOdtApplied = false;
     undotrace::log("refresh:fallthrough");
     displayFrame(m_lastSourceFrame, false,
-                 resolvedDisplayTimelineUsec(-1));
+                 resolvedDisplayTimelineUsec(-1), m_lastSourceFrameV1StabBaked);
 }
 
 void VideoPlayer::showTimelineSkim(const QImage &image)
@@ -6136,7 +6250,7 @@ void VideoPlayer::updateAdaptiveQuality()
     m_adaptiveQualityTier = divisor;
 }
 
-void VideoPlayer::cachePreviewComposite(const QImage &composed)
+void VideoPlayer::cachePreviewComposite(const QImage &composed, bool v1StabBaked)
 {
     if (!m_adaptivePreviewEnabled || composed.isNull())
         return;
@@ -6147,7 +6261,7 @@ void VideoPlayer::cachePreviewComposite(const QImage &composed)
     key.height       = composed.height();
     key.qualityTier  = m_adaptiveQualityTier;
     key.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
-    m_frameCache.put(key, composed);
+    m_frameCache.put(key, composed, v1StabBaked);
 }
 
 void VideoPlayer::handlePlaybackTick()
@@ -6522,9 +6636,10 @@ void VideoPlayer::handlePlaybackTick()
             if (!ssotFrame.isNull()) {
                 if (m_glPreview)
                     setCompositeBakedModeForDisplay(true);
-                cachePreviewComposite(ssotFrame);
+                // US-2203: renderFrameAt has stabilized V1.
+                cachePreviewComposite(ssotFrame, true);
                 m_lastFrameTransitionsApplied = true;
-                displayFrame(ssotFrame, true, m_timelinePositionUs);
+                displayFrame(ssotFrame, true, m_timelinePositionUs, true);
                 servedByNestedSequenceSsot = true;
             }
         }
@@ -6557,13 +6672,14 @@ void VideoPlayer::handlePlaybackTick()
             hitKey.qualityTier  = m_adaptiveQualityTier;
             hitKey.useProxy     = (m_proxyDivisor > 1) || (playbackProxyDivisor() > 1);
             QImage cached;
-            if (m_frameCache.tryGet(hitKey, cached)
+            bool cachedV1StabBaked = false;
+            if (m_frameCache.tryGet(hitKey, cached, &cachedV1StabBaked)
                 && !cached.isNull()
                 && cached.size() == QSize(hitKey.width, hitKey.height)) {
                 if (m_glPreview)
                     setCompositeBakedModeForDisplay(true);
                 // Cache hits can re-serve ODT-baked frames; without a cached baked flag, paused same-playhead hits can double-apply ACES.
-                displayFrame(cached, false, m_timelinePositionUs);
+                displayFrame(cached, false, m_timelinePositionUs, cachedV1StabBaked);
                 servedFromCache = true;
             }
         }
@@ -6869,6 +6985,9 @@ void VideoPlayer::handlePlaybackTick()
             recordParentAdmissionForTest("multi-track", layers,
                                          QSize(canvasW, canvasH));
         }
+        // US-2203: with other layers V1's layer is stabilized here, before the
+        // fit, for every composite below (GPU input included).
+        const bool v1StabBaked = warpV1ForCpuComposite(layers);
         for (DecodedLayer &L : layers) {
             {
                 double insetFw = 1.0, insetFh = 1.0;
@@ -6921,6 +7040,7 @@ void VideoPlayer::handlePlaybackTick()
                 if (traceTick)
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
                 QImage fallbackFrame = m_lastV1RawFrame;
+                bool fallbackBaked = false;  // US-2204: clip-local CPU FX stabilized V1
                 if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                     const auto &entry = m_sequence[m_activeEntry];
                     const QSize sourceSize =
@@ -6933,9 +7053,9 @@ void VideoPlayer::handlePlaybackTick()
                         / AV_TIME_BASE;
                     fallbackFrame = preparePreviewClipFrame(
                         m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
-                        sourceSize, m_timelinePositionUs);
+                        sourceSize, m_timelinePositionUs, &fallbackBaked);
                 }
-                displayFrame(fallbackFrame, false, m_timelinePositionUs);
+                displayFrame(fallbackFrame, false, m_timelinePositionUs, fallbackBaked);
             } else {
                 if (traceTick) {
                     m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
@@ -6969,9 +7089,9 @@ void VideoPlayer::handlePlaybackTick()
                     // 二重適用しないよう viewport を identity 扱いにする。
                     if (m_glPreview)
                         setCompositeBakedModeForDisplay(true);
-                    cachePreviewComposite(displayedComposite);  // CPU 経路と同じキーで put
+                    cachePreviewComposite(displayedComposite, v1StabBaked);  // CPU 経路と同じキーで put
                     displayFrame(displayedComposite, false,
-                                 m_timelinePositionUs);          // 1 tick = 最大 1 displayFrame
+                                 m_timelinePositionUs, v1StabBaked);          // 1 tick = 最大 1 displayFrame
                 } else {
                 // Phase 1e Win #7 — in-place compose. Default ON; opt out
                 // via VEDITOR_INPLACE_COMPOSE_DISABLE=1 to fall back to the
@@ -6988,8 +7108,8 @@ void VideoPlayer::handlePlaybackTick()
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
                         setCompositeBakedModeForDisplay(true);
-                    cachePreviewComposite(m_canvasBase);
-                    displayFrame(m_canvasBase, false, m_timelinePositionUs);
+                    cachePreviewComposite(m_canvasBase, v1StabBaked);
+                    displayFrame(m_canvasBase, false, m_timelinePositionUs, v1StabBaked);
                 } else if (inplaceComposeEnabled) {
                     composeMultiTrackFrameInto(m_canvasBase, layers);
                     if (traceTick)
@@ -7010,8 +7130,8 @@ void VideoPlayer::handlePlaybackTick()
                     // A/V sync を壊さない)。同一プレイヘッドの再描画 (リサイズ /
                     // scrub 戻り) でのみ将来 hit する純キャッシュ。displayFrame の
                     // 発火回数は不変 (1 tick = 最大 1 frame)。
-                    cachePreviewComposite(m_canvasBase);
-                    displayFrame(m_canvasBase, false, m_timelinePositionUs);
+                    cachePreviewComposite(m_canvasBase, v1StabBaked);
+                    displayFrame(m_canvasBase, false, m_timelinePositionUs, v1StabBaked);
                 } else {
                     // Legacy path (VEDITOR_INPLACE_COMPOSE_DISABLE=1): allocates
                     // a separate `composed` via composeMultiTrackFrame's
@@ -7024,8 +7144,8 @@ void VideoPlayer::handlePlaybackTick()
                         m_tickTraceComposeNs += tickTimer.nsecsElapsed() - sectionMark;
                     if (m_glPreview)
                         setCompositeBakedModeForDisplay(true);
-                    cachePreviewComposite(composed); // ADAPTIVE-1: 上の in-place 分岐と同旨
-                    displayFrame(composed, false, m_timelinePositionUs);
+                    cachePreviewComposite(composed, v1StabBaked); // ADAPTIVE-1: 上の in-place 分岐と同旨
+                    displayFrame(composed, false, m_timelinePositionUs, v1StabBaked);
                 }
                 } // STAGE3-GPU: close `else` (CPU フォールバック経路)
             }
@@ -7053,6 +7173,7 @@ void VideoPlayer::handlePlaybackTick()
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
             QImage fallbackFrame = m_lastV1RawFrame;
+            bool fallbackBaked = false;  // US-2204: clip-local CPU FX stabilized V1
             if (m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
                 const auto &entry = m_sequence[m_activeEntry];
                 const QSize sourceSize =
@@ -7065,9 +7186,9 @@ void VideoPlayer::handlePlaybackTick()
                     / AV_TIME_BASE;
                 fallbackFrame = preparePreviewClipFrame(
                     m_lastV1RawFrame, entry, m_activeEntry, sourceSec,
-                    sourceSize, m_timelinePositionUs);
+                    sourceSize, m_timelinePositionUs, &fallbackBaked);
             }
-            displayFrame(fallbackFrame, false, m_timelinePositionUs);
+            displayFrame(fallbackFrame, false, m_timelinePositionUs, fallbackBaked);
         }
       } // ADAPTIVE-1: close `if (!servedFromCache)`
     }

@@ -15,7 +15,7 @@
 
 // US-2003: .cube sizes outside 2..256 (3D) / 2..65536 (1D) must load as invalid
 // LUTs, and LutData::isValid() needs size >= 2. G1 / G7 are 2-point controls.
-// US-2102: 1D top interval, DOMAIN_MIN / DOMAIN_MAX, toGpuGrid (G7 revised, G8-G12).
+// US-2102: 1D top interval, DOMAIN_MIN / DOMAIN_MAX, GPU lookup addresses (G7 revised, G8-G12).
 namespace {
 
 // Reports success through *ok: every write returned the expected byte count and
@@ -262,111 +262,75 @@ int runLutImportSelftest()
                    + " comment: " + d(cmt) + " same=" + std::to_string(same));
     }
 
-    // G12: GPU grid (no GL needed).
+    // G12: CPU twins of the GL preview's lookup addresses (no GL needed; the pixels are pinned
+    // by lut-gl).
     {
-        // (a) 2-point 1D -> 2^3 grid whose corners match applyLut; metadata is carried over.
+        const auto close = [](float a, float b) { return std::abs(a - b) <= 1e-6f; };
+        // (a) texel-centre address of a 2-texel axis: 0.25 -> 0.375, 0.75 -> 0.625, clamped to 0..1.
         bool aok = false;
-        LutData l = loadText(dir, "g12a.cube", "LUT_1D_SIZE 2\n0.2 0.4 0.6\n0.8 0.9 1.0\n", &aok);
-        const LutData g = LutImporter::toGpuGrid(l);
-        bool cornersOk = g.table.size() == 8;
-        std::string cornerDetail;
-        for (int i = 0; cornersOk && i < 8; ++i) {
-            const int r = (i & 1) * 255, gg = ((i >> 1) & 1) * 255, b = ((i >> 2) & 1) * 255;
-            const QColor c = LutImporter::applyLut(pixel(r, gg, b), l).pixelColor(0, 0);
-            const QVector3D v = g.table[i];
-            cornersOk = std::abs(v.x() * 255.0f - c.red()) <= 1.0f && std::abs(v.y() * 255.0f - c.green()) <= 1.0f
-                     && std::abs(v.z() * 255.0f - c.blue()) <= 1.0f;
-            cornerDetail += " c" + std::to_string(i) + "=" + rgb(c);
-        }
-        l.intensity = 0.5;
-        l.name = QStringLiteral("n");
-        l.filePath = QStringLiteral("p.cube");
-        const LutData gm = LutImporter::toGpuGrid(l);
-        const bool metaOk = gm.intensity == 0.5 && gm.name == l.name && gm.filePath == l.filePath
-            && !gm.isBuiltIn() && gm.type == LutType::Cube3D;
-        const bool okA = aok && g.type == LutType::Cube3D && g.size == 2 && g.table.size() == 8
-            && cornersOk && metaOk;
+        const LutData l = loadText(dir, "g12a.cube", "LUT_1D_SIZE 2\n0.2 0.4 0.6\n0.8 0.9 1.0\n", &aok);
+        const float a25 = LutImporter::gpuTexelCoord(2, 0.25f), a75 = LutImporter::gpuTexelCoord(2, 0.75f);
+        const bool okA = aok && l.isValid() && l.type == LutType::Cube1D && close(a25, 0.375f) && close(a75, 0.625f)
+            && close(LutImporter::gpuTexelCoord(2, -1.0f), 0.25f) && close(LutImporter::gpuTexelCoord(2, 2.0f), 0.75f);
 
-        // (b) 65-point identity -> 65^3, grid point (i,j,k) == (i,j,k)/64; (b') 1024-point v^3 -> 65^3.
-        QByteArray id65 = "LUT_1D_SIZE 65\n";
-        for (int i = 0; i < 65; ++i) {
-            const QByteArray v = QByteArray::number(i / 64.0, 'g', 17);
-            id65 += v + " " + v + " " + v + "\n";
-        }
-        bool bok = false, b2ok = false;
-        const LutData id = loadText(dir, "g12b.cube", id65, &bok);
-        const LutData idg = LutImporter::toGpuGrid(id);
-        bool idOk = idg.size == 65 && idg.table.size() == 65 * 65 * 65;
-        for (int k = 0; idOk && k < 65; ++k)
-            for (int j = 0; idOk && j < 65; ++j)
-                for (int i = 0; idOk && i < 65; ++i) {
-                    const QVector3D v = idg.table[i + j * 65 + k * 65 * 65];
-                    idOk = std::abs(v.x() - i / 64.0f) <= 1e-6f && std::abs(v.y() - j / 64.0f) <= 1e-6f
-                        && std::abs(v.z() - k / 64.0f) <= 1e-6f;
-                }
+        // (b) the last knot of a 65-texel axis sits at the centre of texel 64; (b') a 1024-point
+        // 1D v^3 table is sampled linearly between neighbouring entries (the GL texture filter).
+        const float b1 = LutImporter::gpuTexelCoord(65, 1.0f), b0 = LutImporter::gpuTexelCoord(65, 0.0f);
+        const bool bok = close(b1, 64.5f / 65.0f) && close(b0, 0.5f / 65.0f);
         QByteArray cube1k = "LUT_1D_SIZE 1024\n";
         for (int i = 0; i < 1024; ++i) {
             const double t = i / 1023.0;
             const QByteArray v = QByteArray::number(t * t * t, 'g', 17);
             cube1k += v + " " + v + " " + v + "\n";
         }
+        bool b2ok = false;
         const LutData big = loadText(dir, "g12b2.cube", cube1k, &b2ok);
-        const LutData bigg = LutImporter::toGpuGrid(big);
-        bool bigOk = big.isValid() && bigg.size == 65 && bigg.table.size() == 65 * 65 * 65;
-        for (int k = 0; bigOk && k < 65; ++k)
-            for (int j = 0; bigOk && j < 65; ++j)
-                for (int i = 0; bigOk && i < 65; ++i) {
-                    const QVector3D e = LutImporter::sample(big, QVector3D(i / 64.0f, j / 64.0f, k / 64.0f));
-                    const QVector3D v = bigg.table[i + j * 65 + k * 65 * 65];
-                    bigOk = std::abs(v.x() - e.x()) <= 1e-6f && std::abs(v.y() - e.y()) <= 1e-6f
-                         && std::abs(v.z() - e.z()) <= 1e-6f;
-                }
-        // independent anchor: grid point (32,32,32) is t = 0.5 -> about 0.125 (1D table step 1/1023)
-        const bool anchor = bigg.table.size() == 65 * 65 * 65
-            && std::abs(bigg.table[32 + 32 * 65 + 32 * 65 * 65].x() - 0.125f) < 1e-3f;
+        bool midOk = b2ok && big.isValid() && big.size == 1024;
+        std::string midDetail;
+        for (int i : {0, 100, 511, 1022}) {
+            if (!midOk) break;
+            const float t = (i + 0.5f) / 1023.0f;
+            const QVector3D s = LutImporter::sample(big, QVector3D(t, t, t));
+            const float want = (big.table[i].x() + big.table[i + 1].x()) / 2.0f;
+            midOk = std::abs(s.x() - want) <= 1e-5f && s.x() == s.y() && s.y() == s.z();
+            midDetail += " mid" + std::to_string(i) + "=" + std::to_string(s.x());
+        }
+        // independent anchor: t = 0.5 is about 0.125 (v^3), 1D table step 1/1023
+        const float half = b2ok ? LutImporter::sample(big, QVector3D(0.5f, 0.5f, 0.5f)).x() : 0.0f;
+        const bool anchor = std::abs(half - 0.125f) < 1e-3f;
 
-        // (c) 3D LUT with DOMAIN_MAX 2 -> default-domain 3D grid; white matches the original.
+        // (c) DOMAIN_MIN / DOMAIN_MAX are kept by the loader and remapped by gpuDomainRemap exactly
+        // as the shader does: DOMAIN_MAX 2 sends 1 -> 0.5, 0..0.5 sends 0.25 -> 0.5, 0.1..0.6 sends
+        // 0.35 -> 0.5 (and clamps outside to 0 / 1).
         bool cok = false;
         const LutData dom = loadText(dir, "g12c.cube", "DOMAIN_MAX 2 2 2\n" + g1Body(), &cok);
-        const LutData domg = LutImporter::toGpuGrid(dom);
-        const QColor w0 = LutImporter::applyLut(pixel(255, 255, 255), dom).pixelColor(0, 0);
-        const QColor w1 = LutImporter::applyLut(pixel(255, 255, 255), domg).pixelColor(0, 0);
-        bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && domg.type == LutType::Cube3D
-            && domg.size == 65 && domg.hasDefaultDomain() && near(w1, w0.red(), w0.green(), w0.blue());
-        // Narrow (0..0.5, row v^2) and shifted (0.1..0.6, row v^2 / 2) 3-point domains: the
-        // grid tracks the original on the diagonal and an off-axis line within 2/255.
-        std::string domDetail;
+        bool okC = cok && dom.isValid() && !dom.hasDefaultDomain() && dom.domainMax == QVector3D(2.0f, 2.0f, 2.0f)
+            && LutImporter::gpuDomainRemap(dom, QVector3D(1.0f, 1.0f, 1.0f)) == QVector3D(0.5f, 0.5f, 0.5f);
+        std::string domDetail = " c_size=" + std::to_string(dom.size);
         const char *domHeads[2] = {"DOMAIN_MIN 0 0 0\nDOMAIN_MAX 0.5 0.5 0.5\n",
                                    "DOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.6 0.6 0.6\n"};
         const char *domNames[2] = {"g12c2.cube", "g12c3.cube"};
+        const float domIn[2] = {0.25f, 0.35f};
         for (int d = 0; d < 2; ++d) {
-            const double scale = d == 0 ? 1.0 : 0.5;
             QByteArray text = QByteArray("LUT_3D_SIZE 3\n") + domHeads[d];
             for (int b = 0; b < 3; ++b)
                 for (int gg = 0; gg < 3; ++gg)
                     for (int r = 0; r < 3; ++r)
-                        text += QByteArray::number(scale * r * r / 4.0) + " "
-                              + QByteArray::number(scale * gg * gg / 4.0) + " "
-                              + QByteArray::number(scale * b * b / 4.0) + "\n";
+                        text += QByteArray::number(r * r / 4.0) + " " + QByteArray::number(gg * gg / 4.0) + " "
+                              + QByteArray::number(b * b / 4.0) + "\n";
             bool lok = false;
             const LutData orig = loadText(dir, domNames[d], text, &lok);
-            const LutData grid = LutImporter::toGpuGrid(orig);
-            const bool valid = lok && orig.isValid() && grid.isValid();
-            float maxErr = valid ? 0.0f : 1.0f;
-            for (int k = 0; valid && k <= 255; ++k) {
-                const float t = k / 255.0f;
-                const QVector3D xs[2] = {QVector3D(t, t, t), QVector3D(t, 0.25f, 0.75f)};
-                for (const QVector3D &x : xs) {
-                    const QVector3D e = LutImporter::sample(grid, x) - LutImporter::sample(orig, x);
-                    maxErr = qMax(maxErr, qMax(std::abs(e.x()), qMax(std::abs(e.y()), std::abs(e.z()))));
-                }
-            }
-            okC = okC && valid && orig.size == 3 && !orig.hasDefaultDomain()
-                && grid.hasDefaultDomain() && maxErr <= 2.0f / 255.0f;
-            domDetail += " dom" + std::to_string(d) + "_err255=" + std::to_string(maxErr * 255.0f);
+            const QVector3D mid = lok ? LutImporter::gpuDomainRemap(orig, QVector3D(domIn[d], domIn[d], domIn[d])) : QVector3D();
+            const QVector3D lo = lok ? LutImporter::gpuDomainRemap(orig, QVector3D(-1.0f, -1.0f, -1.0f)) : QVector3D(1, 1, 1);
+            const QVector3D hi = lok ? LutImporter::gpuDomainRemap(orig, QVector3D(2.0f, 2.0f, 2.0f)) : QVector3D();
+            const bool pt = lok && orig.size == 3 && !orig.hasDefaultDomain()
+                && std::abs(mid.x() - 0.5f) <= 1e-6f && std::abs(mid.z() - 0.5f) <= 1e-6f
+                && lo == QVector3D(0.0f, 0.0f, 0.0f) && hi == QVector3D(1.0f, 1.0f, 1.0f);
+            okC = okC && pt;
+            domDetail += " dom" + std::to_string(d) + "_remap=" + std::to_string(pt) + "_mid=" + std::to_string(mid.x());
         }
-        // Logged only, not part of the gate (Wave 22 carryover C-02-residual): a domain narrower
-        // than one 1/64 grid step (0.1..0.101, row 0 / 0.25 / 1) cannot be tracked by a uniform grid.
+        // (c4) A domain narrower than any grid step (0.1..0.101, row 0 / 0.25 / 1): the GL domain
+        // remap (CPU twin) sends 26/255 to 1 like sample(); 13/255 to 0.
         {
             const double row[3] = {0.0, 0.25, 1.0};
             QByteArray text("LUT_3D_SIZE 3\nDOMAIN_MIN 0.1 0.1 0.1\nDOMAIN_MAX 0.101 0.101 0.101\n");
@@ -377,31 +341,31 @@ int runLutImportSelftest()
                               + QByteArray::number(row[b]) + "\n";
             bool rok = false;
             const LutData orig = loadText(dir, "g12c4.cube", text, &rok);
-            const LutData grid = LutImporter::toGpuGrid(orig);
-            if (rok && orig.isValid() && grid.isValid()) {
-                const float t = 26.0f / 255.0f;
-                const float ov = LutImporter::sample(orig, QVector3D(t, t, t)).x();
-                const float gv = LutImporter::sample(grid, QVector3D(t, t, t)).x();
-                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual (logged, not a pass): loaded="
-                          << rok << " DOMAIN 0.1..0.101 x=26/255 orig=" << ov << " grid=" << gv
-                          << " err255=" << std::abs(gv - ov) * 255.0f << "\n";
-            } else {
-                std::cerr << "[INFO] lut-import G12 (c) narrow-domain residual: fixture not loaded\n";
-            }
+            const float t26 = 26.0f / 255.0f, t13 = 13.0f / 255.0f;
+            const bool valid = rok && orig.isValid();
+            const QVector3D r26 = valid ? LutImporter::gpuDomainRemap(orig, QVector3D(t26, t26, t26)) : QVector3D();
+            const QVector3D r13 = valid ? LutImporter::gpuDomainRemap(orig, QVector3D(t13, t13, t13)) : QVector3D(1, 1, 1);
+            const QVector3D s26 = valid ? LutImporter::sample(orig, QVector3D(t26, t26, t26)) : QVector3D();
+            const bool ok4 = valid && r26 == QVector3D(1.0f, 1.0f, 1.0f)
+                && r13 == QVector3D(0.0f, 0.0f, 0.0f) && s26 == QVector3D(1.0f, 1.0f, 1.0f);
+            okC = okC && ok4;
+            domDetail += " remap26=" + std::to_string(r26.x()) + " remap13=" + std::to_string(r13.x())
+                       + " sample26=" + std::to_string(s26.x());
         }
 
-        // (d) default-domain 3D LUT is returned unchanged.
+        // (d) a default-domain 3D LUT's gpuDomainRemap is the identity on 0..1.
         bool dok = false;
         const LutData plain = loadText(dir, "g12d.cube", g1Body(), &dok);
-        const LutData pg = LutImporter::toGpuGrid(plain);
-        const bool okD = dok && plain.isValid() && pg.size == plain.size && pg.table == plain.table
-            && pg.type == plain.type && pg.intensity == plain.intensity;
+        bool idRemap = dok && plain.isValid() && plain.hasDefaultDomain();
+        for (float v : {0.0f, 0.1f, 0.5f, 0.77f, 1.0f})
+            idRemap = idRemap && LutImporter::gpuDomainRemap(plain, QVector3D(v, 1.0f - v, v)) == QVector3D(v, 1.0f - v, v);
+        const bool okD = idRemap;
 
-        tally.gate(12, okA && bok && idOk && b2ok && bigOk && anchor && okC && okD,
-                   "a=" + std::to_string(okA) + cornerDetail + " b=" + std::to_string(bok && idOk)
-                   + " b'=" + std::to_string(b2ok && bigOk) + " anchor=" + std::to_string(anchor)
-                   + " c=" + std::to_string(okC) + " w0=" + rgb(w0) + " w1=" + rgb(w1) + domDetail
-                   + " d=" + std::to_string(okD));
+        tally.gate(12, okA && bok && b2ok && midOk && anchor && okC && okD,
+                   "a=" + std::to_string(okA) + " a25=" + std::to_string(a25) + " a75=" + std::to_string(a75)
+                   + " b=" + std::to_string(bok) + " b1=" + std::to_string(b1)
+                   + " b'=" + std::to_string(b2ok && midOk) + midDetail + " anchor=" + std::to_string(anchor)
+                   + " c=" + std::to_string(okC) + domDetail + " d=" + std::to_string(okD));
     }
 
     return tally.finish("lut-import");

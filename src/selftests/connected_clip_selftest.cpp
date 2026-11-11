@@ -4004,10 +4004,79 @@ void nestedAdjustmentGate(selftest::GateTally &tally, Timeline &tl, SequenceSide
                  "with layer disabled: changed inside C %d, outside C %d (expect 0) | ok=%d\n",
                  toQ, toR, parked2, smallGradedOk, transparent, alphaMismatch, colorChanged, insideChanged,
                  outsideChanged, alphaOk);
-    tally.gate(45, activeC && toP && parkedOk && graded > 0 && gradeOk && outsideOk && disabledOk && alphaOk,
+    // (e) offset nest: C follows a 0.7 s filler clip on P's V1 (parent t = 0.7 s) with
+    // inPoint 0.3 s, and C's own layer covers C-local [0.2, 0.6). Parent t = 0.8 s is C-local 0.4 s
+    // (graded), t = 1.1 s is C-local 0.7 s (ungraded) and t = 0.3 s is the filler only. Ignoring
+    // the offset or the inPoint would grade t = 1.1 s (local 0.4) or leave t = 0.8 s (local 0.1) clean.
+    ClipInfo pre = clipFor("g45-pre", 0.7);
+    pre.filePath = videoPath;
+    ClipInfo offRef = clipFor("g45-off-ref", child.duration());
+    offRef.sequenceRefId = child.id;
+    offRef.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+    offRef.inPoint = 0.3;
+    TimelineSequence offP;
+    offP.id = QStringLiteral("seq-off");
+    offP.name = QStringLiteral("O");
+    offP.videoTracks = {{pre, offRef}};
+    offP.audioTracks = {{}};
+    TimelineSequence bgOnly;
+    bgOnly.id = QStringLiteral("seq-bg");
+    bgOnly.name = QStringLiteral("BG");
+    bgOnly.videoTracks = {{pre}};
+    bgOnly.audioTracks = {{}};
+    child.videoTracks = {{v1}};
+    AdjustmentLayer localLayer = layer;
+    localLayer.timelineStartUs = 200000;
+    localLayer.timelineEndUs = 600000;
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    tl.setSequences({offP, bgOnly, child}, child.id);
+    const qint64 offGraded = 800000, offClean = 1100000, offBefore = 300000;
+    tl.setAdjustmentLayers({localLayer});
+    const bool toOff = tl.setActiveSequence(offP.id);
+    const bool parkedOff = tl.parkedSidecarsBySequence().value(child.id).adjustments.size() == 1
+        && tl.adjustmentLayers().isEmpty();
+    const QHash<QString, Timeline::SequenceSidecars> partial = tl.parkedSidecarsBySequence();
+    const QImage offAt8 = tlrender::renderFrameAt(&tl, offGraded, outSize);
+    const QImage offAt11 = tlrender::renderFrameAt(&tl, offClean, outSize);
+    const QImage offAt3 = tlrender::renderFrameAt(&tl, offBefore, outSize);
+    // Same nest with the layer over all of C's local range, and with it disabled: the references.
+    QHash<QString, Timeline::SequenceSidecars> whole = partial;
+    if (!whole[child.id].adjustments.isEmpty()) {
+        whole[child.id].adjustments.first().timelineStartUs = 0;
+        whole[child.id].adjustments.first().timelineEndUs = 2000000;
+    }
+    tl.setParkedSidecarsBySequence(whole);
+    const QImage wholeAt8 = tlrender::renderFrameAt(&tl, offGraded, outSize);
+    const QImage wholeAt11 = tlrender::renderFrameAt(&tl, offClean, outSize);
+    QHash<QString, Timeline::SequenceSidecars> none = partial;
+    if (!none[child.id].adjustments.isEmpty())
+        none[child.id].adjustments.first().gradingEnabled = false;
+    tl.setParkedSidecarsBySequence(none);
+    const QImage noneAt8 = tlrender::renderFrameAt(&tl, offGraded, outSize);
+    const QImage noneAt11 = tlrender::renderFrameAt(&tl, offClean, outSize);
+    const bool toBg = tl.setActiveSequence(bgOnly.id);
+    const QImage bgAt3 = tlrender::renderFrameAt(&tl, offBefore, outSize);
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    const int offControl = differingPixels(wholeAt8, noneAt8);
+    const bool offOk = toOff && toBg && parkedOff && offControl > 0 && differingPixels(wholeAt11, noneAt11) > 0
+        && sameImage(offAt8, wholeAt8) && !sameImage(offAt8, noneAt8) && sameImage(offAt11, noneAt11)
+        && !sameImage(offAt11, wholeAt11) && sameImage(offAt3, bgAt3);
+    std::fprintf(stderr, "connected-clip G45 (e) toOff %d toBg %d parked %d | control: C fully graded vs ungraded "
+                 "differ @0.8s in %d px, @1.1s in %d px (expect > 0) | P @0.8s %s == fully graded %s %d (!= "
+                 "ungraded %s) | P @1.1s %s == ungraded %s %d (!= fully graded %s) | P @0.3s %s == background only "
+                 "%s %d | ok=%d\n",
+                 toOff, toBg, parkedOff, offControl, differingPixels(wholeAt11, noneAt11),
+                 qPrintable(imageSha(offAt8)), qPrintable(imageSha(wholeAt8)), sameImage(offAt8, wholeAt8),
+                 qPrintable(imageSha(noneAt8)), qPrintable(imageSha(offAt11)), qPrintable(imageSha(noneAt11)),
+                 sameImage(offAt11, noneAt11), qPrintable(imageSha(wholeAt11)), qPrintable(imageSha(offAt3)),
+                 qPrintable(imageSha(bgAt3)), sameImage(offAt3, bgAt3), offOk);
+    tally.gate(45, activeC && toP && parkedOk && graded > 0 && gradeOk && outsideOk && disabledOk && alphaOk
+                   && offOk,
                "a nested sequence's parked adjustment layer did not grade it in the parent's render (or "
                "graded outside its local range, or graded while disabled, or flattened the child's alpha "
-               "over the parent's background)");
+               "over the parent's background, or ignored the child's placement offset and inPoint)");
 }
 
 static void carriersByUidGate(selftest::GateTally &tally, Timeline *mainTimeline)
@@ -5990,6 +6059,43 @@ int runConnectedClipSelftest()
             };
             // Precondition: the shown track has painted at least once before the drag starts.
             for (int i = 0; i < 10 && paintV1->paintCountForTest() == 0; ++i) idleFor200ms();
+            // The snap line fades for kSnapLineFadeMs (200 ms) after a snap and repaints while it does:
+            // wait until it is gone (capped at 3 s), then require the paint count to stay put for two
+            // consecutive 250 ms windows (capped at 3 s) before it is read as settled.
+            auto waitSnapLineGone = [&paintTl, &idleFor200ms] {
+                QElapsedTimer t;
+                t.start();
+                while (paintTl.snapLineX() != -1 && t.elapsed() < 3000) idleFor200ms();
+                return paintTl.snapLineX() == -1;
+            };
+            auto settlePaint = [&paintV1](quint64 &first, quint64 &second) {
+                QElapsedTimer t;
+                t.start();
+                auto window250ms = [] {
+                    QElapsedTimer w;
+                    w.start();
+                    while (w.elapsed() < 250) {
+                        QCoreApplication::processEvents(QEventLoop::AllEvents, 20);
+                        QThread::msleep(5);
+                    }
+                };
+                quint64 prev = paintV1->paintCountForTest();
+                quint64 cur = prev;
+                bool prevStable = false;
+                while (t.elapsed() < 3000) {
+                    window250ms();
+                    cur = paintV1->paintCountForTest();
+                    const bool stable = cur == prev;
+                    first = prev;
+                    second = cur;
+                    if (stable && prevStable) return true;
+                    prevStable = stable;
+                    prev = cur;
+                }
+                return false;
+            };
+            quint64 settleA = 0, settleB = 0;
+            const bool baseSettled = waitSnapLineGone() && settlePaint(settleA, settleB);
             const quint64 paintBase = paintV1->paintCountForTest();
             const QPointF pressPos(2.5 * paintV1->pixelsPerSecond(), paintV1->height() / 2.0);
             QMouseEvent press(QEvent::MouseButtonPress, pressPos, pressPos, Qt::LeftButton, Qt::LeftButton,
@@ -5998,15 +6104,12 @@ int runConnectedClipSelftest()
             const QPointF movePos = pressPos + QPointF(6.0, 0.0);
             QMouseEvent move(QEvent::MouseMove, movePos, movePos, Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
             QApplication::sendEvent(paintV1, &move);
-            idleFor200ms();  // settle the press / move repaints
-            idleFor200ms();
-            const quint64 paintAfterFirst = paintV1->paintCountForTest();
-            idleFor200ms();
-            const quint64 paintAfterSecond = paintV1->paintCountForTest();
+            quint64 paintAfterFirst = 0, paintAfterSecond = 0;
+            const bool dragSettled = waitSnapLineGone() && settlePaint(paintAfterFirst, paintAfterSecond);
             QMouseEvent release(QEvent::MouseButtonRelease, movePos, movePos, Qt::LeftButton, Qt::NoButton,
                                 Qt::NoModifier);
             QApplication::sendEvent(paintV1, &release);
-            const bool paintOk = paintBase > 0
+            const bool paintOk = paintBase > 0 && baseSettled && dragSettled
                 && paintAfterSecond == paintAfterFirst;
             const bool lockOk = lockAccepted && lockV2After == lockV2Before + 1 && lockA2After == lockA2Before
                 && !lockAudioAccepted && lockCtlV2 == lockV2After && lockCtlA2 == lockA2After
@@ -6018,14 +6121,14 @@ int runConnectedClipSelftest()
                          "lockedA2: videoDrop=%d V2 %d -> %d A2 %d -> %d (expect 1, V2 +1, A2 unchanged) "
                          "audioDrop=%d (expect 0) V2 %d A2 %d (expect unchanged) unlockedAudioDrop=%d A2 %d "
                          "(expect 1, A2 grows) lockOk=%d | paint counts base=%llu afterIdle1=%llu "
-                         "afterIdle2=%llu (expect idle2 == idle1 > 0) paintOk=%d | ok=%d\n",
+                         "afterIdle2=%llu (expect idle2 == idle1 > 0) baseSettled=%d dragSettled=%d paintOk=%d | ok=%d\n",
                          multiAccepted, projectAccepted, projectCopied, subV2Before, subV2AfterRefused,
                          gapAccepted, qPrintable(describe(gapClip, QString())),
                          qPrintable(gapClip.clip.anchorUid), lockAccepted, lockV2Before, lockV2After,
                          lockA2Before, lockA2After, lockAudioAccepted, lockCtlV2, lockCtlA2,
                          unlockedAudioAccepted, unlockedA2, lockOk, static_cast<unsigned long long>(paintBase),
                          static_cast<unsigned long long>(paintAfterFirst),
-                         static_cast<unsigned long long>(paintAfterSecond), paintOk, subOk);
+                         static_cast<unsigned long long>(paintAfterSecond), baseSettled, dragSettled, paintOk, subOk);
             std::fprintf(stderr, "connected-clip G26 ON: v2Drop=%d a2Drop=%d v1Drop=%d (expect 1/1/1) v2[%s] "
                          "a2[%s] clipDrop=%d y[%s] v1New[%s] bPushed[%s] v1Ok=%d ok=%d | OFF: v2Drop=%d a2Drop=%d "
                          "v1Drop=%d (expect 0/0/0) V2 clips "

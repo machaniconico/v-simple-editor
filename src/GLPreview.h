@@ -74,8 +74,15 @@ public:
     void setEffectsEnabled(bool enabled) { m_effectsEnabled = enabled; update(); }
     bool effectsEnabled() const { return m_effectsEnabled; }
     void setLut(const LutData &lut);
-    // US-FEAT-B: LUT 3D-texture blend — upload QImage grid as GL_TEXTURE_3D
-    void setLutTexture(const QImage &lutGrid, float intensity);
+    // Test-only: caps the width of the N x 1 texture a 1D LUT is uploaded as, so the
+    // resample branch (N above GL_MAX_TEXTURE_SIZE) runs on any GPU; 0 = the context's limit.
+    void setLut1DMaxTextureWidthForTest(int width) { m_lut1DMaxWidthOverride = width; }
+    // Test-only: the texture unit the main program's sampler uniform `name` holds now
+    // (glGetUniformiv after the last paint); -1 when there is no program or the uniform
+    // is inactive. Lets a selftest see a sampler-type clash that a lenient driver ignores.
+    int samplerUnitForTest(const char *name);
+    // Width of the uploaded 1D LUT texture (0 = no 1D LUT).
+    int lut1DTextureWidthForTest() const { return m_lut1DTexture ? m_lut1DN : 0; }
     void setLutIntensity(double intensity);
     void clearLut();
     // US-WIRE-2: Lift/Gamma/Gain color wheels from ColorGradingPanel
@@ -194,10 +201,17 @@ public:
     // user 3D-rotate matrix is preserved (transforms compose by stacking).
     void setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs);
     void setStabilizerSourceTimeUs(qint64 sourceUs);
+    // US-2202: the size the keys were analysed at (their dx / dy unit); invalid =
+    // the uploaded frame's size. Rebuilds the matrix when keys are set.
+    void setStabilizerSourceSize(const QSize &sourceSize);
     // US-2111 test seam: the nine row-major uStab values (stabwarp::inverseMatrixUv).
     std::array<float, 9> stabMatrixForTest() const;
+    // US-2202 test seam: whether the uStab stage runs on the next paint.
+    bool stabEnabledForTest() const { return m_stabEnabled; }
     // US-2111: V1's stabilizer sample at the time of the special composite shown
-    // next (identity: none) and V1's decoded frame size, the unit of its dx / dy.
+    // next (identity: none) and the size V1's keys were analysed at, the unit of
+    // its dx / dy (ClipInfo::stabilizerSourceSize, falling back to the decoded
+    // frame size when no size is stored, as in old files).
     // The composite's V1 layer is already warped on the CPU and the GL gets no
     // keys, so the bound brush drawn on it gets this warp; the next displayFrame
     // takes it and every later one clears it.
@@ -514,7 +528,19 @@ private:
     int m_locLut3D = -1;
     int m_locLutIntensity = -1;
     int m_locLutEnabled = -1;
+    int m_locLutSize = -1;
+    int m_locLutDomainMin = -1;
+    int m_locLutDomainMax = -1;
+    int m_locLut1D = -1;
+    int m_locLutIs1D = -1;
+    int m_locLut1DSize = -1;
     QOpenGLTexture *m_lutTexture = nullptr;
+    QOpenGLTexture *m_lut1DTexture = nullptr;     // N x 1 RGB32F table of a 1D LUT (unit 4)
+    int m_lut1DN = 0;                             // texels of m_lut1DTexture
+    int m_lut1DMaxWidthOverride = 0;
+    int m_lutN = 0;                               // texels per axis of m_lutTexture (0 = none)
+    QVector3D m_lutDomainMin{0.0f, 0.0f, 0.0f};   // uLutDomainMin / uLutDomainMax
+    QVector3D m_lutDomainMax{1.0f, 1.0f, 1.0f};
     float m_lutIntensity = 1.0f;
     bool m_lutEnabled = false;
 
@@ -684,6 +710,10 @@ private:
     qint64 m_stabSourceUs  = 0;
     int   m_stabFrameW     = 0;
     int   m_stabFrameH     = 0;
+    QSize m_stabSourceSize;
+    // US-2202: m_stabMatrix / m_stabEnabled from m_stabKeyframes at m_stabSourceUs,
+    // in m_stabSourceSize when valid, else the uploaded frame's size.
+    void rebuildStabMatrix();
 
     // US-INT-1: non-owning Timeline pointer for adjustment-layer composition.
     Timeline *m_timeline = nullptr;
