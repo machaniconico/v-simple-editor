@@ -14679,6 +14679,9 @@ void Timeline::setSidecarStateHooks(std::function<QJsonObject()> collect,
 
 void Timeline::absorbIntoCurrentUndoPoint()
 {
+    // US-2308: a live drag / motion burst takes its point first, so the replace below lands
+    // on the burst's point (drag + this edit) and not on the point before the burst.
+    emit aboutToSaveUndoState();
     reconcileConnectedClips();
     m_undoManager->updateCurrentState(currentState());
     captureReconcileBaseline();

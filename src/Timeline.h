@@ -1656,7 +1656,8 @@ signals:
     void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
     // US-2216: at the top of saveUndoState, before the edit's own point is taken, so a
-    // pending burst point lands first with the state the burst left.
+    // pending burst point lands first with the state the burst left. US-2308: also at the top
+    // of absorbIntoCurrentUndoPoint, right before it reads or replaces the current point.
     void aboutToSaveUndoState();
     // US-1408: at the success return of importMedia() (every GUI / MCP / drop
     // import) and of createSequence(name, tracks, tracks) with clips (GUI / MCP
