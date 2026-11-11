@@ -184,6 +184,9 @@ bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
 
 QImage warpV1LayerForPreview(const QImage &v1, const PlaybackEntry &entry, qint64 sourceUs)
 {
+    // US-2300: stabwarp::applyForExport warps every track now; VideoPlayer's own
+    // preview warp stays on V1 here until US-2301 removes this guard.
+    if (entry.sourceTrack != 0) return v1;
     ClipInfo clip;
     clip.stabilizerKeyframes = entry.stabilizerKeyframes;
     return stabwarp::applyForExport(v1, clip, entry.sourceTrack, /*sequenceDepth=*/0,

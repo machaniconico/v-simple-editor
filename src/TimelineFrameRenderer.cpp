@@ -2173,8 +2173,9 @@ QImage renderClipLayerSource(const Timeline *timeline,
     // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
     // that image feeds both the echo and the plain branch.
     QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
-    // US-2111: V1's stabilizer on the brushed source, before VFX / grade, at the
-    // export's source time and the decoded size (stabwarp::applyForExport decides).
+    // US-2111 / US-2300: the stabilizer of every layer that carries keys (any track,
+    // a nested child at its own source time) on the brushed source, before VFX /
+    // grade, at the export's source time and the decoded size.
     raw = stabwarp::applyForExport(raw, clip, trackIdx, sequenceDepth, sourceSec);
     if (stopAfterBrush)
         return raw;

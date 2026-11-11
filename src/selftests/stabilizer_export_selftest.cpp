@@ -4,11 +4,15 @@
 // clamp-to-edge bilinear sampling; the special-composite preview warps V1's layer
 // the same way. Fixture: a 64x64 project, 60-frame `%03d` PNG sequences (black,
 // opaque, 2x2 white dots) written here, so the fit is the identity and a source
-// pixel lands on the same output pixel.
+// pixel lands on the same output pixel. US-2300: every layer that carries keys is
+// warped (upper tracks, a nested child at its own source time); G13 / G14.
 #include "../BrushAnimation.h"
+#include "../Camera3D.h"
+#include "../OnionSkin.h"
 #include "../GLPreview.h"
 #include "../Keyframe.h"
 #include "../MainWindow.h"
+#include "../ShapeLayer.h"
 #include "../StabilizerWarp.h"
 #include "../StillCompare.h"
 #include "../Timeline.h"
@@ -22,6 +26,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QImage>
 #include <QJsonObject>
@@ -352,21 +357,24 @@ int runStabilizerExportSelftest()
         tally.gate(4, plainOk && sized && mismatches == 0 && nonOpaque == 0, d.str());
     }
 
-    // G5: (a) V1 only, (b) the matrix (pin), (c) pixel centres / rotation centre and
-    // the non-square UV mapping, (d) no stabilization inside a nested pass.
+    // G5: (a) a V2 key applies to the export too (US-2300; was "V1 only"), (b) the
+    // matrix (pin), (c) pixel centres / rotation centre and the non-square UV
+    // mapping, (d) a nested child's V1 moves by its key (US-2300; was "no
+    // stabilization inside a nested pass").
     {
         std::ostringstream d;
-        // (a) the same key on V2 leaves V2's export unchanged. V1 is frontmost and
-        // opaque (US-1804), so it sits at videoDx -0.375 (output x 0..39) and V2's
-        // dot (40,40) shows beside it (G6 (c)'s layout).
+        // (a) the same key on V2 moves V2's dot (40,40) -> (44,40). V1 is frontmost
+        // and opaque (US-1804), so it sits at videoDx -0.375 (output x 0..39) and
+        // V2's dot shows beside it (G6 (c)'s layout).
         ClipInfo v1Left = seqClip(seqB);
         v1Left.videoDx = -0.375;
         const ClipInfo plainC = seqClip(seqC);
         const QImage v2Plain = exportAt({{v1Left}, {plainC}}, t);
         const QImage v2Keyed = exportAt({{v1Left}, {withKeys(plainC, {key(0.0, 4.0)})}}, t);
         const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        const Box v2KeyedBox = whiteBox(v2Keyed, v2Area);
         const bool aOk = !v2Plain.isNull() && whiteBox(v2Plain, v2Area).rect == QRect(40, 40, 2, 2)
-            && sha(v2Plain) == sha(v2Keyed);
+            && v2KeyedBox.n == 4 && v2KeyedBox.rect == QRect(44, 40, 2, 2);
         d << "(a) v2Plain sha=" << sha(v2Plain) << " V2 white " << boxText(whiteBox(v2Plain, v2Area))
           << " v2Keyed sha=" << sha(v2Keyed) << " V2 white " << boxText(whiteBox(v2Keyed, v2Area))
           << " ok=" << aOk;
@@ -442,7 +450,8 @@ int runStabilizerExportSelftest()
           << " ok=" << cOk;
 
         // (d) the G2 key on V1 of a child sequence C, referenced from V1 of P: the
-        // nested pass does not stabilize, so P renders like the key-less C.
+        // nested pass stabilizes the child, so P's dot moves (10,10) -> (14,10).
+        Box nestedBox;
         const auto nestedSha = [&](const ClipInfo &child) {
             TimelineSequence c;
             c.id = QStringLiteral("child");
@@ -463,12 +472,15 @@ int runStabilizerExportSelftest()
             timeline.setSequences(QVector<TimelineSequence>{p, c}, p.id);
             const QImage image =
                 tlrender::renderFrameAt(&timeline, us(t), QSize(kSize, kSize));
-            d << " (d) nested white " << boxText(whiteBox(image));
+            nestedBox = whiteBox(image);
+            d << " (d) nested white " << boxText(nestedBox);
             return sha(image);
         };
         const std::string nestedKeyed = nestedSha(withKeys(plainA, {key(0.0, 4.0)}));
+        const Box nestedKeyedBox = nestedBox;
         const std::string nestedPlain = nestedSha(plainA);
-        const bool dOk = nestedPlain != "null" && nestedKeyed == nestedPlain;
+        const bool dOk = nestedPlain != "null" && nestedBox.rect == QRect(10, 10, 2, 2)
+            && nestedKeyedBox.n == 4 && nestedKeyedBox.rect == QRect(14, 10, 2, 2);
         d << " (d) keyedSha=" << nestedKeyed << " plainSha=" << nestedPlain << " ok=" << dOk;
         tally.gate(5, plainOk && aOk && bOk && glOk && cOk && dOk, d.str());
     }
@@ -1384,6 +1396,571 @@ int runStabilizerExportSelftest()
               << boxText(nonBlackBox(plainRun.exported, full)) << " ok=" << plainOk2
               << ";" << sd.str() << " ok=" << seekOk;
             tally.gate(12, keyedOk && plainOk2 && seekOk, d.str());
+        }
+    }
+
+    // US-2300 G13: a nested child's key is sampled at the child's own source time.
+    // The child clip starts at source 0.4 s (inPoint) and carries keys (source 0.4 s
+    // dx 0, 1.4 s dx +10); P = V1 [filler 0.5 s, reference to C]. (a) At timeline
+    // 0.8 s C is at child-local 0.3 s = source 0.7 s: dx +3 (the child-local time
+    // would read 0, the timeline time +4); (b) the reference at speed 2: child 0.6 s =
+    // source 1.0 s, +6; (c) the same keyed clip on C's V2 (C's V1 key-less); (d) two
+    // levels (C = V1 [filler 0.2 s, reference to G], G holds the clip) at 1.0 s:
+    // G 0.3 s = source 0.7 s, +3; (e) control: the key-less fixtures render
+    // byte-identical to the base exe 0335b53 (S0-1 (a) shas). HEAD: (a)-(d) unmoved.
+    {
+        std::ostringstream d;
+        const auto seqOf = [](const QString &id, const QVector<QVector<ClipInfo>> &tracks) {
+            TimelineSequence s;
+            s.id = id;
+            s.name = id;
+            s.videoTracks = tracks;
+            return s;
+        };
+        const auto refTo = [](const TimelineSequence &c, double length, double speed) {
+            ClipInfo ref;
+            ref.sequenceRefId = c.id;
+            ref.filePath = timeline_nesting::sequenceClipFilePath(c.id);
+            ref.displayName = c.id;
+            ref.duration = ref.outPoint = length;
+            ref.speed = speed;
+            ref.opacity = 1.0;
+            return ref;
+        };
+        // P = V1 [filler `lead` s, reference to children[0]] rendered at `sec`.
+        const auto renderNested = [&](QVector<TimelineSequence> children, double lead,
+                                      double length, double speed, double sec) {
+            const TimelineSequence p = seqOf(
+                QStringLiteral("parent"),
+                {{seqClip(seqC, lead), refTo(children.first(), length, speed)}});
+            children.prepend(p);
+            Timeline timeline;
+            timeline.setProjectOutputConfig(kSize, kSize, false, kFps);
+            timeline.setSequences(children, p.id);
+            return tlrender::renderFrameAt(&timeline, us(sec), QSize(kSize, kSize));
+        };
+        ClipInfo childPlain = seqClip(seqA);
+        childPlain.inPoint = 0.4;
+        const ClipInfo childKeyed = withKeys(childPlain, {key(0.4, 0.0), key(1.4, 10.0)});
+        ClipInfo c2Plain = seqClip(seqC);
+        c2Plain.inPoint = 0.4;
+        const ClipInfo c2Keyed = withKeys(c2Plain, {key(0.4, 0.0), key(1.4, 10.0)});
+        ClipInfo v1Left = seqClip(seqB);
+        v1Left.videoDx = -0.375;
+        const QString childId = QStringLiteral("child");
+        const QString grandId = QStringLiteral("grand");
+        const auto twoLevel = [&](const ClipInfo &clip) {
+            const TimelineSequence g = seqOf(grandId, {{clip}});
+            const TimelineSequence c = seqOf(childId, {{seqClip(seqC, 0.2), refTo(g, 1.6, 1.0)}});
+            return renderNested({c, g}, 0.5, 1.8, 1.0, 1.0);
+        };
+        const QRect topArea(0, 0, kSize, 30);
+        const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        struct Leg {
+            const char *name;
+            QImage keyed, plain;
+            QRect area;
+            QPoint expect;
+        };
+        const QVector<Leg> legs = {
+            {"(a)", renderNested({seqOf(childId, {{childKeyed}})}, 0.5, 1.6, 1.0, 0.8),
+             renderNested({seqOf(childId, {{childPlain}})}, 0.5, 1.6, 1.0, 0.8), topArea,
+             QPoint(13, 10)},
+            {"(b)", renderNested({seqOf(childId, {{childKeyed}})}, 0.5, 1.6, 2.0, 0.8),
+             renderNested({seqOf(childId, {{childPlain}})}, 0.5, 1.6, 2.0, 0.8), topArea,
+             QPoint(16, 10)},
+            {"(c)", renderNested({seqOf(childId, {{v1Left}, {c2Keyed}})}, 0.5, 1.6, 1.0, 0.8),
+             renderNested({seqOf(childId, {{v1Left}, {c2Plain}})}, 0.5, 1.6, 1.0, 0.8), v2Area,
+             QPoint(43, 40)},
+            {"(d)", twoLevel(childKeyed), twoLevel(childPlain), topArea, QPoint(13, 10)},
+        };
+        // S0-1 (a): sha() of each key-less fixture on the base exe 0335b53.
+        const char *const baseKeylessSha[] = {"1b7195d757a492af", "1b7195d757a492af",
+                                              "fd326ad3deb46e6b", "1b7195d757a492af"};
+        bool movedOk = true;
+        bool controlOk = true;
+        for (int i = 0; i < legs.size(); ++i) {
+            const Leg &leg = legs[i];
+            const Box kBox = whiteBox(leg.keyed, leg.area);
+            const Box pBox = whiteBox(leg.plain, leg.area);
+            const QPoint plainAt = leg.area == v2Area ? QPoint(40, 40) : QPoint(10, 10);
+            const bool moved = kBox.n == 4 && kBox.rect == QRect(leg.expect, QSize(2, 2));
+            const bool still = pBox.n == 4 && pBox.rect == QRect(plainAt, QSize(2, 2));
+            const bool base = sha(leg.plain) == baseKeylessSha[i];
+            // (c): C's key-less V1 stays where it was.
+            const bool v1Still = i != 2
+                || whiteBox(leg.keyed, QRect(0, 0, 40, 30)).rect == QRect(10, 10, 2, 2);
+            movedOk = movedOk && moved && v1Still;
+            controlOk = controlOk && still && base;
+            d << ' ' << leg.name << " keyed " << boxText(kBox) << " expect (" << leg.expect.x()
+              << ',' << leg.expect.y() << ") v1Still=" << v1Still << " key-less "
+              << boxText(pBox) << " sha=" << sha(leg.plain) << " base=" << baseKeylessSha[i]
+              << " moved=" << moved << " (e) control=" << (still && base);
+        }
+        d << " movedOk=" << movedOk << " controlOk=" << controlOk;
+        tally.gate(13, movedOk && controlOk, d.str());
+    }
+
+    // US-2300 G14: keys on an upper track, wherever renderFrameAt or the special
+    // composite draws the frame. G5 (a)'s layout: V1 at videoDx -0.375 (source dot
+    // (34,10) -> (10,10), covering x 0..39), V2's dot (40,40) beside it. (a) export
+    // with V2 dx +4 (V1 key-less): V2 +4, V1 still; (b) V1 +8 and V2 +4: each its own;
+    // (c) the special composite (V1 brushed) equals renderFrameAt (maxDiff 0) on (a)
+    // and (b) and shows V2 +4; (d) the brush record follows the bound brush clip's
+    // keyed layer (V1 +8, V2 +4 analysed at 128x128, V3 key-less): V2 bound -> +4 and
+    // 128x128, V1 / V3 / none bound -> V1's +8; (e) an Echo on V2 with keys (0 s, 0)
+    // / (1 s, +8) at 1 s: each sample at its own source time (G12's leg on V2);
+    // (f) the preview the timeline renderer serves (S1-S3 of the design's F4) with a
+    // shape clip active: (f1) the paused SSOT display and its refresh after a key
+    // edit, (f2) a playback tick, each equal to renderFrameAt with no GL keys;
+    // (f3) pin of the US-2300 guard: VideoPlayer's own warp leaves an active keyed
+    // V2 composed with another layer unmoved. HEAD: (a)(b)(c) V2 unmoved, (d) V2
+    // bound gives V1's +8, (e) V2's trail unmoved, (f1)(f2) V2 unmoved.
+    {
+        std::ostringstream d;
+        ClipInfo v1Left = seqClip(seqB);
+        v1Left.videoDx = -0.375;
+        const ClipInfo v2Plain = seqClip(seqC);
+        const QRect v1Area(0, 0, 40, 20);
+        const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        const auto dotAt = [](const Box &b, int x, int y) {
+            return b.n == 4 && b.rect == QRect(x, y, 2, 2);
+        };
+        const auto maxDiff = [](const QImage &a, const QImage &b) {
+            if (a.isNull() || b.isNull() || a.size() != b.size())
+                return 255;
+            const QImage x = a.convertToFormat(QImage::Format_RGBA8888);
+            const QImage y = b.convertToFormat(QImage::Format_RGBA8888);
+            int worst = 0;
+            for (int row = 0; row < x.height(); ++row)
+                for (int col = 0; col < x.width() * 4; ++col)
+                    worst = qMax(worst, std::abs(int(x.constScanLine(row)[col])
+                                                 - int(y.constScanLine(row)[col])));
+            return worst;
+        };
+        const ClipInfo v1Keyed8 = withKeys(v1Left, {key(0.0, 8.0)});
+        const ClipInfo v2Keyed4 = withKeys(v2Plain, {key(0.0, 4.0)});
+
+        // (a) / (b) export.
+        const QImage aPlain = exportAt({{v1Left}, {v2Plain}}, t);
+        const QImage aKeyed = exportAt({{v1Left}, {v2Keyed4}}, t);
+        const QImage bKeyed = exportAt({{v1Keyed8}, {v2Keyed4}}, t);
+        const bool aOk = dotAt(whiteBox(aPlain, v2Area), 40, 40)
+            && dotAt(whiteBox(aPlain, v1Area), 10, 10) && dotAt(whiteBox(aKeyed, v2Area), 44, 40)
+            && dotAt(whiteBox(aKeyed, v1Area), 10, 10);
+        const bool bOk = dotAt(whiteBox(bKeyed, v1Area), 18, 10)
+            && dotAt(whiteBox(bKeyed, v2Area), 44, 40);
+        d << "(a) export V2 " << boxText(whiteBox(aKeyed, v2Area)) << " V1 "
+          << boxText(whiteBox(aKeyed, v1Area)) << " key-less V2 "
+          << boxText(whiteBox(aPlain, v2Area)) << " ok=" << aOk << " (b) V1 "
+          << boxText(whiteBox(bKeyed, v1Area)) << " V2 " << boxText(whiteBox(bKeyed, v2Area))
+          << " ok=" << bOk;
+
+        // (c) / (d) on MainWindow.
+        bool cOk = false;
+        bool dOk = false;
+        {
+            MainWindow window;
+            window.hide();
+            Timeline *mainTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            if (mainTimeline) {
+                emit mainTimeline->projectOutputConfigRestored(kSize, kSize, false);
+                const auto load = [&](const QVector<QVector<ClipInfo>> &tracks) {
+                    mainTimeline->setProjectOutputConfig(kSize, kSize, false, kFps);
+                    mainTimeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0,
+                                                     -1.0, -1.0, 100);
+                    mainTimeline->refreshPlaybackSequence();
+                };
+                const ClipInfo v1Brushed = withBrush(v1Left, QPointF(54.0, 30.0));
+                const ClipInfo v1Brushed8 = withKeys(v1Brushed, {key(0.0, 8.0)});
+                bool cAll = true;
+                const auto cLeg = [&](const char *name, const ClipInfo &v1, const ClipInfo &v2,
+                                      QPoint v1Dot, QPoint v2Dot) {
+                    load({{v1}, {v2}});
+                    const bool wants = tlrender::timelineBrushWantsSpecialPath(mainTimeline, t);
+                    const QImage composite = window.buildSpecialClipComposite(t);
+                    const QImage exported =
+                        tlrender::renderFrameAt(mainTimeline, us(t), QSize(kSize, kSize));
+                    const int diff = maxDiff(composite, exported);
+                    const Box cV1 = whiteBox(composite, v1Area);
+                    const Box cV2 = whiteBox(composite, v2Area);
+                    const bool ok = wants && diff == 0 && dotAt(cV1, v1Dot.x(), v1Dot.y())
+                        && dotAt(cV2, v2Dot.x(), v2Dot.y());
+                    d << " (c" << name << ") wants=" << wants << " maxDiff=" << diff << " V1 "
+                      << boxText(cV1) << " V2 " << boxText(cV2) << " ok=" << ok;
+                    return ok;
+                };
+                // The key-less control leg pins the parity itself.
+                cAll = cLeg("0", v1Brushed, v2Plain, QPoint(10, 10), QPoint(40, 40)) && cAll;
+                cAll = cLeg("a", v1Brushed, v2Keyed4, QPoint(10, 10), QPoint(44, 40)) && cAll;
+                cAll = cLeg("b", v1Brushed8, v2Keyed4, QPoint(18, 10), QPoint(44, 40)) && cAll;
+                cOk = cAll;
+
+                // (d) every layer brushed, so each can be bound.
+                ClipInfo dV2 = withBrush(v2Keyed4, QPointF(50.0, 50.0));
+                dV2.stabilizerSourceSize = QSize(128, 128);
+                const ClipInfo dV3 = withBrush(seqClip(seqA), QPointF(20.0, 50.0));
+                load({{v1Brushed8}, {dV2}, {dV3}});
+                bool dAll = true;
+                const auto dLeg = [&](const char *name, int bindTrack, double dx, QSize size,
+                                      const QString &id) {
+                    window.syncBrushAnimationPreviewForClip(bindTrack, bindTrack < 0 ? -1 : 0);
+                    const QString bound = window.brushPreviewClipIdForTest();
+                    stabwarp::StabSample stab;
+                    QSize stabSize;
+                    QString stabId;
+                    const QImage composite =
+                        window.buildSpecialClipComposite(t, nullptr, &stab, &stabSize, &stabId);
+                    const bool boundOk = bindTrack < 0
+                        ? bound.isEmpty() : bound == QStringLiteral("%1:0").arg(bindTrack);
+                    const bool ok = boundOk && !composite.isNull() && std::abs(stab.dx - dx) < 1e-9
+                        && stabSize == size && stabId == id;
+                    d << " (d" << name << ") bound=" << bound.toStdString() << " record dx="
+                      << stab.dx << " size=" << stabSize.width() << 'x' << stabSize.height()
+                      << " id=" << stabId.toStdString() << " expect dx=" << dx << ' '
+                      << size.width() << 'x' << size.height() << ' ' << id.toStdString()
+                      << " ok=" << ok;
+                    return ok;
+                };
+                dAll = dLeg("V2", 1, 4.0, QSize(128, 128), QStringLiteral("1:0")) && dAll;
+                dAll = dLeg("V1", 0, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dAll = dLeg("V3", 2, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dAll = dLeg("none", -1, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dOk = dAll;
+            } else {
+                d << " (c)(d) mainTimeline missing";
+            }
+        }
+
+        // (e) Echo on V2, keys (0 s, 0) / (1 s, +8), at 1 s: the dot at x 48 and its
+        // samples 0.25 / 0.5 s back at x 46 / 44 (a box (44,40)-(49,41)); warping the
+        // finished echo once would put the whole trail at x 48.
+        bool eOk = false;
+        {
+            ClipInfo echoed = v2Plain;
+            echoed.effects = {VideoEffect::createEcho(0.25, 2, 0.5, 2)};
+            const QImage ePlain = exportAt({{v1Left}, {echoed}}, 1.0);
+            const QImage eKeyed =
+                exportAt({{v1Left}, {withKeys(echoed, {key(0.0, 0.0), key(1.0, 8.0)})}}, 1.0);
+            const Box epBox = nonBlackBox(ePlain, v2Area);
+            const Box ekBox = nonBlackBox(eKeyed, v2Area);
+            // Three separate 2x2 samples (12 pixels), one in each of x 44 / 46 / 48.
+            const int s44 = nonBlackBox(eKeyed, QRect(44, 40, 2, 2)).n;
+            const int s46 = nonBlackBox(eKeyed, QRect(46, 40, 2, 2)).n;
+            const int s48 = nonBlackBox(eKeyed, QRect(48, 40, 2, 2)).n;
+            eOk = epBox.rect == QRect(40, 40, 2, 2) && epBox.n == 4
+                && ekBox.rect == QRect(44, 40, 6, 2) && ekBox.n == 12 && s44 > 0 && s46 > 0
+                && s48 > 0 && dotAt(whiteBox(eKeyed, v1Area), 10, 10);
+            d << " (e) echo V2 keyed " << boxText(ekBox) << " samples x44/46/48 n=" << s44
+              << '/' << s46 << '/' << s48 << " key-less " << boxText(epBox) << " ok=" << eOk;
+        }
+
+        // (f) V1 key-less (or +8), V2 a constant +4 (both keys), a shape clip on V3:
+        // a static picture, so every frame is renderFrameAt(t)'s.
+        Shape square;
+        square.type = ShapeType::Rectangle;
+        square.properties.size = QSizeF(8.0, 8.0);
+        square.position = QPointF(56.0, 8.0);
+        square.fill.color = QColor(200, 30, 30, 255);
+        square.fill.opacity = 1.0;
+        square.fill.enabled = true;
+        square.fill.gradient = false;
+        square.stroke.enabled = false;
+        ClipInfo shapeClip;
+        shapeClip.displayName = QStringLiteral("shape");
+        shapeClip.duration = shapeClip.outPoint = kDuration;
+        shapeClip.shapes = {square};
+        const ClipInfo v2Const4 = withKeys(v2Plain, {key(0.0, 4.0), key(kDuration, 4.0)});
+        bool fRan = false;
+        bool f1Ok = false;
+        bool f2Ok = false;
+        {
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            if (!(view && player.isGLAccelerated())) {
+                d << " (f1)(f2) not run: GL preview unavailable (environment)";
+            } else {
+                fRan = true;
+                player.setCanvasSize(kSize, kSize);
+                player.setProjectOutputSize(QSize(kSize, kSize));
+                int shownCount = 0;
+                QImage shown;
+                QObject::connect(&player, &VideoPlayer::frameComposited,
+                                 [&](const QImage &image) {
+                                     ++shownCount;
+                                     shown = image;
+                                 });
+                bool all = true;
+                // (f1) on a timeline with V1 `v1`.
+                const auto pausedLeg = [&](const char *name, const ClipInfo &v1, QPoint v1Dot,
+                                           bool refreshLeg) {
+                    auto timeline = makeTimeline({{v1}, {v2Const4}, {shapeClip}});
+                    view->setTimeline(timeline.get());
+                    player.m_sequence = timeline->computePlaybackSequence();
+                    player.m_activeEntry = -1;
+                    for (int i = 0; i < player.m_sequence.size(); ++i)
+                        if (player.m_sequence[i].sourceTrack == 0)
+                            player.m_activeEntry = i;
+                    player.m_timelinePositionUs = us(t);
+                    const int before = shownCount;
+                    const bool served = player.displayNestedSequenceFrameAt(timeline.get(), us(t));
+                    const QImage expected =
+                        tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+                    const int diff = maxDiff(shown, expected);
+                    const bool glOff = !view->stabEnabledForTest();
+                    bool ok = served && shownCount == before + 1 && diff <= 1
+                        && dotAt(whiteBox(shown, v2Area), 44, 40)
+                        && dotAt(whiteBox(shown, v1Area), v1Dot.x(), v1Dot.y()) && glOff
+                        && player.m_activeEntry >= 0;
+                    d << " (f1" << name << ") served=" << served << " shown+="
+                      << (shownCount - before) << " maxDiff=" << diff << " V1 "
+                      << boxText(whiteBox(shown, v1Area)) << " V2 "
+                      << boxText(whiteBox(shown, v2Area)) << " glKeys="
+                      << view->stabEnabledForTest() << " ok=" << ok;
+                    if (refreshLeg) {
+                        // V2's keys +4 -> +6 on the timeline (no setSequence), then refresh.
+                        QVector<ClipInfo> clips = timeline->videoTracks().at(1)->clips();
+                        clips[0].stabilizerKeyframes = {key(0.0, 6.0), key(kDuration, 6.0)};
+                        timeline->videoTracks().at(1)->setClips(clips);
+                        const int beforeRefresh = shownCount;
+                        player.refreshDisplayedFrame();
+                        const QImage expected6 =
+                            tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+                        const int diff6 = maxDiff(shown, expected6);
+                        const bool refreshOk = shownCount == beforeRefresh + 1 && diff6 <= 1
+                            && dotAt(whiteBox(expected6, v2Area), 46, 40)
+                            && dotAt(whiteBox(shown, v2Area), 46, 40)
+                            && !view->stabEnabledForTest();
+                        d << " refresh: shown+=" << (shownCount - beforeRefresh)
+                          << " maxDiff=" << diff6 << " V2 " << boxText(whiteBox(shown, v2Area))
+                          << " glKeys=" << view->stabEnabledForTest() << " ok=" << refreshOk;
+                        ok = ok && refreshOk;
+                    }
+                    view->setTimeline(nullptr);
+                    return ok;
+                };
+                all = pausedLeg("", v1Left, QPoint(10, 10), true) && all;
+                all = pausedLeg(" V1+8", v1Keyed8, QPoint(18, 10), false) && all;
+                f1Ok = all;
+            }
+        }
+        if (fRan) {
+            // (f2) a playback tick (shape-clip G5's form).
+            auto timeline = makeTimeline({{v1Left}, {v2Const4}, {shapeClip}});
+            const QImage expected =
+                tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+            VideoPlayer player;
+            player.setCanvasSize(kSize, kSize);
+            player.setProjectOutputSize(QSize(kSize, kSize));
+            player.glPreview()->setTimeline(timeline.get());
+            player.setSequence(timeline->computePlaybackSequence());
+            int ticks = 0;
+            QImage tick;
+            QObject::connect(&player, &VideoPlayer::frameComposited, [&](const QImage &image) {
+                ++ticks;
+                tick = image;
+            });
+            const qint64 before = player.timelinePositionUs();
+            player.play();
+            QElapsedTimer guard;
+            guard.start();
+            // Until a tick after the playhead moved (play() itself may show one frame).
+            while (guard.elapsed() < 2000
+                   && (ticks < 2 || player.timelinePositionUs() <= before))
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            player.pause();
+            const qint64 after = player.timelinePositionUs();
+            const int diff = maxDiff(tick, expected);
+            // GL keys on during playback would warp the tick a second time on screen.
+            const bool stabOn = player.glPreview()->stabEnabledForTest();
+            f2Ok = ticks >= 2 && after > before && diff <= 1
+                && dotAt(whiteBox(tick, v2Area), 44, 40) && dotAt(whiteBox(tick, v1Area), 10, 10)
+                && !stabOn;
+            d << " (f2) ticks=" << ticks << " position " << before << "->" << after
+              << " maxDiff=" << diff << " V2 " << boxText(whiteBox(tick, v2Area)) << " V1 "
+              << boxText(whiteBox(tick, v1Area)) << " enabled=" << stabOn << " ok=" << f2Ok;
+            player.glPreview()->setTimeline(nullptr);
+        }
+
+        // (f3) the keyed V2 as the active entry (V1 empty there; V2 and V3 start
+        // together, so the lower track is active, F15) with a V3 layer present:
+        // VideoPlayer's own warp (warpV1ForCpuComposite) keeps it unmoved while
+        // the US-2300 guard stands; US-2301 rewrites this leg to +4 (US-2301 がこの
+        // 脚を +4 に書き換える). Control: the same entry on V1 is warped +4.
+        bool f3Ok = false;
+        {
+            VideoPlayer player;
+            const auto entry = [&](const QString &file, int track) {
+                PlaybackEntry e;
+                e.filePath = file;
+                e.clipIn = 0.0;
+                e.clipOut = kDuration;
+                e.timelineStart = 0.0;
+                e.timelineEnd = kDuration;
+                e.speed = 1.0;
+                e.sourceTrack = track;
+                e.sourceClipIndex = 0;
+                return e;
+            };
+            QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            black.fill(Qt::black);
+            const auto composeV2 = [&](int track) {
+                PlaybackEntry e2 = entry(seqC, track);
+                e2.stabilizerKeyframes = {key(0.0, 4.0)};
+                const PlaybackEntry e3 = entry(seqA, track + 1);
+                VideoPlayer::DecodedLayer l2;
+                l2.rgb = dotFrame({QPoint(40, 40)})
+                             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                l2.sourceTrack = track;
+                l2.sequenceIdx = 0;
+                VideoPlayer::DecodedLayer l3;
+                l3.rgb = dotFrame({QPoint(10, 10)})
+                             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                l3.sourceTrack = track + 1;
+                l3.sequenceIdx = 1;
+                // V3 paints first (backmost), the active V2 last.
+                return player.composeAndPresentForTest(black, {l3, l2}, {e2, e3}, 0, us(t));
+            };
+            const Box upper = whiteBox(composeV2(1), v2Area);
+            const Box lower = whiteBox(composeV2(0), v2Area);
+            f3Ok = dotAt(upper, 40, 40) && dotAt(lower, 44, 40);
+            d << " (f3) pin: active keyed V2 + V3 layer V2 " << boxText(upper)
+              << " (US-2301 rewrites this leg to +4); control on V1 " << boxText(lower)
+              << " ok=" << f3Ok;
+        }
+        const bool cpuOk = aOk && bOk && cOk && dOk && eOk && f3Ok;
+        if (!fRan && cpuOk)
+            tally.skip(14, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(14, cpuOk && f1Ok && f2Ok, d.str());
+
+        // US-2300 diagnostic (not part of any gate): F4's S4-S6 on (f)'s fixture
+        // (V1 key-less, V2 constant +4, shape on V3), printed for the result log.
+        {
+            auto tl = makeTimeline({{v1Left}, {v2Const4}, {shapeClip}});
+            const QImage ref = tlrender::renderFrameAt(tl.get(), us(t), QSize(kSize, kSize));
+            std::cerr << "US-2300 probe renderFrameAt(t) V2 " << boxText(whiteBox(ref, v2Area))
+                      << " V1 " << boxText(whiteBox(ref, v1Area)) << '\n';
+            PlaybackEntry e1;
+            e1.filePath = seqB;
+            e1.clipIn = 0.0;
+            e1.clipOut = kDuration;
+            e1.timelineStart = 0.0;
+            e1.timelineEnd = kDuration;
+            e1.speed = 1.0;
+            e1.sourceTrack = 0;
+            e1.sourceClipIndex = 0;
+            PlaybackEntry e2 = e1;
+            e2.filePath = seqC;
+            e2.sourceTrack = 1;
+            e2.stabilizerKeyframes = v2Const4.stabilizerKeyframes;
+            QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            black.fill(Qt::black);
+            VideoPlayer::DecodedLayer l1;
+            l1.rgb = dotFrame({QPoint(34, 10)}).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            l1.videoDx = -0.375;
+            l1.sourceTrack = 0;
+            l1.sequenceIdx = 0;
+            VideoPlayer::DecodedLayer l2;
+            l2.rgb = dotFrame({QPoint(40, 40)}).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            l2.sourceTrack = 1;
+            l2.sequenceIdx = 1;
+            const auto fields = [&](const QImage &image) {
+                return "V2 " + boxText(whiteBox(image, v2Area)) + " V1 "
+                    + boxText(whiteBox(image, v1Area));
+            };
+            {   // S4: the still-compare display as the GL view receives it (bypass path).
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated()) {
+                    player.setCanvasSize(kSize, kSize);
+                    view->setTimeline(tl.get());
+                    // Vertical wipe at 0.25: rows 48-63 show the still, rows 0-47 (both
+                    // dots and the shape) the live frame.
+                    QImage still(kSize, kSize, QImage::Format_RGB32);
+                    still.fill(QColor(60, 60, 60));
+                    stillcompare::Config on;
+                    on.enabled = true;
+                    on.mode = stillcompare::Mode::WipeVertical;
+                    on.position = 0.25;
+                    on.still = still;
+                    player.setStillCompare(on);
+                    player.composeAndPresentForTest(black, {l2, l1}, {e1, e2}, 0, us(t));
+                    const bool drawn = selftest::glContextUsable(view);
+                    if (drawn)
+                        view->grabFramebuffer();
+                    const QImage upload = view->uploadFrameForTest();
+                    const QImage expect = stillcompare::apply(ref, still, on.mode, on.position);
+                    const QRect live(0, 0, kSize, 48);
+                    std::cerr << "US-2300 probe S4 still-compare GL upload drawn=" << drawn
+                              << " viewTimeline=" << (view->timeline() != nullptr)
+                              << " upload vs renderFrameAt (live rows 0-47) maxDiff="
+                              << maxDiff(upload.copy(live), ref.copy(live))
+                              << " upload vs apply(renderFrameAt, still) maxDiff="
+                              << maxDiff(upload, expect) << ' ' << fields(upload)
+                              << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    player.setStillCompare(stillcompare::Config{});
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S4 not run (GL preview unavailable)\n";
+                }
+            }
+            {   // S5: the project-camera (trueProjection) frame uploaded to the GL view.
+                Camera3DState state;
+                state.trueProjection = true;
+                const Camera3D camera{state};
+                tl->setProjectCamera(camera);
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated() && selftest::glContextUsable(view)) {
+                    player.setProjectOutputSize(QSize(kSize, kSize));
+                    view->setTimeline(tl.get());
+                    view->setProjectCamera(camera);
+                    view->grabFramebuffer();
+                    const QImage upload = view->uploadFrameForTest();
+                    const qint64 at = player.timelinePositionUs();
+                    const QImage ref5 = tlrender::renderFrameAt(tl.get(), at, QSize(kSize, kSize));
+                    std::cerr << "US-2300 probe S5 project-camera upload t=" << at << " size="
+                              << upload.width() << 'x' << upload.height()
+                              << " maxDiff=" << maxDiff(upload, ref5) << ' ' << fields(upload)
+                              << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S5 not run (GL preview unavailable)\n";
+                }
+                tl->setProjectCamera(Camera3D{Camera3DState{}});
+            }
+            {   // S6: the onion-skin ghost at t-1f, and the upload carrying it.
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated()) {
+                    player.setCanvasSize(kSize, kSize);
+                    view->setTimeline(tl.get());
+                    onionskin::Config cfg;
+                    cfg.enabled = true;
+                    cfg.framesBefore = 1;
+                    cfg.framesAfter = 0;
+                    player.setOnionSkinConfig(cfg);
+                    player.composeAndPresentForTest(black, {l2, l1}, {e1, e2}, 0, us(t));
+                    const QImage upload = view->uploadFrameForTest();
+                    const qint64 frameUs =
+                        player.m_frameDurationUs > 0 ? player.m_frameDurationUs : AV_TIME_BASE / 30;
+                    const QImage ghost =
+                        tlrender::renderFrameAt(tl.get(), us(t) - frameUs, QSize(kSize, kSize));
+                    const QImage expect =
+                        onionskin::compose(player.m_currentFrameImage, {ghost}, {}, cfg);
+                    std::cerr << "US-2300 probe S6 onion ghost(t-1f) " << fields(ghost)
+                              << " ghost vs renderFrameAt(t) maxDiff=" << maxDiff(ghost, ref)
+                              << " upload vs compose(current, ghost) maxDiff="
+                              << maxDiff(upload, expect) << " upload (blended) nonBlack V2 "
+                              << boxText(nonBlackBox(upload, v2Area)) << " V1 "
+                              << boxText(nonBlackBox(upload, v1Area)) << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    player.setOnionSkinConfig(onionskin::Config{});
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S6 not run (GL preview unavailable)\n";
+                }
+            }
         }
     }
 
