@@ -194,7 +194,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 14; ++g)
+        for (int g = 1; g <= 15; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -1185,6 +1185,168 @@ int runProjectPersistSelftest()
                            + " (b)=" + b(bOk) + " (c)=" + b(cOk) + " storedCurve=" + b(storedCurve)
                            + " legacyKept=" + b(legacyKept) + " (d)=" + b(dOk));
         }
+    }
+
+    // ---- G15 (US-2306): the file and string entry points share one writer and one reader ----
+    // The rich file (nested sequences, a clip curve, markers, a layer), the same file with the curve
+    // in the legacy table, and the same file at version 1 are each read by load and by
+    // fromJsonString; a save must equal the Indented rendering of toJsonString; errors must match.
+    {
+        const QString cId = QStringLiteral("seq-g15c");
+        timeremap::TimeRemapCurve fast;
+        fast.sourceFps = 10.0;
+        fast.addKey(0.0, 0.0);
+        fast.addKey(1.0, 2.0);
+        ClipInfo cClip;
+        cClip.filePath = QStringLiteral("/selftests/project-persist-g15.mp4");
+        cClip.displayName = QStringLiteral("g15-c");
+        cClip.duration = cClip.outPoint = 2.0;
+        cClip.timeRemapCurve = fast;
+        TimelineSequence child;
+        child.id = cId;
+        child.name = QStringLiteral("C");
+        child.videoTracks = {{cClip}};
+        child.audioTracks = {{}};
+        ClipInfo ref;
+        ref.displayName = QStringLiteral("g15-ref");
+        ref.duration = ref.outPoint = child.duration();
+        ref.sequenceRefId = cId;
+        ref.filePath = timeline_nesting::sequenceClipFilePath(cId);
+        TimelineSequence parent;
+        parent.id = QStringLiteral("seq-g15p");
+        parent.name = QStringLiteral("P");
+        parent.videoTracks = {{ref}};
+        parent.audioTracks = {{}};
+
+        const auto readAll = [](const QString &path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+        };
+        const auto writeAll = [](const QString &path, const QByteArray &bytes) {
+            QFile file(path);
+            const bool written = file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(bytes) == bytes.size();
+            file.close();
+            return written;
+        };
+        const QString richPath = tmp("g15-rich.veditor");
+        bool saved = false;
+        {
+            MainWindow writer;
+            writer.m_timeline->setSequences({parent, child}, parent.id);
+            writer.m_timeline->setMarkers(markers);
+            writer.m_timeline->setAdjustmentLayers({layer});
+            QString err;
+            saved = writer.saveProjectToPath(richPath, &err);
+        }
+        const QJsonObject richRoot = readJson(richPath);
+        // The rich file with C's clip curve moved to C's legacy table (or dropped).
+        const auto withLegacy = [&](const QJsonValue &legacy) {
+            QJsonObject root = richRoot;
+            QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+            for (int i = 0; i < sequences.size(); ++i) {
+                QJsonObject sequence = sequences.at(i).toObject();
+                if (sequence.value(QStringLiteral("id")).toString() != cId)
+                    continue;
+                QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+                QJsonArray clips = tracks.at(0).toArray();
+                QJsonObject clip = clips.at(0).toObject();
+                clip.remove(QStringLiteral("timeRemapCurve"));
+                clips.replace(0, clip);
+                tracks.replace(0, clips);
+                sequence[QStringLiteral("videoTracks")] = tracks;
+                sequence.remove(QStringLiteral("timeRemapClipEntries"));
+                if (!legacy.isNull())
+                    sequence[QStringLiteral("timeRemapClipEntries")] = QJsonArray{QJsonObject{
+                        {QStringLiteral("clipId"), QStringLiteral("0:0")}, {QStringLiteral("curve"), legacy}}};
+                sequences.replace(i, sequence);
+            }
+            root[QStringLiteral("sequences")] = sequences;
+            return root;
+        };
+        QJsonObject v1Root = richRoot;
+        v1Root[QStringLiteral("version")] = 1;
+        QJsonObject v99Root = richRoot;
+        v99Root[QStringLiteral("version")] = 99;
+        const QString legacyPath = tmp("g15-legacy.veditor");
+        const QString plainPath = tmp("g15-plain.veditor");
+        const QString v1Path = tmp("g15-v1.veditor");
+        const QString v99Path = tmp("g15-v99.veditor");
+        const QString cutPath = tmp("g15-cut.veditor");
+        const bool written = saved && !richRoot.isEmpty()
+            && writeAll(legacyPath, QJsonDocument(withLegacy(fast.toJson())).toJson())
+            && writeAll(plainPath, QJsonDocument(withLegacy(QJsonValue())).toJson())
+            && writeAll(v1Path, QJsonDocument(v1Root).toJson())
+            && writeAll(v99Path, QJsonDocument(v99Root).toJson())
+            && writeAll(cutPath, QByteArrayLiteral("{\"a\":"));
+
+        // (a) a save is the Indented rendering of what toJsonString writes compact.
+        ProjectData richData;
+        const bool richLoaded = written && ProjectFile::load(richPath, richData);
+        const QString resavedPath = tmp("g15-resaved.veditor");
+        const bool resaved = richLoaded && ProjectFile::save(resavedPath, richData);
+        const QByteArray resavedBytes = readAll(resavedPath);
+        const QString compact = ProjectFile::toJsonString(richData);
+        const QJsonDocument compactDoc = QJsonDocument::fromJson(compact.toUtf8());
+        const bool aOk = resaved && !resavedBytes.isEmpty() && !compactDoc.isNull()
+            && resavedBytes == compactDoc.toJson(QJsonDocument::Indented)
+            && resavedBytes != compactDoc.toJson(QJsonDocument::Compact)
+            && compact.toUtf8() == compactDoc.toJson(QJsonDocument::Compact)
+            && richData.markers.size() == 2 && richData.adjustmentLayers.size() == 1
+            && resavedBytes.contains("\"sequences\"");
+
+        // (b) load(file) and fromJsonString(text of the file) read the same data.
+        const auto parity = [&](const QString &path, QString *fileOut, bool *okOut) {
+            ProjectData viaFile, viaText;
+            const bool fileOk = ProjectFile::load(path, viaFile);
+            const bool textOk = ProjectFile::fromJsonString(QString::fromUtf8(readAll(path)), viaText);
+            const QString fromFile = ProjectFile::toJsonString(viaFile);
+            *fileOut = fromFile;
+            *okOut = fileOk && textOk && !fromFile.isEmpty() && fromFile == ProjectFile::toJsonString(viaText);
+            return *okOut;
+        };
+        QString richOut, legacyOut, plainOut, v1Out;
+        bool richPar = false, legacyPar = false, plainPar = false, v1Par = false;
+        parity(richPath, &richOut, &richPar);
+        parity(legacyPath, &legacyOut, &legacyPar);
+        parity(plainPath, &plainOut, &plainPar);
+        parity(v1Path, &v1Out, &v1Par);
+        const bool legacyDiffers = legacyOut != plainOut;
+        const bool bOk = richPar && legacyPar && plainPar && v1Par && legacyDiffers && readJson(v1Path).value(QStringLiteral("version")).toInt() == 1
+            && QJsonDocument::fromJson(v1Out.toUtf8()).object().value(QStringLiteral("version")).toInt() == 2;
+
+        // (c) errors: an unopenable path leaves errorMessage alone; a broken document and a refused version
+        // give the same text on both paths, and the data left behind serialises the same.
+        const auto sentinel = [&]() {
+            ProjectData d;
+            d.config.name = QStringLiteral("g15-sentinel");
+            d.markers = markers;
+            return d;
+        };
+        ProjectData missingData = sentinel();
+        QString missingErr = QStringLiteral("untouched");
+        const bool missingOk = ProjectFile::load(tmp("g15-missing-dir/none.veditor"), missingData, &missingErr);
+        const bool missingKept = !missingOk && missingErr == QLatin1String("untouched")
+            && ProjectFile::toJsonString(missingData) == ProjectFile::toJsonString(sentinel());
+        const auto errorsMatch = [&](const QString &path, std::string &d) {
+            ProjectData viaFile = sentinel(), viaText = sentinel();
+            QString errFile, errText;
+            const bool fileOk = ProjectFile::load(path, viaFile, &errFile);
+            const bool textOk = ProjectFile::fromJsonString(QString::fromUtf8(readAll(path)), viaText, &errText);
+            const QString afterFile = ProjectFile::toJsonString(viaFile);
+            d += " '" + errFile.toStdString() + "'";
+            return !fileOk && !textOk && !errFile.isEmpty() && errFile == errText && !afterFile.isEmpty()
+                && afterFile == ProjectFile::toJsonString(viaText);
+        };
+        std::string cDetail;
+        const bool cutSame = errorsMatch(cutPath, cDetail);
+        const bool v99Same = errorsMatch(v99Path, cDetail);
+        const bool cOk = missingKept && cutSame && v99Same && cDetail.find("byte 5:") != std::string::npos;
+
+        tally.gate(15, aOk && bOk && cOk,
+                   "written=" + b(written) + " (a)=" + b(aOk) + " bytes=" + std::to_string(resavedBytes.size())
+                       + " (b)=" + b(bOk) + " rich/legacy/plain/v1=" + b(richPar) + b(legacyPar) + b(plainPar) + b(v1Par)
+                       + " legacyDiffers=" + b(legacyDiffers) + " (c)=" + b(cOk) + " missingKept=" + b(missingKept)
+                       + " cut=" + b(cutSame) + " v99=" + b(v99Same) + " errors:" + cDetail);
     }
 
     tally.gate(7, g7, g7Detail);

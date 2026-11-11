@@ -773,7 +773,7 @@ void ProjectFile::readSequenceSidecarsFromRoot(const QJsonObject &root, ProjectD
     }
 }
 
-bool ProjectFile::save(const QString &filePath, const ProjectData &data)
+QJsonDocument ProjectFile::buildProjectDocument(const ProjectData &data)
 {
     const SequenceStoreExtraction sequenceStore =
         extractSequenceStoreEntries(data.clipParentEntries);
@@ -1059,7 +1059,12 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
     root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
 
-    QJsonDocument doc(root);
+    return QJsonDocument(root);
+}
+
+bool ProjectFile::save(const QString &filePath, const ProjectData &data)
+{
+    const QJsonDocument doc = buildProjectDocument(data);
     // QSaveFile writes to a temp file and atomically renames on commit, so a
     // crash or short write mid-save never truncates the previous project.
     QSaveFile file(filePath);
@@ -1342,873 +1347,314 @@ bool ProjectFile::parseProjectJson(const QByteArray &json, QJsonDocument &doc, Q
     return true;
 }
 
+bool ProjectFile::readProjectBytes(const QByteArray &json, ProjectData &data, QString *errorMessage)
+{
+    QJsonDocument doc;
+    if (!parseProjectJson(json, doc, errorMessage)) return false;
+
+    QJsonObject root = doc.object();
+    int version = 1;
+    if (!readProjectVersion(root, version, errorMessage)) return false;
+
+    data.config = configFromJson(root["config"].toObject());
+    data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
+    data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
+    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
+    data.generatedCaptionOverlays = TextManager::fromJson(
+        root.value("generatedCaptionOverlays").toArray());
+    migrateGeneratedCaptionsToProjectLevel(data);
+
+    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
+    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
+    migrateClipOffsetsToNormalized(data, version);
+
+    data.playheadPos = root["playheadPos"].toDouble();
+    data.markIn = root["markIn"].toDouble(-1.0);
+    data.markOut = root["markOut"].toDouble(-1.0);
+    data.zoomLevel = root["zoomLevel"].toInt(10);
+    data.storylineMode = root.value("storylineMode").toBool(false);
+
+    // Audio mixer (tolerate missing keys)
+    data.trackEqStates.clear();
+    // Both project readers restore de-esser settings through the shared Chain codec.
+    data.trackFx.clear();
+    data.trackMix.clear();
+    data.masterFx = trackfx::Chain{};
+    if (root.contains("audioMixer")) {
+        QJsonObject am = root["audioMixer"].toObject();
+        for (const auto &value : am["trackFx"].toArray()) {
+            const QJsonObject object = value.toObject();
+            const int track = object["track"].toInt(-1);
+            if (track < 0) continue;
+            const auto chain = trackfx::Chain::fromJson(object);
+            if (!chain.isDefault()) data.trackFx.insert(track, chain);
+        }
+        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
+        for (const auto &value : am["trackMix"].toArray()) {
+            const QJsonObject object = value.toObject();
+            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
+        }
+        if (am.contains("trackEq")) {
+            for (const auto &v : am["trackEq"].toArray())
+                data.trackEqStates.append(trackEqFromJson(v.toObject()));
+        }
+        if (am.contains("compressor"))
+            data.masterCompressor = compressorFromJson(am["compressor"].toObject());
+        if (am.contains("autoDuck"))
+            data.autoDuck = autoDuckFromJson(am["autoDuck"].toObject());
+    }
+
+    // UI (tolerate missing keys)
+    if (root.contains("ui")) {
+        QJsonObject ui = root["ui"].toObject();
+        if (ui.contains("audioMetersDockVisible"))
+            data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
+    }
+
+    // US-FEAT-A: overlay persistence — backward compat: missing key = empty list
+    data.overlays.clear();
+    if (root.contains("overlays")) {
+        for (const auto &v : root["overlays"].toArray())
+            data.overlays.append(overlayFromJson(v.toObject()));
+    }
+
+    // US-2000: timeline markers and adjustment layers — missing key = empty
+    data.markers = projectFileMarkersFromJson(root.value("markers").toArray());
+    data.adjustmentLayers = projectFileAdjustmentLayersFromJson(root.value("adjustmentLayers").toArray());
+
+    // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
+    data.planarTracks.clear();
+    if (root.contains("planarTracks")) {
+        for (const auto &v : root["planarTracks"].toArray())
+            data.planarTracks.append(planarTrackFromJson(v.toObject()));
+    }
+
+    // US-BRUSH-5 / US-1706: the legacy root section "brushAnimations" moves onto the
+    // clips in migrateLegacyClipSidecars.
+
+    // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
+    data.pathTexts.clear();
+    if (root.contains("pathTexts"))
+        for (const auto &v : root["pathTexts"].toArray())
+            data.pathTexts.append(pathTextFromJson(v.toObject()));
+
+    data.text3DLayers.clear();
+    if (root.contains("text3DLayers"))
+        for (const auto &v : root["text3DLayers"].toArray())
+            data.text3DLayers.append(text3DLayerFromJson(v.toObject()));
+
+    data.textMaskReveals.clear();
+    if (root.contains("textMaskReveals"))
+        for (const auto &v : root["textMaskReveals"].toArray())
+            data.textMaskReveals.append(textMaskRevealFromJson(v.toObject()));
+
+    data.textPathWarps.clear();
+    if (root.contains("textPathWarps"))
+        for (const auto &v : root["textPathWarps"].toArray())
+            data.textPathWarps.append(textPathWarpFromJson(v.toObject()));
+
+    data.variableFontAxes.clear();
+    if (root.contains("variableFontAxes"))
+        for (const auto &v : root["variableFontAxes"].toArray())
+            data.variableFontAxes.append(variableFontAxisFromJson(v.toObject()));
+
+    data.mographTexts.clear();
+    if (root.contains("mographTexts"))
+        for (const auto &v : root["mographTexts"].toArray())
+            data.mographTexts.append(mographTextFromJson(v.toObject()));
+
+    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
+    data.smartReframe = QJsonObject{};
+    if (root.contains("smartReframe"))
+        data.smartReframe = root["smartReframe"].toObject();
+    data.subtitleSegments.clear();
+    if (root.contains("subtitleSegments")) {
+        for (const auto &v : root["subtitleSegments"].toArray()) {
+            QJsonObject obj = v.toObject();
+            SubtitleEntry entry;
+            entry.start = obj["start"].toDouble(0.0);
+            entry.end = obj["end"].toDouble(0.0);
+            entry.text = obj["text"].toString();
+            data.subtitleSegments.append(entry);
+        }
+    }
+    data.subtitleStyle = QJsonObject{};
+    if (root.contains("subtitleStyle"))
+        data.subtitleStyle = root["subtitleStyle"].toObject();
+    data.loudnessSettings = QJsonObject{};
+    if (root.contains("loudnessSettings"))
+        data.loudnessSettings = root["loudnessSettings"].toObject();
+    data.loudnessSettings.insert(
+        QStringLiteral("_timecodeBurnIn"),
+        TimecodeBurnInSettings::fromJson(
+            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
+    data.particleClipEntries.clear();
+    if (root.contains("particleClipEntries")) {
+        for (const auto &v : root["particleClipEntries"].toArray())
+            data.particleClipEntries.append(particleClipEntryFromJson(v.toObject()));
+    }
+    data.clipNodeGraphs.clear();
+    if (root.contains("clipNodeGraphs")) {
+        for (const auto &v : root["clipNodeGraphs"].toArray())
+            data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
+    }
+    data.rotoClipEntries.clear();
+    if (root.contains("rotoClipEntries")) {
+        for (const auto &v : root["rotoClipEntries"].toArray())
+            data.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
+    }
+    data.timeRemapClipEntries.clear();
+    if (root.contains("timeRemapClipEntries")) {
+        for (const auto &v : root["timeRemapClipEntries"].toArray())
+            data.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
+    }
+    data.trackMatteClipEntries.clear();
+    if (root.contains("trackMatteClipEntries")) {
+        for (const auto &v : root["trackMatteClipEntries"].toArray())
+            data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
+    }
+    data.clipParentEntries.clear();
+    if (root.contains("clipParentEntries")) {
+        for (const auto &v : root["clipParentEntries"].toArray())
+            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
+    }
+    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
+    readSequenceSidecarsFromRoot(root, data);
+    migrateLegacyColorCorrectionKeyframes(data);
+    applyLegacyTimeRemapToStores(data);
+    data.vfxState = root.contains("vfxState")
+        ? vfxStateFromJson(root["vfxState"].toObject())
+        : ProjectVfxState{};
+
+    // US-3D-11: motion-graphics sprint persistence. US-1706: the legacy root sections
+    // "text3DClipEntries" / "brushAnimations" move onto the clips here too.
+    migrateLegacyClipSidecars(root, data);
+    data.projectCamera = root.contains("projectCamera")
+        ? root["projectCamera"].toObject()
+        : QJsonObject{};
+    data.projectLights = root.value("projectLights").toArray();
+
+    // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
+    // the DuckingParams{} defaults and duckingEnabled=false.
+    {
+        const DuckingParams defaults;
+        const QJsonObject duck = root.contains("duckingParams")
+                                   ? root["duckingParams"].toObject()
+                                   : QJsonObject{};
+        data.duckingParams.thresholdDb       = duck.value("thresholdDb").toDouble(defaults.thresholdDb);
+        data.duckingParams.targetReductionDb = duck.value("targetReductionDb").toDouble(defaults.targetReductionDb);
+        data.duckingParams.attackMs          = duck.value("attackMs").toDouble(defaults.attackMs);
+        data.duckingParams.releaseMs         = duck.value("releaseMs").toDouble(defaults.releaseMs);
+        data.duckingParams.holdMs            = duck.value("holdMs").toDouble(defaults.holdMs);
+        data.duckingParams.kneeDb            = duck.value("kneeDb").toDouble(defaults.kneeDb);
+        data.duckingEnabled = root.contains("duckingEnabled")
+                                ? root["duckingEnabled"].toBool(false)
+                                : false;
+    }
+
+    // US-EXT-10: HDR + AI processing settings (Sprint 10) — backward compat:
+    // missing keys keep HDRSettings{} / AIProcessingSettings{} defaults so older
+    // .veditor files without these fields still load cleanly.
+    {
+        const HDRSettings hdrDefaults;
+        const QJsonObject hdr = root.contains("hdrSettings")
+                                   ? root["hdrSettings"].toObject()
+                                   : QJsonObject{};
+        data.hdrSettings.mode                      = hdr.value("mode").toString(hdrDefaults.mode);
+        data.hdrSettings.masterDisplayLuminanceMin = hdr.value("masterDisplayLuminanceMin").toDouble(hdrDefaults.masterDisplayLuminanceMin);
+        data.hdrSettings.masterDisplayLuminanceMax = hdr.value("masterDisplayLuminanceMax").toDouble(hdrDefaults.masterDisplayLuminanceMax);
+        data.hdrSettings.maxCll                    = hdr.value("maxCll").toInt(hdrDefaults.maxCll);
+        data.hdrSettings.maxFall                   = hdr.value("maxFall").toInt(hdrDefaults.maxFall);
+        data.hdrSettings.previewToneMap            = hdr.value("previewToneMap").toString(hdrDefaults.previewToneMap);
+
+        const AIProcessingSettings aiDefaults;
+        const QJsonObject ai = root.contains("aiSettings")
+                                   ? root["aiSettings"].toObject()
+                                   : QJsonObject{};
+        data.aiSettings.upscaleEnabled     = ai.value("upscaleEnabled").toBool(aiDefaults.upscaleEnabled);
+        data.aiSettings.upscaleEngine      = ai.value("upscaleEngine").toString(aiDefaults.upscaleEngine);
+        data.aiSettings.upscaleFactor      = ai.value("upscaleFactor").toInt(aiDefaults.upscaleFactor);
+        data.aiSettings.frameInterpEnabled = ai.value("frameInterpEnabled").toBool(aiDefaults.frameInterpEnabled);
+        data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
+        data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
+    }
+
+    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory (backward compat).
+    data.mobileExportLastDeviceId = QString();
+    if (root.contains("mobileExport")) {
+        const QJsonObject mobile = root["mobileExport"].toObject();
+        data.mobileExportLastDeviceId = mobile.value("lastDeviceId").toString();
+    }
+    data.lastImportFolder = QString();
+    if (root.contains("lastImportFolder"))
+        data.lastImportFolder = root["lastImportFolder"].toString();
+
+    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory (backward compat).
+    data.youtubeLastChannelId        = QString();
+    data.youtubeLastPrivacy          = QString();
+    if (root.contains("youtube")) {
+        const QJsonObject youtube = root["youtube"].toObject();
+        data.youtubeLastChannelId   = youtube.value("lastChannelId").toString();
+        data.youtubeLastPrivacy     = youtube.value("lastPrivacy").toString();
+    }
+    data.collabCurrentUserId         = QString();
+    data.collabCurrentDisplayName    = QString();
+    if (root.contains("collab")) {
+        const QJsonObject collab = root["collab"].toObject();
+        data.collabCurrentUserId       = collab.value("currentUserId").toString();
+        data.collabCurrentDisplayName  = collab.value("currentDisplayName").toString();
+    }
+    data.colorMatchLastReferenceClip = QString();
+    if (root.contains("colormatch")) {
+        const QJsonObject colormatch = root["colormatch"].toObject();
+        data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
+    }
+
+    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
+    {
+        const QJsonObject tp = root.value("trackerPresets").toObject();
+        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
+        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
+    }
+
+    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
+    data.mediaPool.fromJson(root.value("mediaPool").toObject());
+
+    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
+    // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
+    data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
+
+    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
+    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
+    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
+
+    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
+    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
+    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
+
+    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
+    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
+    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
+
+    return true;
+}
+
 bool ProjectFile::load(const QString &filePath, ProjectData &data, QString *errorMessage)
 {
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly))
         return false;
-
-    QJsonDocument doc;
-    if (!parseProjectJson(file.readAll(), doc, errorMessage)) return false;
-
-    QJsonObject root = doc.object();
-    int version = 1;
-    if (!readProjectVersion(root, version, errorMessage)) return false;
-
-    data.config = configFromJson(root["config"].toObject());
-    data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
-    data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
-    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
-    data.generatedCaptionOverlays = TextManager::fromJson(
-        root.value("generatedCaptionOverlays").toArray());
-    migrateGeneratedCaptionsToProjectLevel(data);
-
-    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
-    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
-    migrateClipOffsetsToNormalized(data, version);
-
-    data.playheadPos = root["playheadPos"].toDouble();
-    data.markIn = root["markIn"].toDouble(-1.0);
-    data.markOut = root["markOut"].toDouble(-1.0);
-    data.zoomLevel = root["zoomLevel"].toInt(10);
-    data.storylineMode = root.value("storylineMode").toBool(false);
-
-    // Audio mixer (tolerate missing keys)
-    data.trackEqStates.clear();
-    // Both project readers restore de-esser settings through the shared Chain codec.
-    data.trackFx.clear();
-    data.trackMix.clear();
-    data.masterFx = trackfx::Chain{};
-    if (root.contains("audioMixer")) {
-        QJsonObject am = root["audioMixer"].toObject();
-        for (const auto &value : am["trackFx"].toArray()) {
-            const QJsonObject object = value.toObject();
-            const int track = object["track"].toInt(-1);
-            if (track < 0) continue;
-            const auto chain = trackfx::Chain::fromJson(object);
-            if (!chain.isDefault()) data.trackFx.insert(track, chain);
-        }
-        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
-        for (const auto &value : am["trackMix"].toArray()) {
-            const QJsonObject object = value.toObject();
-            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
-        }
-        if (am.contains("trackEq")) {
-            for (const auto &v : am["trackEq"].toArray())
-                data.trackEqStates.append(trackEqFromJson(v.toObject()));
-        }
-        if (am.contains("compressor"))
-            data.masterCompressor = compressorFromJson(am["compressor"].toObject());
-        if (am.contains("autoDuck"))
-            data.autoDuck = autoDuckFromJson(am["autoDuck"].toObject());
-    }
-
-    // UI (tolerate missing keys)
-    if (root.contains("ui")) {
-        QJsonObject ui = root["ui"].toObject();
-        if (ui.contains("audioMetersDockVisible"))
-            data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
-    }
-
-    // US-FEAT-A: overlay persistence — backward compat: missing key = empty list
-    data.overlays.clear();
-    if (root.contains("overlays")) {
-        for (const auto &v : root["overlays"].toArray())
-            data.overlays.append(overlayFromJson(v.toObject()));
-    }
-
-    // US-2000: timeline markers and adjustment layers — missing key = empty
-    data.markers = projectFileMarkersFromJson(root.value("markers").toArray());
-    data.adjustmentLayers = projectFileAdjustmentLayersFromJson(root.value("adjustmentLayers").toArray());
-
-    // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
-    data.planarTracks.clear();
-    if (root.contains("planarTracks")) {
-        for (const auto &v : root["planarTracks"].toArray())
-            data.planarTracks.append(planarTrackFromJson(v.toObject()));
-    }
-
-    // US-BRUSH-5 / US-1706: the legacy root section "brushAnimations" moves onto the
-    // clips in migrateLegacyClipSidecars.
-
-    // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
-    data.pathTexts.clear();
-    if (root.contains("pathTexts"))
-        for (const auto &v : root["pathTexts"].toArray())
-            data.pathTexts.append(pathTextFromJson(v.toObject()));
-
-    data.text3DLayers.clear();
-    if (root.contains("text3DLayers"))
-        for (const auto &v : root["text3DLayers"].toArray())
-            data.text3DLayers.append(text3DLayerFromJson(v.toObject()));
-
-    data.textMaskReveals.clear();
-    if (root.contains("textMaskReveals"))
-        for (const auto &v : root["textMaskReveals"].toArray())
-            data.textMaskReveals.append(textMaskRevealFromJson(v.toObject()));
-
-    data.textPathWarps.clear();
-    if (root.contains("textPathWarps"))
-        for (const auto &v : root["textPathWarps"].toArray())
-            data.textPathWarps.append(textPathWarpFromJson(v.toObject()));
-
-    data.variableFontAxes.clear();
-    if (root.contains("variableFontAxes"))
-        for (const auto &v : root["variableFontAxes"].toArray())
-            data.variableFontAxes.append(variableFontAxisFromJson(v.toObject()));
-
-    data.mographTexts.clear();
-    if (root.contains("mographTexts"))
-        for (const auto &v : root["mographTexts"].toArray())
-            data.mographTexts.append(mographTextFromJson(v.toObject()));
-
-    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
-    data.smartReframe = QJsonObject{};
-    if (root.contains("smartReframe"))
-        data.smartReframe = root["smartReframe"].toObject();
-    data.subtitleSegments.clear();
-    if (root.contains("subtitleSegments")) {
-        for (const auto &v : root["subtitleSegments"].toArray()) {
-            QJsonObject obj = v.toObject();
-            SubtitleEntry entry;
-            entry.start = obj["start"].toDouble(0.0);
-            entry.end = obj["end"].toDouble(0.0);
-            entry.text = obj["text"].toString();
-            data.subtitleSegments.append(entry);
-        }
-    }
-    data.subtitleStyle = QJsonObject{};
-    if (root.contains("subtitleStyle"))
-        data.subtitleStyle = root["subtitleStyle"].toObject();
-    data.loudnessSettings = QJsonObject{};
-    if (root.contains("loudnessSettings"))
-        data.loudnessSettings = root["loudnessSettings"].toObject();
-    data.loudnessSettings.insert(
-        QStringLiteral("_timecodeBurnIn"),
-        TimecodeBurnInSettings::fromJson(
-            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
-    data.particleClipEntries.clear();
-    if (root.contains("particleClipEntries")) {
-        for (const auto &v : root["particleClipEntries"].toArray())
-            data.particleClipEntries.append(particleClipEntryFromJson(v.toObject()));
-    }
-    data.clipNodeGraphs.clear();
-    if (root.contains("clipNodeGraphs")) {
-        for (const auto &v : root["clipNodeGraphs"].toArray())
-            data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
-    }
-    data.rotoClipEntries.clear();
-    if (root.contains("rotoClipEntries")) {
-        for (const auto &v : root["rotoClipEntries"].toArray())
-            data.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
-    }
-    data.timeRemapClipEntries.clear();
-    if (root.contains("timeRemapClipEntries")) {
-        for (const auto &v : root["timeRemapClipEntries"].toArray())
-            data.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
-    }
-    data.trackMatteClipEntries.clear();
-    if (root.contains("trackMatteClipEntries")) {
-        for (const auto &v : root["trackMatteClipEntries"].toArray())
-            data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
-    }
-    data.clipParentEntries.clear();
-    if (root.contains("clipParentEntries")) {
-        for (const auto &v : root["clipParentEntries"].toArray())
-            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
-    }
-    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
-    readSequenceSidecarsFromRoot(root, data);
-    migrateLegacyColorCorrectionKeyframes(data);
-    applyLegacyTimeRemapToStores(data);
-    data.vfxState = root.contains("vfxState")
-        ? vfxStateFromJson(root["vfxState"].toObject())
-        : ProjectVfxState{};
-
-    // US-3D-11: motion-graphics sprint persistence. US-1706: the legacy root sections
-    // "text3DClipEntries" / "brushAnimations" move onto the clips here too.
-    migrateLegacyClipSidecars(root, data);
-    data.projectCamera = root.contains("projectCamera")
-        ? root["projectCamera"].toObject()
-        : QJsonObject{};
-    data.projectLights = root.value("projectLights").toArray();
-
-    // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
-    // the DuckingParams{} defaults and duckingEnabled=false.
-    {
-        const DuckingParams defaults;
-        const QJsonObject duck = root.contains("duckingParams")
-                                   ? root["duckingParams"].toObject()
-                                   : QJsonObject{};
-        data.duckingParams.thresholdDb       = duck.value("thresholdDb").toDouble(defaults.thresholdDb);
-        data.duckingParams.targetReductionDb = duck.value("targetReductionDb").toDouble(defaults.targetReductionDb);
-        data.duckingParams.attackMs          = duck.value("attackMs").toDouble(defaults.attackMs);
-        data.duckingParams.releaseMs         = duck.value("releaseMs").toDouble(defaults.releaseMs);
-        data.duckingParams.holdMs            = duck.value("holdMs").toDouble(defaults.holdMs);
-        data.duckingParams.kneeDb            = duck.value("kneeDb").toDouble(defaults.kneeDb);
-        data.duckingEnabled = root.contains("duckingEnabled")
-                                ? root["duckingEnabled"].toBool(false)
-                                : false;
-    }
-
-    // US-EXT-10: HDR + AI processing settings (Sprint 10) — backward compat:
-    // missing keys keep HDRSettings{} / AIProcessingSettings{} defaults so older
-    // .veditor files without these fields still load cleanly.
-    {
-        const HDRSettings hdrDefaults;
-        const QJsonObject hdr = root.contains("hdrSettings")
-                                   ? root["hdrSettings"].toObject()
-                                   : QJsonObject{};
-        data.hdrSettings.mode                      = hdr.value("mode").toString(hdrDefaults.mode);
-        data.hdrSettings.masterDisplayLuminanceMin = hdr.value("masterDisplayLuminanceMin").toDouble(hdrDefaults.masterDisplayLuminanceMin);
-        data.hdrSettings.masterDisplayLuminanceMax = hdr.value("masterDisplayLuminanceMax").toDouble(hdrDefaults.masterDisplayLuminanceMax);
-        data.hdrSettings.maxCll                    = hdr.value("maxCll").toInt(hdrDefaults.maxCll);
-        data.hdrSettings.maxFall                   = hdr.value("maxFall").toInt(hdrDefaults.maxFall);
-        data.hdrSettings.previewToneMap            = hdr.value("previewToneMap").toString(hdrDefaults.previewToneMap);
-
-        const AIProcessingSettings aiDefaults;
-        const QJsonObject ai = root.contains("aiSettings")
-                                   ? root["aiSettings"].toObject()
-                                   : QJsonObject{};
-        data.aiSettings.upscaleEnabled     = ai.value("upscaleEnabled").toBool(aiDefaults.upscaleEnabled);
-        data.aiSettings.upscaleEngine      = ai.value("upscaleEngine").toString(aiDefaults.upscaleEngine);
-        data.aiSettings.upscaleFactor      = ai.value("upscaleFactor").toInt(aiDefaults.upscaleFactor);
-        data.aiSettings.frameInterpEnabled = ai.value("frameInterpEnabled").toBool(aiDefaults.frameInterpEnabled);
-        data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
-        data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
-    }
-
-    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory (backward compat).
-    data.mobileExportLastDeviceId = QString();
-    if (root.contains("mobileExport")) {
-        const QJsonObject mobile = root["mobileExport"].toObject();
-        data.mobileExportLastDeviceId = mobile.value("lastDeviceId").toString();
-    }
-    data.lastImportFolder = QString();
-    if (root.contains("lastImportFolder"))
-        data.lastImportFolder = root["lastImportFolder"].toString();
-
-    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory (backward compat).
-    data.youtubeLastChannelId        = QString();
-    data.youtubeLastPrivacy          = QString();
-    if (root.contains("youtube")) {
-        const QJsonObject youtube = root["youtube"].toObject();
-        data.youtubeLastChannelId   = youtube.value("lastChannelId").toString();
-        data.youtubeLastPrivacy     = youtube.value("lastPrivacy").toString();
-    }
-    data.collabCurrentUserId         = QString();
-    data.collabCurrentDisplayName    = QString();
-    if (root.contains("collab")) {
-        const QJsonObject collab = root["collab"].toObject();
-        data.collabCurrentUserId       = collab.value("currentUserId").toString();
-        data.collabCurrentDisplayName  = collab.value("currentDisplayName").toString();
-    }
-    data.colorMatchLastReferenceClip = QString();
-    if (root.contains("colormatch")) {
-        const QJsonObject colormatch = root["colormatch"].toObject();
-        data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
-    }
-
-    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
-    {
-        const QJsonObject tp = root.value("trackerPresets").toObject();
-        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
-        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
-    }
-
-    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
-    data.mediaPool.fromJson(root.value("mediaPool").toObject());
-
-    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
-    // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
-    data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
-
-    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
-    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
-    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
-
-    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
-    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
-    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
-
-    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
-    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
-    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
-
-    return true;
+    return readProjectBytes(file.readAll(), data, errorMessage);
 }
 
 QString ProjectFile::toJsonString(const ProjectData &data)
 {
-    const SequenceStoreExtraction sequenceStore =
-        extractSequenceStoreEntries(data.clipParentEntries);
-
-    QJsonObject root;
-    root["version"] = PROJECT_FORMAT_VERSION;
-    root["config"] = configToJson(data.config);
-    root["videoTracks"] = tracksToJson(data.videoTracks);
-    root["audioTracks"] = tracksToJson(data.audioTracks);
-    root["trackFlags"] = trackFlagsToJson(data);
-    root["generatedCaptionOverlays"] = TextManager::toJson(data.generatedCaptionOverlays);
-    root["playheadPos"] = data.playheadPos;
-    root["markIn"] = data.markIn;
-    root["markOut"] = data.markOut;
-    root["zoomLevel"] = data.zoomLevel;
-    if (data.storylineMode)
-        root["storylineMode"] = true;
-
-    // Audio mixer
-    {
-        QJsonObject am;
-        QJsonArray teArr;
-        for (const auto &s : data.trackEqStates) {
-            if (s.enabled || !s.isDefault())
-                teArr.append(trackEqToJson(s));
-        }
-        am["trackEq"] = teArr;
-        am["compressor"] = compressorToJson(data.masterCompressor);
-        am["autoDuck"] = autoDuckToJson(data.autoDuck);
-        // Chain owns de-esser serialization/default omission for tracks and master.
-        QJsonArray fxArray;
-        for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it) {
-            QJsonObject chain = it.value().toJson();
-            if (it.key() < 0 || chain.isEmpty()) continue;
-            chain["track"] = it.key();
-            fxArray.append(chain);
-        }
-        if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
-        // Only written when a track has a non-default fader gain or pan.
-        QJsonArray mixArray;
-        bool anyMix = false;
-        for (const auto &mix : data.trackMix) {
-            anyMix = anyMix || !mix.isDefault();
-            mixArray.append(QJsonObject{{"gain", mix.gain}, {"pan", mix.pan}});
-        }
-        if (anyMix) am["trackMix"] = mixArray;
-        const QJsonObject masterFx = data.masterFx.toJson();
-        if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
-        root["audioMixer"] = am;
-    }
-
-    // UI
-    {
-        QJsonObject ui;
-        ui["audioMetersDockVisible"] = data.audioMetersDockVisible;
-        root["ui"] = ui;
-    }
-
-    // US-FEAT-A: overlay persistence
-    {
-        QJsonArray ovArr;
-        for (const auto &o : data.overlays)
-            ovArr.append(overlayToJson(o));
-        root["overlays"] = ovArr;
-    }
-
-    // US-2000: timeline markers and adjustment layers — see save() above.
-    root["markers"] = projectFileMarkersToJson(data.markers);
-    root["adjustmentLayers"] = projectFileAdjustmentLayersToJson(data.adjustmentLayers);
-
-    // US-MOCHA-2: planar tracks — skip empty / all-identity tracks on save
-    {
-        QJsonArray ptArr;
-        for (const auto &t : data.planarTracks) {
-            if (!planartrack::shouldSkipOnSave(t)) {
-                ptArr.append(planarTrackToJson(t));
-            }
-        }
-        root["planarTracks"] = ptArr;
-    }
-
-    // US-BRUSH-5 / US-1706: the brush animations are on the clips (clip JSON "brush");
-    // the legacy root section "brushAnimations" is no longer written.
-
-    // US-AETEXT-12: AE text features
-    {
-        QJsonArray ptArr;
-        for (const auto &e : data.pathTexts)
-            ptArr.append(pathTextToJson(e));
-        root["pathTexts"] = ptArr;
-    }
-    {
-        QJsonArray t3Arr;
-        for (const auto &e : data.text3DLayers)
-            t3Arr.append(text3DLayerToJson(e));
-        root["text3DLayers"] = t3Arr;
-    }
-    {
-        QJsonArray mrArr;
-        for (const auto &e : data.textMaskReveals)
-            mrArr.append(textMaskRevealToJson(e));
-        root["textMaskReveals"] = mrArr;
-    }
-    {
-        QJsonArray pwArr;
-        for (const auto &e : data.textPathWarps)
-            pwArr.append(textPathWarpToJson(e));
-        root["textPathWarps"] = pwArr;
-    }
-    {
-        QJsonArray vfArr;
-        for (const auto &e : data.variableFontAxes)
-            vfArr.append(variableFontAxisToJson(e));
-        root["variableFontAxes"] = vfArr;
-    }
-    {
-        QJsonArray mgArr;
-        for (const auto &e : data.mographTexts)
-            mgArr.append(mographTextToJson(e));
-        root["mographTexts"] = mgArr;
-    }
-
-    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization
-    root["smartReframe"] = data.smartReframe;
-    {
-        QJsonArray subArr;
-        for (const auto &entry : data.subtitleSegments) {
-            QJsonObject obj;
-            obj["start"] = entry.start;
-            obj["end"] = entry.end;
-            obj["text"] = entry.text;
-            subArr.append(obj);
-        }
-        root["subtitleSegments"] = subArr;
-    }
-    root["subtitleStyle"] = data.subtitleStyle;
-    {
-        QJsonObject loudness = data.loudnessSettings;
-        const QJsonObject timecode = loudness.take(
-            QStringLiteral("_timecodeBurnIn")).toObject();
-        root["loudnessSettings"] = loudness;
-        root["timecodeBurnIn"] =
-            TimecodeBurnInSettings::fromJson(timecode).toJson();
-    }
-    {
-        QJsonArray particleArr;
-        for (const auto &entry : data.particleClipEntries)
-            particleArr.append(particleClipEntryToJson(entry));
-        root["particleClipEntries"] = particleArr;
-    }
-    {
-        QJsonArray nodeArr;
-        for (const auto &entry : data.clipNodeGraphs)
-            nodeArr.append(clipNodeGraphToJson(entry));
-        root["clipNodeGraphs"] = nodeArr;
-    }
-    {
-        QJsonArray rotoArr;
-        for (const auto &entry : data.rotoClipEntries)
-            rotoArr.append(rotoClipEntryToJson(entry));
-        root["rotoClipEntries"] = rotoArr;
-    }
-    {
-        QJsonArray timeRemapArr;
-        for (const auto &entry : data.timeRemapClipEntries)
-            timeRemapArr.append(timeRemapClipEntryToJson(entry));
-        root["timeRemapClipEntries"] = timeRemapArr;
-    }
-    {
-        QJsonArray matteArr;
-        for (const auto &entry : data.trackMatteClipEntries)
-            matteArr.append(trackMatteClipEntryToJson(entry));
-        root["trackMatteClipEntries"] = matteArr;
-    }
-    if (!data.clipParentEntries.isEmpty()) {
-        QJsonArray parentArr;
-        for (const auto &entry : sequenceStore.normalClipParentEntries)
-            parentArr.append(clipParentEntryToJson(entry));
-        if (!parentArr.isEmpty())
-            root["clipParentEntries"] = parentArr;
-    }
-    writeSequenceStoreToRoot(root, sequenceStore.sequenceStore);
-    writeSequenceSidecarsToRoot(root, data);
-    root["vfxState"] = vfxStateToJson(data.vfxState);
-
-    // US-3D-11 / US-1706: the 3D text is on the clips (clip JSON "text3D"); the legacy
-    // root section "text3DClipEntries" is no longer written.
-    if (!data.projectCamera.isEmpty())
-        root["projectCamera"] = projectCameraJsonForSave(data.projectCamera);
-    if (!data.projectLights.isEmpty())
-        root["projectLights"] = data.projectLights;
-
-    // US-HW-10: audio ducking (Sprint 9) — always written so a saved project
-    // round-trips even when the user has never opened the ducking dialog.
-    {
-        QJsonObject duck;
-        duck["thresholdDb"]       = data.duckingParams.thresholdDb;
-        duck["targetReductionDb"] = data.duckingParams.targetReductionDb;
-        duck["attackMs"]          = data.duckingParams.attackMs;
-        duck["releaseMs"]         = data.duckingParams.releaseMs;
-        duck["holdMs"]            = data.duckingParams.holdMs;
-        duck["kneeDb"]            = data.duckingParams.kneeDb;
-        root["duckingParams"]  = duck;
-        root["duckingEnabled"] = data.duckingEnabled;
-    }
-
-    // US-EXT-10: HDR + AI processing settings (Sprint 10) — always written so
-    // a saved project round-trips even with default values.
-    {
-        QJsonObject hdr;
-        hdr["mode"]                       = data.hdrSettings.mode;
-        hdr["masterDisplayLuminanceMin"]  = data.hdrSettings.masterDisplayLuminanceMin;
-        hdr["masterDisplayLuminanceMax"]  = data.hdrSettings.masterDisplayLuminanceMax;
-        hdr["maxCll"]                     = data.hdrSettings.maxCll;
-        hdr["maxFall"]                    = data.hdrSettings.maxFall;
-        hdr["previewToneMap"]             = data.hdrSettings.previewToneMap;
-        root["hdrSettings"] = hdr;
-
-        QJsonObject ai;
-        ai["upscaleEnabled"]      = data.aiSettings.upscaleEnabled;
-        ai["upscaleEngine"]       = data.aiSettings.upscaleEngine;
-        ai["upscaleFactor"]       = data.aiSettings.upscaleFactor;
-        ai["frameInterpEnabled"]  = data.aiSettings.frameInterpEnabled;
-        ai["frameInterpEngine"]   = data.aiSettings.frameInterpEngine;
-        ai["frameInterpFactor"]   = data.aiSettings.frameInterpFactor;
-        root["aiSettings"] = ai;
-    }
-
-    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory.
-    {
-        QJsonObject mobile;
-        mobile["lastDeviceId"] = data.mobileExportLastDeviceId;
-        root["mobileExport"] = mobile;
-        root["lastImportFolder"] = data.lastImportFolder;
-    }
-
-    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory.
-    {
-        QJsonObject youtube;
-        youtube["lastChannelId"] = data.youtubeLastChannelId;
-        youtube["lastPrivacy"]   = data.youtubeLastPrivacy;
-        root["youtube"] = youtube;
-
-        QJsonObject collab;
-        collab["currentUserId"]      = data.collabCurrentUserId;
-        collab["currentDisplayName"] = data.collabCurrentDisplayName;
-        root["collab"] = collab;
-
-        QJsonObject colormatch;
-        colormatch["lastReferenceClip"] = data.colorMatchLastReferenceClip;
-        root["colormatch"] = colormatch;
-    }
-
-    // PRD-PROJECT-PRESET: tracker preset state persistence
-    {
-        QJsonObject trackerPresets;
-        trackerPresets["motion"] = motionTrackerStateToJson(data.motionTrackerState);
-        trackerPresets["planar"] = planarTrackerStateToJson(data.planarTrackerState);
-        root["trackerPresets"] = trackerPresets;
-    }
-
-    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化
-    root["mediaPool"] = data.mediaPool.toJson();
-
-    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
-    root["audioBusRouting"] = data.audioBusRouting.toJson();
-
-    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
-    root["acesPipeline"] = aces::pipelineToJson(data.acesPipeline);
-
-    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
-    root["dolbyVision"] = dolbyvision::toJson(data.dolbyVision);
-
-    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
-    root["broadcastCaption"] = broadcastcc::toJson(data.broadcastCaption);
-
-    QJsonDocument doc(root);
-    return QString::fromUtf8(doc.toJson(QJsonDocument::Compact));
+    return QString::fromUtf8(buildProjectDocument(data).toJson(QJsonDocument::Compact));
 }
 
 bool ProjectFile::fromJsonString(const QString &json, ProjectData &data, QString *errorMessage)
 {
-    QJsonDocument doc;
-    if (!parseProjectJson(json.toUtf8(), doc, errorMessage)) return false;
-
-    QJsonObject root = doc.object();
-    int version = 1;
-    if (!readProjectVersion(root, version, errorMessage)) return false;
-
-    data.config = configFromJson(root["config"].toObject());
-    data.videoTracks = tracksFromJson(root["videoTracks"].toArray());
-    data.audioTracks = tracksFromJson(root["audioTracks"].toArray());
-    trackFlagsFromJson(root.value("trackFlags").toObject(), data);
-    data.generatedCaptionOverlays = TextManager::fromJson(
-        root.value("generatedCaptionOverlays").toArray());
-    migrateGeneratedCaptionsToProjectLevel(data);
-
-    // v1 -> v2: convert stale pixel-convention clip pan offsets. Runs after
-    // config (canvas resolution) and tracks are loaded; no-op for version>=2.
-    migrateClipOffsetsToNormalized(data, version);
-
-    data.playheadPos = root["playheadPos"].toDouble();
-    data.markIn = root["markIn"].toDouble(-1.0);
-    data.markOut = root["markOut"].toDouble(-1.0);
-    data.zoomLevel = root["zoomLevel"].toInt(10);
-    data.storylineMode = root.value("storylineMode").toBool(false);
-
-    // Audio mixer (tolerate missing keys)
-    data.trackEqStates.clear();
-    // Both project readers restore de-esser settings through the shared Chain codec.
-    data.trackFx.clear();
-    data.trackMix.clear();
-    data.masterFx = trackfx::Chain{};
-    if (root.contains("audioMixer")) {
-        QJsonObject am = root["audioMixer"].toObject();
-        for (const auto &value : am["trackFx"].toArray()) {
-            const QJsonObject object = value.toObject();
-            const int track = object["track"].toInt(-1);
-            if (track < 0) continue;
-            const auto chain = trackfx::Chain::fromJson(object);
-            if (!chain.isDefault()) data.trackFx.insert(track, chain);
-        }
-        data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
-        for (const auto &value : am["trackMix"].toArray()) {
-            const QJsonObject object = value.toObject();
-            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
-        }
-        if (am.contains("trackEq")) {
-            for (const auto &v : am["trackEq"].toArray())
-                data.trackEqStates.append(trackEqFromJson(v.toObject()));
-        }
-        if (am.contains("compressor"))
-            data.masterCompressor = compressorFromJson(am["compressor"].toObject());
-        if (am.contains("autoDuck"))
-            data.autoDuck = autoDuckFromJson(am["autoDuck"].toObject());
-    }
-
-    // UI (tolerate missing keys)
-    if (root.contains("ui")) {
-        QJsonObject ui = root["ui"].toObject();
-        if (ui.contains("audioMetersDockVisible"))
-            data.audioMetersDockVisible = ui["audioMetersDockVisible"].toBool(true);
-    }
-
-    // US-FEAT-A: overlay persistence — backward compat: missing key = empty list
-    data.overlays.clear();
-    if (root.contains("overlays")) {
-        for (const auto &v : root["overlays"].toArray())
-            data.overlays.append(overlayFromJson(v.toObject()));
-    }
-
-    // US-2000: timeline markers and adjustment layers — missing key = empty
-    data.markers = projectFileMarkersFromJson(root.value("markers").toArray());
-    data.adjustmentLayers = projectFileAdjustmentLayersFromJson(root.value("adjustmentLayers").toArray());
-
-    // US-MOCHA-2: planar tracks — backward compat: missing key = empty vector
-    data.planarTracks.clear();
-    if (root.contains("planarTracks")) {
-        for (const auto &v : root["planarTracks"].toArray())
-            data.planarTracks.append(planarTrackFromJson(v.toObject()));
-    }
-
-    // US-BRUSH-5 / US-1706: the legacy root section "brushAnimations" moves onto the
-    // clips in migrateLegacyClipSidecars.
-
-    // US-AETEXT-12: AE text features — backward compat: missing key = empty vector
-    data.pathTexts.clear();
-    if (root.contains("pathTexts"))
-        for (const auto &v : root["pathTexts"].toArray())
-            data.pathTexts.append(pathTextFromJson(v.toObject()));
-
-    data.text3DLayers.clear();
-    if (root.contains("text3DLayers"))
-        for (const auto &v : root["text3DLayers"].toArray())
-            data.text3DLayers.append(text3DLayerFromJson(v.toObject()));
-
-    data.textMaskReveals.clear();
-    if (root.contains("textMaskReveals"))
-        for (const auto &v : root["textMaskReveals"].toArray())
-            data.textMaskReveals.append(textMaskRevealFromJson(v.toObject()));
-
-    data.textPathWarps.clear();
-    if (root.contains("textPathWarps"))
-        for (const auto &v : root["textPathWarps"].toArray())
-            data.textPathWarps.append(textPathWarpFromJson(v.toObject()));
-
-    data.variableFontAxes.clear();
-    if (root.contains("variableFontAxes"))
-        for (const auto &v : root["variableFontAxes"].toArray())
-            data.variableFontAxes.append(variableFontAxisFromJson(v.toObject()));
-
-    data.mographTexts.clear();
-    if (root.contains("mographTexts"))
-        for (const auto &v : root["mographTexts"].toArray())
-            data.mographTexts.append(mographTextFromJson(v.toObject()));
-
-    // US-SNS-6: SmartReframe, subtitle burn-in, loudness normalization — backward compat: missing key = empty/default
-    data.smartReframe = QJsonObject{};
-    if (root.contains("smartReframe"))
-        data.smartReframe = root["smartReframe"].toObject();
-    data.subtitleSegments.clear();
-    if (root.contains("subtitleSegments")) {
-        for (const auto &v : root["subtitleSegments"].toArray()) {
-            QJsonObject obj = v.toObject();
-            SubtitleEntry entry;
-            entry.start = obj["start"].toDouble(0.0);
-            entry.end = obj["end"].toDouble(0.0);
-            entry.text = obj["text"].toString();
-            data.subtitleSegments.append(entry);
-        }
-    }
-    data.subtitleStyle = QJsonObject{};
-    if (root.contains("subtitleStyle"))
-        data.subtitleStyle = root["subtitleStyle"].toObject();
-    data.loudnessSettings = QJsonObject{};
-    if (root.contains("loudnessSettings"))
-        data.loudnessSettings = root["loudnessSettings"].toObject();
-    data.loudnessSettings.insert(
-        QStringLiteral("_timecodeBurnIn"),
-        TimecodeBurnInSettings::fromJson(
-            root.value(QStringLiteral("timecodeBurnIn")).toObject()).toJson());
-    data.particleClipEntries.clear();
-    if (root.contains("particleClipEntries")) {
-        for (const auto &v : root["particleClipEntries"].toArray())
-            data.particleClipEntries.append(particleClipEntryFromJson(v.toObject()));
-    }
-    data.clipNodeGraphs.clear();
-    if (root.contains("clipNodeGraphs")) {
-        for (const auto &v : root["clipNodeGraphs"].toArray())
-            data.clipNodeGraphs.append(clipNodeGraphFromJson(v.toObject()));
-    }
-    data.rotoClipEntries.clear();
-    if (root.contains("rotoClipEntries")) {
-        for (const auto &v : root["rotoClipEntries"].toArray())
-            data.rotoClipEntries.append(rotoClipEntryFromJson(v.toObject()));
-    }
-    data.timeRemapClipEntries.clear();
-    if (root.contains("timeRemapClipEntries")) {
-        for (const auto &v : root["timeRemapClipEntries"].toArray())
-            data.timeRemapClipEntries.append(timeRemapClipEntryFromJson(v.toObject()));
-    }
-    data.trackMatteClipEntries.clear();
-    if (root.contains("trackMatteClipEntries")) {
-        for (const auto &v : root["trackMatteClipEntries"].toArray())
-            data.trackMatteClipEntries.append(trackMatteClipEntryFromJson(v.toObject()));
-    }
-    data.clipParentEntries.clear();
-    if (root.contains("clipParentEntries")) {
-        for (const auto &v : root["clipParentEntries"].toArray())
-            data.clipParentEntries.append(clipParentEntryFromJson(v.toObject()));
-    }
-    appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
-    readSequenceSidecarsFromRoot(root, data);
-    migrateLegacyColorCorrectionKeyframes(data);
-    applyLegacyTimeRemapToStores(data);
-    data.vfxState = root.contains("vfxState")
-        ? vfxStateFromJson(root["vfxState"].toObject())
-        : ProjectVfxState{};
-
-    // US-3D-11: motion-graphics sprint persistence. US-1706: the legacy root sections
-    // "text3DClipEntries" / "brushAnimations" move onto the clips here too.
-    migrateLegacyClipSidecars(root, data);
-    data.projectCamera = root.contains("projectCamera")
-        ? root["projectCamera"].toObject()
-        : QJsonObject{};
-    data.projectLights = root.value("projectLights").toArray();
-
-    // US-HW-10: audio ducking (Sprint 9) — backward compat: missing key keeps
-    // the DuckingParams{} defaults and duckingEnabled=false.
-    {
-        const DuckingParams defaults;
-        const QJsonObject duck = root.contains("duckingParams")
-                                   ? root["duckingParams"].toObject()
-                                   : QJsonObject{};
-        data.duckingParams.thresholdDb       = duck.value("thresholdDb").toDouble(defaults.thresholdDb);
-        data.duckingParams.targetReductionDb = duck.value("targetReductionDb").toDouble(defaults.targetReductionDb);
-        data.duckingParams.attackMs          = duck.value("attackMs").toDouble(defaults.attackMs);
-        data.duckingParams.releaseMs         = duck.value("releaseMs").toDouble(defaults.releaseMs);
-        data.duckingParams.holdMs            = duck.value("holdMs").toDouble(defaults.holdMs);
-        data.duckingParams.kneeDb            = duck.value("kneeDb").toDouble(defaults.kneeDb);
-        data.duckingEnabled = root.contains("duckingEnabled")
-                                ? root["duckingEnabled"].toBool(false)
-                                : false;
-    }
-
-    // US-EXT-10: HDR + AI processing settings (Sprint 10) — backward compat:
-    // missing keys keep HDRSettings{} / AIProcessingSettings{} defaults so older
-    // .veditor files without these fields still load cleanly.
-    {
-        const HDRSettings hdrDefaults;
-        const QJsonObject hdr = root.contains("hdrSettings")
-                                   ? root["hdrSettings"].toObject()
-                                   : QJsonObject{};
-        data.hdrSettings.mode                      = hdr.value("mode").toString(hdrDefaults.mode);
-        data.hdrSettings.masterDisplayLuminanceMin = hdr.value("masterDisplayLuminanceMin").toDouble(hdrDefaults.masterDisplayLuminanceMin);
-        data.hdrSettings.masterDisplayLuminanceMax = hdr.value("masterDisplayLuminanceMax").toDouble(hdrDefaults.masterDisplayLuminanceMax);
-        data.hdrSettings.maxCll                    = hdr.value("maxCll").toInt(hdrDefaults.maxCll);
-        data.hdrSettings.maxFall                   = hdr.value("maxFall").toInt(hdrDefaults.maxFall);
-        data.hdrSettings.previewToneMap            = hdr.value("previewToneMap").toString(hdrDefaults.previewToneMap);
-
-        const AIProcessingSettings aiDefaults;
-        const QJsonObject ai = root.contains("aiSettings")
-                                   ? root["aiSettings"].toObject()
-                                   : QJsonObject{};
-        data.aiSettings.upscaleEnabled     = ai.value("upscaleEnabled").toBool(aiDefaults.upscaleEnabled);
-        data.aiSettings.upscaleEngine      = ai.value("upscaleEngine").toString(aiDefaults.upscaleEngine);
-        data.aiSettings.upscaleFactor      = ai.value("upscaleFactor").toInt(aiDefaults.upscaleFactor);
-        data.aiSettings.frameInterpEnabled = ai.value("frameInterpEnabled").toBool(aiDefaults.frameInterpEnabled);
-        data.aiSettings.frameInterpEngine  = ai.value("frameInterpEngine").toString(aiDefaults.frameInterpEngine);
-        data.aiSettings.frameInterpFactor  = ai.value("frameInterpFactor").toInt(aiDefaults.frameInterpFactor);
-    }
-
-    // US-INT-2: Sprint 16 — mobile export + import-hub UI memory (backward compat).
-    data.mobileExportLastDeviceId = QString();
-    if (root.contains("mobileExport")) {
-        const QJsonObject mobile = root["mobileExport"].toObject();
-        data.mobileExportLastDeviceId = mobile.value("lastDeviceId").toString();
-    }
-    data.lastImportFolder = QString();
-    if (root.contains("lastImportFolder"))
-        data.lastImportFolder = root["lastImportFolder"].toString();
-
-    // US-INT-3: Sprint 17/18/19 — YouTube / Collab / ColorMatch UI memory (backward compat).
-    data.youtubeLastChannelId        = QString();
-    data.youtubeLastPrivacy          = QString();
-    if (root.contains("youtube")) {
-        const QJsonObject youtube = root["youtube"].toObject();
-        data.youtubeLastChannelId   = youtube.value("lastChannelId").toString();
-        data.youtubeLastPrivacy     = youtube.value("lastPrivacy").toString();
-    }
-    data.collabCurrentUserId         = QString();
-    data.collabCurrentDisplayName    = QString();
-    if (root.contains("collab")) {
-        const QJsonObject collab = root["collab"].toObject();
-        data.collabCurrentUserId       = collab.value("currentUserId").toString();
-        data.collabCurrentDisplayName  = collab.value("currentDisplayName").toString();
-    }
-    data.colorMatchLastReferenceClip = QString();
-    if (root.contains("colormatch")) {
-        const QJsonObject colormatch = root["colormatch"].toObject();
-        data.colorMatchLastReferenceClip = colormatch.value("lastReferenceClip").toString();
-    }
-
-    // PRD-PROJECT-PRESET: tracker preset state persistence (backward compat: missing key = default struct)
-    {
-        const QJsonObject tp = root.value("trackerPresets").toObject();
-        data.motionTrackerState = motionTrackerStateFromJson(tp.value("motion").toObject());
-        data.planarTrackerState = planarTrackerStateFromJson(tp.value("planar").toObject());
-    }
-
-    // PRD-PHASE1-MEDIA-POOL: メディアプール永続化 (キー欠落でも空 object → 空プールで安全)
-    data.mediaPool.fromJson(root.value("mediaPool").toObject());
-
-    // PRD-PHASE2-AUDIO-BUS: バス/サブミックス/AUXセンド ルーティング永続化
-    // (キー欠落でも空 object → 空ルーティング=identity、旧 .veditor 後方互換)
-    data.audioBusRouting.fromJson(root.value("audioBusRouting").toObject());
-
-    // PRD-PHASE3-ACES: ACES カラーマネジメント設定永続化
-    // (キー欠落でも空 object → enabled=false 既定=identity、旧 .veditor 後方互換)
-    data.acesPipeline = aces::pipelineFromJson(root.value("acesPipeline").toObject());
-
-    // PRD-PHASE3-DOLBY-VISION: Dolby Vision メタデータ永続化
-    // (キー欠落でも空 object → 空メタ既定、旧 .veditor 後方互換)
-    data.dolbyVision = dolbyvision::fromJson(root.value("dolbyVision").toObject());
-
-    // PRD-PHASE3-BROADCAST-CC: 放送CC (CEA-608/708) 永続化
-    // (キー欠落でも空 object → 空 doc 既定、旧 .veditor 後方互換)
-    data.broadcastCaption = broadcastcc::fromJson(root.value("broadcastCaption").toObject());
-
-    return true;
+    return readProjectBytes(json.toUtf8(), data, errorMessage);
 }
 
 // --- Config ---
