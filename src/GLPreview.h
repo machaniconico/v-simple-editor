@@ -77,6 +77,10 @@ public:
     // Test-only: caps the width of the N x 1 texture a 1D LUT is uploaded as, so the
     // resample branch (N above GL_MAX_TEXTURE_SIZE) runs on any GPU; 0 = the context's limit.
     void setLut1DMaxTextureWidthForTest(int width) { m_lut1DMaxWidthOverride = width; }
+    // Test-only: the texture unit the main program's sampler uniform `name` holds now
+    // (glGetUniformiv after the last paint); -1 when there is no program or the uniform
+    // is inactive. Lets a selftest see a sampler-type clash that a lenient driver ignores.
+    int samplerUnitForTest(const char *name);
     // Width of the uploaded 1D LUT texture (0 = no 1D LUT).
     int lut1DTextureWidthForTest() const { return m_lut1DTexture ? m_lut1DN : 0; }
     void setLutIntensity(double intensity);

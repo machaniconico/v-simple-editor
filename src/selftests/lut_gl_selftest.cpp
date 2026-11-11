@@ -23,7 +23,10 @@
 // G6 1D resample: 65536 points with setLut1DMaxTextureWidthForTest(1024) uploads a 1024-wide
 //    texture whose bands 0 and 1 match applyLut within 2/255. The context's real
 //    GL_MAX_TEXTURE_SIZE shows as the width of an unforced upload (INFO line, not a gate).
-// GL unavailable (invalid context or null grab): G1-G6 are skipped.
+// G7 fresh 1D-first: a new GLPreview that never held a 3D LUT shows a 1D LUT. No GL error
+//    after the draw, pixels match applyLut within kTol, and uLut3D's unit (glGetUniformiv)
+//    differs from every sampler2D's unit, since lenient drivers draw despite the clash.
+// GL unavailable (invalid context or null grab): G1-G7 are skipped.
 #include "SelftestGate.h"
 #include "../GLPreview.h"
 #include "../LutImporter.h"
@@ -32,10 +35,12 @@
 #include <QApplication>
 #include <QImage>
 #include <QOpenGLContext>
+#include <QOpenGLFunctions>
 #include <QVector3D>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <functional>
 #include <iostream>
 #include <string>
@@ -159,7 +164,7 @@ int runLutGlSelftest()
         }
     }
     if (!glOk) {
-        for (int g = 1; g <= 6; ++g)
+        for (int g = 1; g <= 7; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
         return tally.finish("lut-gl");
     }
@@ -168,10 +173,10 @@ int runLutGlSelftest()
     // sampled Nearest, so frame pixel (x, y) is device pixel
     // (floor((x + 0.5) * dpr), floor((y + 0.5) * dpr)); a grab of another size is null.
     bool sizeOk = true;
-    const auto grab = [&]() -> QImage {
+    const auto grabFrom = [&](GLPreview *w) -> QImage {
         QApplication::processEvents(QEventLoop::AllEvents, 25);
-        const QImage raw = gl->grabFramebuffer();
-        const qreal dpr = gl->devicePixelRatioF();
+        const QImage raw = w->grabFramebuffer();
+        const qreal dpr = w->devicePixelRatioF();
         const QSize device(qRound(kW * dpr), qRound(kH * dpr));
         if (raw.isNull() || raw.size() != device) {
             sizeOk = false;
@@ -189,6 +194,7 @@ int runLutGlSelftest()
         }
         return frame;
     };
+    const auto grab = [&]() { return grabFrom(gl); };
     const auto render = [&](const QImage &in, const LutData *lut) {
         gl->displayFrame(in);
         if (lut)
@@ -319,6 +325,62 @@ int runLutGlSelftest()
         tally.gate(6, sizeOk && w == 1024 && d.maxErr <= kTol,
                    "65536pt -> width=" + std::to_string(w) + " bands0-1 " + d.str()
                    + " sizeOk=" + std::to_string(sizeOk));
+    }
+
+    // G7: a fresh GLPreview that never held a 3D LUT shows a 1D LUT first. uLut3D must not
+    // share unit 0 with uTexture (GL_INVALID_OPERATION, no frame); error drained before the draw.
+    {
+        VideoPlayer fresh;
+        GLPreview *fg = fresh.glPreview();
+        bool fOk = false;
+        if (fg) {
+            fg->setFixedSize(kW, kH);
+            fg->setFrameTextureNearestForTest(true);
+            fresh.show();
+            for (int i = 0; i < 8 && !fOk; ++i) {
+                QApplication::processEvents(QEventLoop::AllEvents, 25);
+                const QImage probe = fg->grabFramebuffer();
+                fOk = fg->context() && fg->context()->isValid() && !probe.isNull();
+            }
+        }
+        if (!fOk) {
+            tally.skip(7, "no usable QOpenGLWidget context for the fresh preview");
+        } else {
+            const float kTwoPi = 6.28318530718f;
+            const LutData sine = make1D(1024, [kTwoPi](float x) { return 0.5f + 0.45f * std::sin(kTwoPi * 8.0f * x); });
+            fg->displayFrame(in);
+            fg->setLut(sine);
+            fg->displayFrame(in);
+            QApplication::processEvents(QEventLoop::AllEvents, 25);
+            fg->makeCurrent();
+            while (fg->context()->functions()->glGetError() != GL_NO_ERROR) {}
+            fg->doneCurrent();
+            const QImage g = grabFrom(fg);
+            fg->makeCurrent();
+            const GLenum err = fg->context()->functions()->glGetError();
+            fg->doneCurrent();
+            const QImage ref = LutImporter::applyLut(in, sine);
+            const Diff d = compareBands(g, ref, 0, 1);
+            const int px = 100, py = 10; // band 0 grey ramp: input 100
+            const int gotPx = g.isNull() ? -1 : qRed(g.pixel(px, py));
+            const int wantPx = qRed(ref.convertToFormat(QImage::Format_RGB32).pixel(px, py));
+            // Driver-independent half: a lenient driver draws despite the clash, so read the
+            // sampler3D's unit back and require it off every sampler2D's unit.
+            const int u3 = fg->samplerUnitForTest("uLut3D");
+            const int uTex = fg->samplerUnitForTest("uTexture");
+            const int u1 = fg->samplerUnitForTest("uLut1D");
+            const int uCurve = fg->samplerUnitForTest("uCurveLut");
+            const int uHue = fg->samplerUnitForTest("uHueVsSatLut");
+            const bool unitsOk = u3 >= 0 && u3 != uTex && u3 != u1 && u3 != uCurve && u3 != uHue;
+            const bool ok = sizeOk && err == GL_NO_ERROR && !g.isNull() && std::abs(gotPx - wantPx) <= kTol
+                && d.maxErr <= kTol && unitsOk;
+            tally.gate(7, ok, "fresh preview 1D-first glError=0x" + [&] { char b[16]; snprintf(b, sizeof b, "%x", unsigned(err)); return std::string(b); }()
+                       + " pixel(100,10) measured=" + std::to_string(gotPx) + " expected=" + std::to_string(wantPx)
+                       + " | bands0-1 " + d.str() + " sizeOk=" + std::to_string(sizeOk)
+                       + " | units uLut3D=" + std::to_string(u3) + " uTexture=" + std::to_string(uTex)
+                       + " uLut1D=" + std::to_string(u1) + " uCurveLut=" + std::to_string(uCurve)
+                       + " uHueVsSatLut=" + std::to_string(uHue));
+        }
     }
 
     return tally.finish("lut-gl");

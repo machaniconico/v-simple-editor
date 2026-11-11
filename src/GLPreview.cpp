@@ -1974,6 +1974,22 @@ void GLPreview::setFrameTextureNearestForTest(bool nearest)
     update();
 }
 
+int GLPreview::samplerUnitForTest(const char *name)
+{
+    if (!m_program || !context())
+        return -1;
+    makeCurrent();
+    int unit = -1;
+    const int loc = m_program->uniformLocation(name);
+    if (loc >= 0) {
+        GLint v = -1;
+        glGetUniformiv(m_program->programId(), loc, &v);
+        unit = v;
+    }
+    doneCurrent();
+    return unit;
+}
+
 void GLPreview::setHdrTransfer(int transfer)
 {
     const int clamped = (transfer == 1 || transfer == 2) ? transfer : 0;
@@ -2705,10 +2721,14 @@ void GLPreview::paintGL()
     m_program->setUniformValue(m_locLutDomainMax, m_lutDomainMax);
     m_program->setUniformValue(m_locLutIs1D, m_lut1DTexture ? 1 : 0);
     m_program->setUniformValue(m_locLut1DSize, m_lut1DTexture ? static_cast<float>(m_lut1DN) : 1.0f);
+    // The 3D sampler always points at unit 1, even before any 3D LUT exists:
+    // left at its default unit 0 it would share the unit with the sampler2D
+    // uTexture, and samplers of different types on one unit make the draw
+    // fail with GL_INVALID_OPERATION (a fresh session showing a 1D LUT first).
+    m_program->setUniformValue(m_locLut3D, 1);
     if (m_lutEnabled && m_lutTexture) {
         glActiveTexture(GL_TEXTURE1);
         m_lutTexture->bind();
-        m_program->setUniformValue(m_locLut3D, 1);
     }
     // The 1D sampler always points at unit 4, which no other sampler uses.
     m_program->setUniformValue(m_locLut1D, 4);
