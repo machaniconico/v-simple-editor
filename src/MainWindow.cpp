@@ -9303,7 +9303,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
     QImage composed;
     bool regraded = false;
     if (hasTrackMatteLayer) {
-        // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
+        // A matte frame blends its blended layers after the Normal stack, each cut
+        // by its own matte, as renderFrameAt's matte branch does (one kernel).
         composed = trackmatte::composite(layers, layerImages, canvasSize);
         // US-2206: renderFrameAt's matte branch grades the composite with the
         // adjustment clips of tracks 1.. ascending (not track 0), straight RGBA.
