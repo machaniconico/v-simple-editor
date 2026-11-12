@@ -68,6 +68,7 @@ int runBatchExportE2ESelftest();
 int runBatchExportSelftest();
 int runBeatDetectSelftest();
 int runBezierEasingSelftest();
+int runBlendImagesSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runBundleAdjustSelftest();
@@ -764,6 +765,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoDucking: thresholded VO envelope + non-destructive BGM gain keyframes (21 gates)" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
+    { "blend-images",      "VEDITOR_BLEND_IMAGES_SELFTEST",       runBlendImagesSelftest,        false,
+      "LayerCompositor::blendImages banded on the global pool: byte-identical to the serial loop for every blend mode, stored sha256, concurrency and saturated-pool re-entrancy (3 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
     { "keyers", "VEDITOR_KEYERS_SELFTEST", runKeyersSelftest, false,
