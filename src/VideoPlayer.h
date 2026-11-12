@@ -477,8 +477,9 @@ private:
     // `overlaysAlreadyBaked` is used only by the nested-sequence SSOT path:
     // tlrender::renderFrameAt has already applied the parent timeline's text,
     // so composing m_textOverlays again would darken/double every caption.
-    // US-2203: `v1StabBaked`: V1's stabilizer is already in `image` (a CPU
-    // composite with other layers, or renderFrameAt), so the GL warps nothing.
+    // US-2203: `v1StabBaked`: the stabilizer of every layer that carries keys is
+    // already in `image` (a CPU composite with other layers, clip-local CPU FX or
+    // renderFrameAt; US-2301: on any track), so the GL warps nothing.
     void displayFrame(const QImage &image, bool overlaysAlreadyBaked,
                       qint64 displayTimelineUsec, bool v1StabBaked);
     void displaySeekFrameConformed(const QImage &v1Image,
@@ -829,9 +830,10 @@ private:
     // text. A paused overlay edit must re-render that timeline frame instead
     // of treating this cache as a raw image.
     bool m_lastSourceFrameHasBakedText = false;
-    // US-2203: whether V1's stabilizer is baked into m_lastSourceFrame. displayFrame
-    // sets it and the raw V1 frame writers (VideoPlayer.cpp ~5530, ~5651) clear it
-    // to false, so a re-present of a baked frame does not warp V1 again on the GL.
+    // US-2203: whether the keyed layers' stabilizer (US-2301: every track) is baked
+    // into m_lastSourceFrame. displayFrame sets it and the raw frame writers
+    // (VideoPlayer.cpp ~5530, ~5651) clear it to false, so a re-present of a baked
+    // frame does not warp it again on the GL.
     bool m_lastSourceFrameV1StabBaked = false;
     // Phase 1d compositor base: a never-composed copy of the latest V1
     // frame. m_lastSourceFrame may end up holding the post-composite image
@@ -1019,12 +1021,14 @@ private:
     void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special,
                         bool v1StabBaked);
     void pushV1StabilizerToGl(const PlaybackEntry &entry, bool special, bool v1StabBaked);
-    // US-2203: the source time the active V1 entry's stabilizer is sampled at.
-    qint64 v1StabilizerSourceUs(const PlaybackEntry &entry) const;
-    // US-2203: when `layers` holds a layer besides V1 (sequenceIdx != m_activeEntry),
-    // stabilizes V1's layer (sequenceIdx == m_activeEntry) in place and returns
-    // true; the canvas is never warped. V1 alone (or no active entry) is left to
-    // the GL and returns false.
+    // US-2301: the source time entry `entryIdx`'s stabilizer is sampled at, the
+    // position its decoder used (entryLocalPositionUs), on any track.
+    qint64 v1StabilizerSourceUs(int entryIdx) const;
+    // US-2203 / US-2301: when `layers` holds a layer besides the active entry's
+    // (sequenceIdx != m_activeEntry), stabilizes every layer that carries keys in
+    // place, each at its own source time, and returns true; the canvas is never
+    // warped. A frame with clip-local CPU FX (already stabilized) returns true too.
+    // A lone layer (or no active entry) is left to the GL and returns false.
     bool warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const;
     void setCompositeBakedModeForDisplay(bool baked);
     void endSpecialDisplayLatch();

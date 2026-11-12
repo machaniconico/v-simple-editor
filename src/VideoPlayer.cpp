@@ -184,9 +184,6 @@ bool shouldApplyCanvasPreviewStack(const QVector<VideoEffect> &evaluated,
 
 QImage warpV1LayerForPreview(const QImage &v1, const PlaybackEntry &entry, qint64 sourceUs)
 {
-    // US-2300: stabwarp::applyForExport warps every track now; VideoPlayer's own
-    // preview warp stays on V1 here until US-2301 removes this guard.
-    if (entry.sourceTrack != 0) return v1;
     ClipInfo clip;
     clip.stabilizerKeyframes = entry.stabilizerKeyframes;
     return stabwarp::applyForExport(v1, clip, entry.sourceTrack, /*sequenceDepth=*/0,
@@ -3599,10 +3596,10 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
         && m_activeEntry < m_sequence.size()) {
         entry = &m_sequence[m_activeEntry];
     }
-    // V1 alone: the GL stabilizes it, unless the clip-local CPU FX path already
-    // stabilized it before the FX (US-2204, preparePreviewClipFrame).
+    // A lone layer (any track, US-2301): the GL stabilizes it, unless the clip-local
+    // CPU FX path already stabilized it before the FX (US-2204, preparePreviewClipFrame).
     const ClipInfo *seekClip = entry ? clipForPlaybackEntry(previewTimeline(), *entry) : nullptr;
-    const bool v1StabBaked = seekClip && !seekClip->isAdjustment && entry->sourceTrack == 0
+    const bool v1StabBaked = seekClip && !seekClip->isAdjustment
         && hasClipLocalCpuFxAt(timelineUsec);
     if (!m_projectOutputSize.isValid()) {
         displayFrame(v1Image, false, timelineUsec, v1StabBaked);
@@ -3731,9 +3728,9 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
 // US-2202: the production compose + present on this player: the layers are
 // composed onto a copy of `canvasBase` (the callers' black canvas, V1 among the
 // layers with sequenceIdx == activeEntry) and the result goes through displayFrame
-// as the SSOT / playback paths hand it over (overlays baked). US-2203: V1's layer
-// is stabilized before the composite as the playback tick and the paused refresh
-// do (warpV1ForCpuComposite on their layers, before the fit).
+// as the SSOT / playback paths hand it over (overlays baked). US-2203 / US-2301:
+// the keyed layers are stabilized before the composite as the playback tick and
+// the paused refresh do (warpV1ForCpuComposite on their layers, before the fit).
 QImage VideoPlayer::composeAndPresentForTest(const QImage &canvasBase,
                                              const QVector<DecodedLayer> &layers,
                                              const QVector<PlaybackEntry> &seq,
@@ -3933,58 +3930,56 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     presentDisplay(composed, timelineUsec, special, v1StabBaked);
 }
 
-// US-2202: the active entry's V1 stabilizer for the GL: its keys, the size they
+// US-2202: the active entry's stabilizer for the GL: its keys, the size they
 // were analysed at (the entry's filePath may be a smaller proxy) and the source
-// time. US-2111: a shown special composite already has V1's layer stabilized on
-// the CPU (buildSpecialClipComposite), so the GL warps nothing. US-2203: neither
-// does a frame whose V1 stabilizer is baked (`v1StabBaked`).
+// time. US-2301: whichever track the entry is on, as the GL's single uStab is
+// bound to the lone layer shown. US-2111: a shown special composite already has
+// its layers stabilized on the CPU (buildSpecialClipComposite), so the GL warps
+// nothing. US-2203: neither does a frame whose keyed layers are baked (`v1StabBaked`).
 void VideoPlayer::pushV1StabilizerToGl(const PlaybackEntry &ae, bool special,
                                        bool v1StabBaked)
 {
-    if (ae.sourceTrack != 0 || special || v1StabBaked) {
+    if (special || v1StabBaked) {
         m_glPreview->setStabilizerKeyframes({});
         return;
     }
     m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
     m_glPreview->setStabilizerSourceSize(ae.stabilizerSourceSize);
-    m_glPreview->setStabilizerSourceTimeUs(v1StabilizerSourceUs(ae));
+    m_glPreview->setStabilizerSourceTimeUs(v1StabilizerSourceUs(m_activeEntry));
 }
 
-qint64 VideoPlayer::v1StabilizerSourceUs(const PlaybackEntry &ae) const
+// US-2301: an entry's keys are sampled at the position its decoder used
+// (entryLocalPositionUs: reversed and speed-ramp aware), on every track.
+qint64 VideoPlayer::v1StabilizerSourceUs(int entryIdx) const
 {
-    const double T = static_cast<double>(m_timelinePositionUs)
-                   / static_cast<double>(AV_TIME_BASE);
-    const double srcSec = playbackEntryIsReversed(previewTimeline(), ae, &m_reverseStates)
-        ? static_cast<double>(entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
-              / AV_TIME_BASE
-        : ae.clipIn + (T - ae.timelineStart) * ae.speed;
-    return static_cast<qint64>(srcSec * 1.0e6);
+    return entryLocalPositionUs(entryIdx, m_timelinePositionUs);
 }
 
 bool VideoPlayer::warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const
 {
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return false;
-    // US-2204: a frame with clip-local CPU FX has V1 stabilized before the FX in
-    // preparePreviewClipFrame (the layer is already warped, alone or not).
-    const PlaybackEntry &activeEntry = m_sequence[m_activeEntry];
-    const ClipInfo *activeClip = clipForPlaybackEntry(previewTimeline(), activeEntry);
-    if (activeEntry.sourceTrack == 0 && activeClip && !activeClip->isAdjustment
-        && hasClipLocalCpuFxAt(m_timelinePositionUs)) {
+    // US-2204: a frame with clip-local CPU FX has every keyed layer stabilized
+    // before the FX in preparePreviewClipFrame (US-2301: on any track, alone or
+    // not), so none is warped again here.
+    if (hasClipLocalCpuFxAt(m_timelinePositionUs))
         return true;
-    }
     const bool overlay = std::any_of(
         layers.cbegin(), layers.cend(),
         [this](const DecodedLayer &L) { return L.sequenceIdx != m_activeEntry; });
     if (!overlay)
         return false;
-    // The GL would warp the whole composite (the other layers too), so V1's layer
-    // is warped here and the GL gets no keys.
-    const PlaybackEntry &entry = m_sequence[m_activeEntry];
-    const qint64 sourceUs = v1StabilizerSourceUs(entry);
+    // The GL would warp the whole composite (the other layers too), so every layer
+    // that carries keys is warped here, each at its own source time (US-2301), and
+    // the GL gets no keys.
     for (DecodedLayer &L : layers) {
-        if (L.sequenceIdx == m_activeEntry && !L.rgb.isNull())
-            L.rgb = videopreview::warpV1LayerForPreview(L.rgb, entry, sourceUs);
+        if (L.rgb.isNull() || L.sequenceIdx < 0 || L.sequenceIdx >= m_sequence.size())
+            continue;
+        const PlaybackEntry &entry = m_sequence[L.sequenceIdx];
+        if (entry.stabilizerKeyframes.isEmpty())
+            continue;
+        L.rgb = videopreview::warpV1LayerForPreview(L.rgb, entry,
+                                                    v1StabilizerSourceUs(L.sequenceIdx));
     }
     return true;
 }
@@ -4029,10 +4024,10 @@ void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
             else if (m_hdrInfo.trc == AVCOL_TRC_ARIB_STD_B67) hdrTransfer = 2;
         }
         m_glPreview->setHdrTransfer(hdrTransfer);
-        // US-INT-4: push the active entry's stabilizer keyframes (V1 only;
-        // higher-track stabilization is a follow-up) and the current source
-        // time so GLPreview's binary-search lookup can pick the matching
-        // keyframe and bake the inverse 2D affine pre-warp.
+        // US-INT-4: push the active entry's stabilizer keyframes (any track,
+        // US-2301) and the current source time so GLPreview's binary-search
+        // lookup can pick the matching keyframe and bake the inverse 2D affine
+        // pre-warp.
         if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size())
             pushV1StabilizerToGl(m_sequence[m_activeEntry], !special.isNull(),
                                  v1StabBaked);
@@ -4255,11 +4250,12 @@ QImage VideoPlayer::preparePreviewClipFrame(
             // for the composited frame. Bake every active clip independently
             // so [GPU FX, CPU FX] order, masks, and track isolation are kept.
             const QSize echoRenderSize = source.size();
-            // US-2204: V1's stabilizer goes before the clip-local FX; the caller
+            // US-2204: the stabilizer goes before the clip-local FX; the caller
             // hands the frame on as baked (clipFxApplied) so the GL warps nothing.
-            // A stabilized V1 echo sample is raw here: prepareClipForCpuComposite
-            // warps it, then applies VFX / grade (export order).
-            const bool stabV1 = entryIndex == m_activeEntry && entry.sourceTrack == 0;
+            // A stabilized echo sample is raw here: prepareClipForCpuComposite
+            // warps it, then applies VFX / grade (export order). US-2301: every
+            // entry that carries keys, on any track.
+            const bool stabV1 = !entry.stabilizerKeyframes.isEmpty();
             tlrender::EchoFrameProvider echoFrameProvider;
             if (hasEcho) {
                 const ClipInfo sourceClipSnapshot = *sourceClip;
@@ -4837,8 +4833,7 @@ void VideoPlayer::restoreStillCompareGlState()
     m_glPreview->setTimeline(const_cast<Timeline *>(m_stillCompareGlTimeline));
     restorePreviewPostEffects();
     if (sequenceActive() && m_activeEntry >= 0
-        && m_activeEntry < m_sequence.size()
-        && m_sequence[m_activeEntry].sourceTrack == 0) {
+        && m_activeEntry < m_sequence.size()) {
         m_glPreview->setStabilizerKeyframes(
             m_sequence[m_activeEntry].stabilizerKeyframes);
     } else {
@@ -5983,7 +5978,8 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     if (m_parentAdmissionObservation)
         recordParentAdmissionForTest("cpu-composite", layers, canvasSize);
 
-    // US-2203: with other layers V1's layer is stabilized here, before the fit.
+    // US-2203: with other layers every keyed layer (US-2301: any track) is
+    // stabilized here, before the fit.
     const bool v1StabBaked = warpV1ForCpuComposite(layers);
     for (DecodedLayer &layer : layers) {
         layer.rgb = snsfit::maybeFit(
@@ -6988,8 +6984,9 @@ void VideoPlayer::handlePlaybackTick()
             recordParentAdmissionForTest("multi-track", layers,
                                          QSize(canvasW, canvasH));
         }
-        // US-2203: with other layers V1's layer is stabilized here, before the
-        // fit, for every composite below (GPU input included).
+        // US-2203: with other layers every keyed layer (US-2301: any track) is
+        // stabilized here, before the fit, for every composite below (GPU input
+        // included).
         const bool v1StabBaked = warpV1ForCpuComposite(layers);
         for (DecodedLayer &L : layers) {
             {
