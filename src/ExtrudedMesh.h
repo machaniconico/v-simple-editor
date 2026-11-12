@@ -83,7 +83,9 @@ QString extrudeMeshCacheKey(const QString &text, const QFont &font, const Extrud
 /* Build an extruded TriMesh from 2D contours.
  * Produces front cap, back cap, side walls, and optional bevel.
  * The parameters are sanitised first (sanitizeExtrudeParams); a profile whose
- * vertex count would exceed kMaxExtrudeVertices falls back to no bevel.
+ * vertex count would exceed kMaxExtrudeVertices is rebuilt with one bevel segment
+ * fewer at a time (the largest count that fits), and falls back to no bevel only
+ * when even one segment does not fit.
  * *changed is set when either fallback altered the requested mesh. */
 TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParams &params,
                           bool *changed = nullptr);

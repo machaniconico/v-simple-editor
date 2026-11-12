@@ -882,7 +882,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "text3d-export", "VEDITOR_TEXT3D_EXPORT_SELFTEST", runText3dExportSelftest, true,
       "3D text export: drawn on the clip layer source after the mask and before placement, empty configs unchanged, z order, transform, time, worker thread, production path, transition neighbour (10 gates)" },
     { "extrude-mesh", "VEDITOR_EXTRUDE_MESH_SELFTEST", runExtrudeMeshSelftest, true,
-      "Extruded mesh guard: parameters sanitised in the builder, step limit and vertex budget fall back to no bevel, shared cache key and MCP limits (G1-G7) (7 gates)" },
+      "Extruded mesh guard: parameters sanitised in the builder, step limit, vertex budget reduces bevel segments one at a time to the largest that fits (no bevel if one does not fit), shared cache key and MCP limits (G1-G7) (7 gates)" },
     { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
       "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (18 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,

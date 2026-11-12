@@ -2,6 +2,7 @@
 #include "../ExtrudedMesh.h"
 #include "../ProjectFile.h"
 #include "../ShapeLayer.h"
+#include "../SoftRaster3D.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 
@@ -14,6 +15,7 @@
 #include <QImage>
 #include <QJsonObject>
 #include <QString>
+#include <QStringList>
 
 #include <windows.h>
 #include <psapi.h>
@@ -203,6 +205,15 @@ QJsonObject text3DConfig(double depth, double bevelDepth, int segs)
                        {QStringLiteral("extrudeBevelSegments"), segs}};
 }
 
+QStringList *g_g7Warnings = nullptr;
+QtMessageHandler g_g7PreviousHandler = nullptr;
+
+void captureG7Warning(QtMsgType type, const QMessageLogContext &, const QString &msg)
+{
+    if (type == QtWarningMsg && g_g7Warnings && msg.contains(QStringLiteral("buildExtrudedMesh")))
+        g_g7Warnings->append(msg);
+}
+
 } // namespace
 
 int runExtrudeMeshSelftest()
@@ -356,31 +367,114 @@ int runExtrudeMeshSelftest()
     }
 
     // G7: vertex budget. N glyphs of "A" at depth 8.5e-4 / bevel 1.0 / 8 segments exceed 2e6 profile
-    // vertices while staying under the step limit, so the builder drops the bevel.
+    // vertices while staying under the step limit. The builder reduces the segment count one step at a
+    // time to the largest count that fits (N = 4 -> 6, not the halving 4), and drops the bevel only when
+    // one segment does not fit (N = 18).
     {
         const ExtrudeParams p = EP(8.5e-4, 1.0, 1.0, 8);
+        const auto glyphs = [&](int n) {
+            QVector<QPolygonF> c;
+            for (int i = 0; i < n; ++i)
+                c += cA;
+            return c;
+        };
+        // Expected result from the profileSteps formula alone: the largest s in 1..requested whose
+        // layers fit the budget, or 0 (no bevel) when s = 1 does not fit.
+        const auto expectedSegs = [&](int n) {
+            for (int s = p.bevelSegments; s >= 1; --s)
+                if (qint64(profileSteps(EP(8.5e-4, 1.0, 1.0, s))) * n * vA <= mesh3d::kMaxExtrudeVertices)
+                    return s;
+            return 0;
+        };
         const int P = profileSteps(p);
-        const qint64 perGlyph = qint64(P) * vA;
-        const int N = vA > 0 ? int(std::ceil(2.0e6 / double(perGlyph))) + 1 : 0;
-        QVector<QPolygonF> cN;
-        for (int i = 0; i < N; ++i)
-            cN += cA;
-        const qint64 total = qint64(P) * N * vA;
         const quint64 wsBefore = workingSetMB(false);
-        const Built over = build(cN, p);
-        const Built flat = build(cN, EP(8.5e-4, 1.0, 1.0, 0));
+
+        // (a) N = 4: 8 does not fit, the largest that fits is 6; the mesh equals one built at 6 requested.
+        const int nA = 4;
+        const QVector<QPolygonF> cNa = glyphs(nA);
+        const int kA = expectedSegs(nA);
+        QStringList warnings;
+        g_g7Warnings = &warnings;
+        g_g7PreviousHandler = qInstallMessageHandler(captureG7Warning);
+        const Built over = build(cNa, p);
+        qInstallMessageHandler(g_g7PreviousHandler);
+        g_g7Warnings = nullptr;
+        const Built atK = build(cNa, EP(8.5e-4, 1.0, 1.0, 6));
+        const QString expectedNote = QStringLiteral("bevel segments 8 -> 6");
+        const bool warnOk = warnings.size() == 1 && warnings.first().contains(expectedNote);
+
+        // (b) N = 18: one segment does not fit either -> no bevel (HEAD behaviour).
+        const int nB = 18;
+        const QVector<QPolygonF> cNb = glyphs(nB);
+        const int kB = expectedSegs(nB);
+        QStringList warningsB;
+        g_g7Warnings = &warningsB;
+        g_g7PreviousHandler = qInstallMessageHandler(captureG7Warning);
+        const Built none = build(cNb, p);
+        qInstallMessageHandler(g_g7PreviousHandler);
+        g_g7Warnings = nullptr;
+        const Built flatB = build(cNb, EP(8.5e-4, 1.0, 1.0, 0));
+        const bool warnBOk = warningsB.size() == 1 && warningsB.first().contains(QStringLiteral("(no bevel)"));
+
+        // (c) within the budget nothing changes (the 1-glyph default and the 1-glyph 8-segment case).
         const Built control = build(cA, ExtrudeParams());
-        const bool ok = total > 2000000 && mesh3d::extrudeMidSteps(p) <= mesh3d::kMaxExtrudeMidSteps
-            && over.ms <= kRenderLimitMs && over.mesh.positions.size() == flat.mesh.positions.size()
-            && over.changed && !control.changed;
-        tally.gate(7, ok, "vA=" + std::to_string(vA) + " P=" + std::to_string(P) + " N=" + std::to_string(N)
-                              + " P*N*vA=" + std::to_string(total) + " midSteps=" + num(mesh3d::extrudeMidSteps(p))
-                              + " ms=" + std::to_string(over.ms) + " verts=" + std::to_string(over.mesh.positions.size())
-                              + " segs0 verts=" + std::to_string(flat.mesh.positions.size())
-                              + " changed=" + std::to_string(over.changed)
-                              + " control(1 glyph default) changed=" + std::to_string(control.changed)
+        const Built inBudget = build(cA, p);
+        const Built inBudgetSame = build(cA, p);
+
+        // (d) every leg stays inside the vertex budget, derived from the mesh itself: the builder's metric
+        // (profile.size() * totalContourVertices) is layers * n * vA, and each layer carries n * (vA +
+        // one centroid per ring) mesh positions, so layers = positions / perLayer.
+        const auto meshWithinBudget = [&](const Built &b, int n) {
+            const qint64 perLayer = qint64(n) * (vA + cA.size());
+            const qint64 positions = b.mesh.positions.size();
+            return positions % perLayer == 0 && (positions / perLayer) * n * vA <= mesh3d::kMaxExtrudeVertices;
+        };
+        const bool budgetOk = meshWithinBudget(over, nA) && meshWithinBudget(none, nB);
+
+        // (e) the N = 4 mesh rendered through the soft rasteriser stays inside the render time limit
+        // together with its build (Text3DLayer render parameters, fixed yaw / pitch).
+        softras::RenderParams rp;
+        rp.background = QColor(0, 0, 0, 0);
+        rp.wireframe = false;
+        QElapsedTimer rasterTimer;
+        rasterTimer.start();
+        const QImage rasterImg = softras::renderMeshAuto(over.mesh, QSize(kW, kH), 0.0, 0.0, 3.0, rp);
+        const qint64 rasterMs = rasterTimer.elapsed();
+        const bool rasterOk = !rasterImg.isNull() && over.ms + rasterMs <= kRenderLimitMs;
+
+        const qint64 totalA = qint64(P) * nA * vA;
+        const qint64 totalB = qint64(P) * nB * vA;
+        const bool ok = totalA > mesh3d::kMaxExtrudeVertices && totalB > mesh3d::kMaxExtrudeVertices
+            && mesh3d::extrudeMidSteps(p) <= mesh3d::kMaxExtrudeMidSteps
+            && kA == 6 && kB == 0
+            && sameMesh(over.mesh, atK.mesh) && over.mesh.positions.size() > flatB.mesh.positions.size()
+            && over.changed && warnOk
+            && sameMesh(none.mesh, flatB.mesh) && none.changed && warnBOk
+            && !control.changed && !inBudget.changed && sameMesh(inBudget.mesh, inBudgetSame.mesh)
+            && budgetOk && rasterOk
+            && over.ms <= kRenderLimitMs && none.ms <= kRenderLimitMs;
+        tally.gate(7, ok, "vA=" + std::to_string(vA) + " P(8)=" + std::to_string(P)
+                              + " midSteps=" + num(mesh3d::extrudeMidSteps(p))
+                              + " ; (a) N=" + std::to_string(nA) + " P*N*vA=" + std::to_string(totalA)
+                              + " expectedSegs=" + std::to_string(kA) + " verts=" + std::to_string(over.mesh.positions.size())
+                              + " atSegs6 verts=" + std::to_string(atK.mesh.positions.size())
+                              + " sameMesh=" + std::to_string(sameMesh(over.mesh, atK.mesh))
+                              + " changed=" + std::to_string(over.changed) + " warnNote=" + std::to_string(warnOk)
+                              + " ms=" + std::to_string(over.ms)
+                              + " ; (b) N=" + std::to_string(nB) + " P*N*vA=" + std::to_string(totalB)
+                              + " expectedSegs=" + std::to_string(kB) + " verts=" + std::to_string(none.mesh.positions.size())
+                              + " segs0 verts=" + std::to_string(flatB.mesh.positions.size())
+                              + " sameMesh=" + std::to_string(sameMesh(none.mesh, flatB.mesh))
+                              + " changed=" + std::to_string(none.changed) + " warnNoBevel=" + std::to_string(warnBOk)
+                              + " ms=" + std::to_string(none.ms)
+                              + " ; (c) control changed=" + std::to_string(control.changed)
                               + " verts=" + std::to_string(control.mesh.positions.size())
-                              + " workingSetMB before=" + std::to_string(wsBefore)
+                              + " 1-glyph segs8 changed=" + std::to_string(inBudget.changed)
+                              + " verts=" + std::to_string(inBudget.mesh.positions.size())
+                              + " ; (d) budgetOk=" + std::to_string(budgetOk)
+                              + " ; (e) N=4 k=6 rasterMs=" + std::to_string(rasterMs) + " buildMs=" + std::to_string(over.ms)
+                              + " total=" + std::to_string(over.ms + rasterMs) + " null=" + std::to_string(rasterImg.isNull())
+                              + " ; workingSetMB before=" + std::to_string(wsBefore)
                               + " after=" + std::to_string(workingSetMB(false))
                               + " peak=" + std::to_string(workingSetMB(true)));
     }
