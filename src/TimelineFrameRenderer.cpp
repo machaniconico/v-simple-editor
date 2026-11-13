@@ -3411,6 +3411,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 d.matteType = static_cast<gpucomposite::MatteType>(
                     static_cast<int>(rl.layer.matteType));
                 d.matteSourceIndex = rl.layer.matteSourceLayerIndex;
+                d.blendModeOrdinal = static_cast<int>(rl.layer.blendMode);
                 descs.append(d);
 
                 QImage img = rl.image;
