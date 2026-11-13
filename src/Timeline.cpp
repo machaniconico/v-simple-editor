@@ -22,6 +22,7 @@
 #include "DynamicZoom.h"
 #include "OverlayDialogs.h"
 #include "ProjectFile.h"
+#include "JsonNumberClamp.h"
 #include "WaveformGenerator.h"
 #include "MusicRemixDialog.h"
 #include "ShapeModifierDialog.h"
@@ -513,9 +514,15 @@ QJsonObject decodeSequenceStoreObject(const QString &encoded)
 {
     if (encoded.isEmpty())
         return {};
-    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromBase64(encoded.toLatin1()));
+    const QByteArray decoded = QByteArray::fromBase64(encoded.toLatin1());
+    QJsonDocument doc = QJsonDocument::fromJson(decoded);
     if (doc.isNull())
         doc = QJsonDocument::fromJson(encoded.toUtf8());
+    // Only a store the plain parse refused may carry an out-of-range literal (1e400).
+    if (doc.isNull())
+        doc = jsonclamp::parseWithClampFallback(decoded);
+    if (doc.isNull())
+        doc = jsonclamp::parseWithClampFallback(encoded.toUtf8());
     return doc.isObject() ? doc.object() : QJsonObject{};
 }
 } // namespace timeline_nesting

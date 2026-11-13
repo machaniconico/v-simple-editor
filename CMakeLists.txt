@@ -607,6 +607,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIUpscale.cpp
     src/FrameInterpolator.cpp
     src/ProjectFile.cpp
+    src/JsonNumberClamp.h
+    src/JsonNumberClamp.cpp
     src/MediaPaths.h
     src/MediaPaths.cpp
     src/MediaRelinkDialog.h

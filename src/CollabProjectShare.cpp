@@ -1,4 +1,5 @@
 #include "CollabProjectShare.h"
+#include "JsonNumberClamp.h"
 
 #include <QFile>
 #include <QJsonDocument>
@@ -58,7 +59,7 @@ ImportResult importProject(const QString &inPath)
 
     const QByteArray bytes = f.readAll();
     QJsonParseError parseError;
-    QJsonDocument doc = QJsonDocument::fromJson(bytes, &parseError);
+    QJsonDocument doc = jsonclamp::parseWithClampFallback(bytes, &parseError);
     if (doc.isNull()) {
         result.warning = QStringLiteral("JSON parse error: ") + parseError.errorString();
         return result;
