@@ -346,6 +346,10 @@ public:
         int activeEntry, qint64 timelineUsec, bool transitionsAlreadyApplied = false);
     // Test-only seam for grade-keyframe GPU-preview wiring.
     bool pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelineUsec);
+    // US-2302 test seam: decodes the decoder's next frame (consuming it, without
+    // displaying it) and returns its source time in microseconds, -1 at EOF / on
+    // failure. Tells where a seek or a frame step left the decoder.
+    qint64 nextDecodedSourceUsForTest();
 
     // US-910 PARENT-OBS test seam (video-player-parent selftest). While ON,
     // each resolveDecodedLayerParentSources call in the two real layer
@@ -457,7 +461,10 @@ private:
     // would otherwise snap the playhead back to the active entry's
     // file-local PTS, undoing the step).
     void forceTimelineUiToCurrent();
-    bool seekInternal(int64_t positionUs, bool displayFrame, bool precise);
+    // decodeWithoutDisplay (US-2302): with displayFrame false, still decode to the
+    // target (and refresh the frame cache) without presenting the frame.
+    bool seekInternal(int64_t positionUs, bool displayFrame, bool precise,
+                      bool decodeWithoutDisplay = false);
     bool decodeNextFrame(bool displayFrame);
     bool presentDecodedFrame(AVFrame *frame, bool displayFrame);
     // Phase 1e — V1 fast path is opt-in via VEDITOR_GL_INTEROP=1 and limited

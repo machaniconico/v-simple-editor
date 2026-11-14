@@ -568,6 +568,29 @@ bool timelineHasActiveReversedSequenceReference(
     return false;
 }
 
+// US-2302: how a paused frame at `timelineUs` is shown. SeekOnly = the frames the
+// nested-sequence SSOT drew before (a reversed reference, a shape clip or a hidden
+// clip): a seek there only moves the decoder. KeepDecoder = any other active sequence
+// reference: shown through the SSOT too, while a seek still decodes to the target.
+// None = the flattened entry frame.
+enum class NestedPreview { None, SeekOnly, KeepDecoder };
+
+NestedPreview nestedSequencePreviewMode(const Timeline *timeline, qint64 timelineUs)
+{
+    if (timelineHasActiveReversedSequenceReference(timeline, timelineUs)
+        || timelineHasActiveShapeClip(timeline, timelineUs))
+        return NestedPreview::SeekOnly;
+    if (timelineHasActiveSequenceReference(timeline, timelineUs))
+        return NestedPreview::KeepDecoder;
+    return NestedPreview::None;
+}
+
+// The frames the SSOT shows, paused or playing (any sequence reference or shape clip).
+bool nestedSequencePreviewActive(const Timeline *timeline, qint64 timelineUs)
+{
+    return nestedSequencePreviewMode(timeline, timelineUs) != NestedPreview::None;
+}
+
 int previewPrimaryEntryIndexAt(const Timeline *timeline,
                                const QVector<PlaybackEntry> &sequence,
                                int preferredIdx,
@@ -2236,15 +2259,16 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     m_timelinePositionUs = clamped;
 
     if (entryStructurallyChanged) {
-        const bool nestedSequencePreview =
-            timelineHasActiveReversedSequenceReference(timeline, clamped)
-            || shapePreviewActive;
+        const NestedPreview nestedMode =
+            nestedSequencePreviewMode(timeline, clamped);
+        const bool nestedSequencePreview = nestedMode != NestedPreview::None;
         const int64_t localUs = decodableSourcePositionUs(
             timeline, target, clamped,
             entryLocalPositionUs(desiredIdx, clamped),
             m_frameDurationUs, &m_reverseStates);
         undotrace::log("setSeq:beforeSeek");
-        seekInternal(localUs, !nestedSequencePreview, true);
+        seekInternal(localUs, !nestedSequencePreview, true,
+                     nestedMode == NestedPreview::KeepDecoder);
         if (nestedSequencePreview
             && !displayNestedSequenceFrameAt(timeline, clamped)) {
             // Offline/missing nested media keeps the historic flattened
@@ -2522,8 +2546,7 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
 bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
                                                int64_t timelineUs)
 {
-    if (!timelineHasActiveReversedSequenceReference(timeline, timelineUs)
-        && !timelineHasActiveShapeClip(timeline, timelineUs))
+    if (!nestedSequencePreviewActive(timeline, timelineUs))
         return false;
     QSize renderSize = m_projectOutputSize.isValid()
         ? m_projectOutputSize
@@ -2544,6 +2567,7 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     // US-2203: renderFrameAt has stabilized V1 (stabwarp::applyForExport).
     cachePreviewComposite(ssotFrame, true);
     m_lastFrameTransitionsApplied = true;
+    m_lastFrameOdtApplied = false;
     displayFrame(ssotFrame, true, timelineUs, true);
     return true;
 }
@@ -2606,15 +2630,15 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     m_activeEntry = idx;
     m_timelinePositionUs = timelineUs;
     const Timeline *previewTimeline = this->previewTimeline();
-    const bool nestedSequencePreview =
-        timelineHasActiveReversedSequenceReference(
-            previewTimeline, timelineUs)
-        || timelineHasActiveShapeClip(previewTimeline, timelineUs);
+    const NestedPreview nestedMode =
+        nestedSequencePreviewMode(previewTimeline, timelineUs);
+    const bool nestedSequencePreview = nestedMode != NestedPreview::None;
     const int64_t localUs = decodableSourcePositionUs(
         previewTimeline, e, timelineUs,
         entryLocalPositionUs(idx, timelineUs),
         m_frameDurationUs, &m_reverseStates);
-    bool ok = seekInternal(localUs, !nestedSequencePreview, precise);
+    bool ok = seekInternal(localUs, !nestedSequencePreview, precise,
+                           nestedMode == NestedPreview::KeepDecoder);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(previewTimeline, timelineUs);
     if (nestedSequenceRendered)
@@ -2734,12 +2758,12 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         previewTimeline, next, m_timelinePositionUs,
         entryLocalPositionUs(newEntryIdx, m_timelinePositionUs),
         m_frameDurationUs, &m_reverseStates);
-    const bool nestedSequencePreview =
-        timelineHasActiveReversedSequenceReference(
-            previewTimeline, m_timelinePositionUs)
-        || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs);
+    const NestedPreview nestedMode =
+        nestedSequencePreviewMode(previewTimeline, m_timelinePositionUs);
+    const bool nestedSequencePreview = nestedMode != NestedPreview::None;
     bool seekOk = seekInternal(
-        startLocalUs, !nestedSequencePreview, true);
+        startLocalUs, !nestedSequencePreview, true,
+        nestedMode == NestedPreview::KeepDecoder);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(
             previewTimeline, m_timelinePositionUs);
@@ -3276,20 +3300,42 @@ void VideoPlayer::stepForward()
     const bool reverseTimelineDriven = activeReversed
         || timelineHasActiveReversedSequenceReference(
             timeline, m_timelinePositionUs);
-    if (reverseTimelineDriven) {
+    // US-2302: the nested-sequence SSOT shows the frames where the helper says so,
+    // decided at the step's target time (a step can enter an interval while the
+    // active entry stays the same). Leaving an interval inside the active entry
+    // seeks, so the flattened frame, the baked mode and the transform are set up
+    // as a seek sets them.
+    const bool ssotAtTarget = nestedSequencePreviewActive(timeline, newPos);
+    const bool ssotAtCurrent =
+        nestedSequencePreviewActive(timeline, m_timelinePositionUs);
+    if (reverseTimelineDriven
+        || (idx == m_activeEntry && ssotAtCurrent && !ssotAtTarget)) {
         seekToTimelineUs(newPos, /*precise=*/true);
         m_timelinePositionUs = newPos;
         forceTimelineUiToCurrent();
         return;
     }
-    if (decodeNextFrame(true)) {
+    // Into or inside an SSOT interval the decoder still advances one frame, as a
+    // forward playback tick does: the flattened display deferred, then the SSOT.
+    m_deferDisplayThisTick = ssotAtTarget;
+    const bool advanced = decodeNextFrame(true);
+    m_deferDisplayThisTick = false;
+    if (advanced) {
         const int64_t projected = (m_activeEntry >= 0
                 && m_activeEntry < static_cast<int>(m_sequence.size()))
             ? fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs)
             : newPos;
         m_timelinePositionUs = qMax(projected, newPos);
-        forceTimelineUiToCurrent();
-        return;
+        if (!ssotAtTarget) {
+            forceTimelineUiToCurrent();
+            return;
+        }
+        if (!nestedSequencePreviewActive(timeline, m_timelinePositionUs))
+            m_timelinePositionUs = newPos;
+        if (displayNestedSequenceFrameAt(timeline, m_timelinePositionUs)) {
+            forceTimelineUiToCurrent();
+            return;
+        }
     }
 
     // EOF on the active source — fall back to seekToTimelineUs which
@@ -3723,6 +3769,11 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     const bool pushed = pushActiveClipColorCorrectionToGlPreview();
     m_timelinePositionUs = previousTimelineUsec;
     return pushed;
+}
+
+qint64 VideoPlayer::nextDecodedSourceUsForTest()
+{
+    return decodeNextFrame(false) ? m_currentPositionUs : -1;
 }
 
 // US-2202: the production compose + present on this player: the layers are
@@ -5512,7 +5563,8 @@ void VideoPlayer::updatePositionUi()
     emit positionChanged(static_cast<double>(displayUs) / AV_TIME_BASE);
 }
 
-bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise)
+bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise,
+                               bool decodeWithoutDisplay)
 {
     undotrace::log("seek:enter");
     if (!m_formatCtx || !m_codecCtx || m_videoStreamIndex < 0)
@@ -5528,7 +5580,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
     avcodec_flush_buffers(m_codecCtx);
     m_currentPositionUs = targetUs;
 
-    if (!displayFrame) {
+    if (!displayFrame && !decodeWithoutDisplay) {
         updatePositionUi();
         return true;
     }
@@ -5561,32 +5613,37 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
                 previewTimeline, m_timelinePositionUs);
         const bool shapeTimelineDriven = timelineHasActiveShapeClip(
             previewTimeline, m_timelinePositionUs);
-        if (reverseTimelineDriven || shapeTimelineDriven) {
+        if (reverseTimelineDriven || shapeTimelineDriven || decodeWithoutDisplay) {
             // The normal streaming path fills these caches in
             // presentDecodedFrame(). Reverse playback seeks instead, so keep
-            // the compositor's V1 source current here as well.
+            // the compositor's V1 source current here as well. US-2302: so does
+            // a KeepDecoder seek, whose paused frame a clip-local CPU preview
+            // (refreshPreviewClipCpuComposite) composes from.
             m_lastV1RawFrame = image;
             m_lastSourceFrame = image;
             m_lastSourceFrameHasBakedText = false;
             m_lastSourceFrameV1StabBaked = false; // US-2203: a raw V1 frame
         }
-        // This path displays a non-baked frame.
-        QImage displayImage = image;
-        if (sequenceActive()
-            && m_activeEntry >= 0
-            && m_activeEntry < m_sequence.size()) {
-            const auto &entry = m_sequence[m_activeEntry];
-            displayImage = preparePreviewClipFrame(
-                displayImage, entry, m_activeEntry,
-                static_cast<double>(targetUs) / AV_TIME_BASE,
-                QSize(displayable->width, displayable->height),
-                m_timelinePositionUs);
+        // This path displays a non-baked frame (decodeWithoutDisplay: the
+        // caller shows the frame through the nested-sequence SSOT instead).
+        if (displayFrame) {
+            QImage displayImage = image;
+            if (sequenceActive()
+                && m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                displayImage = preparePreviewClipFrame(
+                    displayImage, entry, m_activeEntry,
+                    static_cast<double>(targetUs) / AV_TIME_BASE,
+                    QSize(displayable->width, displayable->height),
+                    m_timelinePositionUs);
+            }
+            m_lastFrameOdtApplied = false;
+            if (!reverseTimelineDriven || !m_deferDisplayThisTick)
+                this->displaySeekFrameConformed(
+                    displayImage,
+                    sequenceActive() ? m_timelinePositionUs : targetUs);
         }
-        m_lastFrameOdtApplied = false;
-        if (!reverseTimelineDriven || !m_deferDisplayThisTick)
-            this->displaySeekFrameConformed(
-                displayImage,
-                sequenceActive() ? m_timelinePositionUs : targetUs);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -6018,6 +6075,13 @@ void VideoPlayer::refreshDisplayedFrame()
     if (refreshPreviewClipCpuComposite())
         return;
 
+    // US-2302: in a nested-sequence SSOT interval a frame the CPU preview
+    // composed above (no baked text) goes back to the SSOT once that preview
+    // is gone.
+    if (!m_lastSourceFrameHasBakedText
+        && displayNestedSequenceFrameAt(previewTimeline(), m_timelinePositionUs))
+        return;
+
     if (m_lastSourceFrameHasBakedText) {
         const Timeline *previewTimeline = this->previewTimeline();
         QSize renderSize = m_projectOutputSize.isValid()
@@ -6388,8 +6452,7 @@ void VideoPlayer::handlePlaybackTick()
     const bool nestedSequenceActive =
         m_playbackSpeed >= 0.0
         && sequenceActive()
-        && (timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs)
-            || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs));
+        && nestedSequencePreviewActive(previewTimeline, m_timelinePositionUs);
     const bool forceProjectOutputComposite =
         m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
