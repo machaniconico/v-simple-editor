@@ -1282,9 +1282,9 @@ int runBrushExportSelftest()
         // {}, while the same timeline without them does not. (2) V2 parented to V1
         // (V2 starts after t, so the player decodes V1 alone and the GL holds the
         // timeline): {} and the bound brush is drawn on the decoded frame
-        // (== renderClipSourceAt, the G6 shape). (4) A VFX Multiply V2 with a matte
-        // source in the timeline: helper false only (the matte makes the composite
-        // non-null). A non-VFX blend is eligible: special-composite G17.
+        // (== renderClipSourceAt, the G6 shape). (4) A VFX Multiply V2 takes the
+        // special path with or without a matte source (US-2303; the composite
+        // match is special-composite G18). A non-VFX blend is eligible: special-composite G17.
         {
             ClipInfo lateNormalV2 = v2Clip;
             lateNormalV2.leadInSec = 2.0;
@@ -1319,7 +1319,7 @@ int runBrushExportSelftest()
             const qint64 brushVisible = diffPixels(exported,
                 tlrender::renderClipSourceAt(plainTl.get(), 0, 0, us(t)));
             const bool same = samePixels(upload, exported);
-            // (4) The matte source decides: the same VFX Multiply without it is eligible.
+            // (4) A VFX Multiply V2 is eligible with or without a matte source (US-2303).
             ClipInfo vfxV2 = v2Clip;
             vfxV2.isVfxFootage = true;
             vfxV2.blendMode = BlendMode::Multiply;
@@ -1402,14 +1402,15 @@ int runBrushExportSelftest()
                       << " brushProgressOnlySpecial=" << controlSpecial << " (expect 1)"
                       << " brushProgressOnly=" << brushProgressOnly
                       << " vfxMultiply special noMatte/matte=" << vfxNoMatteSpecial << '/'
-                      << vfxMatteSpecial << " (expect 1/0)" << '\n';
+                      << vfxMatteSpecial << " (expect 1/1)" << '\n';
             tally.gate(14, movieOk && mainTimeline && !activeComposite.isNull()
                                && !normalComposite.isNull() && parentComposite.isNull()
                                && decoded == QSize(160, 90) && !baked && same && brushVisible > 100
                                && excludedLegacy && controlSpecial && brushProgressOnly
-                               && vfxNoMatteSpecial && !vfxMatteSpecial,
+                               && vfxNoMatteSpecial && vfxMatteSpecial,
                        "an ineligible brushed timeline left the legacy preview path (composite "
-                       "built or the selected-clip brush upload changed)");
+                       "built or the selected-clip brush upload changed), or a VFX blend "
+                       "with a matte source dropped off the special path");
         }
 
         // G15-G17 (US-1906): the special path is decided from the clips active at
