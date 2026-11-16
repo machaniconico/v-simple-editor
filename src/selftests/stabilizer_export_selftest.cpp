@@ -4,11 +4,18 @@
 // clamp-to-edge bilinear sampling; the special-composite preview warps V1's layer
 // the same way. Fixture: a 64x64 project, 60-frame `%03d` PNG sequences (black,
 // opaque, 2x2 white dots) written here, so the fit is the identity and a source
-// pixel lands on the same output pixel.
+// pixel lands on the same output pixel. US-2300: every layer that carries keys is
+// warped (upper tracks, a nested child at its own source time); G13 / G14. US-2301:
+// VideoPlayer's own preview warp too, at the position each layer's decoder used; G15.
+// US-2302: a paused nested sequence (seek, frame step, entry change, sequence
+// update) shows the nested-sequence SSOT with the decoder kept in place; G16.
 #include "../BrushAnimation.h"
+#include "../Camera3D.h"
+#include "../OnionSkin.h"
 #include "../GLPreview.h"
 #include "../Keyframe.h"
 #include "../MainWindow.h"
+#include "../ShapeLayer.h"
 #include "../StabilizerWarp.h"
 #include "../StillCompare.h"
 #include "../Timeline.h"
@@ -22,6 +29,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QImage>
 #include <QJsonObject>
@@ -31,13 +39,23 @@
 #include <QTemporaryDir>
 #include <QVector>
 
+#include <QApplication>
+#include <QSignalBlocker>
+
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <vector>
+
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+}
 
 namespace {
 
@@ -250,6 +268,176 @@ Box diffBox(const QImage &a, const QImage &b)
     return box;
 }
 
+// US-2302 G16 media: 256x144 30 fps mpeg4 movies, a 12x12 white box on a flat
+// background whose place names the source frame (n), so neighbouring frames differ
+// in 288 pixels and a picture tells which source frame (and stabilizer shift) it is.
+constexpr int kMovW = 256;
+constexpr int kMovH = 144;
+constexpr int kMovFrames = 150;
+
+qint64 frameUs(int n) { return qint64(n) * 1000000 / kFps; }
+// The nearest frame index of a time.
+int frameAt(qint64 usec) { return int((usec * kFps + 500000) / 1000000); }
+// The source frame a paused seek to `usec` shows: the first whose start is at or
+// after it (VideoPlayer and renderFrameAt decode up to the target; 1 ms slack).
+int shownFrameAt(qint64 usec) { return int((usec * kFps - 1000 + 999999) / 1000000); }
+QPoint movBoxAt(int n) { return QPoint(12 * (n % 20), 8 + 16 * (n / 20)); }
+
+bool writeBoxMovie(const QString &path, const QColor &background)
+{
+    libavcore::EncodeRequest request;
+    request.width = kMovW;
+    request.height = kMovH;
+    request.fps = request.fpsNum = kFps;
+    request.fpsDen = 1;
+    request.videoBitrateBits = 4000000;
+    request.outputPath = path.toStdString();
+    request.videoCodecName = "mpeg4";
+    request.hwVendorHint = "none";
+    request.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(request))
+        return false;
+    for (int n = 0; n < kMovFrames; ++n) {
+        QImage frame(kMovW, kMovH, QImage::Format_RGB888);
+        frame.fill(background);
+        const QPoint box = movBoxAt(n);
+        for (int y = box.y(); y < box.y() + 12; ++y)
+            for (int x = box.x(); x < box.x() + 12; ++x)
+                frame.setPixelColor(x, y, Qt::white);
+        if (!encoder.pushFrameRgb24(frame.constBits(), frame.bytesPerLine(), n))
+            return false;
+    }
+    return !encoder.finalize();
+}
+
+// Indices (in decode order = display order, no B frames) of the key frames among
+// the movie's video packets; `count` receives the number of video packets.
+QVector<int> keyFrameIndices(const QString &path, int *count)
+{
+    QVector<int> keys;
+    *count = 0;
+    AVFormatContext *fmt = nullptr;
+    if (avformat_open_input(&fmt, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return keys;
+    const int stream = avformat_find_stream_info(fmt, nullptr) >= 0
+        ? av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0)
+        : -1;
+    AVPacket *packet = av_packet_alloc();
+    while (stream >= 0 && packet && av_read_frame(fmt, packet) >= 0) {
+        if (packet->stream_index == stream) {
+            if (packet->flags & AV_PKT_FLAG_KEY)
+                keys.append(*count);
+            ++*count;
+        }
+        av_packet_unref(packet);
+    }
+    av_packet_free(&packet);
+    avformat_close_input(&fmt);
+    return keys;
+}
+
+// Centroid of the bright (min channel > 160) pixels: the box.
+struct Spot {
+    int n = 0;
+    double x = 0.0;
+    double y = 0.0;
+};
+
+Spot brightSpot(const QImage &image, const QRect &region = QRect(0, 0, kMovW, kMovH))
+{
+    Spot spot;
+    if (image.isNull())
+        return spot;
+    const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+    const QRect area = region.intersected(rgba.rect());
+    for (int y = area.top(); y <= area.bottom(); ++y) {
+        const uchar *row = rgba.constScanLine(y);
+        for (int x = area.left(); x <= area.right(); ++x) {
+            const uchar *px = row + x * 4;
+            if (px[0] > 160 && px[1] > 160 && px[2] > 160) {
+                ++spot.n;
+                spot.x += x;
+                spot.y += y;
+            }
+        }
+    }
+    if (spot.n) {
+        spot.x /= spot.n;
+        spot.y /= spot.n;
+    }
+    return spot;
+}
+
+// The box of the source frame shown at `srcUs` shifted right by `dx` (a
+// stabilizer key's dx).
+bool spotAt(const Spot &spot, qint64 srcUs, double dx)
+{
+    const QPoint box = movBoxAt(shownFrameAt(srcUs));
+    return spot.n >= 100 && std::abs(spot.x - (box.x() + 5.5 + dx)) <= 0.75
+        && std::abs(spot.y - (box.y() + 5.5)) <= 0.75;
+}
+
+std::string spotText(const Spot &spot)
+{
+    std::ostringstream out;
+    out.setf(std::ios::fixed);
+    out.precision(2);
+    out << "spot n=" << spot.n << " (" << spot.x << ',' << spot.y << ')';
+    return out.str();
+}
+
+// Largest channel difference (255 when the sizes differ) and the number of pixels
+// whose channels differ by more than 16.
+int imageMaxDiff(const QImage &a, const QImage &b, int *count = nullptr)
+{
+    if (count)
+        *count = 0;
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return 255;
+    const QImage x = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage y = b.convertToFormat(QImage::Format_RGBA8888);
+    int worst = 0;
+    for (int row = 0; row < x.height(); ++row) {
+        const uchar *px = x.constScanLine(row);
+        const uchar *py = y.constScanLine(row);
+        for (int col = 0; col < x.width(); ++col) {
+            int d = 0;
+            for (int c = 0; c < 3; ++c)
+                d = qMax(d, std::abs(int(px[col * 4 + c]) - int(py[col * 4 + c])));
+            worst = qMax(worst, d);
+            if (count && d > 16)
+                ++*count;
+        }
+    }
+    return worst;
+}
+
+// Red shape pixels in the lower left corner (G16's shape clip).
+int shapePixels(const QImage &image)
+{
+    return boxOf(image, QRect(0, 100, 64, kMovH - 100), [](const uchar *p) {
+               return p[0] > 150 && p[1] < 80 && p[2] < 80;
+           }).n;
+}
+
+// Bounding box of the lit (any channel > 30) pixels of a GL read-back inside the
+// canvas frame overlay on the widget perimeter: where the viewport put the picture.
+QRect litExtent(const QImage &image)
+{
+    return boxOf(image, image.rect().adjusted(3, 3, -3, -3), [](const uchar *p) {
+               return p[0] > 30 || p[1] > 30 || p[2] > 30;
+           }).rect;
+}
+
+void pumpEvents(int ms)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < ms)
+        QApplication::processEvents(QEventLoop::AllEvents, 5);
+}
+
 } // namespace
 
 int runStabilizerExportSelftest()
@@ -352,21 +540,24 @@ int runStabilizerExportSelftest()
         tally.gate(4, plainOk && sized && mismatches == 0 && nonOpaque == 0, d.str());
     }
 
-    // G5: (a) V1 only, (b) the matrix (pin), (c) pixel centres / rotation centre and
-    // the non-square UV mapping, (d) no stabilization inside a nested pass.
+    // G5: (a) a V2 key applies to the export too (US-2300; was "V1 only"), (b) the
+    // matrix (pin), (c) pixel centres / rotation centre and the non-square UV
+    // mapping, (d) a nested child's V1 moves by its key (US-2300; was "no
+    // stabilization inside a nested pass").
     {
         std::ostringstream d;
-        // (a) the same key on V2 leaves V2's export unchanged. V1 is frontmost and
-        // opaque (US-1804), so it sits at videoDx -0.375 (output x 0..39) and V2's
-        // dot (40,40) shows beside it (G6 (c)'s layout).
+        // (a) the same key on V2 moves V2's dot (40,40) -> (44,40). V1 is frontmost
+        // and opaque (US-1804), so it sits at videoDx -0.375 (output x 0..39) and
+        // V2's dot shows beside it (G6 (c)'s layout).
         ClipInfo v1Left = seqClip(seqB);
         v1Left.videoDx = -0.375;
         const ClipInfo plainC = seqClip(seqC);
         const QImage v2Plain = exportAt({{v1Left}, {plainC}}, t);
         const QImage v2Keyed = exportAt({{v1Left}, {withKeys(plainC, {key(0.0, 4.0)})}}, t);
         const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        const Box v2KeyedBox = whiteBox(v2Keyed, v2Area);
         const bool aOk = !v2Plain.isNull() && whiteBox(v2Plain, v2Area).rect == QRect(40, 40, 2, 2)
-            && sha(v2Plain) == sha(v2Keyed);
+            && v2KeyedBox.n == 4 && v2KeyedBox.rect == QRect(44, 40, 2, 2);
         d << "(a) v2Plain sha=" << sha(v2Plain) << " V2 white " << boxText(whiteBox(v2Plain, v2Area))
           << " v2Keyed sha=" << sha(v2Keyed) << " V2 white " << boxText(whiteBox(v2Keyed, v2Area))
           << " ok=" << aOk;
@@ -442,7 +633,8 @@ int runStabilizerExportSelftest()
           << " ok=" << cOk;
 
         // (d) the G2 key on V1 of a child sequence C, referenced from V1 of P: the
-        // nested pass does not stabilize, so P renders like the key-less C.
+        // nested pass stabilizes the child, so P's dot moves (10,10) -> (14,10).
+        Box nestedBox;
         const auto nestedSha = [&](const ClipInfo &child) {
             TimelineSequence c;
             c.id = QStringLiteral("child");
@@ -463,12 +655,15 @@ int runStabilizerExportSelftest()
             timeline.setSequences(QVector<TimelineSequence>{p, c}, p.id);
             const QImage image =
                 tlrender::renderFrameAt(&timeline, us(t), QSize(kSize, kSize));
-            d << " (d) nested white " << boxText(whiteBox(image));
+            nestedBox = whiteBox(image);
+            d << " (d) nested white " << boxText(nestedBox);
             return sha(image);
         };
         const std::string nestedKeyed = nestedSha(withKeys(plainA, {key(0.0, 4.0)}));
+        const Box nestedKeyedBox = nestedBox;
         const std::string nestedPlain = nestedSha(plainA);
-        const bool dOk = nestedPlain != "null" && nestedKeyed == nestedPlain;
+        const bool dOk = nestedPlain != "null" && nestedBox.rect == QRect(10, 10, 2, 2)
+            && nestedKeyedBox.n == 4 && nestedKeyedBox.rect == QRect(14, 10, 2, 2);
         d << " (d) keyedSha=" << nestedKeyed << " plainSha=" << nestedPlain << " ok=" << dOk;
         tally.gate(5, plainOk && aOk && bOk && glOk && cOk && dOk, d.str());
     }
@@ -1385,6 +1580,1911 @@ int runStabilizerExportSelftest()
               << ";" << sd.str() << " ok=" << seekOk;
             tally.gate(12, keyedOk && plainOk2 && seekOk, d.str());
         }
+    }
+
+    // US-2300 G13: a nested child's key is sampled at the child's own source time.
+    // The child clip starts at source 0.4 s (inPoint) and carries keys (source 0.4 s
+    // dx 0, 1.4 s dx +10); P = V1 [filler 0.5 s, reference to C]. (a) At timeline
+    // 0.8 s C is at child-local 0.3 s = source 0.7 s: dx +3 (the child-local time
+    // would read 0, the timeline time +4); (b) the reference at speed 2: child 0.6 s =
+    // source 1.0 s, +6; (c) the same keyed clip on C's V2 (C's V1 key-less); (d) two
+    // levels (C = V1 [filler 0.2 s, reference to G], G holds the clip) at 1.0 s:
+    // G 0.3 s = source 0.7 s, +3; (e) control: the key-less fixtures render
+    // byte-identical to the base exe 0335b53 (S0-1 (a) shas). HEAD: (a)-(d) unmoved.
+    {
+        std::ostringstream d;
+        const auto seqOf = [](const QString &id, const QVector<QVector<ClipInfo>> &tracks) {
+            TimelineSequence s;
+            s.id = id;
+            s.name = id;
+            s.videoTracks = tracks;
+            return s;
+        };
+        const auto refTo = [](const TimelineSequence &c, double length, double speed) {
+            ClipInfo ref;
+            ref.sequenceRefId = c.id;
+            ref.filePath = timeline_nesting::sequenceClipFilePath(c.id);
+            ref.displayName = c.id;
+            ref.duration = ref.outPoint = length;
+            ref.speed = speed;
+            ref.opacity = 1.0;
+            return ref;
+        };
+        // P = V1 [filler `lead` s, reference to children[0]] rendered at `sec`.
+        const auto renderNested = [&](QVector<TimelineSequence> children, double lead,
+                                      double length, double speed, double sec) {
+            const TimelineSequence p = seqOf(
+                QStringLiteral("parent"),
+                {{seqClip(seqC, lead), refTo(children.first(), length, speed)}});
+            children.prepend(p);
+            Timeline timeline;
+            timeline.setProjectOutputConfig(kSize, kSize, false, kFps);
+            timeline.setSequences(children, p.id);
+            return tlrender::renderFrameAt(&timeline, us(sec), QSize(kSize, kSize));
+        };
+        ClipInfo childPlain = seqClip(seqA);
+        childPlain.inPoint = 0.4;
+        const ClipInfo childKeyed = withKeys(childPlain, {key(0.4, 0.0), key(1.4, 10.0)});
+        ClipInfo c2Plain = seqClip(seqC);
+        c2Plain.inPoint = 0.4;
+        const ClipInfo c2Keyed = withKeys(c2Plain, {key(0.4, 0.0), key(1.4, 10.0)});
+        ClipInfo v1Left = seqClip(seqB);
+        v1Left.videoDx = -0.375;
+        const QString childId = QStringLiteral("child");
+        const QString grandId = QStringLiteral("grand");
+        const auto twoLevel = [&](const ClipInfo &clip) {
+            const TimelineSequence g = seqOf(grandId, {{clip}});
+            const TimelineSequence c = seqOf(childId, {{seqClip(seqC, 0.2), refTo(g, 1.6, 1.0)}});
+            return renderNested({c, g}, 0.5, 1.8, 1.0, 1.0);
+        };
+        const QRect topArea(0, 0, kSize, 30);
+        const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        struct Leg {
+            const char *name;
+            QImage keyed, plain;
+            QRect area;
+            QPoint expect;
+        };
+        const QVector<Leg> legs = {
+            {"(a)", renderNested({seqOf(childId, {{childKeyed}})}, 0.5, 1.6, 1.0, 0.8),
+             renderNested({seqOf(childId, {{childPlain}})}, 0.5, 1.6, 1.0, 0.8), topArea,
+             QPoint(13, 10)},
+            {"(b)", renderNested({seqOf(childId, {{childKeyed}})}, 0.5, 1.6, 2.0, 0.8),
+             renderNested({seqOf(childId, {{childPlain}})}, 0.5, 1.6, 2.0, 0.8), topArea,
+             QPoint(16, 10)},
+            {"(c)", renderNested({seqOf(childId, {{v1Left}, {c2Keyed}})}, 0.5, 1.6, 1.0, 0.8),
+             renderNested({seqOf(childId, {{v1Left}, {c2Plain}})}, 0.5, 1.6, 1.0, 0.8), v2Area,
+             QPoint(43, 40)},
+            {"(d)", twoLevel(childKeyed), twoLevel(childPlain), topArea, QPoint(13, 10)},
+        };
+        // S0-1 (a): sha() of each key-less fixture on the base exe 0335b53.
+        const char *const baseKeylessSha[] = {"1b7195d757a492af", "1b7195d757a492af",
+                                              "fd326ad3deb46e6b", "1b7195d757a492af"};
+        bool movedOk = true;
+        bool controlOk = true;
+        for (int i = 0; i < legs.size(); ++i) {
+            const Leg &leg = legs[i];
+            const Box kBox = whiteBox(leg.keyed, leg.area);
+            const Box pBox = whiteBox(leg.plain, leg.area);
+            const QPoint plainAt = leg.area == v2Area ? QPoint(40, 40) : QPoint(10, 10);
+            const bool moved = kBox.n == 4 && kBox.rect == QRect(leg.expect, QSize(2, 2));
+            const bool still = pBox.n == 4 && pBox.rect == QRect(plainAt, QSize(2, 2));
+            const bool base = sha(leg.plain) == baseKeylessSha[i];
+            // (c): C's key-less V1 stays where it was.
+            const bool v1Still = i != 2
+                || whiteBox(leg.keyed, QRect(0, 0, 40, 30)).rect == QRect(10, 10, 2, 2);
+            movedOk = movedOk && moved && v1Still;
+            controlOk = controlOk && still && base;
+            d << ' ' << leg.name << " keyed " << boxText(kBox) << " expect (" << leg.expect.x()
+              << ',' << leg.expect.y() << ") v1Still=" << v1Still << " key-less "
+              << boxText(pBox) << " sha=" << sha(leg.plain) << " base=" << baseKeylessSha[i]
+              << " moved=" << moved << " (e) control=" << (still && base);
+        }
+        d << " movedOk=" << movedOk << " controlOk=" << controlOk;
+        tally.gate(13, movedOk && controlOk, d.str());
+    }
+
+    // US-2300 G14: keys on an upper track, wherever renderFrameAt or the special
+    // composite draws the frame. G5 (a)'s layout: V1 at videoDx -0.375 (source dot
+    // (34,10) -> (10,10), covering x 0..39), V2's dot (40,40) beside it. (a) export
+    // with V2 dx +4 (V1 key-less): V2 +4, V1 still; (b) V1 +8 and V2 +4: each its own;
+    // (c) the special composite (V1 brushed) equals renderFrameAt (maxDiff 0) on (a)
+    // and (b) and shows V2 +4; (d) the brush record follows the bound brush clip's
+    // keyed layer (V1 +8, V2 +4 analysed at 128x128, V3 key-less): V2 bound -> +4 and
+    // 128x128, V1 / V3 / none bound -> V1's +8; (e) an Echo on V2 with keys (0 s, 0)
+    // / (1 s, +8) at 1 s: each sample at its own source time (G12's leg on V2);
+    // (f) the preview the timeline renderer serves (S1-S3 of the design's F4) with a
+    // shape clip active: (f1) the paused SSOT display and its refresh after a key
+    // edit, (f2) a playback tick, each equal to renderFrameAt with no GL keys;
+    // (f3) VideoPlayer's own warp moves an active keyed V2 composed with another
+    // layer +4 like renderFrameAt (US-2301; US-2300 pinned it unmoved behind a
+    // guard). HEAD: (a)(b)(c) V2 unmoved, (d) V2 bound gives V1's +8, (e) V2's
+    // trail unmoved, (f1)(f2) V2 unmoved.
+    {
+        std::ostringstream d;
+        ClipInfo v1Left = seqClip(seqB);
+        v1Left.videoDx = -0.375;
+        const ClipInfo v2Plain = seqClip(seqC);
+        const QRect v1Area(0, 0, 40, 20);
+        const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        const auto dotAt = [](const Box &b, int x, int y) {
+            return b.n == 4 && b.rect == QRect(x, y, 2, 2);
+        };
+        const auto maxDiff = [](const QImage &a, const QImage &b) {
+            if (a.isNull() || b.isNull() || a.size() != b.size())
+                return 255;
+            const QImage x = a.convertToFormat(QImage::Format_RGBA8888);
+            const QImage y = b.convertToFormat(QImage::Format_RGBA8888);
+            int worst = 0;
+            for (int row = 0; row < x.height(); ++row)
+                for (int col = 0; col < x.width() * 4; ++col)
+                    worst = qMax(worst, std::abs(int(x.constScanLine(row)[col])
+                                                 - int(y.constScanLine(row)[col])));
+            return worst;
+        };
+        const ClipInfo v1Keyed8 = withKeys(v1Left, {key(0.0, 8.0)});
+        const ClipInfo v2Keyed4 = withKeys(v2Plain, {key(0.0, 4.0)});
+
+        // (a) / (b) export.
+        const QImage aPlain = exportAt({{v1Left}, {v2Plain}}, t);
+        const QImage aKeyed = exportAt({{v1Left}, {v2Keyed4}}, t);
+        const QImage bKeyed = exportAt({{v1Keyed8}, {v2Keyed4}}, t);
+        const bool aOk = dotAt(whiteBox(aPlain, v2Area), 40, 40)
+            && dotAt(whiteBox(aPlain, v1Area), 10, 10) && dotAt(whiteBox(aKeyed, v2Area), 44, 40)
+            && dotAt(whiteBox(aKeyed, v1Area), 10, 10);
+        const bool bOk = dotAt(whiteBox(bKeyed, v1Area), 18, 10)
+            && dotAt(whiteBox(bKeyed, v2Area), 44, 40);
+        d << "(a) export V2 " << boxText(whiteBox(aKeyed, v2Area)) << " V1 "
+          << boxText(whiteBox(aKeyed, v1Area)) << " key-less V2 "
+          << boxText(whiteBox(aPlain, v2Area)) << " ok=" << aOk << " (b) V1 "
+          << boxText(whiteBox(bKeyed, v1Area)) << " V2 " << boxText(whiteBox(bKeyed, v2Area))
+          << " ok=" << bOk;
+
+        // (c) / (d) on MainWindow.
+        bool cOk = false;
+        bool dOk = false;
+        {
+            MainWindow window;
+            window.hide();
+            Timeline *mainTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            if (mainTimeline) {
+                emit mainTimeline->projectOutputConfigRestored(kSize, kSize, false);
+                const auto load = [&](const QVector<QVector<ClipInfo>> &tracks) {
+                    mainTimeline->setProjectOutputConfig(kSize, kSize, false, kFps);
+                    mainTimeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0,
+                                                     -1.0, -1.0, 100);
+                    mainTimeline->refreshPlaybackSequence();
+                };
+                const ClipInfo v1Brushed = withBrush(v1Left, QPointF(54.0, 30.0));
+                const ClipInfo v1Brushed8 = withKeys(v1Brushed, {key(0.0, 8.0)});
+                bool cAll = true;
+                const auto cLeg = [&](const char *name, const ClipInfo &v1, const ClipInfo &v2,
+                                      QPoint v1Dot, QPoint v2Dot) {
+                    load({{v1}, {v2}});
+                    const bool wants = tlrender::timelineBrushWantsSpecialPath(mainTimeline, t);
+                    const QImage composite = window.buildSpecialClipComposite(t);
+                    const QImage exported =
+                        tlrender::renderFrameAt(mainTimeline, us(t), QSize(kSize, kSize));
+                    const int diff = maxDiff(composite, exported);
+                    const Box cV1 = whiteBox(composite, v1Area);
+                    const Box cV2 = whiteBox(composite, v2Area);
+                    const bool ok = wants && diff == 0 && dotAt(cV1, v1Dot.x(), v1Dot.y())
+                        && dotAt(cV2, v2Dot.x(), v2Dot.y());
+                    d << " (c" << name << ") wants=" << wants << " maxDiff=" << diff << " V1 "
+                      << boxText(cV1) << " V2 " << boxText(cV2) << " ok=" << ok;
+                    return ok;
+                };
+                // The key-less control leg pins the parity itself.
+                cAll = cLeg("0", v1Brushed, v2Plain, QPoint(10, 10), QPoint(40, 40)) && cAll;
+                cAll = cLeg("a", v1Brushed, v2Keyed4, QPoint(10, 10), QPoint(44, 40)) && cAll;
+                cAll = cLeg("b", v1Brushed8, v2Keyed4, QPoint(18, 10), QPoint(44, 40)) && cAll;
+                cOk = cAll;
+
+                // (d) every layer brushed, so each can be bound.
+                ClipInfo dV2 = withBrush(v2Keyed4, QPointF(50.0, 50.0));
+                dV2.stabilizerSourceSize = QSize(128, 128);
+                const ClipInfo dV3 = withBrush(seqClip(seqA), QPointF(20.0, 50.0));
+                load({{v1Brushed8}, {dV2}, {dV3}});
+                bool dAll = true;
+                const auto dLeg = [&](const char *name, int bindTrack, double dx, QSize size,
+                                      const QString &id) {
+                    window.syncBrushAnimationPreviewForClip(bindTrack, bindTrack < 0 ? -1 : 0);
+                    const QString bound = window.brushPreviewClipIdForTest();
+                    stabwarp::StabSample stab;
+                    QSize stabSize;
+                    QString stabId;
+                    const QImage composite =
+                        window.buildSpecialClipComposite(t, nullptr, &stab, &stabSize, &stabId);
+                    const bool boundOk = bindTrack < 0
+                        ? bound.isEmpty() : bound == QStringLiteral("%1:0").arg(bindTrack);
+                    const bool ok = boundOk && !composite.isNull() && std::abs(stab.dx - dx) < 1e-9
+                        && stabSize == size && stabId == id;
+                    d << " (d" << name << ") bound=" << bound.toStdString() << " record dx="
+                      << stab.dx << " size=" << stabSize.width() << 'x' << stabSize.height()
+                      << " id=" << stabId.toStdString() << " expect dx=" << dx << ' '
+                      << size.width() << 'x' << size.height() << ' ' << id.toStdString()
+                      << " ok=" << ok;
+                    return ok;
+                };
+                dAll = dLeg("V2", 1, 4.0, QSize(128, 128), QStringLiteral("1:0")) && dAll;
+                dAll = dLeg("V1", 0, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dAll = dLeg("V3", 2, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dAll = dLeg("none", -1, 8.0, QSize(kSize, kSize), QStringLiteral("0:0")) && dAll;
+                dOk = dAll;
+            } else {
+                d << " (c)(d) mainTimeline missing";
+            }
+        }
+
+        // (e) Echo on V2, keys (0 s, 0) / (1 s, +8), at 1 s: the dot at x 48 and its
+        // samples 0.25 / 0.5 s back at x 46 / 44 (a box (44,40)-(49,41)); warping the
+        // finished echo once would put the whole trail at x 48.
+        bool eOk = false;
+        {
+            ClipInfo echoed = v2Plain;
+            echoed.effects = {VideoEffect::createEcho(0.25, 2, 0.5, 2)};
+            const QImage ePlain = exportAt({{v1Left}, {echoed}}, 1.0);
+            const QImage eKeyed =
+                exportAt({{v1Left}, {withKeys(echoed, {key(0.0, 0.0), key(1.0, 8.0)})}}, 1.0);
+            const Box epBox = nonBlackBox(ePlain, v2Area);
+            const Box ekBox = nonBlackBox(eKeyed, v2Area);
+            // Three separate 2x2 samples (12 pixels), one in each of x 44 / 46 / 48.
+            const int s44 = nonBlackBox(eKeyed, QRect(44, 40, 2, 2)).n;
+            const int s46 = nonBlackBox(eKeyed, QRect(46, 40, 2, 2)).n;
+            const int s48 = nonBlackBox(eKeyed, QRect(48, 40, 2, 2)).n;
+            eOk = epBox.rect == QRect(40, 40, 2, 2) && epBox.n == 4
+                && ekBox.rect == QRect(44, 40, 6, 2) && ekBox.n == 12 && s44 > 0 && s46 > 0
+                && s48 > 0 && dotAt(whiteBox(eKeyed, v1Area), 10, 10);
+            d << " (e) echo V2 keyed " << boxText(ekBox) << " samples x44/46/48 n=" << s44
+              << '/' << s46 << '/' << s48 << " key-less " << boxText(epBox) << " ok=" << eOk;
+        }
+
+        // (f) V1 key-less (or +8), V2 a constant +4 (both keys), a shape clip on V3:
+        // a static picture, so every frame is renderFrameAt(t)'s.
+        Shape square;
+        square.type = ShapeType::Rectangle;
+        square.properties.size = QSizeF(8.0, 8.0);
+        square.position = QPointF(56.0, 8.0);
+        square.fill.color = QColor(200, 30, 30, 255);
+        square.fill.opacity = 1.0;
+        square.fill.enabled = true;
+        square.fill.gradient = false;
+        square.stroke.enabled = false;
+        ClipInfo shapeClip;
+        shapeClip.displayName = QStringLiteral("shape");
+        shapeClip.duration = shapeClip.outPoint = kDuration;
+        shapeClip.shapes = {square};
+        const ClipInfo v2Const4 = withKeys(v2Plain, {key(0.0, 4.0), key(kDuration, 4.0)});
+        bool fRan = false;
+        bool f1Ok = false;
+        bool f2Ok = false;
+        {
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            if (!(view && player.isGLAccelerated())) {
+                d << " (f1)(f2) not run: GL preview unavailable (environment)";
+            } else {
+                fRan = true;
+                player.setCanvasSize(kSize, kSize);
+                player.setProjectOutputSize(QSize(kSize, kSize));
+                int shownCount = 0;
+                QImage shown;
+                QObject::connect(&player, &VideoPlayer::frameComposited,
+                                 [&](const QImage &image) {
+                                     ++shownCount;
+                                     shown = image;
+                                 });
+                bool all = true;
+                // (f1) on a timeline with V1 `v1`.
+                const auto pausedLeg = [&](const char *name, const ClipInfo &v1, QPoint v1Dot,
+                                           bool refreshLeg) {
+                    auto timeline = makeTimeline({{v1}, {v2Const4}, {shapeClip}});
+                    view->setTimeline(timeline.get());
+                    player.m_sequence = timeline->computePlaybackSequence();
+                    player.m_activeEntry = -1;
+                    for (int i = 0; i < player.m_sequence.size(); ++i)
+                        if (player.m_sequence[i].sourceTrack == 0)
+                            player.m_activeEntry = i;
+                    player.m_timelinePositionUs = us(t);
+                    const int before = shownCount;
+                    const bool served = player.displayNestedSequenceFrameAt(timeline.get(), us(t));
+                    const QImage expected =
+                        tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+                    const int diff = maxDiff(shown, expected);
+                    const bool glOff = !view->stabEnabledForTest();
+                    bool ok = served && shownCount == before + 1 && diff <= 1
+                        && dotAt(whiteBox(shown, v2Area), 44, 40)
+                        && dotAt(whiteBox(shown, v1Area), v1Dot.x(), v1Dot.y()) && glOff
+                        && player.m_activeEntry >= 0;
+                    d << " (f1" << name << ") served=" << served << " shown+="
+                      << (shownCount - before) << " maxDiff=" << diff << " V1 "
+                      << boxText(whiteBox(shown, v1Area)) << " V2 "
+                      << boxText(whiteBox(shown, v2Area)) << " glKeys="
+                      << view->stabEnabledForTest() << " ok=" << ok;
+                    if (refreshLeg) {
+                        // V2's keys +4 -> +6 on the timeline (no setSequence), then refresh.
+                        QVector<ClipInfo> clips = timeline->videoTracks().at(1)->clips();
+                        clips[0].stabilizerKeyframes = {key(0.0, 6.0), key(kDuration, 6.0)};
+                        timeline->videoTracks().at(1)->setClips(clips);
+                        const int beforeRefresh = shownCount;
+                        player.refreshDisplayedFrame();
+                        const QImage expected6 =
+                            tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+                        const int diff6 = maxDiff(shown, expected6);
+                        const bool refreshOk = shownCount == beforeRefresh + 1 && diff6 <= 1
+                            && dotAt(whiteBox(expected6, v2Area), 46, 40)
+                            && dotAt(whiteBox(shown, v2Area), 46, 40)
+                            && !view->stabEnabledForTest();
+                        d << " refresh: shown+=" << (shownCount - beforeRefresh)
+                          << " maxDiff=" << diff6 << " V2 " << boxText(whiteBox(shown, v2Area))
+                          << " glKeys=" << view->stabEnabledForTest() << " ok=" << refreshOk;
+                        ok = ok && refreshOk;
+                    }
+                    view->setTimeline(nullptr);
+                    return ok;
+                };
+                all = pausedLeg("", v1Left, QPoint(10, 10), true) && all;
+                all = pausedLeg(" V1+8", v1Keyed8, QPoint(18, 10), false) && all;
+                f1Ok = all;
+            }
+        }
+        if (fRan) {
+            // (f2) a playback tick (shape-clip G5's form).
+            auto timeline = makeTimeline({{v1Left}, {v2Const4}, {shapeClip}});
+            const QImage expected =
+                tlrender::renderFrameAt(timeline.get(), us(t), QSize(kSize, kSize));
+            VideoPlayer player;
+            player.setCanvasSize(kSize, kSize);
+            player.setProjectOutputSize(QSize(kSize, kSize));
+            player.glPreview()->setTimeline(timeline.get());
+            player.setSequence(timeline->computePlaybackSequence());
+            int ticks = 0;
+            QImage tick;
+            QObject::connect(&player, &VideoPlayer::frameComposited, [&](const QImage &image) {
+                ++ticks;
+                tick = image;
+            });
+            const qint64 before = player.timelinePositionUs();
+            player.play();
+            QElapsedTimer guard;
+            guard.start();
+            // Until a tick after the playhead moved (play() itself may show one frame).
+            while (guard.elapsed() < 2000
+                   && (ticks < 2 || player.timelinePositionUs() <= before))
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+            player.pause();
+            const qint64 after = player.timelinePositionUs();
+            const int diff = maxDiff(tick, expected);
+            // GL keys on during playback would warp the tick a second time on screen.
+            const bool stabOn = player.glPreview()->stabEnabledForTest();
+            f2Ok = ticks >= 2 && after > before && diff <= 1
+                && dotAt(whiteBox(tick, v2Area), 44, 40) && dotAt(whiteBox(tick, v1Area), 10, 10)
+                && !stabOn;
+            d << " (f2) ticks=" << ticks << " position " << before << "->" << after
+              << " maxDiff=" << diff << " V2 " << boxText(whiteBox(tick, v2Area)) << " V1 "
+              << boxText(whiteBox(tick, v1Area)) << " enabled=" << stabOn << " ok=" << f2Ok;
+            player.glPreview()->setTimeline(nullptr);
+        }
+
+        // (f3) the keyed V2 as the active entry (V1 empty there; V2 and V3 start
+        // together, so the lower track is active, F15) with a V3 layer present:
+        // VideoPlayer's own warp (warpV1ForCpuComposite) moves it +4, equal to
+        // renderFrameAt of that timeline (V2 opaque over V3) within 1. Control: the
+        // same entry on V1 is warped +4.
+        bool f3Ok = false;
+        {
+            VideoPlayer player;
+            const auto entry = [&](const QString &file, int track) {
+                PlaybackEntry e;
+                e.filePath = file;
+                e.clipIn = 0.0;
+                e.clipOut = kDuration;
+                e.timelineStart = 0.0;
+                e.timelineEnd = kDuration;
+                e.speed = 1.0;
+                e.sourceTrack = track;
+                e.sourceClipIndex = 0;
+                return e;
+            };
+            QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            black.fill(Qt::black);
+            const auto composeV2 = [&](int track) {
+                PlaybackEntry e2 = entry(seqC, track);
+                e2.stabilizerKeyframes = {key(0.0, 4.0)};
+                const PlaybackEntry e3 = entry(seqA, track + 1);
+                VideoPlayer::DecodedLayer l2;
+                l2.rgb = dotFrame({QPoint(40, 40)})
+                             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                l2.sourceTrack = track;
+                l2.sequenceIdx = 0;
+                VideoPlayer::DecodedLayer l3;
+                l3.rgb = dotFrame({QPoint(10, 10)})
+                             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+                l3.sourceTrack = track + 1;
+                l3.sequenceIdx = 1;
+                // V3 paints first (backmost), the active V2 last.
+                return player.composeAndPresentForTest(black, {l3, l2}, {e2, e3}, 0, us(t));
+            };
+            const QImage upperShown = composeV2(1);
+            const Box upper = whiteBox(upperShown, v2Area);
+            const Box lower = whiteBox(composeV2(0), v2Area);
+            const QImage upperExport = exportAt(
+                {QVector<ClipInfo>{}, {withKeys(v2Plain, {key(0.0, 4.0)})}, {seqClip(seqA)}}, t);
+            const int f3Diff = maxDiff(upperShown, upperExport);
+            f3Ok = dotAt(upper, 44, 40) && dotAt(whiteBox(upperExport, v2Area), 44, 40)
+                && f3Diff <= 1 && dotAt(lower, 44, 40);
+            d << " (f3) active keyed V2 + V3 layer V2 " << boxText(upper) << " renderFrameAt V2 "
+              << boxText(whiteBox(upperExport, v2Area)) << " maxDiff=" << f3Diff
+              << "; control on V1 " << boxText(lower) << " ok=" << f3Ok;
+        }
+        const bool cpuOk = aOk && bOk && cOk && dOk && eOk && f3Ok;
+        if (!fRan && cpuOk)
+            tally.skip(14, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(14, cpuOk && f1Ok && f2Ok, d.str());
+
+        // US-2300 diagnostic (not part of any gate): F4's S4-S6 on (f)'s fixture
+        // (V1 key-less, V2 constant +4, shape on V3), printed for the result log.
+        {
+            auto tl = makeTimeline({{v1Left}, {v2Const4}, {shapeClip}});
+            const QImage ref = tlrender::renderFrameAt(tl.get(), us(t), QSize(kSize, kSize));
+            std::cerr << "US-2300 probe renderFrameAt(t) V2 " << boxText(whiteBox(ref, v2Area))
+                      << " V1 " << boxText(whiteBox(ref, v1Area)) << '\n';
+            PlaybackEntry e1;
+            e1.filePath = seqB;
+            e1.clipIn = 0.0;
+            e1.clipOut = kDuration;
+            e1.timelineStart = 0.0;
+            e1.timelineEnd = kDuration;
+            e1.speed = 1.0;
+            e1.sourceTrack = 0;
+            e1.sourceClipIndex = 0;
+            PlaybackEntry e2 = e1;
+            e2.filePath = seqC;
+            e2.sourceTrack = 1;
+            e2.stabilizerKeyframes = v2Const4.stabilizerKeyframes;
+            QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+            black.fill(Qt::black);
+            VideoPlayer::DecodedLayer l1;
+            l1.rgb = dotFrame({QPoint(34, 10)}).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            l1.videoDx = -0.375;
+            l1.sourceTrack = 0;
+            l1.sequenceIdx = 0;
+            VideoPlayer::DecodedLayer l2;
+            l2.rgb = dotFrame({QPoint(40, 40)}).convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            l2.sourceTrack = 1;
+            l2.sequenceIdx = 1;
+            const auto fields = [&](const QImage &image) {
+                return "V2 " + boxText(whiteBox(image, v2Area)) + " V1 "
+                    + boxText(whiteBox(image, v1Area));
+            };
+            {   // S4: the still-compare display as the GL view receives it (bypass path).
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated()) {
+                    player.setCanvasSize(kSize, kSize);
+                    view->setTimeline(tl.get());
+                    // Vertical wipe at 0.25: rows 48-63 show the still, rows 0-47 (both
+                    // dots and the shape) the live frame.
+                    QImage still(kSize, kSize, QImage::Format_RGB32);
+                    still.fill(QColor(60, 60, 60));
+                    stillcompare::Config on;
+                    on.enabled = true;
+                    on.mode = stillcompare::Mode::WipeVertical;
+                    on.position = 0.25;
+                    on.still = still;
+                    player.setStillCompare(on);
+                    player.composeAndPresentForTest(black, {l2, l1}, {e1, e2}, 0, us(t));
+                    const bool drawn = selftest::glContextUsable(view);
+                    if (drawn)
+                        view->grabFramebuffer();
+                    const QImage upload = view->uploadFrameForTest();
+                    const QImage expect = stillcompare::apply(ref, still, on.mode, on.position);
+                    const QRect live(0, 0, kSize, 48);
+                    std::cerr << "US-2300 probe S4 still-compare GL upload drawn=" << drawn
+                              << " viewTimeline=" << (view->timeline() != nullptr)
+                              << " upload vs renderFrameAt (live rows 0-47) maxDiff="
+                              << maxDiff(upload.copy(live), ref.copy(live))
+                              << " upload vs apply(renderFrameAt, still) maxDiff="
+                              << maxDiff(upload, expect) << ' ' << fields(upload)
+                              << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    player.setStillCompare(stillcompare::Config{});
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S4 not run (GL preview unavailable)\n";
+                }
+            }
+            {   // S5: the project-camera (trueProjection) frame uploaded to the GL view.
+                Camera3DState state;
+                state.trueProjection = true;
+                const Camera3D camera{state};
+                tl->setProjectCamera(camera);
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated() && selftest::glContextUsable(view)) {
+                    player.setProjectOutputSize(QSize(kSize, kSize));
+                    view->setTimeline(tl.get());
+                    view->setProjectCamera(camera);
+                    view->grabFramebuffer();
+                    const QImage upload = view->uploadFrameForTest();
+                    const qint64 at = player.timelinePositionUs();
+                    const QImage ref5 = tlrender::renderFrameAt(tl.get(), at, QSize(kSize, kSize));
+                    std::cerr << "US-2300 probe S5 project-camera upload t=" << at << " size="
+                              << upload.width() << 'x' << upload.height()
+                              << " maxDiff=" << maxDiff(upload, ref5) << ' ' << fields(upload)
+                              << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S5 not run (GL preview unavailable)\n";
+                }
+                tl->setProjectCamera(Camera3D{Camera3DState{}});
+            }
+            {   // S6: the onion-skin ghost at t-1f, and the upload carrying it.
+                VideoPlayer player;
+                GLPreview *view = player.glPreview();
+                if (view && player.isGLAccelerated()) {
+                    player.setCanvasSize(kSize, kSize);
+                    view->setTimeline(tl.get());
+                    onionskin::Config cfg;
+                    cfg.enabled = true;
+                    cfg.framesBefore = 1;
+                    cfg.framesAfter = 0;
+                    player.setOnionSkinConfig(cfg);
+                    player.composeAndPresentForTest(black, {l2, l1}, {e1, e2}, 0, us(t));
+                    const QImage upload = view->uploadFrameForTest();
+                    const qint64 frameUs =
+                        player.m_frameDurationUs > 0 ? player.m_frameDurationUs : AV_TIME_BASE / 30;
+                    const QImage ghost =
+                        tlrender::renderFrameAt(tl.get(), us(t) - frameUs, QSize(kSize, kSize));
+                    const QImage expect =
+                        onionskin::compose(player.m_currentFrameImage, {ghost}, {}, cfg);
+                    std::cerr << "US-2300 probe S6 onion ghost(t-1f) " << fields(ghost)
+                              << " ghost vs renderFrameAt(t) maxDiff=" << maxDiff(ghost, ref)
+                              << " upload vs compose(current, ghost) maxDiff="
+                              << maxDiff(upload, expect) << " upload (blended) nonBlack V2 "
+                              << boxText(nonBlackBox(upload, v2Area)) << " V1 "
+                              << boxText(nonBlackBox(upload, v1Area)) << " stabEnabled=" << view->stabEnabledForTest() << '\n';
+                    player.setOnionSkinConfig(onionskin::Config{});
+                    view->setTimeline(nullptr);
+                } else {
+                    std::cerr << "US-2300 probe S6 not run (GL preview unavailable)\n";
+                }
+            }
+        }
+    }
+
+    // US-2301 G15: VideoPlayer's own preview warp (the paths that are not the SSOT)
+    // warps every layer that carries keys exactly once, at the position its decoder
+    // used (entryLocalPositionUs: reverse and speed-ramp aware), on any track: the
+    // GL's single uStab takes a lone layer on any track, and with other layers every
+    // keyed layer is warped on the CPU and the GL gets no keys. GL legs read back a
+    // 16:9 widget (256x144, a 256x144 frame, columns 0 / 255 left out) and the same
+    // instance's stabMatrixForTest / stabEnabledForTest. (a) a lone active V2 (V1
+    // empty there), dot (40,40), dx +4: uStab on, the matrix inverseMatrixUv of the
+    // sample, the dot read back at x 44; (b) the same V2 with a 1.5x speed ramp and
+    // keys (0 s, 0) / (2 s, +16) at timeline 1 s: source 1.5 s, x 52 (a timeline
+    // clock reads 1 s, x 48), on the GL and with an Echo baked on the CPU (64x64,
+    // the GL then keyless); (c) composed on a black canvas with a key-less active V1
+    // (G14's layout): V2 +4, V1 still, no GL keys, renderFrameAt within 1; (c2) an
+    // active keyed V2 (V1 empty) at videoDx -0.375 over a V3 layer: V2 +4, V3 still,
+    // no GL keys; (d) V1 +8 and V2 +4: each its own; (e) (b)'s ramped V2 composed
+    // with V1: x 52; (f) a lone keyed V1 with (b)'s ramp: the GL matrix and read-back
+    // at the decoder's position (1.5 s, x 52); renderFrameAt stays at x 48 (no video
+    // speed ramp, declared difference); (g) a re-present of (d)'s frame
+    // (setTextOverlays) and a composite frame cache hit of it keep the upload and no
+    // GL keys; (h) a lone keyed V2 under a still compare: keys off and identity while
+    // comparing, back to (a)'s matrix after. HEAD: (a)(b)(h) GL keys off and the dot
+    // unmoved, (b) Echo trail at x 40, (c)-(e) V2 unmoved, (f) the GL at 1 s (x 48).
+    {
+        std::ostringstream d;
+        constexpr int kGlW = 256;
+        constexpr int kGlH = 144;
+        const QRect v1Area(0, 0, 40, 20);
+        const QRect v2Area(40, 36, kSize - 40, kSize - 36);
+        // The 16:9 canvas frame overlay lies on the widget perimeter only.
+        const QRect glArea(1, 1, kGlW - 2, kGlH - 2);
+        const auto sameM = [](const std::array<float, 9> &a, const std::array<float, 9> &b) {
+            for (int i = 0; i < 9; ++i)
+                if (std::abs(double(a[i]) - double(b[i])) > 1e-6)
+                    return false;
+            return true;
+        };
+        const auto dotAt = [](const Box &b, int x, int y) {
+            return b.n == 4 && b.rect == QRect(x, y, 2, 2);
+        };
+        const auto maxDiff = [](const QImage &a, const QImage &b) {
+            if (a.isNull() || b.isNull() || a.size() != b.size())
+                return 255;
+            const QImage x = a.convertToFormat(QImage::Format_RGBA8888);
+            const QImage y = b.convertToFormat(QImage::Format_RGBA8888);
+            int worst = 0;
+            for (int row = 0; row < x.height(); ++row)
+                for (int col = 0; col < x.width() * 4; ++col)
+                    worst = qMax(worst, std::abs(int(x.constScanLine(row)[col])
+                                                 - int(y.constScanLine(row)[col])));
+            return worst;
+        };
+        const auto entry = [](const QString &file, int track, double start, double end) {
+            PlaybackEntry e;
+            e.filePath = file;
+            e.clipIn = 0.0;
+            e.clipOut = end - start;
+            e.timelineStart = start;
+            e.timelineEnd = end;
+            e.speed = 1.0;
+            e.sourceTrack = track;
+            e.sourceClipIndex = 0;
+            return e;
+        };
+        const auto layerOf = [](const QImage &image, int track, int seqIdx, double videoDx) {
+            VideoPlayer::DecodedLayer layer;
+            layer.rgb = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            layer.videoDx = videoDx;
+            layer.sourceTrack = track;
+            layer.sequenceIdx = seqIdx;
+            return layer;
+        };
+        speedramp::SpeedRamp ramp15;
+        ramp15.keyframes = {{0, 1.5}};
+        const QVector<StabilizerKeyframe> rampKeys = {key(0.0, 0.0), key(2.0, 16.0)};
+        const qint64 rampAt = us(1.0);
+        QImage black(kSize, kSize, QImage::Format_ARGB32_Premultiplied);
+        black.fill(Qt::black);
+        QImage blackGl(kGlW, kGlH, QImage::Format_ARGB32_Premultiplied);
+        blackGl.fill(Qt::black);
+
+        bool glRan = false;
+        bool aOk = false, bOk = false, bEchoOk = false, fOk = false, hOk = false;
+        bool cGlOk = false, gOk = false;
+        bool cOk = false, c2Ok = false, dOk = false, eOk = false;
+        {
+            VideoPlayer player;
+            GLPreview *view = player.glPreview();
+            const bool glAccel = view && player.isGLAccelerated();
+            bool grabOk = false;
+            if (glAccel) {
+                view->setFixedSize(kGlW, kGlH);
+                view->setFrameTextureNearestForTest(true);
+                player.setCanvasSize(kGlW, kGlH);
+                player.show();
+                grabOk = selftest::glContextUsable(view);
+            }
+            glRan = glAccel && grabOk;
+            const auto glState = [&] {
+                std::ostringstream g;
+                g << "enabled=" << view->stabEnabledForTest()
+                  << " m=" << matrixText(view->stabMatrixForTest());
+                return g.str();
+            };
+            // The widget read back in frame pixels (device pixel floor((x + 0.5) * dpr)).
+            const auto grab = [&] {
+                QApplication::processEvents(QEventLoop::AllEvents, 25);
+                const QImage raw = view->grabFramebuffer();
+                const qreal dpr = view->devicePixelRatioF();
+                QImage frame(kGlW, kGlH, QImage::Format_RGB32);
+                frame.fill(Qt::black);
+                for (int y = 0; y < kGlH && !raw.isNull(); ++y)
+                    for (int x = 0; x < kGlW; ++x) {
+                        const int rx = qMin(raw.width() - 1, int(std::floor((x + 0.5) * dpr)));
+                        const int ry = qMin(raw.height() - 1, int(std::floor((y + 0.5) * dpr)));
+                        frame.setPixel(x, y, raw.pixel(rx, ry) | 0xff000000u);
+                    }
+                return frame;
+            };
+            const auto expectM = [](const QVector<StabilizerKeyframe> &keys, qint64 sourceUs,
+                                    int w, int h) {
+                return stabwarp::inverseMatrixUv(stabwarp::sampleAt(keys, sourceUs), w, h);
+            };
+            // A lone layer `track` (dot (40,40) on 256x144) active in [0, 2) s, a key-less
+            // V1 entry after it (V1 empty at the playhead), presented at `at`.
+            const auto lone = [&](int track, const QVector<StabilizerKeyframe> &keys,
+                                  bool ramped, qint64 at) {
+                PlaybackEntry e = entry(seqC, track, 0.0, kDuration);
+                e.stabilizerKeyframes = keys;
+                QVector<PlaybackEntry> seq = {e};
+                if (track != 0)
+                    seq.append(entry(seqA, 0, kDuration, 2 * kDuration));
+                player.m_sequence = seq;
+                QVector<speedramp::SpeedRamp> ramps(seq.size(), speedramp::SpeedRamp::identity());
+                if (ramped)
+                    ramps[0] = ramp15;
+                player.setSpeedRamps(ramps);
+                player.composeAndPresentForTest(
+                    blackGl, {layerOf(dotFrame({QPoint(40, 40)}, kGlW, kGlH), track, 0, 0.0)},
+                    seq, 0, at);
+            };
+            if (glRan) {
+                // (a)
+                lone(1, {key(0.0, 4.0)}, false, us(t));
+                const auto ma = view->stabMatrixForTest();
+                const auto ea = expectM({key(0.0, 4.0)}, us(t), kGlW, kGlH);
+                const Box aDot = whiteBox(grab(), glArea);
+                aOk = view->stabEnabledForTest() && sameM(ma, ea) && dotAt(aDot, 44, 40);
+                d << "(a) lone V2 gl " << glState() << " expect " << matrixText(ea)
+                  << " read-back " << boxText(aDot) << " ok=" << aOk;
+
+                // (b) on the GL.
+                lone(1, rampKeys, true, rampAt);
+                const auto mb = view->stabMatrixForTest();
+                const auto eb = expectM(rampKeys, us(1.5), kGlW, kGlH);
+                const auto linear = expectM(rampKeys, rampAt, kGlW, kGlH);
+                const Box bDot = whiteBox(grab(), glArea);
+                bOk = view->stabEnabledForTest() && sameM(mb, eb) && !sameM(mb, linear)
+                    && dotAt(bDot, 52, 40);
+                d << " (b) ramped lone V2 gl " << glState() << " expect(1.5 s) "
+                  << matrixText(eb) << " read-back " << boxText(bDot) << " ok=" << bOk;
+
+                // (f) the same on V1: the GL samples at its decoder's position (1.5 s,
+                // x 52). Declared difference: renderFrameAt applies no video speed
+                // ramp (its picture and keys are at 1.0 s, x 48; S0-1 (c)).
+                ClipInfo v1Ramped = withKeys(seqClip(seqC), rampKeys);
+                v1Ramped.speedRamp = ramp15;
+                const QImage fExport = exportAt({{v1Ramped}}, 1.0);
+                lone(0, rampKeys, true, rampAt);
+                const auto mf = view->stabMatrixForTest();
+                const Box fDot = whiteBox(grab(), glArea);
+                const Box fExp = whiteBox(fExport);
+                fOk = view->stabEnabledForTest() && sameM(mf, eb) && dotAt(fDot, 52, 40)
+                    && dotAt(fExp, 48, 40);
+                d << " (f) ramped lone V1 gl " << glState() << " read-back " << boxText(fDot)
+                  << " renderFrameAt " << boxText(fExp) << " ok=" << fOk;
+                player.setSpeedRamps({});
+
+                // (h) a still compare over (a).
+                lone(1, {key(0.0, 4.0)}, false, us(t));
+                const auto fresh = view->stabMatrixForTest();
+                const bool freshOn = view->stabEnabledForTest();
+                stillcompare::Config on;
+                on.enabled = true;
+                on.still = dotFrame({QPoint(50, 40)}, kGlW, kGlH);
+                player.setStillCompare(on);
+                const bool hOn = !view->stabEnabledForTest()
+                    && matrixNear(view->stabMatrixForTest(), {1, 0, 0, 0, 1, 0, 0, 0, 1});
+                d << " (h) on " << glState();
+                player.setStillCompare(stillcompare::Config{});
+                hOk = freshOn && sameM(fresh, ea) && hOn && view->stabEnabledForTest()
+                    && sameM(view->stabMatrixForTest(), fresh);
+                d << " off " << glState() << " ok=" << hOk;
+            } else {
+                d << "(a)(b)(f)(h) not run: GL preview unavailable (environment)";
+            }
+
+            // (c)-(e) composed on a black canvas (the production callers' form: the
+            // layers in paint order, the active entry's among them).
+            ClipInfo v1Left = seqClip(seqB);
+            v1Left.videoDx = -0.375;
+            const ClipInfo v2Plain = seqClip(seqC);
+            const QImage v1Img = dotFrame({QPoint(34, 10)});
+            const QImage v2Img = dotFrame({QPoint(40, 40)});
+            const auto composed = [&](const QVector<StabilizerKeyframe> &v1Keys,
+                                      const QVector<StabilizerKeyframe> &v2Keys,
+                                      bool v2Ramped) {
+                PlaybackEntry e1 = entry(seqB, 0, 0.0, kDuration);
+                e1.stabilizerKeyframes = v1Keys;
+                PlaybackEntry e2 = entry(seqC, 1, 0.0, kDuration);
+                e2.stabilizerKeyframes = v2Keys;
+                const QVector<PlaybackEntry> seq = {e1, e2};
+                player.m_sequence = seq;
+                player.setSpeedRamps({speedramp::SpeedRamp::identity(),
+                                      v2Ramped ? ramp15 : speedramp::SpeedRamp::identity()});
+                const qint64 at = v2Ramped ? rampAt : us(t);
+                // V2 paints first (backmost), V1 last, as the production sort orders them.
+                const QImage shown = player.composeAndPresentForTest(
+                    black, {layerOf(v2Img, 1, 1, 0.0), layerOf(v1Img, 0, 0, -0.375)}, seq, 0,
+                    at);
+                player.setSpeedRamps({});
+                return shown;
+            };
+            // `exported` null: no renderFrameAt comparison ((e): renderFrameAt does not
+            // apply a video speed ramp, so it is printed only).
+            const auto cLeg = [&](const char *name, const QImage &shown, const QImage &exported,
+                                  QPoint v1Dot, QPoint v2Dot) {
+                const int diff = exported.isNull() ? 0 : maxDiff(shown, exported);
+                const bool glOff = !glRan || !view->stabEnabledForTest();
+                const bool ok = dotAt(whiteBox(shown, v1Area), v1Dot.x(), v1Dot.y())
+                    && dotAt(whiteBox(shown, v2Area), v2Dot.x(), v2Dot.y()) && diff <= 1;
+                d << ' ' << name << " V1 " << boxText(whiteBox(shown, v1Area)) << " V2 "
+                  << boxText(whiteBox(shown, v2Area));
+                if (!exported.isNull())
+                    d << " maxDiff=" << diff;
+                if (glRan)
+                    d << " gl " << glState();
+                d << " ok=" << (ok && glOff);
+                return std::make_pair(ok, glOff);
+            };
+            const auto [c1, c1Gl] = cLeg("(c)", composed({}, {key(0.0, 4.0)}, false),
+                                         exportAt({{v1Left}, {withKeys(v2Plain, {key(0.0, 4.0)})}}, t),
+                                         QPoint(10, 10), QPoint(44, 40));
+            cOk = c1;
+
+            // (c2) the active keyed V2 at videoDx -0.375 (V1 empty), V3 key-less.
+            bool c2Gl = false;
+            {
+                PlaybackEntry e2 = entry(seqB, 1, 0.0, kDuration);
+                e2.stabilizerKeyframes = {key(0.0, 4.0)};
+                const QVector<PlaybackEntry> seq = {e2, entry(seqC, 2, 0.0, kDuration)};
+                const QImage shown = player.composeAndPresentForTest(
+                    black, {layerOf(v2Img, 2, 1, 0.0), layerOf(v1Img, 1, 0, -0.375)}, seq, 0,
+                    us(t));
+                ClipInfo v2Left = withKeys(seqClip(seqB), {key(0.0, 4.0)});
+                v2Left.videoDx = -0.375;
+                const QImage exported =
+                    exportAt({QVector<ClipInfo>{}, {v2Left}, {seqClip(seqC)}}, t);
+                const auto [ok, glOff] = cLeg("(c2)", shown, exported, QPoint(14, 10),
+                                              QPoint(40, 40));
+                c2Ok = ok;
+                c2Gl = glOff;
+            }
+
+            const QImage dShown = composed({key(0.0, 8.0)}, {key(0.0, 4.0)}, false);
+            const auto [dRes, dGl] =
+                cLeg("(d)", dShown,
+                     exportAt({{withKeys(v1Left, {key(0.0, 8.0)})},
+                               {withKeys(v2Plain, {key(0.0, 4.0)})}},
+                              t),
+                     QPoint(18, 10), QPoint(44, 40));
+            dOk = dRes;
+
+            // (g) re-present (d)'s frame, then serve it from the composite frame cache as
+            // the playback tick does (cachePreviewComposite, then tryGet + displayFrame).
+            if (glRan) {
+                const QImage upload = view->uploadFrameForTest();
+                player.setTextOverlays({});
+                const bool reOk = !view->stabEnabledForTest()
+                    && maxDiff(view->uploadFrameForTest(), upload) == 0;
+                d << " (g) re-present gl " << glState() << " same upload=" << reOk;
+                player.m_adaptivePreviewEnabled = true;
+                player.cachePreviewComposite(player.m_lastSourceFrame,
+                                             player.m_lastSourceFrameV1StabBaked);
+                playback::CompositeFrameKey hitKey;
+                hitKey.timelineRevision = player.m_timelineRevision;
+                hitKey.timeMs = player.m_timelinePositionUs / 1000;
+                hitKey.width = player.m_lastSourceFrame.width();
+                hitKey.height = player.m_lastSourceFrame.height();
+                hitKey.qualityTier = player.m_adaptiveQualityTier;
+                // useProxy follows the playback proxy preference (file-local in
+                // VideoPlayer.cpp): the one entry just put matches one of the two.
+                QImage cached;
+                bool cachedBaked = false;
+                bool hit = false;
+                for (const bool proxy : {false, true}) {
+                    hitKey.useProxy = proxy;
+                    hit = hit || player.m_frameCache.tryGet(hitKey, cached, &cachedBaked);
+                }
+                if (hit)
+                    player.displayFrame(cached, false, player.m_timelinePositionUs, cachedBaked);
+                const bool cacheOk = hit && cachedBaked && !view->stabEnabledForTest()
+                    && maxDiff(view->uploadFrameForTest(), upload) == 0;
+                d << " cache hit=" << hit << " baked=" << cachedBaked << " gl " << glState()
+                  << " same upload=" << cacheOk;
+                gOk = reOk && cacheOk;
+            }
+
+            ClipInfo v2Ramped = withKeys(v2Plain, rampKeys);
+            v2Ramped.speedRamp = ramp15;
+            const auto [eRes, eGl] = cLeg("(e)", composed({}, rampKeys, true), QImage(),
+                                          QPoint(10, 10), QPoint(52, 40));
+            eOk = eRes;
+            d << " (renderFrameAt V2 " << boxText(whiteBox(exportAt({{v1Left}, {v2Ramped}}, 1.0),
+                                                           v2Area))
+              << ')';
+            cGlOk = c1Gl && c2Gl && dGl && eGl;
+
+            // (b) with an Echo baked on the CPU: the lone ramped V2 (64x64, Echo 2
+            // samples 0.25 s apart) prepared as the paused refresh does (its decoder's
+            // source time), then presented: the newest sample at x 52 (rightmost
+            // column 53), the GL keyless.
+            if (glRan) {
+                ClipInfo echoed = v2Ramped;
+                echoed.effects = {VideoEffect::createEcho(0.25, 2, 0.5, 2)};
+                auto timeline = makeTimeline({QVector<ClipInfo>{}, {echoed}});
+                view->setTimeline(timeline.get());
+                const QVector<PlaybackEntry> seq = timeline->computePlaybackSequence();
+                bool applied = false;
+                QImage prepared;
+                if (seq.size() == 1 && seq[0].sourceTrack == 1) {
+                    player.m_sequence = seq;
+                    player.m_activeEntry = 0;
+                    player.m_timelinePositionUs = rampAt;
+                    player.setSpeedRamps({ramp15});
+                    const double sourceSec =
+                        double(player.entryLocalPositionUs(0, rampAt)) / AV_TIME_BASE;
+                    prepared = player.preparePreviewClipFrame(
+                        v2Img, seq[0], 0, sourceSec, QSize(kSize, kSize), rampAt, &applied);
+                    player.composeAndPresentForTest(black, {layerOf(prepared, 1, 0, 0.0)}, seq,
+                                                    0, rampAt);
+                    player.setSpeedRamps({});
+                }
+                const Box echoBox = nonBlackBox(prepared, v2Area);
+                bEchoOk = applied && !view->stabEnabledForTest() && echoBox.n > 0
+                    && echoBox.rect.right() == 53 && echoBox.rect.top() == 40
+                    && dotAt(nonBlackBox(prepared, QRect(52, 36, 12, 28)), 52, 40);
+                d << " (b) echo entries=" << seq.size() << " applied=" << applied << " trail "
+                  << boxText(echoBox) << " gl " << glState() << " ok=" << bEchoOk;
+                view->setTimeline(nullptr);
+            }
+        }
+        const bool cpuOk = cOk && c2Ok && dOk && eOk;
+        if (!glRan && cpuOk)
+            tally.skip(15, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(15, cpuOk && glRan && aOk && bOk && bEchoOk && cGlOk && fOk && gOk && hOk,
+                       d.str());
+    }
+
+    // US-2302 G16: a nested sequence shows the nested-sequence SSOT (renderFrameAt)
+    // paused as it does in the forward tick, through the production entry points,
+    // with the decoder left where it was before. Media: 256x144 mpeg4 movies whose
+    // box names the source frame (fixed GOP checked from the packets). Fixtures on a
+    // shown MainWindow (V1 is frontmost, so V1 sits in the bottom-right quadrant
+    // where an upper track must show): N = V1 [reference to child (A: inPoint 0.4 s,
+    // G13's keys; B: inPoint 0.5 s), C keyed +2]; Cv2 = the reference on V2; R = V1 D
+    // (keyed +2) and a V2 reference (1-2 s, child 0.6-1.6 s) to a child with a 1.5x
+    // speed ramp; S = V1 and a shape clip at 0.5-1.5 s; H = V1 (full frame) and a
+    // hidden clip. (a) the forward tick equals renderFrameAt, the GL keyless; (b1)
+    // seekToTimelineUs, (b2) setSequence with a changed active entry, (b3)
+    // stepForward -> advanceToEntry, (b4) a step inside one entry, (b4') a step into
+    // a nest on V2 (ramped child), refresh (refreshDisplayedFrame after a key
+    // edit): renderFrameAt within 1, the child's box at the key's shift, GL keyless,
+    // one frameComposited per display; (b5) nextDecodedSourceUsForTest after (b1) /
+    // (b3) / (b4) is the frame after the playhead's, and playback right after a
+    // paused seek and across the child boundary does not stall; (c) the reference on
+    // V2; (d) the ramped child (seek and tick); (e) a shape clip seek, (e2) a step
+    // inside it, (e3) H's steps after playback keep the decoder (and a step into the
+    // shape from outside); (f) leaving the nest by seek and by a step equals a direct
+    // seek, and leaving it by playback after a paused seek or step equals playback
+    // across the same boundary; (g) a child key edit through refreshPlaybackSequence;
+    // (h) the effect dialog's clip-local CPU preview after a paused seek composes the
+    // frame at T, and the SSOT comes back when the preview is removed.
+    // HEAD: (b1)-(b4) and refresh show the flattened frame with the GL uStab on,
+    // (b4') / (d) miss the child's ramp, (e2) / (e3) (iv) show the key frame's
+    // picture without the shape.
+    QString encWhy;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encWhy)) {
+        tally.skip(16, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+    } else {
+        std::ostringstream d;
+        const QString movA = dir + QStringLiteral("/g16a.mp4");
+        const QString movB = dir + QStringLiteral("/g16b.mp4");
+        const bool movOk = writeBoxMovie(movA, QColor(70, 70, 70))
+            && writeBoxMovie(movB, QColor(20, 20, 110));
+        int gop = 0;
+        bool gopOk = movOk;
+        for (const QString &path : {movA, movB}) {
+            int packets = 0;
+            const QVector<int> keys = keyFrameIndices(path, &packets);
+            const int n = keys.size() >= 2 ? keys[1] - keys[0] : 0;
+            bool fixed = n >= 12 && packets == kMovFrames && (gop == 0 || n == gop);
+            for (int i = 0; i < keys.size(); ++i)
+                fixed = fixed && keys[i] == i * n;
+            gop = n;
+            gopOk = gopOk && fixed;
+            d << "media packets=" << packets << " gop=" << n << " fixed=" << fixed << ';';
+        }
+        const auto lastKeyOf = [&](int n) { return gop > 0 ? (n / gop) * gop : 0; };
+        const auto movClip = [](const QString &path, double in, double length) {
+            ClipInfo clip;
+            clip.filePath = path;
+            clip.displayName = QStringLiteral("g16");
+            clip.duration = double(kMovFrames) / kFps;
+            clip.inPoint = in;
+            clip.outPoint = in + length;
+            clip.opacity = 1.0;
+            return clip;
+        };
+        const auto seqOf = [](const QString &id, const QVector<QVector<ClipInfo>> &tracks) {
+            TimelineSequence s;
+            s.id = id;
+            s.name = id;
+            s.videoTracks = tracks;
+            return s;
+        };
+        const auto refTo = [](const QString &id, double length, double leadIn) {
+            ClipInfo ref;
+            ref.sequenceRefId = id;
+            ref.filePath = timeline_nesting::sequenceClipFilePath(id);
+            ref.displayName = id;
+            ref.duration = ref.outPoint = length;
+            ref.leadInSec = leadIn;
+            ref.opacity = 1.0;
+            return ref;
+        };
+        const QSize movSize(kMovW, kMovH);
+        // V1 is frontmost in this compositor: a V1 clip scaled into the bottom-right
+        // quadrant leaves the upper tracks visible elsewhere.
+        const auto quadrant = [](ClipInfo clip) {
+            clip.videoScale = 0.5;
+            clip.videoDx = 0.25;
+            clip.videoDy = 0.25;
+            return clip;
+        };
+        const QRect topHalf(0, 0, kMovW, 72);
+        const QVector<StabilizerKeyframe> keysA = {key(0.4, 0.0), key(1.4, 10.0)};
+        const QVector<StabilizerKeyframe> keysA20 = {key(0.4, 0.0), key(1.4, 20.0)};
+        const QVector<StabilizerKeyframe> keys2 = {key(0.0, 2.0)};
+        const QString childId = QStringLiteral("child");
+        const QString mainId = QStringLiteral("main");
+        const auto nestSeqs = [&](const QVector<StabilizerKeyframe> &aKeys) {
+            const TimelineSequence child = seqOf(
+                childId, {{withKeys(movClip(movA, 0.4, 1.6), aKeys), movClip(movB, 0.5, 1.0)}});
+            const TimelineSequence main = seqOf(
+                mainId, {{refTo(childId, 2.6, 0.0), withKeys(movClip(movA, 0.0, 1.0), keys2)}});
+            return QVector<TimelineSequence>{main, child};
+        };
+
+        struct Rig {
+            std::unique_ptr<MainWindow> window;
+            Timeline *tl = nullptr;
+            VideoPlayer *p = nullptr;
+            GLPreview *view = nullptr;
+            int composited = 0;
+            bool gl = false;
+        };
+        bool allGl = true;
+        const auto open = [&](Rig &r, const char *name, const std::function<void(Timeline *)> &build) {
+            r.window = std::make_unique<MainWindow>();
+            r.window->show();
+            pumpEvents(300);
+            r.tl = r.window->findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            r.p = r.window->m_player;
+            bool ok = r.tl && r.p && movOk;
+            if (ok) {
+                r.view = r.p->glPreview();
+                emit r.tl->projectOutputConfigRestored(kMovW, kMovH, false);
+                r.tl->setProjectOutputConfig(kMovW, kMovH, false, kFps);
+                build(r.tl);
+                r.tl->refreshPlaybackSequence();
+                pumpEvents(600);
+                QObject::connect(r.p, &VideoPlayer::frameComposited, r.window.get(),
+                                 [&r](const QImage &) { ++r.composited; });
+                r.gl = r.view && r.p->isGLAccelerated() && selftest::glContextUsable(r.view);
+                ok = !r.p->m_sequence.isEmpty();
+            }
+            allGl = allGl && r.gl;
+            d << " [" << name << "] entries=" << (r.p ? r.p->m_sequence.size() : 0)
+              << " gl=" << r.gl;
+            return ok;
+        };
+        const auto ref = [&](Rig &r, qint64 at) {
+            return tlrender::renderFrameAt(r.tl, at, movSize);
+        };
+        const auto seekTo = [&](Rig &r, qint64 at) {
+            r.p->seekToTimelineUs(at, true);
+            pumpEvents(40);
+        };
+        const auto playhead = [](Rig &r) { return qint64(r.p->m_timelinePositionUs); };
+        // The shown frame against renderFrameAt at `at` (within 1), the box of source
+        // time `srcUs` shifted by the keys' dx there (srcUs < 0: not checked), and the
+        // GL keyless.
+        const auto shownLeg = [&](Rig &r, const char *name, qint64 at, qint64 srcUs,
+                                  const QVector<StabilizerKeyframe> &keys,
+                                  const QRect &spotRegion = QRect(0, 0, kMovW, kMovH)) {
+            const QImage shown = r.p->m_currentFrameImage;
+            const int diff = imageMaxDiff(shown, ref(r, at));
+            const Spot spot = brightSpot(shown, spotRegion);
+            const double dx = stabwarp::sampleAt(keys, srcUs).dx;
+            const bool spotOk = srcUs < 0 || spotAt(spot, srcUs, dx);
+            const bool glOff = !r.view || !r.view->stabEnabledForTest();
+            const bool ok = diff <= 1 && spotOk && glOff;
+            d << ' ' << name << " playhead=" << frameAt(playhead(r)) << "f maxDiff=" << diff
+              << " shown=" << shown.width() << 'x' << shown.height() << ' ' << spotText(spot);
+            if (srcUs >= 0)
+                d << " expect src " << shownFrameAt(srcUs) << "f dx " << dx;
+            d << " stab=" << !glOff << " ok=" << ok;
+            return ok;
+        };
+        // nextDecodedSourceUsForTest against `expectUs` in frames, within [lo, hi].
+        const auto probeLeg = [&](Rig &r, const char *name, qint64 expectUs, int lo, int hi) {
+            const qint64 next = r.p->nextDecodedSourceUsForTest();
+            const int diff = next < 0 ? -999 : frameAt(next) - frameAt(expectUs);
+            const bool ok = diff >= lo && diff <= hi;
+            d << ' ' << name << " probe next=" << (next < 0 ? -1 : frameAt(next)) << "f expect "
+              << frameAt(expectUs) << "f diff=" << diff << " ok=" << ok;
+            return ok;
+        };
+        // positionChanged (elapsed ms, us) from play() until `stopUs` is passed (at
+        // least 6 values) or `maxMs`; then pause.
+        using Emits = std::vector<std::pair<qint64, qint64>>;
+        const auto playRecord = [&](Rig &r, qint64 stopUs, int maxMs) {
+            Emits v;
+            QElapsedTimer timer;
+            const auto conn = QObject::connect(
+                r.p, &VideoPlayer::positionChanged, r.window.get(),
+                [&](double sec) { v.push_back({timer.elapsed(), qRound64(sec * 1000000.0)}); });
+            timer.start();
+            r.p->play();
+            while (timer.elapsed() < maxMs && !(v.size() >= 6 && v.back().second > stopUs))
+                QApplication::processEvents(QEventLoop::AllEvents, 2);
+            r.p->pause();
+            QObject::disconnect(conn);
+            pumpEvents(40);
+            return v;
+        };
+        // From the first value >= fromUs (with `fromStart`, from the first value
+        // play() emitted, which must then be >= fromUs): 5 values strictly
+        // increasing, and the time (from play()) of the first value past `reachUs`
+        // within `limitMs`. A repeat within half a frame of the value's first
+        // emission belongs to that emission burst (HEAD emits the boundary frame at
+        // 0, 9 and 9 ms, one tick, Step 0 S0-2 (xii) (D) (3)) and is collapsed; a
+        // repeat further apart is a later tick re-emitting the value and fails.
+        const auto flowLeg = [&](const char *name, const Emits &v, qint64 fromUs, qint64 reachUs,
+                                 qint64 limitMs, bool fromStart) {
+            size_t first = 0;
+            while (!fromStart && first < v.size() && v[first].second < fromUs)
+                ++first;
+            std::vector<qint64> distinct;
+            qint64 burstStartMs = 0;
+            int burstRepeats = 0;
+            int tickRepeats = 0;
+            for (size_t i = first; i < v.size(); ++i) {
+                if (!distinct.empty() && v[i].second == distinct.back()) {
+                    if (v[i].first - burstStartMs <= frameUs(1) / 2000)
+                        ++burstRepeats;
+                    else
+                        ++tickRepeats;
+                } else if (distinct.size() == 5) {
+                    break;
+                } else {
+                    distinct.push_back(v[i].second);
+                    burstStartMs = v[i].first;
+                }
+            }
+            bool inc = tickRepeats == 0 && distinct.size() >= 5 && distinct[0] >= fromUs;
+            for (size_t i = 1; inc && i < 5; ++i)
+                inc = distinct[i] > distinct[i - 1];
+            qint64 reach = -1;
+            for (const auto &e : v)
+                if (reach < 0 && e.second > reachUs)
+                    reach = e.first;
+            const bool ok = inc && reach >= 0 && reach <= limitMs;
+            d << ' ' << name << " positionChanged(ms:frame)=";
+            for (size_t i = first < 3 ? 0 : first - 3; i < v.size() && i < first + 8; ++i)
+                d << (i ? "," : "") << v[i].first << ':' << frameAt(v[i].second);
+            d << " burstRepeats=" << burstRepeats << " tickRepeats=" << tickRepeats
+              << " increasing=" << inc << " reach=" << reach
+              << "ms limit=" << limitMs
+              << " ok=" << ok;
+            return ok;
+        };
+        // The frames the forward tick presents (frameComposited) from `from` while
+        // the playhead stays below `endUs`, each against renderFrameAt at its time.
+        const auto tickLeg = [&](Rig &r, const char *name, qint64 from, qint64 endUs) {
+            seekTo(r, from);
+            std::vector<std::pair<qint64, QImage>> frames;
+            const auto conn = QObject::connect(
+                r.p, &VideoPlayer::frameComposited, r.window.get(),
+                [&](const QImage &image) { frames.push_back({playhead(r), image}); });
+            r.p->play();
+            QElapsedTimer timer;
+            timer.start();
+            // The GL's uStab after every event-loop turn from the first presented tick
+            // on (a keyed push between two ticks would warp the baked SSOT frame a
+            // second time on the GL); the state the seek left before it is not the
+            // tick's.
+            bool glOff = true;
+            std::string stabTrace;
+            bool lastStab = false;
+            while (timer.elapsed() < 1500 && frames.size() < 6) {
+                QApplication::processEvents(QEventLoop::AllEvents, 2);
+                if (frames.empty())
+                    continue;
+                const bool on = r.view && r.view->stabEnabledForTest();
+                if (on != lastStab)
+                    stabTrace += std::to_string(timer.elapsed()) + "ms:" + (on ? "on@" : "off@")
+                        + std::to_string(frameAt(playhead(r))) + "f,";
+                lastStab = on;
+                glOff = glOff && !on;
+            }
+            r.p->pause();
+            QObject::disconnect(conn);
+            pumpEvents(40);
+            int checked = 0;
+            int worst = 0;
+            d << ' ' << name << " tick frames=";
+            for (const auto &f : frames) {
+                if (f.first >= endUs)
+                    continue;
+                const int diff = imageMaxDiff(f.second, ref(r, f.first));
+                worst = qMax(worst, diff);
+                ++checked;
+                d << frameAt(f.first) << "f:" << diff << ',';
+            }
+            const bool ok = checked >= 3 && worst <= 1 && glOff;
+            d << " checked=" << checked << " worst=" << worst << " stab=" << !glOff
+              << " stabTrace=" << stabTrace << " ok=" << ok;
+            return ok;
+        };
+        struct GlState {
+            bool gl = false;
+            bool baked = false;
+            bool stab = false;
+            std::array<float, 9> m{};
+            QImage grab;
+            QImage shown;
+        };
+        const auto capture = [&](Rig &r) {
+            GlState s;
+            if (!r.view)
+                return s;
+            s.gl = r.gl;
+            s.baked = r.view->compositeBakedMode();
+            s.stab = r.view->stabEnabledForTest();
+            s.m = r.view->stabMatrixForTest();
+            s.grab = r.gl ? r.view->grabFramebuffer() : QImage();
+            s.shown = r.p->m_currentFrameImage;
+            return s;
+        };
+        const auto stateText = [&](const GlState &s) {
+            std::ostringstream o;
+            o << "baked=" << s.baked << " stab=" << s.stab << " m=" << matrixText(s.m)
+              << " extent=(" << litExtent(s.grab).x() << ',' << litExtent(s.grab).y() << ' '
+              << litExtent(s.grab).width() << 'x' << litExtent(s.grab).height() << ')';
+            return o.str();
+        };
+        // Same GL state; samePicture: also the same shown frame and read-back.
+        const auto sameState = [&](const char *name, const GlState &a, const GlState &b,
+                                   bool samePicture) {
+            bool sameM = true;
+            for (int i = 0; i < 9; ++i)
+                sameM = sameM && std::abs(double(a.m[i]) - double(b.m[i])) <= 1e-6;
+            const QRect ea = litExtent(a.grab), eb = litExtent(b.grab);
+            const bool sameExtent = std::abs(ea.left() - eb.left()) <= 1
+                && std::abs(ea.right() - eb.right()) <= 1 && std::abs(ea.top() - eb.top()) <= 1
+                && std::abs(ea.bottom() - eb.bottom()) <= 1;
+            const int shownDiff = imageMaxDiff(a.shown, b.shown);
+            const int grabDiff = imageMaxDiff(a.grab, b.grab);
+            const bool cmpGrab = a.gl && b.gl;
+            const bool ok = a.baked == b.baked && a.stab == b.stab && sameM
+                && (!cmpGrab || sameExtent)
+                && (!samePicture || (shownDiff == 0 && (!cmpGrab || grabDiff <= 1)));
+            d << ' ' << name << " direct " << stateText(a) << " via " << stateText(b);
+            if (samePicture) {
+                d << " shownDiff=" << shownDiff;
+                if (cmpGrab)
+                    d << " grabDiff=" << grabDiff;
+                else
+                    d << " grab=n/a";
+            }
+            d << " ok=" << ok;
+            return ok;
+        };
+        // Plays until the first frame presented at or past `boundaryUs`, then captures
+        // the GL state at once (before pausing); `past` says whether it got there.
+        const auto playOut = [&](Rig &r, qint64 boundaryUs, bool &past) {
+            past = false;
+            qint64 at = -1;
+            const auto conn = QObject::connect(
+                r.p, &VideoPlayer::frameComposited, r.window.get(), [&](const QImage &) {
+                    if (!past && playhead(r) >= boundaryUs) {
+                        past = true;
+                        at = playhead(r);
+                    }
+                });
+            r.p->play();
+            QElapsedTimer timer;
+            timer.start();
+            while (timer.elapsed() < 3000 && !past)
+                QApplication::processEvents(QEventLoop::AllEvents, 1);
+            const GlState s = capture(r);
+            r.p->pause();
+            QObject::disconnect(conn);
+            pumpEvents(40);
+            d << " (first out at " << frameAt(at) << "f past=" << past << ')';
+            return s;
+        };
+        const qint64 T = frameUs(9) + 1000; // child A: source 0.701 s = frame 21
+        const auto srcA = [](qint64 at) { return us(0.4) + at; };
+        bool ok16 = gopOk;
+        int rigs = 0;
+
+        // ---- N: the nest on V1 ----
+        {
+            Rig r;
+            if (open(r, "N", [&](Timeline *tl) { tl->setSequences(nestSeqs(keysA), mainId); })) {
+                ++rigs;
+                // (b1) + (b5) (iii)
+                int c0 = r.composited;
+                seekTo(r, T);
+                const int b1Fires = r.composited - c0;
+                ok16 = shownLeg(r, "(b1) seekToTimelineUs", T, srcA(T), keysA) && ok16;
+                d << " fires=" << b1Fires;
+                ok16 = b1Fires == 1 && ok16;
+                ok16 = probeLeg(r, "(b5)(iii) after (b1)", srcA(T) + frameUs(1), -1, 1) && ok16;
+                // (b4) + (b5) (iii)
+                seekTo(r, T);
+                const QImage atT = r.p->m_currentFrameImage;
+                c0 = r.composited;
+                r.p->stepForward();
+                pumpEvents(40);
+                const int b4Fires = r.composited - c0;
+                const qint64 ph = playhead(r);
+                int moved = 0;
+                imageMaxDiff(r.p->m_currentFrameImage, ref(r, T), &moved);
+                ok16 = shownLeg(r, "(b4) stepForward", ph, srcA(ph), keysA) && ok16;
+                const bool b4Ok = std::abs(frameAt(ph) - 10) <= 1 && moved > 100 && b4Fires == 1
+                    && imageMaxDiff(atT, ref(r, T)) <= 1;
+                d << " vs renderFrameAt(T) px>16=" << moved << " fires=" << b4Fires
+                  << " playheadOk=" << (std::abs(frameAt(ph) - 10) <= 1);
+                ok16 = b4Ok && ok16;
+                ok16 = probeLeg(r, "(b5)(iii) after (b4)", srcA(ph) + frameUs(1), -1, 1) && ok16;
+                // refresh: the child's key edited on the timeline (no setSequence).
+                seekTo(r, T);
+                {
+                    const QSignalBlocker block(r.tl);
+                    r.tl->setSequences(nestSeqs(keysA20), mainId);
+                }
+                c0 = r.composited;
+                r.p->refreshDisplayedFrame();
+                pumpEvents(40);
+                const int refreshFires = r.composited - c0;
+                ok16 = shownLeg(r, "refresh refreshDisplayedFrame", T, srcA(T), keysA20)
+                    && refreshFires >= 1 && ok16;
+                d << " fires=" << refreshFires;
+                {
+                    const QSignalBlocker block(r.tl);
+                    r.tl->setSequences(nestSeqs(keysA), mainId);
+                }
+                r.p->refreshDisplayedFrame();
+                pumpEvents(40);
+                // (g) the same edit through refreshPlaybackSequence -> setSequence.
+                seekTo(r, T);
+                {
+                    const QSignalBlocker block(r.tl);
+                    r.tl->setSequences(nestSeqs(keysA20), mainId);
+                }
+                r.tl->refreshPlaybackSequence();
+                pumpEvents(150);
+                ok16 = shownLeg(r, "(g) child key edit", T, srcA(T), keysA20) && ok16;
+                {
+                    const QSignalBlocker block(r.tl);
+                    r.tl->setSequences(nestSeqs(keysA), mainId);
+                }
+                r.tl->refreshPlaybackSequence();
+                pumpEvents(150);
+                // (b2) setSequence with the active entry changed (C was active).
+                seekTo(r, T);
+                const int before = r.p->m_activeEntry;
+                r.p->m_activeEntry = int(r.p->m_sequence.size()) - 1;
+                const QVector<PlaybackEntry> entries = r.p->m_sequence;
+                c0 = r.composited;
+                r.p->setSequence(entries);
+                pumpEvents(40);
+                d << " (b2) active " << r.p->m_sequence.size() - 1 << "->" << r.p->m_activeEntry
+                  << " (was " << before << ") fires=" << (r.composited - c0);
+                ok16 = shownLeg(r, "(b2) setSequence", T, srcA(T), keysA)
+                    && r.p->m_activeEntry == before && ok16;
+                // (h) the effect dialog's clip-local CPU preview (FilmGrain, fixed seed)
+                // after a paused seek to T in the nest composes the frame at T (W23-G
+                // A2). Reference: the same preview at T after a step that decodes T's
+                // source frame (a seek at T + 1 ms decodes the frame after T's
+                // timeline frame, so the step starts one frame earlier), then a seek
+                // to T. Stale: the frame a step to 32f decoded, which a seek left in
+                // place before A2; its box sits a row (16 px) below T's, which no key's
+                // dx changes. With the preview removed the SSOT is shown again.
+                {
+                    const QVector<VideoEffect> grain{
+                        VideoEffect::createFilmGrain(0.3, 1, 0.0, false)};
+                    bool cpuStack = true;
+                    const auto fxOn = [&]() {
+                        r.p->setPreviewEffects(grain);
+                        pumpEvents(60);
+                        int target = -1;
+                        cpuStack = cpuStack
+                            && r.p->activePreviewClipCpuStack(r.p->m_timelinePositionUs, &target);
+                        return r.p->m_currentFrameImage;
+                    };
+                    const auto fxOff = [&]() {
+                        r.p->setPreviewEffects({});
+                        pumpEvents(60);
+                    };
+                    const auto stepFrom = [&](qint64 at) {
+                        seekTo(r, at);
+                        r.p->stepForward();
+                        pumpEvents(40);
+                        return playhead(r);
+                    };
+                    const qint64 phStale = stepFrom(frameUs(30) + 1000);
+                    const QImage staleFx = fxOn();
+                    fxOff();
+                    const qint64 phStep = stepFrom(T - frameUs(1));
+                    seekTo(r, T);
+                    const QImage refFx = fxOn();
+                    fxOff();
+                    stepFrom(frameUs(30) + 1000);
+                    seekTo(r, T);
+                    const QImage seekFx = fxOn();
+                    int refMoved = 0;
+                    const int dRef = imageMaxDiff(seekFx, refFx, &refMoved);
+                    const int dSsot = imageMaxDiff(seekFx, ref(r, T));
+                    const Spot seekSpot = brightSpot(seekFx);
+                    const Spot staleSpot = brightSpot(staleFx);
+                    const bool notStale = seekSpot.n >= 100 && staleSpot.n >= 100
+                        && std::abs(seekSpot.y - staleSpot.y) > 8.0;
+                    const bool fxOk = cpuStack && std::abs(frameAt(phStale) - 32) <= 1
+                        && dRef <= 1 && notStale;
+                    d << " (h) fx preview after seek T: cpuStack=" << cpuStack
+                      << " vs reference (step to " << frameAt(phStep) << "f, seek T) maxDiff="
+                      << dRef << " px>16=" << refMoved << " vs SSOT maxDiff=" << dSsot << ' '
+                      << spotText(seekSpot) << " stale (step to " << frameAt(phStale) << "f) "
+                      << spotText(staleSpot) << " notStale=" << notStale << " ok=" << fxOk;
+                    ok16 = fxOk && ok16;
+                    fxOff();
+                    ok16 = shownLeg(r, "(h) fx preview off", T, srcA(T), keysA) && ok16;
+                }
+                // (b3) from A's last frame into B (stepForward -> advanceToEntry).
+                seekTo(r, frameUs(47) + 1000);
+                const int entryBefore = r.p->m_activeEntry;
+                r.p->stepForward();
+                pumpEvents(40);
+                {
+                    const qint64 at = playhead(r);
+                    const QImage shown = r.p->m_currentFrameImage;
+                    const int dNew = imageMaxDiff(shown, ref(r, at));
+                    const int dPrev = imageMaxDiff(shown, ref(r, at - frameUs(1)));
+                    const int dStart = imageMaxDiff(shown, ref(r, us(1.6)));
+                    const bool glOff = !r.view || !r.view->stabEnabledForTest();
+                    const bool ok = r.p->m_activeEntry != entryBefore
+                        && (dNew <= 1 || dPrev <= 1 || dStart <= 1) && glOff;
+                    d << " (b3) stepForward->advanceToEntry entry " << entryBefore << "->"
+                      << r.p->m_activeEntry << " playhead=" << frameAt(at)
+                      << "f maxDiff(newPos)=" << dNew << " (newPos-1f)=" << dPrev
+                      << " (timelineStart)=" << dStart << " matched="
+                      << (dNew <= 1 ? "newPos" : dPrev <= 1 ? "newPos-1f"
+                                                : dStart <= 1 ? "timelineStart" : "none")
+                      << ' ' << spotText(brightSpot(shown)) << " stab=" << !glOff
+                      << " ok=" << ok;
+                    ok16 = ok && ok16;
+                    // B starts at its source 0.5 s (frame 15).
+                    ok16 = probeLeg(r, "(b5)(iii) after (b3)", us(0.5) + frameUs(1), -1, 1)
+                        && ok16;
+                }
+                // (a) the forward tick.
+                ok16 = tickLeg(r, "(a)", T, us(1.6)) && ok16;
+                // (b5) (i): play right after the paused seek.
+                seekTo(r, T);
+                ok16 = flowLeg("(b5)(i)", playRecord(r, T + frameUs(4), 1500), T,
+                               T + frameUs(3), 1000, true)
+                    && ok16;
+                // (b5) (ii): across the child boundary A|B (B.inPoint = key frame + 3).
+                seekTo(r, us(1.1) + 1000);
+                {
+                    const Emits v = playRecord(r, us(1.6) + frameUs(4), 2500);
+                    qint64 cross = -1;
+                    for (const auto &e : v)
+                        if (cross < 0 && e.second >= us(1.6) - frameUs(1))
+                            cross = e.first;
+                    Emits shifted;
+                    for (const auto &e : v)
+                        shifted.push_back({cross < 0 ? e.first : e.first - cross, e.second});
+                    ok16 = flowLeg("(b5)(ii)", shifted, us(1.6), us(1.6) + frameUs(3), 1010,
+                                   false)
+                        && cross >= 0 && ok16;
+                }
+                // Skim through the nest as the seek bar drag does (previewSeek per
+                // move, seek on release; recorded, not gated: content (4)): each shown
+                // frame against renderFrameAt, its baked flag and the GL's uStab.
+                {
+                    const auto skimShown = [&]() {
+                        d << frameAt(playhead(r)) << ':'
+                          << imageMaxDiff(r.p->m_currentFrameImage, ref(r, playhead(r))) << ':'
+                          << (r.view && r.view->compositeBakedMode()) << ':'
+                          << (r.view && r.view->stabEnabledForTest()) << ',';
+                    };
+                    seekTo(r, frameUs(4) + 1000);
+                    d << " [skim, recorded, not gated] frames(f:maxDiff:baked:stab)=";
+                    for (int f = 10; f <= 58; f += 8) {
+                        r.p->previewSeek(int(frameUs(f) / 1000) + 1);
+                        pumpEvents(60);
+                        skimShown();
+                    }
+                    r.p->seek(int(frameUs(58) / 1000) + 1);
+                    pumpEvents(60);
+                    d << " release=";
+                    skimShown();
+                }
+                // Reverse playback across A|B (recorded, not gated: content (6), S0-2
+                // (x)): each presented frame against renderFrameAt and its baked flag.
+                seekTo(r, frameUs(52) + 1000);
+                {
+                    struct Shown {
+                        qint64 at;
+                        QImage image;
+                        bool baked;
+                    };
+                    std::vector<Shown> shown;
+                    const auto conn = QObject::connect(
+                        r.p, &VideoPlayer::frameComposited, r.window.get(),
+                        [&](const QImage &image) {
+                            shown.push_back({playhead(r), image, r.view->compositeBakedMode()});
+                        });
+                    r.p->setPlaybackSpeed(-1.0);
+                    r.p->play();
+                    pumpEvents(400);
+                    r.p->pause();
+                    r.p->setPlaybackSpeed(1.0);
+                    QObject::disconnect(conn);
+                    pumpEvents(40);
+                    d << " [reverse, recorded, not gated] frames(f:maxDiff:baked)=";
+                    for (const Shown &f : shown)
+                        d << frameAt(f.at) << ':' << imageMaxDiff(f.image, ref(r, f.at)) << ':'
+                          << f.baked << ',';
+                }
+            } else {
+                ok16 = false;
+            }
+        }
+        pumpEvents(200);
+
+        // ---- Cv2: the nest on V2 over a V1 clip ----
+        {
+            Rig r;
+            const auto build = [&](Timeline *tl) {
+                const TimelineSequence child =
+                    seqOf(childId, {{withKeys(movClip(movA, 0.4, 1.6), keysA)}});
+                const TimelineSequence main = seqOf(
+                    mainId, {{quadrant(movClip(movB, 0.0, 3.0))}, {refTo(childId, 1.6, 0.0)}});
+                tl->setSequences({main, child}, mainId);
+            };
+            if (open(r, "Cv2", build)) {
+                ++rigs;
+                seekTo(r, T);
+                ok16 = shownLeg(r, "(c) seekToTimelineUs", T, srcA(T), keysA, topHalf) && ok16;
+                ok16 = tickLeg(r, "(c)", T, us(1.6)) && ok16;
+            } else {
+                ok16 = false;
+            }
+        }
+        pumpEvents(200);
+
+        // ---- R: V1 D (keyed, scale 0.75) under a V2 nest (1-2 s), child ramped ----
+        {
+            Rig r;
+            const auto build = [&](Timeline *tl) {
+                // The reference shows child 0.6-1.6 s, so the ramp (source 0.5 s + 1.5x
+                // child time) and a ramp-less mapping differ from its first frame.
+                ClipInfo e = movClip(movB, 0.5, 4.0);
+                e.speedRamp.keyframes = {{0, 1.5}};
+                const TimelineSequence child = seqOf(childId, {{e}});
+                ClipInfo nest = refTo(childId, 1.6, 1.0);
+                nest.inPoint = 0.6;
+                const TimelineSequence main = seqOf(
+                    mainId, {{quadrant(withKeys(movClip(movA, 0.0, 3.0), keys2))}, {nest}});
+                tl->setSequences({main, child}, mainId);
+            };
+            if (open(r, "R", build)) {
+                ++rigs;
+                // (d) seek and tick.
+                seekTo(r, frameUs(40) + 1000);
+                ok16 = shownLeg(r, "(d) seekToTimelineUs", playhead(r), -1, {}) && ok16;
+                d << " renderFrameAt " << spotText(brightSpot(ref(r, playhead(r)), topHalf));
+                ok16 = tickLeg(r, "(d)", frameUs(31) + 1000, us(2.0)) && ok16;
+                // (b4') a step from V1 alone into the nest (active entry stays V1).
+                seekTo(r, frameUs(29) + 1000);
+                const int entryBefore = r.p->m_activeEntry;
+                const bool flatStab = r.view && r.view->stabEnabledForTest();
+                r.p->stepForward();
+                pumpEvents(40);
+                d << " (b4') before: stab=" << flatStab << " entry " << entryBefore << "->"
+                  << r.p->m_activeEntry;
+                ok16 = shownLeg(r, "(b4') stepForward into the nest", playhead(r), -1, {})
+                    && std::abs(frameAt(playhead(r)) - 30) <= 1 && ok16;
+                // (f) out of the nest by seek, against a direct seek.
+                seekTo(r, frameUs(75) + 1000);
+                seekTo(r, frameUs(70) + 1000);
+                const GlState directSeek = capture(r);
+                seekTo(r, frameUs(40) + 1000);
+                seekTo(r, frameUs(70) + 1000);
+                ok16 = sameState("(f) seek out", directSeek, capture(r), true) && ok16;
+                // (f) out of the nest by a step inside V1 (content (4a)).
+                seekTo(r, frameUs(70) + 1000);
+                seekTo(r, frameUs(60) + 1000);
+                const GlState directStep = capture(r);
+                seekTo(r, frameUs(59) + 1000);
+                r.p->stepForward();
+                pumpEvents(40);
+                const qint64 out = playhead(r);
+                ok16 = sameState("(f) stepForward out", directStep, capture(r), true)
+                    && frameAt(out) == 60 && ok16;
+                ok16 = probeLeg(r, "(f) after the step out", out + frameUs(1), -1, 1) && ok16;
+                // (f) out of the nest by playback: from 1 s before the boundary, after a
+                // paused seek to the last frame, and after a step into the last frame.
+                seekTo(r, frameUs(30) + 1000);
+                bool past = false;
+                const GlState across = playOut(r, us(2.0), past);
+                ok16 = past && ok16;
+                seekTo(r, frameUs(10) + 1000);
+                r.p->play();
+                pumpEvents(300);
+                r.p->pause();
+                pumpEvents(40);
+                seekTo(r, frameUs(59) + 1000);
+                const GlState afterSeek = playOut(r, us(2.0), past);
+                ok16 = sameState("(f) play out after a seek", across, afterSeek, false) && past
+                    && ok16;
+                seekTo(r, frameUs(10) + 1000);
+                r.p->play();
+                pumpEvents(300);
+                r.p->pause();
+                pumpEvents(40);
+                seekTo(r, frameUs(58) + 1000);
+                r.p->stepForward();
+                pumpEvents(40);
+                const GlState afterStep = playOut(r, us(2.0), past);
+                ok16 = sameState("(f) play out after a step", across, afterStep, false) && past
+                    && ok16;
+            } else {
+                ok16 = false;
+            }
+        }
+        pumpEvents(200);
+
+        // ---- S: a shape clip (0.5-1.5 s = frames 15-44) over a V1 clip ----
+        {
+            Rig r;
+            const auto build = [&](Timeline *tl) {
+                Shape box;
+                box.type = ShapeType::Rectangle;
+                box.properties.size = QSizeF(40.0, 24.0);
+                box.position = QPointF(30.0, 124.0);
+                box.fill.color = QColor(230, 20, 20, 255);
+                box.fill.opacity = 1.0;
+                box.fill.enabled = true;
+                box.fill.gradient = false;
+                box.stroke.enabled = false;
+                ClipInfo shape;
+                shape.displayName = QStringLiteral("shape");
+                shape.duration = shape.outPoint = 1.0;
+                shape.leadInSec = 0.5;
+                shape.shapes = {box};
+                tl->restoreFromProject({{quadrant(movClip(movA, 0.0, 3.0))}, {shape}},
+                                       QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            };
+            if (open(r, "S", build)) {
+                ++rigs;
+                seekTo(r, frameUs(21) + 1000);
+                int px = shapePixels(r.p->m_currentFrameImage);
+                ok16 = shownLeg(r, "(e) seekToTimelineUs", playhead(r), -1, {})
+                    && px > 600 && ok16;
+                d << " shape px=" << px;
+                r.p->stepForward();
+                pumpEvents(40);
+                px = shapePixels(r.p->m_currentFrameImage);
+                ok16 = shownLeg(r, "(e2) stepForward", playhead(r), -1, {}) && px > 600
+                    && std::abs(frameAt(playhead(r)) - 22) <= 1 && ok16;
+                d << " shape px=" << px;
+                // (e3) (iv) into the shape from outside (V1's key frame + 3).
+                seekTo(r, frameUs(14) + 1000);
+                r.p->stepForward();
+                pumpEvents(40);
+                px = shapePixels(r.p->m_currentFrameImage);
+                const qint64 in = playhead(r);
+                ok16 = shownLeg(r, "(e3)(iv) stepForward in", in, -1, {}) && px > 600
+                    && std::abs(frameAt(in) - 15) <= 1 && ok16;
+                d << " shape px=" << px;
+                ok16 = probeLeg(r, "(e3)(iv)", in + frameUs(1), -1, 1) && ok16;
+                // (f) out of the shape by a step, against a direct seek.
+                seekTo(r, frameUs(60) + 1000);
+                seekTo(r, frameUs(45) + 1000);
+                const GlState direct = capture(r);
+                seekTo(r, frameUs(44) + 1000);
+                r.p->stepForward();
+                pumpEvents(40);
+                ok16 = sameState("(f) shape stepForward out", direct, capture(r), true) && ok16;
+                // The same by playback: recorded only (HEAD's form, A8).
+                seekTo(r, frameUs(15) + 1000);
+                bool past = false;
+                const GlState across = playOut(r, us(1.5), past);
+                ok16 = past && ok16;
+                seekTo(r, frameUs(44) + 1000);
+                const GlState afterSeek = playOut(r, us(1.5), past);
+                ok16 = past && ok16;
+                sameState("(f) shape play out after a seek [recorded, not gated]", across,
+                          afterSeek, false);
+            } else {
+                ok16 = false;
+            }
+        }
+        pumpEvents(200);
+
+        // ---- H: a V1 clip and a hidden clip (every frame through the SSOT) ----
+        {
+            Rig r;
+            const auto build = [&](Timeline *tl) {
+                ClipInfo hidden = movClip(movB, 0.0, 0.3);
+                hidden.leadInSec = 2.5;
+                hidden.visible = false;
+                tl->restoreFromProject({{movClip(movA, 0.0, 3.0)}, {hidden}},
+                                       QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            };
+            if (open(r, "H", build)) {
+                ++rigs;
+                const auto playThenStep = [&](const char *name, bool check) {
+                    seekTo(r, 1000);
+                    playRecord(r, us(0.5), 3000);
+                    bool ok = true;
+                    d << ' ' << name << " paused at " << frameAt(playhead(r)) << 'f';
+                    bool reached = false;
+                    int lastFromKey = -1;
+                    for (int s = 0; s < gop; ++s) {
+                        r.p->stepForward();
+                        pumpEvents(40);
+                        const qint64 at = playhead(r);
+                        if (check)
+                            ok = shownLeg(r, "(e3)(i) step", at, at, {}) && ok;
+                        const int fromKey = frameAt(at) - lastKeyOf(frameAt(at));
+                        lastFromKey = fromKey;
+                        if (s >= 2 && fromKey >= 3 && fromKey <= gop - 4) {
+                            reached = true;
+                            break;
+                        }
+                    }
+                    d << " fromKey=" << lastFromKey << " reached=" << reached;
+                    return ok && reached;
+                };
+                ok16 = playThenStep("(e3) run 1", true) && ok16;
+                ok16 = probeLeg(r, "(e3)(ii)", playhead(r), -2, 2) && ok16;
+                ok16 = playThenStep("(e3) run 2", false) && ok16;
+                const qint64 at = playhead(r);
+                ok16 = flowLeg("(e3)(iii)", playRecord(r, at + frameUs(4), 1500), at,
+                               at + frameUs(3), 1000, true)
+                    && ok16;
+            } else {
+                ok16 = false;
+            }
+        }
+        pumpEvents(200);
+
+        // ---- P: premise probes (Step 0 S0-2), recorded in the detail, never gated:
+        // a stepForward and a setSpeedRamps re-seek in a reversed nest, and an
+        // overlay rotation into a nest at a playback boundary ----
+        {
+            const auto probeState = [&](Rig &r, const char *name) {
+                const qint64 ph = playhead(r);
+                const int e = r.p->m_activeEntry;
+                const int track = e >= 0 && e < r.p->m_sequence.size()
+                    ? r.p->m_sequence[e].sourceTrack
+                    : -1;
+                const QImage &shown = r.p->m_currentFrameImage;
+                const QImage at = ref(r, ph);
+                d << " [PROBE " << name << "] ph=" << frameAt(ph) << "f entry=" << e
+                  << " track=" << track << " shown=" << shown.width() << 'x' << shown.height()
+                  << " ref=" << (at.isNull() ? std::string("null")
+                                             : std::to_string(at.width()) + 'x'
+                                                   + std::to_string(at.height()))
+                  << " maxDiff=" << imageMaxDiff(shown, at)
+                  << " (-1f)=" << imageMaxDiff(shown, ref(r, ph - frameUs(1)))
+                  << " (+1f)=" << imageMaxDiff(shown, ref(r, ph + frameUs(1))) << " shown "
+                  << spotText(brightSpot(shown)) << " ref " << spotText(brightSpot(at))
+                  << ' ' << (r.view ? stateText(capture(r)) : std::string("noview"));
+                const qint64 next = r.p->nextDecodedSourceUsForTest();
+                d << " next=" << (next < 0 ? -1 : frameAt(next)) << 'f';
+            };
+            // A visible track whose active clip is a reversed sequence reference
+            // (the first half of timelineHasActiveReversedSequenceReference).
+            const auto reversedRefAt = [&](Rig &r, qint64 atUs) {
+                for (const TimelineTrack *track : r.tl->videoTracks()) {
+                    if (!track || track->isHidden())
+                        continue;
+                    double start = 0.0;
+                    const int i = tlrender::activeClipOnTrack(
+                        track->clips(), double(atUs) / 1000000.0, false, &start);
+                    if (i >= 0 && track->clips()[i].isSequenceReference()
+                        && track->clips()[i].reversed)
+                        return true;
+                }
+                return false;
+            };
+            Rig r;
+            const auto build = [&](Timeline *tl) {
+                const TimelineSequence child =
+                    seqOf(childId, {{movClip(movA, 0.4, 1.6)}});
+                ClipInfo nest = refTo(childId, 1.6, 0.0);
+                nest.reversed = true;
+                const TimelineSequence main =
+                    seqOf(mainId, {{nest, movClip(movB, 0.0, 1.0)}});
+                tl->setSequences({main, child}, mainId);
+            };
+            if (open(r, "Prev", build)) {
+                seekTo(r, frameUs(11) + 1000);
+                probeState(r, "S0-2 reversed direct seek 11f");
+                seekTo(r, frameUs(10) + 1000);
+                const int stepEntry = r.p->m_activeEntry;
+                const bool stepReversed = reversedRefAt(r, playhead(r));
+                r.p->stepForward();
+                pumpEvents(40);
+                d << " [PROBE S0-2 reversed stepForward branch] entry " << stepEntry << "->"
+                  << r.p->m_activeEntry << " reversedRef=" << stepReversed;
+                probeState(r, "S0-2 reversed stepForward 10f->");
+                seekTo(r, frameUs(20) + 1000);
+                const int e = r.p->m_activeEntry;
+                QVector<speedramp::SpeedRamp> ramps = r.p->m_speedRamps;
+                while (ramps.size() < r.p->m_sequence.size())
+                    ramps.append(speedramp::SpeedRamp::identity());
+                const QVector<speedramp::SpeedRamp> original = ramps;
+                if (e >= 0 && e < ramps.size()) {
+                    ramps[e].keyframes = {{0, 1.5}};
+                    const int before = r.composited;
+                    r.p->setSpeedRamps(ramps);
+                    pumpEvents(40);
+                    d << " [PROBE S0-2 setSpeedRamps] entry=" << e
+                      << " rampChanged=" << !(ramps[e] == original[e])
+                      << " reversedRef=" << reversedRefAt(r, playhead(r))
+                      << " playing=" << r.p->m_playing
+                      << " composited+=" << r.composited - before;
+                    probeState(r, "S0-2 setSpeedRamps changed");
+                    seekTo(r, frameUs(20) + 1000);
+                    const int restoreBefore = r.composited;
+                    r.p->setSpeedRamps(original);
+                    pumpEvents(40);
+                    d << " [PROBE S0-2 setSpeedRamps restored] composited+="
+                      << r.composited - restoreBefore;
+                    probeState(r, "S0-2 setSpeedRamps restored");
+                } else {
+                    d << " [PROBE S0-2 setSpeedRamps] no active entry " << e;
+                }
+            }
+            pumpEvents(200);
+            for (int v = 0; v < 2; ++v) {
+                Rig o;
+                const auto buildRot = [&](Timeline *tl) {
+                    const TimelineSequence child = seqOf(
+                        childId, {{movClip(movA, 0.4, 1.6), movClip(movB, 0.5, 1.0)}});
+                    const QVector<ClipInfo> shortTrack = {movClip(movB, 0.0, 1.0)};
+                    const QVector<ClipInfo> nestTrack = {refTo(childId, 2.0, 0.0)};
+                    const TimelineSequence main = seqOf(
+                        mainId, v == 0 ? QVector<QVector<ClipInfo>>{shortTrack, nestTrack}
+                                       : QVector<QVector<ClipInfo>>{nestTrack, shortTrack});
+                    tl->setSequences({main, child}, mainId);
+                };
+                if (open(o, v == 0 ? "Prot1" : "Prot2", buildRot)) {
+                    seekTo(o, frameUs(20) + 1000);
+                    const int e0 = o.p->m_activeEntry;
+                    d << " [PROBE S0-2 overlay rotation] start entry=" << e0 << " track="
+                      << (e0 >= 0 && e0 < o.p->m_sequence.size()
+                              ? o.p->m_sequence[e0].sourceTrack
+                              : -1);
+                    // Active entry changes while playing, with the playhead and the
+                    // end of the entry left (the tick boundary is at that end).
+                    int lastEntry = e0;
+                    std::ostringstream moves;
+                    const auto trackOf = [&](int e) {
+                        return e >= 0 && e < o.p->m_sequence.size()
+                            ? o.p->m_sequence[e].sourceTrack
+                            : -1;
+                    };
+                    const auto conn = QObject::connect(
+                        o.p, &VideoPlayer::positionChanged, o.window.get(), [&](double) {
+                            const int e = o.p->m_activeEntry;
+                            if (e == lastEntry)
+                                return;
+                            moves << ' ' << lastEntry << "->" << e << " at "
+                                  << frameAt(playhead(o)) << "f leftEnd="
+                                  << (lastEntry >= 0 && lastEntry < o.p->m_sequence.size()
+                                          ? frameAt(qRound64(
+                                                o.p->m_sequence[lastEntry].timelineEnd
+                                                * 1000000.0))
+                                          : -1)
+                                  << "f track " << trackOf(lastEntry) << "->" << trackOf(e);
+                            lastEntry = e;
+                        });
+                    playRecord(o, us(1.0) + frameUs(3), 3000);
+                    QObject::disconnect(conn);
+                    d << " [PROBE S0-2 overlay rotation moves]" << moves.str();
+                    probeState(o, "S0-2 overlay rotation after 1.0 s");
+                    seekTo(o, frameUs(frameAt(playhead(o))) + 1000);
+                    probeState(o, "S0-2 overlay rotation then paused seek");
+                }
+                pumpEvents(200);
+            }
+        }
+        pumpEvents(200);
+
+        ok16 = ok16 && rigs == 5;
+        d << " rigs=" << rigs << " gopOk=" << gopOk;
+        if (!allGl && ok16)
+            tally.skip(16, ("GL preview unavailable (environment); " + d.str()).c_str());
+        else
+            tally.gate(16, ok16 && allGl, d.str());
     }
 
     return tally.finish("stabilizer-export");

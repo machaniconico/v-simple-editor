@@ -64,6 +64,7 @@ struct LayerDesc {
     bool      visible = true;
     int       matteSourceIndex = -1;             // -1 == no matte
     MatteType matteType = MatteType::None;
+    int       blendModeOrdinal = 0;              // == static_cast<int>(BlendMode); 0 == Normal
 };
 
 // RGBAf: a premultiplied-alpha RGBA color, each component in [0,1].

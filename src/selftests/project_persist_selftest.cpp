@@ -3,8 +3,11 @@
 // save / load and toJsonString / fromJsonString, every load replaces both lists
 // before the undo baseline, and the file-backed render queue
 // (RenderQueue::resolveTimeline) applies the saved adjustment layers.
+#include "../CollabProjectShare.h"
+#include "../JsonNumberClamp.h"
 #include "../MainWindow.h"
 #include "../ProjectFile.h"
+#include "../ProjectTemplate.h"
 #include "../RenderQueue.h"
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
@@ -23,6 +26,7 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QSignalSpy>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
 
@@ -194,7 +198,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 14; ++g)
+        for (int g = 1; g <= 17; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -1185,6 +1189,346 @@ int runProjectPersistSelftest()
                            + " (b)=" + b(bOk) + " (c)=" + b(cOk) + " storedCurve=" + b(storedCurve)
                            + " legacyKept=" + b(legacyKept) + " (d)=" + b(dOk));
         }
+    }
+
+    // ---- G15 (US-2306): the file and string entry points share one writer and one reader ----
+    // The rich file (nested sequences, a clip curve, markers, a layer), the same file with the curve
+    // in the legacy table, and the same file at version 1 are each read by load and by
+    // fromJsonString; a save must equal the Indented rendering of toJsonString; errors must match.
+    {
+        const QString cId = QStringLiteral("seq-g15c");
+        timeremap::TimeRemapCurve fast;
+        fast.sourceFps = 10.0;
+        fast.addKey(0.0, 0.0);
+        fast.addKey(1.0, 2.0);
+        ClipInfo cClip;
+        cClip.filePath = QStringLiteral("/selftests/project-persist-g15.mp4");
+        cClip.displayName = QStringLiteral("g15-c");
+        cClip.duration = cClip.outPoint = 2.0;
+        cClip.timeRemapCurve = fast;
+        TimelineSequence child;
+        child.id = cId;
+        child.name = QStringLiteral("C");
+        child.videoTracks = {{cClip}};
+        child.audioTracks = {{}};
+        ClipInfo ref;
+        ref.displayName = QStringLiteral("g15-ref");
+        ref.duration = ref.outPoint = child.duration();
+        ref.sequenceRefId = cId;
+        ref.filePath = timeline_nesting::sequenceClipFilePath(cId);
+        TimelineSequence parent;
+        parent.id = QStringLiteral("seq-g15p");
+        parent.name = QStringLiteral("P");
+        parent.videoTracks = {{ref}};
+        parent.audioTracks = {{}};
+
+        const auto readAll = [](const QString &path) {
+            QFile file(path);
+            return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+        };
+        const auto writeAll = [](const QString &path, const QByteArray &bytes) {
+            QFile file(path);
+            const bool written = file.open(QIODevice::WriteOnly | QIODevice::Truncate) && file.write(bytes) == bytes.size();
+            file.close();
+            return written;
+        };
+        const QString richPath = tmp("g15-rich.veditor");
+        bool saved = false;
+        {
+            MainWindow writer;
+            writer.m_timeline->setSequences({parent, child}, parent.id);
+            writer.m_timeline->setMarkers(markers);
+            writer.m_timeline->setAdjustmentLayers({layer});
+            QString err;
+            saved = writer.saveProjectToPath(richPath, &err);
+        }
+        const QJsonObject richRoot = readJson(richPath);
+        // The rich file with C's clip curve moved to C's legacy table (or dropped).
+        const auto withLegacy = [&](const QJsonValue &legacy) {
+            QJsonObject root = richRoot;
+            QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+            for (int i = 0; i < sequences.size(); ++i) {
+                QJsonObject sequence = sequences.at(i).toObject();
+                if (sequence.value(QStringLiteral("id")).toString() != cId)
+                    continue;
+                QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+                QJsonArray clips = tracks.at(0).toArray();
+                QJsonObject clip = clips.at(0).toObject();
+                clip.remove(QStringLiteral("timeRemapCurve"));
+                clips.replace(0, clip);
+                tracks.replace(0, clips);
+                sequence[QStringLiteral("videoTracks")] = tracks;
+                sequence.remove(QStringLiteral("timeRemapClipEntries"));
+                if (!legacy.isNull())
+                    sequence[QStringLiteral("timeRemapClipEntries")] = QJsonArray{QJsonObject{
+                        {QStringLiteral("clipId"), QStringLiteral("0:0")}, {QStringLiteral("curve"), legacy}}};
+                sequences.replace(i, sequence);
+            }
+            root[QStringLiteral("sequences")] = sequences;
+            return root;
+        };
+        QJsonObject v1Root = richRoot;
+        v1Root[QStringLiteral("version")] = 1;
+        QJsonObject v99Root = richRoot;
+        v99Root[QStringLiteral("version")] = 99;
+        const QString legacyPath = tmp("g15-legacy.veditor");
+        const QString plainPath = tmp("g15-plain.veditor");
+        const QString v1Path = tmp("g15-v1.veditor");
+        const QString v99Path = tmp("g15-v99.veditor");
+        const QString cutPath = tmp("g15-cut.veditor");
+        const bool written = saved && !richRoot.isEmpty()
+            && writeAll(legacyPath, QJsonDocument(withLegacy(fast.toJson())).toJson())
+            && writeAll(plainPath, QJsonDocument(withLegacy(QJsonValue())).toJson())
+            && writeAll(v1Path, QJsonDocument(v1Root).toJson())
+            && writeAll(v99Path, QJsonDocument(v99Root).toJson())
+            && writeAll(cutPath, QByteArrayLiteral("{\"a\":"));
+
+        // (a) a save is the Indented rendering of what toJsonString writes compact.
+        ProjectData richData;
+        const bool richLoaded = written && ProjectFile::load(richPath, richData);
+        const QString resavedPath = tmp("g15-resaved.veditor");
+        const bool resaved = richLoaded && ProjectFile::save(resavedPath, richData);
+        const QByteArray resavedBytes = readAll(resavedPath);
+        const QString compact = ProjectFile::toJsonString(richData);
+        const QJsonDocument compactDoc = QJsonDocument::fromJson(compact.toUtf8());
+        const bool aOk = resaved && !resavedBytes.isEmpty() && !compactDoc.isNull()
+            && resavedBytes == compactDoc.toJson(QJsonDocument::Indented)
+            && resavedBytes != compactDoc.toJson(QJsonDocument::Compact)
+            && compact.toUtf8() == compactDoc.toJson(QJsonDocument::Compact)
+            && richData.markers.size() == 2 && richData.adjustmentLayers.size() == 1
+            && resavedBytes.contains("\"sequences\"");
+
+        // (b) load(file) and fromJsonString(text of the file) read the same data.
+        const auto parity = [&](const QString &path, QString *fileOut, bool *okOut) {
+            ProjectData viaFile, viaText;
+            const bool fileOk = ProjectFile::load(path, viaFile);
+            const bool textOk = ProjectFile::fromJsonString(QString::fromUtf8(readAll(path)), viaText);
+            const QString fromFile = ProjectFile::toJsonString(viaFile);
+            *fileOut = fromFile;
+            *okOut = fileOk && textOk && !fromFile.isEmpty() && fromFile == ProjectFile::toJsonString(viaText);
+            return *okOut;
+        };
+        QString richOut, legacyOut, plainOut, v1Out;
+        bool richPar = false, legacyPar = false, plainPar = false, v1Par = false;
+        parity(richPath, &richOut, &richPar);
+        parity(legacyPath, &legacyOut, &legacyPar);
+        parity(plainPath, &plainOut, &plainPar);
+        parity(v1Path, &v1Out, &v1Par);
+        const bool legacyDiffers = legacyOut != plainOut;
+        const bool bOk = richPar && legacyPar && plainPar && v1Par && legacyDiffers && readJson(v1Path).value(QStringLiteral("version")).toInt() == 1
+            && QJsonDocument::fromJson(v1Out.toUtf8()).object().value(QStringLiteral("version")).toInt() == 2;
+
+        // (c) errors: an unopenable path leaves errorMessage alone; a broken document and a refused version
+        // give the same text on both paths, and the data left behind serialises the same.
+        const auto sentinel = [&]() {
+            ProjectData d;
+            d.config.name = QStringLiteral("g15-sentinel");
+            d.markers = markers;
+            return d;
+        };
+        ProjectData missingData = sentinel();
+        QString missingErr = QStringLiteral("untouched");
+        const bool missingOk = ProjectFile::load(tmp("g15-missing-dir/none.veditor"), missingData, &missingErr);
+        const bool missingKept = !missingOk && missingErr == QLatin1String("untouched")
+            && ProjectFile::toJsonString(missingData) == ProjectFile::toJsonString(sentinel());
+        const auto errorsMatch = [&](const QString &path, std::string &d) {
+            ProjectData viaFile = sentinel(), viaText = sentinel();
+            QString errFile, errText;
+            const bool fileOk = ProjectFile::load(path, viaFile, &errFile);
+            const bool textOk = ProjectFile::fromJsonString(QString::fromUtf8(readAll(path)), viaText, &errText);
+            const QString afterFile = ProjectFile::toJsonString(viaFile);
+            d += " '" + errFile.toStdString() + "'";
+            return !fileOk && !textOk && !errFile.isEmpty() && errFile == errText && !afterFile.isEmpty()
+                && afterFile == ProjectFile::toJsonString(viaText);
+        };
+        std::string cDetail;
+        const bool cutSame = errorsMatch(cutPath, cDetail);
+        const bool v99Same = errorsMatch(v99Path, cDetail);
+        const bool cOk = missingKept && cutSame && v99Same && cDetail.find("byte 5:") != std::string::npos;
+
+        tally.gate(15, aOk && bOk && cOk,
+                   "written=" + b(written) + " (a)=" + b(aOk) + " bytes=" + std::to_string(resavedBytes.size())
+                       + " (b)=" + b(bOk) + " rich/legacy/plain/v1=" + b(richPar) + b(legacyPar) + b(plainPar) + b(v1Par)
+                       + " legacyDiffers=" + b(legacyDiffers) + " (c)=" + b(cOk) + " missingKept=" + b(missingKept)
+                       + " cut=" + b(cutSame) + " v99=" + b(v99Same) + " errors:" + cDetail);
+    }
+
+    // ---- G16 (US-2307): a sequence store with an out-of-range literal still decodes ----
+    // The store is read by a plain parse first (base64, then plain text); only a store both refuse
+    // goes through the clamp, so an in-range store never reaches the scanner.
+    {
+        const auto makeStore = [] {
+            QJsonObject clip{{QStringLiteral("filePath"), QStringLiteral("/selftests/g16.mp4")},
+                             {QStringLiteral("displayName"), QStringLiteral("g16")},
+                             {QStringLiteral("duration"), 2}, {QStringLiteral("speed"), 3}};
+            const auto sequence = [&](const char *id) {
+                QJsonArray videoTracks, audioTracks;
+                videoTracks.append(QJsonArray{clip}); // one track holding one clip
+                audioTracks.append(QJsonArray());
+                return QJsonObject{{QStringLiteral("id"), QString::fromLatin1(id)},
+                                   {QStringLiteral("name"), QString::fromLatin1(id)},
+                                   {QStringLiteral("videoTracks"), videoTracks},
+                                   {QStringLiteral("audioTracks"), audioTracks}};
+            };
+            return QJsonObject{{QStringLiteral("version"), 1}, {QStringLiteral("activeSequenceId"), QStringLiteral("p")},
+                               {QStringLiteral("sequences"), QJsonArray{sequence("p"), sequence("c")}}};
+        };
+        const QJsonObject store = makeStore();
+        const QByteArray inRange = QJsonDocument(store).toJson(QJsonDocument::Compact);
+        QByteArray overflowing = inRange;
+        const int replaced = overflowing.count("\"speed\":3");
+        overflowing.replace("\"speed\":3", "\"speed\":1e400");
+        const QString inRangeBase64 = QString::fromLatin1(inRange.toBase64());
+        const QString inRangePlain = QString::fromUtf8(inRange);
+        const QString overBase64 = QString::fromLatin1(overflowing.toBase64());
+        const QString overPlain = QString::fromUtf8(overflowing);
+
+        // Decodes `encoded` and reports the scanner calls it cost.
+        const auto decode = [](const QString &encoded, int &scans) {
+            const int before = jsonclamp::scanCountForTest();
+            const QJsonObject out = timeline_nesting::decodeSequenceStoreObject(encoded);
+            scans = jsonclamp::scanCountForTest() - before;
+            return out;
+        };
+        const auto firstSpeed = [](const QJsonObject &o) {
+            return o.value(QStringLiteral("sequences")).toArray().at(0).toObject().value(QStringLiteral("videoTracks"))
+                .toArray().at(0).toArray().at(0).toObject().value(QStringLiteral("speed")).toDouble();
+        };
+        int scansA = -1, scansB = -1, scansC1 = -1, scansC2 = -1, scansD1 = -1, scansD2 = -1;
+        const QJsonObject outA = decode(overBase64, scansA);
+        const QJsonObject outB = decode(overPlain, scansB);
+        const QJsonObject outC1 = decode(inRangeBase64, scansC1);
+        const QJsonObject outC2 = decode(inRangePlain, scansC2);
+        const QJsonObject outD1 = decode(QString::fromLatin1(inRange.left(inRange.size() / 2).toBase64()), scansD1);
+        const QJsonObject outD2 = decode(QString::fromUtf8(inRange.left(inRange.size() / 2)), scansD2);
+        // The stored sequence is materialized the way Timeline.cpp (sequenceFromStoreJson) does: the G8 repair brings the speed into 1e-7..1e7.
+        const auto repairedFirstSpeed = [](const QJsonObject &o) {
+            const QJsonObject seq = o.value(QStringLiteral("sequences")).toArray().at(0).toObject();
+            QJsonObject project;
+            project[QStringLiteral("version")] = 2;
+            project[QStringLiteral("config")] = QJsonObject{};
+            project[QStringLiteral("videoTracks")] = seq.value(QStringLiteral("videoTracks")).toArray();
+            project[QStringLiteral("audioTracks")] = seq.value(QStringLiteral("audioTracks")).toArray();
+            project[QStringLiteral("playheadPos")] = 0.0;
+            project[QStringLiteral("markIn")] = -1.0;
+            project[QStringLiteral("markOut")] = -1.0;
+            project[QStringLiteral("zoomLevel")] = 10;
+            ProjectData repaired;
+            const bool ok = ProjectFile::fromJsonString(
+                QString::fromUtf8(QJsonDocument(project).toJson(QJsonDocument::Compact)), repaired);
+            if (!ok || repaired.videoTracks.isEmpty() || repaired.videoTracks[0].isEmpty())
+                return -1.0;
+            return double(repaired.videoTracks[0][0].speed);
+        };
+        const double repairedA = repairedFirstSpeed(outA);
+        const double repairedB = repairedFirstSpeed(outB);
+        const bool aOk = replaced == 2 && outA.value(QStringLiteral("sequences")).toArray().size() == 2
+            && firstSpeed(outA) == DBL_MAX && repairedA == 1e7 && scansA == 1;
+        const bool bOk = outB.value(QStringLiteral("sequences")).toArray().size() == 2 && firstSpeed(outB) == DBL_MAX
+            && repairedB == 1e7 && scansB == 2; // (c'): the base64 step clamps nothing, the plain-text step reads it
+        const bool cOk = outC1 == store && outC2 == store && scansC1 == 0 && scansC2 == 0;
+        const bool dOk = outD1.isEmpty() && outD2.isEmpty();
+
+        // (e) load -> save -> load keeps the sequences, with the speed brought into range.
+        ProjectData withStore;
+        withStore.config.name = QStringLiteral("g16");
+        ClipParentEntry entry;
+        entry.clipId = timeline_nesting::sequenceStoreParentKey();
+        entry.parentClipId = overBase64;
+        withStore.clipParentEntries.append(entry);
+        const auto sequenceCount = [](const QString &json) {
+            return QJsonDocument::fromJson(json.toUtf8()).object().value(QStringLiteral("sequences")).toArray().size();
+        };
+        const QString saved1 = ProjectFile::toJsonString(withStore);
+        ProjectData reloaded;
+        QString reloadErr;
+        const bool reloadOk = ProjectFile::fromJsonString(saved1, reloaded, &reloadErr);
+        const QString saved2 = ProjectFile::toJsonString(reloaded);
+        ProjectData reloaded2;
+        QString reloadErr2;
+        const bool reloadOk2 = ProjectFile::fromJsonString(saved2, reloaded2, &reloadErr2);
+        int reloaded2Sequences = -1;
+        for (const ClipParentEntry &e : reloaded2.clipParentEntries)
+            if (e.clipId == timeline_nesting::sequenceStoreParentKey())
+                reloaded2Sequences = timeline_nesting::decodeSequenceStoreObject(e.parentClipId)
+                                         .value(QStringLiteral("sequences")).toArray().size();
+        const bool eOk = reloadOk && reloadOk2 && sequenceCount(saved1) == 2 && sequenceCount(saved2) == 2
+            && reloaded2Sequences == 2;
+
+        tally.gate(16, aOk && bOk && cOk && dOk && eOk,
+                   "replaced=" + std::to_string(replaced) + " (a) seq=" + std::to_string(outA.value(QStringLiteral("sequences")).toArray().size())
+                       + " speed=" + std::to_string(firstSpeed(outA)) + " repaired=" + std::to_string(repairedA) + "/" + std::to_string(repairedB)
+                       + " scans=" + std::to_string(scansA)
+                       + " (b) seq=" + std::to_string(outB.value(QStringLiteral("sequences")).toArray().size()) + " scans=" + std::to_string(scansB)
+                       + " (c) same=" + b(outC1 == store) + b(outC2 == store) + " scans=" + std::to_string(scansC1) + "/" + std::to_string(scansC2)
+                       + " (d) empty=" + b(outD1.isEmpty()) + b(outD2.isEmpty()) + " scans=" + std::to_string(scansD1) + "/" + std::to_string(scansD2)
+                       + " (e) reload=" + b(reloadOk) + b(reloadOk2) + " seq=" + std::to_string(sequenceCount(saved1)) + "/" + std::to_string(sequenceCount(saved2))
+                       + " reloaded2=" + std::to_string(reloaded2Sequences));
+    }
+
+    // ---- G17 (US-2307): the collaboration import and the template metadata loader clamp too ----
+    {
+        const auto writeFile = [](const QString &path, const QByteArray &bytes) {
+            QFile f(path);
+            const bool ok = f.open(QIODevice::WriteOnly | QIODevice::Truncate) && f.write(bytes) == bytes.size();
+            f.close();
+            return ok;
+        };
+        const QByteArray overflowing = QByteArrayLiteral(
+            "{\"project\":{\"version\":2,\"config\":{\"name\":\"g17\",\"width\":1920,\"height\":1080,\"fps\":30},"
+            "\"videoTracks\":[[{\"filePath\":\"a.mp4\",\"displayName\":\"a\",\"duration\":2,\"speed\":1e400}]],"
+            "\"audioTracks\":[]},\"comments\":{}}");
+        const QString importPath = tmp("g17-import.json");
+        const bool importWritten = writeFile(importPath, overflowing);
+        const collab::share::ImportResult imported = collab::share::importProject(importPath);
+        const double importedSpeed = imported.project.videoTracks.size() > 0 && imported.project.videoTracks[0].size() > 0
+            ? imported.project.videoTracks[0][0].speed : -1.0;
+
+        // A broken file with nothing to clamp keeps the plain parser's message (HEAD's wording).
+        const QByteArray plainBroken = QByteArrayLiteral("{\"project\":");
+        QJsonParseError plainError;
+        QJsonDocument::fromJson(plainBroken, &plainError);
+        const QString plainPath = tmp("g17-plain.json");
+        const bool plainWritten = writeFile(plainPath, plainBroken);
+        const QString plainWarning = collab::share::importProject(plainPath).warning;
+        const bool plainSame = plainWritten && plainWarning == QStringLiteral("JSON parse error: ") + plainError.errorString();
+
+        // A number to clamp and a syntax error: the message is the syntax error's, not the number's.
+        const QByteArray both = QByteArrayLiteral("{\"a\":1e400,\"b\":");
+        QJsonParseError numberError, syntaxError;
+        QJsonDocument::fromJson(both, &numberError);
+        QJsonDocument::fromJson(QByteArrayLiteral("{\"a\":1.7976931348623157e308,\"b\":"), &syntaxError);
+        const QString bothPath = tmp("g17-both.json");
+        const bool bothWritten = writeFile(bothPath, both);
+        const collab::share::ImportResult bothResult = collab::share::importProject(bothPath);
+        const bool bothOk = bothWritten && !bothResult.ok && numberError.errorString() != syntaxError.errorString()
+            && bothResult.warning == QStringLiteral("JSON parse error: ") + syntaxError.errorString();
+        // The returned offset points into the ORIGINAL bytes (the unterminated object ends at both.size()),
+        // not into the rewritten text, where the longer DBL_MAX literal shifts it.
+        QJsonParseError mappedError;
+        jsonclamp::parseWithClampFallback(both, &mappedError);
+        QJsonParseError rewrittenError;
+        QJsonDocument::fromJson(jsonclamp::clampOutOfRangeNumbers(both), &rewrittenError);
+        const bool offsetOk = mappedError.offset == int(both.size()) && rewrittenError.offset != mappedError.offset
+            && mappedError.errorString() == syntaxError.errorString();
+
+        // Template metadata with 1e-400: the user template directory is redirected for the run.
+        QStandardPaths::setTestModeEnabled(true);
+        const QString templateFile = projtmpl::TemplateLibrary::userTemplateDir() + QStringLiteral("/g17-selftest.json");
+        const bool templateWritten = writeFile(templateFile,
+            QByteArrayLiteral("{\"id\":\"g17-selftest\",\"name\":\"g17\",\"width\":1280,\"height\":720,\"fps\":24,\"extra\":1e-400}"));
+        bool templateListed = false;
+        for (const projtmpl::TemplateMeta &m : projtmpl::TemplateLibrary::userTemplates())
+            templateListed = templateListed || (m.id == QLatin1String("g17-selftest") && m.width == 1280 && m.fps == 24);
+        QFile::remove(templateFile);
+        QStandardPaths::setTestModeEnabled(false);
+
+        tally.gate(17, importWritten && imported.ok && importedSpeed == 1e7 && plainSame && bothOk && offsetOk && templateWritten && templateListed,
+                   "import written=" + b(importWritten) + " ok=" + b(imported.ok) + " warning='" + imported.warning.toStdString()
+                       + "' speed=" + std::to_string(importedSpeed) + " plainSame=" + b(plainSame) + " '" + plainWarning.toStdString()
+                       + "' both ok=" + b(bothOk) + " '" + bothResult.warning.toStdString() + "' offset=" + std::to_string(mappedError.offset) + " rewritten=" + std::to_string(rewrittenError.offset)
+                       + " original=" + std::to_string(both.size()) + " number='" + numberError.errorString().toStdString()
+                       + "' template written=" + b(templateWritten) + " listed=" + b(templateListed));
     }
 
     tally.gate(7, g7, g7Detail);

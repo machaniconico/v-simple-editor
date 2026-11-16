@@ -9074,9 +9074,16 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             // (78), renderClipLayerSource's order and cache key).
             if (brushWantsSpecialPath)
                 frame = tlrender::applyClipBrushSource(frame, clip, localSeconds, clipId);
-            // US-2111: V1's stabilizer after the brush, before FX, as export does
+            // US-2111: the stabilizer after the brush, before FX, as export does
             // (renderClipLayerSource); the GL gets no keys while this is shown.
-            if (trackIdx == 0 && !clip.stabilizerKeyframes.isEmpty()) {
+            // US-2300: every keyed layer is warped (applyForExport below); the
+            // record for the GL's brush overlay is the bound brush clip's layer
+            // when it carries keys, else V1's (tracks run upwards from V1, so a
+            // bound upper-track layer overwrites V1's record).
+            if (!clip.stabilizerKeyframes.isEmpty()
+                && (trackIdx == 0
+                    || (!m_brushPreviewClipIdForTest.isEmpty()
+                        && clipId == m_brushPreviewClipIdForTest))) {
                 if (v1Stab)
                     *v1Stab = stabwarp::sampleAt(clip.stabilizerKeyframes,
                                                  static_cast<qint64>(fxSourceSeconds * 1.0e6));
@@ -9296,7 +9303,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
     QImage composed;
     bool regraded = false;
     if (hasTrackMatteLayer) {
-        // A matte frame ignores blend modes, as renderFrameAt's matte branch does.
+        // A matte frame blends its blended layers after the Normal stack, each cut
+        // by its own matte, as renderFrameAt's matte branch does (one kernel).
         composed = trackmatte::composite(layers, layerImages, canvasSize);
         // US-2206: renderFrameAt's matte branch grades the composite with the
         // adjustment clips of tracks 1.. ascending (not track 0), straight RGBA.

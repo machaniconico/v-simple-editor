@@ -117,6 +117,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/VfxGeneratorsSelftest.cpp
     src/selftests/effect_timing_selftest.cpp
     src/selftests/bezier_easing_selftest.cpp
+    src/selftests/blend_images_selftest.cpp
     src/selftests/EasingPresetsSelftest.cpp
     src/selftests/SpatialPathSelftest.cpp
     src/selftests/SmartRenderSelftest.cpp
@@ -606,6 +607,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AIUpscale.cpp
     src/FrameInterpolator.cpp
     src/ProjectFile.cpp
+    src/JsonNumberClamp.h
+    src/JsonNumberClamp.cpp
     src/MediaPaths.h
     src/MediaPaths.cpp
     src/MediaRelinkDialog.h

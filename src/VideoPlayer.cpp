@@ -568,6 +568,29 @@ bool timelineHasActiveReversedSequenceReference(
     return false;
 }
 
+// US-2302: how a paused frame at `timelineUs` is shown. SeekOnly = the frames the
+// nested-sequence SSOT drew before (a reversed reference, a shape clip or a hidden
+// clip): a seek there only moves the decoder. KeepDecoder = any other active sequence
+// reference: shown through the SSOT too, while a seek still decodes to the target.
+// None = the flattened entry frame.
+enum class NestedPreview { None, SeekOnly, KeepDecoder };
+
+NestedPreview nestedSequencePreviewMode(const Timeline *timeline, qint64 timelineUs)
+{
+    if (timelineHasActiveReversedSequenceReference(timeline, timelineUs)
+        || timelineHasActiveShapeClip(timeline, timelineUs))
+        return NestedPreview::SeekOnly;
+    if (timelineHasActiveSequenceReference(timeline, timelineUs))
+        return NestedPreview::KeepDecoder;
+    return NestedPreview::None;
+}
+
+// The frames the SSOT shows, paused or playing (any sequence reference or shape clip).
+bool nestedSequencePreviewActive(const Timeline *timeline, qint64 timelineUs)
+{
+    return nestedSequencePreviewMode(timeline, timelineUs) != NestedPreview::None;
+}
+
 int previewPrimaryEntryIndexAt(const Timeline *timeline,
                                const QVector<PlaybackEntry> &sequence,
                                int preferredIdx,
@@ -2236,15 +2259,16 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     m_timelinePositionUs = clamped;
 
     if (entryStructurallyChanged) {
-        const bool nestedSequencePreview =
-            timelineHasActiveReversedSequenceReference(timeline, clamped)
-            || shapePreviewActive;
+        const NestedPreview nestedMode =
+            nestedSequencePreviewMode(timeline, clamped);
+        const bool nestedSequencePreview = nestedMode != NestedPreview::None;
         const int64_t localUs = decodableSourcePositionUs(
             timeline, target, clamped,
             entryLocalPositionUs(desiredIdx, clamped),
             m_frameDurationUs, &m_reverseStates);
         undotrace::log("setSeq:beforeSeek");
-        seekInternal(localUs, !nestedSequencePreview, true);
+        seekInternal(localUs, !nestedSequencePreview, true,
+                     nestedMode == NestedPreview::KeepDecoder);
         if (nestedSequencePreview
             && !displayNestedSequenceFrameAt(timeline, clamped)) {
             // Offline/missing nested media keeps the historic flattened
@@ -2522,8 +2546,7 @@ int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) co
 bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
                                                int64_t timelineUs)
 {
-    if (!timelineHasActiveReversedSequenceReference(timeline, timelineUs)
-        && !timelineHasActiveShapeClip(timeline, timelineUs))
+    if (!nestedSequencePreviewActive(timeline, timelineUs))
         return false;
     QSize renderSize = m_projectOutputSize.isValid()
         ? m_projectOutputSize
@@ -2544,6 +2567,7 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     // US-2203: renderFrameAt has stabilized V1 (stabwarp::applyForExport).
     cachePreviewComposite(ssotFrame, true);
     m_lastFrameTransitionsApplied = true;
+    m_lastFrameOdtApplied = false;
     displayFrame(ssotFrame, true, timelineUs, true);
     return true;
 }
@@ -2606,15 +2630,15 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
     m_activeEntry = idx;
     m_timelinePositionUs = timelineUs;
     const Timeline *previewTimeline = this->previewTimeline();
-    const bool nestedSequencePreview =
-        timelineHasActiveReversedSequenceReference(
-            previewTimeline, timelineUs)
-        || timelineHasActiveShapeClip(previewTimeline, timelineUs);
+    const NestedPreview nestedMode =
+        nestedSequencePreviewMode(previewTimeline, timelineUs);
+    const bool nestedSequencePreview = nestedMode != NestedPreview::None;
     const int64_t localUs = decodableSourcePositionUs(
         previewTimeline, e, timelineUs,
         entryLocalPositionUs(idx, timelineUs),
         m_frameDurationUs, &m_reverseStates);
-    bool ok = seekInternal(localUs, !nestedSequencePreview, precise);
+    bool ok = seekInternal(localUs, !nestedSequencePreview, precise,
+                           nestedMode == NestedPreview::KeepDecoder);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(previewTimeline, timelineUs);
     if (nestedSequenceRendered)
@@ -2734,12 +2758,12 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         previewTimeline, next, m_timelinePositionUs,
         entryLocalPositionUs(newEntryIdx, m_timelinePositionUs),
         m_frameDurationUs, &m_reverseStates);
-    const bool nestedSequencePreview =
-        timelineHasActiveReversedSequenceReference(
-            previewTimeline, m_timelinePositionUs)
-        || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs);
+    const NestedPreview nestedMode =
+        nestedSequencePreviewMode(previewTimeline, m_timelinePositionUs);
+    const bool nestedSequencePreview = nestedMode != NestedPreview::None;
     bool seekOk = seekInternal(
-        startLocalUs, !nestedSequencePreview, true);
+        startLocalUs, !nestedSequencePreview, true,
+        nestedMode == NestedPreview::KeepDecoder);
     const bool nestedSequenceRendered = nestedSequencePreview
         && displayNestedSequenceFrameAt(
             previewTimeline, m_timelinePositionUs);
@@ -3276,20 +3300,42 @@ void VideoPlayer::stepForward()
     const bool reverseTimelineDriven = activeReversed
         || timelineHasActiveReversedSequenceReference(
             timeline, m_timelinePositionUs);
-    if (reverseTimelineDriven) {
+    // US-2302: the nested-sequence SSOT shows the frames where the helper says so,
+    // decided at the step's target time (a step can enter an interval while the
+    // active entry stays the same). Leaving an interval inside the active entry
+    // seeks, so the flattened frame, the baked mode and the transform are set up
+    // as a seek sets them.
+    const bool ssotAtTarget = nestedSequencePreviewActive(timeline, newPos);
+    const bool ssotAtCurrent =
+        nestedSequencePreviewActive(timeline, m_timelinePositionUs);
+    if (reverseTimelineDriven
+        || (idx == m_activeEntry && ssotAtCurrent && !ssotAtTarget)) {
         seekToTimelineUs(newPos, /*precise=*/true);
         m_timelinePositionUs = newPos;
         forceTimelineUiToCurrent();
         return;
     }
-    if (decodeNextFrame(true)) {
+    // Into or inside an SSOT interval the decoder still advances one frame, as a
+    // forward playback tick does: the flattened display deferred, then the SSOT.
+    m_deferDisplayThisTick = ssotAtTarget;
+    const bool advanced = decodeNextFrame(true);
+    m_deferDisplayThisTick = false;
+    if (advanced) {
         const int64_t projected = (m_activeEntry >= 0
                 && m_activeEntry < static_cast<int>(m_sequence.size()))
             ? fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs)
             : newPos;
         m_timelinePositionUs = qMax(projected, newPos);
-        forceTimelineUiToCurrent();
-        return;
+        if (!ssotAtTarget) {
+            forceTimelineUiToCurrent();
+            return;
+        }
+        if (!nestedSequencePreviewActive(timeline, m_timelinePositionUs))
+            m_timelinePositionUs = newPos;
+        if (displayNestedSequenceFrameAt(timeline, m_timelinePositionUs)) {
+            forceTimelineUiToCurrent();
+            return;
+        }
     }
 
     // EOF on the active source — fall back to seekToTimelineUs which
@@ -3596,10 +3642,10 @@ void VideoPlayer::displaySeekFrameConformed(const QImage &v1Image,
         && m_activeEntry < m_sequence.size()) {
         entry = &m_sequence[m_activeEntry];
     }
-    // V1 alone: the GL stabilizes it, unless the clip-local CPU FX path already
-    // stabilized it before the FX (US-2204, preparePreviewClipFrame).
+    // A lone layer (any track, US-2301): the GL stabilizes it, unless the clip-local
+    // CPU FX path already stabilized it before the FX (US-2204, preparePreviewClipFrame).
     const ClipInfo *seekClip = entry ? clipForPlaybackEntry(previewTimeline(), *entry) : nullptr;
-    const bool v1StabBaked = seekClip && !seekClip->isAdjustment && entry->sourceTrack == 0
+    const bool v1StabBaked = seekClip && !seekClip->isAdjustment
         && hasClipLocalCpuFxAt(timelineUsec);
     if (!m_projectOutputSize.isValid()) {
         displayFrame(v1Image, false, timelineUsec, v1StabBaked);
@@ -3725,12 +3771,17 @@ bool VideoPlayer::pushActiveClipColorCorrectionToGlPreviewForTest(qint64 timelin
     return pushed;
 }
 
+qint64 VideoPlayer::nextDecodedSourceUsForTest()
+{
+    return decodeNextFrame(false) ? m_currentPositionUs : -1;
+}
+
 // US-2202: the production compose + present on this player: the layers are
 // composed onto a copy of `canvasBase` (the callers' black canvas, V1 among the
 // layers with sequenceIdx == activeEntry) and the result goes through displayFrame
-// as the SSOT / playback paths hand it over (overlays baked). US-2203: V1's layer
-// is stabilized before the composite as the playback tick and the paused refresh
-// do (warpV1ForCpuComposite on their layers, before the fit).
+// as the SSOT / playback paths hand it over (overlays baked). US-2203 / US-2301:
+// the keyed layers are stabilized before the composite as the playback tick and
+// the paused refresh do (warpV1ForCpuComposite on their layers, before the fit).
 QImage VideoPlayer::composeAndPresentForTest(const QImage &canvasBase,
                                              const QVector<DecodedLayer> &layers,
                                              const QVector<PlaybackEntry> &seq,
@@ -3930,58 +3981,56 @@ void VideoPlayer::displayFrame(const QImage &image, bool overlaysAlreadyBaked,
     presentDisplay(composed, timelineUsec, special, v1StabBaked);
 }
 
-// US-2202: the active entry's V1 stabilizer for the GL: its keys, the size they
+// US-2202: the active entry's stabilizer for the GL: its keys, the size they
 // were analysed at (the entry's filePath may be a smaller proxy) and the source
-// time. US-2111: a shown special composite already has V1's layer stabilized on
-// the CPU (buildSpecialClipComposite), so the GL warps nothing. US-2203: neither
-// does a frame whose V1 stabilizer is baked (`v1StabBaked`).
+// time. US-2301: whichever track the entry is on, as the GL's single uStab is
+// bound to the lone layer shown. US-2111: a shown special composite already has
+// its layers stabilized on the CPU (buildSpecialClipComposite), so the GL warps
+// nothing. US-2203: neither does a frame whose keyed layers are baked (`v1StabBaked`).
 void VideoPlayer::pushV1StabilizerToGl(const PlaybackEntry &ae, bool special,
                                        bool v1StabBaked)
 {
-    if (ae.sourceTrack != 0 || special || v1StabBaked) {
+    if (special || v1StabBaked) {
         m_glPreview->setStabilizerKeyframes({});
         return;
     }
     m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
     m_glPreview->setStabilizerSourceSize(ae.stabilizerSourceSize);
-    m_glPreview->setStabilizerSourceTimeUs(v1StabilizerSourceUs(ae));
+    m_glPreview->setStabilizerSourceTimeUs(v1StabilizerSourceUs(m_activeEntry));
 }
 
-qint64 VideoPlayer::v1StabilizerSourceUs(const PlaybackEntry &ae) const
+// US-2301: an entry's keys are sampled at the position its decoder used
+// (entryLocalPositionUs: reversed and speed-ramp aware), on every track.
+qint64 VideoPlayer::v1StabilizerSourceUs(int entryIdx) const
 {
-    const double T = static_cast<double>(m_timelinePositionUs)
-                   / static_cast<double>(AV_TIME_BASE);
-    const double srcSec = playbackEntryIsReversed(previewTimeline(), ae, &m_reverseStates)
-        ? static_cast<double>(entryLocalPositionUs(m_activeEntry, m_timelinePositionUs))
-              / AV_TIME_BASE
-        : ae.clipIn + (T - ae.timelineStart) * ae.speed;
-    return static_cast<qint64>(srcSec * 1.0e6);
+    return entryLocalPositionUs(entryIdx, m_timelinePositionUs);
 }
 
 bool VideoPlayer::warpV1ForCpuComposite(QVector<DecodedLayer> &layers) const
 {
     if (m_activeEntry < 0 || m_activeEntry >= m_sequence.size())
         return false;
-    // US-2204: a frame with clip-local CPU FX has V1 stabilized before the FX in
-    // preparePreviewClipFrame (the layer is already warped, alone or not).
-    const PlaybackEntry &activeEntry = m_sequence[m_activeEntry];
-    const ClipInfo *activeClip = clipForPlaybackEntry(previewTimeline(), activeEntry);
-    if (activeEntry.sourceTrack == 0 && activeClip && !activeClip->isAdjustment
-        && hasClipLocalCpuFxAt(m_timelinePositionUs)) {
+    // US-2204: a frame with clip-local CPU FX has every keyed layer stabilized
+    // before the FX in preparePreviewClipFrame (US-2301: on any track, alone or
+    // not), so none is warped again here.
+    if (hasClipLocalCpuFxAt(m_timelinePositionUs))
         return true;
-    }
     const bool overlay = std::any_of(
         layers.cbegin(), layers.cend(),
         [this](const DecodedLayer &L) { return L.sequenceIdx != m_activeEntry; });
     if (!overlay)
         return false;
-    // The GL would warp the whole composite (the other layers too), so V1's layer
-    // is warped here and the GL gets no keys.
-    const PlaybackEntry &entry = m_sequence[m_activeEntry];
-    const qint64 sourceUs = v1StabilizerSourceUs(entry);
+    // The GL would warp the whole composite (the other layers too), so every layer
+    // that carries keys is warped here, each at its own source time (US-2301), and
+    // the GL gets no keys.
     for (DecodedLayer &L : layers) {
-        if (L.sequenceIdx == m_activeEntry && !L.rgb.isNull())
-            L.rgb = videopreview::warpV1LayerForPreview(L.rgb, entry, sourceUs);
+        if (L.rgb.isNull() || L.sequenceIdx < 0 || L.sequenceIdx >= m_sequence.size())
+            continue;
+        const PlaybackEntry &entry = m_sequence[L.sequenceIdx];
+        if (entry.stabilizerKeyframes.isEmpty())
+            continue;
+        L.rgb = videopreview::warpV1LayerForPreview(L.rgb, entry,
+                                                    v1StabilizerSourceUs(L.sequenceIdx));
     }
     return true;
 }
@@ -4026,10 +4075,10 @@ void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
             else if (m_hdrInfo.trc == AVCOL_TRC_ARIB_STD_B67) hdrTransfer = 2;
         }
         m_glPreview->setHdrTransfer(hdrTransfer);
-        // US-INT-4: push the active entry's stabilizer keyframes (V1 only;
-        // higher-track stabilization is a follow-up) and the current source
-        // time so GLPreview's binary-search lookup can pick the matching
-        // keyframe and bake the inverse 2D affine pre-warp.
+        // US-INT-4: push the active entry's stabilizer keyframes (any track,
+        // US-2301) and the current source time so GLPreview's binary-search
+        // lookup can pick the matching keyframe and bake the inverse 2D affine
+        // pre-warp.
         if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size())
             pushV1StabilizerToGl(m_sequence[m_activeEntry], !special.isNull(),
                                  v1StabBaked);
@@ -4252,11 +4301,12 @@ QImage VideoPlayer::preparePreviewClipFrame(
             // for the composited frame. Bake every active clip independently
             // so [GPU FX, CPU FX] order, masks, and track isolation are kept.
             const QSize echoRenderSize = source.size();
-            // US-2204: V1's stabilizer goes before the clip-local FX; the caller
+            // US-2204: the stabilizer goes before the clip-local FX; the caller
             // hands the frame on as baked (clipFxApplied) so the GL warps nothing.
-            // A stabilized V1 echo sample is raw here: prepareClipForCpuComposite
-            // warps it, then applies VFX / grade (export order).
-            const bool stabV1 = entryIndex == m_activeEntry && entry.sourceTrack == 0;
+            // A stabilized echo sample is raw here: prepareClipForCpuComposite
+            // warps it, then applies VFX / grade (export order). US-2301: every
+            // entry that carries keys, on any track.
+            const bool stabV1 = !entry.stabilizerKeyframes.isEmpty();
             tlrender::EchoFrameProvider echoFrameProvider;
             if (hasEcho) {
                 const ClipInfo sourceClipSnapshot = *sourceClip;
@@ -4834,8 +4884,7 @@ void VideoPlayer::restoreStillCompareGlState()
     m_glPreview->setTimeline(const_cast<Timeline *>(m_stillCompareGlTimeline));
     restorePreviewPostEffects();
     if (sequenceActive() && m_activeEntry >= 0
-        && m_activeEntry < m_sequence.size()
-        && m_sequence[m_activeEntry].sourceTrack == 0) {
+        && m_activeEntry < m_sequence.size()) {
         m_glPreview->setStabilizerKeyframes(
             m_sequence[m_activeEntry].stabilizerKeyframes);
     } else {
@@ -5514,7 +5563,8 @@ void VideoPlayer::updatePositionUi()
     emit positionChanged(static_cast<double>(displayUs) / AV_TIME_BASE);
 }
 
-bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise)
+bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool precise,
+                               bool decodeWithoutDisplay)
 {
     undotrace::log("seek:enter");
     if (!m_formatCtx || !m_codecCtx || m_videoStreamIndex < 0)
@@ -5530,7 +5580,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
     avcodec_flush_buffers(m_codecCtx);
     m_currentPositionUs = targetUs;
 
-    if (!displayFrame) {
+    if (!displayFrame && !decodeWithoutDisplay) {
         updatePositionUi();
         return true;
     }
@@ -5563,32 +5613,37 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
                 previewTimeline, m_timelinePositionUs);
         const bool shapeTimelineDriven = timelineHasActiveShapeClip(
             previewTimeline, m_timelinePositionUs);
-        if (reverseTimelineDriven || shapeTimelineDriven) {
+        if (reverseTimelineDriven || shapeTimelineDriven || decodeWithoutDisplay) {
             // The normal streaming path fills these caches in
             // presentDecodedFrame(). Reverse playback seeks instead, so keep
-            // the compositor's V1 source current here as well.
+            // the compositor's V1 source current here as well. US-2302: so does
+            // a KeepDecoder seek, whose paused frame a clip-local CPU preview
+            // (refreshPreviewClipCpuComposite) composes from.
             m_lastV1RawFrame = image;
             m_lastSourceFrame = image;
             m_lastSourceFrameHasBakedText = false;
             m_lastSourceFrameV1StabBaked = false; // US-2203: a raw V1 frame
         }
-        // This path displays a non-baked frame.
-        QImage displayImage = image;
-        if (sequenceActive()
-            && m_activeEntry >= 0
-            && m_activeEntry < m_sequence.size()) {
-            const auto &entry = m_sequence[m_activeEntry];
-            displayImage = preparePreviewClipFrame(
-                displayImage, entry, m_activeEntry,
-                static_cast<double>(targetUs) / AV_TIME_BASE,
-                QSize(displayable->width, displayable->height),
-                m_timelinePositionUs);
+        // This path displays a non-baked frame (decodeWithoutDisplay: the
+        // caller shows the frame through the nested-sequence SSOT instead).
+        if (displayFrame) {
+            QImage displayImage = image;
+            if (sequenceActive()
+                && m_activeEntry >= 0
+                && m_activeEntry < m_sequence.size()) {
+                const auto &entry = m_sequence[m_activeEntry];
+                displayImage = preparePreviewClipFrame(
+                    displayImage, entry, m_activeEntry,
+                    static_cast<double>(targetUs) / AV_TIME_BASE,
+                    QSize(displayable->width, displayable->height),
+                    m_timelinePositionUs);
+            }
+            m_lastFrameOdtApplied = false;
+            if (!reverseTimelineDriven || !m_deferDisplayThisTick)
+                this->displaySeekFrameConformed(
+                    displayImage,
+                    sequenceActive() ? m_timelinePositionUs : targetUs);
         }
-        m_lastFrameOdtApplied = false;
-        if (!reverseTimelineDriven || !m_deferDisplayThisTick)
-            this->displaySeekFrameConformed(
-                displayImage,
-                sequenceActive() ? m_timelinePositionUs : targetUs);
         m_currentPositionUs = targetUs;
         updatePositionUi();
         return true;
@@ -5980,7 +6035,8 @@ bool VideoPlayer::refreshPreviewClipCpuComposite()
     if (m_parentAdmissionObservation)
         recordParentAdmissionForTest("cpu-composite", layers, canvasSize);
 
-    // US-2203: with other layers V1's layer is stabilized here, before the fit.
+    // US-2203: with other layers every keyed layer (US-2301: any track) is
+    // stabilized here, before the fit.
     const bool v1StabBaked = warpV1ForCpuComposite(layers);
     for (DecodedLayer &layer : layers) {
         layer.rgb = snsfit::maybeFit(
@@ -6017,6 +6073,13 @@ void VideoPlayer::refreshDisplayedFrame()
     // layers. Recompose before any early return whenever an active stack has
     // forced clip-local CPU FX, including FilmGrain and sibling-Echo frames.
     if (refreshPreviewClipCpuComposite())
+        return;
+
+    // US-2302: in a nested-sequence SSOT interval a frame the CPU preview
+    // composed above (no baked text) goes back to the SSOT once that preview
+    // is gone.
+    if (!m_lastSourceFrameHasBakedText
+        && displayNestedSequenceFrameAt(previewTimeline(), m_timelinePositionUs))
         return;
 
     if (m_lastSourceFrameHasBakedText) {
@@ -6389,8 +6452,7 @@ void VideoPlayer::handlePlaybackTick()
     const bool nestedSequenceActive =
         m_playbackSpeed >= 0.0
         && sequenceActive()
-        && (timelineHasActiveSequenceReference(previewTimeline, m_timelinePositionUs)
-            || timelineHasActiveShapeClip(previewTimeline, m_timelinePositionUs));
+        && nestedSequencePreviewActive(previewTimeline, m_timelinePositionUs);
     const bool forceProjectOutputComposite =
         m_projectOutputSize.isValid() && !activeForComposite.isEmpty();
     const bool willComposite = m_playbackSpeed >= 0.0
@@ -6985,8 +7047,9 @@ void VideoPlayer::handlePlaybackTick()
             recordParentAdmissionForTest("multi-track", layers,
                                          QSize(canvasW, canvasH));
         }
-        // US-2203: with other layers V1's layer is stabilized here, before the
-        // fit, for every composite below (GPU input included).
+        // US-2203: with other layers every keyed layer (US-2301: any track) is
+        // stabilized here, before the fit, for every composite below (GPU input
+        // included).
         const bool v1StabBaked = warpV1ForCpuComposite(layers);
         for (DecodedLayer &L : layers) {
             {

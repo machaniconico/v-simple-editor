@@ -162,12 +162,12 @@ QImage warpClampToEdge(const QImage &src, const QTransform &inverse)
     }
 }
 
-QImage applyForExport(const QImage &frame, const ClipInfo &clip, int trackIdx,
-                      int sequenceDepth, double sourceSec, QSize sourceSize)
+QImage applyForExport(const QImage &frame, const ClipInfo &clip, int /*trackIdx*/,
+                      int /*sequenceDepth*/, double sourceSec, QSize sourceSize)
 {
-    // V1 of the top-level sequence only (the preview binds V1's keys alone).
-    if (frame.isNull() || sequenceDepth != 0 || trackIdx != 0
-        || clip.stabilizerKeyframes.isEmpty())
+    // US-2300: every layer that carries keys, on any track and at any depth (a
+    // nested child at its own source time, which the caller passes).
+    if (frame.isNull() || clip.stabilizerKeyframes.isEmpty())
         return frame;
     const StabSample sample =
         sampleAt(clip.stabilizerKeyframes, static_cast<qint64>(sourceSec * 1.0e6));

@@ -163,6 +163,51 @@ QString extrudeMeshCacheKey(const QString &text, const QFont &font, const Extrud
         .arg(sanitized.bevelSegments);
 }
 
+// A bevel profile is a list of (inset, z) pairs from front (0,0) to back.
+// segs <= 0 (or no bevel depth) gives the no-bevel profile [(0,0), (0,-depth)];
+// segs >= 1 gives the front bevel, the straight middle and the back bevel.
+struct BevelStep {
+    double inset; // how far to shrink the XY contour (0 = original)
+    double z;     // z coordinate
+};
+
+static QVector<BevelStep> buildBevelProfile(const ExtrudeParams &params, int segs)
+{
+    QVector<BevelStep> profile;
+    if (segs <= 0 || params.bevelDepth <= 0.0) {
+        // No bevel: just front and back
+        profile.append({0.0, 0.0});
+        profile.append({0.0, -params.depth});
+        return profile;
+    }
+    const double dz = params.depth / (2.0 * segs + 1.0);
+    // Front bevel: from z=0 to z=-bevelDepth (inset grows)
+    for (int i = 0; i <= segs; ++i) {
+        const double t = static_cast<double>(i) / segs;
+        profile.append({params.bevelWidth * t, -params.bevelDepth * t});
+    }
+    // Middle: straight extrusion
+    const double midZ = -params.bevelDepth;
+    const double midEnd = -params.depth + params.bevelDepth;
+    if (midEnd > midZ + 1e-6) {
+        // sanitizeExtrudeParams bounds the step count; clamp again in double so
+        // rounding of the division can never overflow the int conversion.
+        const double midStepsD = std::min((midEnd - midZ) / dz, kMaxExtrudeMidSteps);
+        const int midSteps = std::max(1, static_cast<int>(midStepsD));
+        for (int i = 1; i <= midSteps; ++i) {
+            const double t = static_cast<double>(i) / midSteps;
+            profile.append({params.bevelWidth, midZ + (midEnd - midZ) * t});
+        }
+    }
+    // Back bevel: from z=-depth+bevelDepth to z=-depth (inset shrinks)
+    const double backStart = -params.depth + params.bevelDepth;
+    for (int i = 0; i <= segs; ++i) {
+        const double t = static_cast<double>(i) / segs;
+        profile.append({params.bevelWidth * (1.0 - t), backStart - params.bevelDepth * t});
+    }
+    return profile;
+}
+
 // ---------------------------------------------------------------------------
 // buildExtrudedMesh
 // ---------------------------------------------------------------------------
@@ -229,68 +274,42 @@ TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParam
 
     if (rings.isEmpty()) return mesh;
 
-    // -----------------------------------------------------------------------
     // Phase 2: build bevel profile.
-    // A bevel profile is a list of (inset, z) pairs from front (0,0) to back.
-    // When bevelSegments==0: profile = [(0,0), (0,-depth)] — no bevel.
-    // When bevelSegments>=1: profile has steps from front edge to back edge.
-    // -----------------------------------------------------------------------
-    struct BevelStep {
-        double inset; // how far to shrink the XY contour (0 = original)
-        double z;     // z coordinate
-    };
+    QVector<BevelStep> profile = buildBevelProfile(params, params.bevelSegments);
 
-    QVector<BevelStep> profile;
-
-    if (params.bevelSegments <= 0 || params.bevelDepth <= 0.0) {
-        // No bevel: just front and back
-        profile.append({0.0, 0.0});
-        profile.append({0.0, -params.depth});
-    } else {
-        const int segs = params.bevelSegments;
-        const double dz = params.depth / (2.0 * segs + 1.0);
-        // Front bevel: from z=0 to z=-bevelDepth (inset grows)
-        for (int i = 0; i <= segs; ++i) {
-            const double t = static_cast<double>(i) / segs;
-            profile.append({params.bevelWidth * t, -params.bevelDepth * t});
-        }
-        // Middle: straight extrusion
-        const double midZ = -params.bevelDepth;
-        const double midEnd = -params.depth + params.bevelDepth;
-        if (midEnd > midZ + 1e-6) {
-            // sanitizeExtrudeParams bounds the step count; clamp again in double so
-            // rounding of the division can never overflow the int conversion.
-            const double midStepsD = std::min((midEnd - midZ) / dz, kMaxExtrudeMidSteps);
-            const int midSteps = std::max(1, static_cast<int>(midStepsD));
-            for (int i = 1; i <= midSteps; ++i) {
-                const double t = static_cast<double>(i) / midSteps;
-                profile.append({params.bevelWidth, midZ + (midEnd - midZ) * t});
+    // Vertex budget: a profile whose layers would hold more than kMaxExtrudeVertices
+    // contour vertices is rebuilt with one bevel segment fewer at a time, keeping the
+    // largest count that fits; if even one segment does not fit it falls back to no bevel.
+    QString reduced;
+    if (profile.size() > 2 && qint64(profile.size()) * totalContourVertices > kMaxExtrudeVertices) {
+        const int requested = params.bevelSegments;
+        int fitted = 0;
+        QVector<BevelStep> fit;
+        for (int k = requested - 1; k >= 1; --k) {
+            fit = buildBevelProfile(params, k);
+            if (qint64(fit.size()) * totalContourVertices <= kMaxExtrudeVertices) {
+                fitted = k;
+                break;
             }
         }
-        // Back bevel: from z=-depth+bevelDepth to z=-depth (inset shrinks)
-        const double backStart = -params.depth + params.bevelDepth;
-        for (int i = 0; i <= segs; ++i) {
-            const double t = static_cast<double>(i) / segs;
-            profile.append({params.bevelWidth * (1.0 - t), backStart - params.bevelDepth * t});
+        if (fitted > 0) {
+            profile = fit;
+            reduced = QStringLiteral(" (bevel segments %1 -> %2)").arg(requested).arg(fitted);
+        } else {
+            profile.clear();
+            profile.append({0.0, 0.0});
+            profile.append({0.0, -params.depth});
         }
-    }
-
-    // Vertex budget: a profile whose layers would hold more than
-    // kMaxExtrudeVertices contour vertices falls back to the no-bevel profile.
-    if (profile.size() > 2 && qint64(profile.size()) * totalContourVertices > kMaxExtrudeVertices) {
-        profile.clear();
-        profile.append({0.0, 0.0});
-        profile.append({0.0, -params.depth});
         changed = true;
     }
+    if (reduced.isEmpty() && profile.size() == 2) reduced = QStringLiteral(" (no bevel)");
     if (changed) {
         qWarning("buildExtrudedMesh: extrusion parameters out of range or over the %lld-vertex budget"
                  " (depth=%g bevelDepth=%g bevelWidth=%g segments=%d); built with depth=%g"
                  " bevelDepth=%g bevelWidth=%g segments=%d%s",
                  static_cast<long long>(kMaxExtrudeVertices), rawParams.depth, rawParams.bevelDepth,
                  rawParams.bevelWidth, rawParams.bevelSegments, params.depth, params.bevelDepth,
-                 params.bevelWidth, params.bevelSegments,
-                 profile.size() == 2 ? " (no bevel)" : "");
+                 params.bevelWidth, params.bevelSegments, qUtf8Printable(reduced));
         if (changedOut) *changedOut = true;
     }
 

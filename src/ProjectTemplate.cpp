@@ -1,4 +1,5 @@
 #include "ProjectTemplate.h"
+#include "JsonNumberClamp.h"
 
 #include <QDir>
 #include <QFile>
@@ -146,7 +147,7 @@ QVector<TemplateMeta> TemplateLibrary::userTemplates()
         if (!f.open(QIODevice::ReadOnly))
             continue;
         const QJsonObject obj =
-            QJsonDocument::fromJson(f.readAll()).object();
+            jsonclamp::parseWithClampFallback(f.readAll()).object();
         if (obj.isEmpty())
             continue;
         TemplateMeta m;
