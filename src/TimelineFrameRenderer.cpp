@@ -3253,8 +3253,83 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             [](const OverlayLayer &layer) {
                 return layer.blendMode != BlendMode::Normal;
             });
-        const bool use16 = hdrexport16::enabledFromEnv() && !hasSpecialBlend;
-        if (use16) {
+        const bool use16 = hdrexport16::enabledFromEnv();
+        if (use16 && hasSpecialBlend) {
+            // 16 bit blend: the same order as the 8 bit chain below (Normal
+            // layers back to front with V1 last, then the blend layers
+            // ascending), composed by trackmatte16::composeExport with no
+            // matte, with the same input transforms and output tonemap as the
+            // blend-free 16 bit branch and the matte path.
+            const QSize canvas(base.width(), base.height());
+            const bool odtEnabled = clipodt::enabledFromEnv();
+            const bool idtEnabled = clipidt::enabledFromEnv();
+            aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+            if (!odtEnabled && idtEnabled)
+                v1OutputSpace = clipcolor::acesSpaceFor(v1Clip.colorMeta);
+
+            QVector<gpucomposite::LayerDesc> descs;
+            QVector<QImage> images;
+            descs.reserve(overlays.size() + 1);
+            images.reserve(overlays.size() + 1);
+            auto addLayer = [&](QImage img, double opacity, BlendMode blendMode,
+                                const decltype(v1Clip.colorMeta) &colorMeta) {
+                if (odtEnabled)
+                    img = clipcolor::toLinearWorking(img, colorMeta);
+                else if (idtEnabled)
+                    img = clipcolor::toUnifiedSpace(img, colorMeta, v1OutputSpace);
+                gpucomposite::LayerDesc d;
+                d.sourceTrack = descs.size();
+                d.srcSize = canvas;
+                d.visible = true;
+                d.opacity = qBound(0.0, opacity, 1.0);
+                d.matteType = gpucomposite::MatteType::None;
+                d.blendModeOrdinal = static_cast<int>(blendMode);
+                descs.append(d);
+                images.append(img);
+            };
+
+            for (int i = overlays.size() - 1; i >= 0; --i) {
+                const OverlayLayer &L = overlays[i];
+                if (L.blendMode != BlendMode::Normal
+                    || L.image.isNull() || L.opacity <= 0.001) {
+                    continue;
+                }
+                QImage placed = L.image;
+                if (!L.layerStyle.isIdentity())
+                    placed = layerstyle::apply(placed, L.layerStyle);
+                addLayer(placed, L.opacity, BlendMode::Normal, L.colorMeta);
+            }
+            const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
+            if (v1Opacity > 0.001) {
+                QImage v1Base = base;
+                if (!v1Clip.layerStyle.isIdentity())
+                    v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
+                addLayer(v1Base, v1Opacity, BlendMode::Normal, v1Clip.colorMeta);
+            }
+            for (int i = 0; i < overlays.size(); ++i) {
+                const OverlayLayer &L = overlays[i];
+                if (L.blendMode == BlendMode::Normal
+                    || L.image.isNull() || L.opacity <= 0.001) {
+                    continue;
+                }
+                QImage placed = L.image;
+                if (!L.layerStyle.isIdentity())
+                    placed = layerstyle::apply(placed, L.layerStyle);
+                addLayer(placed, L.opacity, L.blendMode, L.colorMeta);
+            }
+
+            trackmatte16::MatteColorCtx ctx;
+            QImage c64 = trackmatte16::composeExport(descs, images, canvas, ctx);
+            if (odtEnabled) {
+                c64 = clipodt::applyOdt16(
+                    c64,
+                    clipodt::OdtParams{
+                        clipcolor::acesSpaceFor(v1Clip.colorMeta), true
+                    });
+            }
+            stacked = hdrcomposite::to8bit(c64)
+                          .convertToFormat(QImage::Format_RGBA8888);
+        } else if (use16) {
             const QSize canvas(base.width(), base.height());
             QVector<QImage> placedBackToFront;
             QVector<double> opacities;

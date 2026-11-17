@@ -9,6 +9,8 @@
 #include "../TimelineFrameRenderer.h"
 #include "../TrackMatteBake.h"
 #include "../TrackMatteKey.h"
+#include "../VideoEffect.h"
+#include "../color/ClipColorTransform.h"
 #include "../color/ClipOdt.h"
 #include "../playback/HdrCompositeMath.h"
 #include "../playback/TrackMatteCompose16.h"
@@ -467,6 +469,136 @@ qint64 diffPixelCount(const QImage& a, const QImage& b, int threshold)
     return count;
 }
 
+// G10: matte-free frames with a blend layer under VEDITOR_HDR_EXPORT16
+// (US-2407). Canvas-filling solids on a 64x36 timeline, read at the centre.
+constexpr int kG10W = 64;
+constexpr int kG10H = 36;
+
+ClipInfo solidClip10(const QColor& color, double opacity, BlendMode mode = BlendMode::Normal)
+{
+    ClipInfo clip = shapeClip16(color, QRectF(0, 0, kG10W, kG10H));
+    clip.opacity = opacity;
+    if (mode != BlendMode::Normal) {
+        clip.isVfxFootage = true;
+        clip.blendMode = mode;
+    }
+    return clip;
+}
+
+struct HdrEnv10 {
+    bool export16 = false;
+    bool matte16 = false;
+    bool odt = false;
+    bool idt = false;
+};
+
+// The flags are read on every call (S0-7 (d)), so they are set around one
+// renderFrameAt and restored afterwards.
+QImage renderBlend16Frame(const QVector<QVector<ClipInfo>>& tracks, const HdrEnv10& env,
+                          const QHash<QString, TimelineTrackMatteEntry>* mattes = nullptr)
+{
+    const char* const names[] = {"VEDITOR_HDR_EXPORT16", "VEDITOR_HDR_MATTE16",
+                                 "VEDITOR_HDR_ODT", "VEDITOR_HDR_IDT"};
+    const bool on[] = {env.export16, env.matte16, env.odt, env.idt};
+    QByteArray old[4];
+    bool had[4];
+    for (int i = 0; i < 4; ++i) {
+        old[i] = qgetenv(names[i]);
+        had[i] = qEnvironmentVariableIsSet(names[i]);
+        if (on[i])
+            qputenv(names[i], "1");
+        else
+            qunsetenv(names[i]);
+    }
+
+    Timeline timeline;
+    timeline.setProjectOutputConfig(kG10W, kG10H, false, 10);
+    timeline.restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    if (mattes)
+        timeline.setTrackMatteEntries(*mattes);
+    const QImage img = tlrender::renderFrameAt(&timeline, 500000, QSize(kG10W, kG10H));
+
+    for (int i = 0; i < 4; ++i) {
+        if (had[i])
+            qputenv(names[i], old[i]);
+        else
+            qunsetenv(names[i]);
+    }
+    return img;
+}
+
+QRgb centrePx(const QImage& img)
+{
+    return img.isNull() ? 0 : img.pixel(kG10W / 2, kG10H / 2);
+}
+
+int maxRgbDelta(QRgb a, QRgb b)
+{
+    return std::max({std::abs(qRed(a) - qRed(b)), std::abs(qGreen(a) - qGreen(b)),
+                     std::abs(qBlue(a) - qBlue(b))});
+}
+
+std::string rgbText(QRgb p)
+{
+    return "(" + std::to_string(qRed(p)) + "," + std::to_string(qGreen(p)) + ","
+        + std::to_string(qBlue(p)) + ")";
+}
+
+// SHA-256 over the RGBA8888 rows, first 16 hex digits (the S0-7 probe's form).
+QString sha8(const QImage& img)
+{
+    if (img.isNull())
+        return QStringLiteral("null");
+    const QImage c = img.convertToFormat(QImage::Format_RGBA8888);
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    for (int y = 0; y < c.height(); ++y)
+        hash.addData(QByteArrayView(reinterpret_cast<const char*>(c.constScanLine(y)),
+                                    c.width() * 4));
+    return QString::fromLatin1(hash.result().toHex().left(16));
+}
+
+struct SolidLayer10 {
+    QColor color;
+    double opacity;
+    BlendMode mode;
+    clipcolor::ColorMeta meta;
+};
+
+// G10 (c2)(c3) reference: the layers (back to front, as composeExport takes
+// them) as canvas-filling solids through the input transform, composeExport
+// with no matte, the ODT when it is on, then 8 bit.
+QRgb referenceBlend16Px(const QVector<SolidLayer10>& backToFront, bool odt, bool idt,
+                        const clipcolor::ColorMeta& v1Meta)
+{
+    const QSize canvas(kG10W, kG10H);
+    aces::ColorSpace outputSpace = aces::ColorSpace::sRGB;
+    if (!odt && idt)
+        outputSpace = clipcolor::acesSpaceFor(v1Meta);
+    QVector<gpucomposite::LayerDesc> descs;
+    QVector<QImage> images;
+    for (const SolidLayer10& l : backToFront) {
+        QImage img(canvas, QImage::Format_RGBA64_Premultiplied);
+        img.fill(l.color);
+        if (odt)
+            img = clipcolor::toLinearWorking(img, l.meta);
+        else if (idt)
+            img = clipcolor::toUnifiedSpace(img, l.meta, outputSpace);
+        gpucomposite::LayerDesc d;
+        d.sourceTrack = descs.size();
+        d.srcSize = canvas;
+        d.visible = true;
+        d.opacity = l.opacity;
+        d.matteType = gpucomposite::MatteType::None;
+        d.blendModeOrdinal = static_cast<int>(l.mode);
+        descs.append(d);
+        images.append(img);
+    }
+    QImage c64 = trackmatte16::composeExport(descs, images, canvas, trackmatte16::MatteColorCtx{});
+    if (odt)
+        c64 = clipodt::applyOdt16(c64, clipodt::OdtParams{clipcolor::acesSpaceFor(v1Meta), true});
+    return centrePx(hdrcomposite::to8bit(c64).convertToFormat(QImage::Format_RGBA8888));
+}
+
 } // namespace
 
 int runMatte16ParitySelftest()
@@ -882,7 +1014,221 @@ int runMatte16ParitySelftest()
             std::printf("[matte16-parity] G9 failing legs:%s\n", why.c_str());
     }
 
-    std::printf("[matte16-parity] summary: gates=9 passed=%d failed=%d\n",
+    // G10 (US-2407): under VEDITOR_HDR_EXPORT16 a matte-free frame with a
+    // blend layer is composed by trackmatte16::composeExport (Normal layers
+    // back to front with V1 last, the blend layers after it ascending), with
+    // the input transform and output tonemap of the blend-free 16 bit branch.
+    // Constants are the base exe's (S0-7) unless marked as the HEAD renderer's.
+    {
+        std::string why;
+        const HdrEnv10 kOff{};
+        const HdrEnv10 kHdr16{true, false, false, false};
+        const HdrEnv10 kHdr16Odt{true, false, true, false};
+        const HdrEnv10 kHdr16Idt{true, false, false, true};
+        const HdrEnv10 kMatte16{false, true, false, false};
+        const HdrEnv10 kMatte16Odt{false, true, true, false};
+        const HdrEnv10 kBoth{true, true, false, false};
+        const HdrEnv10 kBothOdt{true, true, true, false};
+        auto rgb = [](int r, int g, int b) { return qRgb(r, g, b); };
+
+        // (a) [A] the named pixel: V1 #c9bd82 @0.5, V2 #5079ff @1, V3 Multiply
+        // #46229e @0.4. The 8 bit chain rounds after the Normal stack and after
+        // the blend; the 16 bit path rounds once.
+        const QVector<QVector<ClipInfo>> named = {
+            {solidClip10(QColor(0xc9, 0xbd, 0x82), 0.5)},
+            {solidClip10(QColor(0x50, 0x79, 0xff), 1.0)},
+            {solidClip10(QColor(0x46, 0x22, 0x9e), 0.4, BlendMode::Multiply)}};
+        const QRgb kX16 = rgb(100, 101, 163);
+        const QRgb kX8 = rgb(99, 101, 164);   // base exe, EXPORT16=1 (= flag off)
+        const QImage namedHdr16 = renderBlend16Frame(named, kHdr16);
+        const QImage namedOff = renderBlend16Frame(named, kOff);
+        const QRgb aPx = centrePx(namedHdr16);
+        std::printf("[matte16-parity] G10 (a) named pixel %s (expect %s, base exe %s)\n",
+                    rgbText(aPx).c_str(), rgbText(kX16).c_str(), rgbText(kX8).c_str());
+        if (!(aPx == kX16 && aPx != kX8)) why += " (a)";
+
+        // (b) [A] ODT / IDT off: against the 8 bit chain (the flag-off output),
+        // the G9-shaped fixture differs by 0 and the named fixture by at most 1.
+        {
+            int worstG9 = 0;
+            for (BlendMode m : {BlendMode::Multiply, BlendMode::Screen,
+                                BlendMode::Add, BlendMode::Overlay}) {
+                const QVector<QVector<ClipInfo>> g9 = {
+                    {solidClip10(QColor(200, 60, 40), 1.0)},
+                    {solidClip10(QColor(30, 160, 90), 1.0)},
+                    {solidClip10(QColor(40, 90, 170), 0.8, m)}};
+                worstG9 = std::max(worstG9, maxPerChannelDelta(renderBlend16Frame(g9, kHdr16),
+                                                               renderBlend16Frame(g9, kOff)));
+            }
+            const int namedDelta = maxPerChannelDelta(namedHdr16, namedOff);
+            std::printf("[matte16-parity] G10 (b) vs the 8 bit chain: G9-shaped worst=%d (allow 0) "
+                        "named fixture=%d (allow 1)\n", worstG9, namedDelta);
+            if (!(worstG9 == 0 && namedDelta <= 1)) why += " (b)";
+        }
+
+        // (c) order: an opaque V1 hides V2, and the Multiply layer (0.8) lands
+        // after V1: (200,60,40) x (40,90,170) at 0.8 = (65,29,29). V2 in front
+        // would give (10,..), the blend behind V1 would give (200,60,40).
+        {
+            const QVector<QVector<ClipInfo>> order = {
+                {solidClip10(QColor(200, 60, 40), 1.0)},
+                {solidClip10(QColor(30, 160, 90), 1.0)},
+                {solidClip10(QColor(40, 90, 170), 0.8, BlendMode::Multiply)}};
+            const QRgb cPx = centrePx(renderBlend16Frame(order, kHdr16));
+            std::printf("[matte16-parity] G10 (c) order pixel %s (expect (65,29,29))\n",
+                        rgbText(cPx).c_str());
+            if (cPx != rgb(65, 29, 29)) why += " (c)";
+        }
+
+        // The S0-7 (c)(f) fixture: V1 (180,120,60) @0.6, V2 (40,200,220) @1,
+        // V3 Multiply (230,200,120) @0.5; the same without V3; V3 at 0.002.
+        const clipcolor::ColorMeta sdr{};
+        const QVector<QVector<ClipInfo>> withBlend = {
+            {solidClip10(QColor(180, 120, 60), 0.6)},
+            {solidClip10(QColor(40, 200, 220), 1.0)},
+            {solidClip10(QColor(230, 200, 120), 0.5, BlendMode::Multiply)}};
+        const QVector<QVector<ClipInfo>> noBlend = {withBlend[0], withBlend[1]};
+        QVector<QVector<ClipInfo>> nearZero = withBlend;
+        nearZero[2][0].opacity = 0.002;
+        const QVector<SolidLayer10> withBlendLayers = {
+            {QColor(40, 200, 220), 1.0, BlendMode::Normal, sdr},
+            {QColor(180, 120, 60), 0.6, BlendMode::Normal, sdr},
+            {QColor(230, 200, 120), 0.5, BlendMode::Multiply, sdr}};
+        const QRgb kHeadBlendFrame = rgb(117, 137, 92);   // base exe: no transform, no tonemap
+
+        // (c2) [C] ODT on: toLinearWorking -> composeExport -> applyOdt16 -> 8 bit,
+        // and a near-zero blend layer lands on the blend-free 16 bit frame.
+        {
+            const QRgb got = centrePx(renderBlend16Frame(withBlend, kHdr16Odt));
+            const QRgb ref = referenceBlend16Px(withBlendLayers, true, false, sdr);
+            const QImage noBlendImg = renderBlend16Frame(noBlend, kHdr16Odt);
+            const QImage nearZeroImg = renderBlend16Frame(nearZero, kHdr16Odt);
+            const QRgb noBlendPx = centrePx(noBlendImg);
+            const QRgb nearZeroPx = centrePx(nearZeroImg);
+            const int nearZeroDelta = maxPerChannelDelta(nearZeroImg, noBlendImg);
+            std::printf("[matte16-parity] G10 (c2) ODT on: blend frame %s reference %s "
+                        "(S0-7 proto (166,170,144), base exe %s); near-zero blend %s vs "
+                        "blend-free %s (base exe (173,186,180)) max delta %d (allow 1)\n",
+                        rgbText(got).c_str(), rgbText(ref).c_str(),
+                        rgbText(kHeadBlendFrame).c_str(), rgbText(nearZeroPx).c_str(),
+                        rgbText(noBlendPx).c_str(), nearZeroDelta);
+            if (!(maxRgbDelta(got, ref) <= 1 && maxRgbDelta(got, rgb(166, 170, 144)) <= 1
+                  && maxRgbDelta(got, kHeadBlendFrame) > 1))
+                why += " (c2)";
+            if (!(nearZeroDelta <= 1 && maxRgbDelta(noBlendPx, rgb(173, 186, 180)) <= 1))
+                why += " (c2-near-zero)";
+        }
+
+        // (c3) [B] IDT on, ODT off: toUnifiedSpace -> composeExport -> 8 bit.
+        // With SDR metadata the transform is the identity, so the named value
+        // (S0-7 (f)) differs from the base exe by the rounding only; a Rec.2020
+        // blend layer makes the transform itself visible.
+        {
+            const QRgb sdrPx = centrePx(renderBlend16Frame(withBlend, kHdr16Idt));
+            clipcolor::ColorMeta rec2020;
+            rec2020.primaries = clipcolor::Primaries::Rec2020;
+            QVector<QVector<ClipInfo>> wide = withBlend;
+            wide[2][0].colorMeta = rec2020;
+            QVector<SolidLayer10> wideLayers = withBlendLayers;
+            wideLayers[2].meta = rec2020;
+            const QRgb widePx = centrePx(renderBlend16Frame(wide, kHdr16Idt));
+            const QRgb wideRef = referenceBlend16Px(wideLayers, false, true, sdr);
+            const QRgb wideUntransformed = referenceBlend16Px(wideLayers, false, false, sdr);
+            std::printf("[matte16-parity] G10 (c3) IDT on: SDR blend frame %s (expect (117,136,92), "
+                        "base exe %s); Rec.2020 blend layer %s reference %s (untransformed %s)\n",
+                        rgbText(sdrPx).c_str(), rgbText(kHeadBlendFrame).c_str(),
+                        rgbText(widePx).c_str(), rgbText(wideRef).c_str(),
+                        rgbText(wideUntransformed).c_str());
+            if (!(sdrPx == rgb(117, 136, 92) && sdrPx != kHeadBlendFrame
+                  && maxRgbDelta(widePx, wideRef) <= 1
+                  && maxRgbDelta(wideRef, wideUntransformed) > 1))
+                why += " (c3)";
+        }
+
+        // Matte frame (S0-7 (g)): V1 opaque, V2 under an alpha matte from V3's
+        // left half, V4 Multiply @0.8.
+        QVector<QVector<ClipInfo>> matteTracks = {
+            {solidClip10(QColor(200, 60, 40), 1.0)},
+            {solidClip10(QColor(30, 160, 90), 1.0)},
+            {shapeClip16(QColor(255, 255, 255), QRectF(0, 0, kG10W / 2, kG10H))},
+            {solidClip10(QColor(40, 90, 170), 0.8, BlendMode::Multiply)}};
+        QHash<QString, TimelineTrackMatteEntry> mattes;
+        {
+            TimelineTrackMatteEntry entry;
+            entry.matteType = TrackMatteType::AlphaMatte;
+            entry.matteSourceClipId = trackMatteClipKey(2, 0);
+            mattes.insert(trackMatteClipKey(1, 0), entry);
+        }
+
+        // (d) pins (frames this story does not change; sha = HEAD renderer).
+        {
+            struct Pin {
+                const char* name;
+                QImage img;
+                QRgb basePx;      // base exe centre pixel (S0-7)
+                QString headSha;  // HEAD renderer sha8
+            };
+            const Pin pins[] = {
+                {"env off blend frame", renderBlend16Frame(withBlend, kOff),
+                 rgb(117, 137, 92), QStringLiteral("fc3f7b24d8539fef")},
+                {"blend-free 16 bit frame", renderBlend16Frame(noBlend, kHdr16),
+                 rgb(123, 152, 125), QStringLiteral("74216139149659ea")},
+                {"MATTE16 only matte-free blend frame", renderBlend16Frame(withBlend, kMatte16),
+                 rgb(117, 137, 92), QStringLiteral("fc3f7b24d8539fef")},
+                {"matte frame EXPORT16+MATTE16", renderBlend16Frame(matteTracks, kBoth, &mattes),
+                 rgb(65, 29, 29), QStringLiteral("1e579a78cd9463e0")},
+                {"MATTE16 only + ODT matte-free blend frame [F47 latent, declared]",
+                 renderBlend16Frame(withBlend, kMatte16Odt),
+                 rgb(117, 137, 92), QStringLiteral("fc3f7b24d8539fef")},
+            };
+            for (const Pin& p : pins) {
+                const QString sha = sha8(p.img);
+                const QRgb c = centrePx(p.img);
+                std::printf("[matte16-parity] G10 (d) %s: %s sha=%s (base exe %s, HEAD renderer sha %s)\n",
+                            p.name, rgbText(c).c_str(), sha.toStdString().c_str(),
+                            rgbText(p.basePx).c_str(), p.headSha.toStdString().c_str());
+                if (!(c == p.basePx && sha == p.headSha)) {
+                    why += " (d:";
+                    why += p.name;
+                    why += ")";
+                }
+            }
+        }
+
+        // (e) pins: a matte-free frame with an adjustment layer stays 8 bit.
+        {
+            ClipInfo adjustment = solidClip10(QColor(0, 0, 0), 1.0);
+            adjustment.shapes.clear();
+            adjustment.isAdjustment = true;
+            adjustment.effects = {VideoEffect::createFilmGrain(0.0, 1, 0.0, false)};
+            QVector<QVector<ClipInfo>> adjBlend = withBlend;
+            adjBlend.push_back({adjustment});
+            QVector<QVector<ClipInfo>> adjNoBlend = noBlend;
+            adjNoBlend.push_back({adjustment});
+            const QString shaBlend = sha8(renderBlend16Frame(adjBlend, kHdr16));
+            const QImage odtImg = renderBlend16Frame(adjNoBlend, kBothOdt);
+            const QRgb odtPx = centrePx(odtImg);
+            const QString odtSha = sha8(odtImg);
+            const QString kAdjSha = QStringLiteral("fc3f7b24d8539fef");   // base exe, S0-7 (e)
+            const QString kAdjOdtSha = QStringLiteral("be9560a7da99b5a5");   // HEAD renderer (mutation build, rule 36)
+            std::printf("[matte16-parity] G10 (e) adjustment blend frame EXPORT16 sha=%s (base exe %s); "
+                        "adjustment frame EXPORT16+MATTE16+ODT %s sha=%s (base exe (123,153,125), "
+                        "HEAD renderer sha %s) [F47 latent, declared]\n",
+                        shaBlend.toStdString().c_str(), kAdjSha.toStdString().c_str(),
+                        rgbText(odtPx).c_str(), odtSha.toStdString().c_str(),
+                        kAdjOdtSha.toStdString().c_str());
+            if (shaBlend != kAdjSha) why += " (e)";
+            if (!(odtPx == rgb(123, 153, 125) && odtSha == kAdjOdtSha)) why += " (e-odt)";
+        }
+
+        check(10, "matte-free blend frame under VEDITOR_HDR_EXPORT16 composes at 16 bit: named pixel, "
+                  "8 bit chain bound, layer order, ODT and IDT references, unchanged frames pinned",
+              why.empty());
+        if (!why.empty())
+            std::printf("[matte16-parity] G10 failing legs:%s\n", why.c_str());
+    }
+
+    std::printf("[matte16-parity] summary: gates=10 passed=%d failed=%d\n",
                 passed, failed);
     selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
