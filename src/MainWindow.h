@@ -26,6 +26,8 @@ class PuppetPinTool;
 #include <QStringList>
 #include <QProcessEnvironment>
 #include <QList>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -1424,4 +1426,13 @@ void setTrackComboItems(QComboBox *combo, const QStringList &names,
 // Undo-relevant FX of the mixer: per-track chains + master EQ / DeEsser
 // ("chains" / "masterChain"), with the DeEsser listen monitor cleared.
 QJsonObject undoState(AudioMixer *mixer);
+}
+
+// Bytes -> parse result of the mask Bezier payload (base64 of the JSON in a clip name), the
+// gradient preset file and the saved workspaces, through jsonclamp::parseWithClampFallback.
+namespace plainjson {
+QJsonDocument parseMaskBezierPayload(const QByteArray &base64Payload);
+QJsonObject parseGradientPreset(const QByteArray &bytes);
+// False (out untouched) when the text is not a JSON object.
+bool parseWorkspaces(const QString &json, workspace::WorkspaceManager &out);
 }

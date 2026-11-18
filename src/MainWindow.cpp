@@ -3,6 +3,7 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include "JsonNumberClamp.h"
 #include <QCoreApplication>
 #include <cstdio>
 #include "VideoPlayer.h"
@@ -1168,10 +1169,8 @@ bool decodeMaskBezierMetadata(const QString &name, QVector<MaskEditorPoint> *poi
         return false;
 
     const QByteArray payload = name.mid(markerAt + marker.size()).trimmed().toLatin1();
-    const QByteArray json = QByteArray::fromBase64(payload);
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isArray())
+    const QJsonDocument doc = plainjson::parseMaskBezierPayload(payload);
+    if (!doc.isArray())
         return false;
 
     QVector<MaskEditorPoint> decoded;
@@ -2464,6 +2463,31 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 }
 
 } // namespace
+
+// Bytes -> parse result of the three plain-JSON readers. A number literal outside the double
+// range (1e400, 1e-400) no longer drops the whole payload; in-range input parses as before.
+namespace plainjson {
+
+QJsonDocument parseMaskBezierPayload(const QByteArray &base64Payload)
+{
+    return jsonclamp::parseWithClampFallback(QByteArray::fromBase64(base64Payload));
+}
+
+QJsonObject parseGradientPreset(const QByteArray &bytes)
+{
+    return jsonclamp::parseWithClampFallback(bytes).object();
+}
+
+bool parseWorkspaces(const QString &json, workspace::WorkspaceManager &out)
+{
+    const QJsonDocument doc = jsonclamp::parseWithClampFallback(json.toUtf8());
+    if (!doc.isObject())
+        return false;
+    out.fromJson(doc.object());
+    return true;
+}
+
+} // namespace plainjson
 
 namespace {
 std::atomic<int> prepareAudioMixCalls{0};
@@ -12736,7 +12760,7 @@ void MainWindow::setupToolPropertyPanel()
         if (path.isEmpty()) return;
         QFile f(path);
         if (!f.open(QIODevice::ReadOnly)) return;
-        const QJsonObject root = QJsonDocument::fromJson(f.readAll()).object();
+        const QJsonObject root = plainjson::parseGradientPreset(f.readAll());
         if (m_textToolGradientTypeCombo) {
             const int t = root["type"].toInt(0);
             const int idx = m_textToolGradientTypeCombo->findData(t);
@@ -20734,11 +20758,8 @@ void MainWindow::loadWorkspacesFromSettings()
 {
     QSettings settings("VSimpleEditor", "WindowState");
     const QString json = settings.value("workspaces").toString();
-    if (!json.isEmpty()) {
-        const QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
-        if (doc.isObject())
-            m_workspaces.fromJson(doc.object());
-    }
+    if (!json.isEmpty())
+        plainjson::parseWorkspaces(json, m_workspaces);
     // 1 つも無ければ既定のワークスペース名を投入する (blob は空)。
     if (m_workspaces.count() == 0)
         m_workspaces.ensureDefaults();
