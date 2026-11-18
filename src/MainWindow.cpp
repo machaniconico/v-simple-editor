@@ -410,6 +410,15 @@ static void beginUndoBurst(QTimer *timer, Timeline *timeline)
 void MainWindow::captureUndoBurst(QTimer *timer)
 {
     if (!m_timeline) return;
+    // US-2405: a write of the other kind closes its open burst first, so alternating bursts leave
+    // one point per run in write order. The commit pushes its stored snapshot (it reads no live
+    // state), and this burst's serial / index are taken afterwards by beginUndoBurst.
+    for (const char *name : kPendingUndoTimerNames) {
+        auto *other = findChild<QTimer *>(QLatin1String(name));
+        if (!other || other == timer || !other->isActive()) continue;
+        other->stop();
+        commitUndoBurst(other);
+    }
     if (!timer->isActive()) timer->setProperty("burstSeq", static_cast<qulonglong>(++m_undoBurstSeq));
     m_undoBurstSnapshots.insert(timer, std::make_shared<TimelineState>(m_timeline->captureUndoSnapshot()));
     // US-2220: the sidecars go with the snapshot; at commit time they may already hold a
@@ -437,17 +446,6 @@ void MainWindow::commitUndoBurst(QTimer *timer)
     // The history handler recorded the live sidecars at the new entry; the burst's own replace them.
     if (undo->currentIndex() >= 0 && undo->currentIndex() < m_mediaRelinkSidecarHistory.size())
         m_mediaRelinkSidecarHistory[undo->currentIndex()] = sidecars;
-    // A sibling that was fresh just before this push is still fresh after it; one that an
-    // undo / redo / new point from a path bypassing MainWindow made stale stays stale.
-    for (const char *name : kPendingUndoTimerNames) {
-        auto *other = findChild<QTimer *>(QLatin1String(name));
-        if (!other || other == timer || !other->isActive()) continue;
-        if (other->property("burstSerial").toULongLong() != serial
-            || other->property("burstIndex").toInt() != index)
-            continue;
-        other->setProperty("burstSerial", static_cast<qulonglong>(undo->saveSerial()));
-        other->setProperty("burstIndex", undo->currentIndex());
-    }
 }
 
 // Takes the pending points now, before anything that reads or replaces the undo state, in
