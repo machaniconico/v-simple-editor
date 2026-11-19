@@ -1,0 +1,3 @@
+# doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
+# The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
+# A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.

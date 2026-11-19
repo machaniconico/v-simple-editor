@@ -1,0 +1,24 @@
+# label<TAB>line<TAB>kind: the reports of the whole fixture run
+docs/bad.md	1	MISSING_FILE
+docs/bad.md	2	OUT_OF_RANGE
+docs/bad.md	3	EMPTY_TARGET
+docs/bad.md	4	LITERAL_NOT_FOUND
+docs/bad.md	5	NO_LITERAL
+docs/bad.md	7	AMBIGUOUS_PATH
+docs/bad.md	8	MALFORMED_REF
+docs/bad.md	9	MALFORMED_REF
+docs/bad.md	10	OUT_OF_RANGE
+docs/bad.md	11	MISSING_FILE
+docs/cont.md	16	MALFORMED_REF
+docs/split.md	4	UNPARSED_COLON_NUMBER
+docs/split.md	5	UNPARSED_COLON_NUMBER
+anchors.txt	3	WEAK_ANCHOR
+anchors.txt	4	UNUSED_ANCHOR
+docs/bad.md	12	MISSING_FILE
+docs/bad.md	13	LITERAL_NOT_FOUND
+docs/bad.md	14	MISSING_FILE
+docs/bad.md	15	MISSING_FILE
+docs/split.md	6	OUT_OF_RANGE
+docs/bad.md	16	MISSING_FILE
+docs/bad.md	18	MALFORMED_REF
+docs/bad.md	19	MALFORMED_REF

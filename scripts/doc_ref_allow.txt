@@ -1,0 +1,5 @@
+# doc_ref_check allow list (UTF-8, TAB separated, # starts a comment line). Two kinds of row:
+#   doc:line<TAB>path:range<TAB>reason  a reference to a past revision (only this resolved reference; never NO_LITERAL)
+#   path:range uses exactly the --list-refs spelling; unresolved references use their own token:range.
+#   unparsed<TAB>doc:line<TAB>token<TAB>reason  a ':<digits>' token that is not a reference (token as reported, e.g. D:1)
+#   Every field is required: a row with a missing or empty field (reason included) is a usage error (exit 2).
