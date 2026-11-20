@@ -350,6 +350,16 @@ public:
     // displaying it) and returns its source time in microseconds, -1 at EOF / on
     // failure. Tells where a seek or a frame step left the decoder.
     qint64 nextDecodedSourceUsForTest();
+    // US-2400 test seams (no GL): the reprojections updatePositionUi rejected as
+    // stale, the syncs syncDecoderToPlayheadIfBehind made (a seek or a decode),
+    // and the syncs its guard (c3) = past the file's end / (c4) = a target it
+    // could not reach before (`guard` 3 or 4) did not make.
+    int staleReprojectionRejectsForTest() const { return m_staleReprojectionRejects; }
+    int decoderSyncsForTest() const { return m_decoderSyncs; }
+    int decoderSyncGuardSkipsForTest(int guard) const
+    {
+        return guard == 3 ? m_decoderSyncPastEndSkips : m_decoderSyncUnreachedSkips;
+    }
 
     // US-910 PARENT-OBS test seam (video-player-parent selftest). While ON,
     // each resolveDecodedLayerParentSources call in the two real layer
@@ -467,6 +477,15 @@ private:
                       bool decodeWithoutDisplay = false);
     bool decodeNextFrame(bool displayFrame);
     bool presentDecodedFrame(AVFrame *frame, bool displayFrame);
+    // US-2400: where the nested-sequence SSOT shows the frame and the decoder is
+    // only the clock, decodes (without displaying) the decoder up to the
+    // playhead's source time when it was left behind it (a seek that did not
+    // decode, a preview seek). Returns the source target it synced to, -1 when
+    // it did nothing.
+    // A tick/frame step decodes once more after syncing; a CPU redraw uses
+    // the cached frame directly and must reach the first frame at-or-after target.
+    int64_t syncDecoderToPlayheadIfBehind(bool consumerDecodeFollows);
+    void rememberUnreachedDecoderSync(int64_t targetUs);
     // Phase 1e — V1 fast path is opt-in via VEDITOR_GL_INTEROP=1 and limited
     // to a narrow set of conditions: HW-decoded D3D11 frame, no overlays
     // (text or V2+), no preview effects, no HDR, not deferred. Anything
@@ -773,6 +792,22 @@ private:
     // step in handlePlaybackTick can blend overlays on top before pushing
     // the final image to the GLPreview.
     bool m_deferDisplayThisTick = false;
+    // US-2400 decoder sync state: (s1) the pts of the last frame the decoder
+    // delivered (-1 = unknown after a flush), (s2) the source target a sync could
+    // not reach for this file and entry (-1 = none).
+    int64_t m_deliveredPtsUs = -1;
+    int64_t m_unreachedSyncUs = -1;
+    int m_unreachedSyncEntry = -1;
+    QString m_unreachedSyncFile;
+    // Reprojection-window recovery may rewind once at a given entry/playhead.
+    // Keep this across same-file flushes; clear on file/entry changes.
+    int64_t m_lastWindowSyncPlayheadUs = -1;
+    int m_lastWindowSyncEntry = -1;
+    bool m_decoderSyncing = false;
+    int m_staleReprojectionRejects = 0;
+    int m_decoderSyncs = 0;
+    int m_decoderSyncPastEndSkips = 0;
+    int m_decoderSyncUnreachedSkips = 0;
     // Tracks whether the previous tick took the compositor path. The
     // compositor forces the GL viewport to identity (1,0,0) so the active
     // entry's transform isn't applied twice on top of an already-baked

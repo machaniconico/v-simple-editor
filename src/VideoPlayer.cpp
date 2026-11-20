@@ -591,6 +591,9 @@ bool nestedSequencePreviewActive(const Timeline *timeline, qint64 timelineUs)
     return nestedSequencePreviewMode(timeline, timelineUs) != NestedPreview::None;
 }
 
+// US-2400: the most frames one decoder sync decodes (the GOP of the Wave 23 media).
+constexpr int kDecoderSyncMaxFrames = 60;
+
 int previewPrimaryEntryIndexAt(const Timeline *timeline,
                                const QVector<PlaybackEntry> &sequence,
                                int preferredIdx,
@@ -2119,6 +2122,8 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
         // sequence) doesn't reset the playhead to 0; toggling back ON resumes
         // at the previous position.
         m_activeEntry = -1;
+        m_lastWindowSyncPlayheadUs = -1;
+        m_lastWindowSyncEntry = -1;
         if (m_playing) pause();
         // V3 sprint visibility-toggle fix (part 2): block the seek bar's
         // valueChanged → seek(0) side effect. Shrinking the range to (0,0)
@@ -2256,6 +2261,9 @@ void VideoPlayer::setSequence(const QVector<PlaybackEntry> &entries,
     }
 
     m_activeEntry = desiredIdx;
+    m_unreachedSyncUs = -1; // US-2400: the entry indices are rebuilt
+    m_lastWindowSyncPlayheadUs = -1;
+    m_lastWindowSyncEntry = -1;
     m_timelinePositionUs = clamped;
 
     if (entryStructurallyChanged) {
@@ -2627,6 +2635,11 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
             m_playing = true;
     }
 
+    if (idx != m_activeEntry) {
+        m_unreachedSyncUs = -1; // US-2400: another entry
+        m_lastWindowSyncPlayheadUs = -1;
+        m_lastWindowSyncEntry = -1;
+    }
     m_activeEntry = idx;
     m_timelinePositionUs = timelineUs;
     const Timeline *previewTimeline = this->previewTimeline();
@@ -2735,6 +2748,11 @@ bool VideoPlayer::advanceToEntry(int newEntryIdx)
         }
     }
 
+    if (newEntryIdx != m_activeEntry) {
+        m_unreachedSyncUs = -1; // US-2400: another entry
+        m_lastWindowSyncPlayheadUs = -1;
+        m_lastWindowSyncEntry = -1;
+    }
     m_activeEntry = newEntryIdx;
     // US-T35 apply the new entry's per-clip video source transform to the
     // GL preview so each clip keeps its own scale/offset.
@@ -2931,6 +2949,11 @@ bool VideoPlayer::tryPromotePoolDecoderTo(int newEntryIdx)
     m_displayAspectRatio = target->displayAspect;
     m_currentPositionUs = target->currentPositionUs;
     m_loadedFilePath = next.filePath;
+    // US-2400: a new decoder context; what it delivered last is not known here.
+    m_deliveredPtsUs = -1;
+    m_unreachedSyncUs = -1;
+    m_lastWindowSyncPlayheadUs = -1;
+    m_lastWindowSyncEntry = -1;
 
     // The pool's get_format callback was poolGetHwFormatCallback with
     // opaque == target. We delete `target` below; a stray re-probe would
@@ -3317,9 +3340,13 @@ void VideoPlayer::stepForward()
     }
     // Into or inside an SSOT interval the decoder still advances one frame, as a
     // forward playback tick does: the flattened display deferred, then the SSOT.
+    // US-2400: from the playhead's frame, where a seek may have left the decoder behind.
+    const int64_t syncedUs = syncDecoderToPlayheadIfBehind(/*consumerDecodeFollows=*/true);
     m_deferDisplayThisTick = ssotAtTarget;
     const bool advanced = decodeNextFrame(true);
     m_deferDisplayThisTick = false;
+    if (!advanced && syncedUs >= 0)
+        rememberUnreachedDecoderSync(syncedUs);
     if (advanced) {
         const int64_t projected = (m_activeEntry >= 0
                 && m_activeEntry < static_cast<int>(m_sequence.size()))
@@ -5122,6 +5149,10 @@ void VideoPlayer::resetDecoder()
     m_hdrInfo = {};
     m_durationUs = 0;
     m_currentPositionUs = 0;
+    m_deliveredPtsUs = -1; // US-2400
+    m_unreachedSyncUs = -1;
+    m_lastWindowSyncPlayheadUs = -1;
+    m_lastWindowSyncEntry = -1;
     m_frameDurationUs = 0;
     m_displayAspectRatio = 0.0;
     // Phase 1e Win #15 (Fix M): retain the last presented QImage across
@@ -5536,6 +5567,7 @@ void VideoPlayer::updatePositionUi()
                 || m_seekInProgress || m_pendingSeekMs >= 0) {
                 m_timelinePositionUs = projected;
             } else {
+                ++m_staleReprojectionRejects;
                 static QElapsedTimer s_warnThrottle;
                 if (!s_warnThrottle.isValid() || s_warnThrottle.elapsed() > 1000) {
                     qWarning().nospace()
@@ -5579,6 +5611,7 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
 
     avcodec_flush_buffers(m_codecCtx);
     m_currentPositionUs = targetUs;
+    m_deliveredPtsUs = -1; // US-2400: flushed, nothing delivered yet
 
     if (!displayFrame && !decodeWithoutDisplay) {
         updatePositionUi();
@@ -5653,6 +5686,113 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
     return false;
 }
 
+int64_t VideoPlayer::syncDecoderToPlayheadIfBehind(bool consumerDecodeFollows)
+{
+    // (c1) The SSOT shows the frame and the decoder is the clock: a forward
+    // media entry in a nested-sequence SSOT interval.
+    if (!sequenceActive() || m_activeEntry < 0 || m_activeEntry >= m_sequence.size()
+        || !m_formatCtx || !m_codecCtx || m_videoStreamIndex < 0)
+        return -1;
+    const Timeline *timeline = previewTimeline();
+    const PlaybackEntry &entry = m_sequence[m_activeEntry];
+    if (isShapeClipEntry(timeline, entry)
+        || playbackEntryIsReversed(timeline, entry, &m_reverseStates)
+        || timelineHasActiveReversedSequenceReference(timeline, m_timelinePositionUs)
+        || !nestedSequencePreviewActive(timeline, m_timelinePositionUs))
+        return -1;
+    // (c2) Sync an unknown/behind decoder, or rewind after a paused CPU redraw
+    // when the consumer's next frame would exceed the reprojection window.
+    const int64_t frameUs = m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30;
+    const bool nextFrameWouldBeRejected = consumerDecodeFollows && m_deliveredPtsUs >= 0
+        // Below 0.5x a single source step exceeds the window: rewinding cannot
+        // make that step fit. Leave those clips on the existing playback path.
+        && fileLocalToTimelineUs(m_activeEntry, m_deliveredPtsUs + frameUs)
+                - fileLocalToTimelineUs(m_activeEntry, m_deliveredPtsUs) <= 2 * frameUs
+        && (m_lastWindowSyncEntry != m_activeEntry
+            || m_lastWindowSyncPlayheadUs != m_timelinePositionUs)
+        && fileLocalToTimelineUs(m_activeEntry, m_deliveredPtsUs + frameUs)
+            > m_timelinePositionUs + 2 * frameUs;
+    if (m_deliveredPtsUs >= 0
+        && m_timelinePositionUs - fileLocalToTimelineUs(m_activeEntry, m_deliveredPtsUs)
+            <= frameUs * 3 / 2
+        && !nextFrameWouldBeRejected)
+        return -1;
+    // (c3) The target lies inside the file.
+    const int64_t targetUs = entryLocalPositionUs(m_activeEntry, m_timelinePositionUs);
+    if (m_durationUs > 0 && targetUs >= m_durationUs) {
+        ++m_decoderSyncPastEndSkips;
+        return -1;
+    }
+    // (c4) Not a target this file and entry could not reach before, unless it is
+    // at least a frame earlier (walking forward past it does not sync again).
+    if (m_unreachedSyncUs >= 0 && m_unreachedSyncEntry == m_activeEntry
+        && m_unreachedSyncFile == m_loadedFilePath
+        && targetUs > m_unreachedSyncUs - frameUs) {
+        ++m_decoderSyncUnreachedSkips;
+        return -1;
+    }
+
+    const QScopedValueRollback<bool> syncing(m_decoderSyncing, true);
+    const QScopedValueRollback<bool> quiet(m_suppressUiUpdates, true);
+    const int64_t playheadUs = m_timelinePositionUs;
+    // Decode on from the delivered frame when it is known, before the target and
+    // within the frame limit; otherwise seek again.
+    const bool decodeOn = m_deliveredPtsUs >= 0 && m_deliveredPtsUs < targetUs
+        && targetUs - m_deliveredPtsUs <= kDecoderSyncMaxFrames * frameUs;
+    bool reached = false;
+    bool decoded = false;
+    const bool started = decodeOn || seekInternal(targetUs, /*displayFrame=*/false, /*precise=*/true);
+    if (started) {
+        ++m_decoderSyncs;
+        if (nextFrameWouldBeRejected) {
+            m_lastWindowSyncPlayheadUs = playheadUs;
+            m_lastWindowSyncEntry = m_activeEntry;
+        }
+        for (int n = 0; n < kDecoderSyncMaxFrames && decodeNextFrame(false); ++n) {
+            decoded = true;
+            if (m_deliveredPtsUs >= targetUs) {
+                reached = true;
+                break;
+            }
+            // Only when a consumer decode follows (tick/step), for a clip slower
+            // than 0.75x: when the next frame (the first at or past the
+            // target) and the consumer's frame after it would project more than 2
+            // frames past the playhead, which updatePositionUi rejects, stop at this
+            // last frame before the target.
+            if (consumerDecodeFollows && m_deliveredPtsUs + frameUs >= targetUs
+                && fileLocalToTimelineUs(m_activeEntry, m_deliveredPtsUs + 2 * frameUs)
+                    > playheadUs + 2 * frameUs) {
+                reached = true;
+                break;
+            }
+        }
+    }
+    // The frame cache a KeepDecoder seek fills (seekInternal's decodeWithoutDisplay
+    // branch), which the clip-local CPU preview composes from.
+    if (decoded && m_frame) {
+        if (AVFrame *displayable = ensureSwFrame(m_frame)) {
+            const QImage image = frameToImage(displayable);
+            if (!image.isNull()) {
+                m_lastV1RawFrame = image;
+                m_lastSourceFrame = image;
+                m_lastSourceFrameHasBakedText = false;
+                m_lastSourceFrameV1StabBaked = false;
+            }
+        }
+    }
+    m_timelinePositionUs = playheadUs;
+    if (!reached)
+        rememberUnreachedDecoderSync(targetUs);
+    return targetUs;
+}
+
+void VideoPlayer::rememberUnreachedDecoderSync(int64_t targetUs)
+{
+    m_unreachedSyncUs = targetUs;
+    m_unreachedSyncEntry = m_activeEntry;
+    m_unreachedSyncFile = m_loadedFilePath;
+}
+
 bool VideoPlayer::decodeNextFrame(bool displayFrame)
 {
     if (!m_formatCtx || !m_codecCtx || !m_packet || !m_frame)
@@ -5705,6 +5845,13 @@ bool VideoPlayer::presentDecodedFrame(AVFrame *frame, bool displayFrameRequested
     if (m_durationUs > 0)
         positionUs = qMin(positionUs, m_durationUs);
     m_currentPositionUs = positionUs;
+    m_deliveredPtsUs = positionUs; // US-2400 (s1)
+    // A consumer decode clears (s2) once it reaches the unreached target; short of
+    // it, (c4) keeps blocking the re-seek and the tick walks forward as before.
+    if (!m_decoderSyncing && m_unreachedSyncUs >= 0
+        && positionUs >= m_unreachedSyncUs
+                - (m_frameDurationUs > 0 ? m_frameDurationUs : AV_TIME_BASE / 30))
+        m_unreachedSyncUs = -1;
 
     if (displayFrameRequested) {
         // Phase 1e fast path — when the narrow set of preconditions holds
@@ -5962,8 +6109,11 @@ QSize VideoPlayer::fittedDisplaySize(const QSize &bounds) const
 bool VideoPlayer::refreshPreviewClipCpuComposite()
 {
     int cpuTarget = -1;
-    if (!activePreviewClipCpuStack(m_timelinePositionUs, &cpuTarget)
-        || m_lastV1RawFrame.isNull()) {
+    const bool cpuStack = activePreviewClipCpuStack(m_timelinePositionUs, &cpuTarget);
+    // US-2400: compose the playhead's frame, not the one a seek left behind.
+    if (cpuStack)
+        syncDecoderToPlayheadIfBehind(/*consumerDecodeFollows=*/false);
+    if (!cpuStack || m_lastV1RawFrame.isNull()) {
         return false;
     }
 
@@ -6646,10 +6796,15 @@ void VideoPlayer::handlePlaybackTick()
                 m_tickTraceSkipped += driftSkipped;
                 sectionMark = tickTimer.nsecsElapsed();
             }
+            // US-2400: not after a drift skip (that tick already decoded on).
+            const int64_t syncedUs = driftSkipped == 0
+                ? syncDecoderToPlayheadIfBehind(/*consumerDecodeFollows=*/true) : -1;
             QElapsedTimer decodeTimer;
             if (traceStall)
                 decodeTimer.start();
             advanced = decodeNextFrame(true);
+            if (!advanced && syncedUs >= 0)
+                rememberUnreachedDecoderSync(syncedUs);
             if (traceTick)
                 m_tickTraceDecodeNs += tickTimer.nsecsElapsed() - sectionMark;
             if (traceStall && decodeTimer.isValid()) {
