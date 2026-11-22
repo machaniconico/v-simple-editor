@@ -8906,6 +8906,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                 return {};
         }
     }
+    // US-2401: the playback intervals, read once the first ramped clip is drawn.
+    std::optional<QVector<QVector<OverlapInterval>>> rampIntervals;
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
         const auto *track = m_timeline->videoTracks().value(trackIdx, nullptr);
         if (!track || track->isHidden())
@@ -8971,6 +8973,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             QImage frame;
             int sourceFrameIndex = 0;
             double fxSourceSeconds = clip.inPoint;
+            std::optional<tlrender::RampSourceMapping> rampSamples;
             auto trIt = m_timeRemapClipEntries.constFind(clipId);
             if (trIt != m_timeRemapClipEntries.cend() || clip.hasTimeRemap()) {
                 timeremap::TimeRemapCurve curve = (trIt != m_timeRemapClipEntries.cend())
@@ -9068,20 +9071,53 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                 // Preserve the legacy special-compositor mapping exactly for
                 // every existing project where reverse remains OFF.
                 const double clipOut = clipSourceOutPoint(clip);
-                const double sourceTime = qBound(
+                double sourceTime = qBound(
                     clip.inPoint,
                     clip.inPoint
                         + localSeconds * qMax(clip.speed, 0.0001),
                     clipOut);
+                // US-2401: a clip with a speed ramp maps like renderFrameAt's
+                // top-level pass: through its playback interval (the start and in
+                // point a transition borrowed), at the local time moved by the
+                // seconds borrowed before its in point, clamped to that interval.
+                if (!clip.speedRamp.isIdentity() && !clip.isSequenceReference()) {
+                    if (!rampIntervals)
+                        rampIntervals = m_timeline->videoOverlapIntervals();
+                    tlrender::RampSourceMapping mapping;
+                    if (trackIdx < rampIntervals->size())
+                        for (const OverlapInterval &iv : rampIntervals->at(trackIdx))
+                            if (iv.clipIdx == clipIdx) {
+                                mapping = {&iv, (clip.inPoint - iv.clipIn) / iv.speed};
+                                break;
+                            }
+                    sourceTime = tlrender::rampedSourceSecondInInterval(
+                        clip, mapping.interval, localSeconds + mapping.localOffsetSec);
+                    rampSamples = mapping;
+                }
                 fxSourceSeconds = sourceTime;
                 sourceFrameIndex = roto::sourceFrameIndexFor(sourceTime, fps);
                 // US-1805: the brush path picks export's source frame (the first
                 // at or after sourceTime), the rest keep grabFrameAt.
+                // US-2401: a ramped clip's non-brush decode is clamped to the
+                // interval's borrowed bounds (the sourceTime roto and the
+                // stabilizer use), not again to the clip's own.
                 frame = brushWantsSpecialPath
                     ? tlrender::decodeClipSourceFrame(
                           ProxyManager::instance().getProxyPath(clip.filePath),
-                          sourceTime, /*usePreviousSourceFrame=*/false, clip.inPoint)
+                          sourceTime, /*usePreviousSourceFrame=*/false, clip.inPoint,
+                          /*strictFlushPts=*/rampSamples.has_value())
+                    : rampSamples && rampSamples->interval
+                    ? decodeFrameAtSecondsFromFile(
+                          ProxyManager::instance().getProxyPath(clip.filePath),
+                          qBound(rampSamples->interval->clipIn, sourceTime,
+                                 rampSamples->interval->clipOut))
                     : decodeClipFrameAtSourceTime(clip, sourceTime);
+                // US-2401: export's end-of-file hold of a ramp above 1 (the last
+                // frame before the used-up source), for the brush path too.
+                if (frame.isNull() && brushWantsSpecialPath && rampSamples)
+                    frame = tlrender::decodeClipSourceFrame(
+                        ProxyManager::instance().getProxyPath(clip.filePath),
+                        sourceTime, /*usePreviousSourceFrame=*/true, clip.inPoint);
             }
 
             if (frame.isNull()) {
@@ -9131,17 +9167,30 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip, clipId, trackIdx, brushWantsSpecialPath](
+                    [this, clip, clipId, trackIdx, brushWantsSpecialPath, rampSamples](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         // US-1805: the brush path samples export's source frame
                         // (renderClipSourceFrame), the rest keep grabFrameAt.
-                        const QImage sampleRaw = brushWantsSpecialPath
+                        // US-2401: a ramped clip's non-brush sample is clamped to
+                        // the interval's borrowed bounds, as its frame is.
+                        QImage sampleRaw = brushWantsSpecialPath
                             ? tlrender::decodeClipSourceFrame(
                                   ProxyManager::instance().getProxyPath(clip.filePath),
                                   sampleSourceSec,
                                   clip.sourceTimeRunsBackwardAtLocalTime(sampleLocalSec),
-                                  clip.inPoint)
+                                  clip.inPoint, /*strictFlushPts=*/rampSamples.has_value())
+                            : rampSamples && rampSamples->interval
+                            ? decodeFrameAtSecondsFromFile(
+                                  ProxyManager::instance().getProxyPath(clip.filePath),
+                                  qBound(rampSamples->interval->clipIn, sampleSourceSec,
+                                         rampSamples->interval->clipOut))
                             : decodeClipFrameAtSourceTime(clip, sampleSourceSec);
+                        // US-2401: export's end-of-file hold, as for the frame.
+                        if (sampleRaw.isNull() && brushWantsSpecialPath && rampSamples)
+                            sampleRaw = tlrender::decodeClipSourceFrame(
+                                ProxyManager::instance().getProxyPath(clip.filePath),
+                                sampleSourceSec, /*usePreviousSourceFrame=*/true,
+                                clip.inPoint);
                         if (sampleRaw.isNull())
                             return QImage();
                         // US-2010: export's provider order on both branches:
@@ -9154,7 +9203,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                             clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
-                    frame, clip, localSeconds, fxSourceSeconds, echoProvider);
+                    frame, clip, localSeconds, fxSourceSeconds, echoProvider,
+                    rampSamples ? &*rampSamples : nullptr);
             } else {
                 frame = tlrender::applyClipFxStackFromSource(
                     frame, clip, localSeconds);

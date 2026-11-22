@@ -281,6 +281,7 @@ class MainWindow : public QMainWindow
     friend int runUnsavedPromptSelftest();
     friend int runProjectPersistSelftest();
     friend int runStabilizerExportSelftest();
+    friend int runRampExportSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);

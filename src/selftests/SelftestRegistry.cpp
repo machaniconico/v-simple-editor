@@ -242,6 +242,7 @@ int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runPsdImportSelftest();
 int runPuppetPinSelftest();
+int runRampExportSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
 int runRenderInPlaceSelftest();
@@ -725,6 +726,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
       "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (17 gates)" },
+    { "ramp-export",       "VEDITOR_RAMP_EXPORT_SELFTEST",        runRampExportSelftest,         true,
+      "a top-level clip with a speed ramp maps its export source time through the ClipInfo mapper over its playback interval (the start and in point a transition borrowed, clamped to it) in renderFrameAt, its Echo samples, renderClipSourceAt and the special composite: ramped frames, ends, borrowed origin, consumers, unchanged cases, preview read-back (5 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,

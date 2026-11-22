@@ -2271,8 +2271,8 @@ int runStabilizerExportSelftest()
     // active keyed V2 (V1 empty) at videoDx -0.375 over a V3 layer: V2 +4, V3 still,
     // no GL keys; (d) V1 +8 and V2 +4: each its own; (e) (b)'s ramped V2 composed
     // with V1: x 52; (f) a lone keyed V1 with (b)'s ramp: the GL matrix and read-back
-    // at the decoder's position (1.5 s, x 52); renderFrameAt stays at x 48 (no video
-    // speed ramp, declared difference); (g) a re-present of (d)'s frame
+    // at the decoder's position (1.5 s, x 52), and renderFrameAt at the same source
+    // time (x 52, US-2401: export follows the speed ramp); (g) a re-present of (d)'s frame
     // (setTextOverlays) and a composite frame cache hit of it keep the upload and no
     // GL keys; (h) a lone keyed V2 under a still compare: keys off and identity while
     // comparing, back to (a)'s matrix after. HEAD: (a)(b)(h) GL keys off and the dot
@@ -2417,8 +2417,8 @@ int runStabilizerExportSelftest()
                   << matrixText(eb) << " read-back " << boxText(bDot) << " ok=" << bOk;
 
                 // (f) the same on V1: the GL samples at its decoder's position (1.5 s,
-                // x 52). Declared difference: renderFrameAt applies no video speed
-                // ramp (its picture and keys are at 1.0 s, x 48; S0-1 (c)).
+                // x 52), and renderFrameAt at the same source time (US-2401: export
+                // follows the speed ramp, its picture and keys at 1.5 s, x 52).
                 ClipInfo v1Ramped = withKeys(seqClip(seqC), rampKeys);
                 v1Ramped.speedRamp = ramp15;
                 const QImage fExport = exportAt({{v1Ramped}}, 1.0);
@@ -2427,7 +2427,7 @@ int runStabilizerExportSelftest()
                 const Box fDot = whiteBox(grab(), glArea);
                 const Box fExp = whiteBox(fExport);
                 fOk = view->stabEnabledForTest() && sameM(mf, eb) && dotAt(fDot, 52, 40)
-                    && dotAt(fExp, 48, 40);
+                    && dotAt(fExp, 52, 40);
                 d << " (f) ramped lone V1 gl " << glState() << " read-back " << boxText(fDot)
                   << " renderFrameAt " << boxText(fExp) << " ok=" << fOk;
                 player.setSpeedRamps({});
@@ -2477,8 +2477,9 @@ int runStabilizerExportSelftest()
                 player.setSpeedRamps({});
                 return shown;
             };
-            // `exported` null: no renderFrameAt comparison ((e): renderFrameAt does not
-            // apply a video speed ramp, so it is printed only).
+            // `exported` null: no renderFrameAt comparison ((e): the composed frame is
+            // compared on the dots only; renderFrameAt's V2, which follows the speed ramp
+            // since US-2401, is printed beside it).
             const auto cLeg = [&](const char *name, const QImage &shown, const QImage &exported,
                                   QPoint v1Dot, QPoint v2Dot) {
                 const int diff = exported.isNull() ? 0 : maxDiff(shown, exported);
@@ -2567,9 +2568,8 @@ int runStabilizerExportSelftest()
             const auto [eRes, eGl] = cLeg("(e)", composed({}, rampKeys, true), QImage(),
                                           QPoint(10, 10), QPoint(52, 40));
             eOk = eRes;
-            d << " (renderFrameAt V2 " << boxText(whiteBox(exportAt({{v1Left}, {v2Ramped}}, 1.0),
-                                                           v2Area))
-              << ')';
+            d << " (renderFrameAt V2, ramped since US-2401: "
+              << boxText(whiteBox(exportAt({{v1Left}, {v2Ramped}}, 1.0), v2Area)) << ')';
             cGlOk = c1Gl && c2Gl && dGl && eGl;
 
             // (b) with an Echo baked on the CPU: the lone ramped V2 (64x64, Echo 2
