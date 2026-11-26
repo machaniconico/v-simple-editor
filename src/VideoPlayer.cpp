@@ -3288,6 +3288,56 @@ void VideoPlayer::stepForward()
         }
     }
     if (newPos == m_timelinePositionUs) return; // at end of sequence
+    // US-2403: the playhead before the step (the decode below can reproject it).
+    const int64_t fromUs = m_timelinePositionUs;
+    // US-2403: the first integer us at or past a cut, by findActiveEntryAt's comparison
+    // (truncation and qRound64 can give a time before it, inside the previous entry:
+    // 2999499.9999999995 us -> 2999499, 2999500.25 us -> 2999500).
+    const auto firstUsAtOrAfter = [](double cutSec) {
+        int64_t t = static_cast<int64_t>(std::floor(cutSec * AV_TIME_BASE));
+        while (static_cast<double>(t) / AV_TIME_BASE < cutSec)
+            ++t;
+        return t;
+    };
+    // Resolve a cut without selecting an overlay that began inside the old entry.
+    // cutUs is computed once by each caller and also used for its crossing test.
+    const auto nextEntryAtCut = [this](int curIdx, int64_t cutUs) {
+        const auto &cur = m_sequence[curIdx];
+        const auto nonOverlap = [&](int i) {
+            return i >= 0 && i < m_sequence.size() && i != curIdx
+                && m_sequence[i].timelineStart >= cur.timelineEnd - 1e-6;
+        };
+        const int resolved = findActiveEntryAt(cutUs);
+        if (nonOverlap(resolved))
+            return resolved;
+        const double cutSec = static_cast<double>(cutUs) / AV_TIME_BASE;
+        for (int i = 0; i < m_sequence.size(); ++i) {
+            if (nonOverlap(i) && cutSec >= m_sequence[i].timelineStart
+                && cutSec < m_sequence[i].timelineEnd)
+                return i;
+        }
+        return -1;
+    };
+    // US-2403: after advanceToEntry, which truncates the start, the step lands on the
+    // first us of the entry, and an SSOT frame shown at the truncated time is shown at it.
+    const auto landOnEntryStart = [this, &firstUsAtOrAfter]() {
+        const int64_t startUs = firstUsAtOrAfter(m_sequence[m_activeEntry].timelineStart);
+        if (m_timelinePositionUs >= startUs)
+            return;
+        const int64_t truncUs = m_timelinePositionUs;
+        m_timelinePositionUs = startUs;
+        const Timeline *timeline = previewTimeline();
+        if (nestedSequencePreviewActive(timeline, truncUs)
+            != nestedSequencePreviewActive(timeline, startUs)) {
+            // The truncated cut can still belong to A's SSOT while B is plain.
+            // Re-enter the seek display path to replace that composite and baked mode.
+            seekToTimelineUs(startUs, /*precise=*/true);
+            m_timelinePositionUs = startUs;
+        } else if (nestedSequencePreviewActive(timeline, startUs)) {
+            displayNestedSequenceFrameAt(timeline, startUs);
+        }
+        forceTimelineUiToCurrent();
+    };
 
     const int idx = findActiveEntryAt(newPos);
     if (idx >= 0 && idx < static_cast<int>(m_sequence.size())
@@ -3297,11 +3347,19 @@ void VideoPlayer::stepForward()
         const auto &next = m_sequence[idx];
         if (next.timelineStart >= cur.timelineEnd - 1e-6) {
             // Non-overlap cross — clean snap to next entry's start.
-            advanceToEntry(idx);
+            // US-2403: from inside the previous entry the step lands there, on the
+            // next entry's first frame, whatever the target past it.
+            const int64_t endUs = firstUsAtOrAfter(cur.timelineEnd);
+            const bool fromInsideCur = fromUs < endUs;
+            const int cutIdx = fromInsideCur ? nextEntryAtCut(m_activeEntry, endUs) : -1;
+            const int nextIdx = fromInsideCur && cutIdx >= 0 ? cutIdx : idx;
+            advanceToEntry(nextIdx);
+            if (fromInsideCur)
+                landOnEntryStart();
             // advanceToEntry sets m_timelinePositionUs to next.timelineStart.
             // For a gap-stretched step (target landed past next.timelineStart),
             // force forward so the user actually advances by `step`.
-            if (newPos > m_timelinePositionUs) {
+            if (!fromInsideCur && newPos > m_timelinePositionUs) {
                 m_timelinePositionUs = newPos;
                 forceTimelineUiToCurrent();
             }
@@ -3352,6 +3410,23 @@ void VideoPlayer::stepForward()
                 && m_activeEntry < static_cast<int>(m_sequence.size()))
             ? fileLocalToTimelineUs(m_activeEntry, m_currentPositionUs)
             : newPos;
+        // US-2403: a step from inside the active entry whose decoded frame lies at or
+        // past the entry's end lands on the next entry's first frame, as a step whose
+        // target reaches it does. The target can stop short of the end while the
+        // decoder does not: seek(ms) floors to the millisecond, the truncated step
+        // loses 1 us per step, and at a speed other than 1 a source frame spans
+        // more or less than `step`.
+        if (idx == m_activeEntry && m_activeEntry >= 0
+            && m_activeEntry < static_cast<int>(m_sequence.size())) {
+            const auto &cur = m_sequence[m_activeEntry];
+            const int64_t endUs = firstUsAtOrAfter(cur.timelineEnd);
+            const int nextIdx = nextEntryAtCut(m_activeEntry, endUs);
+            if (nextIdx >= 0 && fromUs < endUs && projected >= endUs) {
+                advanceToEntry(nextIdx);
+                landOnEntryStart();
+                return;
+            }
+        }
         m_timelinePositionUs = qMax(projected, newPos);
         if (!ssotAtTarget) {
             forceTimelineUiToCurrent();
@@ -3369,6 +3444,20 @@ void VideoPlayer::stepForward()
     // will hot-swap or loadFile if the resolved entry differs. After
     // it returns, force m_timelinePositionUs forward in case
     // updatePositionUi snapped it back.
+    // US-2403: a step from the active entry's last frame whose source ends at the
+    // entry's out point (EOF) lands on the next entry's first frame, as a step
+    // whose decoded frame lies past the out point does.
+    if (!advanced && idx == m_activeEntry && m_activeEntry >= 0
+        && m_activeEntry < static_cast<int>(m_sequence.size())) {
+        const auto &cur = m_sequence[m_activeEntry];
+        const int64_t endUs = firstUsAtOrAfter(cur.timelineEnd);
+        const int nextIdx = nextEntryAtCut(m_activeEntry, endUs);
+        if (fromUs < endUs && newPos + step > endUs && nextIdx >= 0) {
+            advanceToEntry(nextIdx);
+            landOnEntryStart();
+            return;
+        }
+    }
     seekToTimelineUs(newPos, /*precise=*/true);
     if (m_timelinePositionUs < newPos) {
         m_timelinePositionUs = newPos;

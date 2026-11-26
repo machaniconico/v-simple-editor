@@ -2645,6 +2645,7 @@ int runStabilizerExportSelftest()
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encWhy)) {
         tally.skip(16, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
         tally.skip(17, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+        tally.skip(18, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
     } else {
         std::ostringstream d;
         const QString movA = dir + QStringLiteral("/g16a.mp4");
@@ -4234,6 +4235,447 @@ int runStabilizerExportSelftest()
             if (!gl17)
                 d << " (GL unavailable: (d1) picture and (h) composite not checked)";
             tally.gate(17, ok17, d.str());
+
+            // US-2403 G18: 1F-> from inside entry A to the entry boundary (G17's media and
+            // V1: A's last frame f89, B from source f70 at 3 s) lands on the next entry's
+            // first frame with the playhead at its start (P = plain, N = nest, H = hidden
+            // clip; g1 / gN = H with B 0.01 s / 0.5 s later; o = H with A ending at 2.99 s;
+            // slow / slowH = A at 0.5x, plain / H). Frames by the box (source frame) and
+            // the background (A grey, B blue). Playheads, entries and renderFrameAt need
+            // no GL; the shown picture is checked with GL or wherever the player composed
+            // one, the direct seek's picture with GL. HEAD (7a1efac): from f89 (2966666 us
+            // / seek(ms) 2966000 us) the step's target 2999999 / 2999333 us stays in A
+            // while the decoded A#90 is at 3 s: [P] shows A#90 at 3 s on entry A, [N][H]
+            // B#70 on entry A and B#70 again at 91f, g1 / gN stop on A#90, o shows B#70 at
+            // 2999999 us and skips B#71, slow shows A#45 at 3 s. (b) and (c) are pins: the
+            // SSOT step is on the frame grid at HEAD (US-2400 steps the synced decoder).
+            d.str(std::string());
+            d.clear();
+            bool ok18 = mov17Ok;
+            bool gl18 = true;
+            int rigs18 = 0;
+            const auto frameId = [&](const QImage &image) -> std::string {
+                if (image.isNull())
+                    return "none";
+                const QImage s = image.size() == movSize ? image : image.scaled(movSize);
+                const QColor bg = s.pixelColor(kMovW / 2, 3);
+                const char clip = bg.blue() > bg.red() + 40 ? 'B' : 'A';
+                const Spot spot = brightSpot(s);
+                // x within 5 px: N's child A is keyed +4 px.
+                for (int n = 0; spot.n >= 100 && n < kMovFrames; ++n) {
+                    const QPoint box = movBoxAt(n);
+                    if (std::abs(spot.x - (box.x() + 5.5)) <= 5.0
+                        && std::abs(spot.y - (box.y() + 5.5)) <= 2.0)
+                        return std::string(1, clip) + '#' + std::to_string(n);
+                }
+                return std::string(1, clip) + "#?";
+            };
+            // Within 1 us of frame k's time k / 30 s.
+            const auto onGrid = [](qint64 t) {
+                return qAbs(t * kFps - qint64(frameAt(t)) * 1000000) < kFps;
+            };
+            const auto step18 = [&](Rig &r) {
+                r.p->stepForward();
+                pumpEvents(40);
+            };
+            const auto shown18 = [&](Rig &r) { return frameId(r.p->m_currentFrameImage); };
+            // The shown picture against `expect`: required with GL, else checked when
+            // the player composed one.
+            const auto shownIs = [](Rig &r, const std::string &shown, const std::string &expect) {
+                return shown == expect || (!r.gl && shown == "none");
+            };
+            const auto bEntry = [](Rig &r, qint64 startUs) {
+                for (int i = 0; i < r.p->m_sequence.size(); ++i) {
+                    const auto &e = r.p->m_sequence[i];
+                    if (qAbs(e.timelineStart * 1e6 - double(startUs)) < 1.0
+                        && qAbs(e.clipIn * 1e6 - double(frameUs(70))) < 2.0)
+                        return i;
+                }
+                return -1;
+            };
+            const auto gapBuild = [&](double gap) {
+                QVector<ClipInfo> e = v1;
+                e[1].leadInSec = gap;
+                return tracksOf({e, {hidden17()}});
+            };
+            // A ending off the grid at 2.99 s (B from 2.99 s), H's hidden clip.
+            const auto shortBuild = [&]() {
+                QVector<ClipInfo> e = v1;
+                e[0] = movClip(movG, 0.0, 2.99);
+                return tracksOf({e, {hidden17()}});
+            };
+            // A at a constant 0.5x (source 0-1.5 s over timeline 0-3 s), plain or H.
+            const auto slowBuild = [&](bool hidden) {
+                QVector<ClipInfo> e = v1;
+                e[0] = movClip(movG, 0.0, 1.5);
+                e[0].speed = 0.5;
+                return hidden ? tracksOf({e, {hidden17()}}) : tracksOf({e});
+            };
+            // A replaced by `a` (B right after it), plain or H.
+            const auto aBuild = [&](const ClipInfo &a, bool hidden) {
+                QVector<ClipInfo> e = v1;
+                e[0] = a;
+                return hidden ? tracksOf({e, {hidden17()}}) : tracksOf({e});
+            };
+            struct Rig18 {
+                const char *name;
+                char kind;
+                qint64 bStartUs;
+            };
+            for (const Rig18 &x : {Rig18{"P", 'P', 3000000}, Rig18{"N", 'N', 3000000},
+                                   Rig18{"H", 'H', 3000000}, Rig18{"g1", '1', 3010000},
+                                   Rig18{"gN", 'G', 3500000}, Rig18{"o", 'O', 2990000},
+                                   Rig18{"slow", 'w', 3000000}, Rig18{"slowH", 'W', 3000000},
+                                   Rig18{"fracP", 'f', 2999500}, Rig18{"fracH", 'F', 2999500},
+                                   Rig18{"fracDP", 'd', 2999501}, Rig18{"fracDH", 'D', 2999501},
+                                   Rig18{"eofP", 'e', 3000000}, Rig18{"eofH", 'E', 3000000},
+                                   Rig18{"fracNestToPlain", 'n', 2999501},
+                                   Rig18{"slowShortB", 's', 3000000},
+                                   Rig18{"crossShortB", 'c', 2990000},
+                                   Rig18{"pipAcrossCut", 'p', 2990000}}) {
+                Rig r;
+                std::function<void(Timeline *)> build = build17(x.kind);
+                if (x.kind == '1' || x.kind == 'G')
+                    build = gapBuild(x.kind == '1' ? 0.01 : 0.5);
+                else if (x.kind == 'O')
+                    build = shortBuild();
+                else if (x.kind == 'w' || x.kind == 'W')
+                    build = slowBuild(x.kind == 'W');
+                else if (x.kind == 'f' || x.kind == 'F')
+                    build = aBuild(movClip(movG, double(frameUs(20)) / 1e6, 2.9995), x.kind == 'F');
+                else if (x.kind == 'd' || x.kind == 'D')
+                    build = aBuild(movClip(movG, double(frameUs(20)) / 1e6, 2.99950025),
+                                   x.kind == 'D');
+                else if (x.kind == 'e' || x.kind == 'E')
+                    build = aBuild(movClip(movG, 2.0, 3.0), x.kind == 'E');
+                else if (x.kind == 'n') {
+                    build = [&](Timeline *tl) {
+                        const TimelineSequence child = seqOf(QStringLiteral("child18"),
+                            {{movClip(movG, double(frameUs(20)) / 1e6, 2.99950025)}});
+                        const TimelineSequence main = seqOf(QStringLiteral("main18"),
+                            {{refTo(QStringLiteral("child18"), 2.99950025, 0.0), v1[1], v1[2]}});
+                        tl->setSequences({main, child}, QStringLiteral("main18"));
+                    };
+                } else if (x.kind == 'p') {
+                    QVector<ClipInfo> clips = v1;
+                    clips[0] = movClip(movG, 0.0, 2.99);
+                    clips[1] = movClip(movH, double(frameUs(70)) / 1e6, 2.01);
+                    ClipInfo overlay = movClip(movG, 0.0, 0.495);
+                    overlay.leadInSec = 2.5;
+                    build = tracksOf({clips, {overlay}});
+                } else if (x.kind == 's' || x.kind == 'c') {
+                    QVector<ClipInfo> clips = v1;
+                    clips[0] = movClip(movG, 0.0, x.kind == 's' ? 0.75 : 2.99);
+                    clips[0].speed = x.kind == 's' ? 0.25 : 1.0;
+                    clips[1] = movClip(movH, double(frameUs(70)) / 1e6,
+                                      x.kind == 's' ? 0.05 : 0.005);
+                    build = tracksOf({clips});
+                }
+                const std::string rigName = std::string(x.name) + "18";
+                if (!open(r, rigName.c_str(), build)) {
+                    ok18 = false;
+                    continue;
+                }
+                ++rigs18;
+                gl18 = gl18 && r.gl;
+                const bool ssot = x.kind != 'P' && x.kind != 'w' && x.kind != 'f' && x.kind != 'd'
+                    && x.kind != 'e';
+                const int bIdx = bEntry(r, x.bStartUs);
+                d << " {" << x.name << "} B entry=" << bIdx;
+                ok18 = ok18 && bIdx >= 0;
+                const std::string bHead = "B#70";
+                // PiP X spans the cut but starts before it: resolving the cut must
+                // skip X and advance onto V1 B, never snap back to X's 2.5 s start.
+                if (x.kind == 'p') {
+                    seekTo(r, frameUs(89));
+                    const qint64 from = playhead(r);
+                    const int before = r.p->m_activeEntry;
+                    const int overlay = r.p->findActiveEntryAt(2990000);
+                    const bool fixture = before >= 0 && overlay >= 0 && bIdx >= 0
+                        && r.p->m_sequence[before].sourceTrack == 0
+                        && r.p->m_sequence[bIdx].sourceTrack == 0
+                        && r.p->m_sequence[overlay].sourceTrack == 1
+                        && qAbs(r.p->m_sequence[overlay].timelineStart - 2.5) < 1e-6
+                        && qAbs(r.p->m_sequence[overlay].timelineEnd - 2.995) < 1e-6;
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const int entry = r.p->m_activeEntry;
+                    const bool ok = fixture && from == frameUs(89) && before != bIdx
+                        && at >= 2990000 && at >= from && entry == bIdx;
+                    d << " (PiP-across-cut) from=" << from << "us entry=" << before
+                      << " -> " << at << "us entry=" << entry << " V1B=" << bIdx
+                      << " overlay=" << overlay << " fixture=" << fixture << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a5) The decoded frame (slow A) or arithmetic target (cross A)
+                // can fall beyond short B into C. Resolve the next entry at A's cut.
+                if (x.kind == 's' || x.kind == 'c') {
+                    bool ok = true;
+                    for (const bool exact : {true, false}) {
+                        const int startFrame = x.kind == 's' ? 88 : 89;
+                        if (exact) seekTo(r, frameUs(startFrame));
+                        else seekMs(r, startFrame, true, 0);
+                        const qint64 from = playhead(r);
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const std::string shown = shown18(r);
+                        const int entry = r.p->m_activeEntry;
+                        bool leg = at == x.bStartUs && entry == bIdx
+                            && r.p->findActiveEntryAt(at) == bIdx && shownIs(r, shown, bHead);
+                        d << " (a5) " << (exact ? "exact" : "seek(ms)") << " from=" << from
+                          << "us -> playhead=" << at << "us entry=" << entry << " shown=" << shown;
+                        if (r.gl) {
+                            seekTo(r, at);
+                            const std::string direct = shown18(r);
+                            leg = leg && direct == shown && direct == bHead;
+                            d << " directSeek=" << direct;
+                        }
+                        d << " ok=" << leg;
+                        ok = ok && leg;
+                    }
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a4) [fracP][fracH]: A from source f20 for 2.9995 s, so B starts at
+                // 2999499.9999999995 us, which truncates into A; [fracDP][fracDH]: for
+                // 2.99950025 s, B starts at 2999500.25 us, which truncates and rounds into A;
+                // [eofP][eofH]: A from source f60 for 3 s, its out point the media's EOF
+                // (source f149 at f89). From f89 (frame time and seek(ms)) one 1F-> lands at
+                // the first us at or past B's start with findActiveEntryAt(playhead) ==
+                // active entry == B, B#70 shown = a direct seek there (= renderFrameAt).
+                // Fails without the step's start rounding (frac: playhead 2999499 /
+                // 2999500 us, entry A at it) / the EOF switch (eof: A's last frame re-shown
+                // inside A).
+                if (x.kind == 'f' || x.kind == 'F' || x.kind == 'd' || x.kind == 'D'
+                    || x.kind == 'e' || x.kind == 'E' || x.kind == 'n') {
+                    const bool frac = x.kind == 'f' || x.kind == 'F';
+                    const bool fracDown = x.kind == 'd' || x.kind == 'D' || x.kind == 'n';
+                    const double bStart = bIdx >= 0 ? r.p->m_sequence[bIdx].timelineStart : 0.0;
+                    const qint64 truncUs = qint64(bStart * 1000000);
+                    const qint64 roundUs = qRound64(bStart * 1000000);
+                    const int aIdx = r.p->findActiveEntryAt(frameUs(89));
+                    const double aOut = aIdx >= 0 ? r.p->m_sequence[aIdx].clipOut : 0.0;
+                    // The fixture: frac's start truncates below its rounding, fracD's
+                    // rounding is its truncation and lies before it, eof's A ends at the
+                    // media's end.
+                    const bool fixture = fracDown
+                        ? truncUs == roundUs && double(roundUs) / 1e6 < bStart
+                            && roundUs + 1 == x.bStartUs
+                        : roundUs == x.bStartUs
+                            && (frac ? truncUs == roundUs - 1
+                                     : qAbs(aOut - double(kMovFrames) / kFps) < 1e-6);
+                    d << " (a4) bStart trunc=" << truncUs << "us round=" << roundUs << "us A="
+                      << aIdx << " clipOut=" << aOut << " fixture=" << fixture;
+                    bool ok = fixture;
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(89));
+                        else
+                            seekMs(r, 89, true, 0);
+                        const qint64 from = playhead(r);
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const int entry = r.p->m_activeEntry;
+                        const int entryAt = r.p->findActiveEntryAt(at);
+                        const std::string shown = shown18(r);
+                        const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                        bool okLeg = at == x.bStartUs && entry == bIdx && entryAt == bIdx
+                            && (!ssot || refAt == bHead) && shownIs(r, shown, bHead);
+                        d << (exact ? " exact" : " seek(ms)") << " from=" << from
+                          << "us -> playhead=" << at << "us entry=" << entry << " entryAt="
+                          << entryAt << " shown=" << shown << " renderFrameAt=" << refAt;
+                        if (r.gl) {
+                            seekTo(r, at);
+                            const std::string direct = shown18(r);
+                            d << " directSeek=" << direct;
+                            okLeg = okLeg && direct == shown;
+                        }
+                        d << " ok=" << okLeg;
+                        ok = ok && okLeg;
+                    }
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a3) [slow][slowH]: steps from f87 (source f43.5, A#44 shown) at 0.5x,
+                // where the step's decode reaches past A's end: the first playhead at or
+                // past B's start is B's start on entry B with B#70, the next B#71.
+                if (x.kind == 'w' || x.kind == 'W') {
+                    seekTo(r, frameUs(87));
+                    qint64 last = playhead(r);
+                    bool rise = true;
+                    int atB = 0;
+                    bool ok = true;
+                    d << " (a3) from=" << last << "us";
+                    for (int i = 0; i < 6 && atB < 2; ++i) {
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const int entry = r.p->m_activeEntry;
+                        const std::string shown = shown18(r);
+                        const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                        rise = rise && at > last;
+                        d << ' ' << at << "us/e" << entry << '/' << shown << '/' << refAt;
+                        if (at >= x.bStartUs) {
+                            const std::string want = atB == 0 ? bHead : "B#71";
+                            const bool place = atB == 0 ? at == x.bStartUs
+                                : at - x.bStartUs >= 33333 && at - x.bStartUs <= 33334;
+                            ok = ok && place && entry == bIdx && (!ssot || refAt == want)
+                                && shownIs(r, shown, want);
+                            ++atB;
+                        }
+                        last = at;
+                    }
+                    ok = ok && rise && atB == 2;
+                    d << " rise=" << rise << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a) [P][N][H] / (d1) gN / (d2) g1 / (d2') o: from A's last frame f89,
+                // frame time exactly and seek(ms) floored to 2966 ms: B#70 at B's start
+                // on entry B; the next step shows B#71, one frame (33333-33334 us) later.
+                for (const bool exact : {true, false}) {
+                    if (exact)
+                        seekTo(r, frameUs(89));
+                    else
+                        seekMs(r, 89, true, 0);
+                    const qint64 from = playhead(r);
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const int entry = r.p->m_activeEntry;
+                    const std::string shown = shown18(r);
+                    const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                    bool ok = at == x.bStartUs && entry == bIdx && (!ssot || refAt == bHead)
+                        && shownIs(r, shown, bHead);
+                    step18(r);
+                    const qint64 at2 = playhead(r);
+                    const int entry2 = r.p->m_activeEntry;
+                    const std::string shown2 = shown18(r);
+                    const std::string ref2 = ssot ? frameId(ref(r, at2)) : std::string("-");
+                    const bool next = at2 - x.bStartUs >= 33333 && at2 - x.bStartUs <= 33334
+                        && entry2 == bIdx && (!ssot || ref2 == "B#71") && shownIs(r, shown2, "B#71");
+                    ok = ok && next;
+                    const char *leg = x.kind == 'G' ? "(d1)" : x.kind == '1' ? "(d2)"
+                        : x.kind == 'O' ? "(d2')" : "(a)";
+                    d << ' ' << leg << (exact ? " exact" : " seek(ms)") << " from=" << from
+                      << "us -> playhead=" << at << "us expect " << x.bStartUs << " entry=" << entry
+                      << " shown=" << shown << " renderFrameAt=" << refAt << "; next step playhead="
+                      << at2 << "us entry=" << entry2 << " shown=" << shown2 << " renderFrameAt="
+                      << ref2 << " nextOk=" << next;
+                    if (r.gl) {
+                        seekTo(r, at);
+                        const std::string direct = shown18(r);
+                        d << " directSeek=" << direct;
+                        ok = ok && direct == shown;
+                    }
+                    // (d4) play() right after the boundary step: no rejected reprojection.
+                    if (exact && (x.kind == 'P' || x.kind == 'H')) {
+                        seekTo(r, frameUs(89));
+                        const int rej0 = rejects(r);
+                        step18(r);
+                        const int stepRej = rejects(r) - rej0;
+                        const qint64 b = playhead(r);
+                        Run run = play17(r, b + frameUs(6), 3000);
+                        const bool d4 = flow17("(d4) step -> play", run, b + frameUs(3));
+                        d << " (d4) rejects step=" << stepRej << " play=" << run.rej;
+                        ok = ok && d4 && stepRej == 0 && run.rej == 0;
+                    }
+                    d << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                }
+                // (b) [P][N][H] [pin at HEAD]: 6 steps from f86 (frame time and seek(ms)):
+                // A#87-89, then B#70-72, the playhead rising on the grid (f87-f92).
+                if (x.kind == 'P' || x.kind == 'N' || x.kind == 'H') {
+                    const std::string expect[] = {"A#87", "A#88", "A#89", "B#70", "B#71", "B#72"};
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(86));
+                        else
+                            seekMs(r, 86, true, 0);
+                        qint64 last = playhead(r);
+                        bool ok = true;
+                        d << " (b)" << (exact ? " exact" : " seek(ms)") << " from=" << last << "us";
+                        for (int i = 0; i < 6; ++i) {
+                            step18(r);
+                            const qint64 at = playhead(r);
+                            const std::string shown = shown18(r);
+                            const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                            const bool rise = at > last && onGrid(at) && frameAt(at) == 87 + i;
+                            ok = ok && rise && (!ssot || refAt == expect[i])
+                                && shownIs(r, shown, expect[i]);
+                            d << ' ' << at << "us/" << shown << '/' << refAt << (rise ? "" : "(off)");
+                            last = at;
+                        }
+                        d << " ok=" << ok;
+                        ok18 = ok18 && ok;
+                    }
+                }
+                // (c) [H] [pin at HEAD]: 3 steps away from the boundary from seek(ms) to f85
+                // (2833 ms) and from f85's frame time: on the grid, shown = renderFrameAt.
+                if (x.kind == 'H') {
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(85));
+                        else
+                            seekMs(r, 85, true, 0);
+                        bool ok = true;
+                        d << " (c)" << (exact ? " exact" : " seek(ms)") << " from=" << playhead(r)
+                          << "us";
+                        for (int i = 0; i < 3; ++i) {
+                            step18(r);
+                            const qint64 at = playhead(r);
+                            const std::string refAt = frameId(ref(r, at));
+                            const std::string shown = shown18(r);
+                            const std::string want = "A#" + std::to_string(86 + i);
+                            ok = ok && onGrid(at) && frameAt(at) == 86 + i && refAt == want
+                                && shownIs(r, shown, want);
+                            d << ' ' << at << "us/" << shown << '/' << refAt;
+                        }
+                        d << " ok=" << ok;
+                        ok18 = ok18 && ok;
+                    }
+                }
+                // (d3) [pin] a seek into the gap (entry B already active), then 1F->:
+                // HEAD's values. The seek shows B#70 while renderFrameAt is empty
+                // (declared, Wave 25). Within a frame of B's start the seek's playhead
+                // reprojects onto it (g1 3005000 us, gN 3490000 us) and the step shows
+                // B#71; from 3.2 s the step lands on B's start (B#70). Each = renderFrameAt.
+                struct Gap18 {
+                    char kind;
+                    qint64 gapAt;
+                    qint64 seekPinUs;
+                    qint64 pinUs;
+                    const char *pinFrame;
+                };
+                for (const Gap18 &g : {Gap18{'G', 3200000, 3200000, 3500000, "B#70"},
+                                       Gap18{'G', 3490000, 3500000, 3533334, "B#71"},
+                                       Gap18{'1', 3005000, 3010000, 3043333, "B#71"}}) {
+                    if (g.kind != x.kind)
+                        continue;
+                    seekTo(r, g.gapAt);
+                    const qint64 seekPh = playhead(r);
+                    const int entry0 = r.p->m_activeEntry;
+                    const std::string seekShown = shown18(r);
+                    const std::string seekRef = frameId(ref(r, g.gapAt));
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const std::string shown = shown18(r);
+                    const std::string refAt = frameId(ref(r, at));
+                    const bool ok = seekPh == g.seekPinUs && entry0 == bIdx
+                        && shownIs(r, seekShown, bHead) && seekRef == "none" && at == g.pinUs
+                        && refAt == g.pinFrame && shownIs(r, shown, g.pinFrame);
+                    d << " (d3) [pin] seek " << g.gapAt << "us playhead=" << seekPh << "us (pin "
+                      << g.seekPinUs << ") entry=" << entry0 << " shown=" << seekShown
+                      << " renderFrameAt=" << seekRef
+                      << " -> 1F-> playhead=" << at << "us (pin " << g.pinUs << ") shown=" << shown
+                      << " renderFrameAt=" << refAt << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                }
+            }
+            ok18 = ok18 && rigs18 == 18;
+            d << " rigs=" << rigs18 << " gl=" << gl18;
+            if (!gl18)
+                d << " (GL unavailable: the shown and direct-seek pictures not checked)";
+            tally.gate(18, ok18, d.str());
         }
     }
 
