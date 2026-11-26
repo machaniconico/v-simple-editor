@@ -286,6 +286,9 @@ public:
     // US-T37 OBS-style snap-to-frame logic during video-source drag.
     QRectF canvasFrameRect() const;
     void commitCurrentTextToolEdit();
+    bool beginInlineEditOverlay(int overlayIndex,
+                                const QRectF &normalizedCenterRect,
+                                const QString &prefillText);
 
     // US-T34 OBS-style video source transform. scale is uniform relative
     // to the letterbox; dx/dy are offsets in fractions of the letterbox

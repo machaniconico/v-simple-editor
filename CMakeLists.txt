@@ -213,6 +213,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/DynamicZoomDialog.h
     src/DynamicZoomDialog.cpp
     src/MainWindow.cpp
+    src/ContextMenuOrder.h
+    src/ContextMenuOrder.cpp
     src/VideoPlayer.cpp
     src/Timeline.cpp
     src/Timecode.cpp
@@ -354,6 +356,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LayerStyleSelftest.cpp
     src/selftests/LayerStyleUiSelftest.cpp
     src/selftests/RightclickPausePrefSelftest.cpp
+    src/selftests/context_menu_order_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp

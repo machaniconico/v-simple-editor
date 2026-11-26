@@ -3248,6 +3248,32 @@ void GLPreview::commitCurrentTextToolEdit()
     }
 }
 
+bool GLPreview::beginInlineEditOverlay(int overlayIndex,
+                                       const QRectF &normalizedCenterRect,
+                                       const QString &prefillText)
+{
+    if (overlayIndex < 0)
+        return false;
+    const QRectF lb = letterboxRect();
+    if (lb.width() <= 1.0 || lb.height() <= 1.0)
+        return false;
+    const double cx = normalizedCenterRect.x();
+    const double cy = normalizedCenterRect.y();
+    const double bw = normalizedCenterRect.width() > 0.0 ? normalizedCenterRect.width() : 0.40;
+    const double bh = normalizedCenterRect.height() > 0.0 ? normalizedCenterRect.height() : 0.14;
+    const int rw = qMax(24, static_cast<int>(bw * lb.width()));
+    const int rh = qMax(20, static_cast<int>(bh * lb.height()));
+    const int rx = static_cast<int>(lb.x() + (cx - bw / 2.0) * lb.width());
+    const int ry = static_cast<int>(lb.y() + (cy - bh / 2.0) * lb.height());
+    m_textToolRect = QRect(rx, ry, rw, rh);
+    m_textToolHasRect = true;
+    m_textToolEditingIndex = overlayIndex;
+    enterTextToolEditMode();
+    m_textToolInputText = prefillText;
+    update();
+    return true;
+}
+
 int GLPreview::hitTestExistingOverlay(const QPoint &widgetPos) const
 {
     if (m_textToolOverlayHits.isEmpty())
