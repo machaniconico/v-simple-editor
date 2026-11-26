@@ -1121,7 +1121,7 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
         exportAudioMixEntryClipDuration(clipIn.toDouble(), clipOut.toDouble(), speed,
                                         reversed, rampFactor, timelineLength),
         leadInType, leadInDuration, trailOutType, trailOutDuration,
-        rampFactor != 1.0);
+        exportAudioRampStageApplies(reversed, rampFactor, timelineLength));
     // Join at the DSP boundary without changing the legacy graph text.
     pre.chop(QStringLiteral("[prefx%1]").arg(inputIndex).size());
     post.remove(0, QStringLiteral("[%1:a]").arg(inputIndex).size());

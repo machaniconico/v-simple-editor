@@ -1650,6 +1650,22 @@ int runRampExportSelftest()
                 }
                 iOk = iOk && legOk;
             }
+            // US-2420 waveFix: direct builder calls where no ramp stage applies
+            // (reversed=true or timelineLength=0 with rampFactor=2.0) must keep legacy 'g',15 fades.
+            for (const bool revCase : {true, false}) {
+                const QString ch = buildExportAudioMixEntryFilterChain(
+                    0, QStringLiteral("0.500000"), QStringLiteral("3.500015"), 0,
+                    QStringLiteral("1.000000"), AudioChannelMode::Stereo, revCase, 1.0,
+                    TransitionType::None, 0.0, TransitionType::FadeOut, 3.0,
+                    2.0, revCase ? 4.0 : 0.0);
+                const QRegularExpressionMatch m = stRe.match(ch);
+                const QString st = m.hasMatch() ? m.captured(1) : QString();
+                const bool noStageExpOk = !ch.contains(QStringLiteral("asetrate="))
+                    && m.hasMatch() && (st.contains(QLatin1Char('e')) || st.contains(QLatin1Char('E')));
+                d << " (i)nostage-" << (revCase ? "rev" : "len0") << ".st=" << st.toStdString()
+                  << (noStageExpOk ? "" : " [FAIL]");
+                iOk = iOk && noStageExpOk;
+            }
         }
         ok = ok && aOk && a2Ok && bOk && cOk && dOk && eOk && fOk && gOk && hOk && iOk;
         d << " legs: a=" << aOk << " a2=" << a2Ok << " b=" << bOk << " c=" << cOk << " d=" << dOk

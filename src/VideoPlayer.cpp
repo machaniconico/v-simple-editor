@@ -2650,6 +2650,12 @@ bool VideoPlayer::seekToTimelineUs(int64_t timelineUs, bool precise)
         previewTimeline, e, timelineUs,
         entryLocalPositionUs(idx, timelineUs),
         m_frameDurationUs, &m_reverseStates);
+    // US-2420 waveFix: an explicit backward seek within the same entry (even < 1 frame
+    // earlier than an unreached target) flushes the decoder and must not be suppressed by c4.
+    if (m_unreachedSyncUs >= 0 && m_unreachedSyncEntry == m_activeEntry
+        && m_unreachedSyncFile == m_loadedFilePath && localUs < m_unreachedSyncUs) {
+        m_unreachedSyncUs = -1;
+    }
     bool ok = seekInternal(localUs, !nestedSequencePreview, precise,
                            nestedMode == NestedPreview::KeepDecoder);
     const bool nestedSequenceRendered = nestedSequencePreview

@@ -4189,6 +4189,15 @@ int runStabilizerExportSelftest()
                     const int c4 = r.p->decoderSyncGuardSkipsForTest(4) - c40;
                     d << " (g2) far f100 syncs=" << first << " again=" << again << " c4=" << c4;
                     bool ok = first == 1 && again == 0 && c4 >= 1;
+                    // US-2420 waveFix: an explicit backward seek within 1 frame of the
+                    // unreached target clears c4 instead of suppressing resync.
+                    const int sBeforeSub = syncs(r);
+                    seekTo(r, 3333000 - 10000);
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int subBackSync = syncs(r) - sBeforeSub;
+                    d << " subFrameBackSync=" << subBackSync;
+                    ok = ok && subBackSync == 1;
                     r.p->setPreviewEffects({});
                     pumpEvents(60);
                     seekMs(r, 50, true);

@@ -113,14 +113,18 @@ QString trackFxPostChain(const audioexport::MixPlan &plan, int i)
 {
     const PlaybackEntry &entry = plan.entries[i];
     const double rampFactor = plan.rampFactors.value(i, 1.0);
+    const bool reversed = plan.reversed.value(i, false);
+    const double timelineLength = entry.timelineEnd - entry.timelineStart;
+    const bool fixedPointFades = !reversed && std::isfinite(rampFactor) && rampFactor > 0.0
+        && std::abs(rampFactor - 1.0) > 1e-9
+        && std::isfinite(timelineLength) && timelineLength > 0.0;
     return buildExportAudioMixEntryPostFxFilterChain(i,
         qMax(0, qRound(entry.timelineStart * 1000.0)),
         volumeExpressionForEntry(entry),
         exportAudioMixEntryClipDuration(entry.clipIn, entry.clipOut, entry.speed,
-            plan.reversed.value(i, false), rampFactor,
-            entry.timelineEnd - entry.timelineStart),
+            reversed, rampFactor, timelineLength),
         entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration,
-        rampFactor != 1.0);
+        fixedPointFades);
 }
 } // namespace
 
