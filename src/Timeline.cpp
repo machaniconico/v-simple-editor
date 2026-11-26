@@ -1,6 +1,9 @@
 #include "RenderInPlace.h"
 #include "ContextMenuOrder.h"
+#include "ClipRoles.h"
+#include "CreatorTools.h"
 #include "ExternalGenerator.h"
+#include "GradeVersions.h"
 #include "LoudnessPresets.h"
 #include <QFileDialog>
 #include "Timeline.h"
@@ -10486,9 +10489,30 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                 aMenu.addSeparator();
         }
         aMenu.addSeparator();
+        QMenu *aRoleMenu = aMenu.addMenu(QStringLiteral("ロールを設定"));
+        QList<QPair<QAction *, cliproles::Role>> aRoleActions;
+        const cliproles::Role curAudioRole = cliproles::effectiveRoleForClip(aClip, true);
+        for (const auto &rm : cliproles::allRoles()) {
+            if (!rm.isAudioRole && rm.role != cliproles::Role::None)
+                continue;
+            QAction *ra = aRoleMenu->addAction(rm.displayName);
+            ra->setCheckable(true);
+            ra->setChecked(curAudioRole == rm.role);
+            aRoleActions.append({ra, rm.role});
+        }
+        aMenu.addSeparator();
         QAction *aCustomize = aMenu.addAction(QStringLiteral("メニューをカスタマイズ…"));
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
+        for (const auto &pair : aRoleActions) {
+            if (aChosen == pair.first) {
+                cliproles::setRoleForClip(aClip.uid, pair.second);
+                emit statusMessageRequested(
+                    QStringLiteral("クリップのロールを「%1」に設定しました")
+                        .arg(cliproles::metaFor(pair.second).displayName), 3000);
+                return;
+            }
+        }
         for (const auto &na : aNormActions) {
             if (aChosen != na.act)
                 continue;
@@ -10976,6 +11000,19 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
 
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
+    QAction *gradeVerAct = menu.addAction(QStringLiteral("カラーグレード・バージョン管理…"));
+    QAction *beatCutAct = menu.addAction(QStringLiteral("ビート同期自動カット (A1 基準)…"));
+    QMenu *vRoleMenu = menu.addMenu(QStringLiteral("ロールを設定"));
+    QList<QPair<QAction *, cliproles::Role>> vRoleActions;
+    const cliproles::Role curVideoRole = cliproles::effectiveRoleForClip(clipInfo, false);
+    for (const auto &rm : cliproles::allRoles()) {
+        if (rm.isAudioRole)
+            continue;
+        QAction *ra = vRoleMenu->addAction(rm.displayName);
+        ra->setCheckable(true);
+        ra->setChecked(curVideoRole == rm.role);
+        vRoleActions.append({ra, rm.role});
+    }
     QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
     QAction *parentAct = menu.addAction(QStringLiteral("ペアレント..."));
     QAction *nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
@@ -11039,6 +11076,15 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     }
 
     if (!chosen) return;
+    for (const auto &pair : vRoleActions) {
+        if (chosen == pair.first) {
+            cliproles::setRoleForClip(clipInfo.uid, pair.second);
+            emit statusMessageRequested(
+                QStringLiteral("クリップのロールを「%1」に設定しました")
+                    .arg(cliproles::metaFor(pair.second).displayName), 3000);
+            return;
+        }
+    }
     for (const auto &labelAction : labelActions) {
         if (chosen == labelAction.first) {
             applyLabelToSelection(labelAction.second);
@@ -11190,6 +11236,21 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
+    else if (chosen == gradeVerAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0) return;
+        gradeversions::GradeVersionsDialog dlg(this, trackIdx, clipIndex, this);
+        dlg.exec();
+        scheduleEmitSequenceChanged();
+    }
+    else if (chosen == beatCutAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0) return;
+        const auto res = creatortools::detectBeatsAndAutoCut(this, trackIdx, clipIndex, 0, 0, 1);
+        emit statusMessageRequested(res.summary, 5000);
+        if (res.ok)
+            scheduleEmitSequenceChanged();
+    }
     else if (extGenConfigAct && chosen == extGenConfigAct) {
         const int trackIdx = m_videoTracks.indexOf(track);
         if (trackIdx < 0 || track->isLocked()) return;

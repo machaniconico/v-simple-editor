@@ -3,8 +3,14 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include "ClipRoles.h"
 #include "ContextMenuOrder.h"
+#include "CreatorTools.h"
+#include "DuplicateFrameDetector.h"
 #include "ExternalGenerator.h"
+#include "OtioImport.h"
+#include "PowerBinStore.h"
+#include "TimelineIndexDock.h"
 #include "JsonNumberClamp.h"
 #include <QCoreApplication>
 #include <cstdio>
@@ -5306,6 +5312,35 @@ void MainWindow::setupMenuBar()
     connect(m_zoomToFitSequenceAction, &QAction::triggered, this, [this]() {
         m_timeline->zoomToFitSequence();
     });
+    auto *timelineIndexAct = viewMenu->addAction(QStringLiteral("タイムライン・インデックス…"));
+    connect(timelineIndexAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        tlindex::TimelineIndexDialog dlg(m_timeline, this);
+        connect(&dlg, &tlindex::TimelineIndexDialog::jumpToTimeRequested, this, [this](double sec) {
+            if (m_player)
+                m_player->seek(qRound(sec * 1000.0));
+        });
+        dlg.exec();
+    });
+    auto *powerBinAct = viewMenu->addAction(QStringLiteral("パワービン (共有アセット)…"));
+    connect(powerBinAct, &QAction::triggered, this, [this]() {
+        powerbin::PowerBinDialog dlg(this);
+        if (dlg.exec() == QDialog::Accepted && !dlg.selectedFilePath().isEmpty()) {
+            const QString path = dlg.selectedFilePath();
+            if (m_timeline && !m_timeline->videoTracks().isEmpty() && !m_timeline->videoTracks()[0]->isLocked()) {
+                ClipInfo clip;
+                clip.filePath = path;
+                clip.displayName = QFileInfo(path).fileName();
+                clip.duration = 5.0;
+                clip.inPoint = 0.0;
+                clip.outPoint = 5.0;
+                m_timeline->videoTracks()[0]->addClip(clip);
+                m_timeline->saveUndoState(QStringLiteral("パワービンから挿入"));
+                m_timeline->refreshPlaybackSequence();
+                statusBar()->showMessage(QStringLiteral("パワービンから挿入しました: %1").arg(clip.displayName), 4000);
+            }
+        }
+    });
     m_zoomToSelectionAction = viewMenu->addAction(QStringLiteral("選択範囲にズーム"));
     m_zoomToSelectionAction->setEnabled(m_timeline->hasAnySelection());
     connect(m_zoomToSelectionAction, &QAction::triggered, this, [this]() {
@@ -5693,6 +5728,106 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({addExtGenClipAction,
         QStringLiteral("Edge HTML/React や QuickJS プラグイン等の外部ジェネレータで描画するクリップを追加します。")});
+
+    auto *addVisAction = insertMenu->addAction(QStringLiteral("オーディオビジュアライザを挿入…"));
+    connect(addVisAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const QStringList styles = {
+            QStringLiteral("スペクトラムバー (bars)"),
+            QStringLiteral("ミラーバー (mirror)"),
+            QStringLiteral("円形リング (circular)"),
+            QStringLiteral("波形ライン (waveform)")
+        };
+        bool ok = false;
+        const QString picked = QInputDialog::getItem(
+            this, QStringLiteral("オーディオビジュアライザ"), QStringLiteral("スタイル:"), styles, 0, false, &ok);
+        if (!ok) return;
+        const int idx = styles.indexOf(picked);
+        const auto style = static_cast<creatortools::VisualizerStyle>(qMax(0, idx));
+        TimelineTrack *tr = nullptr;
+        for (TimelineTrack *cand : m_timeline->videoTracks()) {
+            if (cand && !cand->isLocked()) { tr = cand; break; }
+        }
+        if (!tr) return;
+        ClipInfo clip;
+        clip.filePath = creatortools::buildVisualizerGeneratorUri(style);
+        clip.displayName = QStringLiteral("ビジュアライザ (%1)").arg(creatortools::visualizerStyleToString(style));
+        clip.duration = 10.0;
+        clip.inPoint = 0.0;
+        clip.outPoint = 10.0;
+        tr->addClip(clip);
+        m_timeline->saveUndoState(QStringLiteral("オーディオビジュアライザを挿入"));
+        m_timeline->refreshPlaybackSequence();
+        statusBar()->showMessage(QStringLiteral("オーディオビジュアライザを追加しました"), 4000);
+    });
+
+    auto *collageMenu = insertMenu->addMenu(QStringLiteral("画面分割コラージュ"));
+    auto addCollageItem = [&](const QString &label, creatortools::CollagePreset preset) {
+        QAction *act = collageMenu->addAction(label);
+        connect(act, &QAction::triggered, this, [this, preset]() {
+            if (!m_timeline) return;
+            const auto res = creatortools::applySplitScreenCollage(
+                m_timeline, preset, m_timeline->playheadPosition());
+            statusBar()->showMessage(res.summary, 4000);
+            if (res.ok) m_timeline->refreshPlaybackSequence();
+        });
+    };
+    addCollageItem(QStringLiteral("2分割 (左右)"), creatortools::CollagePreset::TwoUpHorizontal);
+    addCollageItem(QStringLiteral("2分割 (上下)"), creatortools::CollagePreset::TwoUpVertical);
+    addCollageItem(QStringLiteral("3分割 (左メイン + 右2)"), creatortools::CollagePreset::ThreeUpMainLeft);
+    addCollageItem(QStringLiteral("4分割 (2x2 グリッド)"), creatortools::CollagePreset::FourUpGrid);
+
+    auto *importOtioAct = insertMenu->addAction(QStringLiteral("OTIO タイムラインをインポート (.otio)…"));
+    connect(importOtioAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const QString path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("OpenTimelineIO (.otio) をインポート"),
+            QString(), QStringLiteral("OpenTimelineIO (*.otio);;JSON (*.json)"));
+        if (path.isEmpty()) return;
+        const otio::ImportResult parsed = otio::readOtioFile(path);
+        QString err;
+        if (!otio::applyOtioToTimeline(m_timeline, parsed, &err)) {
+            QMessageBox::warning(this, QStringLiteral("OTIO インポート失敗"), err);
+            return;
+        }
+        m_timeline->refreshPlaybackSequence();
+        statusBar()->showMessage(QStringLiteral("OTIO をインポートしました: %1").arg(parsed.name), 5000);
+    });
+
+    auto *dupCheckAct = insertMenu->addAction(QStringLiteral("重複フレームを検出…"));
+    connect(dupCheckAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const auto res = dupframes::analyzeTimeline(m_timeline, true, true);
+        if (res.overlaps.isEmpty()) {
+            QMessageBox::information(this, QStringLiteral("重複フレーム検出"),
+                                     QStringLiteral("重複して使用されているフレーム区間は見つかりませんでした。"));
+            return;
+        }
+        QStringList lines;
+        lines << QStringLiteral("重複区間: %1 件 (%2 素材 / %3 クリップ)")
+                     .arg(res.overlaps.size()).arg(res.distinctSources).arg(res.affectedClipCount);
+        for (int i = 0; i < qMin(15, res.overlaps.size()); ++i) {
+            const auto &ov = res.overlaps[i];
+            lines << QStringLiteral("・%1 [%2s - %3s]: %4 ↔ %5")
+                         .arg(QFileInfo(ov.sourcePath).fileName())
+                         .arg(ov.overlapSourceIn, 0, 'f', 2)
+                         .arg(ov.overlapSourceOut, 0, 'f', 2)
+                         .arg(ov.first.displayName, ov.second.displayName);
+        }
+        QMessageBox::information(this, QStringLiteral("重複フレーム検出"), lines.join(QLatin1Char('\n')));
+    });
+
+    auto *stemExportAct = insertMenu->addAction(QStringLiteral("ロール別に音声ステムを書き出し (WAV)…"));
+    connect(stemExportAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const QString dir = QFileDialog::getExistingDirectory(
+            this, QStringLiteral("音声ステム書き出し先フォルダを選択"));
+        if (dir.isEmpty()) return;
+        const auto res = cliproles::exportAudioStemsByRole(m_timeline, dir);
+        statusBar()->showMessage(res.summary, 5000);
+        if (!res.ok)
+            QMessageBox::warning(this, QStringLiteral("音声ステム書き出し"), res.summary);
+    });
 
     // US-AETEXT-12: AE Text Parity — 11 new menu actions
     insertMenu->addSeparator();

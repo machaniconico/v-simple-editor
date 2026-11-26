@@ -360,6 +360,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/platform_loudness_selftest.cpp
     src/selftests/wave25_parity_selftest.cpp
     src/selftests/ext_generator_selftest.cpp
+    src/selftests/competitor_gap_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -754,6 +755,20 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/ExternalGenerator.cpp
     src/ExternalGeneratorEdge.h
     src/ExternalGeneratorEdge.cpp
+    src/DuplicateFrameDetector.h
+    src/DuplicateFrameDetector.cpp
+    src/OtioImport.h
+    src/OtioImport.cpp
+    src/ClipRoles.h
+    src/ClipRoles.cpp
+    src/PowerBinStore.h
+    src/PowerBinStore.cpp
+    src/TimelineIndexDock.h
+    src/TimelineIndexDock.cpp
+    src/GradeVersions.h
+    src/GradeVersions.cpp
+    src/CreatorTools.h
+    src/CreatorTools.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp

@@ -190,6 +190,7 @@ int runLutImportSelftest();
 int runLoudnessAutoSelftest();
 int runWave25ParitySelftest();
 int runExtGeneratorSelftest();
+int runCompetitorGapSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -972,6 +973,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 25 carryover parity: B2 ramp tail preview clamp/EOF hold, CHANGE 6 remap precedence, B5 uniform speed audio, C-03 Echo ramp mapping (6 gates)" },
     { "ext-generator", "VEDITOR_EXT_GENERATOR_SELFTEST", runExtGeneratorSelftest, true,
       "External Generator clips (Plans A/B/C): URI & project persist, R3 trust gate, SSOT render & alpha composite, preview cache vs export, missing-renderer fallback, VGEN framing, bake+undo, Edge CDP helpers, QuickJS manifest, Plan A schema (10 gates)" },
+    { "competitor-gap", "VEDITOR_COMPETITOR_GAP_SELFTEST", runCompetitorGapSelftest, true,
+      "Wave 26 competitor-gap features: DuplicateFrameDetector, OtioImport round-trip, ClipRoles & multi-stem WAV export, PowerBins, GradeVersions+undo, TimelineIndex, SplitScreenCollage, AudioVisualizer SSOT, BeatSyncAutoCut (10 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
