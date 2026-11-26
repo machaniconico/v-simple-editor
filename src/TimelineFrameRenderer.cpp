@@ -1,4 +1,5 @@
 #include "TimelineFrameRenderer.h"
+#include "ExternalGenerator.h"
 #include "Timeline.h"
 #include "OpticalFlow.h"
 #include <atomic>
@@ -1907,6 +1908,8 @@ QImage renderClipSourceFrame(const Timeline *timeline,
 {
     if (!clip.shapes.isEmpty())
         return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
+    if (extgen::isExternalGeneratorFilePath(clip.filePath))
+        return extgen::renderGeneratorClipFrame(clip, clipLocalSec, outSize, timeline);
 
     // `sampleFromLeftBoundary` carries an ancestor sequence's source-time
     // direction. Compose it with this clip's resolved local direction. The
@@ -2161,7 +2164,8 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
         // Nor clips the special composite cannot draw as renderFrameAt does
         // (shape, nested sequence, disabled): those frames keep their HEAD
         // preview instead of losing the layer.
-        if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
+        if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible
+            || extgen::isExternalGeneratorFilePath(clip.filePath))
             return false;
         // Nor what it places statically: keyframed transform / opacity (any
         // track but brush_progress), SNS fit.
@@ -2563,6 +2567,7 @@ std::optional<ParentLayerHit> parentLayerAtInTracks(
         hit.clipLocalSeconds, reverse, topLevel, /*countDisabled=*/false);
     const QFileInfo parentFileInfo(c.filePath);
     hit.decodable = clipgeom::isNullObjectFilePath(c.filePath)
+        || extgen::isExternalGeneratorFilePath(c.filePath)
         || !c.sequenceRefId.isEmpty()
         || (parentFileInfo.exists() && parentFileInfo.size() > 0);
     return hit;

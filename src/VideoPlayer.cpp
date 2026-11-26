@@ -1,4 +1,5 @@
 #include "VideoPlayer.h"
+#include "ExternalGenerator.h"
 #include <QScopedValueRollback>
 #include <QSet>
 #include "GLPreview.h"
@@ -494,7 +495,7 @@ bool timelineHasActiveShapeClip(const Timeline *timeline, qint64 timelineUsec)
         if (!track || track->isHidden())
             continue;
         const ClipInfo *clip = activeClipOnTrack(track->clips(), targetSec);
-        if (clip && !clip->shapes.isEmpty())
+        if (clip && (!clip->shapes.isEmpty() || extgen::isExternalGeneratorFilePath(clip->filePath)))
             return true;
     }
     return false;
@@ -2585,8 +2586,11 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     if (renderSize.isEmpty())
         return false;
 
+    const bool prevHint = extgen::previewModeHintForCurrentThread();
+    extgen::setPreviewModeHintForCurrentThread(true);
     const QImage ssotFrame = tlrender::renderFrameAt(
         timeline, timelineUs, renderSize);
+    extgen::setPreviewModeHintForCurrentThread(prevHint);
     if (ssotFrame.isNull())
         return false;
     if (m_glPreview)

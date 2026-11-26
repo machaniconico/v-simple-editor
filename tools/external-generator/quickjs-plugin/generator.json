@@ -1,0 +1,8 @@
+{
+  "id": "quickjs",
+  "name": "QuickJS Script Renderer",
+  "executable": "vse-quickjs-gen.exe",
+  "protocol": "stdio-rgba",
+  "args": [],
+  "extensions": [".js", ".mjs"]
+}

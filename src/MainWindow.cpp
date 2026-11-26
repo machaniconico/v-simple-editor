@@ -4,6 +4,7 @@
 #include "RenderInPlace.h"
 #include "MainWindow.h"
 #include "ContextMenuOrder.h"
+#include "ExternalGenerator.h"
 #include "JsonNumberClamp.h"
 #include <QCoreApplication>
 #include <cstdio>
@@ -5657,6 +5658,41 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::addShapeLayer);
     m_menuHelpEntries.append({addShapeClipAction,
         QStringLiteral("選択中の動画トラックへ、図形を描画する5秒のクリップを挿入します。")});
+
+    auto *addExtGenClipAction = insertMenu->addAction(QStringLiteral("外部ジェネレータクリップ…"));
+    connect(addExtGenClipAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        extgen::ExternalGeneratorDialog dlg(extgen::GeneratorSpec{}, 5.0, this);
+        if (dlg.exec() != QDialog::Accepted) return;
+        const extgen::GeneratorSpec spec = dlg.spec();
+        if (!spec.entryPath.isEmpty() && spec.renderer != QStringLiteral("dummy"))
+            extgen::ensureEntryTrustedInteractive(spec.entryPath, this);
+        TimelineTrack *targetTrack = nullptr;
+        for (TimelineTrack *tr : m_timeline->videoTracks()) {
+            if (tr && !tr->isLocked()) {
+                targetTrack = tr;
+                break;
+            }
+        }
+        if (!targetTrack) {
+            QMessageBox::warning(this, QStringLiteral("外部ジェネレータクリップ"),
+                                 QStringLiteral("挿入できる動画トラックがありません。"));
+            return;
+        }
+        ClipInfo clip;
+        clip.filePath = extgen::buildGeneratorUri(spec);
+        clip.displayName = QStringLiteral("ジェネレータ (%1)").arg(spec.renderer);
+        clip.duration = dlg.durationSec();
+        clip.inPoint = 0.0;
+        clip.outPoint = dlg.durationSec();
+        targetTrack->addClip(clip);
+        m_timeline->saveUndoState(QStringLiteral("外部ジェネレータクリップを挿入"));
+        m_timeline->refreshPlaybackSequence();
+        statusBar()->showMessage(
+            QStringLiteral("外部ジェネレータクリップを追加しました (%1)").arg(spec.renderer), 4000);
+    });
+    m_menuHelpEntries.append({addExtGenClipAction,
+        QStringLiteral("Edge HTML/React や QuickJS プラグイン等の外部ジェネレータで描画するクリップを追加します。")});
 
     // US-AETEXT-12: AE Text Parity — 11 new menu actions
     insertMenu->addSeparator();
