@@ -292,6 +292,8 @@ void reverseInterleavedStereoS16(QByteArray &pcm)
 }
 } // namespace
 
+bool audioAtempoEnvForce() { return audioAtempoEnvForceCached(); }
+
 QVector<float> reversedPcmFrames(const QVector<float> &samples, int channelCount)
 {
     QVector<float> result = samples;
@@ -2029,6 +2031,18 @@ void AudioMixer::setAtempoFlags(const QVector<bool> &flags)
             << "enabled=" << enabledCount
             << "rearmedSeek=" << rearmed
             << "atempoEnvvar=" << audioAtempoEnvForceCached();
+}
+
+QVector<speedramp::SpeedRamp> AudioMixer::speedRampsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_speedRamps;
+}
+
+QVector<bool> AudioMixer::atempoFlagsForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_atempoFlags;
 }
 
 void AudioMixer::seekTo(int64_t timelineUs) {

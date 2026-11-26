@@ -233,6 +233,7 @@ double exporter_loudnessGainDb();
 #include "VoiceIsolationDialog.h"
 #include "NoisePrintDialog.h"
 #include "libavcore/AudioExtract.h"
+#include "AudioExportMix.h"
 #include "AudioMixer.h"
 #include "playback/AudioPan.h"
 #include "AudioTrackFx.h"
@@ -921,7 +922,9 @@ bool timelineAudioMatchesPassthrough(Timeline *timeline)
         && a.volumeEnvelope.isEmpty()
         && a.audioChannelMode == AudioChannelMode::Stereo
         && a.leadIn.type == TransitionType::None
-        && a.trailOut.type == TransitionType::None;
+        && a.trailOut.type == TransitionType::None
+        // A clip that follows its constant speed ramp exports resampled audio.
+        && audioexport::exportAudioRampFactor(a, a.reversed, a.speed, audioAtempoEnvForce()) == 1.0;
 }
 
 bool timelineNeedsAudioMixForExport(Timeline *timeline)

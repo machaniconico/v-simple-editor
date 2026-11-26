@@ -189,17 +189,28 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             TransitionType leadInType = TransitionType::None,
                                             double leadInDuration = 0.0,
                                             TransitionType trailOutType = TransitionType::None,
-                                            double trailOutDuration = 0.0);
+                                            double trailOutDuration = 0.0,
+                                            double rampFactor = 1.0,
+                                            double timelineLength = 0.0);
 
 // DSP boundary: PreFx ends at [prefxN], PostFx reads [N:a] and ends at [aN].
 // Gain, fades and timeline silence must only be applied after track DSP.
+// A forward entry with rampFactor f != 1 (audioexport::exportAudioRampFactor) and a
+// timelineLength T > 0 reads min(span, T * f) source seconds, resamples them by f with
+// the pitch (asetrate, as the preview mixer's resample) and is padded / cut to T.
 QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
     const QString &clipIn, const QString &clipOut, AudioChannelMode mode,
-    bool reversed = false, double speed = 1.0);
+    bool reversed = false, double speed = 1.0,
+    double rampFactor = 1.0, double timelineLength = 0.0);
+// The length the trail fade is placed against: (clipOut - clipIn) / speed, or with the
+// PreFx resample stage (rampFactor f != 1, T > 0) min(T, (clipOut - clipIn) / f).
+double exportAudioMixEntryClipDuration(double clipIn, double clipOut, double speed,
+    bool reversed = false, double rampFactor = 1.0, double timelineLength = 0.0);
 QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
     int delayMs, const QString &volumeExpression, double clipDuration,
     TransitionType leadInType = TransitionType::None, double leadInDuration = 0.0,
-    TransitionType trailOutType = TransitionType::None, double trailOutDuration = 0.0);
+    TransitionType trailOutType = TransitionType::None, double trailOutDuration = 0.0,
+    bool fixedPointFades = false);
 
 struct ClipInfo {
     QString filePath;

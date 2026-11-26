@@ -37,6 +37,25 @@
 // G5 (GL) the paused preview read back against renderFrameAt: (a) G1's times,
 //    (b) after the source is used up (export gated, preview recorded [B2]),
 //    (c1)-(c4) the borrowed origin.
+// US-2402 (export audio of a forward top-level clip that follows speed, the atempo flag
+// or VEDITOR_AUDIO_ATEMPO, with a constant non-identity ramp s: resampled by
+// f = entry.speed x s with the pitch, cut at the clip's timeline length):
+// G6 (no ffmpeg) the plan: (a) the stage in both callers for s x speed, (a2) the trail
+//    fade position, (b) unchanged chains pinned at the base exe, (c) the preview's
+//    (ramp, atempo) arrays and the plan's factors name the same clip, (d) passthrough,
+//    (e) the env force argument, (f) a borrowed entry's clipIn, (g) fixed-point stage
+//    lengths for a short entry, (h) a fixed-point trail-fade start near 0 in both callers.
+// G7 (ffmpeg) the rendered audio of a 440 Hz tone with a click every 0.5 s: click times
+//    against an atempo-off control leg on the same m4a path, the pitch, the cut, the
+//    trail fade, a lone untrimmed clip, (g) the track-FX path's reverb after the source
+//    is used up and the next clip, (g2) the timeline length of a lone track-FX ramp
+//    clip, (h) the (h) fade case of G6 exported on both paths, (i) a source shorter than
+//    the span on the track-FX path (no reverb over the padding), (e) the A/V offset of a
+//    video-only dissolve recorded; the preview mixer's clicks recorded beside them.
+// G8 a two-keyframe ramp: the base exe's chain and one warning (none with atempo off),
+//    also on a passthrough timeline.
+#include "../AudioExportMix.h"
+#include "../AudioMixer.h"
 #include "../GLPreview.h"
 #include "../BrushAnimation.h"
 #include "../Keyframe.h"
@@ -49,6 +68,7 @@
 #include "../TimeRemap.h"
 #include "../VideoEffect.h"
 #include "../VideoPlayer.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 #include "SelftestGl.h"
@@ -56,6 +76,8 @@
 #include <QApplication>
 #include <QCryptographicHash>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileInfo>
 #include <QFont>
 #include <QFontDatabase>
 
@@ -64,13 +86,18 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 #include <QImage>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTest>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <sstream>
@@ -122,17 +149,23 @@ bool writeBoxMovie(const QString &path, int rowBase)
 // libx264; the installed ffmpeg encoder supplies a stream with reorder delay.
 // Keep the generated boxes identical to writeBoxMovie and require real B-frames
 // in G2, so an encoder fallback cannot silently make the flush test vacuous.
-bool writeDelayedBoxMovie(const QString &path)
+// A non-empty audioWav is muxed in as the audio stream (pcm_s16le, US-2402 G7).
+bool writeDelayedBoxMovie(const QString &path, const QString &audioWav = QString())
 {
     const QString ffmpeg = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
     if (ffmpeg.isEmpty()) return false;
     QProcess encoder;
-    encoder.start(ffmpeg, {QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"),
+    encoder.start(ffmpeg, QStringList{QStringLiteral("-hide_banner"), QStringLiteral("-loglevel"),
         QStringLiteral("error"), QStringLiteral("-y"), QStringLiteral("-f"),
         QStringLiteral("rawvideo"), QStringLiteral("-pixel_format"), QStringLiteral("rgb24"),
         QStringLiteral("-video_size"), QStringLiteral("384x216"), QStringLiteral("-framerate"),
-        QStringLiteral("30"), QStringLiteral("-i"), QStringLiteral("pipe:0"),
-        QStringLiteral("-an"), QStringLiteral("-c:v"), QStringLiteral("libx264"),
+        QStringLiteral("30"), QStringLiteral("-i"), QStringLiteral("pipe:0")}
+        + (audioWav.isEmpty()
+               ? QStringList{QStringLiteral("-an")}
+               : QStringList{QStringLiteral("-i"), audioWav, QStringLiteral("-map"),
+                             QStringLiteral("0:v"), QStringLiteral("-map"), QStringLiteral("1:a"),
+                             QStringLiteral("-c:a"), QStringLiteral("pcm_s16le")})
+        + QStringList{QStringLiteral("-c:v"), QStringLiteral("libx264"),
         QStringLiteral("-bf"), QStringLiteral("3"), QStringLiteral("-g"), QStringLiteral("60"),
         QStringLiteral("-crf"), QStringLiteral("18"), QStringLiteral("-pix_fmt"),
         QStringLiteral("yuv420p"), path});
@@ -305,6 +338,47 @@ const std::map<std::string, std::string> kPins = {
     {"g4.speed20", "093cdbc917c194a2"},
     {"g4.speed21", "eaedaa7cde356991"},
     {"g4.speed22", "bba3945070e8d6a3"},
+    // US-2402 (G6 (b), G7 (c), G8): taken on the base exe HEAD f6b7ffd with the test-only
+    // accessors of US-2402-raw/head-shim.py (chains: sha16 of the UTF-8 filter text; pcm: of the floats).
+    {"g6.f2.atrimStart", "2.504167"},
+    {"g6.i.off.post", "5ef6e65003bbfe77"},
+    {"g6.i.off.single", "9e978c082cc3f3ec"},
+    {"g6.i.rev.post", "5ef6e65003bbfe77"},
+    {"g6.i.rev.single", "1d15f3d8b2e07455"},
+    {"g6.identity.post", "cd25d8af550f8efe"},
+    {"g6.identity.pre", "c35eb45542098172"},
+    {"g6.identity.single", "8b2365d2a3080fb0"},
+    {"g6.nestkid.post", "cd25d8af550f8efe"},
+    {"g6.nestkid.pre", "c35eb45542098172"},
+    {"g6.nestkid.single", "8b2365d2a3080fb0"},
+    {"g6.nestparent.post", "cd25d8af550f8efe"},
+    {"g6.nestparent.pre", "c35eb45542098172"},
+    {"g6.nestparent.single", "8b2365d2a3080fb0"},
+    {"g6.off15.post", "cd25d8af550f8efe"},
+    {"g6.off15.pre", "c35eb45542098172"},
+    {"g6.off15.single", "8b2365d2a3080fb0"},
+    {"g6.reversed.post", "cd25d8af550f8efe"},
+    {"g6.reversed.pre", "1aa2be76341a1ade"},
+    {"g6.reversed.single", "7d90a3d2b47c2051"},
+    {"g6.reversed15.post", "cd25d8af550f8efe"},
+    {"g6.reversed15.pre", "1aa2be76341a1ade"},
+    {"g6.reversed15.single", "7d90a3d2b47c2051"},
+    {"g6.speed2identity.post", "cd25d8af550f8efe"},
+    {"g6.speed2identity.pre", "c35eb45542098172"},
+    {"g6.speed2identity.single", "8b2365d2a3080fb0"},
+    {"g6.speed2off.post", "cd25d8af550f8efe"},
+    {"g6.speed2off.pre", "c35eb45542098172"},
+    {"g6.speed2off.single", "8b2365d2a3080fb0"},
+    {"g6.speed2on.post", "cd25d8af550f8efe"},
+    {"g6.speed2on.pre", "c35eb45542098172"},
+    {"g6.speed2on.single", "8b2365d2a3080fb0"},
+    {"g6.twokey.post", "cd25d8af550f8efe"},
+    {"g6.twokey.pre", "c35eb45542098172"},
+    {"g6.twokey.single", "8b2365d2a3080fb0"},
+    {"g7.c.pcm", "b03a490ca7b32916"},
+    {"g8.twokeyoff.post", "cd25d8af550f8efe"},
+    {"g8.twokeyoff.pre", "c35eb45542098172"},
+    {"g8.twokeyoff.single", "8b2365d2a3080fb0"},
 };
 
 bool pinned(const std::string &name, const std::string &value, std::ostringstream &d)
@@ -321,6 +395,149 @@ void pumpEvents(int ms)
     timer.start();
     while (timer.elapsed() < ms)
         QApplication::processEvents(QEventLoop::AllEvents, 5);
+}
+
+// ---- US-2402 audio fixtures and measures ----
+constexpr int kRate = 48000;
+constexpr double kTone = 0.2;   // 440 Hz steady tone
+constexpr double kClick = 0.7;  // 1 ms click every 0.5 s of the source (0.5, 1.0, ... 9.5)
+
+// 10 s, 48 kHz stereo s16: the tone plus the clicks.
+bool writeClickWav(const QString &path, int seconds = 10)
+{
+    const int frames = kRate * seconds;
+    QByteArray pcm(frames * 4, '\0');
+    auto *s = reinterpret_cast<qint16 *>(pcm.data());
+    for (int i = 0; i < frames; ++i) {
+        double v = kTone * std::sin(2.0 * 3.14159265358979323846 * 440.0 * i / kRate);
+        const int inHalf = i % (kRate / 2);
+        if (i >= kRate / 2 && inHalf < kRate / 1000)
+            v += kClick;
+        const qint16 q = qint16(std::lround(qBound(-1.0, v, 1.0) * 32767.0));
+        s[2 * i] = s[2 * i + 1] = q;
+    }
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly))
+        return false;
+    bool ok = true;
+    const auto put = [&](const char *data, qint64 size) { ok = f.write(data, size) == size && ok; };
+    const auto u32 = [&](quint32 v) { put(reinterpret_cast<const char *>(&v), 4); };
+    const auto u16 = [&](quint16 v) { put(reinterpret_cast<const char *>(&v), 2); };
+    put("RIFF", 4); u32(36 + pcm.size()); put("WAVEfmt ", 8);
+    u32(16); u16(1); u16(2); u32(kRate); u32(kRate * 4); u16(4); u16(16);
+    put("data", 4); u32(pcm.size()); put(pcm.constData(), pcm.size());
+    ok = f.flush() && ok;
+    f.close();
+    return ok && QFileInfo(path).size() == 44 + pcm.size();
+}
+
+// Mono float 48 kHz PCM of a file's first audio stream (empty on failure), through
+// libavcore::extractAudioToWav (s16 mono, (L + R) / 2). Scaled by sqrt(2) so the levels
+// match the L + R sum of ffmpeg's -ac 1 that the thresholds below were set on.
+std::vector<float> decodeMono(const QString &path)
+{
+    const QString tmp = path + QStringLiteral(".decoded.wav");
+    std::vector<double> mono;
+    int rate = 0;
+    const bool ok = libavcore::extractAudioToWav(path, tmp, kRate)
+        && libavcore::readPcm16WavToMono(tmp, mono, rate) && rate == kRate;
+    QFile::remove(tmp);
+    if (!ok)
+        return {};
+    std::vector<float> pcm(mono.size());
+    for (size_t i = 0; i < mono.size(); ++i)
+        pcm[i] = float(mono[i] * std::sqrt(2.0));
+    return pcm;
+}
+
+// Interleaved stereo s16 (the mixer probe) to mono float.
+std::vector<float> monoOfS16(const QByteArray &pcm)
+{
+    const auto *s = reinterpret_cast<const qint16 *>(pcm.constData());
+    std::vector<float> m(size_t(pcm.size()) / 4);
+    for (size_t i = 0; i < m.size(); ++i)
+        m[i] = float((s[2 * i] + s[2 * i + 1]) / 65534.0);
+    return m;
+}
+
+// Click onsets (|x| above the tone, 60 ms refractory) in seconds.
+std::vector<double> clicksOf(const std::vector<float> &pcm)
+{
+    std::vector<double> t;
+    for (size_t i = 0; i < pcm.size(); ++i) {
+        if (std::abs(pcm[i]) > 0.45f) {
+            t.push_back(double(i) / kRate);
+            i += kRate * 60 / 1000;
+        }
+    }
+    return t;
+}
+
+double rmsOf(const std::vector<float> &pcm, double t0, double t1)
+{
+    const size_t a = size_t(qMax(0.0, t0) * kRate), b = qMin(pcm.size(), size_t(qMax(0.0, t1) * kRate));
+    double sum = 0.0;
+    for (size_t i = a; i < b; ++i)
+        sum += double(pcm[i]) * pcm[i];
+    return b > a ? std::sqrt(sum / double(b - a)) : 0.0;
+}
+
+// Tone frequency from interpolated rising zero crossings in [t0, t1) (0 when none).
+double toneHz(const std::vector<float> &pcm, double t0, double t1)
+{
+    const size_t a = size_t(qMax(0.0, t0) * kRate), b = qMin(pcm.size(), size_t(qMax(0.0, t1) * kRate));
+    double first = -1.0, last = -1.0;
+    int n = 0;
+    for (size_t i = a + 1; i < b; ++i) {
+        if (pcm[i - 1] < 0.0f && pcm[i] >= 0.0f) {
+            const double x = double(i - 1) + pcm[i - 1] / double(pcm[i - 1] - pcm[i]);
+            if (first < 0.0) first = x;
+            last = x;
+            ++n;
+        }
+    }
+    return n > 1 ? (n - 1) * double(kRate) / (last - first) : 0.0;
+}
+
+// The source clicks inside (in, in + used) at timeline start + (m - in) / f + c.
+std::vector<double> expectedClicks(double in, double used, double f, double start, double c)
+{
+    std::vector<double> t;
+    for (int k = 1; k < 20; ++k) {
+        const double m = 0.5 * k;
+        if (m > in + 0.005 && m < in + used - 0.005)
+            t.push_back(start + (m - in) / f + c);
+    }
+    return t;
+}
+
+bool clicksMatch(const std::vector<double> &got, const std::vector<double> &want, double tol,
+                 std::ostringstream &d)
+{
+    bool ok = got.size() == want.size();
+    double worst = 0.0;
+    for (size_t i = 0; i < got.size() && i < want.size(); ++i)
+        worst = std::max(worst, std::abs(got[i] - want[i]));
+    ok = ok && worst <= tol;
+    d << " clicks=" << got.size() << "/expect=" << want.size() << " worst_ms=" << worst * 1000.0
+      << " first=" << (got.empty() ? -1.0 : got.front()) << " expect_first="
+      << (want.empty() ? -1.0 : want.front()) << (ok ? "" : " [clicks mismatch]");
+    return ok;
+}
+
+std::string sha16Of(const QByteArray &bytes)
+{
+    return QCryptographicHash::hash(bytes, QCryptographicHash::Sha256).toHex().left(16).toStdString();
+}
+
+std::atomic<int> g_rampWarnings{0};
+QtMessageHandler g_previousRampHandler = nullptr;
+void captureRampWarning(QtMsgType type, const QMessageLogContext &context, const QString &message)
+{
+    if (type == QtWarningMsg && message.contains(QStringLiteral("speed ramp of a clip that follows speed is not constant")))
+        ++g_rampWarnings;
+    if (g_previousRampHandler)
+        g_previousRampHandler(type, context, message);
 }
 
 } // namespace
@@ -360,7 +577,7 @@ int runRampExportSelftest()
     };
 
     if (!mediaOk) {
-        for (int g = 1; g <= 5; ++g)
+        for (int g = 1; g <= 8; ++g)
             tally.gate(g, false, "fixture media failed");
         return tally.finish("ramp-export");
     }
@@ -1058,6 +1275,820 @@ int runRampExportSelftest()
             d << " | legs: a=" << aOk << " b=" << bOk << " c1=" << c1Ok << " c2=" << c2Ok << " c3=" << c3Ok;
             tally.gate(5, aOk && bOk && c1Ok && c2Ok && c3Ok, d.str());
         }
+    }
+    // ==== US-2402: export audio of a clip that follows its constant speed ramp ====
+    const QString wav = dir.filePath(QStringLiteral("ramp-click.wav"));
+    const bool wavOk = writeClickWav(wav);
+    const auto loadAV = [&](const QVector<QVector<ClipInfo>> &v, const QVector<QVector<ClipInfo>> &a) {
+        timeline->setRotoEntries({});
+        timeline->restoreFromProject(v, a, 0.0, -1.0, -1.0, 100);
+    };
+    // An audio clip: `length` source seconds from `in`; s > 0 sets the ramp {0, s}.
+    const auto audioClip = [&](const QString &path, double in, double length, double s, bool atempo) {
+        ClipInfo c;
+        c.filePath = path;
+        c.displayName = QStringLiteral("ramp-audio");
+        c.duration = 10.0;
+        c.inPoint = in;
+        c.outPoint = in + length;
+        if (s > 0.0)
+            c.speedRamp = ramp(s);
+        c.atempoEnabled = atempo;
+        return c;
+    };
+    const auto planNow = [&]() {
+        return audioexport::buildMixPlan(timeline, nullptr, audioexport::MixOptions{});
+    };
+    // The plan index of A1 clip `clipIdx` (-1 when none).
+    const auto planIndex = [](const audioexport::MixPlan &plan, int clipIdx) {
+        for (int i = 0; i < plan.entries.size(); ++i)
+            if (plan.entries[i].sourceTrack == 0 && plan.entries[i].sourceClipIndex == clipIdx)
+                return i;
+        return -1;
+    };
+    const auto num = [](double v) { return QString::number(v, 'g', 15); };
+    const auto chainsOf = [](const audioexport::MixPlan &plan, int i) {
+        return QStringList{audioexport::singleChainForTest(plan, i),
+                           audioexport::trackFxPreChainForTest(plan, i),
+                           audioexport::trackFxPostChainForTest(plan, i)};
+    };
+    // The content (2) stage after an atrim of [in, end): resample by f, pad / cut at T.
+    const auto stageText = [&](double in, double end, double f, double length) {
+        return QStringLiteral("atrim=start=%1:end=%2,asetpts=PTS-STARTPTS,aresample=48000,asetrate=%3,"
+                              "aresample=48000,asetpts=PTS-STARTPTS,apad=whole_dur=%4,atrim=end=%4,aformat=")
+            .arg(audioexport::ffmpegNumber(in), audioexport::ffmpegNumber(end)).arg(qRound64(48000.0 * f))
+            .arg(audioexport::ffmpegNumber(length));
+    };
+    // A V1 clip on another file: with V1 empty the export has no picture and
+    // timelineAudioMatchesPassthrough answers passthrough before any audio rule.
+    const QVector<QVector<ClipInfo>> v1Other = {{movClip(movA, 0.0, 4.0)}};
+
+    // ---- G6 (plan, no ffmpeg) ----
+    {
+        std::ostringstream d;
+        bool ok = wavOk;
+        // (a) atempo on, s x entry.speed: both callers carry the stage, the factor is v * s.
+        bool aOk = true;
+        for (double v : {1.0, 2.0}) {
+            for (double s : {0.5, 1.5, 2.0}) {
+                ClipInfo a = audioClip(wav, 0.5, 4.0, s, true);
+                a.speed = v;
+                loadAV(v1Other, {{a}});
+                const audioexport::MixPlan plan = planNow();
+                const int i = planIndex(plan, 0);
+                const double f = v * s;
+                const double length = 4.0 / v;
+                const double factor = i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0;
+                const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+                bool legOk = i >= 0 && chains.size() == 3 && !plan.passthrough;
+                if (std::abs(f - 1.0) <= 1e-9) {
+                    // v 2 x s 0.5: f = 1, no stage (content (1)).
+                    legOk = legOk && factor == 1.0 && !chains.join(QString()).contains(QStringLiteral("asetrate"));
+                } else {
+                    const QString stage = stageText(0.5, 0.5 + qMin(4.0, length * f), f, length);
+                    legOk = legOk && std::abs(factor - f) <= 1e-12 && chains[0].contains(stage)
+                        && chains[1].contains(stage);
+                }
+                legOk = legOk && !chains.join(QString()).contains(QStringLiteral("atempo"));
+                d << " (a)v" << v << "s" << s << ":f=" << factor << (legOk ? "" : " [FAIL]");
+                if (!legOk)
+                    d << " entries=" << plan.entries.size() << " passthrough=" << plan.passthrough;
+                if (!legOk && i >= 0)
+                    d << " single=" << chains[0].toStdString() << " pre=" << chains[1].toStdString();
+                aOk = aOk && legOk;
+            }
+        }
+        // The factor is clamp(entry.speed x s, 0.1, 10), as the mixer's speedMul: the product
+        // reaches both ends (setClipSpeed up to 4, the ramp dialog up to 5).
+        {
+            const double high = audioexport::exportAudioRampFactor(audioClip(wav, 0.5, 4.0, 5.0, true),
+                                                                   false, 4.0, false);
+            const double low = audioexport::exportAudioRampFactor(audioClip(wav, 0.5, 4.0, 0.25, true),
+                                                                  false, 0.25, false);
+            const bool clampOk = std::abs(high - 10.0) <= 1e-12 && std::abs(low - 0.1) <= 1e-12;
+            d << " (a)clamp:v4s5=" << high << " v0.25s0.25=" << low << (clampOk ? "" : " [FAIL]");
+            aOk = aOk && clampOk;
+        }
+        // (a2) the trail fade: s 0.5 -> T - 1, s 1.5 -> span / 1.5 - 1; the lead fade unchanged.
+        bool a2Ok = true;
+        for (double s : {0.5, 1.5}) {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, s, true);
+            a.leadIn.type = TransitionType::FadeIn;
+            a.leadIn.duration = 0.5;
+            a.trailOut.type = TransitionType::CrossDissolve;
+            a.trailOut.duration = 1.0;
+            loadAV(v1Other, {{a}});
+            const audioexport::MixPlan plan = planNow();
+            const int i = planIndex(plan, 0);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+            const QString trail = QStringLiteral("afade=t=out:curve=qsin:st=%1:d=1")
+                                      .arg(num((s < 1.0 ? 4.0 : 4.0 / 1.5) - 1.0));
+            const QString lead = QStringLiteral("afade=t=in:curve=qsin:d=0.5,afade=t=out");
+            const bool legOk = chains.size() == 3 && chains[0].contains(trail) && chains[2].contains(trail)
+                && chains[0].contains(lead) && chains[2].contains(lead);
+            d << " (a2)s" << s << ":" << (legOk ? "ok" : "[FAIL]");
+            if (chains.size() == 3)
+                d << " post=" << chains[2].toStdString();
+            a2Ok = a2Ok && legOk;
+        }
+        // (b) pins: the base exe's chains (single, track-FX PreFx, PostFx).
+        bool bOk = true;
+        const auto pinChains = [&](const std::string &name, int clipIdx) {
+            const audioexport::MixPlan plan = planNow();
+            const int i = planIndex(plan, clipIdx);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{QString(), QString(), QString()};
+            const double factor = i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0;
+            bool pinOk = factor == 1.0;
+            pinOk = pinned(name + ".single", sha16Of(chains[0].toUtf8()), d) && pinOk;
+            pinOk = pinned(name + ".pre", sha16Of(chains[1].toUtf8()), d) && pinOk;
+            pinOk = pinned(name + ".post", sha16Of(chains[2].toUtf8()), d) && pinOk;
+            if (!pinOk)
+                d << " f=" << factor << " single=" << chains[0].toStdString();
+            return pinOk;
+        };
+        const auto lonePin = [&](const std::string &name, ClipInfo a) {
+            loadAV(v1Other, {{a}});
+            return pinChains(name, 0);
+        };
+        bOk = lonePin("g6.off15", audioClip(wav, 0.5, 4.0, 1.5, false)) && bOk;
+        bOk = lonePin("g6.identity", audioClip(wav, 0.5, 4.0, 1.0, true)) && bOk;
+        {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, true);
+            a.reversed = true;
+            bOk = lonePin("g6.reversed", a) && bOk;
+            a.speedRamp = ramp(1.5);
+            bOk = lonePin("g6.reversed15", a) && bOk;
+        }
+        for (bool atempo : {false, true}) {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, atempo);
+            a.speed = 2.0;
+            bOk = lonePin(atempo ? "g6.speed2on" : "g6.speed2off", a) && bOk;
+        }
+        {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 1.0, true);
+            a.speed = 2.0;
+            bOk = lonePin("g6.speed2identity", a) && bOk;
+        }
+        {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, true);
+            a.speedRamp.keyframes = {{0, 1.0}, {1000000, 2.0}};
+            bOk = lonePin("g6.twokey", a) && bOk;
+        }
+        // The nested pins: a flattened entry names its parent reference clip.
+        const auto nestedAudio = [&](const ClipInfo &kid, const speedramp::SpeedRamp &parentRamp) {
+            timeline->setRotoEntries({});
+            TimelineSequence kids;
+            kids.id = QStringLiteral("ramp-audio-kids");
+            kids.name = kids.id;
+            kids.audioTracks = {{kid}};
+            ClipInfo parent;
+            parent.sequenceRefId = kids.id;
+            parent.filePath = timeline_nesting::sequenceClipFilePath(kids.id);
+            parent.duration = parent.outPoint = 4.0;
+            parent.speedRamp = parentRamp;
+            parent.atempoEnabled = true;
+            TimelineSequence main;
+            main.id = QStringLiteral("ramp-audio-main");
+            main.name = main.id;
+            main.videoTracks = v1Other;
+            main.audioTracks = {{parent}};
+            timeline->setSequences(QVector<TimelineSequence>{main, kids}, main.id);
+            timeline->refreshPlaybackSequence();
+        };
+        nestedAudio(audioClip(wav, 0.5, 4.0, 0.0, false), ramp(1.5));
+        {
+            const audioexport::MixPlan plan = planNow();
+            d << " nested1.entries=" << plan.entries.size();
+            bOk = plan.entries.size() == 1 && pinChains("g6.nestparent", 0) && bOk;
+        }
+        nestedAudio(audioClip(wav, 0.5, 4.0, 1.5, true), speedramp::SpeedRamp::identity());
+        {
+            const audioexport::MixPlan plan = planNow();
+            d << " nested2.entries=" << plan.entries.size();
+            bOk = plan.entries.size() == 1 && pinChains("g6.nestkid", 0) && bOk;
+        }
+        // (c) the preview's (ramp, atempo) arrays and the plan's factors name the same A1 clip.
+        bool cOk = false;
+        {
+            ClipInfo first = audioClip(wav, 0.5, 2.0, 0.0, false);
+            ClipInfo second = audioClip(wav, 3.0, 3.0, 1.5, true);
+            loadAV(v1Other, {{first, second}});
+            timeline->refreshPlaybackSequence();
+            pumpEvents(300); // past the 50 ms emitSequenceChanged debounce
+            AudioMixer *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+            const QVector<PlaybackEntry> seq = timeline->computeAudioPlaybackSequence();
+            const QVector<speedramp::SpeedRamp> ramps = mixer ? mixer->speedRampsForTest() : QVector<speedramp::SpeedRamp>{};
+            const QVector<bool> flags = mixer ? mixer->atempoFlagsForTest() : QVector<bool>{};
+            const audioexport::MixPlan plan = planNow();
+            cOk = mixer && seq.size() == 2 && ramps.size() == 2 && flags.size() == 2 && plan.entries.size() == 2;
+            for (int e = 0; cOk && e < seq.size(); ++e) {
+                const int i = planIndex(plan, seq[e].sourceClipIndex);
+                const bool ramped = !ramps[e].isIdentity();
+                const double factor = i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0;
+                d << " (c)entry" << e << ":clip=" << seq[e].sourceClipIndex << " previewRamp=" << ramped
+                  << " previewAtempo=" << flags[e] << " planFactor=" << factor;
+                cOk = i >= 0 && ramped == (seq[e].sourceClipIndex == 1) && flags[e] == ramped
+                    && (ramped ? std::abs(factor - 1.5) <= 1e-12 : factor == 1.0);
+            }
+            if (!cOk)
+                d << " (c) [FAIL] mixer=" << (mixer != nullptr) << " seq=" << seq.size() << " ramps=" << ramps.size();
+        }
+        // (d) passthrough: a lone untrimmed clip on V1's file.
+        bool dOk = true;
+        for (int form = 0; form < 3; ++form) {
+            ClipInfo v = movClip(movA, 0.0, 10.0);
+            ClipInfo a = audioClip(movA, 0.0, 10.0, form == 1 ? 1.0 : 1.5, form != 2);
+            loadAV({{v}}, {{a}});
+            const bool passthrough = planNow().passthrough;
+            const bool want = form != 0; // 0: atempo on + {0, 1.5}; 1: identity; 2: atempo off
+            d << " (d)" << (form == 0 ? "on15" : form == 1 ? "identity" : "off15") << ":passthrough="
+              << passthrough << (passthrough == want ? "" : " [FAIL]");
+            dOk = dOk && passthrough == want;
+        }
+        // (e) env force through the factor function's argument.
+        bool eOk = false;
+        {
+            const ClipInfo a = audioClip(wav, 0.5, 4.0, 1.5, false);
+            const double on = audioexport::exportAudioRampFactor(a, false, 1.0, true);
+            const double off = audioexport::exportAudioRampFactor(a, false, 1.0, false);
+            const QString chainOn = buildExportAudioMixEntryFilterChain(0, QStringLiteral("0.5"),
+                QStringLiteral("4.5"), 0, QStringLiteral("1"), AudioChannelMode::Stereo, false, 1.0,
+                TransitionType::None, 0.0, TransitionType::None, 0.0, on, 4.0);
+            const QString chainOff = buildExportAudioMixEntryFilterChain(0, QStringLiteral("0.5"),
+                QStringLiteral("4.5"), 0, QStringLiteral("1"), AudioChannelMode::Stereo, false, 1.0,
+                TransitionType::None, 0.0, TransitionType::None, 0.0, off, 4.0);
+            const QString head = buildExportAudioMixEntryFilterChain(0, QStringLiteral("0.5"),
+                QStringLiteral("4.5"), 0, QStringLiteral("1"), AudioChannelMode::Stereo);
+            // Inside one binary this only shows the f = 1 call equals the default-argument
+            // call; byte-identity with the base exe comes from the audio-fixture comparison
+            // (rule (11)(b)) and the base exe's pinned chain constants in (b).
+            eOk = std::abs(on - 1.5) <= 1e-12 && off == 1.0 && chainOn.contains(QStringLiteral("asetrate=72000"))
+                && chainOff == head;
+            d << " (e)envOn=" << on << " envOff=" << off << " offChainEqualsDefaultArgs=" << (chainOff == head)
+              << (eOk ? "" : " [FAIL]");
+        }
+        // (f) A | B, 1 s CrossDissolve (Center), B atempo on + {0, 1.5}: B's entry borrowed
+        // 0.5 s (clipIn 3.0 - 0.5, start 3.5 - 0.5, end 7.5): closed form 2.5 / 7 / 72000 / 4.5,
+        // plus an off-grid fixture (rule 132) with B's inPoint shifted by kOff = 1/240 s:
+        // clipIn = 601/240 (2.504167), start = 3.0, end = 7.5, atrim end = 1681/240 (7.004167),
+        // length = 4.5 (4.500000), asetrate = 72000.
+        bool fOk = false;
+        {
+            ClipInfo a = audioClip(wav, 2.0, 3.5, 0.0, false);
+            ClipInfo b = audioClip(wav, 3.0, 4.0, 1.5, true);
+            dissolve(a, b, TransitionAlignment::Center);
+            loadAV(v1Other, {{a, b}});
+            const audioexport::MixPlan plan = planNow();
+            const int i = planIndex(plan, 1);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+            const QString stage = stageText(2.5, 7.0, 1.5, 4.5);
+            bool f1Ok = i >= 0 && std::abs(plan.rampFactors.value(i, 1.0) - 1.5) <= 1e-12 && chains[0].contains(stage)
+                && chains[1].contains(stage);
+            d << " (f)";
+            if (i >= 0)
+                d << "clipIn=" << plan.entries[i].clipIn << " start=" << plan.entries[i].timelineStart
+                  << " end=" << plan.entries[i].timelineEnd << " f=" << plan.rampFactors.value(i, 1.0)
+                  << " atrimStart2.5=" << chains[0].contains(QStringLiteral("atrim=start=2.500000:"));
+            if (!f1Ok)
+                d << " [FAIL] single=" << (i >= 0 ? chains[0].toStdString() : std::string("none"));
+
+            // Off-grid borrowed handle: B inPoint = 3.0 + 1/240 = 721/240.
+            // Hand-computed closed-form literals: clipIn = 601/240, start = 3.0, end = 7.5,
+            // length = 4.5, span = 4.5, min(span, length * 1.5) = 4.5, atrim end = 1681/240.
+            ClipInfo a2 = audioClip(wav, 2.0, 3.5, 0.0, false);
+            ClipInfo b2 = audioClip(wav, 3.0 + kOff, 4.0, 1.5, true);
+            dissolve(a2, b2, TransitionAlignment::Center);
+            loadAV(v1Other, {{a2, b2}});
+            const audioexport::MixPlan plan2 = planNow();
+            const int i2 = planIndex(plan2, 1);
+            const QStringList chains2 = i2 >= 0 ? chainsOf(plan2, i2) : QStringList{};
+            const QString stageOff = QStringLiteral(
+                "atrim=start=2.504167:end=7.004167,asetpts=PTS-STARTPTS,aresample=48000,"
+                "asetrate=72000,aresample=48000,asetpts=PTS-STARTPTS,"
+                "apad=whole_dur=4.500000,atrim=end=4.500000,aformat=");
+            const QRegularExpression startRe(QStringLiteral("atrim=start=([^:]+):"));
+            const QRegularExpressionMatch startM = chains2.size() == 3 ? startRe.match(chains2[0]) : QRegularExpressionMatch();
+            const std::string gotStart = startM.hasMatch() ? startM.captured(1).toStdString() : std::string();
+            const bool startPinned = pinned("g6.f2.atrimStart", gotStart, d);
+            const bool f2Ok = i2 >= 0
+                && std::abs(plan2.entries[i2].clipIn - 601.0 / 240.0) <= 1e-12
+                && std::abs(plan2.entries[i2].timelineStart - 3.0) <= 1e-12
+                && std::abs(plan2.entries[i2].timelineEnd - 7.5) <= 1e-12
+                && std::abs(plan2.rampFactors.value(i2, 1.0) - 1.5) <= 1e-12
+                && chains2.size() == 3 && chains2[0].contains(stageOff) && chains2[1].contains(stageOff)
+                && startPinned;
+            d << " (f2)";
+            if (i2 >= 0)
+                d << "clipIn=" << plan2.entries[i2].clipIn << " start=" << plan2.entries[i2].timelineStart
+                  << " end=" << plan2.entries[i2].timelineEnd << " f=" << plan2.rampFactors.value(i2, 1.0);
+            if (!f2Ok)
+                d << " [FAIL] single=" << (i2 >= 0 ? chains2[0].toStdString() : std::string("none"));
+            fOk = f1Ok && f2Ok;
+        }
+        // (g) a short ramped entry (clipIn 0, T 0.00008, f 0.5): the stage's atrim / apad
+        // lengths are fixed-point (FFmpeg's duration parser rejects an exponent like 4e-05).
+        bool gOk = false;
+        {
+            const QString chain = buildExportAudioMixEntryPreFxFilterChain(0, QStringLiteral("0"),
+                QStringLiteral("4"), AudioChannelMode::Stereo, false, 1.0, 0.5, 0.00008);
+            const bool exponent = chain.contains(QRegularExpression(QStringLiteral("[0-9.][eE][-+]?[0-9]")));
+            gOk = !exponent && chain.contains(QStringLiteral("atrim=start=0:end=0.000040,"))
+                && chain.contains(QStringLiteral("apad=whole_dur=0.000080,atrim=end=0.000080,"));
+            d << " (g)exponent=" << exponent << (gOk ? "" : " [FAIL] chain=" + chain.toStdString());
+        }
+        // (h) span 3.000015, f 1.5, a 2 s CrossDissolve trail: the fade starts at
+        // 3.000015 / 1.5 - 2 = 1e-5, printed fixed-point in both callers ('g' gives 1e-05).
+        bool hOk = false;
+        {
+            ClipInfo a = audioClip(wav, 0.5, 3.000015, 1.5, true);
+            a.trailOut.type = TransitionType::CrossDissolve;
+            a.trailOut.duration = 2.0;
+            loadAV(v1Other, {{a}});
+            const audioexport::MixPlan plan = planNow();
+            const int i = planIndex(plan, 0);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+            const QRegularExpression stRe(QStringLiteral("afade=t=out:curve=qsin:st=([^:]+):"));
+            hOk = chains.size() == 3 && std::abs(plan.rampFactors.value(i, 1.0) - 1.5) <= 1e-12;
+            for (int c : {0, 2}) {
+                const QRegularExpressionMatch m = chains.size() == 3 ? stRe.match(chains[c]) : QRegularExpressionMatch();
+                const QString st = m.hasMatch() ? m.captured(1) : QString();
+                bool parsed = false;
+                const double v = st.toDouble(&parsed);
+                const bool stOk = m.hasMatch() && !st.contains(QLatin1Char('e')) && !st.contains(QLatin1Char('E'))
+                    && parsed && std::abs(v - 1e-5) <= 1e-9;
+                d << " (h)" << (c == 0 ? "single" : "post") << ".st=" << st.toStdString() << (stOk ? "" : " [FAIL]");
+                if (!stOk && chains.size() == 3)
+                    d << " chain=" << chains[c].toStdString();
+                hOk = hOk && stOk;
+            }
+        }
+        // (i) non-ramped near-zero fade start (atempo off + reversed, span 3.000015, 3.0 s FadeOut):
+        // must remain byte-identical to HEAD ('g',15 exponent preserved), not fixed-point.
+        bool iOk = true;
+        {
+            const QRegularExpression stRe(QStringLiteral("afade=t=out:curve=qsin:st=([^:]+):"));
+            for (const bool rev : {false, true}) {
+                ClipInfo a = audioClip(wav, 0.5, 3.000015, 1.5, rev);
+                a.reversed = rev;
+                a.trailOut.type = TransitionType::FadeOut;
+                a.trailOut.duration = 3.0;
+                loadAV(v1Other, {{a}});
+                const audioexport::MixPlan plan = planNow();
+                const int i = planIndex(plan, 0);
+                const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+                const std::string tag = rev ? "g6.i.rev" : "g6.i.off";
+                bool legOk = chains.size() == 3 && plan.rampFactors.value(i, 1.0) == 1.0;
+                legOk = pinned(tag + ".single", chains.size() == 3 ? sha16Of(chains[0].toUtf8()) : std::string(), d) && legOk;
+                legOk = pinned(tag + ".post", chains.size() == 3 ? sha16Of(chains[2].toUtf8()) : std::string(), d) && legOk;
+                for (int c : {0, 2}) {
+                    const QRegularExpressionMatch m = chains.size() == 3 ? stRe.match(chains[c]) : QRegularExpressionMatch();
+                    const QString st = m.hasMatch() ? m.captured(1) : QString();
+                    const bool expOk = m.hasMatch() && (st.contains(QLatin1Char('e')) || st.contains(QLatin1Char('E')));
+                    d << " (i)" << (rev ? "rev" : "off") << (c == 0 ? ".single.st=" : ".post.st=")
+                      << st.toStdString() << (expOk ? "" : " [FAIL]");
+                    legOk = legOk && expOk;
+                }
+                iOk = iOk && legOk;
+            }
+        }
+        ok = ok && aOk && a2Ok && bOk && cOk && dOk && eOk && fOk && gOk && hOk && iOk;
+        d << " legs: a=" << aOk << " a2=" << a2Ok << " b=" << bOk << " c=" << cOk << " d=" << dOk
+          << " e=" << eOk << " f=" << fOk << " g=" << gOk << " h=" << hOk << " i=" << iOk;
+        tally.gate(6, ok, d.str());
+    }
+
+    // ---- G7 (ffmpeg): the rendered clicks, pitch, cut and fade ----
+    const QString ffmpeg = audioexport::findFfmpegBinary();
+    // One file with the box video and the click audio, so a lone untrimmed clip can be
+    // passthrough on HEAD (the audio file must be V1's file).
+    const QString media = dir.filePath(QStringLiteral("ramp-av.mov"));
+    const bool muxOk = !ffmpeg.isEmpty() && wavOk && writeDelayedBoxMovie(media, wav);
+    if (ffmpeg.isEmpty()) {
+        tally.skip(7, "ffmpeg not found (G7 renders the export audio)");
+    } else if (!wavOk || !muxOk) {
+        tally.gate(7, false, std::string("fixture creation failed: click wav=") + (wavOk ? "1" : "0")
+                                 + " ramp-av.mov=" + (muxOk ? "1" : "0"));
+    } else {
+        std::ostringstream d;
+        // The export audio of the loaded timeline: the source when passthrough, else the mix.
+        bool lastPassthrough = false;
+        const auto exportAudio = [&]() -> std::vector<float> {
+            const audioexport::MixPlan plan = planNow();
+            lastPassthrough = plan.passthrough;
+            if (plan.passthrough)
+                return decodeMono(media);
+            QString error;
+            const QString out = audioexport::executeMixPlan(plan, [] { return false; }, &error);
+            if (out.isEmpty()) {
+                d << " [mix failed: " << error.toStdString() << ']';
+                return {};
+            }
+            std::vector<float> pcm = decodeMono(out);
+            QFile::remove(out);
+            return pcm;
+        };
+        const double in = 0.25 + kOff;
+        const auto vClip = [&](double vin, double length, double s) {
+            ClipInfo v = movClip(media, vin, length);
+            if (s > 0.0)
+                v.speedRamp = ramp(s);
+            return v;
+        };
+        // (c) control: atempo off + {0, 1.5} -> 1x (pin); c = its first click's delay.
+        loadAV({{vClip(in, 4.0, 1.5)}}, {{audioClip(media, in, 4.0, 1.5, false)}});
+        const std::vector<float> pcmC = exportAudio();
+        const std::vector<double> clicksC = clicksOf(pcmC);
+        const double c = clicksC.empty() ? 0.0 : clicksC.front() - (0.5 - in);
+        bool cOk = !pcmC.empty() && !lastPassthrough && c > -0.005 && c < 0.06;
+        d << " (c)c_ms=" << c * 1000.0 << " passthrough=" << lastPassthrough;
+        cOk = clicksMatch(clicksC, expectedClicks(in, 4.0, 1.0, 0.0, c), 0.010, d) && cOk;
+        const double hzC = toneHz(pcmC, 0.5 - in + c + 0.03, 1.0 - in + c - 0.03);
+        d << " hz=" << hzC;
+        cOk = cOk && std::abs(hzC - 440.0) <= 440.0 * 0.03;
+        cOk = pinned("g7.c.pcm", sha16Of(QByteArray(reinterpret_cast<const char *>(pcmC.data()),
+                                                    int(pcmC.size() * sizeof(float)))), d) && cOk;
+        // (a) atempo on + {0, 1.5}: clicks at m / 1.5 + c, 660 Hz, the video frame, silence after.
+        bool aOk = false;
+        {
+            loadAV({{vClip(in, 4.0, 1.5)}}, {{audioClip(media, in, 4.0, 1.5, true)}});
+            const std::vector<float> pcm = exportAudio();
+            const std::vector<double> got = clicksOf(pcm);
+            const std::vector<double> want = expectedClicks(in, 4.0, 1.5, 0.0, c);
+            d << " (a)";
+            aOk = !pcm.empty() && clicksMatch(got, want, 0.010, d);
+            const double hz = want.size() > 1 ? toneHz(pcm, want[0] + 0.03, want[1] - 0.03) : 0.0;
+            // rmsOf is 0 past the PCM's end: the silence window must be covered.
+            const bool covered = pcm.size() >= size_t((4.0 - 0.03) * kRate);
+            const double silence = rmsOf(pcm, 4.0 / 1.5 + 0.03, 4.0 - 0.03);
+            d << " hz=" << hz << " pcm_s=" << double(pcm.size()) / kRate << (covered ? "" : " [short pcm]")
+              << " silence_rms=" << silence << " frames:";
+            aOk = aOk && std::abs(hz - 660.0) <= 660.0 * 0.03 && covered && silence < 0.005;
+            bool framesOk = got.size() == want.size();
+            for (size_t k = 0; framesOk && k < got.size(); ++k) {
+                const double m = in + (want[k] - c) * 1.5; // the click's source second
+                const int box = boxOf(render(got[k] - c), kRowsA);
+                d << ' ' << box << '/' << frameAt(m);
+                framesOk = std::abs(box - frameAt(m)) <= 1;
+            }
+            aOk = aOk && framesOk;
+        }
+        // (b) atempo on + {0, 0.5} followed by a plain clip at 4 s: clicks at m / 0.5 + c,
+        // 220 Hz, cut at 4 s (no click of the ramped clip after it), the next clip's clicks
+        // measured and gated separately from the ramped clip's clicks.
+        bool bOk = false;
+        {
+            const double in2 = 5.35;
+            loadAV({{vClip(in, 4.0, 0.5), vClip(in2, 2.0, 0.0)}},
+                   {{audioClip(media, in, 4.0, 0.5, true), audioClip(media, in2, 2.0, 0.0, false)}});
+            const std::vector<float> pcm = exportAudio();
+            const std::vector<double> mine = expectedClicks(in, 2.0, 0.5, 0.0, c);
+            const std::vector<double> next = expectedClicks(in2, 2.0, 1.0, 4.0, c);
+            const std::vector<double> allGot = clicksOf(pcm);
+            std::vector<double> gotOwn, gotNext;
+            for (double t : allGot) {
+                if (t >= 4.0 - 0.005)
+                    gotNext.push_back(t);
+                else
+                    gotOwn.push_back(t);
+            }
+            d << " (b)own:";
+            const bool ownOk = clicksMatch(gotOwn, mine, 0.010, d);
+            d << " next_measured=";
+            for (size_t k = 0; k < gotNext.size(); ++k)
+                d << (k ? "," : "") << gotNext[k];
+            double nextMaxDev = 0.0;
+            for (size_t k = 0; k < gotNext.size() && k < next.size(); ++k)
+                nextMaxDev = std::max(nextMaxDev, std::abs(gotNext[k] - next[k]));
+            d << " next_max_dev_ms=" << nextMaxDev * 1000.0 << " next:";
+            const bool nextOk = clicksMatch(gotNext, next, 0.010, d);
+            const double hz = mine.size() > 1 ? toneHz(pcm, mine[0] + 0.03, mine[1] - 0.03) : 0.0;
+            d << " hz=" << hz;
+            bOk = !pcm.empty() && ownOk && nextOk && std::abs(hz - 220.0) <= 220.0 * 0.03;
+        }
+        // (b2) (b)'s clip alone with a 1 s trail fade: the tone falls over its last second.
+        bool b2Ok = false;
+        {
+            ClipInfo a = audioClip(media, in, 4.0, 0.5, true);
+            a.trailOut.type = TransitionType::FadeOut;
+            a.trailOut.duration = 1.0;
+            loadAV({{vClip(in, 4.0, 0.5)}}, {{a}});
+            const std::vector<float> pcm = exportAudio();
+            const std::vector<double> clicks = expectedClicks(in, 2.0, 0.5, 0.0, c);
+            // RMS of [t0, t1) leaving out 20 ms around each click.
+            const auto toneRms = [&](double t0, double t1) {
+                std::vector<float> part;
+                for (size_t i = size_t(t0 * kRate); i < size_t(t1 * kRate) && i < pcm.size(); ++i) {
+                    const double t = double(i) / kRate;
+                    bool nearClick = false;
+                    for (double k : clicks)
+                        nearClick = nearClick || std::abs(t - k) < 0.020;
+                    if (!nearClick)
+                        part.push_back(pcm[i]);
+                }
+                return rmsOf(part, 0.0, double(part.size()) / kRate);
+            };
+            const double mid = toneRms(1.8, 2.2);
+            const bool covered = pcm.size() >= size_t(4.0 * kRate);
+            bool falling = covered && mid > 0.05;
+            double prev = mid * 1.05;
+            d << " (b2)pcm_s=" << double(pcm.size()) / kRate << (covered ? "" : " [short pcm]")
+              << " mid=" << mid << " fade:";
+            for (int w = 0; w < 10; ++w) {
+                const double r = toneRms(3.0 + 0.1 * w, 3.1 + 0.1 * w);
+                d << ' ' << r;
+                falling = falling && r < prev;
+                prev = r;
+            }
+            const double tail = toneRms(3.95, 4.0);
+            d << " last50ms=" << tail;
+            b2Ok = falling && tail <= 0.1 * mid;
+        }
+        // (d) a lone untrimmed clip (passthrough on HEAD), atempo on + {0, 1.5}.
+        bool dOk = false;
+        {
+            loadAV({{vClip(0.0, 10.0, 1.5)}}, {{audioClip(media, 0.0, 10.0, 1.5, true)}});
+            const std::vector<float> pcm = exportAudio();
+            const std::vector<double> want = expectedClicks(0.0, 10.0, 1.5, 0.0, c);
+            d << " (d)passthrough=" << lastPassthrough;
+            const std::vector<double> got = clicksOf(pcm);
+            dOk = !pcm.empty() && !lastPassthrough && clicksMatch(got, want, 0.010, d);
+            const double hz = want.size() > 1 ? toneHz(pcm, want[0] + 0.03, want[1] - 0.03) : 0.0;
+            const bool covered = pcm.size() >= size_t((10.0 - 0.03) * kRate);
+            const double silence = rmsOf(pcm, 10.0 / 1.5 + 0.03, 9.97);
+            d << " hz=" << hz << " pcm_s=" << double(pcm.size()) / kRate << (covered ? "" : " [short pcm]")
+              << " silence_rms=" << silence << " frames:";
+            dOk = dOk && std::abs(hz - 660.0) <= 660.0 * 0.03 && covered && silence < 0.005;
+            bool framesOk = got.size() == want.size();
+            for (size_t k = 0; framesOk && k < got.size(); ++k) {
+                const double m = (want[k] - c) * 1.5; // the click's source second (in = 0)
+                const int box = boxOf(render(got[k] - c), kRowsA);
+                d << ' ' << box << '/' << frameAt(m);
+                framesOk = std::abs(box - frameAt(m)) <= 1;
+            }
+            dOk = dOk && framesOk;
+        }
+        // (g) the track-FX path (reverb on A1): A (atempo on + {0, 1.5}) uses its 4 s of source
+        // up at 4 / 1.5 s of its 4 s on the timeline, then B. The DSP must not run over A's
+        // padding (a gap): no reverb ring after the source ends. B is compared with the same B
+        // after a non-ramped A of the same source length by its click times and by its RMS once
+        // A's reverb tail has decayed (the reverb history carries A's different content into B
+        // and the AAC encoder's state differs, so B can not be sha-equal; B_maxdiff is recorded).
+        bool gOk = false, g2Ok = false, hOk = false, iOk = false;
+        {
+            trackfx::Chain rev;
+            rev.reverbEnabled = rev.reverb.enabled = true;
+            rev.reverb.mixRatio = 0.5;
+            rev.reverb.decaySeconds = 1.3;
+            AudioMixer fxMixer;
+            fxMixer.setTrackChain(0, rev);
+            const double in2 = 5.35, lenB = 4.5;
+            const auto fxExport = [&](double sA, double *factor, bool *trackFx) -> std::vector<float> {
+                loadAV({{vClip(in, 4.0, sA), vClip(in2, lenB, 0.0)}},
+                       {{audioClip(media, in, 4.0, sA, true), audioClip(media, in2, lenB, 0.0, false)}});
+                const audioexport::MixPlan plan =
+                    audioexport::buildMixPlan(timeline, &fxMixer, audioexport::MixOptions{});
+                const int a = planIndex(plan, 0);
+                *factor = a >= 0 ? plan.rampFactors.value(a, 1.0) : -1.0;
+                *trackFx = plan.useTrackFx && !plan.passthrough;
+                QString error;
+                const QString out = audioexport::executeMixPlan(plan, [] { return false; }, &error);
+                if (out.isEmpty()) {
+                    d << " [mix failed: " << error.toStdString() << ']';
+                    return {};
+                }
+                std::vector<float> pcm = decodeMono(out);
+                QFile::remove(out);
+                return pcm;
+            };
+            double fRamp = 0.0, fPlain = 0.0;
+            bool fxRamp = false, fxPlain = false;
+            const std::vector<float> pcm = fxExport(1.5, &fRamp, &fxRamp);
+            const std::vector<float> plain = fxExport(0.0, &fPlain, &fxPlain);
+            const bool covered = pcm.size() >= size_t((4.0 - 0.03) * kRate);
+            const double silence = rmsOf(pcm, 4.0 / 1.5 + 0.05, 4.0 - 0.03);
+            const double b0 = 4.0 + 3.0, b1 = 4.0 + lenB - 0.05;
+            const bool bCovered = pcm.size() >= size_t(b1 * kRate) && plain.size() >= size_t(b1 * kRate);
+            const double rmsB = rmsOf(pcm, b0, b1), rmsPlainB = rmsOf(plain, b0, b1);
+            double maxDiff = 0.0;
+            for (size_t i = size_t(b0 * kRate); bCovered && i < size_t(b1 * kRate); ++i)
+                maxDiff = std::max(maxDiff, double(std::abs(pcm[i] - plain[i])));
+            // B's clicks (from 4 s) against the plain export's.
+            const auto clicksFrom4 = [&](const std::vector<float> &x) {
+                std::vector<double> t;
+                for (double k : clicksOf(x))
+                    if (k > 4.0 - 0.005)
+                        t.push_back(k);
+                return t;
+            };
+            const std::vector<double> clicksB = clicksFrom4(pcm), clicksPlainB = clicksFrom4(plain);
+            bool clicksSame = !clicksPlainB.empty() && clicksB.size() == clicksPlainB.size();
+            for (size_t k = 0; clicksSame && k < clicksB.size(); ++k)
+                clicksSame = std::abs(clicksB[k] - clicksPlainB[k]) <= 0.001;
+            d << " (g)trackFx=" << fxRamp << '/' << fxPlain << " f=" << fRamp << '/' << fPlain
+              << " pcm_s=" << double(pcm.size()) / kRate << (covered ? "" : " [short pcm]")
+              << " silence_rms=" << silence << " B_rms=" << rmsB << "/plain=" << rmsPlainB
+              << " B_maxdiff=" << maxDiff << " [recorded]" << (bCovered ? "" : " [short B pcm]")
+              << " B_clicks=" << clicksB.size() << "/plain=" << clicksPlainB.size()
+              << (clicksSame ? "" : " [B clicks differ]");
+            gOk = fxRamp && fxPlain && std::abs(fRamp - 1.5) < 1e-9 && fPlain == 1.0 && covered
+                && silence < 0.005 && bCovered && rmsPlainB > 0.05
+                && std::abs(rmsB - rmsPlainB) <= 0.01 * rmsPlainB && clicksSame;
+            // (g2) the same ramped A alone (no B): the track-FX mix keeps A's 4 s timeline
+            // length (the cut before the DSP is padded back), silent after the source ends.
+            loadAV({{vClip(in, 4.0, 1.5)}}, {{audioClip(media, in, 4.0, 1.5, true)}});
+            const audioexport::MixPlan lonePlan =
+                audioexport::buildMixPlan(timeline, &fxMixer, audioexport::MixOptions{});
+            const int lone = planIndex(lonePlan, 0);
+            const double fLone = lone >= 0 ? lonePlan.rampFactors.value(lone, 1.0) : -1.0;
+            const bool fxLone = lonePlan.useTrackFx && !lonePlan.passthrough;
+            QString loneError;
+            const QString loneOut = audioexport::executeMixPlan(lonePlan, [] { return false; }, &loneError);
+            std::vector<float> lonePcm;
+            if (loneOut.isEmpty()) {
+                d << " [mix failed: " << loneError.toStdString() << ']';
+            } else {
+                lonePcm = decodeMono(loneOut);
+                QFile::remove(loneOut);
+            }
+            const long long loneDiff = static_cast<long long>(lonePcm.size()) - 4LL * kRate;
+            const double loneSilence = rmsOf(lonePcm, 4.0 / 1.5 + 0.05, 4.0 - 0.03);
+            g2Ok = fxLone && std::abs(fLone - 1.5) < 1e-9 && loneDiff <= kRate / kFps && loneDiff >= -(kRate / kFps)
+                && loneSilence < 0.005;
+            d << " (g2)trackFx=" << fxLone << " f=" << fLone << " pcm_samples=" << lonePcm.size()
+              << " want=" << 4 * kRate << " diff=" << loneDiff << " silence_rms=" << loneSilence
+              << (g2Ok ? "" : " [FAIL]");
+            // The mix of the loaded A1 timeline (single chain, or track FX with fxMixer); the
+            // PCM is empty when FFmpeg or the mix failed.
+            const auto mixPcm = [&](bool trackFx, audioexport::MixPlan *planOut) -> std::vector<float> {
+                *planOut = audioexport::buildMixPlan(timeline, trackFx ? &fxMixer : nullptr,
+                                                     audioexport::MixOptions{});
+                QString error;
+                const QString out = audioexport::executeMixPlan(*planOut, [] { return false; }, &error);
+                if (out.isEmpty()) {
+                    d << " [mix failed: " << error.toStdString() << ']';
+                    return {};
+                }
+                std::vector<float> pcm = decodeMono(out);
+                QFile::remove(out);
+                return pcm;
+            };
+            // (h) the G6 (h) clip (span 3.000015, f 1.5, 2 s trail, fade start 1e-5) exported:
+            // FFmpeg accepts the fade start on the single-chain and the track-FX path.
+            {
+                ClipInfo a = audioClip(media, in, 3.000015, 1.5, true);
+                a.trailOut.type = TransitionType::CrossDissolve;
+                a.trailOut.duration = 2.0;
+                loadAV(v1Other, {{a}});
+                hOk = true;
+                for (bool trackFx : {false, true}) {
+                    audioexport::MixPlan plan;
+                    const std::vector<float> pcm = mixPcm(trackFx, &plan);
+                    const int i = planIndex(plan, 0);
+                    const bool legOk = i >= 0 && !plan.passthrough && plan.useTrackFx == trackFx
+                        && std::abs(plan.rampFactors.value(i, 1.0) - 1.5) < 1e-9
+                        && pcm.size() >= size_t((3.000015 - 0.03) * kRate);
+                    d << " (h)" << (trackFx ? "trackFx" : "single") << ":pcm_s=" << double(pcm.size()) / kRate
+                      << (legOk ? "" : " [FAIL]");
+                    hOk = hOk && legOk;
+                }
+            }
+            // (i) a 1 s source under a 4 s span, f 1.5, track reverb: the source ends at
+            // 1 / 1.5 s; the padding after it is a gap the reverb does not run over.
+            {
+                const QString shortWav = dir.filePath(QStringLiteral("ramp-click-1s.wav"));
+                const bool shortOk = writeClickWav(shortWav, 1);
+                loadAV(v1Other, {{audioClip(shortWav, 0.0, 4.0, 1.5, true)}});
+                audioexport::MixPlan plan;
+                const std::vector<float> pcm = shortOk ? mixPcm(true, &plan) : std::vector<float>{};
+                const int i = planIndex(plan, 0);
+                const double f = i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0;
+                const double length = i >= 0 ? plan.entries[i].timelineEnd - plan.entries[i].timelineStart : -1.0;
+                const long long diff = static_cast<long long>(pcm.size()) - qRound64(length * kRate);
+                const double source = rmsOf(pcm, 0.1, 1.0 / 1.5 - 0.05);
+                const double tail = rmsOf(pcm, 1.0 / 1.5 + 0.05, 4.0 / 1.5 - 0.03);
+                iOk = shortOk && i >= 0 && plan.useTrackFx && !plan.passthrough && std::abs(f - 1.5) < 1e-9
+                    && std::abs(length - 4.0) < 1e-9 && diff <= kRate / kFps && diff >= -(kRate / kFps)
+                    && source > 0.05 && tail < 0.005;
+                d << " (i)trackFx=" << plan.useTrackFx << " f=" << f << " length=" << length
+                  << " pcm_samples=" << pcm.size() << " diff=" << diff << " source_rms=" << source
+                  << " after_source_rms=" << tail << (iOk ? "" : " [FAIL]");
+            }
+        }
+        // (e) [recorded] a video-only dissolve; B's audio (atempo on + {0, 1.5}) borrows nothing.
+        {
+            ClipInfo av = vClip(2.0, 3.5, 0.0);
+            ClipInfo bv = vClip(3.0, 4.0, 1.5);
+            dissolve(av, bv, TransitionAlignment::Center);
+            loadAV({{av, bv}}, {{audioClip(media, 2.0, 3.5, 0.0, false), audioClip(media, 3.0, 4.0, 1.5, true)}});
+            const std::vector<float> pcm = exportAudio();
+            const std::vector<double> got = clicksOf(pcm);
+            // The first click of B after the dissolve (B's audio starts at 3.5, source 3.0).
+            double tClick = -1.0;
+            for (double t : got)
+                if (t - c > 4.05 && tClick < 0.0)
+                    tClick = t - c;
+            const double m = tClick > 0.0 ? 3.0 + (tClick - 3.5) * 1.5 : -1.0;
+            const int box = tClick > 0.0 ? boxOf(render(tClick), kRowsA) : -1;
+            d << " (e)click=" << tClick << " source=" << m << " box=" << box;
+            if (tClick <= 0.0 || box < 0) {
+                d << " av_offset_ms=missing reason=" << (tClick <= 0.0 ? "no_click" : "box_unreadable");
+            } else {
+                d << " av_offset_ms=" << std::lround((box / double(kFps) - m) / 1.5 * 1000.0) << " [F45 declared]";
+            }
+            d << " no preview value to compare: S0-2 (e3)(3) could not separate the"
+                 " preview's audible - playhead from the playback delay";
+        }
+        // The preview mixer on the same timeline (recorded; the premise of (a) / (c)).
+        {
+            for (bool atempo : {true, false}) {
+                loadAV({{vClip(in, 4.0, 1.5)}}, {{audioClip(media, in, 4.0, 1.5, atempo)}});
+                AudioMixer mixer;
+                mixer.setSequence(timeline->computeAudioPlaybackSequence());
+                mixer.setSpeedRamps({ramp(1.5)});
+                mixer.setAtempoFlags({atempo});
+                const std::vector<float> pcm = monoOfS16(mixer.renderPcmForTest(kRate * 4));
+                const std::vector<double> got = clicksOf(pcm);
+                const double hz = got.size() > 1 ? toneHz(pcm, got[0] + 0.03, got[1] - 0.03) : 0.0;
+                d << " preview(" << (atempo ? "on" : "off") << ") clicks=" << got.size() << " first="
+                  << (got.empty() ? -1.0 : got.front()) << " second=" << (got.size() > 1 ? got[1] : -1.0)
+                  << " hz=" << hz;
+            }
+        }
+        const bool ok = cOk && aOk && bOk && b2Ok && dOk && gOk && g2Ok && hOk && iOk;
+        d << " legs: c=" << cOk << " a=" << aOk << " b=" << bOk << " b2=" << b2Ok
+          << " d=" << dOk << " g=" << gOk << " g2=" << g2Ok << " h=" << hOk << " i=" << iOk << " (c is from the m4a mix path, the same container as every leg)";
+        tally.gate(7, ok, d.str());
+    }
+
+    // ---- G8: a ramp that is not constant: the base exe's chain and one warning ----
+    {
+        std::ostringstream d;
+        bool ok = wavOk;
+        for (bool atempo : {true, false}) {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, atempo);
+            a.speedRamp.keyframes = {{0, 1.0}, {1000000, 2.0}};
+            loadAV(v1Other, {{a}});
+            g_rampWarnings = 0;
+            g_previousRampHandler = qInstallMessageHandler(captureRampWarning);
+            const audioexport::MixPlan plan = planNow();
+            qInstallMessageHandler(g_previousRampHandler);
+            const int warnings = g_rampWarnings.load();
+            const int i = planIndex(plan, 0);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{QString(), QString(), QString()};
+            const std::string name = atempo ? "g6.twokey" : "g8.twokeyoff";
+            d << (atempo ? " on:" : " off:") << "warnings=" << warnings;
+            ok = warnings == (atempo ? 1 : 0) && ok;
+            ok = pinned(name + ".single", sha16Of(chains[0].toUtf8()), d) && ok;
+            ok = pinned(name + ".pre", sha16Of(chains[1].toUtf8()), d) && ok;
+            ok = pinned(name + ".post", sha16Of(chains[2].toUtf8()), d) && ok;
+        }
+        // A lone untrimmed clip on V1's file is passthrough: the warning still fires (atempo on).
+        for (bool atempo : {true, false}) {
+            ClipInfo a = audioClip(movA, 0.0, 10.0, 0.0, atempo);
+            a.speedRamp.keyframes = {{0, 1.0}, {1000000, 2.0}};
+            loadAV({{movClip(movA, 0.0, 10.0)}}, {{a}});
+            g_rampWarnings = 0;
+            g_previousRampHandler = qInstallMessageHandler(captureRampWarning);
+            const bool passthrough = planNow().passthrough;
+            qInstallMessageHandler(g_previousRampHandler);
+            const int warnings = g_rampWarnings.load();
+            d << (atempo ? " passthrough-on:" : " passthrough-off:") << "passthrough=" << passthrough
+              << " warnings=" << warnings;
+            ok = passthrough && warnings == (atempo ? 1 : 0) && ok;
+        }
+        // A project-loaded ramp whose first key starts after clip time 0 holds source 0
+        // before that key, so it is not a constant speed from timeline 0: factor 1, base-exe
+        // chain, and one warning when atempo is on (none when off).
+        {
+            const QJsonObject lateJson = QJsonDocument::fromJson(
+                QByteArrayLiteral(R"({"keyframes":[{"t":1000000,"s":1.5}]})")).object();
+            const speedramp::SpeedRamp lateRamp = speedramp::SpeedRamp::fromJson(lateJson);
+            const bool fixtureOk = lateRamp.keyframes.size() == 1
+                && lateRamp.keyframes.first().clipTimeUs == 1000000
+                && std::abs(lateRamp.keyframes.first().speed - 1.5) <= 1e-9;
+            ok = fixtureOk && ok;
+            for (bool atempo : {true, false}) {
+                ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, atempo);
+                a.speedRamp = lateRamp;
+                loadAV(v1Other, {{a}});
+                g_rampWarnings = 0;
+                g_previousRampHandler = qInstallMessageHandler(captureRampWarning);
+                const audioexport::MixPlan plan = planNow();
+                qInstallMessageHandler(g_previousRampHandler);
+                const int warnings = g_rampWarnings.load();
+                const int i = planIndex(plan, 0);
+                const double factor = i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0;
+                const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{QString(), QString(), QString()};
+                const bool legOk = factor == 1.0 && warnings == (atempo ? 1 : 0);
+                d << (atempo ? " late-on:" : " late-off:") << "f=" << factor << " warnings=" << warnings
+                  << (legOk ? "" : " [FAIL]");
+                ok = legOk && ok;
+                ok = pinned("g6.off15.single", sha16Of(chains[0].toUtf8()), d) && ok;
+                ok = pinned("g6.off15.pre", sha16Of(chains[1].toUtf8()), d) && ok;
+                ok = pinned("g6.off15.post", sha16Of(chains[2].toUtf8()), d) && ok;
+            }
+        }
+        tally.gate(8, ok, d.str());
     }
     return tally.finish("ramp-export");
 }

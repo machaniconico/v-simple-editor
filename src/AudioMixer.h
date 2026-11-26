@@ -83,6 +83,10 @@ inline constexpr bool resolveAudioAtempoEnabled(bool envForce,
     return envForce || perClipFlag;
 }
 
+// The env force of resolveAudioAtempoEnabled (VEDITOR_AUDIO_ATEMPO), read once per
+// process. The preview mixer and the export audio plan read this one cache.
+bool audioAtempoEnvForce();
+
 // Reverse whole interleaved PCM frames while preserving channel order.
 // channelCount=1 is also the scalar helper exercised by reverse-clip G4.
 QVector<float> reversedPcmFrames(const QVector<float> &samples,
@@ -137,6 +141,9 @@ public:
     // Parallel per-entry atempo opt-in flags aligned to setSequence entries.
     // Env VEDITOR_AUDIO_ATEMPO still globally forces the feature on.
     void setAtempoFlags(const QVector<bool> &flags);
+    // Selftest: the arrays last given to setSpeedRamps / setAtempoFlags.
+    QVector<speedramp::SpeedRamp> speedRampsForTest() const;
+    QVector<bool> atempoFlagsForTest() const;
 
     // Jump the audible playhead. Resyncs FFmpeg seek inside every active
     // entry (lazily on next refill) and flushes ring buffers so the next

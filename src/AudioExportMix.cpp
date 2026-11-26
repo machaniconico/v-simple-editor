@@ -78,7 +78,8 @@ QString volumeExpressionForEntry(const PlaybackEntry &entry)
 QString exportAudioFilterChainForEntry(int inputIndex,
                                        const PlaybackEntry &entry,
                                        AudioChannelMode channelMode,
-                                       bool reversed)
+                                       bool reversed,
+                                       double rampFactor)
 {
     const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
     return buildExportAudioMixEntryFilterChain(
@@ -93,9 +94,87 @@ QString exportAudioFilterChainForEntry(int inputIndex,
         entry.leadInType,
         entry.leadInDuration,
         entry.trailOutType,
-        entry.trailOutDuration);
+        entry.trailOutDuration,
+        rampFactor,
+        entry.timelineEnd - entry.timelineStart);
+}
+
+// The track-FX path's clip wav (PreFx) and post-DSP (PostFx) chains of plan entry i.
+QString trackFxPreChain(const audioexport::MixPlan &plan, int i)
+{
+    const PlaybackEntry &entry = plan.entries[i];
+    return buildExportAudioMixEntryPreFxFilterChain(0,
+        audioexport::ffmpegNumber(entry.clipIn), audioexport::ffmpegNumber(entry.clipOut),
+        plan.channelModes.value(i, AudioChannelMode::Stereo), plan.reversed.value(i, false),
+        entry.speed, plan.rampFactors.value(i, 1.0), entry.timelineEnd - entry.timelineStart);
+}
+
+QString trackFxPostChain(const audioexport::MixPlan &plan, int i)
+{
+    const PlaybackEntry &entry = plan.entries[i];
+    const double rampFactor = plan.rampFactors.value(i, 1.0);
+    return buildExportAudioMixEntryPostFxFilterChain(i,
+        qMax(0, qRound(entry.timelineStart * 1000.0)),
+        volumeExpressionForEntry(entry),
+        exportAudioMixEntryClipDuration(entry.clipIn, entry.clipOut, entry.speed,
+            plan.reversed.value(i, false), rampFactor,
+            entry.timelineEnd - entry.timelineStart),
+        entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration,
+        rampFactor != 1.0);
 }
 } // namespace
+
+double audioexport::exportAudioRampFactor(const ClipInfo &clip, bool reversed, double entrySpeed,
+                                          bool envForce, bool *nonConstant)
+{
+    if (nonConstant)
+        *nonConstant = false;
+    if (reversed || clip.isSequenceReference()
+        || !resolveAudioAtempoEnabled(envForce, clip.atempoEnabled)
+        || clip.speedRamp.isIdentity())
+        return 1.0;
+    const auto &keys = clip.speedRamp.keyframes;
+    if (keys.isEmpty())
+        return 1.0;
+    // A project-loaded ramp whose first key starts after clip time 0 holds source 0 before
+    // that key (SpeedRamp::timelineToSourceUs), so speed is not constant from timeline 0.
+    if (keys.first().clipTimeUs != 0) {
+        if (nonConstant)
+            *nonConstant = true;
+        return 1.0;
+    }
+    for (const auto &key : keys) {
+        if (std::abs(key.speed - keys.first().speed) > 1e-9) {
+            if (nonConstant)
+                *nonConstant = true;
+            return 1.0;
+        }
+    }
+    // AudioMixer readData: speedMul = ramp slope x entry speed, bounded to the ramp range.
+    const double uniform = entrySpeed > 0.0 ? entrySpeed : 1.0;
+    const double factor = qBound(speedramp::SpeedRamp::kMinSpeed, keys.first().speed * uniform,
+                                 speedramp::SpeedRamp::kMaxSpeed);
+    return std::abs(factor - 1.0) <= 1e-9 ? 1.0 : factor;
+}
+
+QString audioexport::singleChainForTest(const MixPlan &plan, int index)
+{
+    if (index < 0 || index >= plan.entries.size())
+        return {};
+    return exportAudioFilterChainForEntry(index, plan.entries[index],
+        plan.channelModes.value(index, AudioChannelMode::Stereo),
+        plan.reversed.value(index, false), plan.rampFactors.value(index, 1.0));
+}
+
+QString audioexport::trackFxPreChainForTest(const MixPlan &plan, int index)
+{
+    return index >= 0 && index < plan.entries.size() ? trackFxPreChain(plan, index) : QString();
+}
+
+QString audioexport::trackFxPostChainForTest(const MixPlan &plan, int index)
+{
+    return index >= 0 && index < plan.entries.size() ? trackFxPostChain(plan, index) : QString();
+}
 
 QString audioexport::findFfmpegBinary()
 {
@@ -317,6 +396,39 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
         plan.useTrackFx = plan.useTrackFx || (entry.pan != 0.0 && !entry.audioMuted);
     plan.useMasterEq = (plan.masterChain.eqEnabled || plan.masterChain.deesser.enabled)
         && !audiofxexport::masterEqBypass;
+    const QVector<bool> reversedFlags =
+        audioReversedFlagsForPlaybackEntries(entries);
+    const bool atempoEnvForce = audioAtempoEnvForce();
+    // The clip the preview mixer reads the ramp and the atempo flag from.
+    const QVector<TimelineTrack *> &audioTracks = timeline->audioTracks();
+    const auto rampFactorOf = [&](int entryIndex, bool *nonConstant) {
+        const PlaybackEntry &entry = entries[entryIndex];
+        if (nonConstant)
+            *nonConstant = false;
+        if (entry.sourceTrack < 0 || entry.sourceTrack >= audioTracks.size()
+            || !audioTracks[entry.sourceTrack]
+            || entry.sourceClipIndex < 0
+            || entry.sourceClipIndex >= audioTracks[entry.sourceTrack]->clips().size())
+            return 1.0;
+        return exportAudioRampFactor(
+            audioTracks[entry.sourceTrack]->clips()[entry.sourceClipIndex],
+            reversedFlags.value(entryIndex, false), entry.speed, atempoEnvForce, nonConstant);
+    };
+    // Warn before the passthrough return, so a passthrough export warns too.
+    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
+        const PlaybackEntry &entry = entries[entryIndex];
+        if (entry.audioMuted || !trackAudible(entry.sourceTrack)
+            || entry.timelineEnd <= entry.timelineStart || entry.clipOut <= entry.clipIn
+            || !QFileInfo::exists(entry.filePath))
+            continue;
+        bool nonConstant = false;
+        rampFactorOf(entryIndex, &nonConstant);
+        if (nonConstant) {
+            qWarning().noquote()
+                << QStringLiteral("Export audio: the speed ramp of a clip that follows speed is not constant; its audio is exported without the ramp: %1")
+                       .arg(entry.filePath);
+        }
+    }
     if (options.forcedOutputPath.isEmpty() && !plan.useTrackFx && !plan.useMasterEq
         && loudnessauto::timelineAudioMatchesPassthrough(timeline)) {
         plan.passthrough = true;
@@ -330,10 +442,9 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
         ? nextExportAudioMixPath() : options.forcedOutputPath;
     plan.audioKbps = options.audioKbps;
 
-    const QVector<bool> reversedFlags =
-        audioReversedFlagsForPlaybackEntries(entries);
     plan.entries.reserve(entries.size());
     plan.reversed.reserve(entries.size());
+    plan.rampFactors.reserve(entries.size());
     plan.channelModes.reserve(entries.size());
     for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
         const PlaybackEntry &entry = entries[entryIndex];
@@ -354,8 +465,10 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
                        .arg(entry.filePath);
             continue;
         }
+        const double rampFactor = rampFactorOf(entryIndex, nullptr);
         plan.entries.append(entry);
         plan.reversed.append(reversed);
+        plan.rampFactors.append(rampFactor);
         plan.channelModes.append(audioChannelModeForPlaybackEntry(entry));
     }
     return plan;
@@ -494,10 +607,7 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
             for (int i : it.value()) {
                 const PlaybackEntry &entry = validEntries[i];
                 const QString clipPath = temporary.filePath(QStringLiteral("clip_%1.wav").arg(i));
-                const QString filter = buildExportAudioMixEntryPreFxFilterChain(0,
-                    ffmpegNumber(entry.clipIn), ffmpegNumber(entry.clipOut),
-                    plan.channelModes.value(i, AudioChannelMode::Stereo), plan.reversed.value(i, false),
-                    entry.speed);
+                const QString filter = trackFxPreChain(plan, i);
                 QStringList clipArgs{QStringLiteral("-y"), QStringLiteral("-i"), entry.filePath};
                 clipArgs << QStringLiteral("-filter_complex") << filter
                          << QStringLiteral("-map") << QStringLiteral("[prefx0]")
@@ -512,6 +622,37 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
                     if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
                     return {};
                 }
+                // A resampled entry's wav is padded to its timeline length once the source is
+                // used up; drop that padding so the DSP does not run over it (a gap). The source
+                // can end before the clip's span: keep at most the length the same chain gives
+                // without its apad / atrim=end stages.
+                if (plan.rampFactors.value(i, 1.0) != 1.0) {
+                    size_t keep = static_cast<size_t>(qMax<qint64>(0, qRound64(
+                        exportAudioMixEntryClipDuration(entry.clipIn, entry.clipOut, entry.speed,
+                            plan.reversed.value(i, false), plan.rampFactors.value(i, 1.0),
+                            entry.timelineEnd - entry.timelineStart)
+                        * AudioMixer::kSampleRateHz))) * AudioMixer::kChannels;
+                    const QString padStages = QStringLiteral(",apad=whole_dur=%1,atrim=end=%1")
+                        .arg(ffmpegNumber(entry.timelineEnd - entry.timelineStart));
+                    if (filter.contains(padStages)) {
+                        const QString realPath = temporary.filePath(QStringLiteral("clip_%1_real.wav").arg(i));
+                        QStringList realArgs{QStringLiteral("-y"), QStringLiteral("-i"), entry.filePath};
+                        realArgs << QStringLiteral("-filter_complex") << QString(filter).remove(padStages)
+                                 << QStringLiteral("-map") << QStringLiteral("[prefx0]")
+                                 << QStringLiteral("-vn") << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le")
+                                 << realPath;
+                        if (!runFfmpeg(realArgs)) return {};
+                        std::vector<float> real;
+                        int realRate = 0, realChannels = 0;
+                        if (!libavcore::readWavFloatInterleaved(realPath, &real, &realRate, &realChannels, error))
+                            return {};
+                        QFile::remove(realPath);
+                        if (realRate == rate && realChannels == channels)
+                            keep = qMin(keep, real.size());
+                    }
+                    if (samples.size() > keep)
+                        samples.resize(keep);
+                }
                 buffers.push_back({qRound64(entry.timelineStart * AudioMixer::kSampleRateHz),
                                    std::move(samples)});
                 clipPaths[i] = clipPath;
@@ -523,6 +664,19 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
             processTrackEntries(buffers, plan.trackChains.value(track),
                 plan.legacyEqCoeffs.value(track), plan.legacyEqEnabled.value(track, false),
                 plan.legacyEqConfigs.value(track).preamp);
+            // Give a resampled entry its timeline length back (silence after the source), so
+            // a last ramped entry does not end the mix early (atrim cannot lengthen it).
+            for (int k = 0; k < it.value().size(); ++k) {
+                const int index = it.value()[k];
+                if (plan.rampFactors.value(index, 1.0) == 1.0)
+                    continue;
+                const PlaybackEntry &entry = validEntries[index];
+                const size_t full = static_cast<size_t>(qMax<qint64>(0, qRound64(
+                    (entry.timelineEnd - entry.timelineStart) * AudioMixer::kSampleRateHz)))
+                    * AudioMixer::kChannels;
+                if (buffers[k].samples.size() < full)
+                    buffers[k].samples.resize(full, 0.0f);
+            }
             for (size_t index = 0; index < buffers.size(); ++index) {
                 if (!libavcore::writeWavFloatInterleaved(clipPaths[it.value()[static_cast<int>(index)]],
                         buffers[index].samples, AudioMixer::kSampleRateHz, AudioMixer::kChannels, error))
@@ -534,13 +688,7 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
         for (int i = 0; i < validEntries.size(); ++i) {
             const PlaybackEntry &entry = validEntries[i];
             finalArgs << QStringLiteral("-i") << clipPaths[i];
-            const double clipDuration = std::isfinite(entry.speed) && entry.speed > 0.0
-                ? qMax(0.0, (entry.clipOut - entry.clipIn) / entry.speed)
-                : qMax(0.0, entry.clipOut - entry.clipIn);
-            QString post = buildExportAudioMixEntryPostFxFilterChain(i,
-                qMax(0, qRound(entry.timelineStart * 1000.0)),
-                volumeExpressionForEntry(entry), clipDuration,
-                entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
+            QString post = trackFxPostChain(plan, i);
             // Static track gain, bus / AUX route gains and clip balance also belong after the DSP.
             // Route mix = trackGain × post + pre (pre-fader sends skip the fader, US-1122).
             const auto clipPan = audiopan::balanceGains(entry.pan);
@@ -582,7 +730,8 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
             i,
             entry,
             plan.channelModes.value(i, AudioChannelMode::Stereo),
-            plan.reversed.value(i, false));
+            plan.reversed.value(i, false),
+            plan.rampFactors.value(i, 1.0));
         if (renderInPlace) {
             // adelay can leave unset timestamps on its generated silence.
             // amix propagates them; atrim then cuts at the first real PTS.
