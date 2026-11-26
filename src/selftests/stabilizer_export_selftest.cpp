@@ -2646,6 +2646,7 @@ int runStabilizerExportSelftest()
         tally.skip(16, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
         tally.skip(17, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
         tally.skip(18, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+        tally.skip(19, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
     } else {
         std::ostringstream d;
         const QString movA = dir + QStringLiteral("/g16a.mp4");
@@ -2952,16 +2953,23 @@ int runStabilizerExportSelftest()
             d << " ok=" << ok;
             return ok;
         };
-        // Plays until the first frame presented at or past `boundaryUs`, then captures
+        // Plays until the `needPast`-th frame presented at or past `boundaryUs`, then captures
         // the GL state at once (before pausing); `past` says whether it got there.
-        const auto playOut = [&](Rig &r, qint64 boundaryUs, bool &past) {
+        const auto playOut = [&](Rig &r, qint64 boundaryUs, bool &past, qint64 *outAt = nullptr,
+                                 int needPast = 1, bool *firstBaked = nullptr) {
             past = false;
+            int seenPast = 0;
             qint64 at = -1;
             const auto conn = QObject::connect(
                 r.p, &VideoPlayer::frameComposited, r.window.get(), [&](const QImage &) {
                     if (!past && playhead(r) >= boundaryUs) {
-                        past = true;
-                        at = playhead(r);
+                        ++seenPast;
+                        if (seenPast == 1 && firstBaked && r.view)
+                            *firstBaked = r.view->compositeBakedMode();
+                        if (seenPast >= needPast) {
+                            past = true;
+                            at = playhead(r);
+                        }
                     }
                 });
             r.p->play();
@@ -2973,6 +2981,8 @@ int runStabilizerExportSelftest()
             r.p->pause();
             QObject::disconnect(conn);
             pumpEvents(40);
+            if (outAt)
+                *outAt = at;
             d << " (first out at " << frameAt(at) << "f past=" << past << ')';
             return s;
         };
@@ -3374,7 +3384,7 @@ int runStabilizerExportSelftest()
                 r.p->stepForward();
                 pumpEvents(40);
                 ok16 = sameState("(f) shape stepForward out", direct, capture(r), true) && ok16;
-                // The same by playback: recorded only (HEAD's form, A8).
+                // The same by playback (US-2404: promoted from recorded to gated after US-2400).
                 seekTo(r, frameUs(15) + 1000);
                 bool past = false;
                 const GlState across = playOut(r, us(1.5), past);
@@ -3382,8 +3392,8 @@ int runStabilizerExportSelftest()
                 seekTo(r, frameUs(44) + 1000);
                 const GlState afterSeek = playOut(r, us(1.5), past);
                 ok16 = past && ok16;
-                sameState("(f) shape play out after a seek [recorded, not gated]", across,
-                          afterSeek, false);
+                ok16 = sameState("(f) shape play out after a seek", across, afterSeek, false)
+                    && ok16;
             } else {
                 ok16 = false;
             }
@@ -4676,6 +4686,138 @@ int runStabilizerExportSelftest()
             if (!gl18)
                 d << " (GL unavailable: the shown and direct-seek pictures not checked)";
             tally.gate(18, ok18, d.str());
+
+            // US-2404 G19 (pin): leaving an SSOT interval by 1F-> (a)/(c) or by play()
+            // after a paused seek to its last frame (b) produces the same display state
+            // (baked mode, stabilizer, viewport) as a direct seek to that frame, both
+            // inside a CrossDissolve overlap (ovlShape / ovlNest) and without overlap
+            // (nest / shape, (4a)). Production unchanged; pins S0-3 (c)/(d).
+            d.str(std::string());
+            d.clear();
+            bool ok19 = mov17Ok;
+            int rigs19 = 0;
+            bool gl19 = true;
+            const auto overlapV1 = [&]() {
+                QVector<ClipInfo> e;
+                ClipInfo a = movClip(movG, 0.0, 3.0);
+                ClipInfo b = movClip(movH, double(frameUs(70)) / 1e6, 2.0);
+                Transition t;
+                t.type = TransitionType::CrossDissolve;
+                t.duration = 1.0;
+                t.alignment = TransitionAlignment::Center;
+                a.trailOut = t;
+                b.leadIn = t;
+                e.push_back(a);
+                e.push_back(b);
+                e.push_back(movClip(movG, 0.0, 1.0));
+                return e;
+            };
+            struct Rig19 {
+                const char *name;
+                char kind;
+                int lastFrame;
+                qint64 boundaryUs;
+                bool overlap;
+            };
+            for (const Rig19 &x : {Rig19{"ovlShape", 'S', 95, us(3.2), true},
+                                   Rig19{"ovlNest", 'N', 95, us(3.2), true},
+                                   Rig19{"nest", 'n', 59, us(2.0), false},
+                                   Rig19{"shape", 's', 83, us(2.8), false}}) {
+                Rig r;
+                std::function<void(Timeline *)> build;
+                if (x.kind == 'S') {
+                    build = [&](Timeline *tl) {
+                        tl->restoreFromProject({overlapV1(), {shapeClip17(1.0, 2.2)}},
+                                               QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                    };
+                } else if (x.kind == 'N') {
+                    build = [&](Timeline *tl) {
+                        const QString cid = QStringLiteral("child19ovl");
+                        const QString mid = QStringLiteral("main19ovl");
+                        const TimelineSequence child = seqOf(cid, {{movClip(movH, 0.0, 2.2)}});
+                        const TimelineSequence main =
+                            seqOf(mid, {overlapV1(), {refTo(cid, 2.2, 1.0)}});
+                        tl->setSequences({main, child}, mid);
+                    };
+                } else if (x.kind == 'n') {
+                    build = [&](Timeline *tl) {
+                        const QString cid = QStringLiteral("child19");
+                        const QString mid = QStringLiteral("main19");
+                        const TimelineSequence child = seqOf(cid, {{movClip(movH, 0.0, 1.0)}});
+                        const TimelineSequence main =
+                            seqOf(mid, {{movClip(movG, 0.0, 5.0)}, {refTo(cid, 1.0, 1.0)}});
+                        tl->setSequences({main, child}, mid);
+                    };
+                } else {
+                    build = [&](Timeline *tl) {
+                        tl->restoreFromProject(
+                            {{movClip(movG, 0.0, 5.0)}, {shapeClip17(1.0, 1.8)}},
+                            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                    };
+                }
+                if (!open(r, (std::string(x.name) + "19").c_str(), build)) {
+                    ok19 = false;
+                    continue;
+                }
+                ++rigs19;
+                gl19 = gl19 && r.gl;
+                const qint64 lastUs = frameUs(x.lastFrame) + 1000;
+                // Warm any overlap pool decoder once so both via-step and direct-seek
+                // observe the same steady-state decoder pool.
+                seekTo(r, x.boundaryUs + 1000);
+                // (a)/(c) 1F-> out from the last SSOT frame vs direct seek to the same playhead.
+                seekTo(r, lastUs);
+                const GlState inState = capture(r);
+                r.p->stepForward();
+                pumpEvents(40);
+                const qint64 stepAt = playhead(r);
+                const GlState stepState = capture(r);
+                const qint64 decAfterStep = r.p->nextDecodedSourceUsForTest();
+                seekTo(r, frameUs(5) + 1000);
+                seekTo(r, stepAt);
+                const GlState directStep = capture(r);
+                const qint64 decDirect = r.p->nextDecodedSourceUsForTest();
+                const std::string stepLabel = std::string(x.overlap ? "(a) " : "(a)/(c) ")
+                    + x.name + " 1F-> out pin (S0-3 (c))";
+                const bool stepSame = sameState(stepLabel.c_str(), directStep, stepState, true);
+                const bool stepOk = inState.baked && stepAt >= x.boundaryUs && !stepState.baked
+                    && stepSame;
+                d << " inBaked=" << inState.baked << " stepAt=" << stepAt
+                  << " decoder_after_step=" << decAfterStep << " direct=" << decDirect
+                  << " stepOk=" << stepOk;
+                ok19 = ok19 && stepOk;
+
+                // (b) non-SSOT play -> pause -> seek to last SSOT frame -> play() out vs direct seek.
+                // Tick 1 starts inside SSOT so nestedSequenceActive is still true for that tick
+                // (recorded as tick1Baked); tick 2 is the first tick starting outside SSOT, where
+                // VideoPlayer clears compositeBakedMode (matching Step 0 S0-3 (d)).
+                seekTo(r, frameUs(5) + 1000);
+                r.p->play();
+                pumpEvents(300);
+                r.p->pause();
+                pumpEvents(40);
+                seekTo(r, lastUs);
+                bool past = false;
+                qint64 playAt = -1;
+                bool tick1Baked = false;
+                const GlState playState = playOut(r, x.boundaryUs, past, &playAt, 2, &tick1Baked);
+                seekTo(r, frameUs(5) + 1000);
+                if (playAt >= 0)
+                    seekTo(r, playAt);
+                const GlState directPlay = capture(r);
+                const std::string playLabel =
+                    std::string("(b) ") + x.name + " play out pin (S0-3 (d))";
+                const bool playSame = sameState(playLabel.c_str(), directPlay, playState, false);
+                const bool playOk = past && playAt >= x.boundaryUs && !playState.baked && playSame;
+                d << " tick1Baked=" << tick1Baked << " past=" << past << " playAt=" << playAt
+                  << " playOk=" << playOk;
+                ok19 = ok19 && playOk;
+                pumpEvents(100);
+            }
+            ok19 = ok19 && rigs19 == 4;
+            d << " rigs=" << rigs19 << " gl=" << gl19
+              << " (c) non-overlap (4a) and G16 other legs unchanged pin (S0-3 (c)/(d))";
+            tally.gate(19, ok19, d.str());
         }
     }
 

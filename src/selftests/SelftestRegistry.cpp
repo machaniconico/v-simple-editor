@@ -725,7 +725,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
-      "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (18 gates)" },
+      "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (19 gates)" },
     { "ramp-export",       "VEDITOR_RAMP_EXPORT_SELFTEST",        runRampExportSelftest,         true,
       "a top-level clip with a speed ramp maps its export source time through the ClipInfo mapper over its playback interval (the start and in point a transition borrowed, clamped to it) in renderFrameAt, its Echo samples, renderClipSourceAt and the special composite: ramped frames, ends, borrowed origin, consumers, unchanged cases, preview read-back (8 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
