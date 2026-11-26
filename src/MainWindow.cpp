@@ -3,6 +3,7 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include "AeProTools.h"
 #include "ClipRoles.h"
 #include "ContextMenuOrder.h"
 #include "CreatorTools.h"
@@ -10,7 +11,9 @@
 #include "ExternalGenerator.h"
 #include "OtioImport.h"
 #include "PowerBinStore.h"
+#include "SubclipStore.h"
 #include "TimelineIndexDock.h"
+#include "TimelineMinimap.h"
 #include "JsonNumberClamp.h"
 #include <QCoreApplication>
 #include <cstdio>
@@ -5320,6 +5323,57 @@ void MainWindow::setupMenuBar()
             if (m_player)
                 m_player->seek(qRound(sec * 1000.0));
         });
+        dlg.exec();
+    });
+    auto *minimapAct = viewMenu->addAction(QStringLiteral("タイムライン俯瞰ミニマップ…"));
+    connect(minimapAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        minimap::TimelineMinimapDialog dlg(m_timeline, this);
+        connect(dlg.minimap(), &minimap::TimelineMinimapWidget::seekRequested, this, [this](double sec) {
+            if (m_player)
+                m_player->seek(qRound(sec * 1000.0));
+        });
+        dlg.exec();
+    });
+    auto *subclipAct = viewMenu->addAction(QStringLiteral("サブクリップ管理…"));
+    connect(subclipAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        subclips::SubclipManagerDialog dlg(m_timeline, this);
+        dlg.exec();
+    });
+    auto *shyLayersAct = viewMenu->addAction(QStringLiteral("シャイレイヤー管理…"));
+    connect(shyLayersAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        aepro::ShyLayersDialog dlg(m_timeline, this);
+        if (dlg.exec() == QDialog::Accepted) {
+            statusBar()->showMessage(
+                QStringLiteral("シャイ設定を更新しました (表示トラック V:%1 / A:%2)")
+                    .arg(dlg.visibleVideoTrackCount()).arg(dlg.visibleAudioTrackCount()), 4000);
+        }
+    });
+    auto *speedGraphAct = viewMenu->addAction(QStringLiteral("スピードグラフ表示 (Velocity)…"));
+    connect(speedGraphAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const ClipInfo *target = nullptr;
+        for (TimelineTrack *tr : m_timeline->videoTracks()) {
+            if (!tr) continue;
+            const int sel = tr->selectedClip();
+            if (sel >= 0 && sel < tr->clips().size()) {
+                target = &tr->clips()[sel];
+                break;
+            }
+        }
+        if (!target && !m_timeline->videoTracks().isEmpty()
+            && !m_timeline->videoTracks()[0]->clips().isEmpty()) {
+            target = &m_timeline->videoTracks()[0]->clips()[0];
+        }
+        if (!target) {
+            statusBar()->showMessage(QStringLiteral("スピードグラフを表示するクリップがありません"), 3500);
+            return;
+        }
+        const QString label = target->displayName.isEmpty()
+            ? QFileInfo(target->filePath).fileName() : target->displayName;
+        aepro::SpeedGraphDialog dlg(target->keyframes, label, target->effectiveDuration(), this);
         dlg.exec();
     });
     auto *powerBinAct = viewMenu->addAction(QStringLiteral("パワービン (共有アセット)…"));
