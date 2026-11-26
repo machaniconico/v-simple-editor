@@ -1,5 +1,6 @@
 #include "RenderInPlace.h"
 #include "ContextMenuOrder.h"
+#include "LoudnessPresets.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
 #include "AudioKeyframes.h"
@@ -10347,7 +10348,17 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aDel = nullptr;
         QAction *aReplace = nullptr;
         QAction *aUnlink = nullptr;
-        QAction *aNormalize = nullptr;
+        struct NormMenuAction {
+            QAction *act = nullptr;
+            loudnesspreset::NormalizeScope scope = loudnesspreset::NormalizeScope::SingleClip;
+            double lufs = -14.0;
+            double peak = -1.0;
+            QString label;
+            bool isCustom = false;
+            bool isDialog = false;
+            bool isPeak = false;
+        };
+        QVector<NormMenuAction> aNormActions;
         QAction *aDialogueLevel = nullptr;
         QAction *aRemix = nullptr;
         QAction *aStereoAct = nullptr;
@@ -10385,7 +10396,34 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                 aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
                 aUnlink->setEnabled(aLinkGroup > 0);
             } else if (id == QStringLiteral("audio.normalize")) {
-                aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
+                QMenu *aNormMenu = aMenu.addMenu(QStringLiteral("ノーマライズ"));
+                const auto presets = loudnesspreset::timelinePresets();
+                auto populateScopeMenu = [&](QMenu *sub, loudnesspreset::NormalizeScope scope, bool includePeak) {
+                    for (const auto &p : presets) {
+                        QAction *act = sub->addAction(p.displayName);
+                        aNormActions.append({act, scope, p.targetLufs, p.maxTruePeakDbtp,
+                                             p.displayName, false, false, false});
+                    }
+                    sub->addSeparator();
+                    QAction *actCustom = sub->addAction(QStringLiteral("カスタム LUFS…"));
+                    aNormActions.append({actCustom, scope, -14.0, -1.0,
+                                         QString(), true, false, false});
+                    if (includePeak) {
+                        QAction *actPeak = sub->addAction(QStringLiteral("ピーク正規化 (-1 dBFS)"));
+                        aNormActions.append({actPeak, scope, -14.0, -1.0,
+                                             QString(), false, false, true});
+                    }
+                };
+                QMenu *mSingle = aNormMenu->addMenu(QStringLiteral("このクリップ単体"));
+                populateScopeMenu(mSingle, loudnesspreset::NormalizeScope::SingleClip, true);
+                QMenu *mAllIndiv = aNormMenu->addMenu(QStringLiteral("全クリップ一括 (各クリップを個別に揃える)"));
+                populateScopeMenu(mAllIndiv, loudnesspreset::NormalizeScope::AllClipsIndividual, false);
+                QMenu *mAllUniform = aNormMenu->addMenu(QStringLiteral("全クリップ一括 (全体のバランスを維持して揃える)"));
+                populateScopeMenu(mAllUniform, loudnesspreset::NormalizeScope::AllClipsUniform, false);
+                aNormMenu->addSeparator();
+                QAction *actDialog = aNormMenu->addAction(QStringLiteral("ノーマライズ設定ダイアログ…"));
+                aNormActions.append({actDialog, loudnesspreset::NormalizeScope::SingleClip, -14.0, -1.0,
+                                     QString(), false, true, false});
             } else if (id == QStringLiteral("audio.dialogue_leveler")) {
                 aDialogueLevel = aMenu.addAction(QStringLiteral("ダイアログレベラー…"));
             } else if (id == QStringLiteral("audio.music_remix")) {
@@ -10449,6 +10487,44 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aCustomize = aMenu.addAction(QStringLiteral("メニューをカスタマイズ…"));
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
+        for (const auto &na : aNormActions) {
+            if (aChosen != na.act)
+                continue;
+            const int trackIdx = m_audioTracks.indexOf(track);
+            if (na.isPeak) {
+                normalizeAudioClipPeak(trackIdx, clipIndex);
+                return;
+            }
+            loudnesspreset::NormalizeScope scope = na.scope;
+            double targetLufs = na.lufs;
+            double maxPeak = na.peak;
+            QString label = na.label;
+            if (na.isDialog) {
+                loudnesspreset::NormalizeOptionsDialog dlg(
+                    loudnesspreset::NormalizeScope::SingleClip, -14.0, -1.0, this);
+                if (dlg.exec() != QDialog::Accepted)
+                    return;
+                scope = dlg.selectedScope();
+                targetLufs = dlg.targetLufs();
+                maxPeak = dlg.maxTruePeakDbtp();
+                label = dlg.selectedPresetLabel();
+            } else if (na.isCustom) {
+                bool accepted = false;
+                targetLufs = QInputDialog::getDouble(
+                    this, QStringLiteral("カスタム LUFS ノーマライズ"),
+                    QStringLiteral("目標ラウドネス (LUFS):"), -14.0, -70.0, -1.0, 1, &accepted);
+                if (!accepted)
+                    return;
+                label = QStringLiteral("カスタム %1 LUFS").arg(targetLufs, 0, 'f', 1);
+            }
+            const auto res = loudnesspreset::applyLoudnessNormalization(
+                this, scope, trackIdx, clipIndex, targetLufs, maxPeak, label);
+            if (!res.summary.isEmpty())
+                emit statusMessageRequested(res.summary, 5000);
+            if (res.ok)
+                scheduleEmitSequenceChanged();
+            return;
+        }
         if (aChosen == aCustomize) {
             ctxmenu::ContextMenuCustomizeDialog dlg(ctxmenu::Target::TimelineAudioClip, this);
             dlg.exec();
@@ -10519,10 +10595,6 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             emit audioClipEqRequested(m_audioTracks.indexOf(track), clipIndex);
         }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
-        else if (aChosen == aNormalize) {
-            const int trackIdx = m_audioTracks.indexOf(track);
-            normalizeAudioClipPeak(trackIdx, clipIndex);
-        }
         else if (aChosen == aDialogueLevel) {
             if (!aClip.volumeEnvelope.isEmpty()
                 && QMessageBox::question(

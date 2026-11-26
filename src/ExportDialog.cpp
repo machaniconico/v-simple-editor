@@ -1,5 +1,6 @@
 #include "ExportDialog.h"
 #include "ExportUserPresets.h"
+#include "LoudnessPresets.h"
 #include <QInputDialog>
 #include <QSignalBlocker>
 #include "CodecDetector.h"
@@ -314,7 +315,10 @@ void ExportDialog::setupUI()
     codecForm->addRow(m_autoLoudness);
     m_loudnessPreset = new QComboBox(this);
     m_loudnessPreset->setObjectName("loudnessPreset");
-    m_loudnessPreset->addItems({tr("配信 -14 LUFS"), tr("放送 -23 LUFS"), tr("自由入力")});
+    const auto loudnessPresets = loudnesspreset::exportDialogPresets();
+    for (const auto &p : loudnessPresets)
+        m_loudnessPreset->addItem(p.displayName, p.targetLufs);
+    m_loudnessPreset->addItem(tr("自由入力"));
     m_targetLufs = new QDoubleSpinBox(this);
     m_targetLufs->setObjectName("targetLufs");
     m_targetLufs->setRange(-70.0, -1.0);
@@ -326,14 +330,15 @@ void ExportDialog::setupUI()
     codecForm->addRow(tr("ラウドネスのプリセット:"), m_loudnessPreset);
     codecForm->addRow(tr("目標ラウドネス:"), m_targetLufs);
     connect(m_autoLoudness, &QCheckBox::toggled, this, [this]() { updateLoudnessControlsEnabled(); });
-    connect(m_loudnessPreset, &QComboBox::currentIndexChanged, this, [this](int index) {
-        if (index < 2) {
+    connect(m_loudnessPreset, &QComboBox::currentIndexChanged, this, [this, loudnessPresets](int index) {
+        if (index >= 0 && index < loudnessPresets.size()) {
             const QSignalBlocker blocker(m_targetLufs);
-            m_targetLufs->setValue(index == 0 ? -14.0 : -23.0);
+            m_targetLufs->setValue(loudnessPresets[index].targetLufs);
         }
     });
+    const int customPresetIdx = loudnessPresets.size();
     connect(m_targetLufs, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [this](double) { m_loudnessPreset->setCurrentIndex(2); });
+        [this, customPresetIdx](double) { m_loudnessPreset->setCurrentIndex(customPresetIdx); });
 
     // Hardware encoder combo
     m_hwEncoderCombo = new QComboBox(this);
@@ -941,8 +946,7 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
         const QSignalBlocker blocker(m_targetLufs);
         m_targetLufs->setValue(config.targetLufs);
     }
-    m_loudnessPreset->setCurrentIndex(config.targetLufs == -14.0 ? 0
-                                      : config.targetLufs == -23.0 ? 1 : 2);
+    m_loudnessPreset->setCurrentIndex(loudnesspreset::exportPresetIndexForLufs(config.targetLufs));
     m_audioOnlyCheckbox->setChecked(config.audioOnly);
     if (config.audioOnly) select(m_audioContainerCombo, config.container);
     m_subtitleModeCombo->setCurrentIndex(static_cast<int>(config.subtitleMode));

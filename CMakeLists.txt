@@ -357,6 +357,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LayerStyleUiSelftest.cpp
     src/selftests/RightclickPausePrefSelftest.cpp
     src/selftests/context_menu_order_selftest.cpp
+    src/selftests/platform_loudness_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -745,6 +746,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/LoudnessPanel.h
     src/LoudnessAnalyzer.h
     src/LoudnessAnalyzer.cpp
+    src/LoudnessPresets.h
+    src/LoudnessPresets.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp

@@ -253,6 +253,7 @@ int runReverseClipSelftest();
 int runRgbParadeSelftest();
 int runRightclickPausePrefSelftest();
 int runContextMenuOrderSelftest();
+int runPlatformLoudnessSelftest();
 int runRippleDeleteSelftest();
 int runRollingShutterSelftest();
 int runRotoSelftest();
@@ -963,6 +964,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Right-click pause preference resolver: default, booleans, numeric strings, invalid fallback" },
     { "context-menu-order", "VEDITOR_CONTEXT_MENU_ORDER_SELFTEST", runContextMenuOrderSelftest, true,
       "Preview & audio context menu hit-test, per-target customizable ordering, text/SFX helpers and inline edit (8 gates)" },
+    { "platform-loudness", "VEDITOR_PLATFORM_LOUDNESS_SELFTEST", runPlatformLoudnessSelftest, true,
+      "Platform-specific LUFS loudness normalization presets, true-peak clamp, single/all-clips scope, undo and ExportDialog sync (8 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
