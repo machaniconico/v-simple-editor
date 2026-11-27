@@ -363,6 +363,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/competitor_gap_selftest.cpp
     src/selftests/competitor_gap_p1_selftest.cpp
     src/selftests/competitor_gap_p2_selftest.cpp
+    src/selftests/radeon_amf_selftest.cpp
+    src/selftests/amd_gpu_support_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -787,6 +789,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/MogrtTemplate.cpp
     src/AafExchange.h
     src/AafExchange.cpp
+    src/GpuVendorSupport.h
+    src/GpuVendorSupport.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp

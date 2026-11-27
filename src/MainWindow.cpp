@@ -10,6 +10,7 @@
 #include "CreatorTools.h"
 #include "DuplicateFrameDetector.h"
 #include "ExternalGenerator.h"
+#include "GpuVendorSupport.h"
 #include "LottiePlayer.h"
 #include "MogrtTemplate.h"
 #include "OtioImport.h"
@@ -6938,6 +6939,20 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({aafExportAction,
         QStringLiteral("Avid / Pro Tools / Premiere / Resolve 互換のバイナリ AAF (.aaf) を書き出します。")});
+
+    auto *gpuDiagAction = toolsMenu->addAction(
+        QStringLiteral("GPU / AMD Radeon 対応診断・設定…"));
+    gpuDiagAction->setObjectName("action_gpu_vendor_diagnostics");
+    connect(gpuDiagAction, &QAction::triggered, this, [this]() {
+        gpuvendor::GpuDiagnosticsDialog dlg({}, {}, {}, this);
+        if (dlg.exec() == QDialog::Accepted && statusBar()) {
+            statusBar()->showMessage(
+                QStringLiteral("GPU / AI バックエンド設定を保存しました (%1)")
+                    .arg(gpuvendor::aiBackendDisplayName(dlg.selectedAiPreference())), 4000);
+        }
+    });
+    m_menuHelpEntries.append({gpuDiagAction,
+        QStringLiteral("AMD Radeon / NVIDIA / Intel GPU のエンコード・デコード・WGL-DX・DirectML/Vulkan 設定を確認します。")});
 
     // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
     auto *pptxExportAction = toolsMenu->addAction(

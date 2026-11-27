@@ -809,7 +809,13 @@ void RenderQueue::addJob(const RenderJob &job)
             : m_loudnessGainDb);
     cfg["width"] = copy.width;
     cfg["height"] = copy.height;
-    cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
+    const QString explicitCodec =
+        cfg.value(QStringLiteral("videoCodec")).toString().trimmed();
+    if (explicitCodec.isEmpty()) {
+        cfg["videoCodec"] = mapCodecToEncoderName(copy.codec);
+    } else {
+        copy.codec = explicitCodec;
+    }
     cfg["videoBitrate"] = copy.bitrateBps / 1000;  // legacy config stores kbps
     if (!copy.preset.isEmpty())
         cfg["preset"] = copy.preset;
@@ -1417,12 +1423,17 @@ void RenderQueue::startRenderPipe(int jobIndex)
         const bool dispatchIsHlg =
             !dispatchIsProRes && dispatchHdrMode == QLatin1String("hlg");
         if (dispatchIsHdr10 || dispatchIsHlg) {
-            // US-B3-7: route HDR jobs to subprocess fallback only when the
-            // currently loaded avcodec DLL has no 10-bit HEVC encoder. If a
-            // 10-bit HEVC encoder is present, fall through to the in-process
-            // FrameEncoder path (videoCodecName + isHdr10/isHlg are set
-            // below) which can emit a genuine 10-bit HDR stream directly.
-            if (!libavcore::tenBitHevcEncoderAvailable()) {
+            libavcore::EncodeRequest policy;
+            applyHardwareEncodingConfig(cfg, policy);
+            const auto candidates = libavcore::tenBitHevcEncoderCandidateNames(
+                policy.useHardwareAccel, policy.hwVendorHint);
+            const auto usableTenBit = libavcore::firstTenBitHevcEncoder(
+                candidates,
+                [](const std::string &name) {
+                    return CodecDetector::isTenBitEncoderAvailable(
+                        QString::fromStdString(name));
+                });
+            if (!usableTenBit.has_value()) {
                 startRenderPipeSubprocess(jobIndex);
                 return;
             }
@@ -1599,7 +1610,16 @@ void RenderQueue::startRenderPipe(int jobIndex)
         && videoCodec != QLatin1String("hevc_nvenc")
         && videoCodec != QLatin1String("hevc_qsv")
         && videoCodec != QLatin1String("hevc_amf")) {
-        const auto probed = libavcore::firstTenBitHevcEncoder();
+        libavcore::EncodeRequest policy;
+        applyHardwareEncodingConfig(cfg, policy);
+        const auto candidates = libavcore::tenBitHevcEncoderCandidateNames(
+            policy.useHardwareAccel, policy.hwVendorHint);
+        const auto probed = libavcore::firstTenBitHevcEncoder(
+            candidates,
+            [](const std::string &name) {
+                return CodecDetector::isTenBitEncoderAvailable(
+                    QString::fromStdString(name));
+            });
         if (probed.has_value() && !probed->empty())
             videoCodec = QString::fromStdString(*probed);
         else
@@ -1714,6 +1734,7 @@ void RenderQueue::startRenderPipe(int jobIndex)
             static_cast<int64_t>(videoBitrateKbps) * 1000;
     }
     request.videoCodecName = videoCodec.toUtf8().toStdString();
+    applyHardwareEncodingConfig(cfg, request);
     request.isHdr10 = isHdr10;
     request.isHlg = isHlg;
     request.proresProfile = proresProfile;
@@ -2666,13 +2687,42 @@ int RenderQueue::findJobIndexByUuid(const QString &uuid) const
 
 QString RenderQueue::mapCodecToEncoderName(const QString &codec)
 {
-    // The flat-field codec uses Premiere/Resolve naming; map it to the
-    // libavcore encoder name the render-pipe expects.
     if (codec == "h264") return "libx264";
     if (codec == "hevc" || codec == "h265") return "libx265";
-    if (codec == "av1") return "libsvtav1";
+    if (codec == "av1") return CodecDetector::bestSoftwareAv1Encoder();
     if (codec == "prores") return "prores_ks";
-    return codec;  // already-prefixed names pass through (libx264, libvpx-vp9...)
+    return codec;
+}
+
+void RenderQueue::applyHardwareEncodingConfig(
+    const QJsonObject &config,
+    libavcore::EncodeRequest &request)
+{
+    QString vendor = config.value(QStringLiteral("hwEncoder"))
+                         .toString()
+                         .trimmed()
+                         .toLower();
+    const bool enabled = config.contains(QStringLiteral("useHardwareAccel"))
+        ? config.value(QStringLiteral("useHardwareAccel")).toBool()
+        : (!vendor.isEmpty() && vendor != QLatin1String("none"));
+
+    if (!enabled || vendor == QLatin1String("none")) {
+        request.useHardwareAccel = false;
+        request.hwVendorHint = "none";
+        return;
+    }
+
+    if (vendor.isEmpty())
+        vendor = QStringLiteral("auto");
+    if (vendor != QLatin1String("auto")
+        && vendor != QLatin1String("nvenc")
+        && vendor != QLatin1String("qsv")
+        && vendor != QLatin1String("amf")) {
+        vendor = QStringLiteral("auto");
+    }
+
+    request.useHardwareAccel = true;
+    request.hwVendorHint = vendor.toStdString();
 }
 
 QString RenderQueue::defaultContainerFor(const QString &codec)

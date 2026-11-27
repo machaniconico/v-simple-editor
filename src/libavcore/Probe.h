@@ -19,8 +19,10 @@
 //   automatically — no recompile needed.
 // ===========================================================================
 
+#include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -55,6 +57,23 @@ std::optional<std::string> probeVideoCodecName(const std::string& filePath);
 // MediaFoundation silently downgrades 10-bit input to 8-bit NV12.
 // Returns std::nullopt when no qualifying encoder is found.
 std::optional<std::string> firstTenBitHevcEncoder();
+
+// Same ordered capability probe, additionally filtering each qualifying name
+// through a caller-supplied runtime predicate (rejecting missing GPU runtimes).
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::function<bool(const std::string&)>& runtimeAvailable);
+
+// Build policy-compatible HDR 10-bit HEVC encoder order: explicit vendors
+// never spill into another vendor; "auto" prefers GPU before libx265;
+// software-only returns only libx265.
+std::vector<std::string> tenBitHevcEncoderCandidateNames(
+    bool useHardwareAccel,
+    const std::string& hwVendorHint);
+
+// Probe a caller-provided policy order with static 10-bit + runtime filter.
+std::optional<std::string> firstTenBitHevcEncoder(
+    const std::vector<std::string>& candidates,
+    const std::function<bool(const std::string&)>& runtimeAvailable);
 
 // Convenience wrapper: returns true iff firstTenBitHevcEncoder() has a value.
 bool tenBitHevcEncoderAvailable();

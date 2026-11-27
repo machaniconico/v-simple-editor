@@ -109,6 +109,11 @@ public:
     explicit RenderQueue(QObject *parent = nullptr);
     ~RenderQueue();
 
+    // Convert persisted exportConfig hardware selection into libavcore::EncodeRequest.
+    static void applyHardwareEncodingConfig(
+        const QJsonObject &config,
+        libavcore::EncodeRequest &request);
+
     // Spec API — preferred for new code (uuid-keyed).
     void addJob(const RenderJob &job);
     void removeJob(const QString &uuid);
