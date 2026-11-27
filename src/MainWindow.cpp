@@ -3,12 +3,15 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include "AafExchange.h"
 #include "AeProTools.h"
 #include "ClipRoles.h"
 #include "ContextMenuOrder.h"
 #include "CreatorTools.h"
 #include "DuplicateFrameDetector.h"
 #include "ExternalGenerator.h"
+#include "LottiePlayer.h"
+#include "MogrtTemplate.h"
 #include "OtioImport.h"
 #include "PowerBinStore.h"
 #include "SubclipStore.h"
@@ -5848,6 +5851,44 @@ void MainWindow::setupMenuBar()
         statusBar()->showMessage(QStringLiteral("OTIO をインポートしました: %1").arg(parsed.name), 5000);
     });
 
+    auto *importLottieAct = insertMenu->addAction(QStringLiteral("Lottie アニメーションを挿入 (.json)…"));
+    connect(importLottieAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        lottie::LottieImportDialog dlg(m_timeline, this);
+        if (dlg.exec() == QDialog::Accepted) {
+            m_timeline->refreshPlaybackSequence();
+            statusBar()->showMessage(QStringLiteral("Lottie アニメーションを挿入しました"), 4000);
+        }
+    });
+
+    auto *mogrtBrowserAct = insertMenu->addAction(QStringLiteral("モーショングラフィックス・テンプレート (MOGRT)…"));
+    connect(mogrtBrowserAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        mogrt::MogrtBrowserDialog dlg(m_timeline, this);
+        if (dlg.exec() == QDialog::Accepted) {
+            m_timeline->refreshPlaybackSequence();
+            statusBar()->showMessage(
+                QStringLiteral("MOGRT テンプレートを挿入しました: %1").arg(dlg.currentTemplate().name), 4000);
+        }
+    });
+
+    auto *importAafAct = insertMenu->addAction(QStringLiteral("AAF タイムラインをインポート (.aaf)…"));
+    connect(importAafAct, &QAction::triggered, this, [this]() {
+        if (!m_timeline) return;
+        const QString path = QFileDialog::getOpenFileName(
+            this, QStringLiteral("AAF (.aaf) をインポート"),
+            QString(), QStringLiteral("Advanced Authoring Format (*.aaf);;All Files (*)"));
+        if (path.isEmpty()) return;
+        const aaf::AafImportResult parsed = aaf::readAafFile(path);
+        QString err;
+        if (!aaf::applyAafToTimeline(m_timeline, parsed, &err)) {
+            QMessageBox::warning(this, QStringLiteral("AAF インポート失敗"), err);
+            return;
+        }
+        m_timeline->refreshPlaybackSequence();
+        statusBar()->showMessage(QStringLiteral("AAF をインポートしました: %1").arg(parsed.projectName), 5000);
+    });
+
     auto *dupCheckAct = insertMenu->addAction(QStringLiteral("重複フレームを検出…"));
     connect(dupCheckAct, &QAction::triggered, this, [this]() {
         if (!m_timeline) return;
@@ -6861,6 +6902,42 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({otioExportAction,
         QStringLiteral("アクティブなシーケンスを OpenTimelineIO (.otio) として書き出します。")});
+
+    auto *aafExportAction = toolsMenu->addAction(
+        QStringLiteral("AAF 書き出し (.aaf)…"));
+    aafExportAction->setObjectName("action_aaf_export");
+    connect(aafExportAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("AAF 書き出し"),
+                QStringLiteral("タイムラインが初期化されていません。"));
+            return;
+        }
+        aaf::AafExportOptions defaults;
+        defaults.projectName = m_projectConfig.name.isEmpty()
+            ? QStringLiteral("Untitled") : m_projectConfig.name;
+        defaults.fps = m_projectConfig.fps > 0
+            ? static_cast<double>(m_projectConfig.fps) : 30.0;
+        aaf::AafExchangeDialog dlg(defaults, this);
+        if (dlg.exec() != QDialog::Accepted)
+            return;
+        const aaf::AafExportOptions opts = dlg.options();
+        const QString outPath = QFileDialog::getSaveFileName(
+            this, QStringLiteral("AAF 書き出し"),
+            QDir::homePath() + QDir::separator() + opts.projectName + QStringLiteral(".aaf"),
+            QStringLiteral("Advanced Authoring Format (*.aaf);;All Files (*)"));
+        if (outPath.isEmpty())
+            return;
+        QString err;
+        if (!aaf::writeAafFile(m_timeline, opts, outPath, &err)) {
+            QMessageBox::warning(this, QStringLiteral("AAF 書き出し"),
+                QStringLiteral("書き出しに失敗しました: %1").arg(err));
+            return;
+        }
+        if (statusBar())
+            statusBar()->showMessage(QStringLiteral("AAF を書き出しました: %1").arg(outPath), 5000);
+    });
+    m_menuHelpEntries.append({aafExportAction,
+        QStringLiteral("Avid / Pro Tools / Premiere / Resolve 互換のバイナリ AAF (.aaf) を書き出します。")});
 
     // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
     auto *pptxExportAction = toolsMenu->addAction(
