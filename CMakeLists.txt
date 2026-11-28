@@ -361,6 +361,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/wave25_parity_selftest.cpp
     src/selftests/ext_generator_selftest.cpp
     src/selftests/competitor_gap_selftest.cpp
+    src/selftests/competitor_gap_p1_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -769,6 +770,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/GradeVersions.cpp
     src/CreatorTools.h
     src/CreatorTools.cpp
+    src/SubclipStore.h
+    src/SubclipStore.cpp
+    src/TimelineMinimap.h
+    src/TimelineMinimap.cpp
+    src/CreativeEffects.h
+    src/CreativeEffects.cpp
+    src/AeProTools.h
+    src/AeProTools.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp

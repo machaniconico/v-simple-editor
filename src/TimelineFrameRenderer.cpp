@@ -1,4 +1,5 @@
 #include "TimelineFrameRenderer.h"
+#include "CreativeEffects.h"
 #include "ExternalGenerator.h"
 #include "Timeline.h"
 #include "OpticalFlow.h"
@@ -1906,6 +1907,16 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              const ParkedSidecars &parkedSidecars,
                              bool rampEofHold = false)
 {
+    if (creative::hasAnyActiveConfig() && !clip.uid.isEmpty()) {
+        const creative::ClipCreativeConfig ccfg = creative::configForClip(clip.uid);
+        if (ccfg.posterizeTime.enabled) {
+            const double qLocal = creative::quantizePosterizeTime(clipLocalSec, ccfg.posterizeTime);
+            const double deltaLocal = qLocal - clipLocalSec;
+            clipLocalSec = qLocal;
+            const double spd = clip.speed > 0.0 ? clip.speed : 1.0;
+            sourceSec = qMax(clip.inPoint, sourceSec + (clip.reversed ? -deltaLocal : deltaLocal) * spd);
+        }
+    }
     if (!clip.shapes.isEmpty())
         return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
     if (extgen::isExternalGeneratorFilePath(clip.filePath))
@@ -2285,6 +2296,18 @@ QImage renderClipLayerSource(const Timeline *timeline,
             raw, clip, localSec, sourceSec, echoFrameProvider, rampMapping);
     } else {
         fx = applyClipFxStackFromSource(raw, clip, localSec);
+    }
+    if (creative::hasAnyActiveConfig() && !clip.uid.isEmpty() && !fx.isNull()) {
+        const creative::ClipCreativeConfig ccfg = creative::configForClip(clip.uid);
+        if (ccfg.halation.enabled)
+            fx = creative::applyFilmHalation(fx, ccfg.halation);
+        if (ccfg.cameraDof.enabled && clip.is3DLayer) {
+            const Camera3DState cam = timeline ? timeline->projectCamera() : Camera3DState{};
+            const double dist = creative::layerDistanceFromCamera(clip.layer3D, cam);
+            const double blurPx = creative::computeDofBlurRadiusPx(dist, ccfg.cameraDof);
+            if (blurPx >= 0.5)
+                fx = creative::applyCameraDofBlur(fx, blurPx);
+        }
     }
     // S7: the per-clip compositing mask (motion-tracker animated) on the
     // graded+FX'd native frame, before it is scaled onto the canvas. No-op

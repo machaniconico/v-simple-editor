@@ -1,10 +1,12 @@
 #include "RenderInPlace.h"
 #include "ContextMenuOrder.h"
 #include "ClipRoles.h"
+#include "CreativeEffects.h"
 #include "CreatorTools.h"
 #include "ExternalGenerator.h"
 #include "GradeVersions.h"
 #include "LoudnessPresets.h"
+#include "SubclipStore.h"
 #include <QFileDialog>
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
@@ -11001,6 +11003,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
     QAction *gradeVerAct = menu.addAction(QStringLiteral("カラーグレード・バージョン管理…"));
+    QAction *creativeFxAct = menu.addAction(QStringLiteral("フィルムハレーション / ポスタライズ時間 / 3D 被写界深度…"));
+    QAction *saveSubclipAct = menu.addAction(QStringLiteral("サブクリップとして保存"));
     QAction *beatCutAct = menu.addAction(QStringLiteral("ビート同期自動カット (A1 基準)…"));
     QMenu *vRoleMenu = menu.addMenu(QStringLiteral("ロールを設定"));
     QList<QPair<QAction *, cliproles::Role>> vRoleActions;
@@ -11242,6 +11246,22 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         gradeversions::GradeVersionsDialog dlg(this, trackIdx, clipIndex, this);
         dlg.exec();
         scheduleEmitSequenceChanged();
+    }
+    else if (chosen == creativeFxAct) {
+        if (clipInfo.uid.isEmpty()) return;
+        const QString label = clipInfo.displayName.isEmpty()
+            ? QFileInfo(clipInfo.filePath).fileName() : clipInfo.displayName;
+        creative::CreativeEffectsDialog dlg(clipInfo.uid, label, this);
+        if (dlg.exec() == QDialog::Accepted) {
+            scheduleEmitSequenceChanged();
+            emit statusMessageRequested(QStringLiteral("クリエイティブエフェクト設定を更新しました"), 3500);
+        }
+    }
+    else if (chosen == saveSubclipAct) {
+        const auto saved = subclips::createSubclipFromClip(clipInfo);
+        emit statusMessageRequested(
+            QStringLiteral("サブクリップを保存しました: %1 (%2s)")
+                .arg(saved.name).arg(saved.duration(), 0, 'f', 2), 4000);
     }
     else if (chosen == beatCutAct) {
         const int trackIdx = m_videoTracks.indexOf(track);
