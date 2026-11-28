@@ -36,7 +36,7 @@ jobs:
   windows-msvc-smoke:
     name: Windows MSVC Build & Selftest Smoke
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
 
     env:
       QT_QPA_PLATFORM: offscreen
@@ -51,25 +51,17 @@ jobs:
         with:
           arch: x64
 
-      - name: Cache vcpkg FFmpeg packages
-        id: cache-vcpkg
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\vcpkg\installed\x64-windows
-            C:\Users\runneradmin\AppData\Local\vcpkg\archives
-          key: vcpkg-ffmpeg-core-x64-win-v1-${{ hashFiles('CMakeLists.txt') }}
-          restore-keys: |
-            vcpkg-ffmpeg-core-x64-win-v1-
-
-      - name: Install FFmpeg (vcpkg)
-        shell: cmd
+      - name: Download prebuilt FFmpeg 8.1 (win64-gpl-shared)
+        shell: pwsh
         run: |
-          if not exist "C:\vcpkg\installed\x64-windows\include\libavformat\avformat.h" (
-            C:\vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,swscale,swresample]:x64-windows" --clean-after-build
-          ) else (
-            echo FFmpeg headers already cached in C:\vcpkg\installed\x64-windows
-          )
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          $ext = Join-Path $env:RUNNER_TEMP "ffmpeg_extract"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $ext -Force
+          $root = (Get-ChildItem -Directory $ext | Select-Object -First 1).FullName
+          Write-Host "FFMPEG_ROOT=$root"
+          "FFMPEG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Qt 6
         uses: jurplel/install-qt-action@v4
@@ -78,15 +70,14 @@ jobs:
           host: windows
           target: desktop
           arch: win64_msvc2022_64
-          modules: "qtmultimedia qtsvg qtimageformats"
+          modules: "qtmultimedia qtimageformats"
           cache: true
 
       - name: Configure CMake
         shell: cmd
         run: |
           cmake -S . -B build_win -G "Visual Studio 17 2022" -A x64 ^
-            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%;%FFMPEG_ROOT%"
 
       - name: Build Release
         shell: cmd
@@ -96,7 +87,7 @@ jobs:
       - name: Run Selftest Smoke Suite
         shell: pwsh
         run: |
-          $env:PATH = "$env:Qt6_DIR\bin;C:\vcpkg\installed\x64-windows\bin;$env:PATH"
+          $env:PATH = "$env:Qt6_DIR\bin;$env:FFMPEG_ROOT\bin;$env:PATH"
           $exe = "build_win\Release\v-simple-editor.exe"
           $suites = @("list", "tracker-preset", "hdr-routing", "radeon-amf", "puppet-arap", "context-menu-order")
           $fail = 0
