@@ -190,6 +190,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/mesh_warp_selftest.cpp
     src/selftests/special_composite_selftest.cpp
     src/selftests/stabilizer_export_selftest.cpp
+    src/selftests/ramp_export_selftest.cpp
     src/selftests/filejob_parity_selftest.cpp
     src/selftests/clip_sidecar_selftest.cpp
     src/selftests/surface_tool_selftest.cpp

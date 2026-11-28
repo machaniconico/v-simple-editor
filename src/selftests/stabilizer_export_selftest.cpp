@@ -337,6 +337,108 @@ QVector<int> keyFrameIndices(const QString &path, int *count)
     return keys;
 }
 
+// US-2400 G17 media: the G16 box movie (same pictures, mpeg4 in mp4, no B frames)
+// with a fixed GOP of `gop` frames. FrameEncoder keeps the codec's default GOP (12,
+// G16's media), so this writes the stream through libavcodec directly.
+bool writeBoxMovieGop(const QString &path, const QColor &background, int gop)
+{
+    const QByteArray file = path.toUtf8();
+    const AVCodec *codec = avcodec_find_encoder_by_name("mpeg4");
+    AVFormatContext *fmt = nullptr;
+    if (!codec || avformat_alloc_output_context2(&fmt, nullptr, nullptr, file.constData()) < 0
+        || !fmt)
+        return false;
+    AVCodecContext *ctx = avcodec_alloc_context3(codec);
+    AVStream *stream = avformat_new_stream(fmt, nullptr);
+    AVFrame *frame = av_frame_alloc();
+    AVPacket *packet = av_packet_alloc();
+    bool ok = ctx && stream && frame && packet;
+    bool header = false;
+    if (ok) {
+        ctx->width = kMovW;
+        ctx->height = kMovH;
+        ctx->time_base = AVRational{1, kFps};
+        ctx->framerate = AVRational{kFps, 1};
+        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
+        ctx->bit_rate = 4000000;
+        ctx->gop_size = gop;
+        ctx->max_b_frames = 0;
+        if (fmt->oformat->flags & AVFMT_GLOBALHEADER)
+            ctx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+        ok = avcodec_open2(ctx, codec, nullptr) >= 0
+            && avcodec_parameters_from_context(stream->codecpar, ctx) >= 0;
+    }
+    if (ok) {
+        stream->time_base = ctx->time_base;
+        stream->avg_frame_rate = ctx->framerate;
+        ok = avio_open(&fmt->pb, file.constData(), AVIO_FLAG_WRITE) >= 0
+            && avformat_write_header(fmt, nullptr) >= 0;
+        header = ok;
+    }
+    if (ok) {
+        frame->format = AV_PIX_FMT_YUV420P;
+        frame->width = kMovW;
+        frame->height = kMovH;
+        ok = av_frame_get_buffer(frame, 0) >= 0;
+    }
+    const auto drain = [&]() {
+        while (ok && avcodec_receive_packet(ctx, packet) == 0) {
+            packet->duration = 1; // one frame (the frame rate the player reads)
+            av_packet_rescale_ts(packet, ctx->time_base, stream->time_base);
+            packet->stream_index = stream->index;
+            ok = av_interleaved_write_frame(fmt, packet) >= 0;
+        }
+    };
+    // BT.601 limited range, as the decoder's sws conversion reads it back.
+    const auto yuv = [](const QColor &c, int *y, int *u, int *v) {
+        const double r = c.red(), g = c.green(), b = c.blue();
+        *y = qRound(16.0 + (65.481 * r + 128.553 * g + 24.966 * b) / 255.0);
+        *u = qRound(128.0 + (-37.797 * r - 74.203 * g + 112.0 * b) / 255.0);
+        *v = qRound(128.0 + (112.0 * r - 93.786 * g - 18.214 * b) / 255.0);
+    };
+    int bgY = 0, bgU = 0, bgV = 0, boxY = 0, boxU = 0, boxV = 0;
+    yuv(background, &bgY, &bgU, &bgV);
+    yuv(Qt::white, &boxY, &boxU, &boxV);
+    for (int n = 0; ok && n < kMovFrames; ++n) {
+        ok = av_frame_make_writable(frame) >= 0;
+        const QPoint box = movBoxAt(n); // even corner and size: whole chroma samples
+        for (int y = 0; ok && y < kMovH; ++y) {
+            uint8_t *row = frame->data[0] + y * frame->linesize[0];
+            for (int x = 0; x < kMovW; ++x) {
+                const bool in = x >= box.x() && x < box.x() + 12 && y >= box.y()
+                    && y < box.y() + 12;
+                row[x] = uint8_t(in ? boxY : bgY);
+            }
+        }
+        for (int y = 0; ok && y < kMovH / 2; ++y) {
+            uint8_t *u = frame->data[1] + y * frame->linesize[1];
+            uint8_t *v = frame->data[2] + y * frame->linesize[2];
+            for (int x = 0; x < kMovW / 2; ++x) {
+                const bool in = 2 * x >= box.x() && 2 * x < box.x() + 12 && 2 * y >= box.y()
+                    && 2 * y < box.y() + 12;
+                u[x] = uint8_t(in ? boxU : bgU);
+                v[x] = uint8_t(in ? boxV : bgV);
+            }
+        }
+        frame->pts = n;
+        ok = ok && avcodec_send_frame(ctx, frame) >= 0;
+        drain();
+    }
+    if (ok) {
+        ok = avcodec_send_frame(ctx, nullptr) >= 0;
+        drain();
+    }
+    if (header)
+        ok = av_write_trailer(fmt) >= 0 && ok;
+    if (fmt->pb)
+        avio_closep(&fmt->pb);
+    av_packet_free(&packet);
+    av_frame_free(&frame);
+    avcodec_free_context(&ctx);
+    avformat_free_context(fmt);
+    return ok;
+}
+
 // Centroid of the bright (min channel > 160) pixels: the box.
 struct Spot {
     int n = 0;
@@ -2169,8 +2271,8 @@ int runStabilizerExportSelftest()
     // active keyed V2 (V1 empty) at videoDx -0.375 over a V3 layer: V2 +4, V3 still,
     // no GL keys; (d) V1 +8 and V2 +4: each its own; (e) (b)'s ramped V2 composed
     // with V1: x 52; (f) a lone keyed V1 with (b)'s ramp: the GL matrix and read-back
-    // at the decoder's position (1.5 s, x 52); renderFrameAt stays at x 48 (no video
-    // speed ramp, declared difference); (g) a re-present of (d)'s frame
+    // at the decoder's position (1.5 s, x 52), and renderFrameAt at the same source
+    // time (x 52, US-2401: export follows the speed ramp); (g) a re-present of (d)'s frame
     // (setTextOverlays) and a composite frame cache hit of it keep the upload and no
     // GL keys; (h) a lone keyed V2 under a still compare: keys off and identity while
     // comparing, back to (a)'s matrix after. HEAD: (a)(b)(h) GL keys off and the dot
@@ -2315,8 +2417,8 @@ int runStabilizerExportSelftest()
                   << matrixText(eb) << " read-back " << boxText(bDot) << " ok=" << bOk;
 
                 // (f) the same on V1: the GL samples at its decoder's position (1.5 s,
-                // x 52). Declared difference: renderFrameAt applies no video speed
-                // ramp (its picture and keys are at 1.0 s, x 48; S0-1 (c)).
+                // x 52), and renderFrameAt at the same source time (US-2401: export
+                // follows the speed ramp, its picture and keys at 1.5 s, x 52).
                 ClipInfo v1Ramped = withKeys(seqClip(seqC), rampKeys);
                 v1Ramped.speedRamp = ramp15;
                 const QImage fExport = exportAt({{v1Ramped}}, 1.0);
@@ -2325,7 +2427,7 @@ int runStabilizerExportSelftest()
                 const Box fDot = whiteBox(grab(), glArea);
                 const Box fExp = whiteBox(fExport);
                 fOk = view->stabEnabledForTest() && sameM(mf, eb) && dotAt(fDot, 52, 40)
-                    && dotAt(fExp, 48, 40);
+                    && dotAt(fExp, 52, 40);
                 d << " (f) ramped lone V1 gl " << glState() << " read-back " << boxText(fDot)
                   << " renderFrameAt " << boxText(fExp) << " ok=" << fOk;
                 player.setSpeedRamps({});
@@ -2375,8 +2477,9 @@ int runStabilizerExportSelftest()
                 player.setSpeedRamps({});
                 return shown;
             };
-            // `exported` null: no renderFrameAt comparison ((e): renderFrameAt does not
-            // apply a video speed ramp, so it is printed only).
+            // `exported` null: no renderFrameAt comparison ((e): the composed frame is
+            // compared on the dots only; renderFrameAt's V2, which follows the speed ramp
+            // since US-2401, is printed beside it).
             const auto cLeg = [&](const char *name, const QImage &shown, const QImage &exported,
                                   QPoint v1Dot, QPoint v2Dot) {
                 const int diff = exported.isNull() ? 0 : maxDiff(shown, exported);
@@ -2465,9 +2568,8 @@ int runStabilizerExportSelftest()
             const auto [eRes, eGl] = cLeg("(e)", composed({}, rampKeys, true), QImage(),
                                           QPoint(10, 10), QPoint(52, 40));
             eOk = eRes;
-            d << " (renderFrameAt V2 " << boxText(whiteBox(exportAt({{v1Left}, {v2Ramped}}, 1.0),
-                                                           v2Area))
-              << ')';
+            d << " (renderFrameAt V2, ramped since US-2401: "
+              << boxText(whiteBox(exportAt({{v1Left}, {v2Ramped}}, 1.0), v2Area)) << ')';
             cGlOk = c1Gl && c2Gl && dGl && eGl;
 
             // (b) with an Echo baked on the CPU: the lone ramped V2 (64x64, Echo 2
@@ -2542,6 +2644,9 @@ int runStabilizerExportSelftest()
     QString encWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encWhy)) {
         tally.skip(16, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+        tally.skip(17, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+        tally.skip(18, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
+        tally.skip(19, ("mpeg4 encoder unavailable (environment): " + encWhy).toStdString().c_str());
     } else {
         std::ostringstream d;
         const QString movA = dir + QStringLiteral("/g16a.mp4");
@@ -2848,16 +2953,23 @@ int runStabilizerExportSelftest()
             d << " ok=" << ok;
             return ok;
         };
-        // Plays until the first frame presented at or past `boundaryUs`, then captures
+        // Plays until the `needPast`-th frame presented at or past `boundaryUs`, then captures
         // the GL state at once (before pausing); `past` says whether it got there.
-        const auto playOut = [&](Rig &r, qint64 boundaryUs, bool &past) {
+        const auto playOut = [&](Rig &r, qint64 boundaryUs, bool &past, qint64 *outAt = nullptr,
+                                 int needPast = 1, bool *firstBaked = nullptr) {
             past = false;
+            int seenPast = 0;
             qint64 at = -1;
             const auto conn = QObject::connect(
                 r.p, &VideoPlayer::frameComposited, r.window.get(), [&](const QImage &) {
                     if (!past && playhead(r) >= boundaryUs) {
-                        past = true;
-                        at = playhead(r);
+                        ++seenPast;
+                        if (seenPast == 1 && firstBaked && r.view)
+                            *firstBaked = r.view->compositeBakedMode();
+                        if (seenPast >= needPast) {
+                            past = true;
+                            at = playhead(r);
+                        }
                     }
                 });
             r.p->play();
@@ -2869,6 +2981,8 @@ int runStabilizerExportSelftest()
             r.p->pause();
             QObject::disconnect(conn);
             pumpEvents(40);
+            if (outAt)
+                *outAt = at;
             d << " (first out at " << frameAt(at) << "f past=" << past << ')';
             return s;
         };
@@ -3270,7 +3384,7 @@ int runStabilizerExportSelftest()
                 r.p->stepForward();
                 pumpEvents(40);
                 ok16 = sameState("(f) shape stepForward out", direct, capture(r), true) && ok16;
-                // The same by playback: recorded only (HEAD's form, A8).
+                // The same by playback (US-2404: promoted from recorded to gated after US-2400).
                 seekTo(r, frameUs(15) + 1000);
                 bool past = false;
                 const GlState across = playOut(r, us(1.5), past);
@@ -3278,8 +3392,8 @@ int runStabilizerExportSelftest()
                 seekTo(r, frameUs(44) + 1000);
                 const GlState afterSeek = playOut(r, us(1.5), past);
                 ok16 = past && ok16;
-                sameState("(f) shape play out after a seek [recorded, not gated]", across,
-                          afterSeek, false);
+                ok16 = sameState("(f) shape play out after a seek", across, afterSeek, false)
+                    && ok16;
             } else {
                 ok16 = false;
             }
@@ -3485,6 +3599,1235 @@ int runStabilizerExportSelftest()
             tally.skip(16, ("GL preview unavailable (environment); " + d.str()).c_str());
         else
             tally.gate(16, ok16 && allGl, d.str());
+
+        // US-2400 G17: where the nested-sequence SSOT shows the frame and the decoder
+        // is only the clock (S = shape clip, H = hidden clip, N = nest; plain = no
+        // SSOT), the forward tick, a frame step and the clip-local CPU preview first
+        // decode the decoder, without displaying, up to the playhead a seek left it
+        // behind (a shape / hidden-clip seek decodes nothing, a preview seek stops at
+        // the key frame). Media: G16's box movies with a fixed 60-frame GOP (key frame
+        // + 10 = f70, + 28 = f88) and one with a single key frame (150). V1 = A (0-3 s)
+        // | B (from source f70, 3-5 s) | C (0-1 s, 5-6 s). Counters, no GL: the
+        // reprojections updatePositionUi rejected as stale, the decoder syncs and the
+        // guard's skips; positionChanged after play() (one value's emission burst is
+        // one value). GL only for (d1)'s picture and (h)'s composite. HEAD (Step 0
+        // S0-1 (a)(c)(i)(j)): (a)(b)(d2)(e) [S][H] / [N] (e) and the ramp leg reject
+        // reprojections and hold the playhead, (d1) probes -10 frames, (h) composes
+        // the frame a step decoded before the seek.
+        d.str(std::string());
+        d.clear();
+        {
+            const QString movG = dir + QStringLiteral("/g17a.mp4");
+            const QString movH = dir + QStringLiteral("/g17b.mp4");
+            const QString movL = dir + QStringLiteral("/g17long.mp4");
+            const bool mov17Ok = writeBoxMovieGop(movG, QColor(70, 70, 70), 60)
+                && writeBoxMovieGop(movH, QColor(20, 20, 110), 60)
+                && writeBoxMovieGop(movL, QColor(70, 70, 70), kMovFrames);
+            bool ok17 = mov17Ok;
+            for (const auto &[path, expectGop] :
+                 {std::pair<QString, int>{movG, 60}, {movH, 60}, {movL, kMovFrames}}) {
+                int packets = 0;
+                const QVector<int> keys = keyFrameIndices(path, &packets);
+                bool fixed = packets == kMovFrames
+                    && keys.size() == (kMovFrames + expectGop - 1) / expectGop;
+                for (int i = 0; fixed && i < keys.size(); ++i)
+                    fixed = keys[i] == i * expectGop;
+                ok17 = ok17 && fixed;
+                d << "media packets=" << packets << " keys=" << keys.size() << " gop "
+                  << expectGop << " fixed=" << fixed << ';';
+            }
+            const auto shapeClip17 = [](double leadIn, double length) {
+                Shape box;
+                box.type = ShapeType::Rectangle;
+                box.properties.size = QSizeF(40.0, 24.0);
+                box.position = QPointF(30.0, 124.0);
+                box.fill.color = QColor(230, 20, 20, 255);
+                box.fill.opacity = 1.0;
+                box.fill.enabled = true;
+                box.fill.gradient = false;
+                box.stroke.enabled = false;
+                ClipInfo shape;
+                shape.displayName = QStringLiteral("shape");
+                shape.duration = shape.outPoint = length;
+                shape.leadInSec = leadIn;
+                shape.shapes = {box};
+                return shape;
+            };
+            const auto hidden17 = [&]() {
+                ClipInfo hidden = movClip(movH, 0.0, 0.5);
+                hidden.leadInSec = 5.2;
+                hidden.visible = false;
+                return hidden;
+            };
+            const auto tracksOf = [](const QVector<QVector<ClipInfo>> &tracks) {
+                return [tracks](Timeline *tl) {
+                    tl->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0,
+                                           100);
+                };
+            };
+            const QVector<ClipInfo> v1 = {movClip(movG, 0.0, 3.0),
+                                          movClip(movH, double(frameUs(70)) / 1e6, 2.0),
+                                          movClip(movG, 0.0, 1.0)};
+            const auto build17 = [&](char kind) -> std::function<void(Timeline *)> {
+                if (kind == 'N') {
+                    return [&](Timeline *tl) {
+                        const TimelineSequence child = seqOf(
+                            QStringLiteral("child17"), {{withKeys(v1[0], {key(0.0, 4.0)}), v1[1]}});
+                        const TimelineSequence main = seqOf(
+                            QStringLiteral("main17"),
+                            {{refTo(QStringLiteral("child17"), 5.0, 0.0), v1[2]}});
+                        tl->setSequences({main, child}, QStringLiteral("main17"));
+                    };
+                }
+                if (kind == 'S')
+                    return tracksOf({v1, {shapeClip17(1.0, 1.8), shapeClip17(0.1, 0.7)}});
+                if (kind == 'H')
+                    return tracksOf({v1, {hidden17()}});
+                return tracksOf({v1});
+            };
+            bool gl17 = true;
+            int rigs17 = 0;
+            const auto rejects = [](Rig &r) { return r.p->staleReprojectionRejectsForTest(); };
+            const auto syncs = [](Rig &r) { return r.p->decoderSyncsForTest(); };
+            // A paused seek with an explicit offset (default 1 ms; exact keyframes 0) through seek(ms) or
+            // previewSeek(ms) (the scrub's non-precise seek), run by the seek timer.
+            const auto seekMs = [&](Rig &r, int f, bool precise, int offsetMs = 1) {
+                const int ms = int(frameUs(f) / 1000) + offsetMs;
+                if (precise)
+                    r.p->seek(ms);
+                else
+                    r.p->previewSeek(ms);
+                QElapsedTimer timer;
+                timer.start();
+                while (timer.elapsed() < 3000 && (r.p->m_pendingSeekMs >= 0 || r.p->m_seekInProgress))
+                    QApplication::processEvents(QEventLoop::AllEvents, 2);
+                pumpEvents(40);
+            };
+            struct Run {
+                Emits v;
+                std::vector<int> syncsAt;
+                int rej = 0;
+                int sync = 0;
+                bool mono = false;
+                qint64 reach = -1;
+            };
+            // positionChanged from play() until a value past `stopUs` (at least 6) or
+            // `maxMs`, then pause; the rejects and syncs during it.
+            const auto play17 = [&](Rig &r, qint64 stopUs, int maxMs) {
+                Run run;
+                const int rej0 = rejects(r);
+                const int s0 = syncs(r);
+                QElapsedTimer timer;
+                const auto conn = QObject::connect(
+                    r.p, &VideoPlayer::positionChanged, r.window.get(), [&](double sec) {
+                        run.v.push_back({timer.elapsed(), qRound64(sec * 1000000.0)});
+                        run.syncsAt.push_back(syncs(r) - s0);
+                    });
+                timer.start();
+                r.p->play();
+                while (timer.elapsed() < maxMs && !(run.v.size() >= 6 && run.v.back().second > stopUs))
+                    QApplication::processEvents(QEventLoop::AllEvents, 2);
+                r.p->pause();
+                QObject::disconnect(conn);
+                run.rej = rejects(r) - rej0;
+                run.sync = syncs(r) - s0;
+                pumpEvents(40);
+                return run;
+            };
+            // Never below an earlier value (a burst repeats one value), and the time
+            // (from play()) of the first value at or past `reachUs`.
+            const auto flow17 = [&](const char *name, Run &run, qint64 reachUs) {
+                run.mono = !run.v.empty();
+                qint64 top = -1;
+                std::ostringstream back;
+                std::ostringstream syncFrames;
+                for (size_t i = 0; i < run.v.size(); ++i) {
+                    const auto &e = run.v[i];
+                    if (e.second < top && back.tellp() == 0)
+                        back << " back=" << e.first << "ms:" << frameAt(top) << "f->"
+                             << frameAt(e.second) << 'f';
+                    run.mono = run.mono && e.second >= top;
+                    top = qMax(top, e.second);
+                    if (run.reach < 0 && e.second >= reachUs)
+                        run.reach = e.first;
+                    if (run.syncsAt[i] > (i ? run.syncsAt[i - 1] : 0))
+                        syncFrames << (syncFrames.tellp() == 0 ? "" : ",") << frameAt(e.second) << 'f';
+                }
+                d << ' ' << name << " rej=" << run.rej << " syncs=" << run.sync
+                  << " positionChanged(ms:frame/syncs)=";
+                for (size_t i = 0; i < run.v.size() && i < 12; ++i)
+                    d << (i ? "," : "") << run.v[i].first << ':' << frameAt(run.v[i].second) << '/'
+                      << run.syncsAt[i];
+                d << " emits=" << run.v.size() << " syncs at " << syncFrames.str() << back.str()
+                  << " monotonic=" << run.mono << " reach " << frameAt(reachUs) << "f=" << run.reach
+                  << "ms";
+                return run.rej == 0 && run.mono && run.reach >= 0;
+            };
+            // The source frame whose box the picture shows (-1: none).
+            const auto boxFrameOf = [](const QImage &image) {
+                const Spot spot = brightSpot(image);
+                for (int n = 0; spot.n >= 100 && n < kMovFrames; ++n) {
+                    const QPoint box = movBoxAt(n);
+                    if (std::abs(spot.x - (box.x() + 5.5)) <= 2.0
+                        && std::abs(spot.y - (box.y() + 5.5)) <= 2.0)
+                        return n;
+                }
+                return -1;
+            };
+            const QVector<VideoEffect> grain17{VideoEffect::createFilmGrain(0.3, 1, 0.0, false)};
+            for (const char kind : {'P', 'N', 'S', 'H'}) {
+                const char name[] = {kind == 'P' ? 'p' : kind, '\0'};
+                const bool ssot = kind != 'P';
+                const bool media = kind == 'S' || kind == 'H';
+                Rig r;
+                if (!open(r, kind == 'P' ? "plain17" : name, build17(kind))) {
+                    ok17 = false;
+                    continue;
+                }
+                ++rigs17;
+                gl17 = gl17 && r.gl;
+                const int syncs0 = syncs(r);
+                d << " {" << (kind == 'P' ? "plain" : name) << '}';
+                // Control: play from the key frame f60.
+                seekMs(r, 60, true, 0);
+                Run ctrl = play17(r, frameUs(66), 3000);
+                const bool ctrlOk = flow17("control f60", ctrl, frameUs(63));
+                if (media) {
+                    // (a)(b) precise paused seek to key frame + 10 / + 28 -> play();
+                    // (g1) the seek syncs nothing, the first tick once, later ticks not.
+                    for (const int f : {70, 88}) {
+                        const int sBefore = syncs(r);
+                        seekMs(r, f, true);
+                        const int seekSyncs = syncs(r) - sBefore;
+                        Run run = play17(r, frameUs(f + 6), 3000);
+                        const std::string leg = std::string(f == 70 ? "(a)" : "(b)") + " seek f"
+                            + std::to_string(f);
+                        bool ok = flow17(leg.c_str(), run, frameUs(f + 3));
+                        // (time) against the control in the same rig.
+                        const bool timeOk = ctrl.reach > 0 && run.reach >= 0
+                            && run.reach <= ctrl.reach * 5 / 2;
+                        d << " controlReachMs=" << ctrl.reach << " vsControlRatio="
+                          << (ctrl.reach > 0 ? double(run.reach) / ctrl.reach : -1.0)
+                          << " vsControl(<=2.5x)=" << timeOk << " (g1) seek syncs=" << seekSyncs;
+                        // f88 may sync again at the A|B entry change at f90:
+                        // advanceToEntry uses SeekOnly for the new entry.
+                        const bool g1 = seekSyncs == 0 && (f == 70 ? run.sync == 1
+                            : run.sync >= 1 && run.sync <= 2);
+                        d << " (g1) ok=" << g1;
+                        ok = ok && g1;
+                        ok17 = ok && timeOk && ok17;
+                    }
+                    // (d1) seek f70 -> stepForward: the SSOT picture at the playhead and
+                    // the decoder's next frame after it; (d2) again, then play().
+                    {
+                        seekMs(r, 70, true);
+                        const int s1 = syncs(r);
+                        r.p->stepForward();
+                        pumpEvents(40);
+                        const qint64 at = playhead(r);
+                        const int stepSyncs = syncs(r) - s1;
+                        d << " (d1) stepForward playhead=" << frameAt(at) << "f syncs=" << stepSyncs;
+                        bool ok = stepSyncs == 1;
+                        if (r.gl)
+                            ok = shownLeg(r, "(d1) picture", at, -1, {}) && ok;
+                        else
+                            d << " (d1) picture skipped (GL unavailable)";
+                        ok = probeLeg(r, "(d1)", at + frameUs(1), -1, 1) && ok;
+                        seekMs(r, 30, true);
+                        seekMs(r, 70, true);
+                        const int s2 = syncs(r);
+                        r.p->stepForward();
+                        pumpEvents(40);
+                        const int step2 = syncs(r) - s2;
+                        const qint64 from = playhead(r);
+                        Run run = play17(r, from + frameUs(6), 3000);
+                        ok = flow17("(d2) step -> play", run, from + frameUs(3)) && ok;
+                        d << " (d2) step syncs=" << step2 << " play syncs=" << run.sync;
+                        ok17 = ok && step2 == 1 && run.sync == 0 && ok17;
+                    }
+                }
+                // (c) from the key frame f60 across A|B (B from source f70) to + 3 frames.
+                {
+                    seekMs(r, 60, true, 0);
+                    Run run = play17(r, frameUs(96), 10000);
+                    bool ok = flow17("(c) across A|B", run, frameUs(93));
+                    if (kind == 'N')
+                        ok = ok && run.sync <= 1;
+                    ok17 = ok && ok17;
+                }
+                // (e) previewSeek (non-precise) to f70 -> play(); plain is recorded.
+                {
+                    seekMs(r, 30, true);
+                    seekMs(r, 70, false);
+                    d << " (e) previewSeek playhead=" << playhead(r) << "us";
+                    Run run = play17(r, frameUs(76), 3000);
+                    const bool ok = flow17(ssot ? "(e) previewSeek f70" : "(e) previewSeek f70 [A3 declared, recorded]",
+                                           run, frameUs(73));
+                    if (ssot)
+                        ok17 = ok && (kind != 'N' || run.sync <= 1) && ok17;
+                }
+                if (kind == 'N') {
+                    // (f) [N] a precise seek (KeepDecoder) -> play() and 1F->: at most one
+                    // sync; shuttle 2x / 4x from the key frame for 1 s.
+                    seekMs(r, 70, true);
+                    Run run = play17(r, frameUs(76), 3000);
+                    bool ok = flow17("(f) [N] seek f70", run, frameUs(73)) && run.sync <= 1;
+                    seekMs(r, 70, true);
+                    const int s1 = syncs(r);
+                    r.p->stepForward();
+                    pumpEvents(40);
+                    d << " (f) [N] step syncs=" << (syncs(r) - s1);
+                    ok = ok && syncs(r) - s1 <= 1;
+                    for (const double speed : {2.0, 4.0}) {
+                        seekMs(r, 60, true, 0);
+                        r.p->setPlaybackSpeed(speed);
+                        Run sh = play17(r, us(100.0), 1000);
+                        r.p->setPlaybackSpeed(1.0);
+                        d << " (f) shuttle " << speed << "x rej=" << sh.rej << " syncs=" << sh.sync
+                          << " last=" << (sh.v.empty() ? -1 : frameAt(sh.v.back().second)) << 'f';
+                        // Progress: past half of the 1 s shuttle's frames from f60.
+                        ok = ok && sh.rej == 0 && sh.sync <= 1 && !sh.v.empty()
+                            && frameAt(sh.v.back().second) > 60 + int(kFps * speed * 0.5);
+                    }
+                    ok17 = ok && ok17;
+                }
+                // (h) the clip-local CPU preview (FilmGrain, fixed seed) after a step to
+                // 30f and a paused seek to f70 composes the playhead's frame (f71's box),
+                // not 31f's; one sync, none in the play() after it. plain: recorded
+                // ([declared, Wave 25], Step 0 CHANGE 3).
+                {
+                    seekMs(r, 29, true);
+                    r.p->stepForward();
+                    pumpEvents(40);
+                    r.p->setPreviewEffects(grain17);
+                    pumpEvents(60);
+                    seekMs(r, 70, true);
+                    const int s1 = syncs(r);
+                    int target = -1;
+                    const bool cpuStack = r.p->activePreviewClipCpuStack(
+                        r.p->m_timelinePositionUs, &target);
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int fxSyncs = syncs(r) - s1;
+                    const int box = boxFrameOf(r.p->m_currentFrameImage);
+                    const int expect = shownFrameAt(r.p->m_timelinePositionUs);
+                    const QImage fxRef = r.gl ? ref(r, playhead(r)) : QImage();
+                    const bool fxComparable = !r.p->m_currentFrameImage.isNull()
+                        && r.p->m_currentFrameImage.size() == fxRef.size();
+                    const int fxDiff = r.gl
+                        ? imageMaxDiff(r.p->m_currentFrameImage, fxRef) : -1;
+                    r.p->setPreviewEffects({});
+                    pumpEvents(60);
+                    const qint64 from = playhead(r);
+                    Run run = play17(r, from + frameUs(6), 3000);
+                    d << " (h) cpu composite box=" << box << "f expect " << expect << "f syncs="
+                      << fxSyncs << " cpuStack=" << cpuStack << " fxComparable=" << fxComparable
+                      << " fxDiff=" << fxDiff;
+                    if (media) {
+                        bool ok = flow17("(h) play", run, from + frameUs(3)) && fxSyncs == 1
+                            && run.sync == 0 && cpuStack;
+                        if (r.gl)
+                            ok = ok && box == expect && fxComparable && fxDiff > 0 && fxDiff < 255;
+                        else
+                            d << " (h) composite skipped (GL unavailable)";
+                        ok17 = ok && ok17;
+                    } else {
+                        d << (ssot ? "" : " [declared, Wave 25]");
+                    }
+                }
+                if (kind == 'P') {
+                    const int all = syncs(r) - syncs0;
+                    d << " (f) plain syncs=" << all;
+                    ok17 = all == 0 && ok17;
+                }
+                if (kind == 'N' || media)
+                    ok17 = ctrlOk && ok17;
+            }
+            // (f) none in a reversed reference or on a shape entry (no decoder).
+            {
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    const TimelineSequence child =
+                        seqOf(QStringLiteral("child17r"), {{movClip(movG, 0.0, 3.0)}});
+                    ClipInfo nest = refTo(QStringLiteral("child17r"), 3.0, 0.0);
+                    nest.reversed = true;
+                    tl->setSequences({seqOf(QStringLiteral("main17r"), {{nest, v1[2]}}), child},
+                                     QStringLiteral("main17r"));
+                };
+                Rig s;
+                if (open(r, "rev17", build) && open(s, "shapeV1", tracksOf({{shapeClip17(0.0, 3.0)}}))) {
+                    rigs17 += 2;
+                    for (Rig *x : {&r, &s}) {
+                        const int s0 = syncs(*x);
+                        seekMs(*x, 70, true);
+                        play17(*x, frameUs(80), 600);
+                        seekMs(*x, 70, true);
+                        x->p->stepForward();
+                        pumpEvents(40);
+                        d << " (f) " << (x == &r ? "reversed" : "shape entry") << " syncs="
+                          << (syncs(*x) - s0);
+                        ok17 = syncs(*x) == s0 && ok17;
+                    }
+                } else {
+                    ok17 = false;
+                }
+            }
+            // (f) shuttle [H] 2x / 4x for 1 s from the key frame f0 of a 5 s V1 clip
+            // (inside one entry: an entry boundary is a new start).
+            {
+                Rig r;
+                if (open(r, "shuttle17", tracksOf({{movClip(movG, 0.0, 5.0)}, {hidden17()}}))) {
+                    ++rigs17;
+                    for (const double speed : {2.0, 4.0}) {
+                        seekMs(r, 0, true, 0);
+                        r.p->setPlaybackSpeed(speed);
+                        Run sh = play17(r, us(100.0), 1000);
+                        r.p->setPlaybackSpeed(1.0);
+                        d << " (f) [H] shuttle " << speed << "x rej=" << sh.rej << " syncs="
+                          << sh.sync << " last="
+                          << (sh.v.empty() ? -1 : frameAt(sh.v.back().second)) << 'f';
+                        // Progress: past half of the 1 s shuttle's frames from f0.
+                        ok17 = sh.rej == 0 && sh.sync <= 1 && !sh.v.empty()
+                            && frameAt(sh.v.back().second) > int(kFps * speed * 0.5) && ok17;
+                    }
+                } else {
+                    ok17 = false;
+                }
+            }
+            // (f) slow [H]: V1 at a constant 0.6x (source 0-3 s over timeline 0-5 s), a
+            // paused off-grid seek (precise / previewSeek) to timeline f117 (source
+            // f70.2) -> play(): the sync stops at source f70, not f71, so the consumer's
+            // f71 projects within the 2-frame window instead of f72 at +2.97 frames.
+            {
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    ClipInfo slow = movClip(movG, 0.0, 3.0);
+                    slow.speed = 0.6;
+                    tracksOf({{slow}, {hidden17()}})(tl);
+                };
+                if (open(r, "slow17", build)) {
+                    ++rigs17;
+                    for (const bool precise : {true, false}) {
+                        seekMs(r, 30, true);
+                        seekMs(r, 117, precise);
+                        Run run = play17(r, frameUs(123), 3000);
+                        ok17 = flow17(precise ? "(f) slow 0.6 seek f117" : "(f) slow 0.6 previewSeek f117",
+                                      run, frameUs(120))
+                            && run.sync <= 1 && ok17;
+                    }
+                    // (h) A paused CPU redraw consumes the helper's cached frame directly:
+                    // unlike tick/step there is no consumer decode after the sync. Source
+                    // f70.2 must therefore use the first frame at-or-after it, f71.
+                    r.p->setPreviewEffects(grain17);
+                    pumpEvents(60);
+                    seekMs(r, 117, true);
+                    int target = -1;
+                    const bool cpuStack = r.p->activePreviewClipCpuStack(
+                        r.p->m_timelinePositionUs, &target);
+                    const int s0 = syncs(r);
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int cachedBox = boxFrameOf(r.p->m_lastV1RawFrame.scaled(movSize));
+                    const int cachedPtsFrame = frameAt(r.p->m_deliveredPtsUs);
+                    const int shownBox = boxFrameOf(r.p->m_currentFrameImage);
+                    d << " (h) slow 0.6 paused f117 cpuStack=" << cpuStack
+                      << " cachedBox=" << cachedBox << " rawSize="
+                      << r.p->m_lastV1RawFrame.width() << 'x' << r.p->m_lastV1RawFrame.height()
+                      << " cachedPtsFrame=" << cachedPtsFrame
+                      << " expect=71 syncs=" << syncs(r) - s0;
+                    bool ok = cpuStack && !r.p->m_lastV1RawFrame.isNull() && cachedPtsFrame == 71
+                        && syncs(r) - s0 == 1;
+                    if (r.gl) {
+                        const int refBox = boxFrameOf(ref(r, playhead(r)));
+                        d << " shownBox=" << shownBox << " refBox=" << refBox;
+                        ok = ok && shownBox == refBox && refBox == 71;
+                    } else {
+                        d << " slow composite skipped (GL unavailable)";
+                    }
+                    ok17 = ok && ok17;
+                    Run run = play17(r, frameUs(123), 3000);
+                    ok17 = flow17("(h) slow 0.6 play after refresh", run, frameUs(120))
+                        && run.rej == 0 && run.sync <= 1 && ok17;
+                    r.p->setPreviewEffects({});
+                } else {
+                    ok17 = false;
+                }
+            }
+            // Below 0.5x one source frame spans more than the reprojection window.
+            // Sync must not repeatedly rewind a decoder already at this playhead.
+            {
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    ClipInfo slow = movClip(movG, 0.0, 1.0);
+                    slow.speed = 0.25; // A ends at timeline f120.
+                    // A decoder-free next entry isolates A's sync budget: a movie
+                    // next entry would legitimately add its own startup sync.
+                    tracksOf({{slow, shapeClip17(0.0, 1.0)}, {hidden17()}})(tl);
+                };
+                if (open(r, "quarter17", build)) {
+                    ++rigs17;
+                    for (const bool precise : {true, false}) {
+                        seekMs(r, 30, true);
+                        seekMs(r, 110, precise);
+                        const int entry = r.p->m_activeEntry;
+                        Run run = play17(r, frameUs(126), 4000);
+                        const bool past = !run.v.empty() && run.v.back().second > frameUs(120)
+                            && r.p->m_activeEntry != entry;
+                        d << " (f) quarter 0.25 " << (precise ? "precise" : "previewSeek")
+                          << " syncs=" << run.sync << " past=" << past;
+                        // At <0.5x retain HEAD's reprojection rejects; require
+                        // forward progress and no repeated sync instead.
+                        flow17(precise ? "(f) quarter precise past A" : "(f) quarter previewSeek past A",
+                               run, frameUs(123));
+                        ok17 = run.mono && run.reach >= 0 && run.sync <= 1 && past && ok17;
+                    }
+                    seekMs(r, 70, true);
+                    const int s0 = syncs(r);
+                    const qint64 before = playhead(r);
+                    for (int n = 0; n < 3; ++n) {
+                        r.p->stepForward();
+                        pumpEvents(40);
+                    }
+                    d << " (f) quarter three steps syncs=" << syncs(r) - s0
+                      << " playhead=" << frameAt(playhead(r)) << 'f';
+                    ok17 = syncs(r) - s0 <= 1 && playhead(r) > before && ok17;
+                } else {
+                    ok17 = false;
+                }
+            }
+            // (f) ramp: start well inside A so the A|B jump cannot supply +3 frames.
+            {
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    tracksOf({v1, {hidden17()}})(tl);
+                    speedramp::SpeedRamp ramp;
+                    ramp.keyframes = {{0, 1.5}};
+                    tl->setSpeedRamp(0, ramp);
+                };
+                if (open(r, "ramp17", build)) {
+                    ++rigs17;
+                    seekMs(r, 30, true, 0);
+                    Run run = play17(r, us(100.0), 1000);
+                    ok17 = flow17("(f) ramp 1.5 seek f30", run, frameUs(33)) && run.sync <= 2
+                        && ok17;
+                } else {
+                    ok17 = false;
+                }
+            }
+            // (g2) the end of the file [H]: eof = B reads movH to its end (source 3-5 s);
+            // eofRamp = the same B with a 1.5x ramp, out of source at 4.31 s; eofPast =
+            // B's out point 1 s past the file's end (source 4-6 s). Play from a paused
+            // seek past B's end: at most two syncs (the seek's, C's entry), none while
+            // the playhead walks with the decoder at EOF (F24); c3 / c4 = the syncs the
+            // guard skipped (eofPast walks past the file's end: c3).
+            for (const int variant : {0, 1, 2}) {
+                const char *names[] = {"eof17", "eofRamp17", "eofPast17"};
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    QVector<ClipInfo> e = v1;
+                    e[1] = movClip(movH, variant == 2 ? 4.0 : 3.0, 2.0);
+                    tracksOf({e, {hidden17()}})(tl);
+                    if (variant == 1) {
+                        speedramp::SpeedRamp ramp;
+                        ramp.keyframes = {{0, 1.5}};
+                        tl->setSpeedRamp(1, ramp);
+                    }
+                };
+                if (!open(r, names[variant], build)) {
+                    ok17 = false;
+                    continue;
+                }
+                ++rigs17;
+                const int c3 = r.p->decoderSyncGuardSkipsForTest(3);
+                const int c4 = r.p->decoderSyncGuardSkipsForTest(4);
+                const int seekF[] = {140, 115, 100}; // source f140 / f127 / f130
+                seekMs(r, seekF[variant], true);
+                Run run = play17(r, frameUs(158), 5000);
+                const std::string leg = std::string("(g2) ") + names[variant] + " seek f"
+                    + std::to_string(seekF[variant]);
+                flow17(leg.c_str(), run, frameUs(153));
+                const int c3n = r.p->decoderSyncGuardSkipsForTest(3) - c3;
+                const int c4n = r.p->decoderSyncGuardSkipsForTest(4) - c4;
+                const double clipOut = r.p->m_sequence.size() > 1 ? r.p->m_sequence[1].clipOut : -1.0;
+                d << " B.clipOut=" << clipOut << " c3=" << c3n << " c4=" << c4n;
+                bool ok = run.reach >= 0 && run.sync <= 2;
+                if (variant == 2)
+                    ok = ok && clipOut > 5.0 && c3n >= 1;
+                // Each sync happens on the first tick after play() or at or after C's
+                // entry start (150f), never while the playhead walks B.
+                bool walkSync = false;
+                for (size_t i = 0; i < run.v.size(); ++i) {
+                    const int f = frameAt(run.v[i].second);
+                    if (run.syncsAt[i] > (i ? run.syncsAt[i - 1] : 0) && f > seekF[variant] + 2
+                        && f < 150)
+                        walkSync = true;
+                }
+                d << " walkingSync=" << walkSync;
+                ok = ok && !walkSync;
+                ok17 = ok && ok17;
+            }
+            // (g2) guard (c4) [H]: a single-GOP movie (key frame 0 only); paused seek to
+            // f100 -> the CPU preview's sync decodes the 60-frame limit and stops short
+            // of the target; a second refresh does not sync towards the same target
+            // again; (g3) a paused seek to an earlier frame of the same file -> play()
+            // syncs once and plays on.
+            {
+                Rig r;
+                if (open(r, "far17", tracksOf({{movClip(movL, 0.0, 5.0)}, {hidden17()}}))) {
+                    ++rigs17;
+                    r.p->setPreviewEffects(grain17);
+                    pumpEvents(60);
+                    const int s0 = syncs(r);
+                    const int c40 = r.p->decoderSyncGuardSkipsForTest(4);
+                    seekMs(r, 100, true);
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int first = syncs(r) - s0;
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int again = syncs(r) - s0 - first;
+                    const int c4 = r.p->decoderSyncGuardSkipsForTest(4) - c40;
+                    d << " (g2) far f100 syncs=" << first << " again=" << again << " c4=" << c4;
+                    bool ok = first == 1 && again == 0 && c4 >= 1;
+                    // US-2420 waveFix: an explicit backward seek within 1 frame of the
+                    // unreached target clears c4 instead of suppressing resync.
+                    const int sBeforeSub = syncs(r);
+                    seekTo(r, 3333000 - 10000);
+                    r.p->refreshDisplayedFrame();
+                    pumpEvents(40);
+                    const int subBackSync = syncs(r) - sBeforeSub;
+                    d << " subFrameBackSync=" << subBackSync;
+                    ok = ok && subBackSync == 1;
+                    r.p->setPreviewEffects({});
+                    pumpEvents(60);
+                    seekMs(r, 50, true);
+                    Run run = play17(r, frameUs(56), 3000);
+                    ok = flow17("(g3) seek f50", run, frameUs(53)) && run.sync == 1 && ok;
+                    // (g2) a consumer frame short of the unreached target keeps (c4):
+                    // paused seek to f100 / f130 -> play() syncs at most once (60-frame
+                    // limit), then the tick walks forward one frame per tick instead of
+                    // seeking back to the key frame on every tick (f130: the consumer's
+                    // f60 is more than 60 frames short, so a cleared (c4) loops there).
+                    // The rejects are HEAD's walk, not gated; so is its end, where the
+                    // reprojection window (2 frames) takes the walking frame back below
+                    // the held playhead once.
+                    for (const int seekF : {100, 130}) {
+                        seekMs(r, seekF, true);
+                        Run walk = play17(r, frameUs(seekF + 3), 10000);
+                        const std::string leg = "(g2) far seek f" + std::to_string(seekF) + " walk";
+                        flow17(leg.c_str(), walk, frameUs(seekF + 3));
+                        int drops = 0;
+                        int maxDrop = 0;
+                        for (size_t i = 1; i < walk.v.size(); ++i) {
+                            const int drop = frameAt(walk.v[i - 1].second) - frameAt(walk.v[i].second);
+                            if (drop > 0) {
+                                ++drops;
+                                maxDrop = qMax(maxDrop, drop);
+                            }
+                        }
+                        d << " drops=" << drops << " maxDrop=" << maxDrop;
+                        ok = ok && walk.reach >= 0 && walk.sync <= 1 && drops <= 1 && maxDrop <= 2;
+                    }
+                    ok17 = ok && ok17;
+                } else {
+                    ok17 = false;
+                }
+            }
+            // (f) S (G16's rig): seekTo(44f) -> play out of the shape: no rejects, the
+            // playhead in order, past 1.5 s.
+            {
+                Rig r;
+                const auto build = [&](Timeline *tl) {
+                    tracksOf({{quadrant(movClip(movA, 0.0, 3.0))}, {shapeClip17(0.5, 1.0)}})(tl);
+                };
+                if (open(r, "S16", build)) {
+                    ++rigs17;
+                    seekTo(r, frameUs(44) + 1000);
+                    Run run = play17(r, us(1.5) + frameUs(3), 3000);
+                    ok17 = flow17("(f) S seekTo 44f -> play out", run, us(1.5)) && ok17;
+                } else {
+                    ok17 = false;
+                }
+            }
+            ok17 = ok17 && rigs17 == 15;
+            d << " rigs=" << rigs17 << " gl=" << gl17;
+            if (!gl17)
+                d << " (GL unavailable: (d1) picture and (h) composite not checked)";
+            tally.gate(17, ok17, d.str());
+
+            // US-2403 G18: 1F-> from inside entry A to the entry boundary (G17's media and
+            // V1: A's last frame f89, B from source f70 at 3 s) lands on the next entry's
+            // first frame with the playhead at its start (P = plain, N = nest, H = hidden
+            // clip; g1 / gN = H with B 0.01 s / 0.5 s later; o = H with A ending at 2.99 s;
+            // slow / slowH = A at 0.5x, plain / H). Frames by the box (source frame) and
+            // the background (A grey, B blue). Playheads, entries and renderFrameAt need
+            // no GL; the shown picture is checked with GL or wherever the player composed
+            // one, the direct seek's picture with GL. HEAD (7a1efac): from f89 (2966666 us
+            // / seek(ms) 2966000 us) the step's target 2999999 / 2999333 us stays in A
+            // while the decoded A#90 is at 3 s: [P] shows A#90 at 3 s on entry A, [N][H]
+            // B#70 on entry A and B#70 again at 91f, g1 / gN stop on A#90, o shows B#70 at
+            // 2999999 us and skips B#71, slow shows A#45 at 3 s. (b) and (c) are pins: the
+            // SSOT step is on the frame grid at HEAD (US-2400 steps the synced decoder).
+            d.str(std::string());
+            d.clear();
+            bool ok18 = mov17Ok;
+            bool gl18 = true;
+            int rigs18 = 0;
+            const auto frameId = [&](const QImage &image) -> std::string {
+                if (image.isNull())
+                    return "none";
+                const QImage s = image.size() == movSize ? image : image.scaled(movSize);
+                const QColor bg = s.pixelColor(kMovW / 2, 3);
+                const char clip = bg.blue() > bg.red() + 40 ? 'B' : 'A';
+                const Spot spot = brightSpot(s);
+                // x within 5 px: N's child A is keyed +4 px.
+                for (int n = 0; spot.n >= 100 && n < kMovFrames; ++n) {
+                    const QPoint box = movBoxAt(n);
+                    if (std::abs(spot.x - (box.x() + 5.5)) <= 5.0
+                        && std::abs(spot.y - (box.y() + 5.5)) <= 2.0)
+                        return std::string(1, clip) + '#' + std::to_string(n);
+                }
+                return std::string(1, clip) + "#?";
+            };
+            // Within 1 us of frame k's time k / 30 s.
+            const auto onGrid = [](qint64 t) {
+                return qAbs(t * kFps - qint64(frameAt(t)) * 1000000) < kFps;
+            };
+            const auto step18 = [&](Rig &r) {
+                r.p->stepForward();
+                pumpEvents(40);
+            };
+            const auto shown18 = [&](Rig &r) { return frameId(r.p->m_currentFrameImage); };
+            // The shown picture against `expect`: required with GL, else checked when
+            // the player composed one.
+            const auto shownIs = [](Rig &r, const std::string &shown, const std::string &expect) {
+                return shown == expect || (!r.gl && shown == "none");
+            };
+            const auto bEntry = [](Rig &r, qint64 startUs) {
+                for (int i = 0; i < r.p->m_sequence.size(); ++i) {
+                    const auto &e = r.p->m_sequence[i];
+                    if (qAbs(e.timelineStart * 1e6 - double(startUs)) < 1.0
+                        && qAbs(e.clipIn * 1e6 - double(frameUs(70))) < 2.0)
+                        return i;
+                }
+                return -1;
+            };
+            const auto gapBuild = [&](double gap) {
+                QVector<ClipInfo> e = v1;
+                e[1].leadInSec = gap;
+                return tracksOf({e, {hidden17()}});
+            };
+            // A ending off the grid at 2.99 s (B from 2.99 s), H's hidden clip.
+            const auto shortBuild = [&]() {
+                QVector<ClipInfo> e = v1;
+                e[0] = movClip(movG, 0.0, 2.99);
+                return tracksOf({e, {hidden17()}});
+            };
+            // A at a constant 0.5x (source 0-1.5 s over timeline 0-3 s), plain or H.
+            const auto slowBuild = [&](bool hidden) {
+                QVector<ClipInfo> e = v1;
+                e[0] = movClip(movG, 0.0, 1.5);
+                e[0].speed = 0.5;
+                return hidden ? tracksOf({e, {hidden17()}}) : tracksOf({e});
+            };
+            // A replaced by `a` (B right after it), plain or H.
+            const auto aBuild = [&](const ClipInfo &a, bool hidden) {
+                QVector<ClipInfo> e = v1;
+                e[0] = a;
+                return hidden ? tracksOf({e, {hidden17()}}) : tracksOf({e});
+            };
+            struct Rig18 {
+                const char *name;
+                char kind;
+                qint64 bStartUs;
+            };
+            for (const Rig18 &x : {Rig18{"P", 'P', 3000000}, Rig18{"N", 'N', 3000000},
+                                   Rig18{"H", 'H', 3000000}, Rig18{"g1", '1', 3010000},
+                                   Rig18{"gN", 'G', 3500000}, Rig18{"o", 'O', 2990000},
+                                   Rig18{"slow", 'w', 3000000}, Rig18{"slowH", 'W', 3000000},
+                                   Rig18{"fracP", 'f', 2999500}, Rig18{"fracH", 'F', 2999500},
+                                   Rig18{"fracDP", 'd', 2999501}, Rig18{"fracDH", 'D', 2999501},
+                                   Rig18{"eofP", 'e', 3000000}, Rig18{"eofH", 'E', 3000000},
+                                   Rig18{"fracNestToPlain", 'n', 2999501},
+                                   Rig18{"slowShortB", 's', 3000000},
+                                   Rig18{"crossShortB", 'c', 2990000},
+                                   Rig18{"pipAcrossCut", 'p', 2990000}}) {
+                Rig r;
+                std::function<void(Timeline *)> build = build17(x.kind);
+                if (x.kind == '1' || x.kind == 'G')
+                    build = gapBuild(x.kind == '1' ? 0.01 : 0.5);
+                else if (x.kind == 'O')
+                    build = shortBuild();
+                else if (x.kind == 'w' || x.kind == 'W')
+                    build = slowBuild(x.kind == 'W');
+                else if (x.kind == 'f' || x.kind == 'F')
+                    build = aBuild(movClip(movG, double(frameUs(20)) / 1e6, 2.9995), x.kind == 'F');
+                else if (x.kind == 'd' || x.kind == 'D')
+                    build = aBuild(movClip(movG, double(frameUs(20)) / 1e6, 2.99950025),
+                                   x.kind == 'D');
+                else if (x.kind == 'e' || x.kind == 'E')
+                    build = aBuild(movClip(movG, 2.0, 3.0), x.kind == 'E');
+                else if (x.kind == 'n') {
+                    build = [&](Timeline *tl) {
+                        const TimelineSequence child = seqOf(QStringLiteral("child18"),
+                            {{movClip(movG, double(frameUs(20)) / 1e6, 2.99950025)}});
+                        const TimelineSequence main = seqOf(QStringLiteral("main18"),
+                            {{refTo(QStringLiteral("child18"), 2.99950025, 0.0), v1[1], v1[2]}});
+                        tl->setSequences({main, child}, QStringLiteral("main18"));
+                    };
+                } else if (x.kind == 'p') {
+                    QVector<ClipInfo> clips = v1;
+                    clips[0] = movClip(movG, 0.0, 2.99);
+                    clips[1] = movClip(movH, double(frameUs(70)) / 1e6, 2.01);
+                    ClipInfo overlay = movClip(movG, 0.0, 0.495);
+                    overlay.leadInSec = 2.5;
+                    build = tracksOf({clips, {overlay}});
+                } else if (x.kind == 's' || x.kind == 'c') {
+                    QVector<ClipInfo> clips = v1;
+                    clips[0] = movClip(movG, 0.0, x.kind == 's' ? 0.75 : 2.99);
+                    clips[0].speed = x.kind == 's' ? 0.25 : 1.0;
+                    clips[1] = movClip(movH, double(frameUs(70)) / 1e6,
+                                      x.kind == 's' ? 0.05 : 0.005);
+                    build = tracksOf({clips});
+                }
+                const std::string rigName = std::string(x.name) + "18";
+                if (!open(r, rigName.c_str(), build)) {
+                    ok18 = false;
+                    continue;
+                }
+                ++rigs18;
+                gl18 = gl18 && r.gl;
+                const bool ssot = x.kind != 'P' && x.kind != 'w' && x.kind != 'f' && x.kind != 'd'
+                    && x.kind != 'e';
+                const int bIdx = bEntry(r, x.bStartUs);
+                d << " {" << x.name << "} B entry=" << bIdx;
+                ok18 = ok18 && bIdx >= 0;
+                const std::string bHead = "B#70";
+                // PiP X spans the cut but starts before it: resolving the cut must
+                // skip X and advance onto V1 B, never snap back to X's 2.5 s start.
+                if (x.kind == 'p') {
+                    seekTo(r, frameUs(89));
+                    const qint64 from = playhead(r);
+                    const int before = r.p->m_activeEntry;
+                    const int overlay = r.p->findActiveEntryAt(2990000);
+                    const bool fixture = before >= 0 && overlay >= 0 && bIdx >= 0
+                        && r.p->m_sequence[before].sourceTrack == 0
+                        && r.p->m_sequence[bIdx].sourceTrack == 0
+                        && r.p->m_sequence[overlay].sourceTrack == 1
+                        && qAbs(r.p->m_sequence[overlay].timelineStart - 2.5) < 1e-6
+                        && qAbs(r.p->m_sequence[overlay].timelineEnd - 2.995) < 1e-6;
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const int entry = r.p->m_activeEntry;
+                    const bool ok = fixture && from == frameUs(89) && before != bIdx
+                        && at >= 2990000 && at >= from && entry == bIdx;
+                    d << " (PiP-across-cut) from=" << from << "us entry=" << before
+                      << " -> " << at << "us entry=" << entry << " V1B=" << bIdx
+                      << " overlay=" << overlay << " fixture=" << fixture << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a5) The decoded frame (slow A) or arithmetic target (cross A)
+                // can fall beyond short B into C. Resolve the next entry at A's cut.
+                if (x.kind == 's' || x.kind == 'c') {
+                    bool ok = true;
+                    for (const bool exact : {true, false}) {
+                        const int startFrame = x.kind == 's' ? 88 : 89;
+                        if (exact) seekTo(r, frameUs(startFrame));
+                        else seekMs(r, startFrame, true, 0);
+                        const qint64 from = playhead(r);
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const std::string shown = shown18(r);
+                        const int entry = r.p->m_activeEntry;
+                        bool leg = at == x.bStartUs && entry == bIdx
+                            && r.p->findActiveEntryAt(at) == bIdx && shownIs(r, shown, bHead);
+                        d << " (a5) " << (exact ? "exact" : "seek(ms)") << " from=" << from
+                          << "us -> playhead=" << at << "us entry=" << entry << " shown=" << shown;
+                        if (r.gl) {
+                            seekTo(r, at);
+                            const std::string direct = shown18(r);
+                            leg = leg && direct == shown && direct == bHead;
+                            d << " directSeek=" << direct;
+                        }
+                        d << " ok=" << leg;
+                        ok = ok && leg;
+                    }
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a4) [fracP][fracH]: A from source f20 for 2.9995 s, so B starts at
+                // 2999499.9999999995 us, which truncates into A; [fracDP][fracDH]: for
+                // 2.99950025 s, B starts at 2999500.25 us, which truncates and rounds into A;
+                // [eofP][eofH]: A from source f60 for 3 s, its out point the media's EOF
+                // (source f149 at f89). From f89 (frame time and seek(ms)) one 1F-> lands at
+                // the first us at or past B's start with findActiveEntryAt(playhead) ==
+                // active entry == B, B#70 shown = a direct seek there (= renderFrameAt).
+                // Fails without the step's start rounding (frac: playhead 2999499 /
+                // 2999500 us, entry A at it) / the EOF switch (eof: A's last frame re-shown
+                // inside A).
+                if (x.kind == 'f' || x.kind == 'F' || x.kind == 'd' || x.kind == 'D'
+                    || x.kind == 'e' || x.kind == 'E' || x.kind == 'n') {
+                    const bool frac = x.kind == 'f' || x.kind == 'F';
+                    const bool fracDown = x.kind == 'd' || x.kind == 'D' || x.kind == 'n';
+                    const double bStart = bIdx >= 0 ? r.p->m_sequence[bIdx].timelineStart : 0.0;
+                    const qint64 truncUs = qint64(bStart * 1000000);
+                    const qint64 roundUs = qRound64(bStart * 1000000);
+                    const int aIdx = r.p->findActiveEntryAt(frameUs(89));
+                    const double aOut = aIdx >= 0 ? r.p->m_sequence[aIdx].clipOut : 0.0;
+                    // The fixture: frac's start truncates below its rounding, fracD's
+                    // rounding is its truncation and lies before it, eof's A ends at the
+                    // media's end.
+                    const bool fixture = fracDown
+                        ? truncUs == roundUs && double(roundUs) / 1e6 < bStart
+                            && roundUs + 1 == x.bStartUs
+                        : roundUs == x.bStartUs
+                            && (frac ? truncUs == roundUs - 1
+                                     : qAbs(aOut - double(kMovFrames) / kFps) < 1e-6);
+                    d << " (a4) bStart trunc=" << truncUs << "us round=" << roundUs << "us A="
+                      << aIdx << " clipOut=" << aOut << " fixture=" << fixture;
+                    bool ok = fixture;
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(89));
+                        else
+                            seekMs(r, 89, true, 0);
+                        const qint64 from = playhead(r);
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const int entry = r.p->m_activeEntry;
+                        const int entryAt = r.p->findActiveEntryAt(at);
+                        const std::string shown = shown18(r);
+                        const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                        bool okLeg = at == x.bStartUs && entry == bIdx && entryAt == bIdx
+                            && (!ssot || refAt == bHead) && shownIs(r, shown, bHead);
+                        d << (exact ? " exact" : " seek(ms)") << " from=" << from
+                          << "us -> playhead=" << at << "us entry=" << entry << " entryAt="
+                          << entryAt << " shown=" << shown << " renderFrameAt=" << refAt;
+                        if (r.gl) {
+                            seekTo(r, at);
+                            const std::string direct = shown18(r);
+                            d << " directSeek=" << direct;
+                            okLeg = okLeg && direct == shown;
+                        }
+                        d << " ok=" << okLeg;
+                        ok = ok && okLeg;
+                    }
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a3) [slow][slowH]: steps from f87 (source f43.5, A#44 shown) at 0.5x,
+                // where the step's decode reaches past A's end: the first playhead at or
+                // past B's start is B's start on entry B with B#70, the next B#71.
+                if (x.kind == 'w' || x.kind == 'W') {
+                    seekTo(r, frameUs(87));
+                    qint64 last = playhead(r);
+                    bool rise = true;
+                    int atB = 0;
+                    bool ok = true;
+                    d << " (a3) from=" << last << "us";
+                    for (int i = 0; i < 6 && atB < 2; ++i) {
+                        step18(r);
+                        const qint64 at = playhead(r);
+                        const int entry = r.p->m_activeEntry;
+                        const std::string shown = shown18(r);
+                        const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                        rise = rise && at > last;
+                        d << ' ' << at << "us/e" << entry << '/' << shown << '/' << refAt;
+                        if (at >= x.bStartUs) {
+                            const std::string want = atB == 0 ? bHead : "B#71";
+                            const bool place = atB == 0 ? at == x.bStartUs
+                                : at - x.bStartUs >= 33333 && at - x.bStartUs <= 33334;
+                            ok = ok && place && entry == bIdx && (!ssot || refAt == want)
+                                && shownIs(r, shown, want);
+                            ++atB;
+                        }
+                        last = at;
+                    }
+                    ok = ok && rise && atB == 2;
+                    d << " rise=" << rise << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                    continue;
+                }
+                // (a) [P][N][H] / (d1) gN / (d2) g1 / (d2') o: from A's last frame f89,
+                // frame time exactly and seek(ms) floored to 2966 ms: B#70 at B's start
+                // on entry B; the next step shows B#71, one frame (33333-33334 us) later.
+                for (const bool exact : {true, false}) {
+                    if (exact)
+                        seekTo(r, frameUs(89));
+                    else
+                        seekMs(r, 89, true, 0);
+                    const qint64 from = playhead(r);
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const int entry = r.p->m_activeEntry;
+                    const std::string shown = shown18(r);
+                    const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                    bool ok = at == x.bStartUs && entry == bIdx && (!ssot || refAt == bHead)
+                        && shownIs(r, shown, bHead);
+                    step18(r);
+                    const qint64 at2 = playhead(r);
+                    const int entry2 = r.p->m_activeEntry;
+                    const std::string shown2 = shown18(r);
+                    const std::string ref2 = ssot ? frameId(ref(r, at2)) : std::string("-");
+                    const bool next = at2 - x.bStartUs >= 33333 && at2 - x.bStartUs <= 33334
+                        && entry2 == bIdx && (!ssot || ref2 == "B#71") && shownIs(r, shown2, "B#71");
+                    ok = ok && next;
+                    const char *leg = x.kind == 'G' ? "(d1)" : x.kind == '1' ? "(d2)"
+                        : x.kind == 'O' ? "(d2')" : "(a)";
+                    d << ' ' << leg << (exact ? " exact" : " seek(ms)") << " from=" << from
+                      << "us -> playhead=" << at << "us expect " << x.bStartUs << " entry=" << entry
+                      << " shown=" << shown << " renderFrameAt=" << refAt << "; next step playhead="
+                      << at2 << "us entry=" << entry2 << " shown=" << shown2 << " renderFrameAt="
+                      << ref2 << " nextOk=" << next;
+                    if (r.gl) {
+                        seekTo(r, at);
+                        const std::string direct = shown18(r);
+                        d << " directSeek=" << direct;
+                        ok = ok && direct == shown;
+                    }
+                    // (d4) play() right after the boundary step: no rejected reprojection.
+                    if (exact && (x.kind == 'P' || x.kind == 'H')) {
+                        seekTo(r, frameUs(89));
+                        const int rej0 = rejects(r);
+                        step18(r);
+                        const int stepRej = rejects(r) - rej0;
+                        const qint64 b = playhead(r);
+                        Run run = play17(r, b + frameUs(6), 3000);
+                        const bool d4 = flow17("(d4) step -> play", run, b + frameUs(3));
+                        d << " (d4) rejects step=" << stepRej << " play=" << run.rej;
+                        ok = ok && d4 && stepRej == 0 && run.rej == 0;
+                    }
+                    d << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                }
+                // (b) [P][N][H] [pin at HEAD]: 6 steps from f86 (frame time and seek(ms)):
+                // A#87-89, then B#70-72, the playhead rising on the grid (f87-f92).
+                if (x.kind == 'P' || x.kind == 'N' || x.kind == 'H') {
+                    const std::string expect[] = {"A#87", "A#88", "A#89", "B#70", "B#71", "B#72"};
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(86));
+                        else
+                            seekMs(r, 86, true, 0);
+                        qint64 last = playhead(r);
+                        bool ok = true;
+                        d << " (b)" << (exact ? " exact" : " seek(ms)") << " from=" << last << "us";
+                        for (int i = 0; i < 6; ++i) {
+                            step18(r);
+                            const qint64 at = playhead(r);
+                            const std::string shown = shown18(r);
+                            const std::string refAt = ssot ? frameId(ref(r, at)) : std::string("-");
+                            const bool rise = at > last && onGrid(at) && frameAt(at) == 87 + i;
+                            ok = ok && rise && (!ssot || refAt == expect[i])
+                                && shownIs(r, shown, expect[i]);
+                            d << ' ' << at << "us/" << shown << '/' << refAt << (rise ? "" : "(off)");
+                            last = at;
+                        }
+                        d << " ok=" << ok;
+                        ok18 = ok18 && ok;
+                    }
+                }
+                // (c) [H] [pin at HEAD]: 3 steps away from the boundary from seek(ms) to f85
+                // (2833 ms) and from f85's frame time: on the grid, shown = renderFrameAt.
+                if (x.kind == 'H') {
+                    for (const bool exact : {true, false}) {
+                        if (exact)
+                            seekTo(r, frameUs(85));
+                        else
+                            seekMs(r, 85, true, 0);
+                        bool ok = true;
+                        d << " (c)" << (exact ? " exact" : " seek(ms)") << " from=" << playhead(r)
+                          << "us";
+                        for (int i = 0; i < 3; ++i) {
+                            step18(r);
+                            const qint64 at = playhead(r);
+                            const std::string refAt = frameId(ref(r, at));
+                            const std::string shown = shown18(r);
+                            const std::string want = "A#" + std::to_string(86 + i);
+                            ok = ok && onGrid(at) && frameAt(at) == 86 + i && refAt == want
+                                && shownIs(r, shown, want);
+                            d << ' ' << at << "us/" << shown << '/' << refAt;
+                        }
+                        d << " ok=" << ok;
+                        ok18 = ok18 && ok;
+                    }
+                }
+                // (d3) [pin] a seek into the gap (entry B already active), then 1F->:
+                // HEAD's values. The seek shows B#70 while renderFrameAt is empty
+                // (declared, Wave 25). Within a frame of B's start the seek's playhead
+                // reprojects onto it (g1 3005000 us, gN 3490000 us) and the step shows
+                // B#71; from 3.2 s the step lands on B's start (B#70). Each = renderFrameAt.
+                struct Gap18 {
+                    char kind;
+                    qint64 gapAt;
+                    qint64 seekPinUs;
+                    qint64 pinUs;
+                    const char *pinFrame;
+                };
+                for (const Gap18 &g : {Gap18{'G', 3200000, 3200000, 3500000, "B#70"},
+                                       Gap18{'G', 3490000, 3500000, 3533334, "B#71"},
+                                       Gap18{'1', 3005000, 3010000, 3043333, "B#71"}}) {
+                    if (g.kind != x.kind)
+                        continue;
+                    seekTo(r, g.gapAt);
+                    const qint64 seekPh = playhead(r);
+                    const int entry0 = r.p->m_activeEntry;
+                    const std::string seekShown = shown18(r);
+                    const std::string seekRef = frameId(ref(r, g.gapAt));
+                    step18(r);
+                    const qint64 at = playhead(r);
+                    const std::string shown = shown18(r);
+                    const std::string refAt = frameId(ref(r, at));
+                    const bool ok = seekPh == g.seekPinUs && entry0 == bIdx
+                        && shownIs(r, seekShown, bHead) && seekRef == "none" && at == g.pinUs
+                        && refAt == g.pinFrame && shownIs(r, shown, g.pinFrame);
+                    d << " (d3) [pin] seek " << g.gapAt << "us playhead=" << seekPh << "us (pin "
+                      << g.seekPinUs << ") entry=" << entry0 << " shown=" << seekShown
+                      << " renderFrameAt=" << seekRef
+                      << " -> 1F-> playhead=" << at << "us (pin " << g.pinUs << ") shown=" << shown
+                      << " renderFrameAt=" << refAt << " ok=" << ok;
+                    ok18 = ok18 && ok;
+                }
+            }
+            ok18 = ok18 && rigs18 == 18;
+            d << " rigs=" << rigs18 << " gl=" << gl18;
+            if (!gl18)
+                d << " (GL unavailable: the shown and direct-seek pictures not checked)";
+            tally.gate(18, ok18, d.str());
+
+            // US-2404 G19 (pin): leaving an SSOT interval by 1F-> (a)/(c) or by play()
+            // after a paused seek to its last frame (b) produces the same display state
+            // (baked mode, stabilizer, viewport) as a direct seek to that frame, both
+            // inside a CrossDissolve overlap (ovlShape / ovlNest) and without overlap
+            // (nest / shape, (4a)). Production unchanged; pins S0-3 (c)/(d).
+            d.str(std::string());
+            d.clear();
+            bool ok19 = mov17Ok;
+            int rigs19 = 0;
+            bool gl19 = true;
+            const auto overlapV1 = [&]() {
+                QVector<ClipInfo> e;
+                ClipInfo a = movClip(movG, 0.0, 3.0);
+                ClipInfo b = movClip(movH, double(frameUs(70)) / 1e6, 2.0);
+                Transition t;
+                t.type = TransitionType::CrossDissolve;
+                t.duration = 1.0;
+                t.alignment = TransitionAlignment::Center;
+                a.trailOut = t;
+                b.leadIn = t;
+                e.push_back(a);
+                e.push_back(b);
+                e.push_back(movClip(movG, 0.0, 1.0));
+                return e;
+            };
+            struct Rig19 {
+                const char *name;
+                char kind;
+                int lastFrame;
+                qint64 boundaryUs;
+                bool overlap;
+            };
+            for (const Rig19 &x : {Rig19{"ovlShape", 'S', 95, us(3.2), true},
+                                   Rig19{"ovlNest", 'N', 95, us(3.2), true},
+                                   Rig19{"nest", 'n', 59, us(2.0), false},
+                                   Rig19{"shape", 's', 83, us(2.8), false}}) {
+                Rig r;
+                std::function<void(Timeline *)> build;
+                if (x.kind == 'S') {
+                    build = [&](Timeline *tl) {
+                        tl->restoreFromProject({overlapV1(), {shapeClip17(1.0, 2.2)}},
+                                               QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                    };
+                } else if (x.kind == 'N') {
+                    build = [&](Timeline *tl) {
+                        const QString cid = QStringLiteral("child19ovl");
+                        const QString mid = QStringLiteral("main19ovl");
+                        const TimelineSequence child = seqOf(cid, {{movClip(movH, 0.0, 2.2)}});
+                        const TimelineSequence main =
+                            seqOf(mid, {overlapV1(), {refTo(cid, 2.2, 1.0)}});
+                        tl->setSequences({main, child}, mid);
+                    };
+                } else if (x.kind == 'n') {
+                    build = [&](Timeline *tl) {
+                        const QString cid = QStringLiteral("child19");
+                        const QString mid = QStringLiteral("main19");
+                        const TimelineSequence child = seqOf(cid, {{movClip(movH, 0.0, 1.0)}});
+                        const TimelineSequence main =
+                            seqOf(mid, {{movClip(movG, 0.0, 5.0)}, {refTo(cid, 1.0, 1.0)}});
+                        tl->setSequences({main, child}, mid);
+                    };
+                } else {
+                    build = [&](Timeline *tl) {
+                        tl->restoreFromProject(
+                            {{movClip(movG, 0.0, 5.0)}, {shapeClip17(1.0, 1.8)}},
+                            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+                    };
+                }
+                if (!open(r, (std::string(x.name) + "19").c_str(), build)) {
+                    ok19 = false;
+                    continue;
+                }
+                ++rigs19;
+                gl19 = gl19 && r.gl;
+                const qint64 lastUs = frameUs(x.lastFrame) + 1000;
+                // Warm any overlap pool decoder once so both via-step and direct-seek
+                // observe the same steady-state decoder pool.
+                seekTo(r, x.boundaryUs + 1000);
+                // (a)/(c) 1F-> out from the last SSOT frame vs direct seek to the same playhead.
+                seekTo(r, lastUs);
+                const GlState inState = capture(r);
+                r.p->stepForward();
+                pumpEvents(40);
+                const qint64 stepAt = playhead(r);
+                const GlState stepState = capture(r);
+                const qint64 decAfterStep = r.p->nextDecodedSourceUsForTest();
+                seekTo(r, frameUs(5) + 1000);
+                seekTo(r, stepAt);
+                const GlState directStep = capture(r);
+                const qint64 decDirect = r.p->nextDecodedSourceUsForTest();
+                const std::string stepLabel = std::string(x.overlap ? "(a) " : "(a)/(c) ")
+                    + x.name + " 1F-> out pin (S0-3 (c))";
+                const bool stepSame = sameState(stepLabel.c_str(), directStep, stepState, true);
+                const bool stepOk = inState.baked && stepAt >= x.boundaryUs && !stepState.baked
+                    && stepSame;
+                d << " inBaked=" << inState.baked << " stepAt=" << stepAt
+                  << " decoder_after_step=" << decAfterStep << " direct=" << decDirect
+                  << " stepOk=" << stepOk;
+                ok19 = ok19 && stepOk;
+
+                // (b) non-SSOT play -> pause -> seek to last SSOT frame -> play() out vs direct seek.
+                // Tick 1 starts inside SSOT so nestedSequenceActive is still true for that tick
+                // (recorded as tick1Baked); tick 2 is the first tick starting outside SSOT, where
+                // VideoPlayer clears compositeBakedMode (matching Step 0 S0-3 (d)).
+                seekTo(r, frameUs(5) + 1000);
+                r.p->play();
+                pumpEvents(300);
+                r.p->pause();
+                pumpEvents(40);
+                seekTo(r, lastUs);
+                bool past = false;
+                qint64 playAt = -1;
+                bool tick1Baked = false;
+                const GlState playState = playOut(r, x.boundaryUs, past, &playAt, 2, &tick1Baked);
+                seekTo(r, frameUs(5) + 1000);
+                if (playAt >= 0)
+                    seekTo(r, playAt);
+                const GlState directPlay = capture(r);
+                const std::string playLabel =
+                    std::string("(b) ") + x.name + " play out pin (S0-3 (d))";
+                const bool playSame = sameState(playLabel.c_str(), directPlay, playState, false);
+                const bool playOk = past && playAt >= x.boundaryUs && !playState.baked && playSame;
+                d << " tick1Baked=" << tick1Baked << " past=" << past << " playAt=" << playAt
+                  << " playOk=" << playOk;
+                ok19 = ok19 && playOk;
+                pumpEvents(100);
+            }
+            ok19 = ok19 && rigs19 == 4;
+            d << " rigs=" << rigs19 << " gl=" << gl19
+              << " (c) non-overlap (4a) and G16 other legs unchanged pin (S0-3 (c)/(d))";
+            tally.gate(19, ok19, d.str());
+        }
     }
 
     return tally.finish("stabilizer-export");

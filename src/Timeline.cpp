@@ -976,13 +976,40 @@ QString exportAudioChannelPanFilterForMode(AudioChannelMode mode)
     return {};
 }
 
+// The export resample stage of buildExportAudioMixEntryPreFxFilterChain: forward only,
+// f != 1 within 1e-9 and a positive timeline length to cut at.
+static bool exportAudioRampStageApplies(bool reversed, double rampFactor, double timelineLength)
+{
+    return !reversed && std::isfinite(rampFactor) && rampFactor > 0.0
+        && std::abs(rampFactor - 1.0) > 1e-9
+        && std::isfinite(timelineLength) && timelineLength > 0.0;
+}
+
+double exportAudioMixEntryClipDuration(double clipIn, double clipOut, double speed,
+    bool reversed, double rampFactor, double timelineLength)
+{
+    const double span = qMax(0.0, clipOut - clipIn);
+    if (exportAudioRampStageApplies(reversed, rampFactor, timelineLength))
+        return qMin(timelineLength, span / rampFactor);
+    return std::isfinite(speed) && speed > 0.0 ? span / speed : span;
+}
+
 QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
     const QString &clipIn, const QString &clipOut, AudioChannelMode mode,
-    bool reversed, double speed)
+    bool reversed, double speed, double rampFactor, double timelineLength)
 {
     QStringList filters;
-    filters << QStringLiteral("atrim=start=%1:end=%2")
-                   .arg(clipIn, clipOut);
+    const bool rampStage = exportAudioRampStageApplies(reversed, rampFactor, timelineLength);
+    if (rampStage) {
+        // Read only the source the cut keeps (T * f seconds, at most the span).
+        const double in = clipIn.toDouble();
+        const double span = qMax(0.0, clipOut.toDouble() - in);
+        filters << QStringLiteral("atrim=start=%1:end=%2")
+                       .arg(clipIn, QString::number(in + qMin(span, timelineLength * rampFactor), 'f', 6));
+    } else {
+        filters << QStringLiteral("atrim=start=%1:end=%2")
+                       .arg(clipIn, clipOut);
+    }
     if (reversed) {
         filters << QStringLiteral("areverse");
         // Reversed preview consumes its buffered PCM at the clip's uniform
@@ -1005,8 +1032,19 @@ QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
         }
     }
     filters << QStringLiteral("asetpts=PTS-STARTPTS")
-            << QStringLiteral("aresample=48000")
-            << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");
+            << QStringLiteral("aresample=48000");
+    if (rampStage) {
+        // The preview mixer follows the ramp by resampling (the pitch moves with the
+        // speed), not atempo: relabel the rate by f, return to 48 kHz, then pad the
+        // used-up source with silence and cut at the clip's timeline length.
+        const QString length = QString::number(timelineLength, 'f', 6);
+        filters << QStringLiteral("asetrate=%1").arg(qRound64(48000.0 * rampFactor))
+                << QStringLiteral("aresample=48000")
+                << QStringLiteral("asetpts=PTS-STARTPTS")
+                << QStringLiteral("apad=whole_dur=%1").arg(length)
+                << QStringLiteral("atrim=end=%1").arg(length);
+    }
+    filters << QStringLiteral("aformat=sample_fmts=fltp:channel_layouts=stereo");
 
     const QString panFilter = exportAudioChannelPanFilterForMode(mode);
     if (!panFilter.isEmpty())
@@ -1019,7 +1057,8 @@ QString buildExportAudioMixEntryPreFxFilterChain(int inputIndex,
 QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
     int delayMs, const QString &volumeExpression, double clipDuration,
     TransitionType leadInType, double leadInDuration,
-    TransitionType trailOutType, double trailOutDuration)
+    TransitionType trailOutType, double trailOutDuration,
+    bool fixedPointFades)
 {
     QStringList filters;
     filters << QStringLiteral("volume='%1':eval=frame").arg(volumeExpression);
@@ -1035,15 +1074,22 @@ QString buildExportAudioMixEntryPostFxFilterChain(int inputIndex,
     const bool trailFade = (trailOutType == TransitionType::FadeOut
                             || trailOutType == TransitionType::CrossDissolve)
         && std::isfinite(trailOutDuration) && trailOutDuration > 0.0;
+    // FFmpeg's duration parser rejects an exponent (1e-05): print such a value fixed-point
+    // only for ramped entries (fixedPointFades), keeping untouched entries byte-identical to HEAD.
+    const auto fadeNumber = [fixedPointFades](double value) {
+        const QString text = QString::number(value, 'g', 15);
+        if (!fixedPointFades || (!text.contains(QLatin1Char('e')) && !text.contains(QLatin1Char('E'))))
+            return text;
+        return std::abs(value) < 5e-10 ? QStringLiteral("0") : QString::number(value, 'f', 9);
+    };
     if (leadFade) {
         filters << QStringLiteral("afade=t=in:curve=qsin:d=%1")
-                       .arg(QString::number(leadInDuration, 'g', 15));
+                       .arg(fadeNumber(leadInDuration));
     }
     if (trailFade) {
         const double start = qMax(0.0, clipDuration - trailOutDuration);
         filters << QStringLiteral("afade=t=out:curve=qsin:st=%1:d=%2")
-                       .arg(QString::number(start, 'g', 15),
-                            QString::number(trailOutDuration, 'g', 15));
+                       .arg(fadeNumber(start), fadeNumber(trailOutDuration));
     }
 
     if (delayMs > 0)
@@ -1064,16 +1110,18 @@ QString buildExportAudioMixEntryFilterChain(int inputIndex,
                                             TransitionType leadInType,
                                             double leadInDuration,
                                             TransitionType trailOutType,
-                                            double trailOutDuration)
+                                            double trailOutDuration,
+                                            double rampFactor,
+                                            double timelineLength)
 {
     QString pre = buildExportAudioMixEntryPreFxFilterChain(
-        inputIndex, clipIn, clipOut, mode, reversed, speed);
+        inputIndex, clipIn, clipOut, mode, reversed, speed, rampFactor, timelineLength);
     QString post = buildExportAudioMixEntryPostFxFilterChain(inputIndex,
         delayMs, volumeExpression,
-        std::isfinite(speed) && speed > 0.0
-            ? qMax(0.0, (clipOut.toDouble() - clipIn.toDouble()) / speed)
-            : qMax(0.0, clipOut.toDouble() - clipIn.toDouble()),
-        leadInType, leadInDuration, trailOutType, trailOutDuration);
+        exportAudioMixEntryClipDuration(clipIn.toDouble(), clipOut.toDouble(), speed,
+                                        reversed, rampFactor, timelineLength),
+        leadInType, leadInDuration, trailOutType, trailOutDuration,
+        exportAudioRampStageApplies(reversed, rampFactor, timelineLength));
     // Join at the DSP boundary without changing the legacy graph text.
     pre.chop(QStringLiteral("[prefx%1]").arg(inputIndex).size());
     post.remove(0, QStringLiteral("[%1:a]").arg(inputIndex).size());

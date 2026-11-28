@@ -471,7 +471,8 @@ bool openVideoInput(const QString &path, AVFormatContext **fmtCtx,
 // layer gracefully — mirrors S2's "any failure -> null" contract.
 QImage decodeClipFrameNative(const QString &filePath, double sourceSec,
                              bool usePreviousSourceFrame = false,
-                             double sourceInSec = 0.0)
+                             double sourceInSec = 0.0,
+                             bool strictFlushPts = false)
 {
     AVFormatContext *fmtCtx = nullptr;
     AVCodecContext *decCtx = nullptr;
@@ -630,6 +631,14 @@ QImage decodeClipFrameNative(const QString &filePath, double sourceSec,
                 av_frame_unref(frame);
                 decoded = !result.isNull();
                 break;
+            }
+            // Ramp EOF holds must search delayed output with the same PTS
+            // rule as the packet loop; otherwise an early flush frame masks EOF.
+            const double framePts = static_cast<double>(frame->pts)
+                * av_q2d(vStream->time_base);
+            if (strictFlushPts && framePts + 1e-6 < sourceSec) {
+                av_frame_unref(frame);
+                continue;
             }
             buildResult(frame);
             av_frame_unref(frame);
@@ -945,10 +954,34 @@ bool hasActiveRollingShutter(const ClipInfo &clip, double clipLocalSeconds)
     return false;
 }
 
+namespace {
+// US-2401: the clip-local -> source mapping of the Echo / RollingShutter samples
+// and its bounds: the clip's own mapper, or, for a top-level clip with a speed
+// ramp (`ramp` set by the renderer), export's ramped interval mapping.
+struct SampleSourceMap {
+    const ClipInfo &clip;
+    const RampSourceMapping *ramp;
+    double at(double local) const
+    {
+        return ramp ? rampedSourceSecondInInterval(clip, ramp->interval,
+                                                   local + ramp->localOffsetSec)
+                    : clip.sourceSecondAtLocalTime(local);
+    }
+    double in() const { return ramp && ramp->interval ? ramp->interval->clipIn : clip.inPoint; }
+    double out() const
+    {
+        if (ramp && ramp->interval)
+            return ramp->interval->clipOut;
+        return clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
+    }
+};
+} // namespace
+
 QImage applyRollingShutterFromSource(
     const QImage &source, const VideoEffect &effect, const ClipInfo &clip,
     double localSeconds, double sourceSeconds,
-    const EchoFrameProvider &provider, double sourceFps)
+    const EchoFrameProvider &provider, double sourceFps,
+    const RampSourceMapping *rampMapping)
 {
     if (rollingShutterDisabled.load() || clip.isAdjustment || source.isNull()
         || !provider || !activeRollingShutterEffect(effect))
@@ -960,10 +993,10 @@ QImage applyRollingShutterFromSource(
     auto sample = [&](double local) {
         if (local < -1e-9 || local >= clip.effectiveDuration() - 1e-9)
             return QImage();
-        const double src = sourceSeconds + clip.sourceSecondAtLocalTime(local)
-            - clip.sourceSecondAtLocalTime(localSeconds);
-        const double sourceOut = clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
-        if (src < clip.inPoint - 1e-9 || src >= sourceOut - 1e-9)
+        const SampleSourceMap map{clip, rampMapping};
+        const double src = sourceSeconds + map.at(local) - map.at(localSeconds);
+        const double sourceOut = map.out();
+        if (src < map.in() - 1e-9 || src >= sourceOut - 1e-9)
             return QImage();
         return provider(src, qMax(0.0, local));
     };
@@ -1030,7 +1063,8 @@ bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds)
 
 QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                                double clipLocalSeconds, double sourceSeconds,
-                               const EchoFrameProvider &frameProvider)
+                               const EchoFrameProvider &frameProvider,
+                               const RampSourceMapping *rampMapping)
 {
     // Adjustment layers have no clip-local source frame to re-fetch. Keep
     // Echo a no-op there while preserving every other effect's stack order.
@@ -1096,7 +1130,8 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                     return frame.isNull() ? frame : applyPrefix(frame, effectIndex, loc, src);
                 };
                 result = VideoEffectProcessor::blendEffectMask(result, applyRollingShutterFromSource(
-                    result, effect, clip, localSeconds, currentSourceSeconds, prefixProvider), effect);
+                    result, effect, clip, localSeconds, currentSourceSeconds, prefixProvider,
+                    /*sourceFps=*/0.0, rampMapping), effect);
                 continue;
             }
             if (!effect.enabled || effect.type != VideoEffectType::Echo) {
@@ -1127,21 +1162,24 @@ QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                 // ramp-less legacy export mapping), the echoes shift with the
                 // base frame instead of drifting onto a different time axis.
                 // With matching mappings the delta is exactly zero.
+                // US-2401: a top-level clip with a speed ramp takes the delta
+                // and the bounds from export's interval mapping (rampMapping),
+                // so a sample is that mapping at the sample's local time.
                 double sampleLocalSec = localSeconds - i * delaySec;
                 if (sampleLocalSec < -kEchoBoundaryEps)
                     break;
                 sampleLocalSec = qMax(0.0, sampleLocalSec);
-                const double sourceOut =
-                    clip.outPoint > 0.0 ? clip.outPoint : clip.duration;
-                const bool hasSourceBounds = sourceOut > clip.inPoint;
+                const SampleSourceMap map{clip, rampMapping};
+                const double sourceIn = map.in();
+                const double sourceOut = map.out();
+                const bool hasSourceBounds = sourceOut > sourceIn;
                 const double sampleSourceSec = hasSourceBounds
                     ? currentSourceSeconds
-                        + (clip.sourceSecondAtLocalTime(sampleLocalSec)
-                           - clip.sourceSecondAtLocalTime(localSeconds))
+                        + (map.at(sampleLocalSec) - map.at(localSeconds))
                     : currentSourceSeconds
                         + (clip.reversed ? 1.0 : -1.0) * i * delaySec;
                 if (hasSourceBounds
-                    && (sampleSourceSec < clip.inPoint - kEchoBoundaryEps
+                    && (sampleSourceSec < sourceIn - kEchoBoundaryEps
                         || sampleSourceSec > sourceOut + kEchoBoundaryEps)) {
                     continue;
                 }
@@ -1512,7 +1550,31 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
     return -1;
 }
 
+double rampedSourceSecondInInterval(const ClipInfo &clip, const OverlapInterval *interval,
+                                    double intervalLocalSec)
+{
+    if (!interval)
+        return clip.sourceSecondAtLocalTime(intervalLocalSec);
+    // Built like the reverse branch of overlapSourceSecond: the interval's
+    // (borrowed) bounds and speed, the clip's ramp.
+    ClipInfo mapped{};
+    mapped.inPoint = interval->clipIn;
+    mapped.outPoint = mapped.duration = interval->clipOut;
+    mapped.speed = interval->speed;
+    mapped.speedRamp = clip.speedRamp;
+    return mapped.sourceSecondAtLocalTime(intervalLocalSec);
+}
+
 namespace {
+
+// US-2401: a clip whose export source time follows its speed ramp in a top-level
+// pass. Time remap still wins, reversed clips keep the reverse-composition
+// branch, and a sequence reference's own ramp never maps its child timeline.
+bool exportRampMapsClip(const ClipInfo &clip)
+{
+    return !clip.speedRamp.isIdentity() && clip.timeRemapCurve.keys.isEmpty()
+        && !clip.reversed && !clip.isSequenceReference();
+}
 
 double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec,
                                       bool reverseCompositionActive)
@@ -1537,7 +1599,8 @@ double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec,
 // Direct reverse clips keep their original trim; flattened sequence entries
 // instead map through the expanded interval's source range.
 double overlapSourceSecond(const OverlapInterval &iv, const ClipInfo &clip,
-                           double localSec, bool reverseCompositionActive)
+                           double localSec, bool reverseCompositionActive,
+                           bool topLevel)
 {
     if (reverseCompositionActive && (clip.reversed || clip.isSequenceReference())) {
         ClipInfo mapped{};
@@ -1551,6 +1614,8 @@ double overlapSourceSecond(const OverlapInterval &iv, const ClipInfo &clip,
         mapped.reversed = true;
         return mapped.sourceSecondAtLocalTime(localSec);
     }
+    if (topLevel && !reverseCompositionActive && exportRampMapsClip(clip))
+        return rampedSourceSecondInInterval(clip, &iv, localSec);
     return qBound(iv.clipIn, iv.clipIn + localSec * iv.speed, iv.clipOut);
 }
 
@@ -1837,7 +1902,8 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              const QVector<Light3DState> &projectLights,
                              const QVector3D &projectLightViewPosition,
                              bool sampleFromLeftBoundary,
-                             const ParkedSidecars &parkedSidecars)
+                             const ParkedSidecars &parkedSidecars,
+                             bool rampEofHold = false)
 {
     if (!clip.shapes.isEmpty())
         return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
@@ -1868,9 +1934,18 @@ QImage renderClipSourceFrame(const Timeline *timeline,
         const QImage still = readTransitionStillFrame(clip.filePath);
         if (!still.isNull()) return still;
     }
-    return decodeClipFrameNative(
+    const QImage decoded = decodeClipFrameNative(
         clip.filePath, sourceSec,
-        resolvedSampleFromLeft, clip.inPoint);
+        resolvedSampleFromLeft, clip.inPoint,
+        /*strictFlushPts=*/rampEofHold && !resolvedSampleFromLeft);
+    // US-2401: a ramp above 1 holds its interval's clipOut once the source is
+    // used up; at the end of the file no frame starts at or after it, so the
+    // hold is the last frame before it. Only the top-level ramp-mapped layer
+    // (rampEofHold); nested passes and the preview's Echo source keep HEAD's.
+    if (decoded.isNull() && rampEofHold && !resolvedSampleFromLeft)
+        return decodeClipFrameNative(clip.filePath, sourceSec,
+                                     /*usePreviousSourceFrame=*/true, clip.inPoint);
+    return decoded;
 }
 
 // Roto source frame rate, chosen like the special-composite preview
@@ -2128,9 +2203,11 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
 }
 
 QImage decodeClipSourceFrame(const QString &filePath, double sourceSec,
-                             bool usePreviousSourceFrame, double sourceInSec)
+                             bool usePreviousSourceFrame, double sourceInSec,
+                             bool strictFlushPts)
 {
-    return decodeClipFrameNative(filePath, sourceSec, usePreviousSourceFrame, sourceInSec);
+    return decodeClipFrameNative(filePath, sourceSec, usePreviousSourceFrame, sourceInSec,
+                                 strictFlushPts);
 }
 
 namespace {
@@ -2154,16 +2231,20 @@ QImage renderClipLayerSource(const Timeline *timeline,
                              bool sampleFromLeftBoundary,
                              const ParkedSidecars &parkedSidecars,
                              bool promoteMaskTo16,
-                             bool stopAfterBrush = false)
+                             bool stopAfterBrush = false,
+                             const RampSourceMapping *rampMapping = nullptr)
 {
     g_clipLayerSourceCalls.fetch_add(1, std::memory_order_relaxed);
     const QString scopedClipId = renderScopedClipId(trackIdx, clipIdx, sequenceDepth,
                                                     sequenceStack);
+    // US-2401: the end-of-file hold of a top-level ramp-mapped layer.
+    const bool rampEofHold = sequenceDepth == 0 && rampMapping;
     const QImage roto = applyRotoForRender(timeline, rotoEntries, trackIdx, clipIdx, clip,
         renderClipSourceFrame(
             timeline, clip, sourceSec, localSec, outSize, sequenceDepth,
             sequenceSnapshot, sequenceStack, projectLights,
-            projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars),
+            projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars,
+            rampEofHold),
         sourceSec, localSec);
     if (roto.isNull())
         return QImage();
@@ -2184,7 +2265,8 @@ QImage renderClipLayerSource(const Timeline *timeline,
                     timeline, clip, sampleSourceSec, sampleLocalSec,
                     outSize, sequenceDepth,
                     sequenceSnapshot, sequenceStack, projectLights,
-                    projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars);
+                    projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars,
+                    rampEofHold);
                 if (sampleRaw.isNull())
                     return QImage();
                 // US-2010: each past sample carries the brush at its own local
@@ -2196,7 +2278,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
                     clip, sampleLocalSec);
             };
         fx = applyClipFxStackWithEchoFromSource(
-            raw, clip, localSec, sourceSec, echoFrameProvider);
+            raw, clip, localSec, sourceSec, echoFrameProvider, rampMapping);
     } else {
         fx = applyClipFxStackFromSource(raw, clip, localSec);
     }
@@ -2340,18 +2422,52 @@ int selectClipOnTrack(const QVector<RenderTrackSnapshot> &tracks,
     return activeClipOnTrack(tracks[t].clips, targetSec, clamp, start);
 }
 
+// US-2401: outside a borrowed overlap window, a ramped clip's layer local time
+// (from its own start) moves to its interval's local time by the seconds a
+// transition borrowed before its in point; no interval = the clip's own bounds.
+RampSourceMapping rampMappingOutsideOverlap(
+    const QVector<QVector<OverlapInterval>> &intervals, int t, int clipIdx,
+    const ClipInfo &c)
+{
+    if (t >= 0 && t < intervals.size())
+        for (const OverlapInterval &iv : intervals[t])
+            if (iv.clipIdx == clipIdx)
+                return RampSourceMapping{&iv, (c.inPoint - iv.clipIn) / iv.speed};
+    return RampSourceMapping{};
+}
+
 double sourceSecondOnTrack(const QVector<RenderTrackSnapshot> &tracks,
                            const QVector<QVector<OverlapInterval>> &intervals,
                            const QVector<int> &overlapA, const QVector<int> &overlapB,
-                           int t, const ClipInfo &c, double local, bool reverse,
-                           bool countDisabled)
+                           int t, int clipIdx, const ClipInfo &c, double local,
+                           bool reverse, bool topLevel, bool countDisabled)
 {
     if (overlapA[t] >= 0) {
         const auto &selected = selectedOverlapInterval(
             tracks, intervals, overlapA, overlapB, t, countDisabled);
-        return overlapSourceSecond(selected, c, local, reverse);
+        return overlapSourceSecond(selected, c, local, reverse, topLevel);
+    }
+    if (topLevel && !reverse && exportRampMapsClip(c)) {
+        const RampSourceMapping m = rampMappingOutsideOverlap(intervals, t, clipIdx, c);
+        return rampedSourceSecondInInterval(c, m.interval, local + m.localOffsetSec);
     }
     return sourceSecondForClipAtLocalTime(c, local, reverse);
+}
+
+// US-2401: the Echo / RollingShutter sample mapping of the layer sourceSecondOnTrack
+// maps (same interval and offset), or none when that layer keeps its own mapper.
+std::optional<RampSourceMapping> rampSampleMappingOnTrack(
+    const QVector<RenderTrackSnapshot> &tracks,
+    const QVector<QVector<OverlapInterval>> &intervals,
+    const QVector<int> &overlapA, const QVector<int> &overlapB,
+    int t, int clipIdx, const ClipInfo &c, bool reverse, bool topLevel)
+{
+    if (!topLevel || reverse || !exportRampMapsClip(c))
+        return std::nullopt;
+    if (overlapA[t] >= 0)
+        return RampSourceMapping{&selectedOverlapInterval(
+            tracks, intervals, overlapA, overlapB, t, /*countDisabled=*/false), 0.0};
+    return rampMappingOutsideOverlap(intervals, t, clipIdx, c);
 }
 
 std::atomic<quint64> g_parentLayerAtCalls{0};
@@ -2415,7 +2531,7 @@ std::optional<ParentLayerHit> parentLayerAtInTracks(
     const QVector<int> &overlapA, const QVector<int> &overlapB,
     double targetSec, int trackIdx, int clipIdx,
     const QVector<TimelineSequence> &sequenceSnapshot,
-    bool sampleFromLeftBoundary)
+    bool sampleFromLeftBoundary, bool topLevel)
 {
     // Test-only count; default OFF costs one relaxed load + branch.
     if (g_layerTimeObservation.load(std::memory_order_relaxed))
@@ -2443,8 +2559,8 @@ std::optional<ParentLayerHit> parentLayerAtInTracks(
     const bool reverse = sampleFromLeftBoundary
         || clipParticipatesInReverseComposition(c, sequenceSnapshot);
     hit.sourceSeconds = sourceSecondOnTrack(
-        tracks, intervals, overlapA, overlapB, trackIdx, c,
-        hit.clipLocalSeconds, reverse, /*countDisabled=*/false);
+        tracks, intervals, overlapA, overlapB, trackIdx, idx, c,
+        hit.clipLocalSeconds, reverse, topLevel, /*countDisabled=*/false);
     const QFileInfo parentFileInfo(c.filePath);
     hit.decodable = clipgeom::isNullObjectFilePath(c.filePath)
         || !c.sequenceRefId.isEmpty()
@@ -2513,10 +2629,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                                  t, targetSec, clamp, start,
                                  /*countDisabled=*/true);
     };
-    auto sourceAt = [&](int t, const ClipInfo &c, double local, bool reverse) {
+    auto sourceAt = [&](int t, int clipIdx, const ClipInfo &c, double local, bool reverse) {
         return sourceSecondOnTrack(tracks, intervals, overlapA, overlapB,
-                                   t, c, local, reverse,
+                                   t, clipIdx, c, local, reverse,
+                                   /*topLevel=*/sequenceDepth == 0,
                                    /*countDisabled=*/true);
+    };
+    // US-2401: the same mapping for the layer's Echo / RollingShutter samples.
+    auto rampSamplesAt = [&](int t, int clipIdx, const ClipInfo &c, bool reverse) {
+        return rampSampleMappingOnTrack(tracks, intervals, overlapA, overlapB,
+                                        t, clipIdx, c, reverse,
+                                        /*topLevel=*/sequenceDepth == 0);
     };
     // US-908: roto stage (applyRotoForRender, inside renderClipLayerSource).
     // Echo samples get none, as in the preview. US-2112: a nested pass takes its
@@ -2536,12 +2659,13 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     // US-1707: every top-level clip layer source of this composition.
     auto layerSource = [&](int t, int clipIdx, const ClipInfo &c,
                            double sourceSec, double localSec,
-                           bool promoteMaskTo16) {
+                           bool promoteMaskTo16,
+                           const RampSourceMapping *rampMapping) {
         return renderClipLayerSource(
             timeline, rotoEntries, t, clipIdx, c, sourceSec, localSec, outSize,
             sequenceDepth, sequenceSnapshot, sequenceStack, projectLights,
             projectLightViewPosition, sampleFromLeftBoundary, parkedSidecars,
-            promoteMaskTo16);
+            promoteMaskTo16, /*stopAfterBrush=*/false, rampMapping);
     };
 
     // The preview applies transitions to its primary playback entry only,
@@ -2582,9 +2706,13 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const double local = targetSec - b.timelineStart;
         const bool reverse = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
-        const double source = overlapSourceSecond(b, c, local, reverse);
+        const bool topLevel = sequenceDepth == 0;
+        const double source = overlapSourceSecond(b, c, local, reverse, topLevel);
+        const RampSourceMapping neighbourRamp{&b, 0.0};
+        const bool neighbourRamped = topLevel && !reverse && exportRampMapsClip(c);
         QImage neighbour = layerSource(primaryTrack, b.clipIdx, c, source, local,
-                                       /*promoteMaskTo16=*/false);
+                                       /*promoteMaskTo16=*/false,
+                                       neighbourRamped ? &neighbourRamp : nullptr);
         if (neighbour.isNull()) return composed;
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
         const clipgeom::ClipTransform neighbourTransform =
@@ -2651,7 +2779,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const bool v1ReverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(
                 v1Clip, sequenceSnapshot);
-        const double v1SourceSec = sourceAt(0, v1Clip, v1LocalSec, v1ReverseComposition);
+        const double v1SourceSec = sourceAt(0, v1Idx, v1Clip, v1LocalSec, v1ReverseComposition);
+        const std::optional<RampSourceMapping> v1Ramp =
+            rampSamplesAt(0, v1Idx, v1Clip, v1ReverseComposition);
         const bool v1HasKeyframes = clipanim::hasAnyDynamicTransform(v1Clip);
         const clipanim::EvalEnv v1Env = v1HasKeyframes ? clipEvalEnv(v1Clip, v1Start) : evalEnv;
         v1Transform = v1HasKeyframes
@@ -2683,7 +2813,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // canvas, each a strict no-op for a default clip so a lone V1 clip
         // stays byte-identical to S2.
         const QImage v1Native = layerSource(0, v1Idx, v1Clip, v1SourceSec, v1LocalSec,
-                                            /*promoteMaskTo16=*/true);
+                                            /*promoteMaskTo16=*/true,
+                                            v1Ramp ? &*v1Ramp : nullptr);
         if (v1Native.isNull())
             return QImage();
         const bool contained =
@@ -2800,7 +2931,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         const double localSec = targetSec - start;            // >= 0
         const bool reverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
-        const double srcSec = sourceAt(t, c, localSec, reverseComposition);
+        const double srcSec = sourceAt(t, idx, c, localSec, reverseComposition);
+        const std::optional<RampSourceMapping> cRamp =
+            rampSamplesAt(t, idx, c, reverseComposition);
         observeLayerTime(t, idx, localSec, srcSec);
         const bool cHasKeyframes = clipanim::hasAnyDynamicTransform(c);
         const clipanim::EvalEnv cEnv = cHasKeyframes ? clipEvalEnv(c, start) : evalEnv;
@@ -2848,7 +2981,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // is scaled onto the shared canvas. No-op for plain overlays, so S3's
         // multi-track MSE stays ~0.
         QImage native = layerSource(t, idx, c, srcSec, localSec,
-                                    /*promoteMaskTo16=*/true);
+                                    /*promoteMaskTo16=*/true,
+                                    cRamp ? &*cRamp : nullptr);
         if (native.isNull())
             continue;
         native = snsfit::maybeFit(native, c.fitContain, c.fitCover, outSize);
@@ -2964,7 +3098,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                                 tracks, intervals, overlapA, overlapB, targetSec,
                                 renderLayers[parentIdx].trackIndex,
                                 renderLayers[parentIdx].clipIndex,
-                                sequenceSnapshot, sampleFromLeftBoundary)) {
+                                sequenceSnapshot, sampleFromLeftBoundary,
+                                /*topLevel=*/sequenceDepth == 0)) {
                             stack.removeLast();
                             return false;
                         }
@@ -3253,8 +3388,83 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             [](const OverlayLayer &layer) {
                 return layer.blendMode != BlendMode::Normal;
             });
-        const bool use16 = hdrexport16::enabledFromEnv() && !hasSpecialBlend;
-        if (use16) {
+        const bool use16 = hdrexport16::enabledFromEnv();
+        if (use16 && hasSpecialBlend) {
+            // 16 bit blend: the same order as the 8 bit chain below (Normal
+            // layers back to front with V1 last, then the blend layers
+            // ascending), composed by trackmatte16::composeExport with no
+            // matte, with the same input transforms and output tonemap as the
+            // blend-free 16 bit branch and the matte path.
+            const QSize canvas(base.width(), base.height());
+            const bool odtEnabled = clipodt::enabledFromEnv();
+            const bool idtEnabled = clipidt::enabledFromEnv();
+            aces::ColorSpace v1OutputSpace = aces::ColorSpace::sRGB;
+            if (!odtEnabled && idtEnabled)
+                v1OutputSpace = clipcolor::acesSpaceFor(v1Clip.colorMeta);
+
+            QVector<gpucomposite::LayerDesc> descs;
+            QVector<QImage> images;
+            descs.reserve(overlays.size() + 1);
+            images.reserve(overlays.size() + 1);
+            auto addLayer = [&](QImage img, double opacity, BlendMode blendMode,
+                                const decltype(v1Clip.colorMeta) &colorMeta) {
+                if (odtEnabled)
+                    img = clipcolor::toLinearWorking(img, colorMeta);
+                else if (idtEnabled)
+                    img = clipcolor::toUnifiedSpace(img, colorMeta, v1OutputSpace);
+                gpucomposite::LayerDesc d;
+                d.sourceTrack = descs.size();
+                d.srcSize = canvas;
+                d.visible = true;
+                d.opacity = qBound(0.0, opacity, 1.0);
+                d.matteType = gpucomposite::MatteType::None;
+                d.blendModeOrdinal = static_cast<int>(blendMode);
+                descs.append(d);
+                images.append(img);
+            };
+
+            for (int i = overlays.size() - 1; i >= 0; --i) {
+                const OverlayLayer &L = overlays[i];
+                if (L.blendMode != BlendMode::Normal
+                    || L.image.isNull() || L.opacity <= 0.001) {
+                    continue;
+                }
+                QImage placed = L.image;
+                if (!L.layerStyle.isIdentity())
+                    placed = layerstyle::apply(placed, L.layerStyle);
+                addLayer(placed, L.opacity, BlendMode::Normal, L.colorMeta);
+            }
+            const double v1Opacity = qBound(0.0, v1EffectiveOpacity, 1.0);
+            if (v1Opacity > 0.001) {
+                QImage v1Base = base;
+                if (!v1Clip.layerStyle.isIdentity())
+                    v1Base = layerstyle::apply(v1Base, v1Clip.layerStyle);
+                addLayer(v1Base, v1Opacity, BlendMode::Normal, v1Clip.colorMeta);
+            }
+            for (int i = 0; i < overlays.size(); ++i) {
+                const OverlayLayer &L = overlays[i];
+                if (L.blendMode == BlendMode::Normal
+                    || L.image.isNull() || L.opacity <= 0.001) {
+                    continue;
+                }
+                QImage placed = L.image;
+                if (!L.layerStyle.isIdentity())
+                    placed = layerstyle::apply(placed, L.layerStyle);
+                addLayer(placed, L.opacity, L.blendMode, L.colorMeta);
+            }
+
+            trackmatte16::MatteColorCtx ctx;
+            QImage c64 = trackmatte16::composeExport(descs, images, canvas, ctx);
+            if (odtEnabled) {
+                c64 = clipodt::applyOdt16(
+                    c64,
+                    clipodt::OdtParams{
+                        clipcolor::acesSpaceFor(v1Clip.colorMeta), true
+                    });
+            }
+            stacked = hdrcomposite::to8bit(c64)
+                          .convertToFormat(QImage::Format_RGBA8888);
+        } else if (use16) {
             const QSize canvas(base.width(), base.height());
             QVector<QImage> placedBackToFront;
             QVector<double> opacities;
@@ -3542,8 +3752,11 @@ static QImage renderClipSourceAtStage(const Timeline *timeline, int trackIdx, in
     const double localSec = targetSec - start;
     const bool reverse = clipParticipatesInReverseComposition(c, sequenceSnapshot);
     const double sourceSec = sourceSecondOnTrack(
-        tracks, intervals, overlapA, overlapB, trackIdx, c, localSec, reverse,
-        /*countDisabled=*/false);
+        tracks, intervals, overlapA, overlapB, trackIdx, clipIdx, c, localSec, reverse,
+        /*topLevel=*/true, /*countDisabled=*/false);
+    const std::optional<RampSourceMapping> rampSamples = rampSampleMappingOnTrack(
+        tracks, intervals, overlapA, overlapB, trackIdx, clipIdx, c, reverse,
+        /*topLevel=*/true);
     QVector<QString> sequenceStack;
     const QString activeId = timeline->activeSequenceId();
     if (!activeId.isEmpty())
@@ -3555,7 +3768,7 @@ static QImage renderClipSourceAtStage(const Timeline *timeline, int trackIdx, in
         localSec, outSize, /*sequenceDepth=*/0, sequenceSnapshot, sequenceStack,
         projectLights, timeline->projectLightViewPosition(),
         /*sampleFromLeftBoundary=*/false, timeline->parkedSidecarsBySequence(),
-        /*promoteMaskTo16=*/true, stopAfterBrush);
+        /*promoteMaskTo16=*/true, stopAfterBrush, rampSamples ? &*rampSamples : nullptr);
 }
 
 QImage renderClipSourceAt(const Timeline *timeline, int trackIdx, int clipIdx,
@@ -3720,7 +3933,8 @@ QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
 
 QImage applyClipFxStackWithEchoFromSource(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
-    double sourceSeconds, const EchoFrameProvider &frameProvider)
+    double sourceSeconds, const EchoFrameProvider &frameProvider,
+    const RampSourceMapping *rampMapping)
 {
     // US-1301: the CPU preview sends every mesh-warp / puppet clip here. Without
     // an active Echo / RollingShutter, take the export path (applyClipFxPack has
@@ -3730,7 +3944,7 @@ QImage applyClipFxStackWithEchoFromSource(
         return applyClipFxStackFromSource(source, clip, clipLocalSeconds);
     return applyClipMeshWarp(applyClipFxPackWithEcho(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
-        clip, clipLocalSeconds, sourceSeconds, frameProvider), clip);
+        clip, clipLocalSeconds, sourceSeconds, frameProvider, rampMapping), clip);
 }
 
 QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)
@@ -3814,7 +4028,7 @@ std::optional<ParentLayerHit> parentLayerAt(const Timeline *timeline, qint64 use
     return parentLayerAtInTracks(tracks, intervals, overlapA, overlapB,
                                  targetSec, trackIdx, clipIdx,
                                  timeline->sequences(),
-                                 /*sampleFromLeftBoundary=*/false);
+                                 /*sampleFromLeftBoundary=*/false, /*topLevel=*/true);
 }
 
 namespace detail {

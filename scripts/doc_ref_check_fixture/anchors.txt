@@ -1,0 +1,4 @@
+# doc_ref_check fixture anchors: path:range<TAB>literal
+target.cpp:14	workerThree
+target.cpp:13	worker
+target.cpp:17	workerSix

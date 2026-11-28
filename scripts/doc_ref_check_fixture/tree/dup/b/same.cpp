@@ -1,0 +1,2 @@
+// b
+int sameRightFunc() {}

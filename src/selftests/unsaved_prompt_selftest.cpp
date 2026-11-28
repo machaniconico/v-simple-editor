@@ -165,7 +165,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 15; ++g)
+        for (int g = 1; g <= 16; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -1467,15 +1467,16 @@ int runUnsavedPromptSelftest()
         leg("(f') drag,motion,wait", {DM, D, base}, [&] { dragWrite(2.0); wait(50); motionWrite(); wait(450); });
         leg("(f2) drag across the motion timeout", {expect(3.0, -0.3, 0.25, 30.0, 0), M, base}, [&] {
             motionWrite(); wait(50); dragWrite(2.0); wait(280); dragWrite(2.5); wait(280); dragWrite(3.0); wait(700); });
-        // (g) an undo that bypasses MainWindow (MCP) between two bursts: the drag's point is stale and dropped;
-        // nothing the undo removed comes back.
-        leg("(g) bypass undo", {ME, M, base}, [&] {
-            edit();                        // a point past the base, for the MCP undo to remove
+        // (g) an undo that bypasses MainWindow (MCP) between two bursts: the drag's burst is stale and dropped;
+        // nothing the undo removed comes back. US-2405: the drag closes the motion burst, so the motion's point
+        // is the top one the undo removes, and the edit's point stays under the motion burst that follows.
+        leg("(g) bypass undo", {ME, ME, expect(1.0, 0.0, 0.0, 0.0, 1), base}, [&] {
+            edit();                        // a point past the base
             wait(10);
             motionWrite(); wait(50);       // t = 0 / 60
-            dragWrite(2.0); wait(50);      // t = 50
-            tl.undo(); wait(20);           // t = 100: undoes the edit, bypassing MainWindow
-            motionWrite(); wait(30);       // t = 120: re-bases the motion burst only
+            dragWrite(2.0); wait(50);      // t = 50: closes the motion burst, which takes its point
+            tl.undo(); wait(20);           // t = 100: undoes that point, bypassing MainWindow; the drag is stale
+            motionWrite(); wait(30);       // t = 120: a burst of its own
             edit(); wait(500);             // t = 150: flush in capture order
         });
         // US-2220 (h): a relink within the burst rewrites the overlay before its save; the burst's
@@ -1738,6 +1739,117 @@ int runUnsavedPromptSelftest()
             setMatte(); tl.absorbIntoCurrentUndoPoint(); wait(400);
         });
         tally.gate(15, ok, d);
+    }
+
+    // ---- G16 (US-2405): a write of the other kind closes the open drag / motion burst, so alternating
+    // bursts (motion, drag, motion) leave one undo point per run in the order the edits were made; every
+    // leg reads the content of each undo step ----
+    {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        MainWindow w16;
+        Timeline &tl = *w16.m_timeline;
+        UndoManager *um = tl.undoManager();
+        const QString clipPath = tmp("g16-clip.mp4");
+        const bool filesOk = touchFile(clipPath);
+        const auto setup = [&] {
+            tl.videoTracks()[0]->setClips({makeClip(clipPath)});
+            tl.videoTracks()[0]->setSelectedClip(0);
+            tl.setTrackMatteEntries({});
+            um->clear();
+            tl.saveUndoState(QStringLiteral("Initial"));
+            w16.markProjectClean();
+        };
+        const auto sig = [&]() -> QString {
+            const auto &clips = tl.videoClips();
+            const QString matte = QStringLiteral(" m%1").arg(tl.trackMatteEntries().size());
+            if (clips.isEmpty()) return QStringLiteral("none") + matte;
+            const ClipInfo &c = clips.first();
+            return QStringLiteral("s%1 x%2 y%3 r%4").arg(c.videoScale, 0, 'f', 2).arg(c.videoDx, 0, 'f', 2)
+                .arg(c.videoDy, 0, 'f', 2).arg(c.rotation2DDegrees, 0, 'f', 1) + matte;
+        };
+        const auto expect = [](double scale, double dx, double dy, double rot, int mattes) {
+            return QStringLiteral("s%1 x%2 y%3 r%4 m%5").arg(scale, 0, 'f', 2).arg(dx, 0, 'f', 2)
+                .arg(dy, 0, 'f', 2).arg(rot, 0, 'f', 1).arg(mattes);
+        };
+        const auto motionWrite = [&](double rotation) {
+            Q_EMIT tl.clipSelectedOnTrack(0, 0);
+            auto *motion = w16.m_effectControlsPanel->findChild<effectctrl::MotionSectionWidget *>();
+            if (!motion) return;
+            effectctrl::MotionState state = motion->currentMotion();
+            state.rotation2DDeg = rotation;
+            Q_EMIT motion->motionChanged(state);
+        };
+        const auto dragWrite = [&](double scale) {
+            Q_EMIT w16.m_player->videoSourceTransformChanged(0, 0, scale, -0.3, 0.25);
+        };
+        const auto setMatte = [&] {
+            QHash<QString, TimelineTrackMatteEntry> mattes;
+            mattes.insert(QStringLiteral("0:0"), TimelineTrackMatteEntry{TrackMatteType::AlphaMatte, QStringLiteral("1:0")});
+            tl.setTrackMatteEntries(mattes);
+        };
+        const auto wait = [](int ms) { QCoreApplication::processEvents(); QTest::qWait(ms); };
+        const auto walk = [&](bool &roundTrip) {
+            QStringList topFirst{sig()};
+            while (um->canUndo()) {
+                tl.undo();
+                topFirst << sig();
+            }
+            QStringList up{sig()};
+            while (um->canRedo()) {
+                tl.redo();
+                up << sig();
+            }
+            QStringList down = topFirst;
+            std::reverse(down.begin(), down.end());
+            roundTrip = up == down;
+            return topFirst;
+        };
+        bool ok = filesOk;
+        std::string d = "files=" + b(filesOk);
+        setup();
+        const QString base = sig();
+        const auto leg = [&](const char *name, const QStringList &want, const std::function<void()> &run) {
+            setup();
+            run();
+            bool roundTrip = false;
+            const QStringList got = walk(roundTrip);
+            const bool legOk = got == want && roundTrip;
+            ok = ok && legOk;
+            d += std::string(" | ") + name + " " + b(legOk) + " [" + got.join(" > ").toStdString() + "] want ["
+                + want.join(" > ").toStdString() + "] roundTrip=" + b(roundTrip);
+        };
+        const double dx = -0.3, dy = 0.25;
+        const QString M30 = expect(1.0, 0.0, 0.0, 30.0, 0);       // the first motion burst alone
+        const QString DM30 = expect(2.0, dx, dy, 30.0, 0);        // + the drag
+        const QString DM60 = expect(2.0, dx, dy, 60.0, 0);        // + the second motion burst
+        const QString DM60T = expect(2.0, dx, dy, 60.0, 1);       // the same with the matte joined
+        const auto motionDragMotion = [&] { motionWrite(30.0); wait(50); dragWrite(2.0); wait(50); motionWrite(60.0); };
+        // (a) motion, drag, motion inside the windows, settled by the timeouts: three points in write order.
+        leg("(a) motion,drag,motion timeout", {DM60, DM30, M30, base}, [&] { motionDragMotion(); wait(500); });
+        // (b) the same run settled by a flush: the hook before a save, and the absorb's flush.
+        leg("(b1) motion,drag,motion save hook", {DM60T, DM60, DM30, M30, base}, [&] {
+            motionDragMotion(); setMatte(); tl.saveUndoState(QStringLiteral("edit")); wait(400); });
+        leg("(b2) motion,drag,motion absorb", {DM60T, DM30, M30, base}, [&] {
+            motionDragMotion(); setMatte(); tl.absorbIntoCurrentUndoPoint(); wait(400); });
+        leg("(b3) drag,motion,drag absorb", {expect(3.0, dx, dy, 30.0, 1), DM30, expect(2.0, dx, dy, 0.0, 0), base}, [&] {
+            dragWrite(2.0); wait(50); motionWrite(30.0); wait(50); dragWrite(3.0);
+            setMatte(); tl.absorbIntoCurrentUndoPoint(); wait(400); });
+        // (c) pins: a run of one kind stays one point, two kinds are two points in write order, and a burst a
+        // bypassing undo made stale is still dropped.
+        leg("(c1) motion x3", {expect(1.0, 0.0, 0.0, 50.0, 0), base}, [&] {
+            motionWrite(30.0); wait(50); motionWrite(40.0); wait(50); motionWrite(50.0); wait(500); });
+        leg("(c2) drag x3", {expect(4.0, dx, dy, 0.0, 0), base}, [&] {
+            dragWrite(2.0); wait(50); dragWrite(3.0); wait(50); dragWrite(4.0); wait(500); });
+        leg("(c3) motion,drag", {DM30, M30, base}, [&] {
+            motionWrite(30.0); wait(50); dragWrite(2.0); wait(500); });
+        leg("(c4) drag,motion", {DM30, expect(2.0, dx, dy, 0.0, 0), base}, [&] {
+            dragWrite(2.0); wait(50); motionWrite(30.0); wait(500); });
+        leg("(c5) bypass undo then other kind", {M30, base}, [&] {
+            tl.saveUndoState(QStringLiteral("point"));
+            dragWrite(2.0); wait(50);
+            tl.undo(); wait(20);                       // bypasses MainWindow: the drag burst is stale
+            motionWrite(30.0); wait(500); });
+        tally.gate(16, ok, d);
     }
 
     window.setUnsavedChangesPromptForTest({});

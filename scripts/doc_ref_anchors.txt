@@ -1,0 +1,58 @@
+# doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
+# The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
+# A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.
+README.md:813	ブラシを持つクリップの RenderInPlace
+src/AudioExportMix.cpp:204	audioexport::sortedDedupedEnvelope(
+src/AudioExportMix.cpp:216	audio::clampClipGain(point.gain)
+src/AudioExportMix.cpp:230	audioexport::mergeDuckingEnvelope(
+src/AudioExportMix.cpp:383-391	const auto trackAudible = [&](int track)
+src/AudioExportMix.cpp:51	audio::clampClipGain(entry.volume)
+src/AudioMixer.cpp:934	double gain = audio::clampClipGain(clipGain);
+src/AudioMixerDock.cpp:198-203	m_timeline->toggleMuteTrack(i);
+src/AutoSave.cpp:88-99	project_autosave_utc_%1_
+src/Camera3D.cpp:325	layer3D.isDefaultIgnoringWorld()
+src/CameraMotionDialog.cpp:161-166	camera3d::horizontalFovDegrees(
+src/CameraMotionDialog.cpp:213-219	makeSpinBox(1.0, 100000.0, 1.0, 60.0)
+src/CameraMotionDialog.cpp:219	makeSpinBox(1.0, 100000.0, 1.0, 60.0)
+src/CameraSolver.cpp:302-373	applySolvedPosesToCamera(Camera3D& camera
+src/GLPreview.cpp:1258	if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush)
+src/GLPreview.cpp:158	clipanim::layer3DAt(clip, clipLocalSeconds)
+src/GLPreview.cpp:2224	m_projectCameraFrame = tlrender::renderFrameAt(
+src/GLPreview.cpp:2967	!m_solvePointOverlay.isEmpty()
+src/MainWindow.cpp:12494	400% = max
+src/MainWindow.cpp:16156	MainWindow::createNullAtSolvePoint(int index)
+src/MainWindow.cpp:17049-17052	applied.poses.cbegin(), applied.poses.cend()
+src/MainWindow.cpp:17064-17072	3D カメラ解析を適用できませんでした
+src/MainWindow.cpp:8870	preview/text3dProxyThreshold
+src/MainWindow.cpp:9274	active.layer.zOrder = trackIdx;
+src/MainWindow.cpp:9275	active.layer.layer3D = clipanim::layer3DAt(
+src/MainWindow.cpp:9317	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
+src/MainWindow.cpp:9358-9365	if (!hasTrackMatteLayer)
+src/PlanarTrackerDialog.cpp:920	m_cameraFovWarning->setText(
+src/ProjectFile.cpp:1705	clip.dynamicTimeOffsetSec != 0.0
+src/RenderInPlace.cpp:27-29	The brush (brushData, brush_progress) is drawn
+src/RenderInPlace.cpp:393-404	overlayShiftTimelineSec = prefix - videoStart;
+src/RenderInPlace.cpp:45	to.text3DConfig = from.text3DConfig;
+src/RenderInPlace.cpp:454	temporary.setProjectOutputConfig(
+src/RenderInPlace.cpp:474-477	usesAlphaPath = bakesRoto || !original.brushData.isEmpty()
+src/SmartRender.cpp:450	if (!clip.brushData.isEmpty())
+src/SmartRender.cpp:478	if (!clip.brushData.isEmpty())
+src/Text3DExtrusionDialog.cpp:438-440	result->setTimeOffsetSec(timeOffset.toDouble())
+src/Text3DLayer.cpp:382	kPreviewProxyLongEdge) / static_cast<double>(longDim)
+src/Text3DLayer.cpp:390	if (threshold <= 0 || !layer.extrudeEnabled())
+src/Text3DLayer.cpp:394	std::max(frameSize.width(), frameSize.height()) > threshold
+src/Timeline.cpp:1978	bool splitClipByConsumedSource(
+src/Timeline.cpp:2017	piece.timeRemapCurve = timeremap::TimeRemapCurve{};
+src/Timeline.cpp:2026	clip.timeRemapCurve.sliced(fromSec, toSec, mn)
+src/Timeline.cpp:2174-2177	secondHalf.timeRemapCurve = timeremap::TimeRemapCurve{};
+src/Timeline.cpp:2184	secondHalf.leadIn = Transition{};
+src/Timeline.cpp:2257	secondHalf.dynamicTimeOffsetSec += cutLocalSec;
+src/TimelineFrameRenderer.cpp:2116	bool timelineBrushWantsSpecialPath(
+src/TimelineFrameRenderer.cpp:2565-2567	hit.decodable = clipgeom::isNullObjectFilePath(
+src/TimelineFrameRenderer.cpp:3545	V1 base painted last
+src/VideoPlayer.cpp:4432	tlrender::EchoFrameProvider echoFrameProvider;
+src/VideoPlayer.cpp:4502	return VideoEffectProcessor::applyEffectStack(
+src/clipanim/ClipAnim.cpp:712	Layer3DTransform layer3DAt(
+src/clipanim/ClipAnim.cpp:739	clipLocalSeconds + clip.dynamicTimeOffsetSec
+src/mcp/McpEditorTools.cpp:3163-3173	windowGuard->prepareExportAudioMix(
+src/mcp/McpEditorTools.cpp:3173	RenderQueue::setIntermediateProjectFile(job, audioMixPath)

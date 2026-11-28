@@ -111,6 +111,23 @@ QImage composeEcho(const QImage &base, const QVector<QImage> &echoes,
 using EchoFrameProvider =
     std::function<QImage(double sourceSeconds, double clipLocalSeconds)>;
 
+// US-2401: the source second export gives a top-level clip with a non-identity
+// speed ramp (no time remap, not reversed, not a sequence reference): the
+// ClipInfo mapper (ramp, then clamp) over `interval`'s clipIn / clipOut / speed
+// (the playback interval, so the start and in point a transition borrowed, as
+// VideoPlayer::entryLocalPositionUs maps the entry) at `intervalLocalSec` from
+// the interval's start. A null interval means the clip's own bounds, which is
+// clip.sourceSecondAtLocalTime(intervalLocalSec).
+double rampedSourceSecondInInterval(const ClipInfo &clip, const OverlapInterval *interval,
+                                    double intervalLocalSec);
+// US-2401: how the Echo / RollingShutter samples of such a clip map a
+// clip-local time `local`: rampedSourceSecondInInterval(clip, interval,
+// local + localOffsetSec), bounded by the interval (or the clip's own bounds).
+struct RampSourceMapping {
+    const OverlapInterval *interval = nullptr;
+    double localOffsetSec = 0.0;
+};
+
 // Clip mesh is applied once after the ordered FX stack, before masks/geometry.
 bool hasActiveMeshWarp(const ClipInfo &clip);
 void setMeshWarpDisabledForTesting(bool disabled);
@@ -126,7 +143,8 @@ quint64 rollingShutterInvocationCountForTesting();
 QImage applyRollingShutterFromSource(
     const QImage &source, const VideoEffect &effect, const ClipInfo &clip,
     double clipLocalSeconds, double sourceSeconds,
-    const EchoFrameProvider &frameProvider, double sourceFps = 0.0);
+    const EchoFrameProvider &frameProvider, double sourceFps = 0.0,
+    const RampSourceMapping *rampMapping = nullptr);
 
 bool hasActiveEcho(const ClipInfo &clip, double clipLocalSeconds);
 // Shared clip-local pre-Echo stage used by export and VideoPlayer. The source
@@ -138,13 +156,15 @@ QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
                                   double clipLocalSeconds);
 QImage applyClipFxPackWithEcho(const QImage &graded, const ClipInfo &clip,
                                double clipLocalSeconds, double sourceSeconds,
-                               const EchoFrameProvider &frameProvider);
+                               const EchoFrameProvider &frameProvider,
+                               const RampSourceMapping *rampMapping = nullptr);
 // Full native clip stage for Echo/RollingShutterRepair: VFX footage controls ->
 // grade/LUT -> ordered FX/Echo. Both export and preview call this function
 // before mask, fit, transform, and canvas composition.
 QImage applyClipFxStackWithEchoFromSource(
     const QImage &source, const ClipInfo &clip, double clipLocalSeconds,
-    double sourceSeconds, const EchoFrameProvider &frameProvider);
+    double sourceSeconds, const EchoFrameProvider &frameProvider,
+    const RampSourceMapping *rampMapping = nullptr);
 
 // Random-access source-frame path shared with preview Echo. It mirrors the
 // export provider's source decode/nested render -> VFX controls -> grade order.
@@ -219,8 +239,11 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
 // US-1805: one source frame by renderFrameAt's rule: the first frame at or after
 // `sourceSec`, or with `usePreviousSourceFrame` (a reversed source position) the
 // last frame before it, not before `sourceInSec`. Null on any failure.
+// Ramped EOF holds opt into strict PTS filtering of delayed flush output;
+// other callers preserve the historical flush selection.
 QImage decodeClipSourceFrame(const QString &filePath, double sourceSec,
-                             bool usePreviousSourceFrame, double sourceInSec);
+                             bool usePreviousSourceFrame, double sourceInSec,
+                             bool strictFlushPts = false);
 // Dynamic bool property on the GLPreview: the frame on screen is a special
 // composite that drew the brushes (US-1906: not any composite, a roto or matte one
 // draws none). MainWindow sets it with each paused display and only the next

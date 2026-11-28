@@ -242,6 +242,7 @@ int runProjectPresetSelftest();
 int runProxySelftestV2();
 int runPsdImportSelftest();
 int runPuppetPinSelftest();
+int runRampExportSelftest();
 int runReduceProjectSelftest();
 int runRenderFixtureSelftest();
 int runRenderInPlaceSelftest();
@@ -724,7 +725,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
-      "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (16 gates)" },
+      "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (19 gates)" },
+    { "ramp-export",       "VEDITOR_RAMP_EXPORT_SELFTEST",        runRampExportSelftest,         true,
+      "a top-level clip with a speed ramp maps its export source time through the ClipInfo mapper over its playback interval (the start and in point a transition borrowed, clamped to it) in renderFrameAt, its Echo samples, renderClipSourceAt and the special composite: ramped frames, ends, borrowed origin, consumers, unchanged cases, preview read-back (8 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
@@ -1090,7 +1093,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
       "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates); includes 16-bit precision proof, graceful GL skip" },
     { "matte16-parity", "VEDITOR_MATTE16_PARITY_SELFTEST", runMatte16ParitySelftest, true,
-      "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (9 gates)" },
+      "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (10 gates)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
     { "vfx-generators",    "VEDITOR_VFX_GENERATORS_SELFTEST",     runVfxGeneratorsSelftest,     true,
@@ -1124,9 +1127,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
-      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (15 gates)" },
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (16 gates)" },
     { "project-persist", nullptr, runProjectPersistSelftest, true,
-      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (17 gates)" },
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (18 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

@@ -198,7 +198,7 @@ int runProjectPersistSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 17; ++g)
+        for (int g = 1; g <= 18; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("project-persist");
     }
@@ -1529,6 +1529,86 @@ int runProjectPersistSelftest()
                        + "' both ok=" + b(bothOk) + " '" + bothResult.warning.toStdString() + "' offset=" + std::to_string(mappedError.offset) + " rewritten=" + std::to_string(rewrittenError.offset)
                        + " original=" + std::to_string(both.size()) + " number='" + numberError.errorString().toStdString()
                        + "' template written=" + b(templateWritten) + " listed=" + b(templateListed));
+    }
+
+    // ---- G18: the mask payload, the gradient preset and the saved workspaces survive an
+    // out-of-range number literal; in-range input parses exactly as a plain fromJson ----
+    // Per reader: (over) one 1e400, (under) one 1e-400, (inRange) the same input with in-range
+    // numbers, (garbage) a broken document. Each out-of-range input is first shown to make a plain
+    // fromJson return null, so the gate cannot pass on a reader that never needed the clamp. The
+    // expected values are constants, not a second plain fromJson of the same bytes.
+    {
+        // ---- mask Bezier payload (base64 of the JSON) ----
+        auto maskInput = [](const char *x, const char *inX) {
+            return (QByteArrayLiteral(R"([{"x":)") + x + R"(,"y":0.5},{"x":0.1,"y":0.1,"inX":)" + inX
+                    + R"(},{"x":0.9,"y":0.9}])");
+        };
+        auto maskLeg = [&](const QByteArray &json, double expectX, double expectInX) {
+            const QJsonArray a = plainjson::parseMaskBezierPayload(json.toBase64()).array();
+            return a.size() == 3
+                && a.at(0).toObject().value(QStringLiteral("x")).toDouble(-1.0) == expectX
+                && a.at(0).toObject().value(QStringLiteral("y")).toDouble(-1.0) == 0.5
+                && a.at(1).toObject().value(QStringLiteral("x")).toDouble(-1.0) == 0.1
+                && a.at(1).toObject().value(QStringLiteral("inX")).toDouble(-1.0) == expectInX
+                && a.at(2).toObject().value(QStringLiteral("x")).toDouble(-1.0) == 0.9
+                && a.at(2).toObject().value(QStringLiteral("y")).toDouble(-1.0) == 0.9;
+        };
+        const QByteArray maskOverIn = maskInput("1e400", "0.25");
+        const QByteArray maskUnderIn = maskInput("0.5", "1e-400");
+        const QByteArray maskGoodIn = maskInput("0.5", "0.25");
+        const bool maskOver = QJsonDocument::fromJson(maskOverIn).isNull() && maskLeg(maskOverIn, DBL_MAX, 0.25);
+        const bool maskUnder = QJsonDocument::fromJson(maskUnderIn).isNull() && maskLeg(maskUnderIn, 0.5, 0.0);
+        const bool maskInRange = !QJsonDocument::fromJson(maskGoodIn).isNull() && maskLeg(maskGoodIn, 0.5, 0.25);
+        const QJsonDocument maskBroken = plainjson::parseMaskBezierPayload(QByteArray("[1,2").toBase64());
+        const bool maskGarbage = maskBroken.isNull() && !maskBroken.isArray();
+
+        // ---- gradient preset file ----
+        auto gradInput = [](const char *angle) {
+            return (QByteArrayLiteral(R"({"name":"g","type":1,"angle":)") + angle
+                    + R"(,"reverse":true,"stops":[{"position":0.5,"color":"#ff0000ff","opacity":1}]})");
+        };
+        auto gradLeg = [&](const QByteArray &json, double expectAngle) {
+            const QJsonObject o = plainjson::parseGradientPreset(json);
+            return o.value(QStringLiteral("angle")).toDouble(-1.0) == expectAngle
+                && o.value(QStringLiteral("type")).toInt(0) == 1
+                && o.value(QStringLiteral("reverse")).toBool(false)
+                && o.value(QStringLiteral("stops")).toArray().size() == 1;
+        };
+        const QByteArray gradOverIn = gradInput("1e400");
+        const QByteArray gradUnderIn = gradInput("1e-400");
+        const QByteArray gradGoodIn = gradInput("45.5");
+        const bool gradOver = QJsonDocument::fromJson(gradOverIn).isNull() && gradLeg(gradOverIn, DBL_MAX);
+        const bool gradUnder = QJsonDocument::fromJson(gradUnderIn).isNull() && gradLeg(gradUnderIn, 0.0);
+        const bool gradInRange = !QJsonDocument::fromJson(gradGoodIn).isNull() && gradLeg(gradGoodIn, 45.5);
+        const bool gradGarbage = plainjson::parseGradientPreset(QByteArrayLiteral(R"({"type":1)")).isEmpty();
+
+        // ---- saved workspaces ----
+        auto wsInput = [](const char *extra) {
+            return QStringLiteral(R"({"workspaces":[{"name":"Edit","windowState":"AQID","geometry":"BAUG","extra":)")
+                + QLatin1String(extra) + QStringLiteral(R"(}],"currentName":"Edit"})");
+        };
+        auto wsLeg = [&](const QString &json) {
+            workspace::WorkspaceManager loaded;
+            const bool parsed = plainjson::parseWorkspaces(json, loaded);
+            const workspace::Workspace *edit = loaded.get(QStringLiteral("Edit"));
+            return parsed && loaded.count() == 1 && edit && edit->windowState == QByteArray::fromBase64("AQID")
+                && edit->geometry == QByteArray::fromBase64("BAUG") && loaded.currentName() == QLatin1String("Edit");
+        };
+        const QString wsOverIn = wsInput("1e400");
+        const QString wsUnderIn = wsInput("1e-400");
+        const QString wsGoodIn = wsInput("0.5");
+        const bool wsOver = QJsonDocument::fromJson(wsOverIn.toUtf8()).isNull() && wsLeg(wsOverIn);
+        const bool wsUnder = QJsonDocument::fromJson(wsUnderIn.toUtf8()).isNull() && wsLeg(wsUnderIn);
+        const bool wsInRange = !QJsonDocument::fromJson(wsGoodIn.toUtf8()).isNull() && wsLeg(wsGoodIn);
+        workspace::WorkspaceManager wsKept;
+        wsKept.addOrUpdate(QStringLiteral("Keep"), QByteArray("k"), QByteArray("k"));
+        const bool wsGarbage = !plainjson::parseWorkspaces(QStringLiteral("[1,2"), wsKept) && wsKept.count() == 1;
+
+        tally.gate(18, maskOver && maskUnder && maskInRange && maskGarbage && gradOver && gradUnder && gradInRange
+                           && gradGarbage && wsOver && wsUnder && wsInRange && wsGarbage,
+                   "mask over=" + b(maskOver) + " under=" + b(maskUnder) + " inRange=" + b(maskInRange) + " garbage=" + b(maskGarbage)
+                       + " gradient over=" + b(gradOver) + " under=" + b(gradUnder) + " inRange=" + b(gradInRange) + " garbage=" + b(gradGarbage)
+                       + " workspaces over=" + b(wsOver) + " under=" + b(wsUnder) + " inRange=" + b(wsInRange) + " garbage=" + b(wsGarbage));
     }
 
     tally.gate(7, g7, g7Detail);

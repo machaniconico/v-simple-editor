@@ -13,6 +13,7 @@
 #include <vector>
 
 class Timeline;
+struct ClipInfo;
 struct RenderJob;
 enum class AudioChannelMode; // Timeline.h
 
@@ -57,6 +58,8 @@ struct MixPlan {
     bool passthrough = false; // no mix needed: the caller muxes the source audio as is
     QVector<PlaybackEntry> entries; // mixable entries in playback-sequence order
     QVector<bool> reversed;
+    // Per entry: the resample factor of exportAudioRampFactor (1.0 = no speed stage).
+    QVector<double> rampFactors;
     QVector<AudioChannelMode> channelModes;
     QMap<int, trackfx::Chain> trackChains;
     QMap<int, AudioEQConfig> legacyEqConfigs;
@@ -82,8 +85,22 @@ struct MixPlan {
     bool failAacConvertForTest = false;
 };
 
+// The export audio speed factor of the audio clip an entry plays (the clip at the entry's
+// sourceTrack / sourceClipIndex, as the preview mixer's ramp list): entrySpeed x s, the
+// preview mixer's speedMul, when the entry runs forward, the clip is not a sequence
+// reference (a nested entry names its parent reference), the clip follows speed
+// (resolveAudioAtempoEnabled(envForce, clip.atempoEnabled)) and its ramp is non-identity
+// with one speed s on every keyframe. 1.0 (no stage) otherwise. *nonConstant is set when
+// such a clip's ramp has keyframes of different speeds (export keeps it ramp-free).
+double exportAudioRampFactor(const ClipInfo &clip, bool reversed, double entrySpeed,
+                             bool envForce, bool *nonConstant = nullptr);
 // GUI thread only: reads the Timeline, the mixer and the global playback bindings.
 MixPlan buildMixPlan(Timeline *timeline, AudioMixer *mixer, const MixOptions &options);
+// Selftest: the filter text executeMixPlan hands ffmpeg for plan entry `index`: the single
+// chain (no track DSP), and the track-FX path's clip wav PreFx chain and PostFx chain.
+QString singleChainForTest(const MixPlan &plan, int index);
+QString trackFxPreChainForTest(const MixPlan &plan, int index);
+QString trackFxPostChainForTest(const MixPlan &plan, int index);
 // Touches no Timeline / QObject / MainWindow. Returns plan.outputPath, or empty on failure
 // (a partly written output is removed). cancelled is polled before each ffmpeg run.
 QString executeMixPlan(const MixPlan &plan, const std::function<bool()> &cancelled, QString *error);

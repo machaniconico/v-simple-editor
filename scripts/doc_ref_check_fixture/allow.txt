@@ -1,0 +1,3 @@
+# doc_ref_check fixture allow list: doc:line<TAB>path:range<TAB>reason
+docs/ok.md:9	missing.cpp:3	過去の revision を指す参照
+docs/bad.md:5	target.cpp:3	NO_LITERAL is never hidden by allow
