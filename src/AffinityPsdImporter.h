@@ -57,5 +57,11 @@ QString psdBlendToString(const QString& psdCode);
 // PsdDocument when the signature is not "8BPS" or version != 1.  Never throws.
 PsdDocument loadPsd(const QString& path);
 
+// Selftest seam: bytes the most recent unicode layer name (luni) read actually
+// allocated; 0 when that read rejected its count.  Not for production callers.
+namespace psdtest {
+qint64 lastLuniAllocatedBytes();
+}
+
 } // namespace psd
 } // namespace affinity

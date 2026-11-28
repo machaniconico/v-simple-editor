@@ -22,6 +22,7 @@
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFont>
 #include <QImage>
 #include <QJsonObject>
@@ -1684,6 +1685,65 @@ int runBrushExportSelftest()
                        "the held-brush mark went stale: the held composite was drawn on twice "
                        "or the next ordinary frame kept the mark");
         }
+    }
+
+    // G18 (US-2113): the preview's active clip is export's, inside a dissolve window too.
+    // V1: A (placed 0-2 s, brushed) -> B (placed 2-4 s, brushed) with a 1 s centred
+    // dissolve: the borrowed window is [1.5, 2.5). At 2.25 s (past A's clipEnd) A and B
+    // both draw: selecting either gives progress > 0 (HEAD: A 0, the exporter's outgoing
+    // clip). Controls: before the window B is not active (0), after it A is not (0).
+    {
+        MainWindow window;
+        window.hide();
+        Timeline *tl = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+        GLPreview *view = window.m_player ? window.m_player->glPreview() : nullptr;
+        double aIn = -1.0, bIn = -1.0, bBefore = -1.0, aAfter = -1.0;
+        qint64 activeUs = -1;
+        int activeCount = -1;
+        bool bound = false;
+        if (tl && view) {
+            ClipInfo a = withBrush(fullFrame(QColor(30, 30, 30)), movieBrush,
+                                   {{0.0, 0.0}, {3.0, 1.0}});
+            a.duration = 3.0;
+            a.inPoint = 0.0;
+            a.outPoint = 2.0;
+            ClipInfo b = withBrush(fullFrame(QColor(150, 150, 150)), movieBrush,
+                                   {{0.0, 0.0}, {2.0, 1.0}});
+            b.duration = 3.0;
+            b.inPoint = 1.0;
+            b.outPoint = 3.0;
+            a.trailOut.type = b.leadIn.type = TransitionType::CrossDissolve;
+            a.trailOut.duration = b.leadIn.duration = 1.0;
+            a.trailOut.alignment = b.leadIn.alignment = TransitionAlignment::Center;
+            tl->restoreFromProject(QVector<QVector<ClipInfo>>{{a, b}},
+                                   QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            tl->refreshPlaybackSequence();
+            const auto progressAt = [&](int clipIdx, double sec) {
+                window.syncBrushAnimationPreviewForClip(0, clipIdx);
+                emit tl->positionChanged(sec);
+                return view->brushAnimationProgressForTest();
+            };
+            bound = true;
+            aIn = progressAt(0, 2.25);
+            bound = bound && window.brushPreviewClipIdForTest() == QStringLiteral("0:0");
+            aAfter = progressAt(0, 2.75);
+            bIn = progressAt(1, 2.25);
+            bound = bound && window.brushPreviewClipIdForTest() == QStringLiteral("0:1");
+            bBefore = progressAt(1, 1.0);
+            QElapsedTimer timer;
+            timer.start();
+            activeCount = tlrender::brushActiveClipsAt(tl, 2.25).size();
+            activeUs = timer.nsecsElapsed() / 1000;
+            window.syncBrushAnimationPreviewForClip(-1, -1);
+        }
+        std::cerr << "brush-export G18 bound=" << bound << " progressA@2.25=" << aIn
+                  << " progressB@2.25=" << bIn << " progressB@1.0=" << bBefore
+                  << " progressA@2.75=" << aAfter << " activeClips@2.25=" << activeCount
+                  << " brushActiveClipsAtMicros=" << activeUs << '\n';
+        tally.gate(18, bound && activeCount == 2 && aIn > 0.0 && bIn > 0.0
+                          && std::abs(bBefore) < 1e-9 && std::abs(aAfter) < 1e-9,
+                   "the preview brush progress inside a dissolve window disagrees with export's "
+                   "active clips");
     }
 
     return tally.finish("brush-export");

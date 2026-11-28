@@ -104,6 +104,12 @@
 //      clips split at 2.0 s have the same 3 keyframes on both pieces, the right piece's clipIn is
 //      2.0, and the right half's computePlaybackSequence entry carries the same 3 points at
 //      clipIn 2.0 (the VideoPlayer source-time pull sees the same keys). HEAD PASS pin.
+//   G21 (US-2103) a clip's mask tracking result (3 regions + the 5 scalars) is written under
+//      "maskTracking" and round-trips (rect / confidence / frameNumber / subPixelCenter and the
+//      scalars); an empty result writes no key; 262145 regions (about 12 MB) load as an empty result
+//      inside 5 s with the other clip fields intact; a region with rect [1e308, -1e308, 10, 10],
+//      frameNumber 1e308 and a string srcWidth is clamped to +-2^24 / the default 0. Detects:
+//      clipToJson not writing the key (HEAD), the region cap removed, intOr cast without a clamp.
 #include "../AudioClipEditor.h"
 #include "../AudioExportMix.h"
 #include "../AudioKeyframes.h"
@@ -123,6 +129,7 @@
 #include "../libavcore/Probe.h"
 #include "SelftestGate.h"
 
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QFont>
@@ -1970,6 +1977,99 @@ int runClipSidecarSelftest()
             check20(tag + QStringLiteral("Entry"), entryOk, entryShown);
         }
         tally.gate(20, ok20, shown20.join(QLatin1Char(' ')).toStdString());
+    }
+
+    // G21 (US-2103): the mask tracking result rides on the clip JSON and loads defensively.
+    {
+        bool ok21 = true;
+        QStringList shown21;
+        const auto check21 = [&](const QString &name, bool passed, const QString &value = QString()) {
+            ok21 = ok21 && passed;
+            shown21 << QStringLiteral("%1=%2%3").arg(name).arg(int(passed))
+                           .arg(value.isEmpty() ? QString() : QStringLiteral(" (%1)").arg(value));
+        };
+        ClipInfo tracked = sidecarClip(QStringLiteral("tracked"), 4.0);
+        tracked.maskTrackingData.startFrame = 2;
+        tracked.maskTrackingData.endFrame = 4;
+        tracked.maskTrackingData.fps = 29.97;
+        tracked.maskTrackingData.srcWidth = 1920;
+        tracked.maskTrackingData.srcHeight = 1080;
+        for (int i = 0; i < 3; ++i) {
+            TrackingRegion r;
+            r.rect = QRect(10 + i * 7, -20 + i * 3, 40 + i, 30 + i);
+            r.confidence = 0.5 + 0.125 * i;
+            r.frameNumber = 2 + i;
+            r.subPixelCenter = QPointF(30.25 + i, -5.5 + i);
+            tracked.maskTrackingData.regions.append(r);
+        }
+        ClipInfo bare = sidecarClip(QStringLiteral("bare"), 2.0);
+        ProjectData data;
+        data.videoTracks = {{tracked, bare}};
+        data.audioTracks = {{}};
+        const QString json = ProjectFile::toJsonString(data);
+        const QJsonObject root = rootOf(json);
+        const QJsonObject mt = firstClipJson(root, 0).value(QStringLiteral("maskTracking")).toObject();
+        check21(QStringLiteral("keyWritten"), mt.value(QStringLiteral("regions")).toArray().size() == 3);
+        check21(QStringLiteral("emptyNoKey"), !firstClipJson(root, 1).isEmpty()
+                    && !firstClipJson(root, 1).contains(QStringLiteral("maskTracking")));
+        ProjectData loaded;
+        const bool parsed = ProjectFile::fromJsonString(json, loaded);
+        const TrackingResult &got = loaded.videoTracks.value(0).value(0).maskTrackingData;
+        const TrackingResult &want = tracked.maskTrackingData;
+        bool same = parsed && got.regions.size() == 3 && got.startFrame == want.startFrame
+            && got.endFrame == want.endFrame && got.fps == want.fps && got.srcWidth == want.srcWidth
+            && got.srcHeight == want.srcHeight;
+        for (int i = 0; same && i < 3; ++i) {
+            same = got.regions[i].rect == want.regions[i].rect
+                && got.regions[i].confidence == want.regions[i].confidence
+                && got.regions[i].frameNumber == want.regions[i].frameNumber
+                && got.regions[i].subPixelCenter == want.regions[i].subPixelCenter;
+        }
+        check21(QStringLiteral("roundTrip"), same);
+        check21(QStringLiteral("emptyLoadsEmpty"), parsed && loaded.videoTracks.value(0).value(1).maskTrackingData.isEmpty());
+
+        // Hostile: one region over the cap, built as a document (about 12 MB of JSON text).
+        const auto withTracking = [&](const QJsonObject &tracking) {
+            QJsonObject r = root;
+            QJsonArray track = r.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+            QJsonObject c0 = track.at(0).toObject();
+            c0[QStringLiteral("maskTracking")] = tracking;
+            track[0] = c0;
+            QJsonArray tracks;
+            tracks.append(track);
+            r[QStringLiteral("videoTracks")] = tracks;
+            return QString::fromUtf8(QJsonDocument(r).toJson(QJsonDocument::Compact));
+        };
+        QJsonArray many;
+        for (int i = 0; i < 262145; ++i)
+            many.append(QJsonArray{i % 100, 0, 10, 10, 0.5, i, 0.0, 0.0});
+        const QString bigJson = withTracking(QJsonObject{{QStringLiteral("regions"), many}});
+        ProjectData big;
+        QElapsedTimer timer;
+        timer.start();
+        const bool bigParsed = ProjectFile::fromJsonString(bigJson, big);
+        const qint64 ms = timer.elapsed();
+        const ClipInfo &bigClip = big.videoTracks.value(0).value(0);
+        check21(QStringLiteral("capDropped"), bigParsed && ms < 5000 && bigClip.maskTrackingData.isEmpty()
+                    && bigClip.displayName == tracked.displayName && bigClip.duration == 4.0,
+                QStringLiteral("%1 ms, %2 bytes").arg(ms).arg(bigJson.size()));
+
+        // Hostile ints: clamped to +-2^24, a string scalar falls back to 0.
+        const QJsonArray hostileRegion{1e308, -1e308, 10, 10, 0.5, 1e308, 0.0, 0.0};
+        QJsonArray hostileRegions;
+        hostileRegions.append(hostileRegion);
+        ProjectData hostile;
+        const bool hostileParsed = ProjectFile::fromJsonString(
+            withTracking(QJsonObject{{QStringLiteral("regions"), hostileRegions},
+                                     {QStringLiteral("srcWidth"), QStringLiteral("x")}}), hostile);
+        const TrackingResult &h = hostile.videoTracks.value(0).value(0).maskTrackingData;
+        check21(QStringLiteral("hostileInt"), hostileParsed && h.regions.size() == 1
+                    && h.regions[0].rect.x() == 16777216 && h.regions[0].rect.y() == -16777216
+                    && h.regions[0].frameNumber == 16777216 && h.srcWidth == 0,
+                h.regions.isEmpty() ? QStringLiteral("no region")
+                    : QStringLiteral("x %1 y %2 frame %3 srcWidth %4").arg(h.regions[0].rect.x())
+                          .arg(h.regions[0].rect.y()).arg(h.regions[0].frameNumber).arg(h.srcWidth));
+        tally.gate(21, ok21, shown21.join(QLatin1Char(' ')).toStdString());
     }
 
     return tally.finish("clip-sidecar");

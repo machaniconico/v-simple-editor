@@ -14,6 +14,7 @@
 #include <QUrl>
 
 #include <cmath>
+#include <cstdio>
 #include <string>
 
 namespace {
@@ -49,6 +50,20 @@ double rtValue(const QJsonObject &range, const char *key)
         .value(QStringLiteral("value")).toDouble(-1.0);
 }
 
+// VEDITOR_OTIO_SELFTEST_KEEP: also write the file for scripts/otio_validate.py.
+// An unset or empty value keeps nothing. A failed write is reported as an [INFO] line (not a gate).
+void keepOtio(Timeline *tl, const QString &name)
+{
+    const QString dir = qEnvironmentVariable("VEDITOR_OTIO_SELFTEST_KEEP");
+    if (dir.isEmpty()) return; // set but empty: keep nothing (never write to the drive root)
+    const QString path = dir + QLatin1Char('/') + name + QStringLiteral(".otio");
+    QString err;
+    QDir().mkpath(dir);
+    if (!otio::writeOtio(tl, 24.0, name, path, &err))
+        std::fprintf(stderr, "[INFO] otio-export KEEP write failed: %s: %s\n",
+                     path.toLocal8Bit().constData(), err.toLocal8Bit().constData());
+}
+
 } // namespace
 
 int runOtioExportSelftest()
@@ -69,6 +84,7 @@ int runOtioExportSelftest()
     tl.restoreFromProject(QVector<QVector<ClipInfo>>{v1, v2},
                           QVector<QVector<ClipInfo>>{a1}, 0.0, -1.0, -1.0, 100);
     const QJsonObject doc = otio::timelineToOtio(&tl, 24.0, QStringLiteral("t"));
+    if (qEnvironmentVariableIsSet("VEDITOR_OTIO_SELFTEST_KEEP")) keepOtio(&tl, QStringLiteral("t"));
     const QJsonArray trk = tracksOf(doc);
     const QJsonArray v2c = trk.size() > 1
         ? trk.at(0).toObject().value(QStringLiteral("children")).toArray()
@@ -104,6 +120,7 @@ int runOtioExportSelftest()
         Timeline t4;
         t4.restoreFromProject(QVector<QVector<ClipInfo>>{{fast, norm}},
                               QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+        if (qEnvironmentVariableIsSet("VEDITOR_OTIO_SELFTEST_KEEP")) keepOtio(&t4, QStringLiteral("s"));
         const QJsonArray ch = tracksOf(otio::timelineToOtio(&t4, 24.0, QStringLiteral("s")))
             .at(0).toObject().value(QStringLiteral("children")).toArray();
         const QJsonObject c0 = ch.at(0).toObject();
@@ -127,6 +144,7 @@ int runOtioExportSelftest()
         Marker m2; m2.id = 2; m2.timelineUs = 1500000; m2.durationUs = 500000;
         m2.label = QStringLiteral("s"); m2.color = QColor(QStringLiteral("#00ff00"));
         t5.setMarkers(QVector<Marker>{m1, m2});
+        if (qEnvironmentVariableIsSet("VEDITOR_OTIO_SELFTEST_KEEP")) keepOtio(&t5, QStringLiteral("m"));
         const QJsonArray mk = otio::timelineToOtio(&t5, 24.0, QStringLiteral("m"))
             .value(QStringLiteral("tracks")).toObject().value(QStringLiteral("markers")).toArray();
         bool ok = mk.size() == 2;

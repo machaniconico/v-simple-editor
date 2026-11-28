@@ -8,6 +8,7 @@
 #include "TimelineFrameRenderer.h"
 #include "clipanim/ClipAnim.h"
 #include "SurfaceTool.h"
+#include "StabilizerWarp.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -1234,9 +1235,29 @@ QImage GLPreview::brushedUploadFrame(bool cameraBaked) const
         && !(player && player->isPlaying())
         && property(tlrender::kSpecialCompositeHoldsBrushProperty).toBool();
     if (m_brushAnimation && !cameraBaked && !specialCompositeHoldsBrush) {
-        OverlayRenderer::renderBrushOverlay(frame,
-                                            m_brushAnimation,
-                                            m_brushAnimationProgress);
+        // US-2111: a special composite has V1's layer stabilized on the CPU and
+        // the GL warps nothing, so the brush gets V1's warp here (identity: as
+        // before, drawn on the frame directly).
+        const int stabSrcW = m_compositeBrushStabSize.width();
+        const int stabSrcH = m_compositeBrushStabSize.height();
+        if (m_compositeBakedMode
+            && !stabwarp::isIdentity(m_compositeBrushStab, stabSrcW, stabSrcH)) {
+            QImage layer(frame.size(), QImage::Format_ARGB32_Premultiplied);
+            layer.fill(Qt::transparent);
+            OverlayRenderer::renderBrushOverlay(layer,
+                                                m_brushAnimation,
+                                                m_brushAnimationProgress);
+            layer = stabwarp::warpClampToEdge(
+                layer,
+                stabwarp::inverseTransform(m_compositeBrushStab, stabSrcW, stabSrcH,
+                                           layer.width(), layer.height()));
+            QPainter painter(&frame);
+            painter.drawImage(0, 0, layer);
+        } else {
+            OverlayRenderer::renderBrushOverlay(frame,
+                                                m_brushAnimation,
+                                                m_brushAnimationProgress);
+        }
     }
     return frame;
 }
@@ -1832,6 +1853,10 @@ void GLPreview::displayFrame(const QImage &frame)
     // path (m_stabKeyframes empty) leaves the matrix at identity so this
     // is a free no-op when stabilization is not in use.
     m_projectCameraFrame = QImage();
+    m_compositeBrushStab = m_pendingCompositeBrushStab;
+    m_compositeBrushStabSize = m_pendingCompositeBrushStabSize;
+    m_pendingCompositeBrushStab = {};
+    m_pendingCompositeBrushStabSize = QSize();
     m_stabFrameW = frame.width();
     m_stabFrameH = frame.height();
     const QImage::Format inFmt = frame.format();
@@ -3708,6 +3733,9 @@ void GLPreview::setLut(const LutData &lut)
         return;
     }
 
+    // 1D / non-default-domain LUTs become a 3D grid; a default-domain 3D LUT passes through
+    const LutData grid = LutImporter::toGpuGrid(lut);
+
     undotrace::log("gl:beforeMakeCurrent");
     makeCurrent();
     undotrace::log("gl:afterMakeCurrent");
@@ -3719,7 +3747,7 @@ void GLPreview::setLut(const LutData &lut)
 
     // Create 3D texture from LUT table
     m_lutTexture = new QOpenGLTexture(QOpenGLTexture::Target3D);
-    m_lutTexture->setSize(lut.size, lut.size, lut.size);
+    m_lutTexture->setSize(grid.size, grid.size, grid.size);
     m_lutTexture->setFormat(QOpenGLTexture::RGB32F);
     m_lutTexture->allocateStorage();
     m_lutTexture->setMinificationFilter(QOpenGLTexture::Linear);
@@ -3728,8 +3756,8 @@ void GLPreview::setLut(const LutData &lut)
 
     // Upload LUT data as float RGB
     QVector<float> data;
-    data.reserve(lut.table.size() * 3);
-    for (const QVector3D &v : lut.table) {
+    data.reserve(grid.table.size() * 3);
+    for (const QVector3D &v : grid.table) {
         data.append(v.x());
         data.append(v.y());
         data.append(v.z());
@@ -3737,7 +3765,7 @@ void GLPreview::setLut(const LutData &lut)
     m_lutTexture->setData(QOpenGLTexture::RGB, QOpenGLTexture::Float32,
                           data.constData());
 
-    m_lutIntensity = static_cast<float>(lut.intensity);
+    m_lutIntensity = static_cast<float>(grid.intensity);
     m_lutEnabled = true;
 
     doneCurrent();
@@ -4076,14 +4104,12 @@ void GLPreview::setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs)
     update();
 }
 
-// US-INT-4: per-frame source-time hook. std::lower_bound picks the first
-// keyframe with timeUs >= sourceUs; we lerp between (idx-1) and idx for a
-// smooth inverse-affine. Out-of-range source times clamp to the endpoints.
-// Builds the inverse 2D affine in (lensCoord-0.5) space:
-//   inverse stab = scale(1/s) * rotate(-theta) * translate(-dx_uv, -dy_uv)
-// where dx_uv/dy_uv are the keyframe pixel offsets divided by frame size
-// (frame size = MotionStabilizer's last source dim, captured below). The
-// resulting 3x3 mat3 is stored row-major in m_stabMatrix.
+// US-INT-4: per-frame source-time hook. stabwarp::sampleAt picks the active
+// keyframe (lower_bound + lerp, clamped to the endpoints) and
+// stabwarp::inverseMatrixUv builds the inverse 2D affine in (lensCoord-0.5)
+// space from the keyframe pixel offsets and the current frame size (the last
+// uploaded frame's, captured in displayFrame). US-2111: the export warps with
+// the same matrix, so its nine row-major values are only copied here.
 void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
 {
     m_stabSourceUs = sourceUs;
@@ -4092,67 +4118,26 @@ void GLPreview::setStabilizerSourceTimeUs(qint64 sourceUs)
         return;
     }
 
-    // Binary search for the first keyframe with timeUs >= sourceUs.
-    auto cmp = [](const StabilizerKeyframe &kf, qint64 t) { return kf.timeUs < t; };
-    auto it = std::lower_bound(m_stabKeyframes.constBegin(), m_stabKeyframes.constEnd(),
-                               sourceUs, cmp);
-    int idx = static_cast<int>(it - m_stabKeyframes.constBegin());
-
-    double dx = 0.0, dy = 0.0, theta = 0.0, scl = 1.0;
-    if (idx <= 0) {
-        const auto &kf = m_stabKeyframes.first();
-        dx = kf.dx; dy = kf.dy; theta = kf.theta; scl = kf.scale;
-    } else if (idx >= m_stabKeyframes.size()) {
-        const auto &kf = m_stabKeyframes.last();
-        dx = kf.dx; dy = kf.dy; theta = kf.theta; scl = kf.scale;
-    } else {
-        const auto &a = m_stabKeyframes[idx - 1];
-        const auto &b = m_stabKeyframes[idx];
-        const qint64 span = b.timeUs - a.timeUs;
-        const double t = (span > 0)
-            ? static_cast<double>(sourceUs - a.timeUs) / static_cast<double>(span)
-            : 0.0;
-        dx    = a.dx    + (b.dx    - a.dx)    * t;
-        dy    = a.dy    + (b.dy    - a.dy)    * t;
-        theta = a.theta + (b.theta - a.theta) * t;
-        scl   = a.scale + (b.scale - a.scale) * t;
-    }
-
-    // Frame size: MotionStabilizer trans deltas are in SOURCE pixels; the
-    // shader pre-warp operates in normalised (0..1) UV space. Divide by
-    // current frame dimensions (set by setFrameSize / displayFrame). Fall
-    // back to 1920x1080 if unknown so we don't divide by zero.
-    const double fw = (m_stabFrameW > 0) ? static_cast<double>(m_stabFrameW) : 1920.0;
-    const double fh = (m_stabFrameH > 0) ? static_cast<double>(m_stabFrameH) : 1080.0;
-    const double dxUv = dx / fw;
-    const double dyUv = dy / fh;
-
-    // Inverse 2D affine in (cx, cy, 1) space:
-    //   c' = (1/s) * R(-theta) * c - (dxUv, dyUv)
-    // where R(-theta) = [ cosT  sinT; -sinT  cosT ] (note flipped signs vs R(theta))
-    const double invS = (std::abs(scl) > 1e-9) ? 1.0 / scl : 1.0;
-    const double cT = std::cos(-theta);
-    const double sT = std::sin(-theta);
-
-    // Row-major 3x3 matrix [m11 m12 m13; m21 m22 m23; 0 0 1].
-    // q.x = invS*(cT*cx + sT*cy) - dxUv
-    // q.y = invS*(-sT*cx + cT*cy) - dyUv
-    m_stabMatrix[0] = static_cast<float>(invS * cT);
-    m_stabMatrix[1] = static_cast<float>(invS * sT);
-    m_stabMatrix[2] = static_cast<float>(-dxUv);
-    m_stabMatrix[3] = static_cast<float>(invS * -sT);
-    m_stabMatrix[4] = static_cast<float>(invS * cT);
-    m_stabMatrix[5] = static_cast<float>(-dyUv);
-    m_stabMatrix[6] = 0.0f;
-    m_stabMatrix[7] = 0.0f;
-    m_stabMatrix[8] = 1.0f;
-
-    constexpr double kIdEps = 1e-6;
-    m_stabEnabled = (std::abs(dxUv) > kIdEps
-                  || std::abs(dyUv) > kIdEps
-                  || std::abs(theta) > kIdEps
-                  || std::abs(scl - 1.0) > kIdEps);
+    const stabwarp::StabSample sample = stabwarp::sampleAt(m_stabKeyframes, sourceUs);
+    const std::array<float, 9> matrix =
+        stabwarp::inverseMatrixUv(sample, m_stabFrameW, m_stabFrameH);
+    std::copy(matrix.begin(), matrix.end(), m_stabMatrix);
+    m_stabEnabled = !stabwarp::isIdentity(sample, m_stabFrameW, m_stabFrameH);
     update();
+}
+
+void GLPreview::setSpecialCompositeBrushStabilizer(const stabwarp::StabSample &sample,
+                                                   const QSize &sourceSize)
+{
+    m_pendingCompositeBrushStab = sample;
+    m_pendingCompositeBrushStabSize = sourceSize;
+}
+
+std::array<float, 9> GLPreview::stabMatrixForTest() const
+{
+    std::array<float, 9> matrix;
+    std::copy(m_stabMatrix, m_stabMatrix + 9, matrix.begin());
+    return matrix;
 }
 
 void GLPreview::setOffset(const std::array<double,3> &values)

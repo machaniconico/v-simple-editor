@@ -701,6 +701,9 @@ void CaptionEditorDialog::onImportClicked()
         QMessageBox::warning(this, tr("取り込みエラー"), result.error);
         return;
     }
+    if (!result.warnings.isEmpty())
+        QMessageBox::information(this, tr("字幕の取り込み"),
+                                 result.warnings.join(QLatin1Char('\n')));
 
     m_track.clear();
     m_recognizedSourcePath.clear();

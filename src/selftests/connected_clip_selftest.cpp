@@ -226,6 +226,26 @@ extern "C" {
 //        (h) remaps committed through the real path (map, clip curve, undo point): A mA1, B1, A
 //        mA2, undo to B1, switch to A: the map and V1 clip 0 hold mA2, also after the next
 //        sidecar collection and populateProjectData.
+//   G42 (US-2112): P's V1 references C; a roto placed on C's V1 clip 0 while C was active and
+//        parked by the switch to P draws in renderFrameAt(P): byte-identical to C rendered
+//        active with the roto (which differs from C without it); with the parked table
+//        cleared P renders C's roto-free frame. Detects: HEAD draws no roto in a nested pass.
+//   G43 (US-2112): C's parked track matte (V2 by V3) and parent (V3 under V2) draw in P
+//        byte-identical to C rendered active with both (both differ from C with one or none);
+//        P without C's parked sidecars matches C active without any (the identity control).
+//   G44 (US-2112): P / C saved by MainWindow and rebuilt by RenderQueue::resolveTimeline (the
+//        file job): its parkedSidecarsBySequence() holds C's roto / matte / parent (not P's)
+//        and it renders P byte-identical to the live Timeline; C's store clip remap: (a) the
+//        inline timeRemapCurve maps local 1 s like the live clip (and unlike no remap), (b) a
+//        file with only the legacy sequences[C].timeRemapClipEntries gives the same value,
+//        (c) with both, the inline curve wins.
+//   G45 (US-2110 / US-2112): C's enabled gain adjustment layer [0, 1 s) covering its V1 clip,
+//        parked by the switch to P (P's own list empty), grades the nested layer in P at local
+//        0.5 s byte-identical to C rendered active with it (which differs from C without it),
+//        and leaves local 1.5 s (outside the layer) and the layer disabled byte-identical to C
+//        without it; (d) with C's V1 scaled to 0.5 the graded nested layer keeps C's alpha exactly
+//        and, over a background on P's V2, changes no pixel outside C's coverage. Detects: a
+//        nested pass that drops its sequence's parked adjustments or makes the child opaque.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -3526,10 +3546,470 @@ void sequenceSidecarUndoGate(selftest::GateTally &tally, Timeline &tl, SequenceS
                "(e) / (g) / (h) the landing sequence's remap entries were not mirrored onto its clip curves");
 }
 
+// US-2112 (G42-G44): P (V1 = a reference to C) and C (`childVideo`), C active with no sidecars
+// live or parked, one baseline undo entry. Returns {P id, C id}.
+QPair<QString, QString> setupNestedSidecars(Timeline &tl, SequenceSidecarView &view,
+                                            const QVector<QVector<ClipInfo>> &childVideo)
+{
+    tl.setClipParentEntries({});
+    tl.setRotoEntries({});
+    tl.setTrackMatteEntries({});
+    tl.setParkedSidecarsBySequence({});
+    view.liveRemap->clear();
+    view.parkedRemap->clear();
+    TimelineSequence child;
+    child.id = QStringLiteral("seq-c");
+    child.name = QStringLiteral("C");
+    child.videoTracks = childVideo;
+    child.audioTracks = {{}};
+    ClipInfo ref = clipFor("nest-ref", child.duration());
+    ref.sequenceRefId = child.id;
+    ref.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+    TimelineSequence parent;
+    parent.id = QStringLiteral("seq-p");
+    parent.name = QStringLiteral("P");
+    parent.videoTracks = {{ref}};
+    parent.audioTracks = {{}};
+    tl.setSequences({parent, child}, child.id);
+    tl.undoManager()->clear();
+    tl.saveUndoState(QStringLiteral("Initial"));
+    tl.takeConnectionWarnings();
+    QPair<QString, QString> ids;
+    for (const TimelineSequence &s : tl.sequences())
+        (s.name == QStringLiteral("P") ? ids.first : ids.second) = s.id;
+    return ids;
+}
+
+QString imageSha(const QImage &image)
+{
+    if (image.isNull())
+        return QStringLiteral("null");
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    for (int y = 0; y < image.height(); ++y)
+        hash.addData(QByteArrayView(reinterpret_cast<const char *>(image.constScanLine(y)),
+                                    image.bytesPerLine()));
+    return QString::fromLatin1(hash.result().toHex().left(16));
+}
+
+int differingPixels(const QImage &a, const QImage &b)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return -1;
+    const QImage x = a.convertToFormat(QImage::Format_ARGB32);
+    const QImage y = b.convertToFormat(QImage::Format_ARGB32);
+    int n = 0;
+    for (int row = 0; row < x.height(); ++row)
+        for (int col = 0; col < x.width(); ++col)
+            n += x.pixel(col, row) != y.pixel(col, row) ? 1 : 0;
+    return n;
+}
+
+// C's layout for G43 / G44 (the same media on every track, so only coverage shows): V1 small
+// top-left (frontmost), V2 the right half, V3 small bottom-left clear of both; parented to V2,
+// V3 moves into V2's area.
+QVector<QVector<ClipInfo>> nestedMatteParentVideo(const QString &videoPath, const QString &tag)
+{
+    QVector<QVector<ClipInfo>> video;
+    const double scale[] = {0.25, 0.5, 0.25};
+    const double dx[] = {-0.3, 0.25, -0.25};
+    const double dy[] = {-0.3, 0.0, 0.3};
+    for (int t = 0; t < 3; ++t) {
+        ClipInfo clip = clipFor(QStringLiteral("%1-v%2").arg(tag).arg(t + 1), 2.0);
+        clip.filePath = videoPath;
+        clip.videoScale = scale[t];
+        clip.videoDx = dx[t];
+        clip.videoDy = dy[t];
+        video.append({clip});
+    }
+    return video;
+}
+
+void placeNestedMatteParent(Timeline &tl, bool matte, bool parent)
+{
+    TimelineTrackMatteEntry entry;
+    entry.matteType = TrackMatteType::AlphaMatte;
+    entry.matteSourceClipId = QStringLiteral("2:0");
+    tl.setTrackMatteEntries(matte ? QHash<QString, TimelineTrackMatteEntry>{{QStringLiteral("1:0"), entry}}
+                                  : QHash<QString, TimelineTrackMatteEntry>{});
+    // clearClipParent, not setClipParentEntries({}): the latter drops the sequence store.
+    if (parent)
+        tl.setClipParent(QStringLiteral("2:0"), QStringLiteral("1:0"));
+    else
+        tl.clearClipParent(QStringLiteral("2:0"));
+}
+
+// G42: a nested sequence draws its own parked roto.
+void nestedRotoGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g42.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(42, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(42, false, "the G42 fixture media could not be written");
+        return;
+    }
+    ClipInfo v1 = clipFor("g42-v1", 2.0);
+    v1.filePath = videoPath;
+    const QPair<QString, QString> ids = setupNestedSidecars(tl, view, {{v1}});
+    const QString p = ids.first;
+    const QString c = ids.second;
+    const QSize outSize(40, 24);
+    const qint64 at = 500000;
+    const bool activeC = tl.activeSequenceId() == c && !c.isEmpty() && !p.isEmpty();
+    const QImage cleanC = tlrender::renderFrameAt(&tl, at, outSize);
+    const QHash<QString, RotoClipEntry> roto{{QStringLiteral("0:0"), sidecarRoto(20.0)}};
+    tl.setRotoEntries(roto);
+    const QImage rotoC = tlrender::renderFrameAt(&tl, at, outSize);
+    const bool toP = tl.setActiveSequence(p);
+    const QString parkedRoto = rotoSig(tl.parkedSidecarsBySequence().value(c).roto);
+    const bool parkedOk = parkedRoto == rotoSig(roto) && tl.rotoEntries().isEmpty();
+    const QImage nested = tlrender::renderFrameAt(&tl, at, outSize);
+    tl.setParkedSidecarsBySequence({});
+    const QImage nestedClean = tlrender::renderFrameAt(&tl, at, outSize);
+    const int hole = differingPixels(rotoC, cleanC);
+    const int nestedHole = differingPixels(nested, nestedClean);
+    const bool rotoOk = sameImage(nested, rotoC);
+    const bool controlOk = sameImage(nestedClean, cleanC);
+    std::fprintf(stderr, "connected-clip G42 active C %d, toP %d, parked[C].roto=%s ok=%d | C clean %s, C roto %s "
+                 "(differ in %d px) | P nested %s == C roto %d | P without parked %s == C clean %d | P nested vs "
+                 "P without parked differ in %d px (expect %d)\n",
+                 activeC, toP, qPrintable(parkedRoto), parkedOk, qPrintable(imageSha(cleanC)),
+                 qPrintable(imageSha(rotoC)), hole, qPrintable(imageSha(nested)), rotoOk,
+                 qPrintable(imageSha(nestedClean)), controlOk, nestedHole, hole);
+    tally.gate(42, activeC && toP && parkedOk && hole > 0 && rotoOk && controlOk && nestedHole == hole,
+               "a nested sequence's parked roto was not drawn in the parent's render (or the nested render "
+               "did not match the child rendered active with the roto, or the roto-free control differed)");
+}
+
+// G43: a nested sequence draws its own parked track matte and parent.
+void nestedMatteParentGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g43.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(43, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(43, false, "the G43 fixture media could not be written");
+        return;
+    }
+    const QPair<QString, QString> ids =
+        setupNestedSidecars(tl, view, nestedMatteParentVideo(videoPath, QStringLiteral("g43")));
+    const QString p = ids.first;
+    const QString c = ids.second;
+    const QSize outSize(40, 24);
+    const qint64 at = 500000;
+    const bool activeC = tl.activeSequenceId() == c && !c.isEmpty() && !p.isEmpty();
+    const QImage none = tlrender::renderFrameAt(&tl, at, outSize);
+    placeNestedMatteParent(tl, true, false);
+    const QImage matteOnly = tlrender::renderFrameAt(&tl, at, outSize);
+    placeNestedMatteParent(tl, false, true);
+    const QImage parentOnly = tlrender::renderFrameAt(&tl, at, outSize);
+    placeNestedMatteParent(tl, true, true);
+    const QImage both = tlrender::renderFrameAt(&tl, at, outSize);
+    const QString matteC = matteSig(tl.trackMatteEntries());
+    const QString parentC = parentSig(tl.clipParentEntries());
+    const bool toP = tl.setActiveSequence(p);
+    const Timeline::SequenceSidecars parked = tl.parkedSidecarsBySequence().value(c);
+    const bool parkedOk = matteSig(parked.matte) == matteC && parentSig(parked.parent) == parentC
+        && matteC != QStringLiteral("{}") && parentC != QStringLiteral("{}")
+        && tl.trackMatteEntries().isEmpty() && parentSig(tl.clipParentEntries()) == QStringLiteral("{}");
+    const QImage nested = tlrender::renderFrameAt(&tl, at, outSize);
+    tl.setParkedSidecarsBySequence({});
+    const QImage nestedNone = tlrender::renderFrameAt(&tl, at, outSize);
+    const bool distinct = !sameImage(both, none) && !sameImage(both, matteOnly) && !sameImage(both, parentOnly)
+        && !sameImage(matteOnly, none) && !sameImage(parentOnly, none);
+    const bool nestedOk = sameImage(nested, both);
+    const bool controlOk = sameImage(nestedNone, none);
+    std::fprintf(stderr, "connected-clip G43 active C %d, toP %d, parked[C] matte=%s parent=%s ok=%d | C none %s, "
+                 "matte %s, parent %s, both %s distinct=%d | P nested %s == C both %d | P without parked %s == C "
+                 "none %d\n",
+                 activeC, toP, qPrintable(matteSig(parked.matte)), qPrintable(parentSig(parked.parent)), parkedOk,
+                 qPrintable(imageSha(none)), qPrintable(imageSha(matteOnly)), qPrintable(imageSha(parentOnly)),
+                 qPrintable(imageSha(both)), distinct, qPrintable(imageSha(nested)), nestedOk,
+                 qPrintable(imageSha(nestedNone)), controlOk);
+    tally.gate(43, activeC && toP && parkedOk && distinct && nestedOk && controlOk,
+               "a nested sequence's parked track matte / parent were not drawn in the parent's render (or the "
+               "nested render did not match the child rendered active with them, or the sidecar-free control "
+               "differed)");
+}
+
+// G44: the file-backed render queue Timeline restores the parked sidecars and the legacy
+// per-sequence time remap of clips without an inline curve.
+void nestedFileBackedGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g44.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(44, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(44, false, "the G44 fixture media could not be written");
+        return;
+    }
+    const TimeRemapClipEntry inlineRemap = sidecarRemap(1.0);
+    QVector<QVector<ClipInfo>> video = nestedMatteParentVideo(videoPath, QStringLiteral("g44"));
+    video[0][0].timeRemapCurve = inlineRemap.curve;
+    const QPair<QString, QString> ids = setupNestedSidecars(tl, view, video);
+    const QString p = ids.first;
+    const QString c = ids.second;
+    const QSize outSize(40, 24);
+    const qint64 at = 500000;
+    tl.setRotoEntries({{QStringLiteral("0:0"), sidecarRoto(20.0)}});
+    placeNestedMatteParent(tl, true, true);
+    const bool toP = tl.setActiveSequence(p);
+    const Timeline::SequenceSidecars liveParked = tl.parkedSidecarsBySequence().value(c);
+    const QString liveSigs = rotoSig(liveParked.roto) + matteSig(liveParked.matte) + parentSig(liveParked.parent);
+    const QImage live = tlrender::renderFrameAt(&tl, at, outSize);
+    const double localSec = 1.0;
+    double liveSource = -1.0;
+    for (const TimelineSequence &s : tl.sequences())
+        if (s.id == c && !s.videoTracks.isEmpty() && !s.videoTracks[0].isEmpty())
+            liveSource = s.videoTracks[0][0].sourceSecondAtLocalTime(localSec);
+    const double plainSource = video[1][0].sourceSecondAtLocalTime(localSec);
+
+    struct Resolved {
+        bool ok = false;
+        QString parkedSigs;
+        bool hasP = true;
+        QImage image;
+        double source = -1.0;
+    };
+    auto resolve = [&](const QString &path) {
+        Resolved r;
+        RenderJob job;
+        job.projectFilePath = path;
+        Timeline *owned = nullptr;
+        Timeline *timeline = member(ResolveTimelineTag{})(job, &owned);
+        if (timeline) {
+            const auto parked = timeline->parkedSidecarsBySequence();
+            r.ok = parked.contains(c);
+            r.hasP = parked.contains(p);
+            const Timeline::SequenceSidecars s = parked.value(c);
+            r.parkedSigs = rotoSig(s.roto) + matteSig(s.matte) + parentSig(s.parent);
+            r.image = tlrender::renderFrameAt(timeline, at, outSize);
+            for (const TimelineSequence &sequence : timeline->sequences())
+                if (sequence.id == c && !sequence.videoTracks.isEmpty() && !sequence.videoTracks[0].isEmpty())
+                    r.source = sequence.videoTracks[0][0].sourceSecondAtLocalTime(localSec);
+        }
+        delete owned;
+        return r;
+    };
+    // (b) / (c): the saved file with C's store clip 0:0 inline curve removed (b) or kept (c)
+    // and the legacy per-sequence table holding `legacy`.
+    auto writeVariant = [&](const QJsonObject &saved, const QString &name, bool keepInline,
+                            const TimeRemapClipEntry &legacy) {
+        QJsonObject root = saved;
+        QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+        for (int i = 0; i < sequences.size(); ++i) {
+            QJsonObject sequence = sequences.at(i).toObject();
+            if (sequence.value(QStringLiteral("id")).toString() != c)
+                continue;
+            QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+            QJsonArray clips = tracks.at(0).toArray();
+            QJsonObject clip = clips.at(0).toObject();
+            if (!keepInline)
+                clip.remove(QStringLiteral("timeRemapCurve"));
+            clips.replace(0, clip);
+            tracks.replace(0, clips);
+            sequence[QStringLiteral("videoTracks")] = tracks;
+            sequence[QStringLiteral("timeRemapClipEntries")] = QJsonArray{
+                QJsonObject{{QStringLiteral("clipId"), legacy.clipId}, {QStringLiteral("curve"), legacy.curve.toJson()}}};
+            sequences.replace(i, sequence);
+        }
+        root[QStringLiteral("sequences")] = sequences;
+        const QString path = dir.filePath(name);
+        QFile file(path);
+        const bool written = file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            && file.write(QJsonDocument(root).toJson()) > 0;
+        file.close();
+        return written ? path : QString();
+    };
+
+    const QString savedPath = dir.filePath(QStringLiteral("g44.veditor"));
+    const bool saved = view.save(savedPath);
+    const QJsonObject savedRoot = readJsonFile(savedPath);
+    bool savedInline = false;
+    for (const QJsonValue &value : savedRoot.value(QStringLiteral("sequences")).toArray())
+        if (value.toObject().value(QStringLiteral("id")).toString() == c)
+            savedInline = value.toObject().value(QStringLiteral("videoTracks")).toArray().at(0).toArray().at(0)
+                .toObject().contains(QStringLiteral("timeRemapCurve"));
+    const Resolved a = saved ? resolve(savedPath) : Resolved{};
+    const Resolved b = resolve(writeVariant(savedRoot, QStringLiteral("g44-legacy.veditor"), false, inlineRemap));
+    const TimeRemapClipEntry otherRemap = sidecarRemap(1.5);
+    const Resolved both = resolve(writeVariant(savedRoot, QStringLiteral("g44-both.veditor"), true, otherRemap));
+    const double otherSource = [&] {
+        ClipInfo clip = video[0][0];
+        clip.timeRemapCurve = otherRemap.curve;
+        return clip.sourceSecondAtLocalTime(localSec);
+    }();
+    const auto closeTo = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+    const bool sidecarsOk = toP && saved && a.ok && !a.hasP && a.parkedSigs == liveSigs
+        && liveSigs.count(QStringLiteral("{}")) == 0;
+    const bool renderOk = sameImage(a.image, live);
+    const bool remapA = savedInline && closeTo(a.source, liveSource) && !closeTo(liveSource, plainSource);
+    const bool remapB = closeTo(b.source, liveSource);
+    const bool remapC = closeTo(both.source, liveSource) && !closeTo(otherSource, liveSource);
+    std::fprintf(stderr, "connected-clip G44 toP %d saved %d | file job parked[C] %d [%s] (expect [%s]) parked[P] %d | "
+                 "render %s == live %s %d | remap local %.2f: live %.6f (no remap %.6f) | (a) inline saved %d -> "
+                 "%.6f ok=%d | (b) legacy only -> %.6f ok=%d | (c) inline + legacy (%.6f) -> %.6f ok=%d\n",
+                 toP, saved, a.ok, qPrintable(a.parkedSigs), qPrintable(liveSigs), a.hasP,
+                 qPrintable(imageSha(a.image)), qPrintable(imageSha(live)), renderOk, localSec, liveSource,
+                 plainSource, savedInline, a.source, remapA, b.source, remapB, otherSource, both.source, remapC);
+    tally.gate(44, sidecarsOk && renderOk && remapA && remapB && remapC,
+               "the file-backed render queue Timeline did not restore a non-active sequence's parked roto / matte / "
+               "parent (or rendered the nested sequence differently from the live Timeline), or a store clip's "
+               "remap was not the inline curve, the legacy per-sequence entry when it has no inline curve, or "
+               "the inline curve when it has both");
+}
+
 } // namespace
 
 // G6: carriers follow by uid (in its own function to keep the runConnectedClipSelftest frame
 // small: US-1504 made ClipInfo larger and that frame overflowed the main thread stack).
+// G45: a nested sequence grades with its own parked adjustment layers.
+void nestedAdjustmentGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g45.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(45, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(45, false, "the G45 fixture media could not be written");
+        return;
+    }
+    tl.setAdjustmentLayers({});
+    ClipInfo v1 = clipFor("g45-v1", 2.0);
+    v1.filePath = videoPath;
+    const QPair<QString, QString> ids = setupNestedSidecars(tl, view, {{v1}});
+    const QString p = ids.first;
+    const QString c = ids.second;
+    const QSize outSize(40, 24);
+    const qint64 inside = 500000;
+    const qint64 outside = 1500000;
+    const bool activeC = tl.activeSequenceId() == c && !c.isEmpty() && !p.isEmpty();
+    const QImage cleanIn = tlrender::renderFrameAt(&tl, inside, outSize);
+    const QImage cleanOut = tlrender::renderFrameAt(&tl, outside, outSize);
+    AdjustmentLayer layer;
+    layer.timelineStartUs = 0;
+    layer.timelineEndUs = 1000000;
+    layer.trackIndex = 0;
+    layer.gradingEnabled = true;
+    for (int ch = 0; ch < 3; ++ch)
+        layer.gain[ch] = 0.5;
+    tl.setAdjustmentLayers({layer});
+    const QImage gradedC = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toP = tl.setActiveSequence(p);
+    const QVector<AdjustmentLayer> parked = tl.parkedSidecarsBySequence().value(c).adjustments;
+    const bool parkedOk = parked.size() == 1 && parked.first().gradingEnabled
+        && tl.adjustmentLayers().isEmpty();
+    const QImage nestedIn = tlrender::renderFrameAt(&tl, inside, outSize);
+    const QImage nestedOut = tlrender::renderFrameAt(&tl, outside, outSize);
+    QHash<QString, Timeline::SequenceSidecars> disabled = tl.parkedSidecarsBySequence();
+    if (!disabled[c].adjustments.isEmpty())
+        disabled[c].adjustments.first().gradingEnabled = false;
+    tl.setParkedSidecarsBySequence(disabled);
+    const QImage nestedDisabled = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    const int graded = differingPixels(gradedC, cleanIn);
+    const bool gradeOk = sameImage(nestedIn, gradedC);
+    const bool outsideOk = sameImage(nestedOut, cleanOut);
+    const bool disabledOk = sameImage(nestedDisabled, cleanIn);
+    std::fprintf(stderr, "connected-clip G45 active C %d, toP %d, parked[C].adjustments=%lld ok=%d | C clean %s, "
+                 "C graded %s (differ in %d px) | P nested @0.5s %s == C graded %d | P nested @1.5s %s == "
+                 "C clean @1.5s %s %d | P nested, layer disabled %s == C clean %d\n",
+                 activeC, toP, static_cast<long long>(parked.size()), parkedOk,
+                 qPrintable(imageSha(cleanIn)), qPrintable(imageSha(gradedC)), graded,
+                 qPrintable(imageSha(nestedIn)), gradeOk, qPrintable(imageSha(nestedOut)),
+                 qPrintable(imageSha(cleanOut)), outsideOk, qPrintable(imageSha(nestedDisabled)),
+                 disabledOk);
+    // (d) C's V1 scaled to 0.5 (transparent around it), referenced by Q (V1 only) and by R (V1 the
+    // reference over a full-frame V2 background): the nested grade keeps C's alpha byte-exact and
+    // changes no R pixel outside C's coverage.
+    ClipInfo small = v1;
+    small.videoScale = 0.5;
+    TimelineSequence child;
+    child.id = QStringLiteral("seq-c");
+    child.name = QStringLiteral("C");
+    child.videoTracks = {{small}};
+    child.audioTracks = {{}};
+    ClipInfo ref = clipFor("g45-ref", child.duration());
+    ref.sequenceRefId = child.id;
+    ref.filePath = timeline_nesting::sequenceClipFilePath(child.id);
+    ClipInfo bg = clipFor("g45-bg", 2.0);
+    bg.filePath = videoPath;
+    TimelineSequence q;
+    q.id = QStringLiteral("seq-q");
+    q.name = QStringLiteral("Q");
+    q.videoTracks = {{ref}};
+    q.audioTracks = {{}};
+    TimelineSequence r = q;
+    r.id = QStringLiteral("seq-r");
+    r.name = QStringLiteral("R");
+    r.videoTracks = {{ref}, {bg}};
+    tl.setParkedSidecarsBySequence({});
+    tl.setSequences({q, r, child}, child.id);
+    const QImage smallClean = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setAdjustmentLayers({layer});
+    const QImage smallGradedC = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toQ = tl.setActiveSequence(q.id);
+    const QImage qGraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    const bool toR = tl.setActiveSequence(r.id);
+    const QImage rGraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    QHash<QString, Timeline::SequenceSidecars> off = tl.parkedSidecarsBySequence();
+    const bool parked2 = off.value(child.id).adjustments.size() == 1;
+    if (!off[child.id].adjustments.isEmpty())
+        off[child.id].adjustments.first().gradingEnabled = false;
+    tl.setParkedSidecarsBySequence(off);
+    const QImage rUngraded = tlrender::renderFrameAt(&tl, inside, outSize);
+    tl.setParkedSidecarsBySequence({});
+    tl.setAdjustmentLayers({});
+    int transparent = 0, alphaMismatch = -1, outsideChanged = -1, insideChanged = -1, colorChanged = -1;
+    if (!smallClean.isNull() && !qGraded.isNull() && !rGraded.isNull() && !rUngraded.isNull()
+        && smallClean.size() == outSize && qGraded.size() == outSize && rGraded.size() == outSize
+        && rUngraded.size() == outSize) {
+        const QImage a = smallClean.convertToFormat(QImage::Format_ARGB32);
+        const QImage gq = qGraded.convertToFormat(QImage::Format_ARGB32);
+        const QImage gr = rGraded.convertToFormat(QImage::Format_ARGB32);
+        const QImage ur = rUngraded.convertToFormat(QImage::Format_ARGB32);
+        alphaMismatch = outsideChanged = insideChanged = colorChanged = 0;
+        for (int y = 0; y < outSize.height(); ++y)
+            for (int x = 0; x < outSize.width(); ++x) {
+                const QRgb clean = a.pixel(x, y);
+                const bool covered = qAlpha(clean) > 0;
+                transparent += covered ? 0 : 1;
+                alphaMismatch += qAlpha(gq.pixel(x, y)) != qAlpha(clean) ? 1 : 0;
+                colorChanged += qAlpha(clean) == 255 && gq.pixel(x, y) != clean ? 1 : 0;
+                const bool changed = gr.pixel(x, y) != ur.pixel(x, y);
+                (covered ? insideChanged : outsideChanged) += changed ? 1 : 0;
+            }
+    }
+    const bool smallGradedOk = differingPixels(smallGradedC, smallClean) > 0;
+    const bool alphaOk = toQ && toR && parked2 && smallGradedOk && transparent > 0 && alphaMismatch == 0
+        && colorChanged > 0 && insideChanged > 0 && outsideChanged == 0;
+    std::fprintf(stderr, "connected-clip G45 (d) toQ %d toR %d parked %d C scaled graded active differs %d | "
+                 "transparent px %d, Q nested alpha mismatches %d (expect 0), Q opaque px graded %d | R vs R "
+                 "with layer disabled: changed inside C %d, outside C %d (expect 0) | ok=%d\n",
+                 toQ, toR, parked2, smallGradedOk, transparent, alphaMismatch, colorChanged, insideChanged,
+                 outsideChanged, alphaOk);
+    tally.gate(45, activeC && toP && parkedOk && graded > 0 && gradeOk && outsideOk && disabledOk && alphaOk,
+               "a nested sequence's parked adjustment layer did not grade it in the parent's render (or "
+               "graded outside its local range, or graded while disabled, or flattened the child's alpha "
+               "over the parent's background)");
+}
+
 static void carriersByUidGate(selftest::GateTally &tally, Timeline *mainTimeline)
 {
     // (a) X (connected, roto + parent -> Y) overtakes Y (unconnected, roto).
@@ -6117,6 +6597,10 @@ int runConnectedClipSelftest()
         tally.gate(39, false, "MainWindow has no mainTimeline");
         tally.gate(40, false, "MainWindow has no mainTimeline");
         tally.gate(41, false, "MainWindow has no mainTimeline");
+        tally.gate(42, false, "MainWindow has no mainTimeline");
+        tally.gate(43, false, "MainWindow has no mainTimeline");
+        tally.gate(44, false, "MainWindow has no mainTimeline");
+        tally.gate(45, false, "MainWindow has no mainTimeline");
     } else {
         SequenceSidecarView view;
         view.liveRemap = &window.m_timeRemapClipEntries;
@@ -6128,6 +6612,12 @@ int runConnectedClipSelftest()
         sequenceSwitchSidecarGate(tally, *mainTimeline, view);
         sequenceSidecarPersistGate(tally, *mainTimeline, view);
         sequenceSidecarUndoGate(tally, *mainTimeline, view);
+        // G42-G44 (US-2112): a nested sequence's parked sidecars, live and file-backed.
+        nestedRotoGate(tally, *mainTimeline, view);
+        nestedMatteParentGate(tally, *mainTimeline, view);
+        nestedFileBackedGate(tally, *mainTimeline, view);
+        // G45 (US-2110 / US-2112): a nested sequence's parked adjustment layers.
+        nestedAdjustmentGate(tally, *mainTimeline, view);
     }
 
     return tally.finish("connected-clip");

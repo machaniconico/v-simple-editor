@@ -3912,7 +3912,9 @@ void VideoPlayer::presentDisplay(const QImage &composed, qint64 timelineUsec,
         // keyframe and bake the inverse 2D affine pre-warp.
         if (sequenceActive() && m_activeEntry >= 0 && m_activeEntry < m_sequence.size()) {
             const auto &ae = m_sequence[m_activeEntry];
-            if (ae.sourceTrack == 0) {
+            // US-2111: a shown special composite already has V1's layer stabilized
+            // on the CPU (buildSpecialClipComposite), so the GL warps nothing.
+            if (ae.sourceTrack == 0 && special.isNull()) {
                 m_glPreview->setStabilizerKeyframes(ae.stabilizerKeyframes);
                 const double T = static_cast<double>(m_timelinePositionUs)
                                / static_cast<double>(AV_TIME_BASE);

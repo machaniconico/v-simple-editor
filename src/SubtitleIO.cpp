@@ -4,6 +4,7 @@
 #include <QTextStream>
 #include <QRegularExpression>
 #include <QStringList>
+#include <QStringConverter>
 
 namespace subtitle {
 
@@ -76,7 +77,7 @@ qint64 parseVttTimestamp(const QString& s)
 // Parse a list of non-empty lines as a single SRT/VTT cue block.
 // sep: ',' for SRT, '.' for VTT
 // Returns a valid Clip on success, invalid Clip on failure.
-static caption::Clip parseBlock(const QStringList& lines, QChar sep)
+static caption::Clip parseBlock(const QStringList& lines, QChar sep, bool lenientSrtMs = false)
 {
     caption::Clip clip;
 
@@ -99,13 +100,19 @@ static caption::Clip parseBlock(const QStringList& lines, QChar sep)
     const QString startStr = tsStr.left(arrowIdx).trimmed();
     // VTT may have cue settings after the end timestamp; take first token only
     const QString afterArrow = tsStr.mid(arrowIdx + 5).trimmed();
-    const QString endStr = afterArrow.split(' ').first().trimmed();
+    const QString endStr = afterArrow.split(QRegularExpression("\\s+")).first().trimmed();
 
     qint64 startMs = -1;
     qint64 endMs   = -1;
     if (sep == ',') {
-        startMs = parseSrtTimestamp(startStr);
-        endMs   = parseSrtTimestamp(endStr);
+        // Import accepts a '.' millisecond separator; parseSrtTimestamp stays strict.
+        auto lenient = [lenientSrtMs](QString t) {
+            if (lenientSrtMs)
+                t.replace('.', ',');
+            return t;
+        };
+        startMs = parseSrtTimestamp(lenient(startStr));
+        endMs   = parseSrtTimestamp(lenient(endStr));
     } else {
         startMs = parseVttTimestamp(startStr);
         endMs   = parseVttTimestamp(endStr);
@@ -136,8 +143,8 @@ static QList<QStringList> splitBlocks(const QString& text)
 
     const QStringList lines = text.split('\n');
     for (QString line : lines) {
-        // Normalize CRLF
-        if (line.endsWith('\r'))
+        // Normalize CRLF (exportSrt/exportVtt in text mode write "\r\r\n" on Windows)
+        while (line.endsWith('\r'))
             line.chop(1);
 
         if (line.trimmed().isEmpty()) {
@@ -155,6 +162,74 @@ static QList<QStringList> splitBlocks(const QString& text)
     return blocks;
 }
 
+// Decode raw subtitle bytes: BOM (UTF-8 / UTF-16LE / UTF-16BE), then strict
+// UTF-8, then Shift_JIS, then the system codec. The BOM is not part of the text.
+static QString decodeSubtitleBytes(const QByteArray &raw, QString *encodingUsed)
+{
+    if (raw.startsWith("\xEF\xBB\xBF")) {
+        *encodingUsed = QStringLiteral("UTF-8");
+        QStringDecoder dec(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+        return dec(raw.mid(3));
+    }
+    if (raw.startsWith("\xFF\xFE")) {
+        *encodingUsed = QStringLiteral("UTF-16LE");
+        QStringDecoder dec(QStringConverter::Utf16LE, QStringConverter::Flag::Stateless);
+        return dec(raw.mid(2));
+    }
+    if (raw.startsWith("\xFE\xFF")) {
+        *encodingUsed = QStringLiteral("UTF-16BE");
+        QStringDecoder dec(QStringConverter::Utf16BE, QStringConverter::Flag::Stateless);
+        return dec(raw.mid(2));
+    }
+    QStringDecoder utf8(QStringConverter::Utf8, QStringConverter::Flag::Stateless);
+    const QString strict = utf8(raw);
+    if (!utf8.hasError()) {
+        *encodingUsed = QStringLiteral("UTF-8");
+        return strict;
+    }
+    // Built by name: QStringConverter::encodingForName("Shift_JIS") is empty in this build.
+    QStringDecoder sjis("Shift_JIS");
+    if (sjis.isValid()) {
+        *encodingUsed = QStringLiteral("Shift_JIS");
+        return sjis(raw);
+    }
+    *encodingUsed = QStringLiteral("System");
+    QStringDecoder sys(QStringConverter::System);
+    return sys(raw);
+}
+
+// Read a subtitle file as raw bytes and decode it; adds the fallback warning.
+static bool readSubtitleFile(const QString &path, ImportResult &result, QString &content)
+{
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) {
+        result.success = false;
+        result.error   = QString("Cannot open file: %1").arg(path);
+        return false;
+    }
+    const QByteArray raw = file.readAll();
+    file.close();
+
+    content = decodeSubtitleBytes(raw, &result.encodingUsed);
+    if (result.encodingUsed == QLatin1String("Shift_JIS") || result.encodingUsed == QLatin1String("System"))
+        result.warnings << QStringLiteral("文字コードを %1 として読みました").arg(result.encodingUsed);
+    return true;
+}
+
+// Cue blocks that parsed to nothing: all of them is an error, some is a warning.
+static void reportSkipped(ImportResult &result, int candidates)
+{
+    const int skipped = candidates - int(result.clips.size());
+    if (candidates > 0 && result.clips.isEmpty()) {
+        result.success = false;
+        result.error   = QStringLiteral("字幕ブロックを 1 つも読めませんでした (%1 ブロック)").arg(candidates);
+        return;
+    }
+    result.success = true;
+    if (skipped > 0)
+        result.warnings << QStringLiteral("%1 ブロックを読み飛ばしました").arg(skipped);
+}
+
 // ---------------------------------------------------------------------------
 // importSrt
 // ---------------------------------------------------------------------------
@@ -163,20 +238,13 @@ ImportResult importSrt(const QString& path)
 {
     ImportResult result;
 
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        result.success = false;
-        result.error   = QString("Cannot open file: %1").arg(path);
+    QString content;
+    if (!readSubtitleFile(path, result, content))
         return result;
-    }
-
-    QTextStream in(&file);
-    in.setEncoding(QStringConverter::Utf8);
-    const QString content = in.readAll();
-    file.close();
 
     const QList<QStringList> blocks = splitBlocks(content);
 
+    int candidates = 0;
     for (const QStringList& block : blocks) {
         // A block whose first non-empty line is purely numeric is a sequence number;
         // strip it before parsing so parseBlock can find the timestamp line.
@@ -190,12 +258,14 @@ ImportResult importSrt(const QString& path)
         if (lines.isEmpty())
             continue;
 
-        const caption::Clip clip = parseBlock(lines, ',');
+        if (block.join('\n').contains(" --> "))
+            ++candidates;
+        const caption::Clip clip = parseBlock(lines, ',', true);
         if (clip.isValid())
             result.clips.append(clip);
     }
 
-    result.success = true;
+    reportSkipped(result, candidates);
     return result;
 }
 
@@ -207,20 +277,13 @@ ImportResult importVtt(const QString& path)
 {
     ImportResult result;
 
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        result.success = false;
-        result.error   = QString("Cannot open file: %1").arg(path);
+    QString content;
+    if (!readSubtitleFile(path, result, content))
         return result;
-    }
-
-    QTextStream in(&file);
-    in.setEncoding(QStringConverter::Utf8);
-    const QString content = in.readAll();
-    file.close();
 
     const QList<QStringList> blocks = splitBlocks(content);
 
+    int candidates = 0;
     bool firstBlock = true;
     for (const QStringList& block : blocks) {
         if (block.isEmpty())
@@ -232,7 +295,7 @@ ImportResult importVtt(const QString& path)
             if (block.first().startsWith("WEBVTT"))
                 continue;
             // Tolerant: no WEBVTT header — note it but continue
-            result.error += "Warning: missing WEBVTT header. ";
+            result.warnings << QStringLiteral("WEBVTT ヘッダがありません");
         }
 
         // Skip NOTE / STYLE / REGION blocks
@@ -250,12 +313,14 @@ ImportResult importVtt(const QString& path)
         if (lines.isEmpty())
             continue;
 
+        if (block.join('\n').contains(" --> "))
+            ++candidates;
         const caption::Clip clip = parseBlock(lines, '.');
         if (clip.isValid())
             result.clips.append(clip);
     }
 
-    result.success = true;
+    reportSkipped(result, candidates);
     return result;
 }
 

@@ -2,6 +2,7 @@
 #include "CaptionTrack.h"
 #include <QString>
 #include <QList>
+#include <QStringList>
 
 namespace subtitle {
 
@@ -18,6 +19,8 @@ struct ImportResult {
     QList<caption::Clip> clips;
     bool    success = false;
     QString error;
+    QStringList warnings;
+    QString encodingUsed;
 };
 
 ImportResult importSrt(const QString& path);

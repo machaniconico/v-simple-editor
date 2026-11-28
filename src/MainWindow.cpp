@@ -103,6 +103,7 @@ double exporter_loudnessGainDb();
 #include "AspectReframer.h"
 #include "ClipGeometry.h"
 #include "SourceMonitorDock.h"
+#include "StabilizerWarp.h"
 #include "StillGalleryDock.h"
 #include "SequenceListDock.h"
 #include "AudioBusPanel.h"   // AB-5: オーディオ バス パネル ドック
@@ -382,13 +383,63 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+// US-2108: the video drag and the effect-controls motion write the timeline without an undo point
+// of their own, so each takes one from a debounce timer (objectName below, label in "undoLabel").
+// A burst records the undo serial / index it started at: an undo, redo or new point from a path
+// that bypasses MainWindow (MCP) makes the pending point stale, and it is dropped.
+static const char *const kPendingUndoTimerNames[] = {"videoDragUndoTimer", "motionUndoTimer"};
+
+static void beginUndoBurst(QTimer *timer, Timeline *timeline)
+{
+    // Also re-based while active: an undo / jump that bypassed MainWindow already replaced the earlier
+    // part of the burst, so the edit that follows must not be dropped as stale.
+    if (timeline && timeline->undoManager()
+        && (!timer->isActive()
+            || timeline->undoManager()->saveSerial() != timer->property("burstSerial").toULongLong()
+            || timeline->undoManager()->currentIndex() != timer->property("burstIndex").toInt())) {
+        timer->setProperty("burstSerial", static_cast<qulonglong>(timeline->undoManager()->saveSerial()));
+        timer->setProperty("burstIndex", timeline->undoManager()->currentIndex());
+    }
+    timer->start();
+}
+
+static void commitUndoBurst(QTimer *timer, Timeline *timeline)
+{
+    if (!timeline || !timeline->undoManager() || timeline->isRestoringState()) return;
+    if (timeline->undoManager()->saveSerial() != timer->property("burstSerial").toULongLong()
+        || timeline->undoManager()->currentIndex() != timer->property("burstIndex").toInt())
+        return;
+    timeline->saveUndoState(timer->property("undoLabel").toString());
+}
+
+// Takes the pending points now, before anything that reads or replaces the undo state.
+static void flushPendingUndoPoints(MainWindow *window, Timeline *timeline)
+{
+    for (const char *name : kPendingUndoTimerNames) {
+        auto *timer = window->findChild<QTimer *>(QLatin1String(name));
+        if (!timer || !timer->isActive()) continue;
+        timer->stop();
+        commitUndoBurst(timer, timeline);
+    }
+}
+
 // Shared by the file menu and import hub; no persistent widget state needed.
 // US-1906: whether the frame presented next is a special composite that drew the
 // brushes. The GL leaves the bound brush off only then
-// (tlrender::kSpecialCompositeHoldsBrushProperty).
-static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush)
+// (tlrender::kSpecialCompositeHoldsBrushProperty). US-2111: `v1Stab` is the
+// stabilizer sample of its V1 layer (decoded at `v1StabSourceSize`), which the GL
+// gives the brush it draws there only when that brush is the V1 clip's own
+// (`boundBrushIsV1Stab`); any other clip's brush stays unwarped as in export.
+static void setSpecialCompositeHoldsBrush(VideoPlayer *player, bool holdsBrush,
+                                          const stabwarp::StabSample &v1Stab,
+                                          const QSize &v1StabSourceSize,
+                                          bool boundBrushIsV1Stab)
 {
     player->glPreview()->setProperty(tlrender::kSpecialCompositeHoldsBrushProperty, holdsBrush);
+    if (boundBrushIsV1Stab)
+        player->glPreview()->setSpecialCompositeBrushStabilizer(v1Stab, v1StabSourceSize);
+    else
+        player->glPreview()->setSpecialCompositeBrushStabilizer({}, {});
 }
 
 static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
@@ -2681,6 +2732,9 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_autoSave, &AutoSave::autoSaved, this, [this](const QString &path) {
         statusBar()->showMessage("Auto-saved: " + QFileInfo(path).fileName(), 3000);
     });
+    connect(m_autoSave, &AutoSave::saveFailed, this, [this](const QString &, const QString &error) {
+        statusBar()->showMessage(tr("自動保存に失敗: %1").arg(error), 5000);
+    });
     connect(m_autoSave, &AutoSave::recoveryAvailable, this, [this](const QStringList &files) {
         if (files.isEmpty())
             return;
@@ -2819,7 +2873,6 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_timeline, &Timeline::markersChanged, this, &MainWindow::markProjectDirty);
     connect(m_timeline, &Timeline::adjustmentLayersChanged, this, &MainWindow::markProjectDirty);
-    connect(m_timeline, &Timeline::trackFlagsChanged, this, &MainWindow::markProjectDirty);
     // Audio FX docks (EQ / compressor / reverb / NR / de-esser): one catch-all
     // for audio track count changes (import / addClip auto-track, BGM, paste,
     // undo / redo, project load, removal). Reseeds only when the track set
@@ -3209,9 +3262,15 @@ void MainWindow::applyStillCompareConfig()
     if (!m_timeline)
         return;
     bool drewBrush = false;
-    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush);
+    stabwarp::StabSample v1Stab;
+    QSize v1StabSourceSize;
+    QString v1StabClipId;
+    const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition(), &drewBrush,
+                                                     &v1Stab, &v1StabSourceSize, &v1StabClipId);
     if (!special.isNull()) {
-        setSpecialCompositeHoldsBrush(m_player, drewBrush);
+        setSpecialCompositeHoldsBrush(m_player, drewBrush, v1Stab, v1StabSourceSize,
+                                      !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         m_player->displaySpecialComposite(special);
     }
 }
@@ -3564,11 +3623,11 @@ void MainWindow::updateBrushPreviewProgress(double timelineSec)
     const TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
         return;
-    // Outside the selected clip (the paused brush path's active rule, V1 clamping to
-    // its first clip at t <= 0) the GL must not draw its strokes: progress 0.
-    double activeStart = 0.0;
-    if (tlrender::activeClipOnTrack(track->clips(), timelineSec,
-                                    /*clampToFirst=*/trackIdx == 0, &activeStart) != clipIdx) {
+    // Outside the clips export shows (US-2113: the exporter's overlap-window and
+    // selectClipOnTrack rule, both members inside a borrowed window; V1 clamping to its
+    // first clip at t <= 0) the GL must not draw its strokes: progress 0.
+    if (!tlrender::brushActiveClipsAt(m_timeline, timelineSec)
+             .contains(qMakePair(trackIdx, clipIdx))) {
         m_player->glPreview()->setBrushAnimationProgress(0.0);
         return;
     }
@@ -3814,10 +3873,32 @@ void MainWindow::setupUI()
                     m_player->setTextOverlays(m_timeline->timelineTextOverlays());
             });
     // US-T35 Video source transform drag/resize → persist to owning clip.
+    // A drag emits per move: each emission restarts this timer, so one undo point lands per
+    // finished drag instead of one per move.
+    auto *videoDragUndoTimer = new QTimer(this);
+    videoDragUndoTimer->setObjectName(QStringLiteral("videoDragUndoTimer"));
+    videoDragUndoTimer->setProperty("undoLabel", QStringLiteral("映像の変形"));
+    videoDragUndoTimer->setSingleShot(true);
+    videoDragUndoTimer->setInterval(300);
+    connect(videoDragUndoTimer, &QTimer::timeout, this, [this, videoDragUndoTimer]() {
+        commitUndoBurst(videoDragUndoTimer, m_timeline);
+    });
     connect(m_player, &VideoPlayer::videoSourceTransformChanged, this,
-            [this](int trackIdx, int clipIdx, double scale, double dx, double dy) {
+            [this, videoDragUndoTimer](int trackIdx, int clipIdx, double scale, double dx, double dy) {
                 if (!m_timeline) return;
-                m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy);
+                // A zero-movement emission (same clamped values) must not rewrite the clip nor
+                // mark the project unsaved.
+                const auto &tracks = m_timeline->videoTracks();
+                if (trackIdx >= 0 && trackIdx < tracks.size() && tracks[trackIdx]) {
+                    const auto &stored = tracks[trackIdx]->clips();
+                    if (clipIdx >= 0 && clipIdx < stored.size()
+                        && stored[clipIdx].videoScale == qBound(0.1, scale, 10.0)
+                        && stored[clipIdx].videoDx == qBound(-5.0, dx, 5.0)
+                        && stored[clipIdx].videoDy == qBound(-5.0, dy, 5.0))
+                        return;
+                }
+                if (m_timeline->setClipVideoTransform(trackIdx, clipIdx, scale, dx, dy))
+                    beginUndoBurst(videoDragUndoTimer, m_timeline);
             });
     // Timeline text-strip edge drag → update right-panel spinboxes + preview
     connect(m_timeline, &Timeline::textOverlayTimeChanged, this,
@@ -4092,10 +4173,17 @@ void MainWindow::setupUI()
             ? static_cast<double>(tUs) / AV_TIME_BASE
             : m_timeline->playheadPosition();
         bool drewBrush = false;
-        const QImage special = buildSpecialClipComposite(sec, &drewBrush);
+        stabwarp::StabSample v1Stab;
+        QSize v1StabSourceSize;
+        QString v1StabClipId;
+        const QImage special = buildSpecialClipComposite(sec, &drewBrush, &v1Stab,
+                                                         &v1StabSourceSize, &v1StabClipId);
         // US-1805: every paused displayFrame passes here, so an ordinary frame
         // (a null composite) clears the mark a previous composite left.
-        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush);
+        setSpecialCompositeHoldsBrush(m_player, !special.isNull() && drewBrush, v1Stab,
+                                      v1StabSourceSize,
+                                      !special.isNull() && !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         return special;
     });
 
@@ -4810,7 +4898,7 @@ void MainWindow::setupMenuBar()
     // Playback frames replace the composite without passing the provider.
     connect(m_player, &VideoPlayer::stateChanged, this, [this](bool playing) {
         if (playing)
-            setSpecialCompositeHoldsBrush(m_player, false);
+            setSpecialCompositeHoldsBrush(m_player, false, {}, {}, false);
         else if (m_timeline
                  && tlrender::timelineBrushWantsSpecialPath(m_timeline,
                                                             m_timeline->playheadPosition()))
@@ -5312,6 +5400,7 @@ void MainWindow::setupMenuBar()
                     if (mixer) {
                         mixer->setTrackEqEnabled(ti, true);
                         mixer->setTrackEqConfig(ti, cfg);
+                        markProjectDirty();
                     }
                     statusBar()->showMessage(
                         QString("A%1 EQ → %2").arg(ti + 1).arg(presetName),
@@ -5325,6 +5414,7 @@ void MainWindow::setupMenuBar()
                     [this, mixer, ti2]() {
                 if (mixer) {
                     mixer->setTrackEqEnabled(ti2, false);
+                    markProjectDirty();
                 }
                 statusBar()->showMessage(
                     QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
@@ -7311,6 +7401,20 @@ void MainWindow::setupMenuBar()
         this, [this](const QVector<VideoEffect> &effects) {
         m_timeline->setClipEffects(effects);
     });
+    // The panel writes the motion with setClipMotion (no undo point): coalesce a burst of edits
+    // into one point, taken once the edits stop.
+    auto *motionUndoTimer = new QTimer(this);
+    motionUndoTimer->setObjectName(QStringLiteral("motionUndoTimer"));
+    motionUndoTimer->setProperty("undoLabel", QStringLiteral("モーションの変更"));
+    motionUndoTimer->setSingleShot(true);
+    motionUndoTimer->setInterval(300);
+    connect(motionUndoTimer, &QTimer::timeout, this, [this, motionUndoTimer]() {
+        commitUndoBurst(motionUndoTimer, m_timeline);
+    });
+    connect(m_effectControlsPanel, &effectctrl::EffectControlsPanel::motionChanged,
+        this, [this, motionUndoTimer](const effectctrl::MotionState &) {
+            beginUndoBurst(motionUndoTimer, m_timeline);
+        });
 
     m_effectLibraryPanel = new EffectLibraryPanel(this);
     m_effectLibraryPanel->setVisible(false);
@@ -8661,10 +8765,19 @@ QImage MainWindow::applyStoredRotoData(const QString &clipId,
     return roto::applyEntryToFrame(it.value(), frame, sourceFrameIndex);
 }
 
-QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush) const
+QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewBrush,
+                                             stabwarp::StabSample *v1Stab,
+                                             QSize *v1StabSourceSize,
+                                             QString *v1StabClipId) const
 {
     if (drewBrush)
         *drewBrush = false;
+    if (v1Stab)
+        *v1Stab = {};
+    if (v1StabSourceSize)
+        *v1StabSourceSize = QSize();
+    if (v1StabClipId)
+        v1StabClipId->clear();
     if (!m_timeline)
         return {};
 
@@ -8701,14 +8814,15 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
         *drewBrush = brushWantsSpecialPath;
     // V1's export clip (renderFrameAt's selectClip(0, clampToFirst)): a visible,
     // non-empty V1 with none draws nothing there, so the preview falls back too.
-    int v1ExportIdx = -1;
+    QVector<QPair<int, int>> exportClips;
     if (brushWantsSpecialPath) {
+        exportClips = tlrender::brushActiveClipsAt(m_timeline, timelineSeconds);
         const auto *v1 = m_timeline->videoTracks().value(0, nullptr);
         if (v1 && !v1->isHidden() && !v1->clips().isEmpty()) {
-            double v1Start = 0.0;
-            v1ExportIdx = tlrender::activeClipOnTrack(
-                v1->clips(), timelineSeconds, /*clampToFirst=*/true, &v1Start);
-            if (v1ExportIdx < 0)
+            bool v1Active = false;
+            for (const auto &pair : exportClips)
+                v1Active = v1Active || pair.first == 0;
+            if (!v1Active)
                 return {};
         }
     }
@@ -8719,7 +8833,6 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
 
         const auto &clips = track->clips();
         double cursor = 0.0;
-        bool trackHasExportClip = false;
         for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
             const ClipInfo &clip = clips[clipIdx];
             cursor += qMax(0.0, clip.leadInSec);
@@ -8728,15 +8841,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             cursor = clipEnd;
 
             if (brushWantsSpecialPath) {
-                // Export's [start, end) interval, at most one clip per track
-                // (activeClipOnTrack), so a cut matches renderFrameAt.
-                if (trackHasExportClip)
-                    break;
-                if (trackIdx == 0 && v1ExportIdx >= 0
-                        ? clipIdx != v1ExportIdx
-                        : (timelineSeconds < clipStart || timelineSeconds >= clipEnd))
+                // The clips export draws (brushActiveClipsAt), one per track
+                // outside a transition window, so a cut matches renderFrameAt.
+                if (!exportClips.contains(qMakePair(trackIdx, clipIdx)))
                     continue;
-                trackHasExportClip = true;
             } else if (timelineSeconds + 1.0 / 120.0 < clipStart
                 || timelineSeconds > clipEnd + 1.0 / 120.0) {
                 continue;
@@ -8885,6 +8993,18 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             // (78), renderClipLayerSource's order and cache key).
             if (brushWantsSpecialPath)
                 frame = tlrender::applyClipBrushSource(frame, clip, localSeconds, clipId);
+            // US-2111: V1's stabilizer after the brush, before FX, as export does
+            // (renderClipLayerSource); the GL gets no keys while this is shown.
+            if (trackIdx == 0 && !clip.stabilizerKeyframes.isEmpty()) {
+                if (v1Stab)
+                    *v1Stab = stabwarp::sampleAt(clip.stabilizerKeyframes,
+                                                 static_cast<qint64>(fxSourceSeconds * 1.0e6));
+                if (v1StabSourceSize)
+                    *v1StabSourceSize = frame.size();
+                if (v1StabClipId)
+                    *v1StabClipId = clipId;
+            }
+            frame = stabwarp::applyForExport(frame, clip, trackIdx, 0, fxSourceSeconds);
 
             // US-708: run the same native FX stage as export (VFX footage
             // controls -> grade/LUT -> ordered FX pack -> mesh warp / puppet
@@ -8897,7 +9017,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip, clipId, brushWantsSpecialPath](
+                    [this, clip, clipId, trackIdx, brushWantsSpecialPath](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         // US-1805: the brush path samples export's source frame
                         // (renderClipSourceFrame), the rest keep grabFrameAt.
@@ -8913,7 +9033,10 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                         // US-2010: export's provider order on both branches:
                         // the sample's own brush, then VFX / grade (no roto).
                         return tlrender::prepareClipSourceForEcho(
-                            tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec, clipId),
+                            stabwarp::applyForExport(
+                                tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec,
+                                                               clipId),
+                                clip, trackIdx, 0, sampleSourceSec),
                             clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
@@ -9144,11 +9267,18 @@ void MainWindow::refreshSpecialClipPreview()
     }
 
     bool drewBrush = false;
-    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush);
+    stabwarp::StabSample v1Stab;
+    QSize v1StabSourceSize;
+    QString v1StabClipId;
+    const QImage composed = buildSpecialClipComposite(playheadSeconds, &drewBrush, &v1Stab,
+                                                      &v1StabSourceSize, &v1StabClipId);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
         // Built while playing, it holds no brush (decision B6).
-        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying());
+        setSpecialCompositeHoldsBrush(m_player, drewBrush && !m_player->isPlaying(), v1Stab,
+                                      v1StabSourceSize,
+                                      !v1StabClipId.isEmpty()
+                                          && v1StabClipId == m_brushPreviewClipIdForTest);
         m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
@@ -9250,8 +9380,11 @@ void MainWindow::populateProjectData(ProjectData &data)
                 entry.clipId = it.key();
                 entries.timeRemapClipEntries.append(entry);
             }
+            // US-2110: in the parked order (the live list is unsorted too).
+            entries.adjustmentLayers = sidecars.adjustments;
             if (entries.rotoClipEntries.isEmpty() && entries.trackMatteClipEntries.isEmpty()
-                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty())
+                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty()
+                && entries.adjustmentLayers.isEmpty())
                 continue;
             auto byClipId = [](const auto &a, const auto &b) { return a.clipId < b.clipId; };
             std::sort(entries.rotoClipEntries.begin(), entries.rotoClipEntries.end(), byClipId);
@@ -9306,15 +9439,7 @@ void MainWindow::populateProjectData(ProjectData &data)
         entry.text = seg.text;
         data.subtitleSegments.append(entry);
     }
-    QJsonObject styleJson;
-    styleJson["fontName"] = m_subtitleStyle.font.family();
-    styleJson["fontSize"] = m_subtitleStyle.font.pointSize();
-    styleJson["fontBold"] = m_subtitleStyle.font.bold();
-    styleJson["color"] = m_subtitleStyle.color.name(QColor::HexArgb);
-    styleJson["outlineColor"] = m_subtitleStyle.outlineColor.name(QColor::HexArgb);
-    styleJson["outlineWidth"] = m_subtitleStyle.outlineWidth;
-    styleJson["verticalPos"] = m_subtitleStyle.verticalPos;
-    data.subtitleStyle = styleJson;
+    data.subtitleStyle = m_subtitleStyle.toJson();
 
     QJsonObject loudnessJson;
     const auto *normalizerMixer = m_player ? m_player->audioMixer() : nullptr;
@@ -9426,6 +9551,9 @@ void MainWindow::stopMeshEditTool()
 void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                         const QString &filePath)
 {
+    // US-2108: a debounced undo point of the old project must not land on the new one.
+    for (const char *name : kPendingUndoTimerNames)
+        if (auto *timer = findChild<QTimer *>(QLatin1String(name))) timer->stop();
     ProjectData data = loadedData;
     QHash<QString, QString> relinkMapping;
     if (m_promptForMissingMedia) {
@@ -9547,6 +9675,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                 if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
                     && entry.clipId != entry.parentClipId)
                     sidecars.parent.insert(entry.clipId, entry.parentClipId);
+            sidecars.adjustments = it->adjustmentLayers;
             parkedSidecars.insert(it.key(), sidecars);
             QHash<QString, TimeRemapClipEntry> remaps;
             for (const auto &entry : it->timeRemapClipEntries)
@@ -9596,16 +9725,8 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         seg.text = entry.text;
         m_subtitleSegments.append(seg);
     }
-    m_subtitleStyle = SubtitleStyle{};
-    if (!data.subtitleStyle.isEmpty()) {
-        m_subtitleStyle.font.setFamily(data.subtitleStyle.value("fontName").toString());
-        m_subtitleStyle.font.setPointSize(data.subtitleStyle.value("fontSize").toInt());
-        m_subtitleStyle.font.setBold(data.subtitleStyle.value("fontBold").toBool());
-        m_subtitleStyle.color = QColor(data.subtitleStyle.value("color").toString());
-        m_subtitleStyle.outlineColor = QColor(data.subtitleStyle.value("outlineColor").toString());
-        m_subtitleStyle.outlineWidth = data.subtitleStyle.value("outlineWidth").toDouble();
-        m_subtitleStyle.verticalPos = data.subtitleStyle.value("verticalPos").toDouble();
-    }
+    m_subtitleStyle = data.subtitleStyle.isEmpty() ? SubtitleStyle{}
+                                                   : SubtitleStyle::fromJson(data.subtitleStyle);
 
     applyVfxProjectState(data.vfxState);
 
@@ -9870,8 +9991,10 @@ QJsonObject MainWindow::collectExternalTrackState() const
         state["mixer"] = mixerState;
     }
     state["buses"] = m_audioBusRouting.toJson();
-    // Timeline playback flags (muted/solo/hidden) are not undoable.
+    // Timeline track flags are TimelineState::trackFlags (US-2106), not captured here.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
+    // US-2110: the sequence these layers belong to (Timeline::restoreState parks by it).
+    state["adjustmentsSequenceId"] = m_timeline->activeSequenceId();
     // Capture live carrier references, including matte edits without an undo entry.
     QJsonArray mattes;
     const auto entries = m_timeline->trackMatteEntries();
@@ -10288,6 +10411,8 @@ void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &ne
         m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
         // The stored clips may carry an older curve than the parked entries: mirror them.
         ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        // US-2106: the active sequence id is saved; a restore-driven switch is not an edit.
+        markProjectDirty();
     } else {
         // Timeline::restoreState's rule: the sequence left keeps its pre-restore live
         // entries; the live ones are the state's (US-1401), parked under the state's
@@ -10450,6 +10575,8 @@ void MainWindow::newProject()
 {
     if (!maybeSaveChanges())
         return;
+    for (const char *name : kPendingUndoTimerNames)
+        if (auto *timer = findChild<QTimer *>(QLatin1String(name))) timer->stop();
     ProjectSettingsDialog dialog(this);
     if (dialog.exec() == QDialog::Accepted)
         resetProject(dialog.config());
@@ -10465,6 +10592,7 @@ void MainWindow::resetProject(const ProjectConfig &config)
     if (m_timeline) {
         m_timeline->setMarkers({});
         m_timeline->setAdjustmentLayers({});
+        m_timeline->resetTracksToDefault();
     }
     applyLoadedProjectData(fresh, QString());
     markProjectClean();
@@ -10588,6 +10716,7 @@ void MainWindow::compareSavedProject()
 
 void MainWindow::saveProject()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (m_projectFilePath.isEmpty()) {
         saveProjectAs();
         return;
@@ -10660,6 +10789,7 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
             *errorMessage = QStringLiteral("エディタを利用できません");
         return false;
     }
+    flushPendingUndoPoints(this, m_timeline);
 
     // US-1506: ImportHub PNGs still in the OS temp dir are copied next to the
     // project (<name>_assets/importhub/) before saving. Order: copy (failure
@@ -10839,7 +10969,10 @@ void MainWindow::markProjectClean()
 
 void MainWindow::markProjectDirty()
 {
-    if ((m_timeline && m_timeline->isRestoringState()) || m_remappingTrackIndices)
+    // createSequence's switch (and the adjustment layers it swaps) is in its undo point,
+    // so undoing the creation returns clean.
+    if ((m_timeline && (m_timeline->isRestoringState() || m_timeline->isSwitchingInsideUndoPoint()))
+        || m_remappingTrackIndices)
         return;
     m_dirtyOutsideUndo = true;
     setWindowModified(true);
@@ -10866,6 +10999,7 @@ void MainWindow::changeEvent(QEvent *event)
 
 bool MainWindow::maybeSaveChanges()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (!isWindowModified())
         return true;
     ++m_unsavedChangesPromptCount;
@@ -11921,8 +12055,6 @@ void MainWindow::pasteEffects()
         return;
     }
 
-    m_timeline->setClipEffects(clipboard.effects());
-
     effectctrl::MotionState motion;
     motion.scale = clipboard.motion().scale;
     motion.dx = clipboard.motion().dx;
@@ -11937,6 +12069,8 @@ void MainWindow::pasteEffects()
     motion.rotY = 0.0;
     motion.rotZ = 0.0;
     m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+    // The effects setter records the undo point; it goes last so the motion is in it.
+    m_timeline->setClipEffects(clipboard.effects());
 
     statusBar()->showMessage("Effects pasted", 2000);
 }
@@ -11985,6 +12119,9 @@ void MainWindow::pasteAttributes()
         motion.rotZ = srcClip.layer3D.rotationZ;
 
         m_timeline->setClipMotion(trackIdx, clipIdx, motion);
+        // With effects selected too, setClipEffects below records the one undo point.
+        if (sel.effectIndices.isEmpty())
+            m_timeline->saveUndoState(QStringLiteral("属性のペースト"));
     }
 
     if (!sel.effectIndices.isEmpty()) {
@@ -12005,6 +12142,7 @@ void MainWindow::pasteAttributes()
 
 void MainWindow::undoAction()
 {
+    flushPendingUndoPoints(this, m_timeline);
     if (!m_projectCameraUndoSlot.isEmpty()
         && m_timeline->undoManager()->currentIndex() == m_projectCameraUndoTimelineDepth
         && m_timeline->undoManager()->saveSerial() == m_projectCameraUndoSaveSerial) {
@@ -12028,6 +12166,7 @@ void MainWindow::undoAction()
 
 void MainWindow::redoAction()
 {
+    flushPendingUndoPoints(this, m_timeline);
     m_timeline->redo();
     statusBar()->showMessage("Redo");
     updateEditActions();
@@ -14639,6 +14778,7 @@ void MainWindow::openLoudnessSettings()
             setProjectNormalizerAmount(mixer, amount);
             mixer->setNormalizerUniformity(uniformity);
         }
+        markProjectDirty(); // normalizerAmount is saved in the project's loudness settings
     } else {
         // Cancel restores the original values (they were live-applied during
         // slider drag).
@@ -20797,6 +20937,7 @@ void MainWindow::openMasterCompressor()
         params.makeupDb = makeupSpin->value();
         params.enabled = enableCheck->isChecked();
         mixer->setCompressorParams(params);
+        markProjectDirty();
         statusBar()->showMessage(
             QString("Compressor %1 (threshold %2 dB, ratio %3:1)")
                 .arg(params.enabled ? "ON" : "OFF")
@@ -20869,6 +21010,7 @@ void MainWindow::openAutoDuckSettings()
         params.attackMs = attackSpin->value();
         params.releaseMs = releaseSpin->value();
         mixer->setAutoDuckParams(params);
+        markProjectDirty();
         statusBar()->showMessage(
             QString("Auto-Duck: threshold %1 dB, ratio %2:1, attack %3 ms, release %4 ms")
                 .arg(params.thresholdDb, 0, 'f', 1)
@@ -20899,6 +21041,7 @@ void MainWindow::onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos)
             if (mixer) {
                 mixer->setTrackEqEnabled(ti, true);
                 mixer->setTrackEqConfig(ti, cfg);
+                markProjectDirty();
             }
             statusBar()->showMessage(
                 QString("A%1 EQ → %2").arg(ti + 1).arg(presetName), 3000);
@@ -20911,6 +21054,7 @@ void MainWindow::onMeterRequestEqPresetMenu(int trackIdx, QPoint globalPos)
             [this, mixer, ti2]() {
         if (mixer) {
             mixer->setTrackEqEnabled(ti2, false);
+            markProjectDirty();
         }
         statusBar()->showMessage(
             QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
@@ -21537,6 +21681,7 @@ void MainWindow::onMultiCamApplyToTimeline(const MultiCamProject &project)
     m_timeline->videoTracks().first()->setClips(v1Clips);
     m_timeline->audioTracks().first()->setClips(a1Clips);
     m_timeline->refreshPlaybackSequence();
+    m_timeline->saveUndoState(QStringLiteral("マルチカム EDL の適用"));
 
     if (skipped > 0) {
         statusBar()->showMessage(
@@ -21645,6 +21790,7 @@ void MainWindow::runMotionStabilizer()
         return;
     }
     m_timeline->setClipStabilizerKeyframes(0, kfs);
+    m_timeline->saveUndoState(QStringLiteral("クリップの手ぶれ補正"));
     statusBar()->showMessage(
         tr("スタビライズ完了: %1 フレーム").arg(kfs.size()), 6000);
 }
@@ -21753,8 +21899,6 @@ void MainWindow::openSpeedRampDialog()
     ramp.clearAndSetIdentity();
     ramp.addKeyframe(0, speedMul);
 
-    m_timeline->setSpeedRamp(clipIdx, ramp);
-
     const auto &vTracks = m_timeline->videoTracks();
     if (!vTracks.isEmpty() && vTracks.first()) {
         auto clips = vTracks.first()->clips();
@@ -21772,6 +21916,8 @@ void MainWindow::openSpeedRampDialog()
             aTracks.first()->setClips(clips);
         }
     }
+    // The ramp setter records the undo point; it goes last so atempo is in it.
+    m_timeline->setSpeedRamp(clipIdx, ramp);
     m_timeline->refreshPlaybackSequence();
     statusBar()->showMessage(
         tr("速度ランプを %1x に設定しました (clip #%2, atempo=%3)")

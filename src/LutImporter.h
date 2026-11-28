@@ -23,8 +23,13 @@ struct LutData {
     int size = 0;                    // grid size (e.g. 33 for 33x33x33)
     QVector<QVector3D> table;        // RGB triplets (0.0-1.0)
     double intensity = 1.0;          // blend strength with original (0.0-1.0)
+    QVector3D domainMin{0.0f, 0.0f, 0.0f};  // DOMAIN_MIN of the .cube (input is normalised by it)
+    QVector3D domainMax{1.0f, 1.0f, 1.0f};  // DOMAIN_MAX of the .cube
 
     bool isValid() const { return size >= 2 && !table.isEmpty(); }
+    bool hasDefaultDomain() const {
+        return domainMin == QVector3D(0.0f, 0.0f, 0.0f) && domainMax == QVector3D(1.0f, 1.0f, 1.0f);
+    }
     bool isBuiltIn() const { return filePath.isEmpty(); }
 };
 
@@ -42,6 +47,15 @@ public:
     // Apply LUT blended with original at given intensity (0.0 = original, 1.0 = full LUT)
     static QImage applyLutWithIntensity(const QImage &image, const LutData &lutData,
                                         double intensity);
+
+    // Float sampler shared by applyLut and toGpuGrid: normalises rgb01 by the LUT domain
+    // (clamped to 0..1 per channel), then 1D linear / 3D trilinear lookup. lut must be valid.
+    static QVector3D sample(const LutData &lut, const QVector3D &rgb01);
+
+    // Grid for the GL preview (a 3D texture of size^3). A 1D LUT is expanded to an n^3 grid
+    // (n = clamp(size, 2, maxSize)) and a 3D LUT with a non-default domain is resampled at its
+    // own size, both through sample(); a default-domain 3D LUT is returned unchanged.
+    static LutData toGpuGrid(const LutData &in, int maxSize = 65);
 
     // Generate a preview image showing the LUT effect on a colour gradient
     static QImage generatePreview(const LutData &lutData, int previewSize = 128);

@@ -1,5 +1,6 @@
 #pragma once
 #include "Timeline.h"
+#include <QHash>
 #include <QStringList>
 
 namespace fcpx::xml {
@@ -13,6 +14,8 @@ struct ImportResult {
     // media id; ref-clips become ClipInfo::sequenceRefId to it.
     QVector<TimelineSequence> sequences;
     QStringList warnings;
+    // Offline sentinel path -> original UNC / file://host path (never probed).
+    QHash<QString, QString> offlineSources;
     QString error;
     int resolvedFiles = 0;
     int unresolvedFiles = 0;

@@ -25,6 +25,10 @@ struct SubtitleStyle {
     int alignment = Qt::AlignHCenter;
     bool karaokeEnabled = false;
     QColor karaokeHighlightColor = QColor(255, 210, 0);
+
+    // All 12 fields; fromJson keeps the struct default for a missing key.
+    QJsonObject toJson() const;
+    static SubtitleStyle fromJson(const QJsonObject &obj);
 };
 
 class SubtitleTrackRenderer : public QObject

@@ -108,6 +108,23 @@ struct Nesting {
     QVector<TimelineSequence> sequences;
 };
 constexpr int kMaxCompoundDepth = 8;
+constexpr int kMaxXmlDepth = 128;
+// A network location: //server/share in any mix of slashes (\\?\UNC\ and \\.\ too), or file://host.
+// A \\?\<letter>:\ long path is local: the prefix is stripped from localPath. Normalised by hand
+// so every platform decides alike (QDir::fromNativeSeparators is a no-op off Windows).
+bool isUncMediaPath(QString &localPath, const QUrl &url)
+{
+    QString n = localPath;
+    n.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    if (n.startsWith(QLatin1String("//?/")) && n.size() >= 7 && n.at(4).isLetter() && n.at(5) == QLatin1Char(':')
+        && n.at(6) == QLatin1Char('/')) {
+        localPath.remove(0, 4);
+        return false;
+    }
+    return n.startsWith(QLatin1String("//"))
+        || (url.scheme() == QLatin1String("file") && !url.host().isEmpty()
+            && url.host().compare(QLatin1String("localhost"), Qt::CaseInsensitive) != 0);
+}
 }
 // originOut / contentEndOut receive the sequence tcStart and the end of its
 // placed clips (relative to tcStart) for a compound clip's asset range.
@@ -182,8 +199,12 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     };
     Time inheritedTrimSec; // the lead cut from the container whose children are being read
     std::optional<Time> inheritedFrameEnd; // the end of the innermost container frame being read
-    std::function<void()> warnDescendants;
-    warnDescendants = [&] {
+    std::function<void(int)> warnDescendants;
+    warnDescendants = [&](int depth) {
+        if (depth > kMaxXmlDepth) {
+            reader.raiseError(QStringLiteral("FCPXML の入れ子が深すぎます (上限 %1 段)").arg(kMaxXmlDepth));
+            return;
+        }
         while (reader.readNextStartElement()) {
             if (isMediaClipTag(reader.name())) {
                 const auto a = reader.attributes();
@@ -191,7 +212,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 result.warnings.append(QStringLiteral("親クリップが不正なため接続クリップを読み飛ばしました: %1 / %2")
                     .arg(a.value("name").toString(), a.value("ref").toString()));
             }
-            warnDescendants();
+            warnDescendants(depth + 1);
         }
     };
     // A ref-clip reads its media sequence once (inner sequences first in
@@ -223,6 +244,8 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             const QStringList existing = result.warnings;
             for (const QString &warning : inner.warnings)
                 if (!existing.contains(warning)) result.warnings.append(warning);
+            for (auto it = inner.offlineSources.cbegin(); it != inner.offlineSources.cend(); ++it)
+                result.offlineSources.insert(it.key(), it.value());
             if (inner.error.isEmpty()) {
                 auto hasClips = [](const QVector<QVector<ClipInfo>> &tracks) {
                     return std::any_of(tracks.cbegin(), tracks.cend(), [](const auto &t) { return !t.isEmpty(); });
@@ -261,7 +284,11 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     // A connected mc-clip (a lane child of a clip) is flattened onto its lane and
     // anchored to its parent; the mc-clip's own lane children attach to the first
     // video clip cut from it.
-    auto readMulticamClip = [&](const Time *parentOffset, const Time *parentStart, int parentIndex) {
+    auto readMulticamClip = [&](const Time *parentOffset, const Time *parentStart, int parentIndex, int depth) {
+        if (depth > kMaxXmlDepth) {
+            reader.raiseError(QStringLiteral("FCPXML の入れ子が深すぎます (上限 %1 段)").arg(kMaxXmlDepth));
+            return;
+        }
         const auto a = reader.attributes();
         const bool connected = parentOffset && parentIndex >= 0;
         if (!connected && a.hasAttribute("lane") && a.value("lane").toString() != QLatin1String("0")) { warnSkip(); return; }
@@ -517,7 +544,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                 warnSkip();
             } else {
                 if (!cutDone) { cutDone = true; firstCut = cut(); }
-                if (firstCut >= 0) readSpine(&frame.offset, &frame.start, firstCut, 1, nullptr);
+                if (firstCut >= 0) readSpine(&frame.offset, &frame.start, firstCut, depth + 1, nullptr);
                 else warnSkip();
             }
         }
@@ -525,6 +552,10 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
     };
     readSpine = [&](const Time *parentOffset, const Time *parentStart, int parentIndex,
                     int depth, const QXmlStreamAttributes *fallback) {
+        if (depth > kMaxXmlDepth) {
+            reader.raiseError(QStringLiteral("FCPXML の入れ子が深すぎます (上限 %1 段)").arg(kMaxXmlDepth));
+            return;
+        }
         const QStringView tag = reader.name();
         if (isContainerTag(tag)) {
             const auto container = reader.attributes();
@@ -555,7 +586,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             if (!valid) {
                 result.warnings.append(QStringLiteral("クリップの値が不正です (接続位置): %1 / %2")
                     .arg(container.value("name").toString(), container.value("ref").toString()));
-                warnDescendants();
+                warnDescendants(depth);
                 return;
             }
             QVector<int> directChildren;
@@ -606,7 +637,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             if (!valid) {
                 result.warnings.append(QStringLiteral("gap の接続位置が不正です: %1")
                     .arg(a.value("name").toString()));
-                warnDescendants();
+                warnDescendants(depth);
                 return;
             }
             ++gapDepth;
@@ -616,11 +647,11 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
             return;
         }
         if (tag == QLatin1String("mc-clip") && (!parentOffset || parentIndex >= 0)) {
-            readMulticamClip(parentOffset, parentStart, parentIndex);
+            readMulticamClip(parentOffset, parentStart, parentIndex, depth);
             return;
         }
         const bool refClip = tag == QLatin1String("ref-clip");
-        if (refClip && !keepCompound(reader.attributes().value("ref").toString())) { warnDescendants(); return; }
+        if (refClip && !keepCompound(reader.attributes().value("ref").toString())) { warnDescendants(depth); return; }
         if (!refClip && !isMediaClipTag(tag)) { warnSkip(); return; }
         ++assetClipCount;
         const auto a = reader.attributes();
@@ -679,7 +710,7 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
         if (!invalid.isEmpty()) {
             result.warnings.append(QStringLiteral("クリップの値が不正です (%1): %2 / %3")
                 .arg(invalid, e.name, e.ref));
-            warnDescendants();
+            warnDescendants(depth);
             return;
         }
         if (inheritedFrameEnd) {
@@ -1022,14 +1053,30 @@ static ImportResult parseDocument(const QString &xml, const QString &directory, 
                     path = timeline_nesting::sequenceClipFilePath(e.ref);
                 } else {
                     const QUrl url(asset.path);
-                    path = url.isLocalFile() ? url.toLocalFile() : asset.path;
+                    // file://localhost/<path> is this machine; toLocalFile would keep it as //localhost/<path>.
+                    QUrl localUrl = url;
+                    if (localUrl.host().compare(QLatin1String("localhost"), Qt::CaseInsensitive) == 0) localUrl.setHost(QString());
+                    path = url.isLocalFile() ? localUrl.toLocalFile() : asset.path;
                     if (path.isEmpty()) path = QStringLiteral("offline-%1").arg(e.ref);
-                    if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
-                    if (QFileInfo(path).isFile()) found.insert(path);
-                    else if (!missing.contains(path)) {
-                        missing.insert(path);
-                        if (!nest.missing.contains(path))
-                            result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path));
+                    if (isUncMediaPath(path, url)) {
+                        // Never probe a network path (an unreachable host stalls isFile for
+                        // seconds): the clip gets an offline sentinel, the original is reported.
+                        const QString original = asset.path;
+                        path = QDir(directory).absoluteFilePath(QStringLiteral("offline-%1").arg(e.ref));
+                        result.offlineSources.insert(path, original);
+                        if (!missing.contains(path)) {
+                            missing.insert(path);
+                            result.warnings.append(QStringLiteral("オフライン素材 (ネットワークパスは確認しません): %1 → %2")
+                                .arg(original, path));
+                        }
+                    } else {
+                        if (QDir::isRelativePath(path)) path = QDir(directory).absoluteFilePath(path);
+                        if (QFileInfo(path).isFile()) found.insert(path);
+                        else if (!missing.contains(path)) {
+                            missing.insert(path);
+                            if (!nest.missing.contains(path))
+                                result.warnings.append(QStringLiteral("オフライン素材: %1").arg(path));
+                        }
                     }
                 }
                 ClipInfo c; c.filePath = path; c.displayName = e.name.isEmpty() ? asset.name : e.name;

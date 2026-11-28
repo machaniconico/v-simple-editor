@@ -19,6 +19,7 @@
 #include "VideoEffect.h"
 #include "LutImporter.h"
 #include "MotionStabilizer.h"
+#include "StabilizerWarp.h"
 #include "Camera3D.h"
 
 class Timeline;
@@ -193,6 +194,15 @@ public:
     // user 3D-rotate matrix is preserved (transforms compose by stacking).
     void setStabilizerKeyframes(const QVector<StabilizerKeyframe> &kfs);
     void setStabilizerSourceTimeUs(qint64 sourceUs);
+    // US-2111 test seam: the nine row-major uStab values (stabwarp::inverseMatrixUv).
+    std::array<float, 9> stabMatrixForTest() const;
+    // US-2111: V1's stabilizer sample at the time of the special composite shown
+    // next (identity: none) and V1's decoded frame size, the unit of its dx / dy.
+    // The composite's V1 layer is already warped on the CPU and the GL gets no
+    // keys, so the bound brush drawn on it gets this warp; the next displayFrame
+    // takes it and every later one clears it.
+    void setSpecialCompositeBrushStabilizer(const stabwarp::StabSample &sample,
+                                            const QSize &sourceSize);
 
     // US-INT-1: non-owning Timeline pointer used to query
     // composeAdjustmentLayersAt(timelineUs) in paintGL. nullptr → no-op
@@ -665,6 +675,12 @@ private:
                               0.0f, 0.0f, 1.0f};
     bool  m_stabEnabled    = false;
     QVector<StabilizerKeyframe> m_stabKeyframes;
+    // US-2111: setSpecialCompositeBrushStabilizer's sample, and the one the shown
+    // frame took in displayFrame.
+    stabwarp::StabSample m_pendingCompositeBrushStab;
+    stabwarp::StabSample m_compositeBrushStab;
+    QSize m_pendingCompositeBrushStabSize;
+    QSize m_compositeBrushStabSize;
     qint64 m_stabSourceUs  = 0;
     int   m_stabFrameW     = 0;
     int   m_stabFrameH     = 0;

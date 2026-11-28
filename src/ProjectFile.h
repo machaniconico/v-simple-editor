@@ -159,6 +159,7 @@ struct SequenceSidecarEntries {
     QVector<TrackMatteClipEntry> trackMatteClipEntries;
     QVector<ClipParentEntry> clipParentEntries;
     QVector<TimeRemapClipEntry> timeRemapClipEntries;
+    QVector<AdjustmentLayer> adjustmentLayers;  // US-2110
 };
 
 // US-3D-11: per-clip 3D extruded-text layer config. `config` is a
@@ -358,7 +359,9 @@ class ProjectFile
 {
 public:
     static bool save(const QString &filePath, const ProjectData &data);
-    static bool load(const QString &filePath, ProjectData &data);
+    // errorMessage (optional) receives the reason when the file is refused for
+    // its version (not an integer in 1..PROJECT_FORMAT_VERSION).
+    static bool load(const QString &filePath, ProjectData &data, QString *errorMessage = nullptr);
 
     // Writes each entry's curve onto the video clip it is keyed to (ids are
     // re-canonicalised); clips without an entry are left untouched.
@@ -366,7 +369,7 @@ public:
                                       const QVector<TimeRemapClipEntry> &entries);
 
     static QString toJsonString(const ProjectData &data);
-    static bool fromJsonString(const QString &json, ProjectData &data);
+    static bool fromJsonString(const QString &json, ProjectData &data, QString *errorMessage = nullptr);
 
     static const QString fileFilter() { return "V Editor Project (*.veditor);;All Files (*)"; }
 

@@ -1033,6 +1033,8 @@ public:
     bool canRedo() const;
     // True while restoreState (undo / redo / history jump) is running.
     bool isRestoringState() const { return m_restoringState; }
+    // True while createSequence switches to the new sequence: its undo point covers the switch.
+    bool isSwitchingInsideUndoPoint() const { return m_switchingInsideUndoPoint; }
     // External index owners participate in the same undo transaction.
     void setExternalTrackStateHooks(std::function<QJsonObject()> collect,
                                     std::function<void(const QJsonObject&)> apply);
@@ -1184,10 +1186,12 @@ public:
     bool setActiveSequence(const QString &sequenceId);
     // US-2005: the roto / matte / parent sidecars of the sequences that are not
     // active, parked by setActiveSequence and restoreState (never in the store).
+    // US-2110: the adjustment layers are parked with them.
     struct SequenceSidecars {
         QHash<QString, RotoClipEntry> roto;
         QHash<QString, TimelineTrackMatteEntry> matte;
         QHash<QString, QString> parent;
+        QVector<AdjustmentLayer> adjustments;
     };
     QHash<QString, SequenceSidecars> parkedSidecarsBySequence() const { return m_parkedSidecarsBySequence; }
     // Replaces the table (project load); the active sequence's entry is dropped.
@@ -1286,6 +1290,11 @@ public:
                                     int *trackIndex = nullptr,
                                     int *clipIndex = nullptr);
     void addAudioTrack(bool recordUndo = true);
+    // New Project: drop the tracks past the construction-time counts, last first, with no
+    // undo point (the caller replaces the whole project right after).
+    static constexpr int kDefaultVideoTracks = 1;
+    static constexpr int kDefaultAudioTracks = 1;
+    void resetTracksToDefault();
     bool removeTrack(bool audio, int index, QString *err = nullptr);
     bool requestRemoveTrack(bool audio, int index);
     int activeVideoTrackIndex() const { return m_activeVideoTrackIndex >= 0
@@ -1745,6 +1754,7 @@ private:
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
     bool m_restoringState = false;
+    bool m_switchingInsideUndoPoint = false;
     void removeTrackInternal(bool audio, int index);
 public:
     void restoreState(const TimelineState &state);
@@ -1825,6 +1835,10 @@ private:
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QHash<QString, SequenceSidecars> m_parkedSidecarsBySequence;
+    // US-2110: the sequence whose live adjustment layers a restore last took from the
+    // state; its later non-structural restores keep following the state. Any live edit
+    // or switch outside restoreState clears it.
+    QString m_adjustmentsFollowStateIn;
     QVector<TimelineSequence> m_sequences;
     QString m_activeSequenceId;
     bool m_sequenceModelEnabled = false;
