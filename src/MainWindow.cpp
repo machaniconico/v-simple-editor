@@ -11,6 +11,9 @@
 #include "CreatorTools.h"
 #include "DuplicateFrameDetector.h"
 #include "ExternalGenerator.h"
+#include "GradeVersions.h"
+#include "CreativeEffects.h"
+#include "ShapeModifierDialog.h"
 #include "GpuVendorSupport.h"
 #include "LottiePlayer.h"
 #include "MogrtTemplate.h"
@@ -3905,14 +3908,22 @@ void MainWindow::setupUI()
                 if (excerpt.size() > 18) excerpt = excerpt.left(18) + QStringLiteral("…");
                 headerText = QStringLiteral("テキスト: 「%1」").arg(excerpt);
             }
-        } else if (hit.target == ctxmenu::Target::PreviewVideoClip && m_timeline) {
+        } else if ((hit.target == ctxmenu::Target::PreviewVideoClip
+                    || hit.target == ctxmenu::Target::PreviewShape
+                    || hit.target == ctxmenu::Target::PreviewExternalGenerator)
+                   && m_timeline) {
             const auto tracks = m_timeline->videoTracks();
             if (hit.videoTrackIndex >= 0 && hit.videoTrackIndex < tracks.size() && tracks[hit.videoTrackIndex]) {
                 const auto clips = tracks[hit.videoTrackIndex]->clips();
                 if (hit.videoClipIndex >= 0 && hit.videoClipIndex < clips.size()) {
                     QString name = clips.at(hit.videoClipIndex).displayName;
                     if (name.size() > 20) name = name.left(20) + QStringLiteral("…");
-                    headerText = QStringLiteral("クリップ: %1 (V%2)").arg(name).arg(hit.videoTrackIndex + 1);
+                    const QString kindTag = (hit.target == ctxmenu::Target::PreviewShape)
+                        ? QStringLiteral("シェイプ")
+                        : (hit.target == ctxmenu::Target::PreviewExternalGenerator
+                               ? QStringLiteral("ジェネレーター")
+                               : QStringLiteral("クリップ"));
+                    headerText = QStringLiteral("%1: %2 (V%3)").arg(kindTag, name).arg(hit.videoTrackIndex + 1);
                 }
             }
         }
@@ -4050,8 +4061,120 @@ void MainWindow::setupUI()
                 } else if (id == QStringLiteral("common.display_settings")) {
                     addDisplaySettingsSubmenu(&menu);
                 }
-            } else if (hit.target == ctxmenu::Target::PreviewVideoClip) {
-                if (id == QStringLiteral("video.split")) {
+            } else if (hit.target == ctxmenu::Target::PreviewVideoClip
+                       || hit.target == ctxmenu::Target::PreviewShape
+                       || hit.target == ctxmenu::Target::PreviewExternalGenerator) {
+                auto openPuppetRigForHit = [this, selectHitVideoClip, hit]() {
+                    if (!m_timeline) return;
+                    selectHitVideoClip();
+                    const auto tracks = m_timeline->videoTracks();
+                    if (hit.videoTrackIndex < 0 || hit.videoTrackIndex >= tracks.size() || !tracks[hit.videoTrackIndex])
+                        return;
+                    const auto &clips = tracks[hit.videoTrackIndex]->clips();
+                    if (hit.videoClipIndex < 0 || hit.videoClipIndex >= clips.size()) return;
+                    double clipStart = 0.0;
+                    for (int i = 0; i <= hit.videoClipIndex; ++i) {
+                        clipStart += qMax(0.0, clips[i].leadInSec);
+                        if (i < hit.videoClipIndex) clipStart += clips[i].effectiveDuration();
+                    }
+                    const double localSec = qMax(0.0, currentPlayheadSeconds() - clipStart);
+                    puppet::PuppetRigDialog dlg(
+                        m_timeline, hit.videoTrackIndex, hit.videoClipIndex, localSec,
+                        [this]() {
+                            refreshSpecialClipPreview();
+                            if (m_player && m_player->glPreview()) m_player->glPreview()->update();
+                        },
+                        this);
+                    if (dlg.exec() == QDialog::Accepted && m_puppetPinTool)
+                        m_puppetPinTool->setToolMode(dlg.selectedToolMode());
+                };
+                if (id == QStringLiteral("video.puppet_edit")
+                    || id == QStringLiteral("shape.puppet_edit")
+                    || id == QStringLiteral("extgen.puppet_edit")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        selectHitVideoClip();
+                        if (m_puppetPinAction) {
+                            if (m_puppetPinAction->isChecked())
+                                stopPuppetPinTool();
+                            m_puppetPinAction->setChecked(true);
+                            emit m_puppetPinAction->triggered(true);
+                        }
+                    });
+                } else if (id == QStringLiteral("video.puppet_rig")
+                           || id == QStringLiteral("shape.puppet_rig")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, openPuppetRigForHit);
+                } else if (id == QStringLiteral("video.grade_versions")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        if (!m_timeline) return;
+                        selectHitVideoClip();
+                        gradeversions::GradeVersionsDialog dlg(m_timeline, hit.videoTrackIndex, hit.videoClipIndex, this);
+                        dlg.exec();
+                    });
+                } else if (id == QStringLiteral("video.creative_fx")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        TimelineTrack *t = selectHitVideoClip();
+                        if (!t || hit.videoClipIndex < 0 || hit.videoClipIndex >= t->clips().size()) return;
+                        const ClipInfo &c = t->clips()[hit.videoClipIndex];
+                        creative::CreativeEffectsDialog dlg(c.uid, c.displayName, this);
+                        if (dlg.exec() == QDialog::Accepted) refreshSpecialClipPreview();
+                    });
+                } else if (id == QStringLiteral("shape.modifiers")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        TimelineTrack *t = selectHitVideoClip();
+                        if (!t || t->isLocked() || hit.videoClipIndex < 0 || hit.videoClipIndex >= t->clips().size())
+                            return;
+                        if (t->clips()[hit.videoClipIndex].shapes.isEmpty()) return;
+                        const ShapeModifiers original = t->clips()[hit.videoClipIndex].shapes.first().modifiers;
+                        ShapeModifierDialog dialog(original, this);
+                        bool changed = false;
+                        connect(&dialog, &ShapeModifierDialog::modifiersChanged, this, [&]() {
+                            changed = true;
+                            m_timeline->setClipShapeModifiers(hit.videoTrackIndex, hit.videoClipIndex, dialog.modifiers(), false);
+                        });
+                        const bool accepted = dialog.exec() == QDialog::Accepted;
+                        const ShapeModifiers finalValue = dialog.modifiers();
+                        if (changed)
+                            m_timeline->setClipShapeModifiers(hit.videoTrackIndex, hit.videoClipIndex, original, false);
+                        if (accepted && changed && finalValue.toJson() != original.toJson())
+                            m_timeline->setClipShapeModifiers(hit.videoTrackIndex, hit.videoClipIndex, finalValue, true);
+                    });
+                } else if (id == QStringLiteral("extgen.config")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        TimelineTrack *t = selectHitVideoClip();
+                        if (!t || t->isLocked() || hit.videoClipIndex < 0 || hit.videoClipIndex >= t->clips().size())
+                            return;
+                        auto clips = t->clips();
+                        const extgen::GeneratorSpec cur = extgen::parseGeneratorUri(clips[hit.videoClipIndex].filePath);
+                        extgen::ExternalGeneratorDialog dlg(cur, clips[hit.videoClipIndex].duration, this);
+                        if (dlg.exec() != QDialog::Accepted) return;
+                        clips[hit.videoClipIndex].filePath = extgen::buildGeneratorUri(dlg.spec());
+                        clips[hit.videoClipIndex].duration = dlg.durationSec();
+                        clips[hit.videoClipIndex].outPoint = dlg.durationSec();
+                        t->setClips(clips);
+                        m_timeline->saveUndoState(QStringLiteral("外部ジェネレータ設定変更"));
+                        refreshSpecialClipPreview();
+                    });
+                } else if (id == QStringLiteral("extgen.bake")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        TimelineTrack *t = selectHitVideoClip();
+                        if (!t || t->isLocked()) return;
+                        const QString outPath = QFileDialog::getSaveFileName(
+                            this, QStringLiteral("外部ジェネレータを動画にベイク"),
+                            QStringLiteral("baked_generator.mp4"),
+                            QStringLiteral("MP4 Video (*.mp4)"));
+                        if (outPath.isEmpty()) return;
+                        const QSize sz(qMax(1, m_projectConfig.width), qMax(1, m_projectConfig.height));
+                        const extgen::BakeResult res = extgen::bakeExternalGeneratorClip(
+                            m_timeline, hit.videoTrackIndex, hit.videoClipIndex, outPath, sz, 0.0);
+                        if (res.ok) {
+                            statusBar()->showMessage(
+                                QStringLiteral("ベイク完了 (%1 フレーム): %2").arg(res.framesRendered).arg(res.outputPath), 5000);
+                            refreshSpecialClipPreview();
+                        } else {
+                            QMessageBox::warning(this, QStringLiteral("ベイク失敗"), res.error);
+                        }
+                    });
+                } else if (id == QStringLiteral("video.split")) {
                     connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
                         if (!m_timeline) return;
                         selectHitVideoClip();

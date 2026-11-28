@@ -1,7 +1,7 @@
 # doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
 # The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
 # A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.
-README.md:821	ブラシを持つクリップの RenderInPlace
+README.md:822	ブラシを持つクリップの RenderInPlace
 src/AudioExportMix.cpp:211	audioexport::sortedDedupedEnvelope(
 src/AudioExportMix.cpp:223	audio::clampClipGain(point.gain)
 src/AudioExportMix.cpp:237	audioexport::mergeDuckingEnvelope(
@@ -19,15 +19,15 @@ src/GLPreview.cpp:1259	if (m_brushAnimation && !cameraBaked && !specialComposite
 src/GLPreview.cpp:159	clipanim::layer3DAt(clip, clipLocalSeconds)
 src/GLPreview.cpp:2255	m_projectCameraFrame = tlrender::renderFrameAt(
 src/GLPreview.cpp:2998	!m_solvePointOverlay.isEmpty()
-src/MainWindow.cpp:13169	400% = max
-src/MainWindow.cpp:16831	MainWindow::createNullAtSolvePoint(int index)
-src/MainWindow.cpp:17724-17727	applied.poses.cbegin(), applied.poses.cend()
-src/MainWindow.cpp:17739-17747	3D カメラ解析を適用できませんでした
-src/MainWindow.cpp:9545	preview/text3dProxyThreshold
-src/MainWindow.cpp:9949	active.layer.zOrder = trackIdx;
-src/MainWindow.cpp:9950	active.layer.layer3D = clipanim::layer3DAt(
-src/MainWindow.cpp:9992	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
-src/MainWindow.cpp:10033-10040	if (!hasTrackMatteLayer)
+src/MainWindow.cpp:13292	400% = max
+src/MainWindow.cpp:16954	MainWindow::createNullAtSolvePoint(int index)
+src/MainWindow.cpp:17848-17851	applied.poses.cbegin(), applied.poses.cend()
+src/MainWindow.cpp:17868-17876	3D カメラ解析を適用できませんでした
+src/MainWindow.cpp:9668	preview/text3dProxyThreshold
+src/MainWindow.cpp:10072	active.layer.zOrder = trackIdx;
+src/MainWindow.cpp:10073	active.layer.layer3D = clipanim::layer3DAt(
+src/MainWindow.cpp:10115	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
+src/MainWindow.cpp:10162-10169	if (!hasTrackMatteLayer)
 src/PlanarTrackerDialog.cpp:920	m_cameraFovWarning->setText(
 src/ProjectFile.cpp:1706	clip.dynamicTimeOffsetSec != 0.0
 src/RenderInPlace.cpp:27-29	The brush (brushData, brush_progress) is drawn

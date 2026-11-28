@@ -1,5 +1,6 @@
 #include "ContextMenuOrder.h"
 
+#include "ExternalGenerator.h"
 #include "Timeline.h"
 
 #include <QAbstractItemView>
@@ -54,10 +55,14 @@ double probeAudioDurationSec(const QString &path)
 QString targetKey(Target target)
 {
     switch (target) {
-    case Target::PreviewText:       return QStringLiteral("preview_text");
-    case Target::PreviewVideoClip:  return QStringLiteral("preview_video");
-    case Target::PreviewBackground: return QStringLiteral("preview_background");
-    case Target::TimelineAudioClip: return QStringLiteral("timeline_audio");
+    case Target::PreviewText:              return QStringLiteral("preview_text");
+    case Target::PreviewVideoClip:         return QStringLiteral("preview_video");
+    case Target::PreviewBackground:        return QStringLiteral("preview_background");
+    case Target::TimelineAudioClip:        return QStringLiteral("timeline_audio");
+    case Target::PreviewShape:             return QStringLiteral("preview_shape");
+    case Target::PreviewExternalGenerator: return QStringLiteral("preview_extgen");
+    case Target::TimelineVideoClip:        return QStringLiteral("timeline_video");
+    case Target::TimelineGap:              return QStringLiteral("timeline_gap");
     }
     return QStringLiteral("preview_background");
 }
@@ -65,10 +70,14 @@ QString targetKey(Target target)
 QString targetDisplayName(Target target)
 {
     switch (target) {
-    case Target::PreviewText:       return QStringLiteral("プレビュー: テキスト");
-    case Target::PreviewVideoClip:  return QStringLiteral("プレビュー: 映像クリップ");
-    case Target::PreviewBackground: return QStringLiteral("プレビュー: 背景");
-    case Target::TimelineAudioClip: return QStringLiteral("タイムライン: 音声クリップ");
+    case Target::PreviewText:              return QStringLiteral("プレビュー: テキスト");
+    case Target::PreviewVideoClip:         return QStringLiteral("プレビュー: 映像クリップ");
+    case Target::PreviewShape:             return QStringLiteral("プレビュー: シェイプ");
+    case Target::PreviewExternalGenerator: return QStringLiteral("プレビュー: 外部ジェネレーター (Lottie/MOGRT)");
+    case Target::PreviewBackground:        return QStringLiteral("プレビュー: 背景");
+    case Target::TimelineVideoClip:        return QStringLiteral("タイムライン: 映像クリップ");
+    case Target::TimelineAudioClip:        return QStringLiteral("タイムライン: 音声クリップ");
+    case Target::TimelineGap:              return QStringLiteral("タイムライン: 空白 / ギャップ");
     }
     return QStringLiteral("プレビュー: 背景");
 }
@@ -78,8 +87,12 @@ QVector<Target> allTargets()
     return {
         Target::PreviewText,
         Target::PreviewVideoClip,
+        Target::PreviewShape,
+        Target::PreviewExternalGenerator,
         Target::PreviewBackground,
-        Target::TimelineAudioClip
+        Target::TimelineVideoClip,
+        Target::TimelineAudioClip,
+        Target::TimelineGap
     };
 }
 
@@ -103,14 +116,43 @@ QVector<ActionDef> defaultActionsFor(Target target)
             { QStringLiteral("video.split"),             QStringLiteral("再生ヘッドで分割"),            true, false },
             { QStringLiteral("video.duplicate"),         QStringLiteral("複製"),                        true, false },
             { QStringLiteral("video.delete"),            QStringLiteral("削除"),                        true, true  },
+            { QStringLiteral("video.puppet_edit"),       QStringLiteral("パペットピンを編集 (ARAP)"),   true, false },
+            { QStringLiteral("video.puppet_rig"),        QStringLiteral("パペット設定 (メッシュ/キー/揺れ)…"), true, true },
             { QStringLiteral("video.speed"),             QStringLiteral("速度を変更…"),                 true, false },
             { QStringLiteral("video.speed_ramp"),        QStringLiteral("スピードランプ…"),             true, false },
             { QStringLiteral("video.reset_transform"),   QStringLiteral("変形をリセット"),              true, true  },
             { QStringLiteral("video.effects"),           QStringLiteral("エフェクトパネルを開く"),      true, false },
             { QStringLiteral("video.color"),             QStringLiteral("カラー調整を開く"),            true, false },
+            { QStringLiteral("video.grade_versions"),    QStringLiteral("カラーグレード・バージョン管理…"), true, false },
+            { QStringLiteral("video.creative_fx"),       QStringLiteral("ハレーション / ポスタライズ / 3D 被写界深度…"), true, true },
             { QStringLiteral("video.sns_fit"),           QStringLiteral("SNS フィット"),                true, true  },
             { QStringLiteral("video.silence_cut"),       QStringLiteral("無音を自動カット…"),           true, false },
             { QStringLiteral("video.beat_markers"),      QStringLiteral("ビートでマーカー…"),           true, true  },
+            { QStringLiteral("common.display_settings"), QStringLiteral("表示設定"),                    true, false },
+        };
+    case Target::PreviewShape:
+        return {
+            { QStringLiteral("shape.modifiers"),         QStringLiteral("シェイプモディファイア…"),     true, true  },
+            { QStringLiteral("shape.puppet_edit"),       QStringLiteral("パペットピンを編集 (ARAP)"),   true, false },
+            { QStringLiteral("shape.puppet_rig"),        QStringLiteral("パペット設定 (メッシュ/キー/揺れ)…"), true, true },
+            { QStringLiteral("video.split"),             QStringLiteral("再生ヘッドで分割"),            true, false },
+            { QStringLiteral("video.duplicate"),         QStringLiteral("複製"),                        true, false },
+            { QStringLiteral("video.delete"),            QStringLiteral("削除"),                        true, true  },
+            { QStringLiteral("video.reset_transform"),   QStringLiteral("変形をリセット"),              true, true  },
+            { QStringLiteral("video.effects"),           QStringLiteral("エフェクトパネルを開く"),      true, false },
+            { QStringLiteral("video.color"),             QStringLiteral("カラー調整を開く"),            true, true  },
+            { QStringLiteral("common.display_settings"), QStringLiteral("表示設定"),                    true, false },
+        };
+    case Target::PreviewExternalGenerator:
+        return {
+            { QStringLiteral("extgen.config"),           QStringLiteral("外部ジェネレータ設定 (Lottie/MOGRT/HTML)…"), true, false },
+            { QStringLiteral("extgen.bake"),             QStringLiteral("動画 (MP4) にベイク…"),        true, true  },
+            { QStringLiteral("extgen.puppet_edit"),      QStringLiteral("パペットピンを編集 (ARAP)"),   true, true  },
+            { QStringLiteral("video.split"),             QStringLiteral("再生ヘッドで分割"),            true, false },
+            { QStringLiteral("video.duplicate"),         QStringLiteral("複製"),                        true, false },
+            { QStringLiteral("video.delete"),            QStringLiteral("削除"),                        true, true  },
+            { QStringLiteral("video.reset_transform"),   QStringLiteral("変形をリセット"),              true, true  },
+            { QStringLiteral("video.effects"),           QStringLiteral("エフェクトパネルを開く"),      true, true  },
             { QStringLiteral("common.display_settings"), QStringLiteral("表示設定"),                    true, false },
         };
     case Target::PreviewBackground:
@@ -122,6 +164,33 @@ QVector<ActionDef> defaultActionsFor(Target target)
             { QStringLiteral("common.monitoring"),          QStringLiteral("モニタリング (露出/フォーカス)"), true, false },
             { QStringLiteral("common.onion_skin"),          QStringLiteral("オニオンスキン"),               true, false },
             { QStringLiteral("common.preview_quality"),     QStringLiteral("再生プレビュー品質"),           true, false },
+        };
+    case Target::TimelineVideoClip:
+        return {
+            { QStringLiteral("tvideo.cut"),              QStringLiteral("カット"),                      true, false },
+            { QStringLiteral("tvideo.copy"),             QStringLiteral("コピー"),                      true, false },
+            { QStringLiteral("tvideo.delete"),           QStringLiteral("削除"),                        true, false },
+            { QStringLiteral("tvideo.replace"),          QStringLiteral("置き換え"),                    true, false },
+            { QStringLiteral("tvideo.freeze_frame"),     QStringLiteral("フリーズフレームを追加"),      true, true  },
+            { QStringLiteral("tvideo.puppet_rig"),       QStringLiteral("パペット設定 (ARAP メッシュ/キー/揺れ)…"), true, false },
+            { QStringLiteral("tvideo.shape_or_extgen"),  QStringLiteral("シェイプ / 外部ジェネレータ設定"), true, false },
+            { QStringLiteral("tvideo.render_in_place"),  QStringLiteral("効果を焼き込んで差し替え / 元に戻す"), true, true },
+            { QStringLiteral("tvideo.transitions"),      QStringLiteral("トランジション"),              true, true  },
+            { QStringLiteral("tvideo.effects"),          QStringLiteral("ビデオエフェクト…"),           true, false },
+            { QStringLiteral("tvideo.color"),            QStringLiteral("色補正 / グレーディング…"),    true, false },
+            { QStringLiteral("tvideo.grade_versions"),   QStringLiteral("カラーグレード・バージョン管理…"), true, false },
+            { QStringLiteral("tvideo.creative_fx"),      QStringLiteral("ハレーション / ポスタライズ / 3D 被写界深度…"), true, true },
+            { QStringLiteral("tvideo.sns_fit"),          QStringLiteral("SNS フィット"),                true, false },
+            { QStringLiteral("tvideo.silence_beat"),     QStringLiteral("無音カット / ビートマーカー / ビート同期カット"), true, true },
+            { QStringLiteral("tvideo.unlink_relink"),    QStringLiteral("同期を切る / 再同期"),         true, false },
+            { QStringLiteral("tvideo.channel_map"),      QStringLiteral("チャンネルマッピング"),        true, true  },
+            { QStringLiteral("tvideo.enabled"),          QStringLiteral("クリップを有効にする"),        true, false },
+            { QStringLiteral("tvideo.label"),            QStringLiteral("ラベルカラー"),                true, false },
+            { QStringLiteral("tvideo.role"),             QStringLiteral("ロールを設定"),                true, true  },
+            { QStringLiteral("tvideo.subclip"),          QStringLiteral("サブクリップとして保存"),      true, false },
+            { QStringLiteral("tvideo.new_sequence"),     QStringLiteral("このクリップから新規シーケンス"), true, false },
+            { QStringLiteral("tvideo.storyline"),        QStringLiteral("主ストーリーライン接続 / 解除"), true, false },
+            { QStringLiteral("tvideo.compositing"),      QStringLiteral("調整レイヤー / ペアレント / ヌル / 自動回転"), true, false },
         };
     case Target::TimelineAudioClip:
         return {
@@ -139,7 +208,18 @@ QVector<ActionDef> defaultActionsFor(Target target)
             { QStringLiteral("audio.label"),             QStringLiteral("ラベルカラー"),                true, true  },
             { QStringLiteral("audio.transitions"),       QStringLiteral("音声トランジション"),          true, false },
             { QStringLiteral("audio.new_sequence"),      QStringLiteral("このクリップから新規シーケンス"), true, true },
-            { QStringLiteral("audio.storyline"),         QStringLiteral("主ストーリーライン接続 / 解除"), true, false },
+            { QStringLiteral("audio.storyline"),         QStringLiteral("主ストーリーライン接続 / 解除"), true, true },
+            { QStringLiteral("audio.pitch_shift"),       QStringLiteral("ピッチシフト / ボイスチェンジャー…"), true, false },
+            { QStringLiteral("audio.role"),              QStringLiteral("ロールを設定"),                true, false },
+        };
+    case Target::TimelineGap:
+        return {
+            { QStringLiteral("gap.close"),               QStringLiteral("ギャップを詰める"),            true, true  },
+            { QStringLiteral("gap.add_marker"),          QStringLiteral("この位置にマーカーを追加…"),   true, false },
+            { QStringLiteral("gap.add_text"),            QStringLiteral("この位置にテキストを追加"),    true, false },
+            { QStringLiteral("gap.add_adjustment"),      QStringLiteral("調整レイヤーを作成"),          true, true  },
+            { QStringLiteral("gap.paste"),               QStringLiteral("クリップを貼り付け"),          true, false },
+            { QStringLiteral("gap.move_playhead"),       QStringLiteral("再生ヘッドをここへ移動"),      true, false },
         };
     }
     return {};
@@ -358,9 +438,15 @@ PreviewHit hitTestPreview(const Timeline *timeline,
                 return a.trackIdx == 0;
             return a.trackIdx > b.trackIdx;
         });
-        result.target = Target::PreviewVideoClip;
         result.videoTrackIndex = hits.first().trackIdx;
         result.videoClipIndex = hits.first().clipIdx;
+        const ClipInfo &hitClip = tracks.at(result.videoTrackIndex)->clips().at(result.videoClipIndex);
+        if (extgen::isExternalGeneratorFilePath(hitClip.filePath))
+            result.target = Target::PreviewExternalGenerator;
+        else if (!hitClip.shapes.isEmpty())
+            result.target = Target::PreviewShape;
+        else
+            result.target = Target::PreviewVideoClip;
     }
 
     return result;
@@ -572,6 +658,30 @@ bool insertAudioClipAtTime(Timeline *timeline,
     }
     timeline->saveUndoState(QStringLiteral("効果音を追加"));
     return true;
+}
+
+bool addMarkerAtTime(Timeline *timeline, double timeSec, const QString &name)
+{
+    if (!timeline) return false;
+    const qint64 usec = static_cast<qint64>(std::llround(qMax(0.0, timeSec) * 1.0e6));
+    return timeline->addMarker(usec, name.isEmpty() ? QStringLiteral("マーカー") : name,
+                               QColor(QStringLiteral("#39c0ff"))) >= 0;
+}
+
+bool addBlankTextAtTime(Timeline *timeline,
+                        double timeSec,
+                        const QString &text,
+                        double durationSec)
+{
+    if (!timeline) return false;
+    EnhancedTextOverlay ov;
+    ov.text = text.isEmpty() ? QStringLiteral("テキスト") : text;
+    ov.x = 0.5;
+    ov.y = 0.5;
+    ov.startTime = qMax(0.0, timeSec);
+    ov.endTime = ov.startTime + qMax(0.2, durationSec);
+    ov.visible = true;
+    return timeline->addTextOverlayToFirstVideoClip(ov);
 }
 
 ContextMenuCustomizeDialog::ContextMenuCustomizeDialog(Target initialTarget,

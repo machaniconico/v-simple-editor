@@ -1,5 +1,7 @@
 #include "../ContextMenuOrder.h"
+#include "../ExternalGenerator.h"
 #include "../GLPreview.h"
+#include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "SelftestGate.h"
 
@@ -375,6 +377,128 @@ int runContextMenuOrderSelftest()
             && committedText == QStringLiteral("Initial");
         rec(8, ok, QStringLiteral("started=%1 committed=%2:%3")
                        .arg(started ? 1 : 0).arg(committedIdx).arg(committedText));
+    }
+
+    // G9 (Wave 33): All 8 targets (including PreviewShape, PreviewExternalGenerator,
+    // TimelineVideoClip, TimelineGap) carry puppet/modern shortcuts with unique IDs.
+    {
+        const auto targets = ctxmenu::allTargets();
+        auto hasId = [](ctxmenu::Target t, const char *id) {
+            for (const auto &d : ctxmenu::defaultActionsFor(t))
+                if (d.id == QLatin1String(id)) return true;
+            return false;
+        };
+        const bool ok = (targets.size() == 8)
+            && hasId(ctxmenu::Target::PreviewVideoClip, "video.puppet_edit")
+            && hasId(ctxmenu::Target::PreviewVideoClip, "video.puppet_rig")
+            && hasId(ctxmenu::Target::PreviewVideoClip, "video.grade_versions")
+            && hasId(ctxmenu::Target::PreviewShape, "shape.modifiers")
+            && hasId(ctxmenu::Target::PreviewShape, "shape.puppet_edit")
+            && hasId(ctxmenu::Target::PreviewExternalGenerator, "extgen.config")
+            && hasId(ctxmenu::Target::PreviewExternalGenerator, "extgen.bake")
+            && hasId(ctxmenu::Target::TimelineVideoClip, "tvideo.puppet_rig")
+            && hasId(ctxmenu::Target::TimelineAudioClip, "audio.pitch_shift")
+            && hasId(ctxmenu::Target::TimelineGap, "gap.close")
+            && hasId(ctxmenu::Target::TimelineGap, "gap.add_marker");
+        rec(9, ok, QStringLiteral("targets=%1").arg(targets.size()));
+    }
+
+    // G10 (Wave 33): hitTestPreview classifies Shape clips as PreviewShape and
+    // External Generator clips as PreviewExternalGenerator while keeping Text priority.
+    {
+        Timeline tl;
+        tl.addVideoTrack(false); // V2
+        ClipInfo shapeClip;
+        shapeClip.displayName = QStringLiteral("Shape Box");
+        shapeClip.duration = 10.0;
+        shapeClip.outPoint = 10.0;
+        Shape rect;
+        rect.type = ShapeType::Rectangle;
+        shapeClip.shapes.append(rect);
+        tl.videoTracks()[0]->addClip(shapeClip);
+
+        ClipInfo extClip;
+        extClip.displayName = QStringLiteral("Lottie Badge");
+        extgen::GeneratorSpec spec;
+        spec.renderer = QStringLiteral("lottie");
+        extClip.filePath = extgen::buildGeneratorUri(spec);
+        extClip.duration = 10.0;
+        extClip.outPoint = 10.0;
+        extClip.videoScale = 0.25;
+        extClip.videoDx = -0.3;
+        extClip.videoDy = -0.3;
+        tl.videoTracks()[1]->addClip(extClip);
+
+        const QRectF lb(100.0, 50.0, 1000.0, 500.0);
+        const auto hExt = ctxmenu::hitTestPreview(&tl, 2.0, lb, QPointF(300.0, 150.0));
+        const auto hShape = ctxmenu::hitTestPreview(&tl, 2.0, lb, QPointF(850.0, 400.0));
+        const bool ok = (hExt.target == ctxmenu::Target::PreviewExternalGenerator
+                         && hExt.videoTrackIndex == 1 && hExt.videoClipIndex == 0)
+            && (hShape.target == ctxmenu::Target::PreviewShape
+                && hShape.videoTrackIndex == 0 && hShape.videoClipIndex == 0);
+        rec(10, ok, QStringLiteral("ext=%1 shape=%2")
+                        .arg(static_cast<int>(hExt.target))
+                        .arg(static_cast<int>(hShape.target)));
+    }
+
+    // G11 (Wave 33): Per-target customization round-trip & dialog support for new targets
+    // (TimelineVideoClip & TimelineGap) without clobbering existing targets.
+    {
+        const QString iniPath = tmpDir.filePath(QStringLiteral("wave33_prefs.ini"));
+        QSettings settings(iniPath, QSettings::IniFormat);
+        const auto vDefs = ctxmenu::defaultActionsFor(ctxmenu::Target::TimelineVideoClip);
+        const auto gDefs = ctxmenu::defaultActionsFor(ctxmenu::Target::TimelineGap);
+
+        ctxmenu::saveLayout(ctxmenu::Target::TimelineVideoClip,
+                            {QStringLiteral("tvideo.puppet_rig"), vDefs[0].id},
+                            {vDefs[1].id}, &settings);
+        ctxmenu::saveLayout(ctxmenu::Target::TimelineGap,
+                            {QStringLiteral("gap.add_marker"), gDefs[0].id},
+                            {}, &settings);
+        settings.sync();
+
+        const auto vLoaded = ctxmenu::loadLayout(ctxmenu::Target::TimelineVideoClip, &settings);
+        const auto gLoaded = ctxmenu::loadLayout(ctxmenu::Target::TimelineGap, &settings);
+        ctxmenu::ContextMenuCustomizeDialog dlg(ctxmenu::Target::TimelineVideoClip, nullptr, &settings);
+        auto *combo = dlg.findChild<QComboBox *>(QStringLiteral("ctxMenuTargetCombo"));
+        const bool ok = (vLoaded[0].id == QStringLiteral("tvideo.puppet_rig"))
+            && (gLoaded[0].id == QStringLiteral("gap.add_marker"))
+            && (combo != nullptr && combo->count() == 8);
+        rec(11, ok, QStringLiteral("vTop=%1 gTop=%2 combo=%3")
+                        .arg(vLoaded[0].id, gLoaded[0].id)
+                        .arg(combo ? combo->count() : -1));
+    }
+
+    // G12 (Wave 33): Timeline gap helpers (addMarkerAtTime exact position/label &
+    // addBlankTextAtTime exact range + 1-step Undo).
+    {
+        Timeline tl;
+        ClipInfo clip;
+        clip.filePath = QStringLiteral("v1.mp4");
+        clip.duration = 8.0;
+        clip.outPoint = 8.0;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, {}, 0.0, -1.0, -1.0, 100);
+
+        const int mkBefore = tl.markers().size();
+        const bool mkAdded = ctxmenu::addMarkerAtTime(&tl, 3.25, QStringLiteral("章見出し"));
+        const int mkAfter = tl.markers().size();
+        const bool mkMatch = mkAfter == mkBefore + 1
+            && tl.markers().last().timelineUs == 3250000
+            && tl.markers().last().label == QStringLiteral("章見出し");
+
+        const int txBefore = tl.timelineTextOverlays().size();
+        const bool txAdded = ctxmenu::addBlankTextAtTime(&tl, 1.5, QStringLiteral("字幕テスト"), 2.0);
+        const int txAfter = tl.timelineTextOverlays().size();
+        const bool txMatch = txAfter == txBefore + 1
+            && std::abs(tl.timelineTextOverlays().last().startTime - 1.5) < 1e-6
+            && std::abs(tl.timelineTextOverlays().last().endTime - 3.5) < 1e-6;
+        tl.undo();
+        const int txUndo = tl.timelineTextOverlays().size();
+
+        const bool ok = mkAdded && mkMatch && txAdded && txMatch && (txUndo == txBefore);
+        rec(12, ok, QStringLiteral("mk=%1->%2 match=%3 tx=%4->%5->%6")
+                        .arg(mkBefore).arg(mkAfter).arg(mkMatch ? 1 : 0)
+                        .arg(txBefore).arg(txAfter).arg(txUndo));
     }
 
     return tally.finish("context-menu-order");
