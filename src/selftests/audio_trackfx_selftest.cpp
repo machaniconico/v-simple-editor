@@ -1445,5 +1445,251 @@ int runAudioTrackFxSelftest()
             && restored.eq.lowMid.gainDb == -10.0 && restored.deesser.enabled
             && pcmRestored == pcmA && listenOk);
     }
+    // G37 / G39 (US-1010): the DeEsser listen monitor is live state. A
+    // structural undo / redo moves it with the track it belongs to, never by
+    // track index. A1 is empty, A2 holds a clip; both have the de-esser on.
+    // Detects the regression to restoring the snapshot's listen (stale after a
+    // later toggle off, dropped after a later toggle on) and, in G39 (b), to
+    // copying listen by index (A2's monitor lands on the restored A1).
+    bool listenControlOk = false;
+    bool deleteCycleOk = false;
+    {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        Timeline *timeline = window.m_timeline;
+        if (timeline)
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}, QVector<ClipInfo>{audioClip}},
+                0.0, -1.0, -1.0, 100);
+        if (mixer && timeline) window.openDeEsserPanel();
+        QWidget *dePanel = window.m_deesserDock ? window.m_deesserDock->widget() : nullptr;
+        auto *deEnabled = dePanel ? dePanel->findChild<QCheckBox *>("deesser_enabled") : nullptr;
+        auto *deListen = dePanel ? dePanel->findChild<QCheckBox *>("deesser_listen") : nullptr;
+        auto *deTarget = dePanel ? dePanel->findChild<QComboBox *>("deesser_target") : nullptr;
+        const bool ready = mixer && timeline && deEnabled && deListen && deTarget;
+        const auto selectTrack = [&](int track) {
+            const int index = deTarget->findData(track);
+            if (index >= 0) deTarget->setCurrentIndex(index);
+            return index >= 0;
+        };
+        // The dock's listen checkbox for one audio track (no undo entry).
+        const auto setListen = [&](int track, bool on) {
+            if (!selectTrack(track)) return false;
+            if (deListen->isChecked() != on) deListen->setChecked(on);
+            return mixer->trackChain(track).deesser.listen == on;
+        };
+        const auto listenOf = [&](int track) { return mixer->trackChain(track).deesser.listen; };
+        // Prints the per-track listen state and compares it with `expected`.
+        const auto expect = [&](const char *step, const std::vector<int> &expected) {
+            bool ok = timeline->audioTrackCount() == static_cast<int>(expected.size());
+            std::string actual, wanted;
+            for (int i = 0; i < timeline->audioTrackCount(); ++i)
+                actual += " idx" + std::to_string(i) + "=" + std::to_string(listenOf(i));
+            for (size_t i = 0; i < expected.size(); ++i) {
+                wanted += " idx" + std::to_string(i) + "=" + std::to_string(expected[i]);
+                ok = ok && i < static_cast<size_t>(timeline->audioTrackCount())
+                    && listenOf(static_cast<int>(i)) == (expected[i] != 0);
+            }
+            std::fprintf(stderr, "audio-trackfx G37 %s: tracks=%d listen%s (expected%s) %s\n",
+                step, timeline->audioTrackCount(), actual.c_str(), wanted.c_str(),
+                ok ? "ok" : "MISMATCH");
+            return ok;
+        };
+        bool setupOk = false, clipOk = false, cycleOk = false;
+        bool a1AfterUndo[2] = {true, true};
+        bool a2AfterUndo[2] = {false, false};
+        if (ready) {
+            // Both tracks carry a de-esser chain, so a listen copied by index
+            // has a restored A1 chain to land on.
+            for (int track : {0, 1}) {
+                setupOk = selectTrack(track) && !deEnabled->isChecked();
+                if (setupOk) deEnabled->setChecked(true);
+                if (!setupOk) break;
+            }
+            setupOk = setupOk && mixer->trackChain(0).deesser.enabled
+                && mixer->trackChain(1).deesser.enabled && setListen(1, true);
+
+            // G39 (a): a clip delete is no structural edit; its undo rewrites
+            // the drifted de-esser through restoreAudioFxUndoState and keeps listen.
+            const double thresholdBefore = mixer->trackChain(1).deesser.thresholdDb;
+            QString editError;
+            const bool deleted = timeline->deleteClipByIndex(true, 1, 0, false, &editError);
+            auto drift = mixer->trackChain(1);
+            drift.deesser.thresholdDb = thresholdBefore - 12.0;
+            mixer->setTrackChain(1, drift);
+            timeline->undo();
+            const double thresholdUndo = mixer->trackChain(1).deesser.thresholdDb;
+            const int clipsUndo = timeline->audioTrackCount() > 1
+                ? int(timeline->audioTracks()[1]->clips().size()) : -1;
+            std::fprintf(stderr,
+                "audio-trackfx G39 (a) clip delete: ok=%d error=%s; drifted threshold %g; after "
+                "undo tracks=%d A2 clips=%d threshold=%g (snapshot %g) listen idx0=%d idx1=%d\n",
+                deleted, editError.toUtf8().constData(), drift.deesser.thresholdDb,
+                timeline->audioTrackCount(), clipsUndo, thresholdUndo, thresholdBefore,
+                listenOf(0), listenOf(1));
+            clipOk = deleted && timeline->audioTrackCount() == 2 && clipsUndo == 1
+                && thresholdUndo == thresholdBefore && !listenOf(0) && listenOf(1);
+
+            // Cycle 1: listen on before the track delete (it is in the snapshot).
+            QString removeError;
+            bool removed = timeline->removeTrack(true, 0, &removeError);
+            cycleOk = removed && expect("cycle 1 delete A1", {1});
+            timeline->undo();
+            a1AfterUndo[0] = listenOf(0);
+            a2AfterUndo[0] = listenOf(1);
+            cycleOk = expect("cycle 1 undo", {0, 1}) && cycleOk;
+            timeline->redo();
+            cycleOk = expect("cycle 1 redo", {1}) && cycleOk;
+            // Listen off after the snapshot: the undo must not bring back the
+            // snapshot's listen.
+            cycleOk = setListen(0, false) && cycleOk;
+            timeline->undo();
+            cycleOk = expect("listen off, then undo", {0, 0}) && cycleOk;
+
+            // Cycle 2: listen on only after the track delete (no snapshot has it).
+            cycleOk = setListen(1, false) && cycleOk;
+            removed =timeline->removeTrack(true, 0, &removeError) && removed;
+            cycleOk = removed && expect("cycle 2 delete A1", {0}) && cycleOk;
+            cycleOk = setListen(0, true) && cycleOk;
+            timeline->undo();
+            a1AfterUndo[1] = listenOf(0);
+            a2AfterUndo[1] = listenOf(1);
+            cycleOk = expect("cycle 2 listen on, then undo", {0, 1}) && cycleOk;
+            timeline->redo();
+            cycleOk = expect("cycle 2 redo", {1}) && cycleOk;
+            std::fprintf(stderr, "audio-trackfx G37: setup=%d removeTrack ok=%d error=%s\n",
+                         setupOk, removed, removeError.toUtf8().constData());
+        } else {
+            std::fprintf(stderr, "audio-trackfx G37: de-esser dock controls not found\n");
+        }
+        deleteCycleOk = setupOk && cycleOk;
+        // G39 (b): the live listen of A2 (index 0 while A1 is deleted) must not
+        // land on the restored A1 at index 0.
+        std::fprintf(stderr,
+            "audio-trackfx G39 (b) live idx0 (A2) -> restored idx1: cycle 1 A1 idx0=%d A2 idx1=%d; "
+            "cycle 2 A1 idx0=%d A2 idx1=%d\n", a1AfterUndo[0], a2AfterUndo[0],
+            a1AfterUndo[1], a2AfterUndo[1]);
+        listenControlOk = setupOk && clipOk && !a1AfterUndo[0] && !a1AfterUndo[1];
+    }
+    // G37 (US-1010, add / move): the listen of an added A2 follows it through
+    // add -> undo -> redo, never stays on the vacated index or reaches a track
+    // added later, and a move undo / redo keeps it on the moved track although
+    // no snapshot holds a chain for it (listen set with setTrackChain, no undo
+    // entry). Detects an unused index sharing the identity of an undone track
+    // (listen off after redo) and listen carried only into snapshot chains.
+    bool addCycleOk = false;
+    {
+        MainWindow window;
+        auto *mixer = window.m_player ? window.m_player->audioMixer() : nullptr;
+        Timeline *timeline = window.m_timeline;
+        if (mixer && timeline) {
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{},
+                QVector<QVector<ClipInfo>>{QVector<ClipInfo>{audioClip}}, 0.0, -1.0, -1.0, 100);
+            const auto listenOf = [&](int track) { return mixer->trackChain(track).deesser.listen; };
+            const auto listenOn = [&](int track) {
+                auto chain = mixer->trackChain(track);
+                chain.deesser.listen = true;
+                mixer->setTrackChain(track, chain);
+            };
+            // Checks every mixer index: indices past the tracks must stay off.
+            const auto expect = [&](const char *step, const std::vector<int> &expected) {
+                bool ok = timeline->audioTrackCount() == static_cast<int>(expected.size());
+                std::string actual, wanted;
+                for (int i = 0; i < AudioMixer::kMaxAudioTracks; ++i) {
+                    const bool want = i < static_cast<int>(expected.size()) && expected[i] != 0;
+                    if (i < timeline->audioTrackCount() || listenOf(i))
+                        actual += " idx" + std::to_string(i) + "=" + std::to_string(listenOf(i));
+                    if (i < static_cast<int>(expected.size()))
+                        wanted += " idx" + std::to_string(i) + "=" + std::to_string(want);
+                    ok = ok && listenOf(i) == want;
+                }
+                std::fprintf(stderr, "audio-trackfx G37 %s: tracks=%d listen%s (expected%s) %s\n",
+                    step, timeline->audioTrackCount(), actual.c_str(), wanted.c_str(),
+                    ok ? "ok" : "MISMATCH");
+                return ok;
+            };
+            addCycleOk = expect("add: one track", {0});
+            timeline->addAudioTrack(true);
+            listenOn(1);
+            addCycleOk = expect("add A2, listen on", {0, 1}) && addCycleOk;
+            timeline->undo();
+            addCycleOk = expect("add undo", {0}) && addCycleOk;
+            timeline->redo();
+            addCycleOk = expect("add redo", {0, 1}) && addCycleOk;
+            timeline->undo();
+            addCycleOk = expect("add undo again", {0}) && addCycleOk;
+            timeline->addAudioTrack(true);
+            addCycleOk = expect("fresh add, no redo", {0, 0}) && addCycleOk;
+            QString moveError;
+            const bool moved = timeline->moveTrack(true, 1, 0, &moveError);
+            listenOn(0);
+            addCycleOk = expect("move A2 up, listen on", {1, 0}) && moved && addCycleOk;
+            timeline->undo();
+            addCycleOk = expect("move undo", {0, 1}) && addCycleOk;
+            timeline->redo();
+            addCycleOk = expect("move redo", {1, 0}) && addCycleOk;
+            std::fprintf(stderr, "audio-trackfx G37 add / move: moveTrack ok=%d error=%s\n",
+                         moved, moveError.toUtf8().constData());
+        } else {
+            std::fprintf(stderr, "audio-trackfx G37 add / move: mixer or timeline missing\n");
+        }
+    }
+    gate(37, deleteCycleOk && addCycleOk);
+    {
+        // G38 (US-1010): setMasterChain writes the master EQ and DeEsser in one
+        // locked section (one applyMasterChainLocked call); the two-setter path
+        // (negative control) takes two and reaches the same output.
+        AudioMixer::EqSettings eq;
+        eq.lowMid = {250.0, -10.0, 1.0, true};
+        trackfx::DeEsserSettings de;
+        de.enabled = true;
+        de.thresholdDb = -30.0;
+        const auto calls = [](AudioMixer *m) { return m->applyMasterChainLockedCallCountForTest(); };
+        auto one = std::make_unique<AudioMixer>();
+        auto two = std::make_unique<AudioMixer>();
+        auto eqOnly = std::make_unique<AudioMixer>();
+        auto deOnly = std::make_unique<AudioMixer>();
+        const auto pcmDefault = masterPcm(one.get());
+        quint64 before = calls(one.get());
+        one->setMasterChain(eq, true, de);
+        const quint64 oneCalls = calls(one.get()) - before;
+        const auto chain = one->masterChain();
+        const auto pcmOne = masterPcm(one.get());
+        before = calls(two.get());
+        two->setMasterEq(eq, true);
+        two->setMasterDeEsser(de);
+        const quint64 twoCalls = calls(two.get()) - before;
+        const auto pcmTwo = masterPcm(two.get());
+        eqOnly->setMasterEq(eq, true);
+        const auto pcmEqOnly = masterPcm(eqOnly.get());
+        deOnly->setMasterDeEsser(de);
+        const auto pcmDeOnly = masterPcm(deOnly.get());
+        // EQ disabled in the same call: only the DeEsser acts.
+        before = calls(one.get());
+        one->setMasterChain(eq, false, de);
+        const quint64 offCalls = calls(one.get()) - before;
+        const auto chainOff = one->masterChain();
+        const auto pcmOff = masterPcm(one.get());
+        std::fprintf(stderr,
+            "audio-trackfx G38: setMasterChain calls=%llu (two setters %llu); chain eqEnabled=%d "
+            "lowMid=%g deesser enabled=%d threshold=%g; pcm==two setters=%d (rms %.1f), vs default "
+            "rms %.1f, vs eq only rms %.1f, vs deesser only rms %.1f\n",
+            static_cast<unsigned long long>(oneCalls), static_cast<unsigned long long>(twoCalls),
+            chain.eqEnabled, chain.eq.lowMid.gainDb, chain.deesser.enabled,
+            chain.deesser.thresholdDb, pcmOne == pcmTwo, rmsDiff(pcmOne, pcmTwo),
+            rmsDiff(pcmOne, pcmDefault), rmsDiff(pcmOne, pcmEqOnly), rmsDiff(pcmOne, pcmDeOnly));
+        std::fprintf(stderr,
+            "audio-trackfx G38 eq off: calls=%llu eqEnabled=%d lowMid=%g deesser=%d pcm==deesser "
+            "only=%d (rms %.1f)\n", static_cast<unsigned long long>(offCalls), chainOff.eqEnabled,
+            chainOff.eq.lowMid.gainDb, chainOff.deesser.enabled, pcmOff == pcmDeOnly,
+            rmsDiff(pcmOff, pcmDeOnly));
+        gate(38, oneCalls == 1 && twoCalls == 2 && chain.eqEnabled
+            && chain.eq.lowMid.gainDb == -10.0 && chain.deesser.enabled
+            && chain.deesser.thresholdDb == -30.0 && pcmOne == pcmTwo && pcmOne != pcmDefault
+            && pcmOne != pcmEqOnly && pcmOne != pcmDeOnly && pcmEqOnly != pcmDefault
+            && pcmDeOnly != pcmDefault && offCalls == 1 && !chainOff.eqEnabled
+            && chainOff.deesser.enabled && pcmOff == pcmDeOnly);
+    }
+    gate(39, listenControlOk);
     return tally.finish("audio-trackfx");
 }

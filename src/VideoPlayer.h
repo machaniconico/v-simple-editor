@@ -349,6 +349,10 @@ public:
         int sourceClipIndex = -1;
         QString parentClipId;
         int parentSourceIndex = -1;
+        bool parentHit = false;        // US-1005: parentLayerAt result used
+        bool parentHitDecodable = false;
+        double parentLocalSeconds = 0.0;
+        double parentSourceSeconds = 0.0;
         clipgeom::ClipTransform localTransform;
         clipgeom::ClipTransform effectiveTransform;
     };
@@ -588,6 +592,13 @@ public:
         int matteSourceIndex = -1;
         QString parentClipId;
         int parentSourceIndex = -1;
+        // US-1005: tlrender::parentLayerAt(parent candidate) that decided the
+        // adoption in resolveDecodedLayerParentSources (parentHit false =
+        // nullopt / not evaluated). Adopted only when hit && decodable.
+        bool parentHit = false;
+        bool parentHitDecodable = false;
+        double parentLocalSeconds = 0.0;
+        double parentSourceSeconds = 0.0;
     };
 
 private:

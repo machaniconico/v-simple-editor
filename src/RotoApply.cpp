@@ -1,6 +1,7 @@
 #include "RotoApply.h"
 
 #include "Rotoscope.h"
+#include "VideoEffect.h"
 #include <QDateTime>
 #include <QFileInfo>
 #include <QHash>
@@ -20,6 +21,16 @@ std::atomic<quint64> gSourceFrameIndexForCalls{0};
 std::atomic<quint64> gRenderApplyCalls{0};
 std::atomic<int> gLastRenderSourceFrameIndex{-1};
 std::atomic<quint64> gProbeVideoStreamFpsOpens{0};
+std::atomic<quint64> gClampAlphaCalls{0};
+
+// The image in a format whose alpha is byte 3 of every 4-byte pixel.
+QImage withByteAlpha(const QImage &image)
+{
+    if (image.format() == QImage::Format_RGBA8888
+        || image.format() == QImage::Format_RGBA8888_Premultiplied)
+        return image;
+    return image.convertToFormat(QImage::Format_RGBA8888);
+}
 } // namespace
 
 QImage applyEntryToFrame(const RotoClipEntry &entry, const QImage &frame,
@@ -153,6 +164,75 @@ double clipEffectiveSourceFps(double probedFps, double fallbackFps)
 quint64 sourceFrameIndexForCallCount()
 {
     return gSourceFrameIndexForCalls.load(std::memory_order_relaxed);
+}
+
+bool hasTranslucentPixel(const QImage &image)
+{
+    if (image.isNull() || !image.hasAlphaChannel())
+        return false;
+    const QImage rgba = withByteAlpha(image);
+    for (int y = 0; y < rgba.height(); ++y) {
+        const uchar *line = rgba.constScanLine(y);
+        for (int x = 0; x < rgba.width(); ++x) {
+            if (line[4 * x + 3] != 255)
+                return true;
+        }
+    }
+    return false;
+}
+
+QImage clampAlphaToInput(const QImage &input, QImage output)
+{
+    if (output.isNull() || input.size() != output.size() || !input.hasAlphaChannel())
+        return output;
+    const QImage in = withByteAlpha(input);
+    if (!hasTranslucentPixel(in))
+        return output;
+
+    gClampAlphaCalls.fetch_add(1, std::memory_order_relaxed);
+    if (output.format() != QImage::Format_RGBA8888)
+        output = output.convertToFormat(QImage::Format_RGBA8888);
+    for (int y = 0; y < output.height(); ++y) {
+        uchar *dst = output.scanLine(y);
+        const uchar *src = in.constScanLine(y);
+        for (int x = 0; x < output.width(); ++x)
+            dst[4 * x + 3] = std::min(dst[4 * x + 3], src[4 * x + 3]);
+    }
+    return output;
+}
+
+quint64 clampAlphaCallCountForTest()
+{
+    return gClampAlphaCalls.load(std::memory_order_relaxed);
+}
+
+bool effectMovesPixels(VideoEffectType type)
+{
+    switch (type) {
+    case VideoEffectType::DisplacementMap:
+    case VideoEffectType::WaveWarp:
+    case VideoEffectType::Ripple:
+    case VideoEffectType::Bulge:
+    case VideoEffectType::Twirl:
+    case VideoEffectType::Mirror:
+    case VideoEffectType::PolarCoordinates:
+    case VideoEffectType::MotionTile:
+    case VideoEffectType::CornerPinSimple:
+    case VideoEffectType::Echo:
+    case VideoEffectType::LensDistortion:
+    case VideoEffectType::RollingShutterRepair:
+    case VideoEffectType::Flip:
+    case VideoEffectType::RGBSplit:
+    case VideoEffectType::GlitchVHS:
+    case VideoEffectType::WarpWave:
+    case VideoEffectType::WarpRipple:
+    case VideoEffectType::WarpSpherize:
+    case VideoEffectType::WarpFisheye:
+    case VideoEffectType::WarpPinch:
+        return true;
+    default:
+        return false;
+    }
 }
 
 } // namespace roto

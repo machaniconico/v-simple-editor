@@ -1066,9 +1066,9 @@ int runBatchExportE2ESelftest()
                 && failState == batchexport::TaskState::Failed
                 && failD.tempsExisted && !anyExists(failD.temps);
             std::fprintf(stderr,
-                "[batchexport-e2e] G16 values: failState=%d message=%s temps=%s "
+                "[batchexport-e2e] G16 values: fixture=%d finished=%d failState=%d message=%s temps=%s "
                 "existedAtDispatch=%d existNow=%d\n",
-                static_cast<int>(failState), qPrintable(finalTasks.value(failId).message),
+                fixture, finished, static_cast<int>(failState), qPrintable(finalTasks.value(failId).message),
                 qPrintable(failD.temps.join('|')), failD.tempsExisted, anyExists(failD.temps));
             check(16, "tempFiles removed after a failed task", g16);
         }

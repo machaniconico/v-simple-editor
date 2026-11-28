@@ -1422,6 +1422,9 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         // chance to refill before this stall budget runs out.
         if (m_mixer->m_decodeRunner) m_mixer->m_decodeRunner->wake();
         if (stalls < kMaxStallCallbacks) {
+            // The sink still receives this zeroed block; feed it to the master tap
+            // like the final write below so tap readers see the silence.
+            m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
             return maxlen;
         }
         // Fall through and advance the cursor so video can keep moving.
@@ -1487,17 +1490,31 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
                     Q_ARG(float, masterSnapshot.peakL), Q_ARG(float, masterSnapshot.peakR),
                     Q_ARG(float, rmsL), Q_ARG(float, rmsR));
             }
-            return maxlen;
         }
     }
 
+    // Master tap: fed with the final s16 block the sink receives (the stall
+    // return above feeds its zeroed block the same way). No copy without
+    // subscribers; never blocks this thread.
+    m_mixer->writeMasterTap(reinterpret_cast<const int16_t *>(data), frameCount);
     return maxlen;
 }
 
 // =====================================================================
 // AudioMixer
 // =====================================================================
+namespace {
+// Track identities are unique in the process, so a snapshot of one mixer
+// never names a track of another.
+quint64 newTrackIdentity()
+{
+    static std::atomic<quint64> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+} // namespace
+
 AudioMixer::AudioMixer(QObject *parent) : QObject(parent) {
+    for (auto &identity : m_trackIdentities) identity = newTrackIdentity();
     m_format.setSampleRate(kSampleRateHz);
     m_format.setChannelCount(kChannels);
     m_format.setSampleFormat(QAudioFormat::Int16);
@@ -2337,6 +2354,30 @@ QByteArray AudioMixer::renderPcmForTest(int frames)
     return result;
 }
 
+QByteArray AudioMixer::pullStalledBlockForTest(int frames)
+{
+    if (frames <= 0 || frames > kSampleRateHz || isPlaying()
+        || (m_sink && m_sink->state() != QAudio::StoppedState))
+        return {};
+    // Same set-up as renderPcmForTest, but no refillRings(): an entry active
+    // at zero keeps an empty ring, so this one pull takes the stall return.
+    if (m_decodeRunner) {
+        m_decodeRunner->requestStop();
+        m_decodeRunner->wait();
+        delete m_decodeRunner;
+        m_decodeRunner = nullptr;
+    }
+    seekTo(0);
+    MixerIODevice io(this);
+    io.open(QIODevice::ReadOnly | QIODevice::Unbuffered);
+    QByteArray result(frames * kBytesPerFrame, '\0');
+    m_playing.store(true, std::memory_order_release);
+    if (io.read(result.data(), result.size()) != result.size()) result.clear();
+    m_playing.store(false, std::memory_order_release);
+    m_consecutiveStallCallbacks.store(0, std::memory_order_release);
+    return result;
+}
+
 void AudioMixer::setBusRouting(const audiobus::AudioBusRouting &r)
 {
     audiobus::AudioBusRouting snapshot = r;
@@ -2512,6 +2553,7 @@ void AudioMixer::clearTrackFx()
     QMutexLocker lock(&m_controlMutex);
     m_trackFxChains.clear();
     m_trackFxProcessors.clear();
+    m_listenOfRemovedTracks.clear();
     m_masterFxChain = trackfx::Chain{};
     applyMasterChainLocked(trackfx::Chain{});
     m_masterEqFilter.reset();
@@ -2580,8 +2622,29 @@ void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
     applyMasterChainLocked(master);
 }
 
+void AudioMixer::setMasterChain(const EqSettings &eq, bool eqEnabled,
+                                const trackfx::DeEsserSettings &deesser)
+{
+    trackfx::Chain settings;
+    settings.deesser = deesser;
+    const auto restored = trackfx::Chain::fromJson(settings.toJson()).deesser;
+    QMutexLocker lock(&m_controlMutex);
+    trackfx::Chain master = m_masterFxChain;
+    master.eq = eq;
+    master.eqEnabled = eqEnabled;
+    master.deesser = restored;
+    applyMasterChainLocked(master);
+}
+
+quint64 AudioMixer::applyMasterChainLockedCallCountForTest() const
+{
+    QMutexLocker lock(&m_controlMutex);
+    return m_applyMasterChainLockedCalls;
+}
+
 void AudioMixer::applyMasterChainLocked(const trackfx::Chain &chain)
 {
+    ++m_applyMasterChainLockedCalls;
     m_masterFxChain.eq = chain.eq;
     m_masterFxChain.eqEnabled = chain.eqEnabled;
     m_masterFxChain.deesser = chain.deesser;
@@ -2823,6 +2886,86 @@ void AudioMixer::setAutoDuckParams(const AutoDuckParams &params) {
 AudioMixer::AutoDuckParams AudioMixer::autoDuckParams() const {
     QMutexLocker lock(&m_controlMutex);
     return m_autoDuckParams;
+}
+
+void AudioMixer::subscribeMasterTap()
+{
+    QMutexLocker lock(&m_tapMutex);
+    if (m_tapRing.isEmpty()) m_tapRing.resize(kMasterTapFrames * kChannels);
+    m_tapSubscribers.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void AudioMixer::unsubscribeMasterTap()
+{
+    QMutexLocker lock(&m_tapMutex);
+    const int subscribers = m_tapSubscribers.load(std::memory_order_acquire);
+    if (subscribers <= 0) return;
+    m_tapSubscribers.store(subscribers - 1, std::memory_order_release);
+    if (subscribers == 1) m_tapWrite = m_tapFill = 0;
+}
+
+int AudioMixer::takeMasterTap(QVector<float> *interleaved, int maxFrames)
+{
+    if (!interleaved) return 0;
+    interleaved->clear();
+    if (maxFrames <= 0) return 0;
+    QMutexLocker lock(&m_tapMutex);
+    const int frames = qMin(m_tapFill, maxFrames);
+    interleaved->resize(frames * kChannels);
+    // m_tapWrite is the slot after the newest frame; the oldest sits m_tapFill
+    // frames behind it.
+    int read = (m_tapWrite - m_tapFill + kMasterTapFrames) % kMasterTapFrames;
+    for (int f = 0; f < frames; ++f) {
+        (*interleaved)[f * kChannels] = m_tapRing[read * kChannels];
+        (*interleaved)[f * kChannels + 1] = m_tapRing[read * kChannels + 1];
+        read = (read + 1) % kMasterTapFrames;
+    }
+    m_tapFill -= frames;
+    return frames;
+}
+
+void AudioMixer::writeMasterTap(const int16_t *interleaved, int frames)
+{
+    // Audio thread: never wait for the GUI reader; a contended block is dropped.
+    if (!interleaved || frames <= 0
+        || m_tapSubscribers.load(std::memory_order_acquire) <= 0
+        || !m_tapMutex.tryLock())
+        return;
+    if (m_tapSubscribers.load(std::memory_order_acquire) <= 0 || m_tapRing.isEmpty()) {
+        m_tapMutex.unlock();
+        return;
+    }
+    // Only the newest kMasterTapFrames of a larger block can survive.
+    const int first = qMax(0, frames - kMasterTapFrames);
+    for (int f = first; f < frames; ++f) {
+        m_tapRing[m_tapWrite * kChannels] = interleaved[f * kChannels] / 32768.0f;
+        m_tapRing[m_tapWrite * kChannels + 1] = interleaved[f * kChannels + 1] / 32768.0f;
+        m_tapWrite = (m_tapWrite + 1) % kMasterTapFrames;
+    }
+    m_tapFill = qMin(kMasterTapFrames, m_tapFill + frames - first);
+    m_tapCopyCount.fetch_add(1, std::memory_order_relaxed);
+    m_tapMutex.unlock();
+    if (!m_tapNotifyPending.exchange(true, std::memory_order_acq_rel)) {
+        QMetaObject::invokeMethod(this, [this] {
+            m_tapNotifyPending.store(false, std::memory_order_release);
+            emit masterTapAvailable();
+        }, Qt::QueuedConnection);
+    }
+}
+
+void AudioMixer::publishMasterBlockForTest(const int16_t *interleaved, int frames)
+{
+    writeMasterTap(interleaved, frames);
+}
+
+quint64 AudioMixer::tapCopyCountForTest() const
+{
+    return m_tapCopyCount.load(std::memory_order_relaxed);
+}
+
+int AudioMixer::tapSubscriberCountForTest() const
+{
+    return m_tapSubscribers.load(std::memory_order_acquire);
 }
 
 bool AudioMixer::ensureSinkLocked() {
@@ -3935,10 +4078,20 @@ QJsonObject AudioMixer::collectTrackState() const
     QJsonObject chains;
     for (auto it = m_trackFxChains.cbegin(); it != m_trackFxChains.cend(); ++it)
         chains.insert(QString::number(it.key()), it.value().toJson());
+    QJsonArray identities;
+    for (quint64 identity : m_trackIdentities) identities.append(static_cast<qint64>(identity));
     // Master EQ / DeEsser (the only master stages the docks edit) ride along so
     // undo restores them; applyTrackState applies the key only when present.
     return QJsonObject{{"states", states}, {"chains", chains},
-                       {"masterChain", m_masterFxChain.toJson()}};
+                       {"masterChain", m_masterFxChain.toJson()}, {"trackIds", identities}};
+}
+
+void AudioMixer::rememberListenLocked(quint64 identity, int liveIndex)
+{
+    if (m_trackFxChains.value(liveIndex).deesser.listen)
+        m_listenOfRemovedTracks.insert(identity);
+    else
+        m_listenOfRemovedTracks.remove(identity);
 }
 
 void AudioMixer::applyTrackState(const QJsonObject &snapshot)
@@ -3963,20 +4116,32 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
     }
     QHash<int, trackfx::Chain> restoredChains;
     QHash<int, std::array<EqBandCoefsParam, 4>> restoredCoefs;
-    const auto chains = snapshot.value("chains").toObject();
-    for (auto it = chains.begin(); it != chains.end(); ++it) {
-        bool valid = false;
-        const int index = it.key().toInt(&valid);
-        if (!valid || index < 0 || index >= kMaxAudioTracks) continue;
-        const auto chain = trackfx::Chain::fromJson(it.value().toObject());
+    const auto insertChain = [&restoredChains, &restoredCoefs](int index, const trackfx::Chain &chain) {
         restoredChains.insert(index, chain);
         restoredCoefs.insert(index, {computeEqBand(chain.eq.low, 0, kSampleRateHz),
             computeEqBand(chain.eq.lowMid, 1, kSampleRateHz),
             computeEqBand(chain.eq.highMid, 2, kSampleRateHz),
             computeEqBand(chain.eq.high, 3, kSampleRateHz)});
+    };
+    const auto chains = snapshot.value("chains").toObject();
+    for (auto it = chains.begin(); it != chains.end(); ++it) {
+        bool valid = false;
+        const int index = it.key().toInt(&valid);
+        if (!valid || index < 0 || index >= kMaxAudioTracks) continue;
+        insertChain(index, trackfx::Chain::fromJson(it.value().toObject()));
     }
     const bool hasMaster = snapshot.contains("masterChain");
     const auto master = trackfx::Chain::fromJson(snapshot.value("masterChain").toObject());
+    const auto identities = snapshot.value("trackIds").toArray();
+    const bool hasIdentities = identities.size() == kMaxAudioTracks;
+    std::array<quint64, kMaxAudioTracks> restoredIdentities{};
+    for (int i = 0; hasIdentities && i < kMaxAudioTracks; ++i)
+        restoredIdentities[i] = static_cast<quint64>(identities[i].toInteger());
+    // Only the identities of the snapshot's audio tracks name a track; a
+    // snapshot without the count treats every index as a track.
+    const int activeTracks = snapshot.contains("trackCount")
+        ? qBound(0, snapshot.value("trackCount").toInt(), int(kMaxAudioTracks))
+        : int(kMaxAudioTracks);
     // Publish one complete snapshot to the audio callback. The master EQ /
     // DeEsser change only when the snapshot carries them (chain + processor).
     QMutexLocker lock(&m_controlMutex);
@@ -3985,6 +4150,42 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
         auto restoredMaster = master;
         restoredMaster.deesser.listen = m_masterFxChain.deesser.listen;
         applyMasterChainLocked(restoredMaster);
+    }
+    // Track listen is not undo state either. Indices move across structural
+    // edits, so each restored chain takes the live listen of the same track
+    // identity (or the listen it had when it left the live tracks); a track
+    // without a snapshot chain gets a default chain to carry it. Without
+    // identities the restored listen is off: never another track's monitor.
+    if (hasIdentities) {
+        const auto activeEnd = restoredIdentities.cbegin() + activeTracks;
+        for (int live = 0; live < kMaxAudioTracks; ++live)
+            if (std::find(restoredIdentities.cbegin(), activeEnd, m_trackIdentities[live]) == activeEnd)
+                rememberListenLocked(m_trackIdentities[live], live);
+        for (auto it = restoredChains.begin(); it != restoredChains.end(); ++it)
+            if (it.key() >= activeTracks) it->deesser.listen = false;
+        for (int index = 0; index < activeTracks; ++index) {
+            const quint64 identity = restoredIdentities[index];
+            const auto live = std::find(m_trackIdentities.cbegin(), m_trackIdentities.cend(), identity);
+            const bool listen = live != m_trackIdentities.cend()
+                ? m_trackFxChains.value(int(live - m_trackIdentities.cbegin())).deesser.listen
+                : m_listenOfRemovedTracks.contains(identity);
+            const auto chain = restoredChains.find(index);
+            if (chain != restoredChains.end()) {
+                chain->deesser.listen = listen;
+            } else if (listen) {
+                trackfx::Chain listenOnly;
+                listenOnly.deesser.listen = true;
+                insertChain(index, listenOnly);
+            }
+            m_listenOfRemovedTracks.remove(identity);
+        }
+        // An index past the tracks never shares the identity of a track that
+        // was undone away and may come back with a redo.
+        for (int index = activeTracks; index < kMaxAudioTracks; ++index)
+            restoredIdentities[index] = newTrackIdentity();
+        m_trackIdentities = restoredIdentities;
+    } else {
+        for (auto &chain : restoredChains) chain.deesser.listen = false;
     }
     m_trackStates = std::move(restoredStates);
     m_trackFxChains = std::move(restoredChains);
@@ -4013,6 +4214,20 @@ void AudioMixer::applyTrackState(const QJsonObject &snapshot)
 void AudioMixer::remapTrackIndices(const QVector<int> &oldToNew)
 {
     QMutexLocker lock(&m_controlMutex);
+    // Identities move with their tracks; a removed one keeps its listen, a
+    // vacated index gets a new identity.
+    auto identities = m_trackIdentities;
+    const int mapped = std::min(int(oldToNew.size()), int(kMaxAudioTracks));
+    for (int i = 0; i < mapped; ++i) {
+        identities[i] = 0;
+        if (oldToNew[i] < 0) rememberListenLocked(m_trackIdentities[i], i);
+    }
+    for (int i = 0; i < mapped; ++i)
+        if (oldToNew[i] >= 0 && oldToNew[i] < kMaxAudioTracks)
+            identities[oldToNew[i]] = m_trackIdentities[i];
+    for (int i = 0; i < mapped; ++i)
+        if (!identities[i]) identities[i] = newTrackIdentity();
+    m_trackIdentities = identities;
     QVector<TrackState> states;
     for (int index : oldToNew) if (index >= states.size()) states.resize(index + 1);
     for (int i = 0; i < oldToNew.size(); ++i)

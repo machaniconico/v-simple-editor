@@ -535,6 +535,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/LiveMatteResolve.h
     src/playback/LiveMatteResolve.cpp
     src/selftests/live_matte_resolve_selftests.cpp
+    src/selftests/matte_ssot_selftest.cpp
+    src/selftests/render_notify_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
     src/CommandPaletteDialog.h
@@ -646,6 +648,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/WhisperTranscriber.cpp
     src/selftests/WhisperWordTimingSelftest.cpp
     src/selftests/CaptionOverlayBuilderSelftest.cpp
+    src/selftests/caption_edit_selftest.cpp
     src/WhisperTranscribeDialog.h
     src/WhisperTranscribeDialog.cpp
     src/selftests/whisper_transcribe_selftest.cpp
@@ -714,6 +717,9 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioMixerDock.cpp
     src/AudioMixerDock.h
     src/selftests/mixer_dock_selftest.cpp
+    src/SpectrumAnalyzerDock.cpp
+    src/SpectrumAnalyzerDock.h
+    src/selftests/spectrum_selftest.cpp
     src/HistoryDockWidget.cpp
     src/HistoryDockWidget.h
     src/LutImporter.cpp

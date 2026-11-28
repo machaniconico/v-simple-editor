@@ -305,6 +305,7 @@ double exporter_loudnessGainDb();
 #include <limits>
 #include "AudioMeterWidget.h"
 #include "AudioMixerDock.h"
+#include "SpectrumAnalyzerDock.h"
 #include "GradientStopBar.h"
 #include "BrushAnimationDialog.h"
 #include "PathText.h"
@@ -2515,33 +2516,6 @@ QVector<fcpx::xml::ClipEntry> buildFcpxmlExportClips(const Timeline *timeline)
 }
 #endif
 
-// TM-8: mirror MainWindow's m_trackMatteClipEntries onto the Timeline so
-// the SSOT renderFrameAt (src/TimelineFrameRenderer.cpp) reads matte
-// wiring from the Timeline object itself instead of walking QObject
-// parents up to this live MainWindow off the RenderQueue worker thread
-// (the old #define-private-public path — C1+C2). The QHash key is
-// MainWindow::brushClipId(track,clip) == tlrender::renderClipId, so this
-// is a straight per-entry copy into the 2-field TimelineTrackMatteEntry
-// the consumer reads. Called on every m_trackMatteClipEntries mutation
-// (configure dialog) and after a project load rebuilds it, so the GUI
-// preview keeps working — now through the Timeline carrier.
-void syncTrackMatteEntriesToTimeline(
-    Timeline *timeline,
-    const QHash<QString, TrackMatteClipEntry> &source)
-{
-    if (!timeline)
-        return;
-    QHash<QString, TimelineTrackMatteEntry> out;
-    out.reserve(source.size());
-    for (auto it = source.cbegin(); it != source.cend(); ++it) {
-        TimelineTrackMatteEntry e;
-        e.matteType = it.value().matteType;
-        e.matteSourceClipId = it.value().matteSourceClipId;
-        out.insert(it.key(), e);
-    }
-    timeline->setTrackMatteEntries(out);
-}
-
 void syncTimeRemapEntriesToTimelineImpl(
     Timeline *timeline,
     const QHash<QString, TimeRemapClipEntry> &source)
@@ -2575,8 +2549,8 @@ void syncTimeRemapEntriesToTimelineImpl(
         timeline->refreshPlaybackSequence();
 }
 
-// RM-1.2 / RM-4: snapshotTrackClips and remapTrackMatteEntriesAfterMutation
-// are defined in TrackMatteKey.cpp (hoisted for testability). The types
+// RM-1.2 / RM-4: snapshotTrackClips is defined in TrackMatteKey.cpp
+// (hoisted for testability). The types
 // ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
 
 constexpr int kLoudnessSampleRate = 48000;
@@ -2928,22 +2902,40 @@ QString renderinplace::prepareAudioMix(Timeline *timeline, const QString &output
 
 namespace {
 std::atomic<int> s_prepareJobCalls{0};
+std::atomic<int> s_silentMixCalls{0};
+std::atomic<loudnessauto::ForcedFailure> s_forcedFailure{loudnessauto::ForcedFailure::None};
 }
 
 int loudnessauto::prepareJobCallCountForTest() { return s_prepareJobCalls.load(); }
+int loudnessauto::silentMixCallCountForTest() { return s_silentMixCalls.load(); }
+void loudnessauto::setForcedFailureForTest(ForcedFailure failure) { s_forcedFailure = failure; }
 
+// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here, so a
+// failed mix never falls back to the unnormalized V1 source audio: it sets loudnessAutoError
+// and RenderQueue::addJob rejects the job.
 QString loudnessauto::prepareJob(RenderJob &job)
 {
     if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
     ++s_prepareJobCalls;
     job.exportConfig.remove("loudnessAutoError");
+    const ForcedFailure forced = s_forcedFailure.load();
+    const bool hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+    const bool hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
+    const bool hasSequence = hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
     QString error;
     QString mix;
-    if (job.timeline && job.timeline->totalDuration() > 0.0
-        && !job.timeline->computeAudioPlaybackSequence().isEmpty()) {
+    if (hasSequence) {
         // Force the existing mixer to produce PCM even for passthrough clips.
         mix = prepareTimelineAudioMixForExport(job.timeline, &error,
             nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration());
+        if (forced == ForcedFailure::PcmMix) {
+            QFile::remove(mix); // a failed mix leaves no output behind (finishMix)
+            mix.clear();
+            error = QStringLiteral("test: forced PCM mix failure");
+        }
+        if (mix.isEmpty() && !hasIntermediate)
+            job.exportConfig["loudnessAutoError"] = error.isEmpty()
+                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
     }
     // The measurement WAV is removed below; registering it makes removeTempFiles retry if that fails.
     if (!mix.isEmpty()) RenderQueue::addTempFile(job.exportConfig, mix);
@@ -2978,7 +2970,12 @@ QString loudnessauto::prepareJob(RenderJob &job)
         QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix, QStringLiteral("-vn")};
         args << exportaudio::aacAudioArgs(job.exportConfig.value("audioBitrate").toInt()) << muxPath;
         RenderQueue::addTempFile(job.exportConfig, muxPath);
-        if (runFfmpegForAudioMix(args, &error)) RenderQueue::setIntermediateProjectFile(job, muxPath);
+        bool converted = runFfmpegForAudioMix(args, &error);
+        if (converted && forced == ForcedFailure::AacConvert) {
+            converted = false;
+            error = QStringLiteral("test: forced AAC conversion failure");
+        }
+        if (converted) RenderQueue::setIntermediateProjectFile(job, muxPath);
         else {
             message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
             job.exportConfig["loudnessAutoStatus"] = message;
@@ -2986,6 +2983,31 @@ QString loudnessauto::prepareJob(RenderJob &job)
             qWarning().noquote() << message;
         }
         QFile::remove(mix);
+    } else if (hasDuration && !hasSequence && !hasIntermediate
+               && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath)) {
+        // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
+        // removed. Make the silent track the ordinary export makes (nothing to measure: 0 dB).
+        const int audioKbps = job.exportConfig.value("audioBitrate").toInt();
+        QString silentError;
+        const QString silent = prepareTimelineAudioMixForExport(job.timeline, &silentError,
+            {}, 0.0, audioKbps > 0 ? audioKbps : 192);
+        // Passthrough (V1 empty): the ordinary export makes no mix either, so leave the job as is.
+        const bool passthrough = silent.isEmpty() && silentError.isEmpty()
+            && timelineAudioMatchesPassthrough(job.timeline);
+        if (!passthrough) {
+            ++s_silentMixCalls;
+            RenderQueue::addTempFile(job.exportConfig, silent);
+            if (forced == ForcedFailure::SilentMix && silentError.isEmpty())
+                silentError = QStringLiteral("test: forced silent mix failure");
+            if (!silent.isEmpty() && silentError.isEmpty()) RenderQueue::setIntermediateProjectFile(job, silent);
+            else {
+                if (silentError.isEmpty()) silentError = QStringLiteral("音声ミックスの作成に失敗しました");
+                message += QStringLiteral(" / 無音トラック作成失敗: ") + silentError;
+                job.exportConfig["loudnessAutoStatus"] = message;
+                job.exportConfig["loudnessAutoError"] = silentError;
+                qWarning().noquote() << message;
+            }
+        }
     }
     job.loudnessGainDb = job.exportConfig.value("loudnessGainDb").toDouble();
     qInfo().noquote() << job.name << message;
@@ -3253,8 +3275,6 @@ MainWindow::MainWindow(QWidget *parent)
         [this](const QJsonObject &state) { applyExternalTrackState(state); });
     connect(m_timeline, &Timeline::trackIndicesRemapped,
             this, &MainWindow::remapExternalTrackIndices);
-    connect(m_timeline, &Timeline::trackStateRestored,
-            this, &MainWindow::syncTrackMatteEntriesFromTimeline);
 
     rebuildAudioMeters();
 
@@ -4369,6 +4389,21 @@ void MainWindow::setupUI()
     }
 }
 
+namespace {
+// The legacy 3-band EQ of one track in collectTrackState's per-track keys. Only
+// the two undo entries of an EQ migration carry it (audio FX sidecar key
+// "legacyEq"): legacy EQ writes record no undo, so other entries leave it alone.
+QJsonObject legacyEqUndoState(AudioMixer *mixer, int track)
+{
+    const AudioEQConfig cfg = mixer->trackEqConfig(track);
+    QJsonArray bands;
+    for (const auto &band : cfg.bands)
+        bands.append(QJsonObject{{"frequency", band.frequency}, {"gain", band.gain}, {"q", band.q}});
+    return QJsonObject{{"eqEnabled", mixer->trackEqEnabled(track)},
+                       {"preamp", cfg.preamp}, {"bands", bands}};
+}
+} // namespace
+
 void MainWindow::setupMenuBar()
 {
     // ファイル メニュー
@@ -4715,10 +4750,7 @@ void MainWindow::setupMenuBar()
     m_moveClipHeadAction = editMenu->addAction("クリップの先頭を再生ヘッドへ移動");
     m_moveClipTailAction = editMenu->addAction("クリップの末尾を再生ヘッドへ移動");
     auto moveToPlayhead = [this](bool tail) {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->moveSelectedClipToPlayhead(tail);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     };
     connect(m_moveClipHeadAction, &QAction::triggered, this,
@@ -4768,58 +4800,40 @@ void MainWindow::setupMenuBar()
     m_duplicateAction = editMenu->addAction("複製");
     m_duplicateAction->setShortcut(QKeySequence("Ctrl+D"));
     connect(m_duplicateAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->duplicateSelectedClips();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeLeftAction = editMenu->addAction("1フレーム左へ移動");
     m_nudgeLeftAction->setShortcut(QKeySequence("Alt+Left"));
     connect(m_nudgeLeftAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(-1);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeRightAction = editMenu->addAction("1フレーム右へ移動");
     m_nudgeRightAction->setShortcut(QKeySequence("Alt+Right"));
     connect(m_nudgeRightAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(1);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeLeft10Action = editMenu->addAction("10フレーム左へ移動");
     m_nudgeLeft10Action->setShortcut(QKeySequence("Alt+Shift+Left"));
     connect(m_nudgeLeft10Action, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(-10);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_nudgeRight10Action = editMenu->addAction("10フレーム右へ移動");
     m_nudgeRight10Action->setShortcut(QKeySequence("Alt+Shift+Right"));
     connect(m_nudgeRight10Action, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->setNudgeFrameRate(m_projectConfig.fps);
         m_timeline->nudgeSelectedClips(10);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_closeAllGapsAction = editMenu->addAction("すべてのギャップを詰める");
     connect(m_closeAllGapsAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->closeAllGaps();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
@@ -4840,10 +4854,7 @@ void MainWindow::setupMenuBar()
         updateEditActions();
     });
     connect(m_bladeAllAction, &QAction::triggered, this, [this]() {
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->bladeAllTracksAtPlayhead();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         updateEditActions();
     });
     connect(m_liftAction, &QAction::triggered, this, [this]() {
@@ -4851,10 +4862,7 @@ void MainWindow::setupMenuBar()
             statusBar()->showMessage(QStringLiteral("削除するクリップを選択してください。"), 3000);
             return;
         }
-        const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         m_timeline->deleteSelectedClip();
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
         statusBar()->showMessage(QStringLiteral("クリップをリフトしました。"), 3000);
         updateEditActions();
     });
@@ -5503,6 +5511,7 @@ void MainWindow::setupMenuBar()
     // Track EQ submenu — rebuilt on aboutToShow with one entry per
     // audio track, each exposing the 5 built-in EQ presets.
     auto *trackEqMenu = audioMenu->addMenu("Track EQ");
+    trackEqMenu->setObjectName(QStringLiteral("trackEqMenu"));
     connect(trackEqMenu, &QMenu::aboutToShow, this, [this, trackEqMenu]() {
         trackEqMenu->clear();
         if (!m_timeline) return;
@@ -5543,6 +5552,66 @@ void MainWindow::setupMenuBar()
                 statusBar()->showMessage(
                     QString("A%1 EQ bypassed").arg(ti2 + 1), 3000);
            });
+            // Explicit migration only (projects are never converted on load):
+            // the legacy EQ moves into the trackfx chain's 4-band EQ as one undo.
+            auto *migrateAct = trackSub->addAction("4 バンド EQ へ移行");
+            migrateAct->setObjectName(QStringLiteral("trackEqMigrateTo4Band"));
+            connect(migrateAct, &QAction::triggered, this,
+                    [this, mixer, ti2]() {
+                if (!mixer || !m_timeline) return;
+                const AudioEQConfig legacy = mixer->trackEqConfig(ti2);
+                if (!mixer->trackEqEnabled(ti2) || legacy.isDefault()) {
+                    statusBar()->showMessage(
+                        QString("A%1 の旧 EQ は使われていません").arg(ti2 + 1), 3000);
+                    return;
+                }
+                trackfx::Chain chain = mixer->trackChain(ti2);
+                if (!trackfx::eqFromLegacy(legacy, &chain.eq)) {
+                    statusBar()->showMessage(
+                        QString("A%1: この EQ 設定は 4 バンド EQ で表現できません (preamp / 3 帯以上)")
+                            .arg(ti2 + 1), 3000);
+                    return;
+                }
+                // The legacy EQ runs after the whole trackfx chain, the 4-band EQ
+                // before its de-esser / compressor / reverb (same predicates as
+                // trackfx::Processor): with any of them active the order changes.
+                const trackfx::Chain live = mixer->trackChain(ti2);
+                if (live.deesser.enabled
+                    || (live.compEnabled && live.comp.enabled && live.comp.ratio > 1.0001)
+                    || (live.reverbEnabled && live.reverb.enabled && live.reverb.mixRatio > 1e-6)) {
+                    statusBar()->showMessage(
+                        QString("A%1: ディエッサー / コンプレッサー / リバーブが有効なため 4 バンド EQ へ移行できません (処理順が変わります)")
+                            .arg(ti2 + 1), 3000);
+                    return;
+                }
+                chain.eqEnabled = true;
+                // Pin the legacy EQ on the entry before and after the migration;
+                // the current entry also takes the live chains, since legacy EQ
+                // writes record no undo (as applyAudioState refreshes on load).
+                const QString key = QString::number(ti2);
+                UndoManager *undo = m_timeline->undoManager();
+                int index = undo->currentIndex();
+                if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()) {
+                    // Keep the pins of earlier migrations on this entry (other tracks).
+                    QJsonObject pins = m_mediaRelinkSidecarHistory[index]
+                                           .audioFx.value("legacyEq").toObject();
+                    pins.insert(key, legacyEqUndoState(mixer, ti2));
+                    QJsonObject before = audiofxui::undoState(mixer);
+                    before.insert("legacyEq", pins);
+                    m_mediaRelinkSidecarHistory[index].audioFx = before;
+                }
+                mixer->setTrackChain(ti2, chain);
+                mixer->setTrackEqEnabled(ti2, false);
+                mixer->setTrackEqConfig(ti2, AudioEQConfig{});
+                reseedAudioFxDocks();
+                m_timeline->saveUndoState(QStringLiteral("EQ を 4 バンドへ移行"));
+                index = undo->currentIndex();
+                if (index >= 0 && index < m_mediaRelinkSidecarHistory.size())
+                    m_mediaRelinkSidecarHistory[index].audioFx.insert(
+                        "legacyEq", QJsonObject{{key, legacyEqUndoState(mixer, ti2)}});
+                statusBar()->showMessage(
+                    QString("A%1 EQ → 4 バンド EQ").arg(ti2 + 1), 3000);
+            });
         }
     });
 
@@ -7082,8 +7151,7 @@ void MainWindow::setupMenuBar()
         auto clips = track->clips();
         clips[clipIdx].keyframes = km;
         track->setClips(clips);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->remapCarriersAfterExternalMutation(snap);
         m_timeline->saveUndoState(QStringLiteral("グレードのキーフレーム追加"));
         m_timeline->refreshPlaybackSequence();
         pushAnimatedHslPreview(m_timeline->playheadPosition());
@@ -7107,8 +7175,7 @@ void MainWindow::setupMenuBar()
         const TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
         clips[clipIdx].colorCorrection = cc;
         track->setClips(clips);
-        remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->remapCarriersAfterExternalMutation(snap);
         dirty = true;
         m_timeline->refreshPlaybackSequence();
         m_player->setColorCorrection(cc);
@@ -8060,6 +8127,11 @@ void MainWindow::setupMenuBar()
     m_audioMixerDock->hide();
     viewMenu->addAction(m_audioMixerDock->toggleViewAction());
 
+    m_spectrumAnalyzerDock = new SpectrumAnalyzerDock(m_player->audioMixer(), this);
+    addDockWidget(Qt::RightDockWidgetArea, m_spectrumAnalyzerDock);
+    m_spectrumAnalyzerDock->hide();
+    viewMenu->addAction(m_spectrumAnalyzerDock->toggleViewAction());
+
     // 取り込み配置ポリシー: 並列トラック (V2/A2...) か 現在トラック追加 (V1/A1 連結)
     auto *importPlacementGroup = new QActionGroup(this);
     importPlacementGroup->setExclusive(true);
@@ -8213,6 +8285,17 @@ void MainWindow::setupMenuBar()
             .setValue("autoPlayOnFirstSequence", on);
     });
     prefsMenu->addAction(autoPlayAction);
+
+    auto *renderNotifyAction = new QAction(QStringLiteral("書き出し完了を通知する"), this);
+    renderNotifyAction->setCheckable(true);
+    renderNotifyAction->setChecked(
+        QSettings("VSimpleEditor", "Preferences").value("notify/renderComplete", false).toBool());
+    connect(renderNotifyAction, &QAction::toggled, this, [](bool on) {
+        QSettings("VSimpleEditor", "Preferences").setValue("notify/renderComplete", on);
+    });
+    prefsMenu->addAction(renderNotifyAction);
+    m_menuHelpEntries.append({renderNotifyAction,
+        QStringLiteral("書き出しがすべて終わったとき、ステータスバーに件数を表示し、ウィンドウを点滅させて音を鳴らします。")});
     prefsMenu->addSeparator();
 
     auto *loudnessAction = new QAction(
@@ -8745,6 +8828,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
     };
 
     const auto rotoEntries = m_timeline->rotoEntries();
+    const auto trackMatteEntries = m_timeline->trackMatteEntries();
     QVector<ActiveLayer> activeLayers;
     bool hasActiveSpecialData = false;
     for (int trackIdx = 0; trackIdx < m_timeline->videoTracks().size(); ++trackIdx) {
@@ -8771,7 +8855,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
                 || rotoEntries.contains(clipId)
                 || m_timeRemapClipEntries.contains(clipId)
                 || clip.hasTimeRemap()
-                || m_trackMatteClipEntries.contains(clipId)
+                || trackMatteEntries.contains(clipId)
                 || m_text3DClipConfigs.contains(clipId)
                 || m_clipExpressionBindings.contains(clipId)
                 || (m_clipWiggleParams.contains(clipId) && m_clipWiggleParams.value(clipId).enabled)
@@ -8993,8 +9077,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
             active.layer.material = clip.material;
             active.layer.inPoint = clipStart;
             active.layer.outPoint = clipEnd;
-            if (auto matteIt = m_trackMatteClipEntries.constFind(clipId);
-                matteIt != m_trackMatteClipEntries.cend()) {
+            if (auto matteIt = trackMatteEntries.constFind(clipId);
+                matteIt != trackMatteEntries.cend()) {
                 active.layer.matteType = matteIt.value().matteType;
             }
             activeLayers.append(active);
@@ -9011,8 +9095,8 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds) const
         indexByClipId.insert(activeLayers[i].clipId, i);
 
     for (int i = 0; i < activeLayers.size(); ++i) {
-        const auto matteIt = m_trackMatteClipEntries.constFind(activeLayers[i].clipId);
-        if (matteIt == m_trackMatteClipEntries.cend())
+        const auto matteIt = trackMatteEntries.constFind(activeLayers[i].clipId);
+        if (matteIt == trackMatteEntries.cend())
             continue;
         activeLayers[i].layer.matteType = matteIt.value().matteType;
         activeLayers[i].layer.matteSourceLayerIndex =
@@ -9093,7 +9177,7 @@ void MainWindow::refreshSpecialClipPreview()
         light3d::statesAt(m_projectLights, playheadSeconds));
     if (m_timeline->rotoEntries().isEmpty() && m_timeRemapClipEntries.isEmpty()
         && !timelineHasClipTimeRemap(m_timeline)
-        && m_trackMatteClipEntries.isEmpty() && m_text3DClipConfigs.isEmpty()
+        && m_timeline->trackMatteEntries().isEmpty() && m_text3DClipConfigs.isEmpty()
         && m_clipExpressionBindings.isEmpty() && !anyWiggleEnabled
         && !anyLightingEnabled) {
         if (!m_player->isPlaying()) {
@@ -9163,8 +9247,10 @@ void MainWindow::populateProjectData(ProjectData &data)
     std::sort(data.timeRemapClipEntries.begin(), data.timeRemapClipEntries.end(),
               [](const TimeRemapClipEntry &a, const TimeRemapClipEntry &b) { return a.clipId < b.clipId; });
     data.trackMatteClipEntries.clear();
-    for (auto it = m_trackMatteClipEntries.cbegin(); it != m_trackMatteClipEntries.cend(); ++it)
-        data.trackMatteClipEntries.append(it.value());
+    const auto trackMatteEntries = m_timeline->trackMatteEntries();
+    for (auto it = trackMatteEntries.cbegin(); it != trackMatteEntries.cend(); ++it)
+        data.trackMatteClipEntries.append(
+            TrackMatteClipEntry{it.key(), it.value().matteType, it.value().matteSourceClipId});
     std::sort(data.trackMatteClipEntries.begin(), data.trackMatteClipEntries.end(),
               [](const TrackMatteClipEntry &a, const TrackMatteClipEntry &b) { return a.clipId < b.clipId; });
     data.clipParentEntries.clear();
@@ -9410,14 +9496,15 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         if (!entry.clipId.isEmpty())
             m_timeRemapClipEntries.insert(entry.clipId, entry);
     }
-    m_trackMatteClipEntries.clear();
+    // TM-8 / US-1016: the Timeline carrier is the matte SSOT (preview AND
+    // export read it), so the loaded wiring goes there directly.
+    QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     for (const auto &entry : data.trackMatteClipEntries) {
         if (!entry.clipId.isEmpty())
-            m_trackMatteClipEntries.insert(entry.clipId, entry);
+            trackMatteEntries.insert(entry.clipId,
+                TimelineTrackMatteEntry{entry.matteType, entry.matteSourceClipId});
     }
-    // TM-8: push the freshly-loaded matte wiring onto the Timeline so the
-    // SSOT renderer (preview AND export) sources it from the Timeline.
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->setTrackMatteEntries(trackMatteEntries);
     QHash<QString, QString> parentEntries;
     for (const auto &entry : data.clipParentEntries) {
         if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
@@ -9678,12 +9765,17 @@ void MainWindow::captureMediaRelinkSidecarsAtCurrentUndoIndex()
     const int index = m_timeline->undoManager()->currentIndex();
     if (index < 0)
         return;
+    // An EQ migration's legacy EQ pins stay on the entry (restore needs them).
+    const QJsonValue legacyEq = index < m_mediaRelinkSidecarHistory.size()
+        ? m_mediaRelinkSidecarHistory.at(index).audioFx.value("legacyEq") : QJsonValue();
     if (m_mediaRelinkSidecarHistory.size() <= index)
         m_mediaRelinkSidecarHistory.resize(index + 1);
     auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    QJsonObject audioFx = mixer ? audiofxui::undoState(mixer) : QJsonObject{};
+    if (mixer && legacyEq.isObject())
+        audioFx.insert("legacyEq", legacyEq);
     m_mediaRelinkSidecarHistory[index] = {
-        m_projectOverlays, m_particleClipConfigs,
-        mixer ? audiofxui::undoState(mixer) : QJsonObject{}
+        m_projectOverlays, m_particleClipConfigs, audioFx
     };
 }
 
@@ -9732,7 +9824,13 @@ void MainWindow::handleMediaRelinkHistoryChanged()
 QJsonObject MainWindow::collectExternalTrackState() const
 {
     QJsonObject state;
-    if (auto *mixer = m_timeline->audioMixer()) state["mixer"] = mixer->collectTrackState();
+    if (auto *mixer = m_timeline->audioMixer()) {
+        // applyTrackState carries the DeEsser listen only by the identities of
+        // these audio tracks, not by those of the unused mixer indices.
+        QJsonObject mixerState = mixer->collectTrackState();
+        mixerState["trackCount"] = m_timeline->audioTrackCount();
+        state["mixer"] = mixerState;
+    }
     state["buses"] = m_audioBusRouting.toJson();
     // Timeline playback flags (muted/solo/hidden) are not undoable.
     state["adjustments"] = adjustmentLayersToJsonArray(m_timeline->adjustmentLayers());
@@ -9772,16 +9870,16 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     if (auto *mixer = m_timeline->audioMixer()) mixer->setBusRouting(m_audioBusRouting);
     m_timeline->setAdjustmentLayers(adjustmentLayersFromJsonArray(state.value("adjustments").toArray()));
     if (state.contains("mattes")) {
-        m_trackMatteClipEntries.clear();
+        // Runs after restoreState, so this external capture wins a structural undo.
+        QHash<QString, TimelineTrackMatteEntry> mattes;
         for (const auto &value : state.value("mattes").toArray()) {
             const auto obj = value.toObject();
-            TrackMatteClipEntry entry;
-            entry.clipId = obj.value("clipId").toString();
+            TimelineTrackMatteEntry entry;
             entry.matteSourceClipId = obj.value("source").toString();
             entry.matteType = static_cast<TrackMatteType>(obj.value("type").toInt());
-            m_trackMatteClipEntries.insert(entry.clipId, entry);
+            mattes.insert(obj.value("clipId").toString(), entry);
         }
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        m_timeline->setTrackMatteEntries(mattes);
     }
     ProjectData particles;
     if (ProjectFile::fromJsonString(state.value("particles").toString(), particles)) {
@@ -9792,20 +9890,6 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
     if (m_audioBusPanel) m_audioBusPanel->refresh();
     rebuildAudioMeters();
     reseedAudioFxDocks();
-}
-
-void MainWindow::syncTrackMatteEntriesFromTimeline()
-{
-    // The Timeline carrier is authoritative after remapping and undo/redo.
-    m_trackMatteClipEntries.clear();
-    const auto mattes = m_timeline->trackMatteEntries();
-    for (auto it = mattes.cbegin(); it != mattes.cend(); ++it) {
-        TrackMatteClipEntry entry;
-        entry.clipId = it.key();
-        entry.matteSourceClipId = it.value().matteSourceClipId;
-        entry.matteType = it.value().matteType;
-        m_trackMatteClipEntries.insert(entry.clipId, entry);
-    }
 }
 
 void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew)
@@ -9831,7 +9915,6 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
         if (layer.trackIndex >= 0) layers.append(layer);
     }
     m_timeline->setAdjustmentLayers(layers);
-    syncTrackMatteEntriesFromTimeline();
     QHash<QString, ParticleEmitterConfig> particles;
     for (const auto *track : m_timeline->videoTracks()) {
         for (const auto &clip : track->clips()) {
@@ -9909,8 +9992,7 @@ void MainWindow::applyAudioState(const ProjectData &data)
         mixer->clearTrackFx();
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
             mixer->setTrackChain(it.key(), it.value());
-        mixer->setMasterEq(data.masterFx.eq, data.masterFx.eqEnabled);
-        mixer->setMasterDeEsser(data.masterFx.deesser);
+        mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled, data.masterFx.deesser);
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);
@@ -10798,10 +10880,48 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
     return job;
 }
 
+RenderQueue *MainWindow::ensureRenderQueue()
+{
+    if (m_renderQueue)
+        return m_renderQueue;
+    m_renderQueue = new RenderQueue(this);
+    // 書き出し完了の通知 (既定 OFF)。jobsChanged で終端ジョブを控え、allCompleted で集計する
+    // (終端後の jobs() 読み取りは空振りになるため)。バッチの専用キュー・RenderInPlace のローカル
+    // キュー・RenderQueueDialog の手動追加 (ダイアログは専用キューを持つ) はここを通らないので対象外。
+    connect(m_renderQueue, &RenderQueue::jobsChanged, this, [this]() {
+        m_renderNotifyTerminal.clear();
+        for (const RenderJob &job : m_renderQueue->jobs()) {
+            if (job.status == RenderJobStatus::Completed || job.status == RenderJobStatus::Failed)
+                m_renderNotifyTerminal.insert(job.uuid, job.status == RenderJobStatus::Failed);
+        }
+    });
+    connect(m_renderQueue, &RenderQueue::allCompleted, this, [this]() {
+        int total = 0;
+        int failed = 0;
+        for (auto it = m_renderNotifyTerminal.cbegin(); it != m_renderNotifyTerminal.cend(); ++it) {
+            if (m_renderNotifyReported.contains(it.key()))
+                continue;
+            m_renderNotifyReported.insert(it.key());
+            ++total;
+            if (it.value())
+                ++failed;
+        }
+        const bool enabled = QSettings("VSimpleEditor", "Preferences")
+                                 .value("notify/renderComplete", false).toBool();
+        if (!enabled || total == 0)
+            return;
+        statusBar()->showMessage(
+            QStringLiteral("書き出しが完了しました (%1 件、失敗 %2 件)").arg(total).arg(failed), 10000);
+        QApplication::alert(this);
+        QApplication::beep();
+        ++renderCompleteNotificationCountForTest;
+    });
+    return m_renderQueue;
+}
+
 bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error)
 {
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
     QString mixError;
     const QString preparedAudioMixPath = config.imageSequence
         ? QString() : (config.autoLoudness ? QString()
@@ -10865,8 +10985,7 @@ void MainWindow::exportVideo()
     // Exporter::doExport (limited applyEffectStack subset, graph skipped for
     // 10-bit/HDR) is NO LONGER reached from any UI action. See progress.txt
     // "### S12 single-path audit".
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
 
     double projectLoudnessGainDb = 0.0;
     RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal, &projectLoudnessGainDb);
@@ -10944,12 +11063,9 @@ void MainWindow::exportVideo()
 
     // RM-1.3: this is a job.timeline != nullptr path — RenderQueue's
     // resolveTimeline early-returns before its persisted-project matte
-    // population, so the live Timeline's matte carrier MUST be current
-    // here or the export silently drops every track matte. Re-sync the
-    // GUI map onto m_timeline immediately before submission so an edit
-    // made after the last configure-matte/load is reflected.
+    // population, so it exports the live Timeline's matte carrier (the
+    // matte SSOT since US-1016; no re-sync is needed).
     syncProjectLightingToTimeline();
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     // AC: production export 経路に ACES SSOT を push (start() 前)。プレビュー /
     // legacy Exporter には openColorManagement / load で既に push 済み。
     // RenderQueue は 8bit 経路でのみ適用し、enabled=false 時はビット同一。
@@ -10964,12 +11080,8 @@ void MainWindow::exportVideo()
 
 void MainWindow::splitClip()
 {
-    // RM-1.2: remap positional matte keys across the clip-index shift.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Timeline remaps the positional matte keys across the clip-index shift.
     m_timeline->splitAtPlayhead();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Split clip at playhead");
     updateEditActions();
 }
@@ -10977,12 +11089,8 @@ void MainWindow::splitClip()
 void MainWindow::deleteClip()
 {
     if (!m_timeline->hasSelection()) return;
-    // RM-1.2: drop matte entries for the removed clip + reindex survivors.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Timeline drops the removed clip's matte entries and reindexes survivors.
     m_timeline->deleteSelectedClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Deleted clip");
     updateEditActions();
 }
@@ -10990,12 +11098,8 @@ void MainWindow::deleteClip()
 void MainWindow::rippleDelete()
 {
     if (!m_timeline->hasAnySelection()) return;
-    // RM-1.2: same as deleteClip — Timeline reindexes, matte keys must follow.
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Same as deleteClip: Timeline reindexes and remaps the matte keys.
     m_timeline->rippleDeleteSelectedClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Ripple deleted clip");
     updateEditActions();
 }
@@ -11009,14 +11113,9 @@ void MainWindow::copyClip()
 
 void MainWindow::pasteClip()
 {
-    // RM-1.2: paste inserts a clip → downstream indices shift; matte keys
-    // for clips after the insertion point must be bumped. The pasted clip
-    // itself is new and carries no matte entry (unmatched → no remap).
-    TrackClipSnapshot snap = snapshotTrackClips(m_timeline);
+    // Paste shifts downstream indices; Timeline bumps their matte keys. The
+    // pasted clip itself is new and carries no matte entry.
     m_timeline->pasteClip();
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries,
-                                        snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     statusBar()->showMessage("Pasted clip");
     updateEditActions();
 }
@@ -13989,8 +14088,7 @@ void MainWindow::exportChapters()
 
 void MainWindow::openRenderQueue()
 {
-    if (!m_renderQueue)
-        m_renderQueue = new RenderQueue(this);
+    ensureRenderQueue();
 
     auto jobs = m_renderQueue->jobs();
     QString info = QString("Render Queue (%1 jobs):\n\n").arg(jobs.size());
@@ -14706,7 +14804,7 @@ void MainWindow::configureTrackMatte()
         sourceCombo->addItem(candidate.label, candidate.id);
 
     const QString targetClipId = brushClipId(targetTrackIdx, targetClipIdx);
-    const TrackMatteClipEntry existing = m_trackMatteClipEntries.value(targetClipId);
+    const TimelineTrackMatteEntry existing = m_timeline->trackMatteEntries().value(targetClipId);
     const int existingTypeIndex = typeCombo->findData(static_cast<int>(existing.matteType));
     if (existingTypeIndex >= 0)
         typeCombo->setCurrentIndex(existingTypeIndex);
@@ -14731,9 +14829,11 @@ void MainWindow::configureTrackMatte()
 
     const TrackMatteType matteType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
     const QString matteSourceId = sourceCombo->currentData().toString();
+    // Matte edits do not save an undo state; the external "mattes" capture keeps them.
+    auto mattes = m_timeline->trackMatteEntries();
     if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
-        m_trackMatteClipEntries.remove(targetClipId);
-        syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+        mattes.remove(targetClipId);
+        m_timeline->setTrackMatteEntries(mattes);
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
         return;
@@ -14744,12 +14844,11 @@ void MainWindow::configureTrackMatte()
         return;
     }
 
-    TrackMatteClipEntry entry;
-    entry.clipId = targetClipId;
+    TimelineTrackMatteEntry entry;
     entry.matteType = matteType;
     entry.matteSourceClipId = matteSourceId;
-    m_trackMatteClipEntries.insert(targetClipId, entry);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    mattes.insert(targetClipId, entry);
+    m_timeline->setTrackMatteEntries(mattes);
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
@@ -15065,8 +15164,7 @@ void MainWindow::convertAudioToKeyframes(int trackIndex, int clipIndex)
     clips[clipIndex].keyframes.removeTrack(keys.propertyName());
     clips[clipIndex].keyframes.addTrack(keys);
     track->setClips(clips);
-    remapTrackMatteEntriesAfterMutation(m_timeline, m_trackMatteClipEntries, snap);
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
+    m_timeline->remapCarriersAfterExternalMutation(snap);
     m_timeline->saveUndoState(title);
     m_timeline->refreshPlaybackSequence();
 }
@@ -17110,8 +17208,7 @@ void MainWindow::onMobileExport()
                     // S12 single-path: mobile export also routes through
                     // RenderQueue -> tlrender::renderFrameAt (S8), NOT the
                     // legacy CPU-only Exporter. See progress.txt S12.
-                    if (!m_renderQueue)
-                        m_renderQueue = new RenderQueue(this);
+                    ensureRenderQueue();
 
                     double projectLoudnessGainDb = 0.0;
                     RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,
@@ -17145,11 +17242,9 @@ void MainWindow::onMobileExport()
                             });
                     connect(progress, &QProgressDialog::canceled,
                             m_renderQueue, &RenderQueue::stop);
-                    // RM-1.3: job.timeline != nullptr path — same carrier
-                    // re-sync requirement as File→Export above.
+                    // RM-1.3: job.timeline != nullptr path — exports the
+                    // live matte carrier, as File→Export above.
                     syncProjectLightingToTimeline();
-                    syncTrackMatteEntriesToTimeline(
-                        m_timeline, m_trackMatteClipEntries);
                     // AC: production export 経路に ACES SSOT を push (start()
                     // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
                     m_renderQueue->setAcesPipeline(m_acesPipeline);
@@ -19937,9 +20032,11 @@ void MainWindow::connectAudioFxDockUndo(Panel *panel, const QString &tag)
         auto *mixer = m_player ? m_player->audioMixer() : nullptr;
         if (!mixer || !m_timeline) return;
         const int index = m_timeline->undoManager()->currentIndex();
-        if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()
-            && m_mediaRelinkSidecarHistory[index].audioFx == audiofxui::undoState(mixer))
-            return;
+        if (index >= 0 && index < m_mediaRelinkSidecarHistory.size()) {
+            QJsonObject recorded = m_mediaRelinkSidecarHistory[index].audioFx;
+            recorded.remove(QStringLiteral("legacyEq")); // pinned by the EQ migration
+            if (recorded == audiofxui::undoState(mixer)) return;
+        }
         m_timeline->saveUndoState(tag);
     });
 }
@@ -19964,8 +20061,22 @@ void MainWindow::restoreAudioFxUndoState(const QJsonObject &audioFx)
     if (audioFx.value("masterChain") != live.value("masterChain")) {
         auto master = trackfx::Chain::fromJson(audioFx.value("masterChain").toObject());
         master.deesser.listen = mixer->masterChain().deesser.listen;
-        mixer->setMasterEq(master.eq, master.eqEnabled);
-        mixer->setMasterDeEsser(master.deesser);
+        mixer->setMasterChain(master.eq, master.eqEnabled, master.deesser);
+    }
+    const QJsonObject legacyEq = audioFx.value("legacyEq").toObject();
+    for (auto it = legacyEq.begin(); it != legacyEq.end(); ++it) {
+        const int track = it.key().toInt();
+        const QJsonObject state = it.value().toObject();
+        if (legacyEqUndoState(mixer, track) == state) continue;
+        AudioEQConfig cfg;
+        cfg.preamp = state.value("preamp").toDouble();
+        for (const QJsonValue &value : state.value("bands").toArray()) {
+            const QJsonObject band = value.toObject();
+            cfg.bands.append(EQBand{band.value("frequency").toDouble(),
+                                    band.value("gain").toDouble(), band.value("q").toDouble()});
+        }
+        mixer->setTrackEqConfig(track, cfg);
+        mixer->setTrackEqEnabled(track, state.value("eqEnabled").toBool());
     }
     reseedAudioFxDocks();
 }
@@ -20407,11 +20518,9 @@ void MainWindow::openRenderQueueDialog()
     }
     if (m_renderQueueDialog->queue())
         m_renderQueueDialog->queue()->setLoudnessGainDb(exporter_loudnessGainDb());
-    // RM-1.4/RM-1.3: keep the live Timeline's matte carrier current so a
-    // "current project" queue job exports the same track matte the GUI
-    // preview shows (the dialog has no save step before submitting).
+    // RM-1.4/RM-1.3: a "current project" queue job exports the live
+    // Timeline's matte carrier, the same one the GUI preview shows.
     syncProjectLightingToTimeline();
-    syncTrackMatteEntriesToTimeline(m_timeline, m_trackMatteClipEntries);
     m_renderQueueDialog->show();
     m_renderQueueDialog->raise();
     m_renderQueueDialog->activateWindow();

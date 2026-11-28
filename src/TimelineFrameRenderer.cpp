@@ -722,7 +722,9 @@ QImage gradeClipNativeFrame(const QImage &native,
     }
 
     // Back to the decoder's format so downstream scale/composite is unchanged.
-    return img.convertToFormat(QImage::Format_RGBA8888);
+    // US-1004: the RGB888 stages drop alpha, so restore the input's alpha
+    // (roto exterior, alpha media); a no-op for an opaque input.
+    return roto::clampAlphaToInput(native, img.convertToFormat(QImage::Format_RGBA8888));
 }
 
 // S5 — FX PACK stage. Apply the clip's per-clip video-effect stack exactly
@@ -769,6 +771,25 @@ QImage applyClipFxPack(const QImage &graded, const ClipInfo &clip,
         clipanim::effectiveEffectsAt(clip, clipLocalSeconds);
     if (effects.isEmpty())
         return graded;
+
+    // US-1004: a layer whose input carries alpha < 255 (roto exterior, alpha
+    // media) keeps it through every effect that does not move pixels: each such
+    // effect's output alpha is clamped to the alpha carried so far (a keyer
+    // combines with it by min). The effects receive exactly the images
+    // applyEffectStack feeds them, so RGB is unchanged; an enabled pixel-moving
+    // effect (roto::effectMovesPixels) restarts the carried alpha from its own
+    // output. A disabled effect returns its input (applyEffect), so it clamps.
+    if (roto::hasTranslucentPixel(graded)) {
+        QImage result = graded;
+        QImage alphaCarrier = graded;
+        for (const VideoEffect &effect : effects) {
+            result = VideoEffectProcessor::applyEffect(result, effect);
+            const bool moves = effect.enabled && effect.type != VideoEffectType::None
+                && roto::effectMovesPixels(effect.type);
+            alphaCarrier = moves ? result : roto::clampAlphaToInput(alphaCarrier, result);
+        }
+        return alphaCarrier.convertToFormat(QImage::Format_RGBA8888);
+    }
 
     // Genuine FX SSOT. Default ColorCorrection -> applyEffectStack's internal
     // applyColorCorrection is a strict no-op (VideoEffect.cpp:158), so this is

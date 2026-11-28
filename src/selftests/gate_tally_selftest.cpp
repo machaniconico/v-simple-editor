@@ -281,5 +281,37 @@ int runGateTallySelftest()
     tally.gate(13, envRun.finished && envRun.exitStatus == QProcess::NormalExit
         && envRun.exitCode != 0 && envMismatch);
 
+    // G14 catches a regression where the std::string detail disappears from
+    // a successful line while the failed line and summary still look valid.
+    std::ostringstream operandOutput;
+    previous = std::cerr.rdbuf(operandOutput.rdbuf());
+    selftest::GateTally operands;
+    operands.gate(1, true, std::string("operand=17"));
+    operands.gate(2, false, std::string("operand=23"));
+    const int operandResult = operands.finish(nullptr, false);
+    std::cerr.rdbuf(previous);
+    const std::string operandText = operandOutput.str();
+    const bool passDetail = operandText.find("PASS G1 operand=17\n") != std::string::npos;
+    const bool failDetail = operandText.find("FAIL G2 operand=23\n") != std::string::npos;
+    const bool operandSummary = operandText.find("summary: 1 PASS, 1 FAIL, 0 SKIP\n")
+        != std::string::npos;
+    std::ostringstream literalOutput;
+    previous = std::cerr.rdbuf(literalOutput.rdbuf());
+    selftest::GateTally literal;
+    literal.gate(3, true, "hidden");
+    const int literalResult = literal.finish(nullptr, false);
+    std::cerr.rdbuf(previous);
+    const std::string literalText = literalOutput.str();
+    const bool literalHidden = literalText.find("PASS G3\n") != std::string::npos
+        && literalText.find("hidden") == std::string::npos && literalResult == 0;
+    std::cerr << "gate-tally G14 passDetail=" << passDetail
+              << " failDetail=" << failDetail << " result=" << operandResult
+              << " passed=" << operands.passed << " failed=" << operands.failed
+              << " skipped=" << operands.skipped << " summary=" << operandSummary
+              << " literalHidden=" << literalHidden << '\n';
+    tally.gate(14, passDetail && failDetail && operandSummary && operandResult == 1
+        && operands.passed == 1 && operands.failed == 1 && operands.skipped == 0
+        && literalHidden);
+
     return tally.finish();
 }

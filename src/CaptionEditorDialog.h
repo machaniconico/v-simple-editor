@@ -47,6 +47,8 @@ signals:
 private slots:
     void onAddClipClicked();
     void onRemoveClipClicked();
+    void onSplitClicked();
+    void onMergeClicked();
     void onImportClicked();
     void onExportClicked();
     void onRecognizeClicked();
@@ -60,6 +62,8 @@ private slots:
 private:
     void rebuildClipTable();
     void refreshClipRow(int row);
+    void updateSplitMergeState();
+    QList<int> selectedRows() const;
     void updateStyleControls();
     void updatePreview();
     void syncSubtitleStyleFromCaptionStyle();
@@ -72,6 +76,7 @@ private:
     QTextEdit*       m_textEdit         = nullptr;
     QSpinBox*        m_startMsSpin      = nullptr;
     QSpinBox*        m_endMsSpin        = nullptr;
+    QSpinBox*        m_splitMsSpin      = nullptr;
 
     QFontComboBox*   m_fontCombo        = nullptr;
     QComboBox*       m_presetCombo      = nullptr;
@@ -95,6 +100,8 @@ private:
 
     QPushButton*     m_addClipButton    = nullptr;
     QPushButton*     m_removeClipButton = nullptr;
+    QPushButton*     m_splitButton      = nullptr;
+    QPushButton*     m_mergeButton      = nullptr;
     QPushButton*     m_importButton     = nullptr;
     QPushButton*     m_exportButton     = nullptr;
     QPushButton*     m_recognizeButton  = nullptr;

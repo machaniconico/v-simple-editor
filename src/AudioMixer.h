@@ -5,6 +5,7 @@
 #include <QVector>
 #include <QString>
 #include <QHash>
+#include <QSet>
 #include <QMutex>
 #include <QMutexLocker>
 #include <QIODevice>
@@ -167,6 +168,9 @@ public:
     // Production readData probe with the hardware sink stopped. Consumes the
     // sequence from zero and stops the decode worker; dedicated test mixers only.
     QByteArray renderPcmForTest(int frames);
+    // One readData pull after seekTo(0) without refilling the rings, so an
+    // entry active at zero takes the decoder-stall return. Same constraints.
+    QByteArray pullStalledBlockForTest(int frames);
 
     // Bus / submix / aux-send routing (AB-4). Replaces the per-track →
     // master bus-gain map consulted in the mix loop. The routing object is
@@ -211,6 +215,10 @@ public:
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);
     void setMasterDeEsser(const trackfx::DeEsserSettings &settings);
+    // Sets the master EQ and DeEsser together in one locked section.
+    void setMasterChain(const EqSettings &eq, bool eqEnabled,
+                        const trackfx::DeEsserSettings &deesser);
+    quint64 applyMasterChainLockedCallCountForTest() const;
     void setMasterEqBypassForTest(bool bypass);
     quint64 masterEqProcessCallsForTest() const;
     // Exercises the same post-sum, pre-normalizer stage as readData.
@@ -336,10 +344,29 @@ public:
     void setAutoDuckParams(const AutoDuckParams &params);
     AutoDuckParams autoDuckParams() const;
 
+    // Master tap: the final s16 block readData hands to the sink, normalized
+    // to float and kept in a fixed ring of the newest kMasterTapFrames stereo
+    // frames. Without subscribers readData copies nothing. The audio thread
+    // only tryLocks m_tapMutex and drops the block when the GUI holds it.
+    // masterTapAvailable is queued and coalesced: one pending notification at
+    // most. All four calls below are for the GUI thread.
+    static constexpr int kMasterTapFrames = 8192;
+    void subscribeMasterTap();
+    // The last unsubscribe discards the buffered frames.
+    void unsubscribeMasterTap();
+    // Moves the oldest min(buffered, maxFrames) frames into *interleaved
+    // (L, R, ...) and returns that frame count.
+    int takeMasterTap(QVector<float> *interleaved, int maxFrames);
+    // Runs the same tap write as readData.
+    void publishMasterBlockForTest(const int16_t *interleaved, int frames);
+    quint64 tapCopyCountForTest() const;
+    int tapSubscriberCountForTest() const;
+
 signals:
     void decoderError(const QString &message);
     void levelChanged(int trackIdx, float peakL, float peakR, float rmsL, float rmsR);
     void masterLevelChanged(float pkL, float pkR, float rmsL, float rmsR);
+    void masterTapAvailable();
 
 private:
     friend class MixerIODevice;
@@ -433,12 +460,24 @@ private:
     // The one writer of the master EQ / DeEsser: updates m_masterFxChain and the
     // m_masterEqFilter processor together. Caller holds m_controlMutex.
     void applyMasterChainLocked(const trackfx::Chain &chain);
+    quint64 m_applyMasterChainLockedCalls = 0;
     trackfx::Chain m_masterFxChain;
     MasterEqFilter m_masterEqFilter;
     bool m_masterEqBypassForTest = false;
     quint64 m_masterEqProcessCalls = 0;
     QHash<int, trackfx::Chain> m_trackFxChains;
     QHash<int, trackfx::Processor> m_trackFxProcessors;
+    // One identity per track index: remapTrackIndices moves it with the track
+    // and collectTrackState stores it ("trackIds"), so applyTrackState carries
+    // the live DeEsser listen monitor by track identity, never by index. An
+    // index past the snapshot's track count ("trackCount") gets a new identity.
+    std::array<quint64, kMaxAudioTracks> m_trackIdentities{};
+    // Identities that left the live tracks while their listen monitor was on.
+    // An entry lives until its identity is restored by applyTrackState (undo /
+    // redo brings the track back) or until clearTrackFx (project load); a track
+    // that never returns leaves one entry (8 bytes) until the next project load.
+    QSet<quint64> m_listenOfRemovedTracks;
+    void rememberListenLocked(quint64 identity, int liveIndex);
     bool m_legacyTrackFxPath = false;
     quint64 m_trackFxProcessCalls = 0;
     QHash<int, EqSettings> m_trackEq;
@@ -572,6 +611,18 @@ private:
     QVector<LevelAccum> m_trackLevelAccum;
     LevelAccum m_masterLevelAccum;
     qint64 m_lastLevelEmitNs = 0;
+
+    // Master tap ring (see subscribeMasterTap). m_tapRing / m_tapWrite /
+    // m_tapFill are guarded by m_tapMutex; the ring is allocated on the first
+    // subscribe so an unused tap costs no memory.
+    void writeMasterTap(const int16_t *interleaved, int frames);
+    QMutex m_tapMutex;
+    QVector<float> m_tapRing;
+    int m_tapWrite = 0;
+    int m_tapFill = 0;
+    std::atomic<int> m_tapSubscribers{0};
+    std::atomic<bool> m_tapNotifyPending{false};
+    std::atomic<quint64> m_tapCopyCount{0};
 
     AudioDecodeRunner *m_decodeRunner = nullptr;
 };
