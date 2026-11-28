@@ -886,6 +886,7 @@ private:
     // A restore that crosses sequences keeps the live entries it replaced and the
     // state's sequence id here until the switch signal (or restoreStateFinished).
     void onActiveSequenceChanged(const QString &oldId, const QString &newId);
+    void syncActiveSequenceConfigToPreview();
     QHash<QString, QHash<QString, TimeRemapClipEntry>> m_timeRemapEntriesBySequence;
     QHash<QString, TimeRemapClipEntry> m_restoreLeavingTimeRemaps;
     QString m_restoreStateSequenceId;
@@ -1000,6 +1001,7 @@ private:
     QImage m_lastCompositedFrame;
     QStringList m_supportedFormats;
     ProjectConfig m_projectConfig;
+    ProjectConfig m_baseProjectConfig;
     QVector<OverlayItem> m_projectOverlays;
     QHash<QString, ParticleEmitterConfig> m_particleClipConfigs;
     struct MediaRelinkSidecarState {

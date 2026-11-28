@@ -2936,6 +2936,16 @@ MainWindow::MainWindow(QWidget *parent)
     // US-2005: the time-remap entries follow the active sequence like Timeline's sidecars.
     connect(m_timeline, &Timeline::activeSequenceChanged,
             this, &MainWindow::onActiveSequenceChanged);
+    connect(m_timeline, &Timeline::sequenceSettingsChanged,
+            this, [this](const QString &seqId, int, int, double) {
+                if (!m_timeline) return;
+                const QString active = m_timeline->activeSequenceId().isEmpty()
+                    ? QStringLiteral("main") : m_timeline->activeSequenceId();
+                if (seqId == active)
+                    syncActiveSequenceConfigToPreview();
+            });
+    connect(m_timeline, &Timeline::restoreStateFinished,
+            this, &MainWindow::syncActiveSequenceConfigToPreview);
     connect(m_timeline, &Timeline::restoreStateFinished, this, [this]() {
         // No activeSequenceChanged fired (the slot clears these first): a restore that
         // lands on the sequence it left keeps that sequence's live entries and parks
@@ -9532,6 +9542,7 @@ void MainWindow::updateTitle()
 
 void MainWindow::applyProjectConfig(const ProjectConfig &config)
 {
+    m_baseProjectConfig = config;
     m_projectConfig = config;
     if (m_player) {
         m_player->setCanvasSize(config.width, config.height);
@@ -10323,7 +10334,7 @@ void MainWindow::refreshSpecialClipPreview()
 void MainWindow::populateProjectData(ProjectData &data)
 {
     syncProjectLightingToTimeline();
-    data.config = m_projectConfig;
+    data.config = m_baseProjectConfig.width > 0 ? m_baseProjectConfig : m_projectConfig;
     data.videoTracks = m_timeline->allVideoTracks();
     data.audioTracks = m_timeline->allAudioTracks();
     data.generatedCaptionOverlays = m_timeline->generatedCaptionOverlays();
@@ -10610,6 +10621,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     if (m_recentFilesManager && !filePath.isEmpty())
         m_recentFilesManager->addFile(filePath);
 
+    m_baseProjectConfig = data.config;
     m_projectConfig = data.config;
     clearLiveBrushAnimations();
     // roto は restoreFromProject より前に carrier へ入れる (setClips は carrier を
@@ -10833,6 +10845,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     if (m_timeline)
         m_timeline->setProjectOutputConfig(data.config.width, data.config.height,
                                            data.config.explicitOutputResolution, data.config.fps);
+    syncActiveSequenceConfigToPreview();
     if (m_timeline && m_timeline->undoManager()) {
         m_timeline->undoManager()->clear();
         m_timeline->saveUndoState(QStringLiteral("Project loaded"));
@@ -11486,6 +11499,44 @@ void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &ne
             if (!clips[c].uid.isEmpty())
                 m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
     }
+    syncActiveSequenceConfigToPreview();
+}
+
+void MainWindow::syncActiveSequenceConfigToPreview()
+{
+    if (!m_timeline)
+        return;
+    const ProjectConfig base = m_baseProjectConfig.width > 0 ? m_baseProjectConfig : m_projectConfig;
+    const QString activeId = m_timeline->activeSequenceId().isEmpty()
+        ? QStringLiteral("main") : m_timeline->activeSequenceId();
+    ProjectConfig target = base;
+    for (const TimelineSequence &seq : m_timeline->sequenceList()) {
+        if (seq.id == activeId && seq.hasCustomSettings()) {
+            target.width = seq.width;
+            target.height = seq.height;
+            target.fps = qMax(1, static_cast<int>(std::lround(seq.fps)));
+            target.explicitOutputResolution = true;
+            break;
+        }
+    }
+    if (target.width == m_projectConfig.width && target.height == m_projectConfig.height
+        && target.fps == m_projectConfig.fps
+        && target.explicitOutputResolution == m_projectConfig.explicitOutputResolution)
+        return;
+    m_projectConfig = target;
+    if (m_player) {
+        m_player->setCanvasSize(target.width, target.height);
+        m_player->setProjectOutputSize(target.explicitOutputResolution
+            ? QSize(target.width, target.height)
+            : QSize());
+    }
+    m_timeline->setProjectOutputConfig(target.width, target.height,
+                                       target.explicitOutputResolution, target.fps);
+    refreshSolvePointOverlay(m_timeline->playheadPosition());
+    applyTimecodeBurnInSettings(m_tcBurnIn);
+    updateTitle();
+    statusBar()->showMessage(QString("Sequence: %1 — %2 %3fps")
+        .arg(activeId).arg(target.resolutionLabel()).arg(target.fps));
 }
 
 void MainWindow::collectAudioState(ProjectData &data)

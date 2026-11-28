@@ -199,6 +199,7 @@ int runQrhiPreviewSelftest();
 int runPuppetArapSelftest();
 int runPuppetPhase3Selftest();
 int runMultibandCompSelftest();
+int runSequenceSettingsSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -999,6 +1000,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 32 ARAP Puppet Phase 3: Ctrl+Drag Puppet Sketch RDP simplification & trail, per-pin Wiggle & Expression secondary motion + Sway Presets, MCP get/set_clip_puppet + Undo + SSOT render (8 gates)" },
     { "multiband-comp", "VEDITOR_MULTIBAND_COMP_SELFTEST", runMultibandCompSelftest, true,
       "Wave 34 4-band phase-aligned LR4 Multiband Compressor: bit-exact bypass, flat crossover reconstruction, band isolation, solo audition, bypass/makeup/wet-dry, JSON round-trip, Master+Track AudioMixer GR & Undo, Export SSOT parity, Presets & UI Panel (9 gates)" },
+    { "sequence-settings", "VEDITOR_SEQUENCE_SETTINGS_SELFTEST", runSequenceSettingsSelftest, true,
+      "Wave 35 Per-Sequence Resolution & FPS Settings: project inheritance, independent W/H/FPS overrides, createSequenceWithSettings + 1-step Undo/Redo, active sequence switching, reset to inherit, sparse .veditor JSON round-trip, SequenceListDock & Dialog (7 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
