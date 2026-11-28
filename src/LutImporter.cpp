@@ -188,11 +188,7 @@ QVector3D LutImporter::trilinearInterpolate(const QVector<QVector3D> &table, int
 
 QVector3D LutImporter::sample(const LutData &lut, const QVector3D &rgb01)
 {
-    float n[3];
-    for (int c = 0; c < 3; ++c) {
-        const float lo = lut.domainMin[c];
-        n[c] = qBound(0.0f, (rgb01[c] - lo) / (lut.domainMax[c] - lo), 1.0f);
-    }
+    const QVector3D n = gpuDomainRemap(lut, rgb01);
     if (lut.type == LutType::Cube3D)
         return trilinearInterpolate(lut.table, lut.size, n[0], n[1], n[2]);
 
@@ -208,29 +204,19 @@ QVector3D LutImporter::sample(const LutData &lut, const QVector3D &rgb01)
     return out;
 }
 
-LutData LutImporter::toGpuGrid(const LutData &in, int maxSize)
+QVector3D LutImporter::gpuDomainRemap(const LutData &lut, const QVector3D &rgb01)
 {
-    if (!in.isValid() || (in.type == LutType::Cube3D && in.hasDefaultDomain()))
-        return in;
+    QVector3D n;
+    for (int c = 0; c < 3; ++c) {
+        const float lo = lut.domainMin[c];
+        n[c] = qBound(0.0f, (rgb01[c] - lo) / (lut.domainMax[c] - lo), 1.0f);
+    }
+    return n;
+}
 
-    // A non-default 3D domain is resampled densely so its knots and clamp edge stay
-    // within one grid step of the default-domain grid points.
-    const int n = in.type == LutType::Cube1D ? qBound(2, in.size, maxSize) : qMax(in.size, maxSize);
-    LutData out;
-    out.name = in.name;
-    out.filePath = in.filePath;
-    out.intensity = in.intensity;
-    out.type = LutType::Cube3D;
-    out.size = n;
-    out.table.resize(qint64(n) * n * n);
-    const float last = static_cast<float>(n - 1);
-    // .cube 3D layout: R changes fastest, then G, then B
-    int i = 0;
-    for (int b = 0; b < n; ++b)
-        for (int g = 0; g < n; ++g)
-            for (int r = 0; r < n; ++r)
-                out.table[i++] = sample(in, QVector3D(r / last, g / last, b / last));
-    return out;
+float LutImporter::gpuTexelCoord(int n, float x)
+{
+    return (qBound(0.0f, x, 1.0f) * static_cast<float>(n - 1) + 0.5f) / static_cast<float>(n);
 }
 
 QImage LutImporter::applyLut(const QImage &image, const LutData &lutData)

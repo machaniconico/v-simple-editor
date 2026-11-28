@@ -5,6 +5,7 @@
 // prompt / save-as / failure-dialog / missing-media seams.
 #include "../AudioMixer.h"
 #include "../AudioMixerDock.h"
+#include "../CompressorPanel.h"
 #include "../EffectClipboard.h"
 #include "../EffectControlsPanel.h"
 #include "../MainWindow.h"
@@ -13,8 +14,11 @@
 #include "../MultiCam.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../TimelineFrameRenderer.h"
+#include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../VideoPlayer.h"
+#include "../libavcore/Encode.h"
 #include "SelftestGate.h"
 
 #include <QApplication>
@@ -26,6 +30,9 @@
 #include <QFileInfo>
 #include <QHash>
 #include <QImage>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLabel>
 #include <QLayout>
 #include <QMenu>
@@ -35,10 +42,12 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSignalSpy>
+#include <QStatusBar>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTimer>
 
+#include <algorithm>
 #include <functional>
 #include <string>
 
@@ -52,6 +61,31 @@ bool touchFile(const QString &path)
 {
     QFile file(path);
     return file.open(QIODevice::WriteOnly) && file.write("media", 5) == 5;
+}
+
+// A 64x64, 1 s solid mpeg4 clip (no alpha) for the G13 matte render comparison.
+bool writeSolidClip(const QString &path, const QColor &color)
+{
+    libavcore::EncodeRequest req;
+    req.width = 64;
+    req.height = 64;
+    req.fps = 12;
+    req.fpsNum = 12;
+    req.fpsDen = 1;
+    req.videoBitrateBits = 600000;
+    req.outputPath = path.toStdString();
+    req.videoCodecName = "mpeg4";
+    req.hwVendorHint = "none";
+    req.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(req))
+        return false;
+    QImage frame(64, 64, QImage::Format_RGB888);
+    frame.fill(color);
+    for (int i = 0; i < 12; ++i)
+        if (!encoder.pushFrame(frame, i))
+            return false;
+    return !encoder.finalize();
 }
 
 ClipInfo makeClip(const QString &path)
@@ -130,7 +164,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 12; ++g)
+        for (int g = 1; g <= 14; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -1162,6 +1196,428 @@ int runUnsavedPromptSelftest()
             d += std::string(" | dragTransform-zeroMove stayedClean=") + b(stayedClean);
         }
         tally.gate(12, ok, d);
+    }
+
+    // ---- G13 (US-2208): opening a file starts from the default track count, so a previous
+    // session's extra tracks are not kept; the file's own tracks, flags and per-track sidecars survive ----
+    {
+        QString whyNot;
+        if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+            tally.skip(13, qPrintable(whyNot));
+        } else {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        const QString redPath = tmp("g13-red.mp4");
+        const QString halfPath = tmp("g13-black.mp4");
+        const QString mediaA = tmp("g13-a.mp3");
+        const bool filesOk = touchFile(mediaA) && writeSolidClip(redPath, QColor(200, 0, 0))
+            && writeSolidClip(halfPath, QColor(0, 0, 0));
+        // The probed ClipInfo of a real file, like a clip read back from a project.
+        const auto imageClip = [&](const QString &path) {
+            Timeline prober;
+            prober.addClip(path);
+            return prober.videoClips().isEmpty() ? makeClip(path) : prober.videoClips().first();
+        };
+        ProjectConfig cfg;
+        cfg.name = QStringLiteral("g13");
+        cfg.width = 64;
+        cfg.height = 64;
+        cfg.fps = 24;
+        // Builds a file with `videos` video tracks (one clip each) and one audio track.
+        const auto makeData = [&](int videos, bool flagged, bool matte) {
+            ProjectData data;
+            data.config = cfg;
+            QVector<QVector<ClipInfo>> v;
+            for (int i = 0; i < videos; ++i)
+                {
+                ClipInfo clip = imageClip(i == 2 ? redPath : halfPath);
+                clip.uid = QStringLiteral("g13-v%1").arg(i + 1);
+                if (i == 0)
+                    clip.opacity = 0.0; // the V1 base stays out of the comparison
+                v.append({clip});
+            }
+            data.videoTracks = v;
+            data.audioTracks = QVector<QVector<ClipInfo>>{{makeClip(mediaA)}};
+            if (flagged) {
+                QJsonObject v2;
+                v2.insert(QStringLiteral("locked"), true);
+                v2.insert(QStringLiteral("muted"), false);
+                v2.insert(QStringLiteral("solo"), false);
+                v2.insert(QStringLiteral("hidden"), false);
+                v2.insert(QStringLiteral("name"), QStringLiteral("B"));
+                data.trackFlags = QJsonObject{
+                    {QStringLiteral("video"), QJsonArray{QJsonObject{}, v2}},
+                    {QStringLiteral("audio"), QJsonArray{QJsonObject{}}}};
+                data.videoTracks.trackFlagsSnapshot = data.trackFlags;
+                data.audioTracks.trackFlagsSnapshot = data.trackFlags;
+            }
+            if (matte) {
+                data.trackMatteClipEntries.append(TrackMatteClipEntry{
+                    trackMatteClipKey(2, 0), TrackMatteType::LumaMatte, trackMatteClipKey(1, 0)});
+                // V2 clip matted by V1 (the renderer ignores a V1 source, so this one is a carrier-only check).
+                data.trackMatteClipEntries.append(TrackMatteClipEntry{
+                    trackMatteClipKey(1, 0), TrackMatteType::LumaMatte, trackMatteClipKey(0, 0)});
+            }
+            return data;
+        };
+        const auto grow = [&](MainWindow &w) {
+            w.m_timeline->addVideoTrack();
+            w.m_timeline->addVideoTrack();
+            w.m_timeline->addAudioTrack();
+        };
+        const auto savedFlags = [](const QString &path) {
+            QFile file(path);
+            if (!file.open(QIODevice::ReadOnly))
+                return QString();
+            return QString::fromUtf8(QJsonDocument(QJsonDocument::fromJson(file.readAll()).object()
+                .value(QStringLiteral("trackFlags")).toObject()).toJson(QJsonDocument::Compact));
+        };
+        bool okA = false, okB = false, okC = false, okD = false, okE = false;
+        std::string d = "files=" + b(filesOk);
+        {
+            MainWindow w13;
+            Timeline &tl = *w13.m_timeline;
+            Timeline probe;
+            grow(w13);
+            const int v0 = tl.videoTrackCount(), a0 = tl.audioTrackCount();
+            w13.applyLoadedProjectData(makeData(1, false, false), QString());
+            okA = filesOk && v0 == 3 && a0 == 2 && tl.videoTrackCount() == 1 && tl.audioTrackCount() == 1
+                && tl.videoTrackCount() == probe.videoTrackCount() && tl.audioTrackCount() == probe.audioTrackCount()
+                && !tl.undoManager()->canUndo() && !w13.isWindowModified();
+            d += " (a) before v=" + std::to_string(v0) + " a=" + std::to_string(a0) + " after v="
+                + std::to_string(tl.videoTrackCount()) + " a=" + std::to_string(tl.audioTrackCount())
+                + " canUndo=" + b(tl.undoManager()->canUndo()) + " modified=" + b(w13.isWindowModified());
+        }
+        {
+            MainWindow w13;
+            Timeline &tl = *w13.m_timeline;
+            grow(w13);
+            const ProjectData fileB = makeData(2, true, false);
+            w13.applyLoadedProjectData(fileB, QString());
+            const bool shape = tl.videoTrackCount() == 2 && tl.audioTrackCount() == 1;
+            const bool flags = shape && tl.videoTracks()[1]->isLocked() && tl.videoTracks()[1]->customName == QStringLiteral("B")
+                && !tl.videoTracks()[0]->isLocked();
+            okB = flags;
+            d += " | (b) v=" + std::to_string(tl.videoTrackCount()) + " locked=" + b(shape && tl.videoTracks()[1]->isLocked())
+                + " name=" + (shape ? tl.videoTracks()[1]->customName.toStdString() : std::string("?"));
+            // (d) round trip: save, open, the saved track flags equal the original's.
+            const QString origPath = tmp("g13-orig.veditor");
+            const QString savedPath = tmp("g13-roundtrip.veditor");
+            ProjectData reread;
+            const bool wrote = ProjectFile::save(origPath, fileB) && ProjectFile::load(origPath, reread);
+            w13.applyLoadedProjectData(reread, origPath);
+            ProjectData first;
+            w13.populateProjectData(first);
+            const bool saved = ProjectFile::save(savedPath, first);
+            ProjectData second;
+            const bool loaded = saved && ProjectFile::load(savedPath, second);
+            grow(w13);
+            w13.applyLoadedProjectData(second, savedPath);
+            const QString origFlags = savedFlags(origPath);
+            const bool same = !origFlags.isEmpty() && origFlags == savedFlags(savedPath);
+            okD = wrote && saved && loaded && flags && same
+                && tl.videoTrackCount() == 2 && tl.videoTracks()[1]->isLocked()
+                && tl.videoTracks()[1]->customName == QStringLiteral("B");
+            d += " (d) saved=" + b(saved) + " flagsSame=" + b(same)
+                + " reopenedLocked=" + b(tl.videoTrackCount() == 2 && tl.videoTracks()[1]->isLocked());
+        }
+        {
+            // (c) the per-track matte sidecar survives; the result equals a one-track session's.
+            MainWindow grown;
+            MainWindow baseline;
+            grow(grown);
+            grown.m_timeline->addVideoTrack();
+            const ProjectData fileC = makeData(3, false, true);
+            grown.applyLoadedProjectData(fileC, QString());
+            baseline.applyLoadedProjectData(fileC, QString());
+            const auto grownMatte = grown.m_timeline->trackMatteEntries();
+            const auto baseMatte = baseline.m_timeline->trackMatteEntries();
+            const QString key = trackMatteClipKey(2, 0);
+            const QString keyV2 = trackMatteClipKey(1, 0);
+            const bool keptV2 = grownMatte.contains(keyV2) && baseMatte.contains(keyV2)
+                && grownMatte.value(keyV2).matteType == TrackMatteType::LumaMatte
+                && grownMatte.value(keyV2).matteType == baseMatte.value(keyV2).matteType
+                && grownMatte.value(keyV2).matteSourceClipId == trackMatteClipKey(0, 0)
+                && grownMatte.value(keyV2).matteSourceClipId == baseMatte.value(keyV2).matteSourceClipId;
+            const bool kept = keptV2 && grownMatte.contains(key) && baseMatte.contains(key)
+                && grownMatte.value(key).matteType == baseMatte.value(key).matteType
+                && grownMatte.value(key).matteSourceClipId == baseMatte.value(key).matteSourceClipId
+                && grownMatte.size() == baseMatte.size();
+            const QImage gImg = tlrender::renderFrameAt(grown.m_timeline, 0, QSize(64, 64));
+            const QImage bImg = tlrender::renderFrameAt(baseline.m_timeline, 0, QSize(64, 64));
+            MainWindow plain;
+            plain.applyLoadedProjectData(makeData(3, false, false), QString());
+            const QImage pImg = tlrender::renderFrameAt(plain.m_timeline, 0, QSize(64, 64));
+            okC = filesOk && kept && !gImg.isNull() && gImg == bImg && gImg != pImg
+                && grown.m_timeline->videoTrackCount() == 3;
+            d += " | (c) keptEntry=" + b(kept) + " renderSameAsBaseline=" + b(!gImg.isNull() && gImg == bImg)
+                + " matteChangesRender=" + b(gImg != pImg);
+        }
+        {
+            // (e) negative control: growth still works when the file has more tracks than the session.
+            MainWindow w13;
+            const bool grew = w13.m_timeline->videoTrackCount() == 1;
+            w13.applyLoadedProjectData(makeData(3, false, false), QString());
+            okE = filesOk && grew && w13.m_timeline->videoTrackCount() == 3;
+            d += " | (e) before1=" + b(grew) + " after=" + std::to_string(w13.m_timeline->videoTrackCount());
+        }
+        tally.gate(13, okA && okB && okC && okD && okE, d);
+        }
+    }
+
+    // ---- G14 (US-2216): a drag / motion undo burst takes its point from the state its last write
+    // left, in capture order, before any other point; every leg reads the content of each undo step ----
+    {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        MainWindow w14;
+        Timeline &tl = *w14.m_timeline;
+        UndoManager *um = tl.undoManager();
+        const QString clipPath = tmp("g14-clip.mp4");
+        const bool filesOk = touchFile(clipPath);
+        VideoEffect blur;
+        blur.type = VideoEffectType::Blur;
+        const auto setup = [&] {
+            tl.videoTracks()[0]->setClips({makeClip(clipPath)});
+            tl.videoTracks()[0]->setSelectedClip(0);
+            um->clear();
+            tl.saveUndoState(QStringLiteral("Initial"));
+            w14.markProjectClean();
+        };
+        // The content of the V1 clip: motion writes the rotation, a drag writes scale / dx / dy.
+        // US-2220: legs (h) / (i) add the sidecars a burst must carry (empty for the others).
+        std::function<QString()> sidecarSig;
+        const auto sig = [&]() -> QString {
+            const QString extra = sidecarSig ? sidecarSig() : QString();
+            const auto &clips = tl.videoClips();
+            if (clips.isEmpty()) return QStringLiteral("none") + extra;
+            const ClipInfo &c = clips.first();
+            return QStringLiteral("s%1 x%2 y%3 r%4 e%5")
+                .arg(c.videoScale, 0, 'f', 2).arg(c.videoDx, 0, 'f', 2).arg(c.videoDy, 0, 'f', 2)
+                .arg(c.rotation2DDegrees, 0, 'f', 1).arg(c.effects.size()) + extra;
+        };
+        const auto expect = [](double scale, double dx, double dy, double rot, int effects) {
+            return QStringLiteral("s%1 x%2 y%3 r%4 e%5")
+                .arg(scale, 0, 'f', 2).arg(dx, 0, 'f', 2).arg(dy, 0, 'f', 2).arg(rot, 0, 'f', 1).arg(effects);
+        };
+        const auto motionWrite = [&] {
+            Q_EMIT tl.clipSelectedOnTrack(0, 0);
+            auto *motion = w14.m_effectControlsPanel->findChild<effectctrl::MotionSectionWidget *>();
+            if (!motion) return;
+            effectctrl::MotionState state = motion->currentMotion();
+            state.rotation2DDeg = 30.0;
+            Q_EMIT motion->motionChanged(state);
+        };
+        const auto dragWrite = [&](double scale) {
+            Q_EMIT w14.m_player->videoSourceTransformChanged(0, 0, scale, -0.3, 0.25);
+        };
+        const auto edit = [&] { tl.setClipEffects({blur}); };
+        const auto wait = [](int ms) { QCoreApplication::processEvents(); QTest::qWait(ms); };
+        struct Stack {
+            QStringList topFirst;
+            bool roundTrip = false;
+        };
+        // The content at the top, then after each undo; redo walks back up and must meet the same contents.
+        const auto walk = [&]() {
+            Stack out;
+            out.topFirst << sig();
+            while (um->canUndo()) {
+                tl.undo();
+                out.topFirst << sig();
+            }
+            QStringList up{sig()};
+            while (um->canRedo()) {
+                tl.redo();
+                up << sig();
+            }
+            QStringList down = out.topFirst;
+            std::reverse(down.begin(), down.end());
+            out.roundTrip = up == down;
+            return out;
+        };
+        const auto show = [](const QStringList &l) { return l.join(" > ").toStdString(); };
+        bool ok = filesOk;
+        std::string d = "files=" + b(filesOk);
+        setup();
+        const QString base = sig();
+        const QString M = expect(1.0, 0.0, 0.0, 30.0, 0);
+        const QString D = expect(2.0, -0.3, 0.25, 0.0, 0);
+        const QString DM = expect(2.0, -0.3, 0.25, 30.0, 0);
+        const QString DME = expect(2.0, -0.3, 0.25, 30.0, 1);
+        const QString ME = expect(1.0, 0.0, 0.0, 30.0, 1);
+        const QString DE = expect(2.0, -0.3, 0.25, 0.0, 1);
+        const auto leg = [&](const char *name, const QStringList &want, const std::function<void()> &run) {
+            setup();
+            run();
+            const Stack got = walk();
+            const bool legOk = got.topFirst == want && got.roundTrip;
+            ok = ok && legOk;
+            d += std::string(" | ") + name + " " + b(legOk) + " [" + show(got.topFirst) + "] want [" + show(want)
+                + "] roundTrip=" + b(got.roundTrip);
+        };
+        leg("(a) motion,edit", {ME, M, base}, [&] { motionWrite(); wait(50); edit(); wait(500); });
+        leg("(b) drag,delete", {QStringLiteral("none"), D, base}, [&] {
+            dragWrite(2.0); wait(50); tl.deleteSelectedClip(); wait(500); });
+        leg("(c) motion,drag,edit", {expect(2.0, -0.3, 0.25, 30.0, 1), DM, M, base}, [&] {
+            motionWrite(); wait(50); dragWrite(2.0); wait(50); edit(); wait(500); });
+        leg("(c') drag,motion,edit", {DME, DM, D, base}, [&] {
+            dragWrite(2.0); wait(50); motionWrite(); wait(50); edit(); wait(500); });
+        leg("(d) motion alone", {M, base}, [&] { motionWrite(); wait(500); });
+        leg("(d') drag alone", {D, base}, [&] { dragWrite(2.0); wait(500); });
+        leg("(f) motion,drag,wait", {DM, M, base}, [&] { motionWrite(); wait(50); dragWrite(2.0); wait(450); });
+        leg("(f') drag,motion,wait", {DM, D, base}, [&] { dragWrite(2.0); wait(50); motionWrite(); wait(450); });
+        leg("(f2) drag across the motion timeout", {expect(3.0, -0.3, 0.25, 30.0, 0), M, base}, [&] {
+            motionWrite(); wait(50); dragWrite(2.0); wait(280); dragWrite(2.5); wait(280); dragWrite(3.0); wait(700); });
+        // (g) an undo that bypasses MainWindow (MCP) between two bursts: the drag's point is stale and dropped;
+        // nothing the undo removed comes back.
+        leg("(g) bypass undo", {ME, M, base}, [&] {
+            edit();                        // a point past the base, for the MCP undo to remove
+            wait(10);
+            motionWrite(); wait(50);       // t = 0 / 60
+            dragWrite(2.0); wait(50);      // t = 50
+            tl.undo(); wait(20);           // t = 100: undoes the edit, bypassing MainWindow
+            motionWrite(); wait(30);       // t = 120: re-bases the motion burst only
+            edit(); wait(500);             // t = 150: flush in capture order
+        });
+        // US-2220 (h): a relink within the burst rewrites the overlay before its save; the burst's
+        // point keeps the overlay it captured, so each step has clip and overlay on the same path.
+        // Detects: commitUndoBurst leaving the live (already relinked) overlay on the burst's entry.
+        {
+            const QString newPath = tmp("g14-relinked.mp4");
+            const bool newOk = touchFile(newPath);
+            OverlayItem overlay;
+            overlay.id = 1;
+            overlay.type = QStringLiteral("image");
+            overlay.text = clipPath;
+            const auto pathTag = [&](const QString &p) {
+                return p == clipPath ? QStringLiteral("old") : p == newPath ? QStringLiteral("new") : p;
+            };
+            sidecarSig = [&]() -> QString {
+                const auto &clips = tl.videoClips();
+                const QString clip = clips.isEmpty() ? QStringLiteral("-") : pathTag(clips.first().filePath);
+                const QString ov = w14.m_projectOverlays.isEmpty() ? QStringLiteral("-")
+                                                                   : pathTag(w14.m_projectOverlays.first().text);
+                return QStringLiteral(" clip=%1 overlay=%2").arg(clip, ov);
+            };
+            const QString oldSide = QStringLiteral(" clip=old overlay=old");
+            const QString newSide = QStringLiteral(" clip=new overlay=new");
+            w14.m_projectOverlays = {overlay};
+            bool relinked = false;
+            leg("(h) motion,relink", {M + newSide, M + oldSide, base + oldSide}, [&] {
+                motionWrite(); wait(50);
+                relinked = w14.relinkMediaPaths({{clipPath, newPath}});
+                wait(500);
+            });
+            ok = ok && newOk && relinked;
+            d += " relinked=" + b(relinked) + " newFile=" + b(newOk);
+            sidecarSig = nullptr;
+            w14.m_projectOverlays.clear();
+        }
+        // US-2220 (i): an audio FX dock saves after the mixer changed; the burst's point keeps the FX it
+        // captured, so undoing the FX step reverts the FX and keeps the motion.
+        // Detects: commitUndoBurst leaving the live (post-gesture) FX on the burst's entry.
+        {
+            w14.openCompressorPanel();
+            auto *panel = w14.m_compressorDock ? qobject_cast<CompressorPanel *>(w14.m_compressorDock->widget())
+                                               : nullptr;
+            AudioMixer *mixer = w14.m_player->audioMixer();
+            QJsonObject fxBefore, fxAfter;
+            sidecarSig = [&]() -> QString {
+                const QJsonObject fx = mixer ? audiofxui::undoState(mixer) : QJsonObject{};
+                return fx == fxBefore ? QStringLiteral(" fx=before")
+                    : fx == fxAfter  ? QStringLiteral(" fx=after") : QStringLiteral(" fx=other");
+            };
+            leg("(i) motion,fx gesture", {M + QStringLiteral(" fx=after"), M + QStringLiteral(" fx=before"),
+                                          base + QStringLiteral(" fx=before")}, [&] {
+                if (!panel || !mixer) return;
+                fxBefore = audiofxui::undoState(mixer);
+                motionWrite(); wait(50);
+                AudioMixer::CompressorSettings c = mixer->compressorForTrack(0);
+                c.enabled = true;
+                c.thresholdDb = -20.0;
+                c.ratio = 4.0;
+                mixer->setCompressorForTrack(0, c);
+                fxAfter = audiofxui::undoState(mixer);
+                Q_EMIT panel->gestureFinished(0);
+                wait(500);
+            });
+            const bool fxChanged = panel && mixer && !fxAfter.isEmpty() && fxAfter != fxBefore;
+            ok = ok && fxChanged;
+            d += " panel=" + b(panel != nullptr) + " fxChanged=" + b(fxChanged);
+            sidecarSig = nullptr;
+        }
+        // US-2220 (j): the EQ migration within a burst commits the burst first, so the pre-migration
+        // legacy EQ pin lands on the burst's entry and undoing the migration re-enables the legacy EQ.
+        // Detects: the pin landing on the entry before the burst, so undo to the burst loses track EQ.
+        {
+            AudioMixer *mixer = w14.m_player->audioMixer();
+            QAction *migrate = nullptr;
+            if (auto *trackEqMenu = w14.findChild<QMenu *>(QStringLiteral("trackEqMenu"))) {
+                Q_EMIT trackEqMenu->aboutToShow();
+                for (QAction *action : trackEqMenu->actions())
+                    if (action->menu() && action->text() == QStringLiteral("A1"))
+                        migrate = action->menu()->findChild<QAction *>(QStringLiteral("trackEqMigrateTo4Band"));
+            }
+            AudioEQConfig legacy;
+            legacy.bands.resize(2);
+            legacy.bands[1] = EQBand{1000.0, -12.0, 1.0};
+            QJsonObject chainPre, chainMigrated;
+            QString migrateMessage;
+            sidecarSig = [&]() -> QString {
+                if (!mixer) return QStringLiteral(" mixer=-");
+                const AudioEQConfig cfg = mixer->trackEqConfig(0);
+                const bool on = mixer->trackEqEnabled(0) && cfg.bands.size() == 2
+                    && cfg.bands[1].frequency == 1000.0 && cfg.bands[1].gain == -12.0;
+                const bool off = !mixer->trackEqEnabled(0) && cfg.bands.isEmpty();
+                const QJsonObject chain = mixer->trackChain(0).toJson();
+                return QStringLiteral(" eq=%1 chain=%2")
+                    .arg(on ? QStringLiteral("on") : off ? QStringLiteral("off") : QStringLiteral("other"),
+                         chain == chainPre ? QStringLiteral("pre")
+                             : chain == chainMigrated ? QStringLiteral("migrated") : QStringLiteral("other"));
+            };
+            const QString on = QStringLiteral(" eq=on chain=pre");
+            const QString migrated = QStringLiteral(" eq=off chain=migrated");
+            // (i) left a compressor, which refuses the migration; clear it before setup() records the base.
+            if (mixer) mixer->setTrackChain(0, trackfx::Chain{});
+            leg("(j) motion,eq migration", {M + migrated, M + on, base + on}, [&] {
+                if (!mixer || !migrate) return;
+                mixer->setTrackEqEnabled(0, true);
+                mixer->setTrackEqConfig(0, legacy);
+                chainPre = mixer->trackChain(0).toJson();
+                motionWrite(); wait(50);
+                migrate->trigger();
+                migrateMessage = w14.statusBar()->currentMessage();
+                chainMigrated = mixer->trackChain(0).toJson();
+                wait(500);
+            });
+            const bool migratedOk = mixer && migrate && !chainMigrated.isEmpty() && chainMigrated != chainPre
+                && mixer->trackChain(0).eqEnabled;
+            ok = ok && migratedOk;
+            d += " migrateAction=" + b(migrate != nullptr) + " chainMigrated=" + b(migratedOk)
+                + " message=" + migrateMessage.toStdString();
+            sidecarSig = nullptr;
+            if (mixer) {
+                mixer->setTrackChain(0, trackfx::Chain{});
+                mixer->setTrackEqEnabled(0, false);
+                mixer->setTrackEqConfig(0, AudioEQConfig{});
+            }
+        }
+        // (e) a flush while the timeline restores takes no point, even with the burst live.
+        {
+            setup();
+            tl.saveUndoState(QStringLiteral("pre"));
+            motionWrite();
+            int calls = 0;
+            const QMetaObject::Connection conn = QObject::connect(&tl, &Timeline::clipSelectedOnTrack, &tl,
+                [&](int, int) { if (tl.isRestoringState()) { ++calls; w14.flushPendingUndoPoints(); } });
+            tl.undo();
+            QObject::disconnect(conn);
+            const bool noPoint = calls >= 1 && um->canRedo() && um->currentIndex() == 0;
+            wait(500);
+            const bool stillNone = um->canRedo() && um->currentIndex() == 0;
+            ok = ok && noPoint && stillNone;
+            d += std::string(" | (e) restore flushCalls=") + std::to_string(calls) + " noPoint=" + b(noPoint)
+                + " afterTimeout=" + b(stillNone);
+        }
+        tally.gate(14, ok, d);
     }
 
     window.setUnsavedChangesPromptForTest({});

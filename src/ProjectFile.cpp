@@ -12,8 +12,10 @@
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
+#include <QJsonParseError>
 #include <QSaveFile>
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 
@@ -1071,6 +1073,62 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     return file.commit();
 }
 
+// US-2207: a non-active sequence's legacy time-remap entries go onto its store clips that
+// carry no inline timeRemapCurve (files saved before the curve rode on the clip); an inline
+// curve wins. Called at the end of load / fromJsonString so every consumer sees the same data.
+void ProjectFile::applyLegacyTimeRemapToStores(ProjectData &data)
+{
+    const QString storeKey = timeline_nesting::sequenceStoreParentKey();
+    for (ClipParentEntry &entry : data.clipParentEntries) {
+        if (entry.clipId != storeKey)
+            continue;
+        QJsonObject store = timeline_nesting::decodeSequenceStoreObject(entry.parentClipId);
+        const QString activeId = store.value(QStringLiteral("activeSequenceId")).toString();
+        QJsonArray sequences = store.value(QStringLiteral("sequences")).toArray();
+        bool storeChanged = false;
+        for (int si = 0; si < sequences.size(); ++si) {
+            QJsonObject sequence = sequences.at(si).toObject();
+            const QString id = sequence.value(QStringLiteral("id")).toString();
+            const auto sidecarIt = data.sequenceSidecars.constFind(id);
+            if (id == activeId || sidecarIt == data.sequenceSidecars.cend()
+                || sidecarIt->timeRemapClipEntries.isEmpty())
+                continue;
+            QHash<QString, timeremap::TimeRemapCurve> curves;
+            for (const TimeRemapClipEntry &remap : sidecarIt->timeRemapClipEntries)
+                if (!remap.clipId.isEmpty())
+                    curves.insert(canonicalClipKey(remap.clipId), remap.curve);
+            QJsonArray tracks = sequence.value(QStringLiteral("videoTracks")).toArray();
+            bool sequenceChanged = false;
+            for (int ti = 0; ti < tracks.size(); ++ti) {
+                QJsonArray clips = tracks.at(ti).toArray();
+                bool trackChanged = false;
+                for (int ci = 0; ci < clips.size(); ++ci) {
+                    QJsonObject clip = clips.at(ci).toObject();
+                    const auto curveIt = curves.constFind(trackMatteClipKey(ti, ci));
+                    if (curveIt == curves.cend() || clip.contains(QStringLiteral("timeRemapCurve")))
+                        continue;
+                    clip[QStringLiteral("timeRemapCurve")] = curveIt->toJson();
+                    clips.replace(ci, clip);
+                    trackChanged = true;
+                }
+                if (trackChanged) {
+                    tracks.replace(ti, clips);
+                    sequenceChanged = true;
+                }
+            }
+            if (sequenceChanged) {
+                sequence[QStringLiteral("videoTracks")] = tracks;
+                sequences.replace(si, sequence);
+                storeChanged = true;
+            }
+        }
+        if (storeChanged) {
+            store[QStringLiteral("sequences")] = sequences;
+            entry.parentClipId = timeline_nesting::encodeSequenceStoreObject(store);
+        }
+    }
+}
+
 void ProjectFile::applyTimeRemapEntries(Timeline *timeline,
                                         const QVector<TimeRemapClipEntry> &entries)
 {
@@ -1153,14 +1211,145 @@ static int intOr(const QJsonValue &v, int def, int lo, int hi)
     return int(std::min(std::max(d, double(lo)), double(hi)));
 }
 
+// US-2215: classify a number token std::from_chars (locale independent) reports as
+// out of range. MSVC returns result_out_of_range with +-inf / 0 for 1e309 and 1e-400
+// alike, so the value cannot tell them apart: the sign of the decimal exponent of the
+// first non-zero mantissa digit does.
+static bool numberTokenOverflows(const char *first, const char *last)
+{
+    const char *p = first;
+    if (p < last && *p == '-') ++p;
+    long long intDigitsAfterFirstNonZero = 0; // digits at and after the first non-zero one, left of '.'
+    long long leadingFractionZeros = 0;       // zeros between '.' and the first non-zero digit
+    bool seenNonZero = false, inFraction = false;
+    for (; p < last && *p != 'e' && *p != 'E'; ++p) {
+        if (*p == '.') { inFraction = true; continue; }
+        if (!seenNonZero && *p == '0') {
+            if (inFraction) ++leadingFractionZeros;
+            continue;
+        }
+        seenNonZero = true;
+        if (!inFraction) ++intDigitsAfterFirstNonZero;
+    }
+    long long exp = 0;
+    if (p < last) {
+        ++p;
+        const bool neg = p < last && *p == '-';
+        if (p < last && (*p == '-' || *p == '+')) ++p;
+        for (; p < last && *p >= '0' && *p <= '9'; ++p)
+            exp = std::min(exp * 10 + (*p - '0'), 100000000LL);
+        if (neg) exp = -exp;
+    }
+    const long long magnitude = intDigitsAfterFirstNonZero > 0 ? exp + intDigitsAfterFirstNonZero - 1
+                                                               : exp - leadingFractionZeros - 1;
+    return magnitude > 0;
+}
+
+// True when [p, last) is exactly one JSON number: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+static bool isJsonNumberToken(const char *p, const char *last)
+{
+    auto digits = [&]() {
+        const char *start = p;
+        while (p < last && *p >= '0' && *p <= '9') ++p;
+        return p - start;
+    };
+    if (p < last && *p == '-') ++p;
+    if (p < last && *p == '0') ++p;
+    else if (p < last && *p >= '1' && *p <= '9') digits();
+    else return false;
+    if (p < last && *p == '.') {
+        ++p;
+        if (digits() == 0) return false;
+    }
+    if (p < last && (*p == 'e' || *p == 'E')) {
+        ++p;
+        if (p < last && (*p == '+' || *p == '-')) ++p;
+        if (digits() == 0) return false;
+    }
+    return p == last;
+}
+
+bool ProjectFile::parseProjectJson(const QByteArray &json, QJsonDocument &doc, QString *err, int *clampedCount)
+{
+    QByteArray rewritten;
+    struct Substitution { qsizetype start, end, originalLength; }; // span in the rewritten buffer
+    QList<Substitution> substitutions;
+    int clamped = 0;
+    const char *const begin = json.constData();
+    const char *const end = begin + json.size();
+    const char *copied = begin; // start of the not yet copied tail
+    for (const char *p = begin; p < end;) {
+        const char c = *p;
+        if (c == '"') { // skip the string, honouring backslash escapes
+            for (++p; p < end && *p != '"'; ++p)
+                if (*p == '\\' && p + 1 < end) ++p;
+            if (p < end) ++p;
+        } else if (c == '-' || (c >= '0' && c <= '9')) {
+            const char *tokenEnd = p + 1;
+            while (tokenEnd < end && ((*tokenEnd >= '0' && *tokenEnd <= '9') || *tokenEnd == '.' || *tokenEnd == '+'
+                                      || *tokenEnd == '-' || *tokenEnd == 'e' || *tokenEnd == 'E'))
+                ++tokenEnd;
+            double value = 0.0;
+            const auto res = std::from_chars(p, tokenEnd, value);
+            if (res.ec == std::errc::result_out_of_range && res.ptr == tokenEnd
+                && isJsonNumberToken(p, tokenEnd)) {
+                if (rewritten.isEmpty())
+                    rewritten.reserve(json.size() + 32);
+                rewritten.append(copied, int(p - copied));
+                const qsizetype substitutionStart = rewritten.size();
+                const bool negative = *p == '-';
+                if (numberTokenOverflows(p, tokenEnd))
+                    rewritten.append(negative ? "-1.7976931348623157e308" : "1.7976931348623157e308");
+                else
+                    rewritten.append("0");
+                substitutions.append({substitutionStart, rewritten.size(), qsizetype(tokenEnd - p)});
+                copied = tokenEnd;
+                ++clamped;
+            }
+            p = tokenEnd;
+        } else {
+            ++p;
+        }
+    }
+    if (clamped > 0) {
+        rewritten.append(copied, int(end - copied));
+        qWarning("ProjectFile: clamped %d out-of-range number literal(s) to +-DBL_MAX / 0 while reading the project JSON",
+                 clamped);
+    }
+    if (clampedCount)
+        *clampedCount = clamped;
+    QJsonParseError parseError;
+    doc = QJsonDocument::fromJson(clamped > 0 ? rewritten : json, &parseError);
+    if (parseError.error != QJsonParseError::NoError) {
+        // Report the offset in the user's file, not in the rewritten buffer.
+        qsizetype offset = parseError.offset;
+        if (clamped > 0) {
+            qsizetype shift = 0;
+            for (const Substitution &s : substitutions) {
+                if (s.end <= offset)
+                    shift += s.originalLength - (s.end - s.start);
+                else if (s.start < offset) { // inside a substituted span: the token's start
+                    offset = s.start;
+                    break;
+                }
+            }
+            offset += shift;
+        }
+        if (err)
+            *err = QStringLiteral("JSON parse error at byte %1: %2").arg(offset).arg(parseError.errorString());
+        return false;
+    }
+    return true;
+}
+
 bool ProjectFile::load(const QString &filePath, ProjectData &data, QString *errorMessage)
 {
     QFile file(filePath);
     if (!file.open(QIODevice::ReadOnly))
         return false;
 
-    QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    if (doc.isNull()) return false;
+    QJsonDocument doc;
+    if (!parseProjectJson(file.readAll(), doc, errorMessage)) return false;
 
     QJsonObject root = doc.object();
     int version = 1;
@@ -1331,6 +1520,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data, QString *erro
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
+    applyLegacyTimeRemapToStores(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -1731,8 +1921,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
 
 bool ProjectFile::fromJsonString(const QString &json, ProjectData &data, QString *errorMessage)
 {
-    QJsonDocument doc = QJsonDocument::fromJson(json.toUtf8());
-    if (doc.isNull()) return false;
+    QJsonDocument doc;
+    if (!parseProjectJson(json.toUtf8(), doc, errorMessage)) return false;
 
     QJsonObject root = doc.object();
     int version = 1;
@@ -1903,6 +2093,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data, QString
     appendSequenceStoreEntryFromRoot(root, data.clipParentEntries);
     readSequenceSidecarsFromRoot(root, data);
     migrateLegacyColorCorrectionKeyframes(data);
+    applyLegacyTimeRemapToStores(data);
     data.vfxState = root.contains("vfxState")
         ? vfxStateFromJson(root["vfxState"].toObject())
         : ProjectVfxState{};
@@ -2196,6 +2387,10 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
             stabilizer.append(k);
         }
         obj["stabilizerKeyframes"] = stabilizer;
+        // US-2202: the size the keys were analysed at; omitted when unknown.
+        if (clip.stabilizerSourceSize.isValid())
+            obj["stabilizerSourceSize"] = QJsonArray{clip.stabilizerSourceSize.width(),
+                                                     clip.stabilizerSourceSize.height()};
     }
     if (!clip.maskTrackingData.isEmpty())
         obj["maskTracking"] = trackingResultToJson(clip.maskTrackingData);
@@ -2361,6 +2556,15 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         kf.theta = k["theta"].toDouble(0.0);
         kf.scale = k["scale"].toDouble(1.0);
         clip.stabilizerKeyframes.append(kf);
+    }
+    // US-2202: [w, h] of whole numbers in 1..32768, else unknown (the frame size).
+    if (!clip.stabilizerKeyframes.isEmpty()) {
+        const QJsonArray size = obj["stabilizerSourceSize"].toArray();
+        const double w = size.size() == 2 ? size.at(0).toDouble(0.0) : 0.0;
+        const double h = size.size() == 2 ? size.at(1).toDouble(0.0) : 0.0;
+        if (w >= 1.0 && h >= 1.0 && w <= 32768.0 && h <= 32768.0
+            && w == std::floor(w) && h == std::floor(h))
+            clip.stabilizerSourceSize = QSize(int(w), int(h));
     }
     if (obj.contains("maskTracking"))
         clip.maskTrackingData = trackingResultFromJson(obj["maskTracking"].toObject());

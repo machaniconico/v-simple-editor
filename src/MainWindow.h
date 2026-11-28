@@ -47,6 +47,7 @@ class PuppetPinTool;
 #include "playback/AutoProxyPolicy.h"  // マルチトラック自動プロキシ判定エンジン (プレビュー専用)
 #include <QSet>
 #include <optional>
+#include <memory>
 #include "PlaybackTypes.h"
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
@@ -113,6 +114,8 @@ class VideoPlayer;
 namespace stabwarp { struct StabSample; }
 bool shouldSkipAutosaveRecovery(const QStringList &args, const QProcessEnvironment &env);
 class Timeline;
+class QTimer;
+struct TimelineState;
 class TimelineTrack;
 class SourceMonitorDock;
 class StillGalleryDock;
@@ -346,6 +349,9 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    // Applies the burn-in settings and records a named undo point (the settings ride in
+    // the sidecarState); the MCP tool and the dialog both commit through here.
+    void commitTimecodeBurnInSettings(const TimecodeBurnInSettings &settings, const QString &label);
     void convertAudioToKeyframes(int trackIndex, int clipIndex);
     // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
     int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
@@ -882,6 +888,15 @@ private:
     bool m_hasRestoreLeaving = false;
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
+    // US-2216: the drag / motion undo bursts. Each write stores the state it left (captured
+    // after the write) and numbers the burst by its first write; the point is taken from
+    // that state, in capture order, by the one commit routine the timers and the flush share.
+    void captureUndoBurst(QTimer *timer);
+    void commitUndoBurst(QTimer *timer);
+    void flushPendingUndoPoints();
+    QHash<QTimer *, std::shared_ptr<TimelineState>> m_undoBurstSnapshots;
+    quint64 m_undoBurstSeq = 0;
+    bool m_flushingUndoBursts = false;
     bool m_promptForMissingMedia = true;
     bool m_dirtyOutsideUndo = false;
     bool m_syncingDirtyFromUndo = false;
@@ -989,6 +1004,8 @@ private:
         QJsonObject audioFx; // audiofxui::undoState of the mixer at this entry
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
+    // US-2220: the sidecars of each pending undo burst, captured with its snapshot.
+    QHash<QTimer *, MediaRelinkSidecarState> m_undoBurstSidecars;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
     bool m_offlineRefreshQueued = false; // US-1408: coalesces mediaImported refreshes
     int m_mediaRelinkObservedUndoIndex = -1;

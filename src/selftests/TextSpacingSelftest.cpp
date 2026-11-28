@@ -1,6 +1,7 @@
 #include "../TextManager.h"
 #include "../TextOverlayBake.h"
 
+#include <QFontDatabase>
 #include <QFontMetrics>
 #include <QGuiApplication>
 #include <QImage>
@@ -17,6 +18,18 @@
 #include <cstring>
 
 namespace {
+
+// True when at least one smoothly scalable font family resolves. The offscreen
+// platform has none (QT_QPA_FONTDIR unset), so text glyphs are not drawn there.
+bool hasScalableFontFamily()
+{
+    const QStringList families = QFontDatabase::families();
+    for (const QString &family : families) {
+        if (QFontDatabase::isSmoothlyScalable(family))
+            return true;
+    }
+    return false;
+}
 
 bool sameImageBytes(const QImage &a, const QImage &b)
 {
@@ -172,11 +185,15 @@ int runTextSpacingSelftest()
             textbake::bakeOverlays(source, trackedList, 0.0, -1, 1.0);
         const QRect normalBounds = alphaBounds(normal);
         const QRect expandedBounds = alphaBounds(expanded);
-        printGate("G2 TRACKING WIDTH",
-                  normalBounds.isValid() && expandedBounds.isValid()
-                      && expandedBounds.width() > normalBounds.width(),
-                  "positive letterSpacing did not increase rendered glyph bounds",
-                  passed, failed);
+        if (!hasScalableFontFamily()) {
+            std::printf("[text-spacing] G2 TRACKING WIDTH: SKIP - no scalable font family\n");
+        } else {
+            printGate("G2 TRACKING WIDTH",
+                      normalBounds.isValid() && expandedBounds.isValid()
+                          && expandedBounds.width() > normalBounds.width(),
+                      "positive letterSpacing did not increase rendered glyph bounds",
+                      passed, failed);
+        }
     }
 
     {

@@ -2,6 +2,7 @@
 
 #include <QString>
 #include <QMetaType>
+#include <QSize>
 #include <QVector>
 #include "Overlay.h"
 #include "MotionStabilizer.h"
@@ -132,6 +133,9 @@ struct PlaybackEntry {
     // = identity (no stabilization). VideoPlayer pushes the active entry's
     // vector to GLPreview so the inverse 2D affine pre-warp can run.
     QVector<StabilizerKeyframe> stabilizerKeyframes;
+    // US-2202: ClipInfo::stabilizerSourceSize (the keys' analysed size), carried
+    // here because `filePath` may name a smaller proxy. Invalid = the frame size.
+    QSize stabilizerSourceSize;
 };
 
 Q_DECLARE_METATYPE(AudioGainPoint)

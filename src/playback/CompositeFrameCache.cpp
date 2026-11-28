@@ -31,6 +31,12 @@ void CompositeFrameCache::setMemoryBudgetBytes(qint64 bytes)
 
 bool CompositeFrameCache::tryGet(const CompositeFrameKey& key, QImage& outImage)
 {
+    return tryGet(key, outImage, nullptr);
+}
+
+bool CompositeFrameCache::tryGet(const CompositeFrameKey& key, QImage& outImage,
+                                 bool *v1StabBaked)
+{
     QMutexLocker locker(&m_mutex);
 
     auto it = m_cache.find(key);
@@ -43,12 +49,20 @@ bool CompositeFrameCache::tryGet(const CompositeFrameKey& key, QImage& outImage)
     m_lruOrder.removeOne(key);
     m_lruOrder.append(key);
 
-    outImage = it.value();
+    outImage = it.value().image;
+    if (v1StabBaked)
+        *v1StabBaked = it.value().v1StabBaked;
     ++m_hits;
     return true;
 }
 
 void CompositeFrameCache::put(const CompositeFrameKey& key, const QImage& image)
+{
+    put(key, image, false);
+}
+
+void CompositeFrameCache::put(const CompositeFrameKey& key, const QImage& image,
+                              bool v1StabBaked)
 {
     QMutexLocker locker(&m_mutex);
 
@@ -67,7 +81,7 @@ void CompositeFrameCache::put(const CompositeFrameKey& key, const QImage& image)
 
     // If already cached, remove old entry first to re-insert as most-recent.
     if (m_cache.contains(key)) {
-        const qint64 oldBytes = static_cast<qint64>(m_cache.value(key).sizeInBytes());
+        const qint64 oldBytes = static_cast<qint64>(m_cache.value(key).image.sizeInBytes());
         m_cache.remove(key);
         m_lruOrder.removeOne(key);
         m_currentBytes -= oldBytes;
@@ -79,7 +93,7 @@ void CompositeFrameCache::put(const CompositeFrameKey& key, const QImage& image)
         return;
     }
 
-    m_cache.insert(key, image);
+    m_cache.insert(key, Entry{image, v1StabBaked});
     m_lruOrder.append(key);
     m_currentBytes += frameBytes;
 }
@@ -97,7 +111,7 @@ void CompositeFrameCache::invalidateRevision(quint64 currentRevision)
     }
 
     for (const CompositeFrameKey& k : std::as_const(toRemove)) {
-        const qint64 bytes = static_cast<qint64>(m_cache.value(k).sizeInBytes());
+        const qint64 bytes = static_cast<qint64>(m_cache.value(k).image.sizeInBytes());
         m_cache.remove(k);
         m_lruOrder.removeOne(k);
         m_currentBytes -= bytes;
@@ -142,7 +156,7 @@ void CompositeFrameCache::evictToFit(qint64 neededBytes)
     {
         const CompositeFrameKey lruKey = m_lruOrder.front();
         m_lruOrder.removeFirst();
-        const qint64 freed = static_cast<qint64>(m_cache.value(lruKey).sizeInBytes());
+        const qint64 freed = static_cast<qint64>(m_cache.value(lruKey).image.sizeInBytes());
         m_cache.remove(lruKey);
         m_currentBytes -= freed;
     }

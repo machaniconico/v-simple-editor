@@ -2632,7 +2632,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_project_option"),
-        QStringLiteral("プロジェクト全体の設定を変更する。現在は option=timecodeBurnIn を受け付け、プレビューと以後の書き出しへ即時反映する。undo 対象外。"),
+        QStringLiteral("プロジェクト全体の設定を変更する。現在は option=timecodeBurnIn を受け付け、プレビューと以後の書き出しへ即時反映する。成功した呼び出しは 1 回の undo 点 (「タイムコード焼き込み (MCP)」) になり、undo で直前の設定へ戻る。"),
         schemaWithRequired(QJsonObject{
             {QStringLiteral("option"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -2739,8 +2739,8 @@ void McpEditorTools::registerWriteTools()
                 merged.insert(it.key(), it.value());
             const TimecodeBurnInSettings updated =
                 TimecodeBurnInSettings::fromJson(merged);
-            m_window->applyTimecodeBurnInSettings(updated);
-            m_window->setWindowModified(true);
+            m_window->commitTimecodeBurnInSettings(
+                updated, QStringLiteral("タイムコード焼き込み (MCP)"));
             return QJsonObject{
                 {QStringLiteral("ok"), true},
                 {QStringLiteral("option"), option},

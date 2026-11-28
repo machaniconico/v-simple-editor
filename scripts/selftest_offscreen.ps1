@@ -74,9 +74,9 @@ foreach ($suite in $suites) {
         $t = Get-Content -LiteralPath $f -Raw -ErrorAction SilentlyContinue
         if ($null -ne $t) { $text += $t }
     }
-    $pass = ([regex]::Matches($text, '(?m)^PASS\b')).Count
-    $fail = ([regex]::Matches($text, '(?m)^FAIL\b')).Count
-    $skip = ([regex]::Matches($text, '(?m)^SKIP\b')).Count
+    $pass = ([regex]::Matches($text, '(?m)^(?:\[[^\]\r\n]+\] )*PASS\b')).Count
+    $fail = ([regex]::Matches($text, '(?m)^(?:\[[^\]\r\n]+\] )*FAIL\b')).Count
+    $skip = ([regex]::Matches($text, '(?m)^(?:\[[^\]\r\n]+\] )*SKIP\b')).Count
     $seconds = [int]((Get-Date) - $started).TotalSeconds
     $line = "{0}`t{1}`t{2}`t{3}`t{4}`t{5}" -f $suite, $rc, $pass, $fail, $skip, $seconds
     Add-Content -LiteralPath $tsv -Value $line

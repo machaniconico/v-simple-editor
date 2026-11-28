@@ -2,6 +2,7 @@
 #include "../FcpxmlExporter.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
+#include "../UncProbe.h"
 #include "../UndoManager.h"
 #include "SelftestGate.h"
 #include <QElapsedTimer>
@@ -9,13 +10,17 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QMutex>
 #include <QPair>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QXmlStreamReader>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <memory>
 
 int runFcpxmlImportSelftest()
 {
@@ -2477,6 +2482,178 @@ int runFcpxmlImportSelftest()
             int(g42Unc), static_cast<long long>(g42TotalMs), int(g42IsLocal(g42Local)), int(g42IsLocal(g42Host)),
             int(g42IsLocal(g42Rel)), int(g42Long), g42Detail.join(QStringLiteral(" ; ")).toUtf8().constData());
         gate(42, g42Ok);
+    }
+
+    // G43: after an import, uncprobe::relinkOfflineSources probes each distinct share root once (then each distinct
+    // file of a share that answers) on a dedicated pool under one deadline, and relinks the offline sentinels to the
+    // normalised \\server\share path. The probe is injected; legs run in the order a ... j, f, f2 so the sleeping
+    // probes of (f) never starve a later leg.
+    {
+        struct G43Rec {
+            QMutex mutex;
+            QStringList calls;
+            std::atomic<int> running{0}, maxRunning{0};
+        };
+        auto g43Make = [](int sleepMs, std::function<bool(const QString &)> answer) {
+            auto rec = std::make_shared<G43Rec>();
+            uncprobe::ProbeFn fn = [rec, sleepMs, answer](const QString &p) {
+                const int now = ++rec->running;
+                int seen = rec->maxRunning.load();
+                while (now > seen && !rec->maxRunning.compare_exchange_weak(seen, now)) {}
+                { QMutexLocker lock(&rec->mutex); rec->calls << p; }
+                if (sleepMs > 0) QThread::msleep(ulong(sleepMs));
+                const bool ok = answer(p);
+                --rec->running;
+                return ok;
+            };
+            return std::make_pair(rec, fn);
+        };
+        const auto g43All = [](const QString &) { return true; };
+        // assets: (src, hasAudio); spine: asset indexes, one clip each, 1 s apart.
+        auto g43Read = [&](const QList<QPair<QString, bool>> &assets, const QList<int> &spine) {
+            QString res, clips;
+            for (int i = 0; i < assets.size(); ++i)
+                res += QStringLiteral("<asset id=\"u%1\" src=\"%2\"%3/>").arg(i).arg(assets[i].first.toHtmlEscaped(),
+                    assets[i].second ? QStringLiteral(" hasVideo=\"1\" hasAudio=\"1\"") : QString());
+            for (int i = 0; i < spine.size(); ++i)
+                clips += QStringLiteral("<asset-clip ref=\"u%1\" offset=\"%2s\" duration=\"1s\"/>").arg(spine[i]).arg(i);
+            return fcpx::xml::parseXml(QStringLiteral("<fcpxml><resources>%1</resources><project name=\"u\"><sequence><spine>%2</spine>"
+                "</sequence></project></fcpxml>").arg(res, clips), dir.path());
+        };
+        auto g43Warn = [](const fcpx::xml::ImportResult &r, const QString &needle) {
+            for (const QString &w : r.warnings) if (w.contains(needle)) return true;
+            return false;
+        };
+        auto g43Paths = [](const fcpx::xml::ImportResult &r) {
+            QStringList out;
+            for (const auto &t : r.videoTracks) for (const ClipInfo &c : t) out << c.filePath;
+            for (const auto &t : r.audioTracks) for (const ClipInfo &c : t) out << c.filePath;
+            return out;
+        };
+        const QString kRoot = QStringLiteral("\\\\srv\\share"), kFile = QStringLiteral("\\\\srv\\share\\x.mov");
+        auto isSentinel = [](const QString &p) { return QFileInfo(p).fileName().startsWith(QStringLiteral("offline-")); };
+
+        // (a) answered: video + audio of one asset relink as ONE file (+1 / -1).
+        auto ra = g43Read({{kFile, true}}, {0});
+        const int aRes = ra.resolvedFiles, aUn = ra.unresolvedFiles, aClips = int(g43Paths(ra).size());
+        auto pa = g43Make(0, g43All);
+        const int aRelinked = uncprobe::relinkOfflineSources(ra, pa.second);
+        bool aOk = aClips == 2 && aUn == 1 && aRelinked == 1 && ra.offlineSources.isEmpty()
+            && ra.resolvedFiles == aRes + 1 && ra.unresolvedFiles == aUn - 1
+            && g43Paths(ra) == QStringList({kFile, kFile}) && ra.warnings.contains(QStringLiteral("再リンク: %1").arg(kFile))
+            && !g43Warn(ra, QStringLiteral("オフライン素材"));
+        // (b) no answer: nothing changes.
+        auto rb = g43Read({{kFile, true}}, {0});
+        const QStringList bBefore = g43Paths(rb);
+        const QStringList bWarn = rb.warnings;
+        auto pb = g43Make(0, [](const QString &) { return false; });
+        const int bRelinked = uncprobe::relinkOfflineSources(rb, pb.second);
+        const bool bOk = bRelinked == 0 && g43Paths(rb) == bBefore && rb.warnings == bWarn && rb.offlineSources.size() == 1
+            && rb.resolvedFiles == 0 && rb.unresolvedFiles == 1 && isSentinel(g43Paths(rb).value(0));
+        // (c) \\?\UNC\ and file://host reach the probe as the same root.
+        bool cOk = true;
+        for (const QString &src : {QStringLiteral("\\\\?\\UNC\\srv\\share\\x.mov"), QStringLiteral("file://srv/share/x.mov")}) {
+            auto rc = g43Read({{src, false}}, {0});
+            auto pc = g43Make(0, g43All);
+            uncprobe::relinkOfflineSources(rc, pc.second);
+            cOk &= pc.first->calls.size() == 2 && pc.first->calls.value(0) == kRoot && pc.first->calls.value(1) == kFile;
+        }
+        // (d) a device path is never probed and stays a sentinel.
+        auto rd = g43Read({{QStringLiteral("\\\\.\\pipe\\x"), false}}, {0});
+        auto pd = g43Make(0, g43All);
+        const int dRelinked = uncprobe::relinkOfflineSources(rd, pd.second);
+        const bool dOk = pd.first->calls.isEmpty() && dRelinked == 0 && rd.offlineSources.size() == 1
+            && isSentinel(g43Paths(rd).value(0));
+        // (e) 8 clips of one file: root once + file once.
+        auto re = g43Read({{kFile, false}}, {0, 0, 0, 0, 0, 0, 0, 0});
+        auto pe = g43Make(0, g43All);
+        const int eRelinked = uncprobe::relinkOfflineSources(re, pe.second);
+        const QStringList ePaths = g43Paths(re);
+        const bool eOk = eRelinked == 1 && pe.first->calls.size() == 2 && ePaths.size() == 8
+            && ePaths.count(kFile) == 8;
+        // (e2) 3 files of one share: root + 3 = 4 calls; an unanswered root: 1 call.
+        const QList<QPair<QString, bool>> e2Assets{{QStringLiteral("\\\\srv\\share\\a.mov"), false},
+            {QStringLiteral("\\\\srv\\share\\b.mov"), false}, {QStringLiteral("\\\\srv\\share\\c.mov"), false}};
+        auto re2 = g43Read(e2Assets, {0, 1, 2});
+        auto pe2 = g43Make(0, g43All);
+        const int e2Relinked = uncprobe::relinkOfflineSources(re2, pe2.second);
+        auto re2n = g43Read(e2Assets, {0, 1, 2});
+        auto pe2n = g43Make(0, [](const QString &) { return false; });
+        uncprobe::relinkOfflineSources(re2n, pe2n.second);
+        const bool e2Ok = e2Relinked == 3 && pe2.first->calls.size() == 4 && pe2n.first->calls.size() == 1;
+        // (g) concurrency never exceeds maxConcurrent, and does reach more than 1.
+        QList<QPair<QString, bool>> gAssets; QList<int> gSpine;
+        for (int i = 0; i < 10; ++i) { gAssets.append({QStringLiteral("\\\\srv%1\\share\\x.mov").arg(i), false}); gSpine.append(i); }
+        auto rg = g43Read(gAssets, gSpine);
+        auto pg = g43Make(60, g43All);
+        const int gRelinked = uncprobe::relinkOfflineSources(rg, pg.second, 3000, 3);
+        const int gMax = pg.first->maxRunning.load();
+        const bool gOk = gRelinked == 10 && gMax <= 3 && gMax >= 2;
+        // (h) audio-only clip and a compound clip's children relink; the compound's top-level clip stays a reference.
+        const QString hSrc = QStringLiteral("\\\\srv\\share\\h.mov"), hWav = QStringLiteral("\\\\srv\\share\\h.wav");
+        auto rh = fcpx::xml::parseXml(QStringLiteral("<fcpxml><resources><asset id=\"hv\" src=\"%1\" hasVideo=\"1\" hasAudio=\"1\"/>"
+            "<asset id=\"ha\" src=\"%2\" hasVideo=\"0\" hasAudio=\"1\"/>"
+            "<media id=\"m1\"><sequence><spine><asset-clip ref=\"hv\" duration=\"2s\"/></spine></sequence></media></resources>"
+            "<project name=\"h\"><sequence><spine><ref-clip ref=\"m1\" duration=\"2s\"/><asset-clip ref=\"ha\" offset=\"2s\" duration=\"1s\"/>"
+            "</spine></sequence></project></fcpxml>").arg(hSrc.toHtmlEscaped(), hWav.toHtmlEscaped()), dir.path());
+        bool hBefore = rh.error.isEmpty() && rh.sequences.size() == 1 && rh.offlineSources.size() == 2;
+        auto ph = g43Make(0, g43All);
+        const int hRelinked = uncprobe::relinkOfflineSources(rh, ph.second);
+        QStringList hNested;
+        if (!rh.sequences.isEmpty()) {
+            for (const auto &t : rh.sequences[0].videoTracks) for (const ClipInfo &c : t) hNested << c.filePath;
+            for (const auto &t : rh.sequences[0].audioTracks) for (const ClipInfo &c : t) hNested << c.filePath;
+        }
+        QStringList hAudioTop;
+        for (const auto &t : rh.audioTracks) for (const ClipInfo &c : t) hAudioTop << c.filePath;
+        const bool hOk = hBefore && hRelinked == 2 && rh.offlineSources.isEmpty() && hNested == QStringList({hSrc, hSrc})
+            && hAudioTop.contains(hWav) && !hAudioTop.contains(hSrc);
+        // (i) a file://host origin ends as the plain \\srv\share\x.mov, never a URL.
+        auto ri = g43Read({{QStringLiteral("file://srv/share/x.mov"), false}}, {0});
+        auto pi = g43Make(0, g43All);
+        uncprobe::relinkOfflineSources(ri, pi.second);
+        const bool iOk = g43Paths(ri).value(0) == QStringLiteral("\\\\srv\\share\\x.mov");
+        // (j) the share answers, the file is not there: ordinary missing media at the real path.
+        auto rj = g43Read({{kFile, false}}, {0});
+        auto pj = g43Make(0, [kRoot](const QString &p) { return p == kRoot; });
+        const int jRelinked = uncprobe::relinkOfflineSources(rj, pj.second);
+        const bool jOk = jRelinked == 0 && g43Paths(rj).value(0) == kFile && rj.offlineSources.isEmpty()
+            && rj.resolvedFiles == 0 && rj.unresolvedFiles == 1 && rj.warnings.contains(QStringLiteral("見つかりません: %1 (共有は応答)").arg(kFile))
+            && !g43Warn(rj, QStringLiteral("オフライン素材"));
+#ifndef Q_OS_WIN
+        // Off Windows the default probe never answers.
+        auto rn = g43Read({{kFile, false}}, {0});
+        const bool nOk = uncprobe::relinkOfflineSources(rn) == 0 && rn.offlineSources.size() == 1;
+#else
+        const bool nOk = true;
+#endif
+        // (f) six distinct shares (more than the 4 concurrent) whose probe sleeps 10 s: back within the deadline, all
+        // still sentinels. (f2) a prompt call right after is not starved by the sleepers.
+        QList<QPair<QString, bool>> fAssets; QList<int> fSpine;
+        for (int i = 0; i < 6; ++i) { fAssets.append({QStringLiteral("\\\\slow%1\\share\\x.mov").arg(i), false}); fSpine.append(i); }
+        auto rf = g43Read(fAssets, fSpine);
+        auto pf = g43Make(10000, g43All);
+        QElapsedTimer fTimer;
+        fTimer.start();
+        const int fRelinked = uncprobe::relinkOfflineSources(rf, pf.second, 1000, 4);
+        const qint64 fMs = fTimer.elapsed();
+        int fSentinels = 0;
+        for (const QString &p : g43Paths(rf)) fSentinels += isSentinel(p) ? 1 : 0;
+        const bool fOk = fMs <= 1500 && fRelinked == 0 && rf.offlineSources.size() == 6 && fSentinels == 6
+            && rf.resolvedFiles == 0 && rf.unresolvedFiles == 6;
+        auto rf2 = g43Read({{QStringLiteral("\\\\fast\\share\\x.mov"), false}}, {0});
+        auto pf2 = g43Make(0, g43All);
+        QElapsedTimer f2Timer;
+        f2Timer.start();
+        const int f2Relinked = uncprobe::relinkOfflineSources(rf2, pf2.second, 3000, 4);
+        const bool f2Ok = f2Relinked == 1 && f2Timer.elapsed() < 2000 && rf2.offlineSources.isEmpty();
+        const bool g43Ok = aOk && bOk && cOk && dOk && eOk && e2Ok && gOk && hOk && iOk && jOk && nOk && fOk && f2Ok;
+        std::fprintf(stderr, "G43 a=%d b=%d c=%d d=%d e=%d(relinked=%d calls=%d clips=%d) e2=%d(calls=%d/%d) g=%d(max=%d relinked=%d) "
+            "h=%d(relinked=%d) i=%d j=%d n=%d f=%d(ms=%lld relinked=%d sentinels=%d) f2=%d\n",
+            int(aOk), int(bOk), int(cOk), int(dOk), int(eOk), eRelinked, int(pe.first->calls.size()), int(ePaths.size()),
+            int(e2Ok), int(pe2.first->calls.size()), int(pe2n.first->calls.size()), int(gOk), gMax, gRelinked,
+            int(hOk), hRelinked, int(iOk), int(jOk), int(nOk), int(fOk), static_cast<long long>(fMs), fRelinked, fSentinels, int(f2Ok));
+        gate(43, g43Ok);
     }
 
     return tally.finish();

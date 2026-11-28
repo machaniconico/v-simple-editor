@@ -23,6 +23,8 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QOffscreenSurface>
+#include <QOpenGLContext>
 #include <QSlider>
 #include <QString>
 #include <QTemporaryDir>
@@ -276,6 +278,23 @@ int runClipLutSelftest()
               && equalRgbaBytes(untouchedFrame, untouchedBaseline));
 
     // US-500: exercise the same non-dialog entry point as both LUT menus.
+    // MainWindow builds a GL preview; without a GL context that aborts ("Texture has not
+    // been created"), so G10 is skipped when a context cannot be made current.
+    {
+        QOpenGLContext probeContext;
+        QOffscreenSurface probeSurface;
+        probeSurface.create();
+        const bool glCurrent = probeContext.create() && probeSurface.isValid()
+            && probeContext.makeCurrent(&probeSurface);
+        probeContext.doneCurrent();
+        if (!glCurrent) {
+            qInfo().noquote() << QStringLiteral("[clip-lut] SKIP G10 no usable OpenGL context for MainWindow");
+            qInfo().noquote() << QStringLiteral("[clip-lut] summary: %1 PASS, %2 FAIL, 1 SKIP")
+                .arg(passed).arg(failed);
+            selftests::reportTally(passed, failed, 1);
+            return failed == 0 ? 0 : failed;
+        }
+    }
     MainWindow window;
     Timeline *menuTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     bool menuOk = menuTimeline && menuTimeline->undoManager();
