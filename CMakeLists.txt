@@ -171,11 +171,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/effects_selftests.cpp
     src/selftests/Text3dPreviewSelftest.cpp
     src/selftests/text3d_export_selftest.cpp
+    src/selftests/extrude_mesh_selftest.cpp
     src/selftests/brush_export_selftest.cpp
     src/selftests/AeFxBlurSelftest.cpp
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp
     src/selftests/log_to_rec709_selftest.cpp
+    src/selftests/psd_import_selftest.cpp
+    src/selftests/lut_import_selftest.cpp
     src/selftests/lens_distort_selftest.cpp
     src/selftests/AeFxDistortSelftest.cpp
     src/selftests/AeFxDistort2Selftest.cpp
@@ -425,6 +428,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # ED (EDL エクスポート): CMX3600 EDL の純粋書き出しエンジン (放送/Avid/DaVinci 互換)。
     src/EdlExport.h
     src/EdlExport.cpp
+    src/OtioExport.h
+    src/OtioExport.cpp
     src/EdlImport.h
     src/EdlImport.cpp
     src/FcpxmlImport.h
@@ -438,6 +443,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/export_meta_selftest.cpp
     src/selftests/export_presets_selftest.cpp
     src/selftests/edl_export_selftest.cpp
+    src/selftests/otio_export_selftest.cpp
     src/selftests/edl_import_selftest.cpp
     src/selftests/fcpxml_import_selftest.cpp
     # WS (ワークスペース): 名前付きドックレイアウトの純粋モデル (Premiere/Resolve 相当)。
@@ -668,6 +674,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/transcript_highlighter_selftest.cpp
     src/selftests/transcript_highlighter_offline_selftest.cpp
     src/selftests/media_relink_selftest.cpp
+    src/selftests/unsaved_prompt_selftest.cpp
+    src/selftests/project_persist_selftest.cpp
     src/selftests/reduce_project_selftest.cpp
     src/selftests/mcp_selftest.cpp
     src/MotionTracker.cpp

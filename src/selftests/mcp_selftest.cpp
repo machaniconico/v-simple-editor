@@ -7835,6 +7835,16 @@ int runMcpSelftest()
                 const QJsonObject edge = toolPayload(extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0.001},
                     {QStringLiteral("extrudeBevelDepth"), 1.0}, {QStringLiteral("extrudeBevelSegments"), 8}}));
                 const QJsonObject edgeCfg = clipAt(0).text3DConfig;
+                // US-2006 pin: no active bevel (0 segments) makes depth 0 acceptable, as the tool description says.
+                const QJsonObject flat0Resp = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0},
+                    {QStringLiteral("extrudeBevelDepth"), 0.1}, {QStringLiteral("extrudeBevelSegments"), 0}});
+                const QJsonObject flat0 = toolPayload(flat0Resp);
+                const QJsonObject flat0Cfg = clipAt(0).text3DConfig;
+                std::fprintf(stderr, "mcp G203 depth0 segments0 bevelDepth0.1 isErr=%d ok=%d depth=%g bevelDepth=%g segs=%d\n",
+                             int(isErr(flat0Resp)), flat0.value(QStringLiteral("ok")).toBool(false),
+                             flat0Cfg.value(QStringLiteral("extrudeDepth")).toDouble(-99),
+                             flat0Cfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99),
+                             flat0Cfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99));
                 std::fprintf(stderr, "mcp G203 extrusion refusals [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] acceptEdge ok=%d depth=%g bevelDepth=%g segs=%d\n",
                              qPrintable(toolErrorText(d1)), qPrintable(toolErrorText(d2)), qPrintable(toolErrorText(dMid)), qPrintable(toolErrorText(dNeg)),
                              qPrintable(toolErrorText(dBig)), qPrintable(toolErrorText(bdBig)), qPrintable(toolErrorText(bwBig)),
@@ -7882,7 +7892,12 @@ int runMcpSelftest()
                                    edge.value(QStringLiteral("ok")).toBool(false)
                                        && edgeCfg.value(QStringLiteral("extrudeDepth")).toDouble(-99) == 0.001
                                        && edgeCfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99) == 1.0
-                                       && edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99) == 8),
+                                       && edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99) == 8)
+                    && observeTerm(203, "depth 0 / bevelDepth 0.1 / 0 segments accepted and stored exactly",
+                                   flat0.value(QStringLiteral("ok")).toBool(false)
+                                       && flat0Cfg.value(QStringLiteral("extrudeDepth")).toDouble(-99) == 0.0
+                                       && flat0Cfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99) == 0.1
+                                       && flat0Cfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99) == 0),
                     "set_clip_text3d accepted an invalid text3d, changed state on refusal, or mis-measured the 64 KiB limit");
             }
 

@@ -8,6 +8,7 @@
 #include "../Timeline.h"
 #include "../Text3DLayer.h"
 #include "../ThreePointEdit.h"
+#include "../TimelineFrameRenderer.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
@@ -24,6 +25,7 @@
 #include <QDataStream>
 #include <QDir>
 #include <QColor>
+#include <QCryptographicHash>
 #include <QDoubleSpinBox>
 #include <QDropEvent>
 #include <QElapsedTimer>
@@ -201,6 +203,29 @@ extern "C" {
 //        VEDITOR_SMART_RENDER=1 a full-length V1 clip with transform.position.x = 0.3 is encoded
 //        (moved at 0.5 s), not stream-copied. Detects: HEAD has no ClipInfo::expressions (and
 //        the root section is written there); hasAnyDynamicTransform ignoring the bindings.
+//   G39 (US-2005): with roto / matte / parent / MainWindow time-remap sidecars on A's V1 clip 0,
+//        setActiveSequence(B) leaves B with none (parent map without the store key, saved remap
+//        list empty) and B renders byte-identical to B before any sidecar existed (control: A's
+//        roto + matte on B change it); setActiveSequence(A) brings all four back;
+//        activeSequenceChanged fires (A,B) then (B,A). Detects: HEAD keeps A's sidecars live on B.
+//   G40 (US-2005): B's four sidecars, parked by a switch to A, are saved as four arrays on B's
+//        sequences[] entry (none on A's, no store key) and come back on B after opening; A's
+//        root ones come back on A. Detects: HEAD writes no per-sequence arrays.
+//   G41 (US-2005): (a) no sequence model: setActiveSequence(default) is a no-op, no signal;
+//        (b) a file without per-sequence arrays puts the root sidecars on the active sequence
+//        only; (c) undo / redo across a switch: the landing sequence takes the state's
+//        sidecars and drops its parked ones, the one left parks its live ones, the time remap
+//        follows the same rule with the US-1401 live value; (d) across a creation, and a new
+//        sequence reusing an undone creation's id starts empty, also after a switch away and a
+//        jump that removes it without a signal (no parked roto / remap kept for its id) and for
+//        an addSequence (precompose) id removed by a jump made inside it; (e) a switch between the undo
+//        point and the creation (lands in C with C's parked set, one signal, nothing parked for
+//        the removed B; V1 clip 0 carries C's taken remap); (f) a history
+//        jump crosses once; (g) undoing a creation while already on the landing sequence keeps
+//        its live sidecars and remap (also on V1 clip 0), parks the state's under A, no signal;
+//        (h) remaps committed through the real path (map, clip curve, undo point): A mA1, B1, A
+//        mA2, undo to B1, switch to A: the map and V1 clip 0 hold mA2, also after the next
+//        sidecar collection and populateProjectData.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -1794,8 +1819,9 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     tl.undo();
     const QString afterSeqUndo = tagsAt(b8Key);
     // US-1505 / US-1706: the expressions and the 3D text ride on b's clip like the wiggle, so
-    // G36's "1:0" (clip z) has none (formerly the position-keyed map value 81).
-    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=- ex=-")
+    // G36's "1:0" (clip z) has none (formerly the position-keyed map value 81). US-2005: the
+    // time remap is parked with the sequence left, so clip z has none either (formerly 81).
+    const bool ok8 = added && switched && inOther == QStringLiteral("tr=- wg=82 t3=- ex=-")
         && afterSeqUndo == tagged(81);
     if (!seqBefore.isEmpty()) tl.setActiveSequence(seqBefore);
 
@@ -1849,7 +1875,7 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                  "(default, expect same) noEntry=%d ->%d (amplitude 5, expect +1) entry=%d undo noEntry=%d ok=%d\n",
                  selected, qPrintable(selectErr), dialogs, others, d7, d7Default, defaultNoEntry, d7Set, setEntry,
                  undoNoEntry, ok7);
-    std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=- "
+    std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=- wg=82 t3=- "
                  "ex=-) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
                  qPrintable(inOther), qPrintable(afterSeqUndo), qPrintable(tagged(81)), ok8);
     std::fprintf(stderr, "connected-clip G36 (9) committed %s, written directly %s (expect %s) depth %d->%d (expect same) "
@@ -2763,6 +2789,741 @@ void threePointCarrierGate(selftest::GateTally &tally, Timeline &tl, const Sidec
                "a source-monitor 3-point insert / overwrite left the roto, matte, parent or timeRemap carrier "
                "of the shifted clip on its old key (or emitted clipKeysRemapped other than once, or "
                "undo did not restore all four), or a locked V1 accepted the edit / kept a success message, or a missing V1 did not refuse with タイムラインがありません");
+}
+
+// US-2005 (G39-G41): MainWindow's private time-remap tables and project paths, handed over
+// by the friend runConnectedClipSelftest.
+struct SequenceSidecarView {
+    QHash<QString, TimeRemapClipEntry> *liveRemap = nullptr;
+    QHash<QString, QHash<QString, TimeRemapClipEntry>> *parkedRemap = nullptr;
+    std::function<void(ProjectData &)> populate;
+    std::function<QJsonObject()> collect;   // collectSidecarState (an undo point's sidecars)
+    std::function<bool(const QString &)> save;
+    std::function<bool(const QString &)> open;
+};
+
+RotoClipEntry sidecarRoto(double width)
+{
+    RotoClipEntry roto;
+    for (const QPointF &p : {QPointF(0, 0), QPointF(width, 0), QPointF(width, 24), QPointF(0, 24)}) {
+        RotoPoint point;
+        point.position = p;
+        point.handleIn = p;
+        point.handleOut = p;
+        roto.path.points.append(point);
+    }
+    return roto;
+}
+
+TimeRemapClipEntry sidecarRemap(double srcEnd)
+{
+    TimeRemapClipEntry remap;
+    remap.clipId = QStringLiteral("0:0");
+    remap.curve.sourceFps = 10.0;
+    remap.curve.addKey(0.0, 0.0);
+    remap.curve.addKey(2.0, srcEnd);
+    return remap;
+}
+
+// "w<right edge>#<hash of the whole entry>": readable in the log, compared in full.
+QString contentHash(const QJsonObject &object)
+{
+    return QString::fromLatin1(QCryptographicHash::hash(QJsonDocument(object).toJson(QJsonDocument::Compact),
+                                                        QCryptographicHash::Sha1).toHex().left(10));
+}
+
+QString rotoSig(const QHash<QString, RotoClipEntry> &entries)
+{
+    QStringList parts;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
+        const RotoClipEntry &entry = it.value();
+        QJsonArray keyframes;
+        for (const auto &keyframe : entry.keyframes) keyframes.append(keyframe.toJson());
+        parts.append(QStringLiteral("%1=w%2#%3").arg(it.key())
+                     .arg(entry.path.points.size() > 1 ? entry.path.points.at(1).position.x() : -1.0)
+                     .arg(contentHash(QJsonObject{{"path", entry.path.toJson()}, {"keyframes", keyframes},
+                                                  {"brushMask", entry.brushMask.isNull() ? 0 : 1}})));
+    }
+    parts.sort();
+    return QLatin1Char('{') + parts.join(QLatin1Char(',')) + QLatin1Char('}');
+}
+
+QString matteSig(const QHash<QString, TimelineTrackMatteEntry> &entries)
+{
+    QStringList parts;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        parts.append(QStringLiteral("%1=%2>%3").arg(it.key()).arg(int(it.value().matteType))
+                     .arg(it.value().matteSourceClipId));
+    parts.sort();
+    return QLatin1Char('{') + parts.join(QLatin1Char(',')) + QLatin1Char('}');
+}
+
+// The parent map without the sequence-store key (always present with a sequence model).
+QString parentSig(const QHash<QString, QString> &entries)
+{
+    QStringList parts;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        if (it.key() != timeline_nesting::sequenceStoreParentKey())
+            parts.append(it.key() + QLatin1Char('>') + it.value());
+    parts.sort();
+    return QLatin1Char('{') + parts.join(QLatin1Char(',')) + QLatin1Char('}');
+}
+
+QString remapSig(const QHash<QString, TimeRemapClipEntry> &entries)
+{
+    QStringList parts;
+    for (auto it = entries.cbegin(); it != entries.cend(); ++it)
+        parts.append(QStringLiteral("%1=src%2#%3").arg(it.key())
+                     .arg(it.value().curve.keys.isEmpty() ? -1.0 : it.value().curve.keys.last().srcTime)
+                     .arg(contentHash(it.value().curve.toJson())));
+    parts.sort();
+    return QLatin1Char('{') + parts.join(QLatin1Char(',')) + QLatin1Char('}');
+}
+
+QString remapSig(const QVector<TimeRemapClipEntry> &entries)
+{
+    QHash<QString, TimeRemapClipEntry> byKey;
+    for (const auto &entry : entries) byKey.insert(entry.clipId, entry);
+    return remapSig(byKey);
+}
+
+// Records Timeline::activeSequenceChanged as "old>new" until disconnected.
+struct SwitchLog {
+    QStringList events;
+    QMetaObject::Connection connection;
+    void attach(Timeline &tl)
+    {
+        events.clear();
+        connection = QObject::connect(&tl, &Timeline::activeSequenceChanged,
+            [this](const QString &oldId, const QString &newId) { events.append(oldId + QLatin1Char('>') + newId); });
+    }
+    ~SwitchLog() { QObject::disconnect(connection); }
+};
+
+// A fresh sequence model on the main timeline: the named sequences (V1 / V2 one clip each), the
+// first active, no sidecars live or parked, one baseline undo entry. Returns the ids by name.
+QHash<QString, QString> setupSequenceSidecars(Timeline &tl, SequenceSidecarView &view,
+                                              const QStringList &names,
+                                              const QVector<QVector<ClipInfo>> &video)
+{
+    tl.setClipParentEntries({});
+    tl.setRotoEntries({});
+    tl.setTrackMatteEntries({});
+    tl.setParkedSidecarsBySequence({});
+    view.liveRemap->clear();
+    view.parkedRemap->clear();
+    QVector<TimelineSequence> sequences;
+    for (const QString &name : names) {
+        TimelineSequence sequence;
+        sequence.id = QStringLiteral("seq-") + name.toLower();
+        sequence.name = name;
+        sequence.videoTracks = video;
+        sequence.audioTracks = {{}};
+        sequences.append(sequence);
+    }
+    tl.setSequences(sequences, sequences.first().id);
+    tl.undoManager()->clear();
+    tl.saveUndoState(QStringLiteral("Initial"));
+    tl.takeConnectionWarnings();
+    QHash<QString, QString> ids;
+    for (const TimelineSequence &s : tl.sequences()) ids.insert(s.name, s.id);
+    return ids;
+}
+
+QJsonObject readJsonFile(const QString &path)
+{
+    QFile file(path);
+    return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+}
+
+bool sameImage(const QImage &a, const QImage &b)
+{
+    return !a.isNull() && a.format() == b.format() && a.size() == b.size() && a == b;
+}
+
+// G39: a switch parks the roto / matte / parent / time-remap sidecars of the sequence it
+// leaves and restores the target's own; the target renders as if it never had any.
+void sequenceSwitchSidecarGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    QTemporaryDir dir;
+    const QString videoPath = dir.filePath(QStringLiteral("g39.mp4"));
+    QString whyNot;
+    if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &whyNot)) {
+        tally.skip(39, qPrintable(whyNot));
+        return;
+    }
+    if (!dir.isValid() || !writeVideoFile(videoPath, 20)) {
+        tally.gate(39, false, "the G39 fixture media could not be written");
+        return;
+    }
+    // V1 [v 0-2], V2 [v 1-3]: at 0.5 s only V1 shows, so a roto on V1 clip 0 is visible.
+    ClipInfo v1 = clipFor("g39-v1", 2.0);
+    v1.filePath = videoPath;
+    ClipInfo v2 = clipFor("g39-v2", 2.0, 1.0);
+    v2.filePath = videoPath;
+    const auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("B")}, {{v1}, {v2}});
+    const QString a = ids.value(QStringLiteral("A"));
+    const QString b = ids.value(QStringLiteral("B"));
+    const QSize outSize(40, 24);
+    const qint64 at = 500000;
+    // B before any sidecar was placed anywhere.
+    const bool toB0 = tl.setActiveSequence(b);
+    const QImage cleanB = tlrender::renderFrameAt(&tl, at, outSize);
+    const bool toA0 = tl.setActiveSequence(a);
+
+    const RotoClipEntry rA = sidecarRoto(20.0);
+    TimelineTrackMatteEntry matte;
+    matte.matteType = TrackMatteType::AlphaMatte;
+    matte.matteSourceClipId = QStringLiteral("1:0");
+    tl.setRotoEntries({{QStringLiteral("0:0"), rA}});
+    tl.setTrackMatteEntries({{QStringLiteral("0:0"), matte}});
+    tl.setClipParent(QStringLiteral("1:0"), QStringLiteral("0:0"));
+    view.liveRemap->insert(QStringLiteral("0:0"), sidecarRemap(1.0));
+    const QString rotoA = rotoSig(tl.rotoEntries());
+    const QString matteA = matteSig(tl.trackMatteEntries());
+    const QString parentA = parentSig(tl.clipParentEntries());
+    const QString remapA = remapSig(*view.liveRemap);
+    ProjectData dataA;
+    view.populate(dataA);
+    const QString savedRemapA = remapSig(dataA.timeRemapClipEntries);
+
+    SwitchLog log;
+    log.attach(tl);
+    const bool toB = tl.setActiveSequence(b);
+    ProjectData dataB;
+    view.populate(dataB);
+    const QString rotoB = rotoSig(tl.rotoEntries());
+    const QString matteB = matteSig(tl.trackMatteEntries());
+    const QString parentB = parentSig(tl.clipParentEntries());
+    const QString savedRemapB = remapSig(dataB.timeRemapClipEntries);
+    const QImage switchedB = tlrender::renderFrameAt(&tl, at, outSize);
+    // Control: A's roto and matte on B change that render (the comparison is not vacuous).
+    tl.setRotoEntries({{QStringLiteral("0:0"), rA}});
+    tl.setTrackMatteEntries({{QStringLiteral("0:0"), matte}});
+    const QImage leakedB = tlrender::renderFrameAt(&tl, at, outSize);
+    tl.setRotoEntries({});
+    tl.setTrackMatteEntries({});
+    const bool toA = tl.setActiveSequence(a);
+    ProjectData dataBack;
+    view.populate(dataBack);
+    const QString empty = QStringLiteral("{}");
+    const bool bEmpty = rotoB == empty && matteB == empty && parentB == empty && savedRemapB == empty;
+    const bool backOk = rotoSig(tl.rotoEntries()) == rotoA && matteSig(tl.trackMatteEntries()) == matteA
+        && parentSig(tl.clipParentEntries()) == parentA && remapSig(*view.liveRemap) == remapA
+        && remapSig(dataBack.timeRemapClipEntries) == savedRemapA;
+    const bool placedOk = rotoA != empty && matteA != empty && parentA != empty && savedRemapA != empty;
+    const bool renderOk = sameImage(switchedB, cleanB);
+    const bool controlOk = !leakedB.isNull() && !sameImage(leakedB, cleanB);
+    const QStringList expectedLog{a + QLatin1Char('>') + b, b + QLatin1Char('>') + a};
+    const bool signalOk = log.events == expectedLog;
+    std::fprintf(stderr, "connected-clip G39 switches %d%d%d%d | A roto=%s matte=%s parent=%s remap=%s saved=%s | on B "
+                 "roto=%s matte=%s parent=%s savedRemap=%s (expect {}) | back on A equal=%d | render B == clean B %d, "
+                 "control A's roto+matte on B differs %d | signals [%s] (expect [%s])\n",
+                 toB0, toA0, toB, toA, qPrintable(rotoA), qPrintable(matteA), qPrintable(parentA),
+                 qPrintable(remapA), qPrintable(savedRemapA), qPrintable(rotoB), qPrintable(matteB),
+                 qPrintable(parentB), qPrintable(savedRemapB), backOk, renderOk, controlOk,
+                 qPrintable(log.events.join(QLatin1Char(' '))), qPrintable(expectedLog.join(QLatin1Char(' '))));
+    tally.gate(39, toB0 && toA0 && toB && toA && placedOk && bEmpty && backOk && renderOk && controlOk && signalOk,
+               "a sequence switch kept the roto / matte / parent / time-remap sidecars of the sequence left on the "
+               "target (or did not bring them back on the return), the target rendered differently from a target "
+               "that never had sidecars, or activeSequenceChanged did not fire once per switch with (old, new)");
+}
+
+// G40: the sidecars of a non-active sequence are saved as four arrays on its "sequences" entry
+// and come back on that sequence after opening; the active one's stay the root arrays.
+void sequenceSidecarPersistGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    const auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("B")},
+                                           {{clipFor("g40-v1", 4.0)}, {clipFor("g40-v2", 4.0)}});
+    const QString a = ids.value(QStringLiteral("A"));
+    const QString b = ids.value(QStringLiteral("B"));
+    TimelineTrackMatteEntry matte;
+    matte.matteType = TrackMatteType::AlphaMatte;
+    matte.matteSourceClipId = QStringLiteral("1:0");
+    auto place = [&](double width, double srcEnd) {
+        tl.setRotoEntries({{QStringLiteral("0:0"), sidecarRoto(width)}});
+        tl.setTrackMatteEntries({{QStringLiteral("0:0"), matte}});
+        tl.setClipParent(QStringLiteral("1:0"), QStringLiteral("0:0"));
+        view.liveRemap->insert(QStringLiteral("0:0"), sidecarRemap(srcEnd));
+    };
+    auto sigs = [&] {
+        return QStringList{rotoSig(tl.rotoEntries()), matteSig(tl.trackMatteEntries()),
+                           parentSig(tl.clipParentEntries()), remapSig(*view.liveRemap)};
+    };
+    const bool toB = tl.setActiveSequence(b);
+    place(30.0, 1.5);
+    const QStringList bSigs = sigs();
+    const bool toA = tl.setActiveSequence(a);
+    place(20.0, 1.0);
+    const QStringList aSigs = sigs();
+
+    QTemporaryDir dir;
+    const QString path = dir.filePath(QStringLiteral("g40.veditor"));
+    const bool saved = dir.isValid() && view.save(path);
+    const QJsonObject root = readJsonFile(path);
+    const QStringList keys{QStringLiteral("rotoClipEntries"), QStringLiteral("trackMatteClipEntries"),
+                           QStringLiteral("clipParentEntries"), QStringLiteral("timeRemapClipEntries")};
+    int bArrays = 0;
+    int aArrays = 0;
+    bool storeKeyInSequence = false;
+    for (const QJsonValue &value : root.value(QStringLiteral("sequences")).toArray()) {
+        const QJsonObject sequence = value.toObject();
+        const QString id = sequence.value(QStringLiteral("id")).toString();
+        for (const QString &key : keys) {
+            const QJsonArray arr = sequence.value(key).toArray();
+            if (id == b && !arr.isEmpty()) ++bArrays;
+            if (id == a && sequence.contains(key)) ++aArrays;
+        }
+        for (const QJsonValue &entry : sequence.value(QStringLiteral("clipParentEntries")).toArray())
+            storeKeyInSequence = storeKeyInSequence
+                || entry.toObject().value(QStringLiteral("clipId")).toString() == timeline_nesting::sequenceStoreParentKey();
+    }
+    const bool rootActiveA = root.value(QStringLiteral("activeSequenceId")).toString() == a;
+
+    // Reopen through MainWindow: A (root) and then B (its sequence entry).
+    tl.setRotoEntries({});
+    tl.setTrackMatteEntries({});
+    view.liveRemap->clear();
+    const bool opened = saved && view.open(path);
+    const bool activeA = tl.activeSequenceId() == a;
+    const QStringList aOpened = sigs();
+    const bool toB2 = tl.setActiveSequence(b);
+    const QStringList bOpened = sigs();
+    const bool fileOk = saved && bArrays == 4 && aArrays == 0 && !storeKeyInSequence && rootActiveA;
+    const bool roundTripOk = opened && activeA && aOpened == aSigs && toB2 && bOpened == bSigs;
+    std::fprintf(stderr, "connected-clip G40 switches %d%d saved=%d sequences[B] arrays=%d (expect 4) sequences[A] "
+                 "keys=%d (expect 0) storeKeyInSequence=%d rootActive=A %d | opened=%d active A %d A [%s] (expect "
+                 "[%s]) | B [%s] (expect [%s])\n", toB, toA, saved, bArrays, aArrays, storeKeyInSequence, rootActiveA,
+                 opened, activeA, qPrintable(aOpened.join(QLatin1Char(' '))), qPrintable(aSigs.join(QLatin1Char(' '))),
+                 qPrintable(bOpened.join(QLatin1Char(' '))), qPrintable(bSigs.join(QLatin1Char(' '))));
+    tally.gate(40, toB && toA && fileOk && roundTripOk && !bSigs.contains(QStringLiteral("{}")),
+               "a non-active sequence's sidecars were not written as four arrays on its sequences[] entry (or "
+               "were written on the active one's / with the store key), or did not come back on that sequence "
+               "after opening (or the active one's root sidecars did not)");
+}
+
+// G41: controls and undo / redo across sequences (decision A12 and the remap rule of content 4).
+void sequenceSidecarUndoGate(selftest::GateTally &tally, Timeline &tl, SequenceSidecarView &view)
+{
+    const QString empty = QStringLiteral("{}");
+    const QString key = QStringLiteral("0:0");
+    const QVector<QVector<ClipInfo>> video{{clipFor("g41-v1", 4.0)}, {clipFor("g41-v2", 4.0)}};
+    auto roto = [&] { return rotoSig(tl.rotoEntries()); };
+    auto rotoOf = [&](double width) { return rotoSig({{key, sidecarRoto(width)}}); };
+    auto setRoto = [&](double width) { tl.setRotoEntries({{key, sidecarRoto(width)}}); };
+    auto parked = [&](const QString &id) { return rotoSig(tl.parkedSidecarsBySequence().value(id).roto); };
+    auto parkedHas = [&](const QString &id) { return tl.parkedSidecarsBySequence().contains(id); };
+    auto live = [&] { return remapSig(*view.liveRemap); };
+    auto remapOf = [&](double srcEnd) {
+        return remapSig(QHash<QString, TimeRemapClipEntry>{{key, sidecarRemap(srcEnd)}});
+    };
+    auto parkedRemap = [&](const QString &id) { return remapSig(view.parkedRemap->value(id)); };
+    // V1 clip 0's own curve (what export reads), as JSON.
+    auto clipCurve = [&] {
+        const auto tracks = tl.videoTracks();
+        return tracks.isEmpty() || !tracks[0] || tracks[0]->clipCount() < 1
+            ? QJsonObject{} : tracks[0]->clips().at(0).timeRemapCurve.toJson();
+    };
+    auto curveOf = [&](double srcEnd) { return sidecarRemap(srcEnd).curve.toJson(); };
+    const QString rA = rotoOf(20.0), rB1 = rotoOf(10.0), rB2 = rotoOf(30.0), rC = rotoOf(15.0);
+    const QString mA = remapOf(1.0), mB = remapOf(1.5), mC = remapOf(0.5);
+    SwitchLog log;
+
+    // (a) no sequence model: setActiveSequence(default) changes nothing and fires nothing.
+    tl.setClipParentEntries({});
+    tl.setParkedSidecarsBySequence({});
+    view.parkedRemap->clear();
+    load(tl, video);
+    setRoto(20.0);
+    TimelineTrackMatteEntry matte;
+    matte.matteType = TrackMatteType::AlphaMatte;
+    matte.matteSourceClipId = QStringLiteral("1:0");
+    tl.setTrackMatteEntries({{key, matte}});
+    tl.setClipParent(QStringLiteral("1:0"), key);
+    view.liveRemap->clear();
+    view.liveRemap->insert(key, sidecarRemap(1.0));
+    auto all = [&] {
+        return QStringList{roto(), matteSig(tl.trackMatteEntries()), parentSig(tl.clipParentEntries()), live(),
+                           QString::number(tl.parkedSidecarsBySequence().size()),
+                           QString::number(view.parkedRemap->size())};
+    };
+    const QStringList aBefore = all();
+    log.attach(tl);
+    const bool aSwitch = tl.setActiveSequence(QStringLiteral("main"));
+    const bool okA = aSwitch && all() == aBefore && log.events.isEmpty() && aBefore.at(0) != empty;
+    std::fprintf(stderr, "connected-clip G41 (a) model off: switch=%d unchanged=%d [%s] signals=%lld (expect 0) ok=%d\n",
+                 aSwitch, all() == aBefore, qPrintable(aBefore.join(QLatin1Char(' '))),
+                 static_cast<long long>(log.events.size()), okA);
+    QObject::disconnect(log.connection);
+
+    // (b) a HEAD-shaped file (no arrays on the sequence entries): root sidecars on the active
+    // sequence, nothing on the other.
+    bool okB = false;
+    {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("B")}, video);
+        const QString a = ids.value(QStringLiteral("A"));
+        const QString b = ids.value(QStringLiteral("B"));
+        tl.setActiveSequence(b);
+        setRoto(30.0);
+        view.liveRemap->insert(key, sidecarRemap(1.5));
+        tl.setActiveSequence(a);
+        setRoto(20.0);
+        view.liveRemap->insert(key, sidecarRemap(1.0));
+        QTemporaryDir dir;
+        const QString path = dir.filePath(QStringLiteral("g41b.veditor"));
+        QJsonObject root;
+        if (dir.isValid() && view.save(path)) root = readJsonFile(path);
+        QJsonArray sequences = root.value(QStringLiteral("sequences")).toArray();
+        for (int i = 0; i < sequences.size(); ++i) {
+            QJsonObject sequence = sequences[i].toObject();
+            for (const char *k : {"rotoClipEntries", "trackMatteClipEntries", "clipParentEntries", "timeRemapClipEntries"})
+                sequence.remove(QLatin1String(k));
+            sequences[i] = sequence;
+        }
+        root[QStringLiteral("sequences")] = sequences;
+        QFile file(path);
+        const bool written = !root.isEmpty() && file.open(QIODevice::WriteOnly | QIODevice::Truncate)
+            && file.write(QJsonDocument(root).toJson()) > 0;
+        file.close();
+        const bool opened = written && view.open(path);
+        const bool activeA = tl.activeSequenceId() == a;
+        const QString aRoto = roto();
+        const QString aRemap = live();
+        const bool parkedEmpty = tl.parkedSidecarsBySequence().isEmpty() && view.parkedRemap->isEmpty();
+        const bool toB = tl.setActiveSequence(b);
+        okB = opened && activeA && aRoto == rA && aRemap == mA && parkedEmpty && toB && roto() == empty
+            && live() == empty && matteSig(tl.trackMatteEntries()) == empty;
+        std::fprintf(stderr, "connected-clip G41 (b) HEAD-shaped file: written=%d opened=%d active A %d roto=%s remap=%s "
+                     "parkedEmpty=%d | B roto=%s remap=%s (expect {}) ok=%d\n", written, opened, activeA,
+                     qPrintable(aRoto), qPrintable(aRemap), parkedEmpty, qPrintable(roto()), qPrintable(live()), okB);
+    }
+
+    // History [base, A1, B1, B2] built on A then B (c / f).
+    QString a;
+    QString b;
+    int idxA1 = -1;
+    int idxB2 = -1;
+    auto buildHistory = [&] {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("B")}, video);
+        a = ids.value(QStringLiteral("A"));
+        b = ids.value(QStringLiteral("B"));
+        setRoto(20.0);
+        view.liveRemap->insert(key, sidecarRemap(1.0));
+        tl.saveUndoState(QStringLiteral("A1"));
+        idxA1 = tl.undoManager()->currentIndex();
+        tl.setActiveSequence(b);
+        setRoto(10.0);
+        tl.saveUndoState(QStringLiteral("B1"));
+        setRoto(30.0);
+        tl.saveUndoState(QStringLiteral("B2"));
+        idxB2 = tl.undoManager()->currentIndex();
+        view.liveRemap->insert(key, sidecarRemap(1.5));   // mB, no undo point
+    };
+
+    // (c) undo / redo across the switch.
+    buildHistory();
+    const bool histC = live() == mB && roto() == rB2 && parked(a) == rA;
+    log.attach(tl);
+    tl.undo();   // -> B1
+    const bool c1 = tl.activeSequenceId() == b && roto() == rB1 && parked(a) == rA && log.events.isEmpty()
+        && live() == empty;
+    std::fprintf(stderr, "connected-clip G41 (c1) undo->B1 active=%s roto=%s parked[A]=%s signals=%lld remap=%s ok=%d\n",
+                 qPrintable(tl.activeSequenceId()), qPrintable(roto()), qPrintable(parked(a)),
+                 static_cast<long long>(log.events.size()), qPrintable(live()), c1);
+    setRoto(30.0);   // rB2 again, no undo point
+    log.events.clear();
+    tl.undo();   // -> A1 (crosses)
+    const QStringList c2Log = log.events;
+    const bool c2 = tl.activeSequenceId() == a && roto() == rA && !parkedHas(a) && parked(b) == rB2
+        && c2Log == QStringList{b + QLatin1Char('>') + a} && live() == mA
+        && view.parkedRemap->contains(b) && parkedRemap(b) == empty && !view.parkedRemap->contains(a);
+    std::fprintf(stderr, "connected-clip G41 (c2) undo->A1 active=%s roto=%s parkedHas(A)=%d parked[B]=%s signals=[%s] "
+                 "remap=%s parkedRemap[B]=%s (has %d) parkedRemapHas(A)=%d ok=%d\n",
+                 qPrintable(tl.activeSequenceId()), qPrintable(roto()), parkedHas(a), qPrintable(parked(b)),
+                 qPrintable(c2Log.join(QLatin1Char(' '))), qPrintable(live()), qPrintable(parkedRemap(b)),
+                 view.parkedRemap->contains(b), view.parkedRemap->contains(a), c2);
+    tl.setActiveSequence(b);
+    const QString c3Seen = QStringLiteral("roto=%1 remap=%2 parked[A]=%3 parkedRemap[A]=%4")
+        .arg(roto(), live(), parked(a), parkedRemap(a));
+    const bool c3 = roto() == rB2 && live() == empty && parked(a) == rA && parkedRemap(a) == mA;
+    tl.setActiveSequence(a);
+    const bool c4 = roto() == rA && parked(b) == rB2 && live() == mA;
+    std::fprintf(stderr, "connected-clip G41 (c3) switch to B: %s ok=%d | "
+                 "(c4) switch to A: roto=%s parked[B]=%s remap=%s ok=%d\n", qPrintable(c3Seen), c3, qPrintable(roto()),
+                 qPrintable(parked(b)), qPrintable(live()), c4);
+    log.events.clear();
+    tl.redo();   // -> B1 (crosses)
+    const QStringList c5Log = log.events;
+    const bool c5 = tl.activeSequenceId() == b && roto() == rB1 && !parkedHas(b) && parked(a) == rA
+        && c5Log == QStringList{a + QLatin1Char('>') + b} && live() == empty && parkedRemap(a) == mA
+        && !view.parkedRemap->contains(b);
+    std::fprintf(stderr, "connected-clip G41 (c5) redo->B1 active=%s roto=%s parkedHas(B)=%d parked[A]=%s signals=[%s] "
+                 "remap=%s parkedRemap[A]=%s parkedRemapHas(B)=%d ok=%d\n",
+                 qPrintable(tl.activeSequenceId()), qPrintable(roto()), parkedHas(b), qPrintable(parked(a)),
+                 qPrintable(c5Log.join(QLatin1Char(' '))), qPrintable(live()), qPrintable(parkedRemap(a)),
+                 view.parkedRemap->contains(b), c5);
+    QObject::disconnect(log.connection);
+    const bool okC = histC && c1 && c2 && c3 && c4 && c5;
+
+    // (d) undo / redo across a sequence creation.
+    bool okD = false;
+    {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A")}, video);
+        const QString a0 = ids.value(QStringLiteral("A"));
+        setRoto(20.0);
+        tl.saveUndoState(QStringLiteral("A1"));
+        const bool created = tl.createSequence(QStringLiteral("B"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString b0 = tl.activeSequenceId();
+        const QString d1Seen = QStringLiteral("parked[A]=%1 live=%2").arg(parked(a0), roto());
+        const bool d1 = created && b0 != a0 && parked(a0) == rA && roto() == empty;
+        log.attach(tl);
+        tl.undo();
+        const QStringList undoLog = log.events;
+        const QString d2Seen = QStringLiteral("active=%1 live=%2 parkedHas(A)=%3")
+            .arg(tl.activeSequenceId(), roto()).arg(int(parkedHas(a0)));
+        const bool d2 = tl.activeSequenceId() == a0 && roto() == rA && !parkedHas(a0)
+            && undoLog == QStringList{b0 + QLatin1Char('>') + a0};
+        log.events.clear();
+        tl.redo();
+        const QStringList redoLog = log.events;
+        const QString d3Seen = QStringLiteral("active=%1 live=%2 parked[A]=%3 parkedHas(B)=%4")
+            .arg(tl.activeSequenceId(), roto(), parked(a0)).arg(int(parkedHas(b0)));
+        const bool d3 = tl.activeSequenceId() == b0 && roto() == empty && parked(a0) == rA && !parkedHas(b0)
+            && redoLog == QStringList{a0 + QLatin1Char('>') + b0};
+        const bool back = tl.setActiveSequence(a0) && roto() == rA;
+        QObject::disconnect(log.connection);
+        // A sequence created after an undone creation reuses its id and starts empty.
+        setupSequenceSidecars(tl, view, {QStringLiteral("A")}, video);
+        setRoto(20.0);
+        tl.saveUndoState(QStringLiteral("A1"));
+        const bool createdB = tl.createSequence(QStringLiteral("B"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString bU = tl.activeSequenceId();
+        setRoto(10.0);
+        view.liveRemap->insert(key, sidecarRemap(1.5));
+        const bool onB = createdB && roto() == rB1 && live() == mB;
+        tl.undo();
+        const bool undone = tl.activeSequenceId() == a0;
+        const bool createdB2 = tl.createSequence(QStringLiteral("B2"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString b2 = tl.activeSequenceId();
+        const QString d4Seen = QStringLiteral("undone B=%1 new=%2 roto=%3 remap=%4 parkedHas(new)=%5")
+            .arg(bU, b2, roto(), live()).arg(int(parkedHas(b2)));
+        const bool d4 = onB && undone && createdB2 && b2 == bU && roto() == empty && live() == empty
+            && !parkedHas(b2);
+        // Switch away from B, then a jump on A removes B without a signal: neither table keeps B.
+        setupSequenceSidecars(tl, view, {QStringLiteral("A")}, video);
+        setRoto(20.0);
+        tl.saveUndoState(QStringLiteral("A1"));
+        const int idxJ = tl.undoManager()->currentIndex();
+        const bool createdJ = tl.createSequence(QStringLiteral("B"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString bJ = tl.activeSequenceId();
+        setRoto(10.0);
+        view.liveRemap->insert(key, sidecarRemap(1.5));
+        const bool onBJ = createdJ && roto() == rB1 && live() == mB;
+        const bool awayJ = tl.setActiveSequence(a0) && parked(bJ) == rB1 && parkedRemap(bJ) == mB;
+        log.attach(tl);
+        const bool jumpedJ = tl.undoManager()->jumpTo(idxJ);
+        const QStringList jumpLog = log.events;
+        QObject::disconnect(log.connection);
+        const QString d5Jump = QStringLiteral("active=%1 signals=[%2] parkedHas(B)=%3 parkedRemapHas(B)=%4")
+            .arg(tl.activeSequenceId(), jumpLog.join(QLatin1Char(' '))).arg(int(parkedHas(bJ)))
+            .arg(int(view.parkedRemap->contains(bJ)));
+        const bool prunedJ = jumpedJ && tl.activeSequenceId() == a0 && jumpLog.isEmpty() && !parkedHas(bJ)
+            && !view.parkedRemap->contains(bJ);
+        const bool createdJ2 = tl.createSequence(QStringLiteral("B3"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString bJ2 = tl.activeSequenceId();
+        const QString d5Seen = QStringLiteral("new=%1 roto=%2 remap=%3 parkedHas(new)=%4 parkedRemapHas(new)=%5")
+            .arg(bJ2, roto(), live()).arg(int(parkedHas(bJ2))).arg(int(view.parkedRemap->contains(bJ2)));
+        const bool d5 = onBJ && awayJ && prunedJ && createdJ2 && bJ2 == bJ && roto() == empty && live() == empty
+            && !parkedHas(bJ2) && !view.parkedRemap->contains(bJ2);
+        // A precompose id (Timeline::addSequence) removed by a jump made inside it, then reused.
+        setupSequenceSidecars(tl, view, {QStringLiteral("A")}, video);
+        const int idxP = tl.undoManager()->currentIndex();
+        TimelineSequence precomp;
+        precomp.id = QStringLiteral("precomp-1");
+        precomp.name = QStringLiteral("Precomp 1");
+        precomp.videoTracks = video;
+        precomp.audioTracks = {{}};
+        auto hasPrecomp = [&] {
+            const auto sequences = tl.sequences();
+            return std::any_of(sequences.cbegin(), sequences.cend(),
+                               [&](const TimelineSequence &s) { return s.id == precomp.id; });
+        };
+        const bool addedP = tl.addSequence(precomp) && hasPrecomp();
+        tl.saveUndoState(QStringLiteral("precompose"));
+        const bool enteredP = tl.setActiveSequence(precomp.id);
+        setRoto(10.0);
+        tl.setTrackMatteEntries({{key, matte}});
+        tl.setClipParent(QStringLiteral("1:0"), key);
+        tl.saveUndoState(QStringLiteral("P roto"));
+        const bool onP = addedP && enteredP && roto() == rB1 && matteSig(tl.trackMatteEntries()) != empty
+            && parentSig(tl.clipParentEntries()) != empty;
+        const bool jumpedP = tl.undoManager()->jumpTo(idxP);
+        const bool goneP = jumpedP && !hasPrecomp();
+        const bool parkedAfterJumpP = parkedHas(precomp.id);
+        const bool prunedP = goneP && !parkedAfterJumpP;
+        // Even with a stale parked entry for the id (as before the restore prune), addSequence starts it empty.
+        Timeline::SequenceSidecars stale;
+        stale.roto = {{key, sidecarRoto(10.0)}};
+        stale.matte = {{key, matte}};
+        stale.parent = {{QStringLiteral("1:0"), key}};
+        tl.setParkedSidecarsBySequence({{precomp.id, stale}});
+        const bool addedP2 = tl.addSequence(precomp) && hasPrecomp() && !parkedHas(precomp.id);
+        const bool enteredP2 = tl.setActiveSequence(precomp.id);
+        const QString d6Seen = QStringLiteral("jumped=%1 gone=%2 parkedHas(P) after jump=%3 | re-add=%4 roto=%5 "
+                                              "matte=%6 parent=%7")
+            .arg(int(jumpedP)).arg(int(goneP)).arg(int(parkedAfterJumpP))
+            .arg(int(addedP2)).arg(roto(), matteSig(tl.trackMatteEntries()), parentSig(tl.clipParentEntries()));
+        const bool d6 = onP && prunedP && addedP2 && enteredP2 && tl.activeSequenceId() == precomp.id
+            && roto() == empty && matteSig(tl.trackMatteEntries()) == empty
+            && parentSig(tl.clipParentEntries()) == empty;
+        okD = d1 && d2 && d3 && back && d4 && d5 && d6;
+        std::fprintf(stderr, "connected-clip G41 (d) create=%d B=%s %s ok1=%d | undo %s signals=[%s] ok2=%d | "
+                     "redo %s signals=[%s] ok3=%d | back to A ok=%d | reuse: B on=%d undone=%d %s ok4=%d | "
+                     "switch-then-jump: B on=%d away=%d jump %s %s ok5=%d | precompose: on=%d pruned=%d %s ok6=%d\n",
+                     created, qPrintable(b0), qPrintable(d1Seen), d1, qPrintable(d2Seen),
+                     qPrintable(undoLog.join(QLatin1Char(' '))), d2, qPrintable(d3Seen),
+                     qPrintable(redoLog.join(QLatin1Char(' '))), d3, back, onB, undone, qPrintable(d4Seen), d4,
+                     onBJ, awayJ, qPrintable(d5Jump), qPrintable(d5Seen), d5, onP, prunedP, qPrintable(d6Seen), d6);
+    }
+
+    // (e) a switch between the undo point and the creation (_sequenceCreationActiveId != recorded).
+    bool okE = false;
+    {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("C")}, video);
+        const QString a0 = ids.value(QStringLiteral("A"));
+        const QString c0 = ids.value(QStringLiteral("C"));
+        setRoto(20.0);
+        view.liveRemap->insert(key, sidecarRemap(1.0));
+        tl.saveUndoState(QStringLiteral("A1"));
+        tl.setActiveSequence(c0);
+        const bool e1 = parked(a0) == rA;
+        setRoto(15.0);
+        view.liveRemap->insert(key, sidecarRemap(0.5));
+        const bool created = tl.createSequence(QStringLiteral("B"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const QString b0 = tl.activeSequenceId();
+        const bool e2 = created && parked(c0) == rC && parkedRemap(c0) == mC;
+        const QString parkedRemapCBefore = parkedRemap(c0);
+        log.attach(tl);
+        tl.undo();
+        const QStringList undoLog = log.events;
+        QObject::disconnect(log.connection);
+        // B left the store: no parked roto / remap stays under its id (a later reuse starts empty).
+        const bool e3 = tl.activeSequenceId() == c0 && roto() == rC && parked(a0) == rA && !parkedHas(b0)
+            && !view.parkedRemap->contains(b0) && !parkedHas(c0) && undoLog == QStringList{b0 + QLatin1Char('>') + c0}
+            && live() == parkedRemapCBefore && parkedRemap(a0) == mA;
+        // The taken parked entry is mirrored onto the landing clip (it never carried it).
+        const bool e4 = clipCurve() == curveOf(0.5);
+        okE = e1 && e2 && e3 && e4;
+        std::fprintf(stderr, "connected-clip G41 (e) parked[A]=%d create=%d parked[C]=%d | undo active=%s (expect C=%s) "
+                     "roto=%s parked[A]=%s parked[B]=%s (has %d, remap has %d) parkedHas(C)=%d signals=[%s] remap=%s parkedRemap[A]=%s "
+                     "clipCurve=mC %d ok=%d\n", e1, created, e2, qPrintable(tl.activeSequenceId()), qPrintable(c0), qPrintable(roto()),
+                     qPrintable(parked(a0)), qPrintable(parked(b0)), parkedHas(b0), int(view.parkedRemap->contains(b0)), parkedHas(c0),
+                     qPrintable(undoLog.join(QLatin1Char(' '))), qPrintable(live()), qPrintable(parkedRemap(a0)), e4, okE);
+    }
+
+    // (f) a history jump crosses once.
+    buildHistory();
+    log.attach(tl);
+    const bool jumped1 = tl.undoManager()->jumpTo(idxA1);
+    const QStringList f1Log = log.events;
+    const QString f1Seen = QStringLiteral("active=%1 roto=%2 parked[B]=%3 parkedHas(A)=%4 remap=%5 parkedRemap[B]=%6")
+        .arg(tl.activeSequenceId(), roto(), parked(b)).arg(int(parkedHas(a))).arg(live(), parkedRemap(b));
+    const bool f1 = jumped1 && f1Log == QStringList{b + QLatin1Char('>') + a} && tl.activeSequenceId() == a
+        && roto() == rA && parked(b) == rB2 && !parkedHas(a) && live() == mA && parkedRemap(b) == mB;
+    log.events.clear();
+    const bool jumped2 = tl.undoManager()->jumpTo(idxB2);
+    const QStringList f2Log = log.events;
+    QObject::disconnect(log.connection);
+    const bool f2 = jumped2 && f2Log == QStringList{a + QLatin1Char('>') + b} && tl.activeSequenceId() == b
+        && roto() == rB2 && parked(a) == rA && live() == empty && parkedRemap(a) == mA;
+    const bool okF = f1 && f2;
+    std::fprintf(stderr, "connected-clip G41 (f) jump A1=%d signals=[%s] %s ok=%d | jump B2=%d signals=[%s] roto=%s "
+                 "parked[A]=%s remap=%s parkedRemap[A]=%s ok=%d\n",
+                 jumped1, qPrintable(f1Log.join(QLatin1Char(' '))), qPrintable(f1Seen), f1, jumped2, qPrintable(f2Log.join(QLatin1Char(' '))), qPrintable(roto()),
+                 qPrintable(parked(a)), qPrintable(live()), qPrintable(parkedRemap(a)), f2);
+
+    // (g) undo across a creation while already on the landing sequence keeps its live sidecars.
+    bool okG = false;
+    {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("C")}, video);
+        const QString a0 = ids.value(QStringLiteral("A"));
+        const QString c0 = ids.value(QStringLiteral("C"));
+        setRoto(20.0);
+        view.liveRemap->insert(key, sidecarRemap(1.0));
+        tl.saveUndoState(QStringLiteral("A1"));
+        tl.setActiveSequence(c0);
+        setRoto(15.0);
+        view.liveRemap->insert(key, sidecarRemap(0.5));
+        const bool created = tl.createSequence(QStringLiteral("B"), {{clipFor("g41-new", 2.0)}}, {{}});
+        const bool onC = created && tl.setActiveSequence(c0) && roto() == rC && live() == mC;
+        log.attach(tl);
+        tl.undo();
+        const QStringList undoLog = log.events;
+        QObject::disconnect(log.connection);
+        const bool g2 = clipCurve() == curveOf(0.5);
+        okG = onC && tl.activeSequenceId() == c0 && roto() == rC && live() == mC && parked(a0) == rA
+            && parkedRemap(a0) == mA && !parkedHas(c0) && undoLog.isEmpty() && g2;
+        std::fprintf(stderr, "connected-clip G41 (g) create=%d on C=%d | undo active=%s (expect C=%s) roto=%s remap=%s "
+                     "parked[A]=%s parkedRemap[A]=%s parkedHas(C)=%d signals=%lld (expect 0) clipCurve=mC %d ok=%d\n",
+                     created, onC, qPrintable(tl.activeSequenceId()), qPrintable(c0), qPrintable(roto()), qPrintable(live()),
+                     qPrintable(parked(a0)), qPrintable(parkedRemap(a0)), parkedHas(c0),
+                     static_cast<long long>(undoLog.size()), g2, okG);
+    }
+
+    // (h) remaps committed through the real path (map + clip curve + undo point): the stored A clips
+    // carry mA1 while A's parked entry is mA2; a switch to A puts mA2 on the clip, and the next
+    // collection (an undo point's sidecars, the project data) keeps mA2 in the map.
+    bool okH = false;
+    {
+        auto ids = setupSequenceSidecars(tl, view, {QStringLiteral("A"), QStringLiteral("B")}, video);
+        const QString a0 = ids.value(QStringLiteral("A"));
+        const QString b0 = ids.value(QStringLiteral("B"));
+        auto commitRemap = [&](double srcEnd, const QString &label) {
+            view.liveRemap->insert(key, sidecarRemap(srcEnd));
+            ProjectFile::applyTimeRemapEntries(&tl, view.liveRemap->values());
+            tl.saveUndoState(label);
+        };
+        const QString mA2 = remapOf(2.5);
+        commitRemap(1.0, QStringLiteral("mA1"));
+        const bool h1 = live() == mA && clipCurve() == curveOf(1.0);
+        tl.setActiveSequence(b0);
+        setRoto(10.0);
+        tl.saveUndoState(QStringLiteral("B1"));
+        const int idxB1 = tl.undoManager()->currentIndex();
+        tl.setActiveSequence(a0);
+        commitRemap(2.5, QStringLiteral("mA2"));
+        const bool h2 = live() == mA2 && clipCurve() == curveOf(2.5);
+        const bool jumped = tl.undoManager()->jumpTo(idxB1);
+        const QString parkedA = parkedRemap(a0);
+        const bool h3 = jumped && tl.activeSequenceId() == b0 && parkedA == mA2;
+        tl.setActiveSequence(a0);
+        const QString switchedLive = live();
+        const bool clipIsA2 = clipCurve() == curveOf(2.5);
+        view.collect();
+        ProjectData data;
+        view.populate(data);
+        const bool h4 = switchedLive == mA2 && clipIsA2 && live() == mA2 && clipCurve() == curveOf(2.5);
+        okH = h1 && h2 && h3 && h4;
+        std::fprintf(stderr, "connected-clip G41 (h) commit mA1=%d | B1, A, commit mA2=%d | undo->B1=%d parkedRemap[A]=%s "
+                     "(expect mA2=%s) ok=%d | switch to A: remap=%s clipCurve=mA2 %d | after collect+populate: "
+                     "remap=%s clipCurve=mA2 %d ok=%d\n", h1, h2, jumped, qPrintable(parkedA), qPrintable(mA2),
+                     h3, qPrintable(switchedLive), clipIsA2, qPrintable(live()), clipCurve() == curveOf(2.5), okH);
+    }
+
+    // Leave the main timeline without a sequence model or sidecars.
+    tl.setClipParentEntries({});
+    tl.setParkedSidecarsBySequence({});
+    tl.setRotoEntries({});
+    tl.setTrackMatteEntries({});
+    view.liveRemap->clear();
+    view.parkedRemap->clear();
+    load(tl, {{}});
+    tally.gate(41, okA && okB && okC && okD && okE && okF && okG && okH,
+               "(a) a switch without a sequence model changed a sidecar or fired; (b) a file without per-sequence "
+               "arrays did not put the root sidecars on the active sequence only; (c)-(g) an undo / redo / history "
+               "jump across sequences did not restore the landing sequence from the state, park the left one's live "
+               "sidecars (and the remap by the same rule), drop the landing one's parked set or fire once; "
+               "(e) / (g) / (h) the landing sequence's remap entries were not mirrored onto its clip curves");
 }
 
 } // namespace
@@ -5350,6 +6111,24 @@ int runConnectedClipSelftest()
     else
         clipExpressionGate(tally, window, *mainTimeline, &MainWindow::saveProjectToPath,
                            &MainWindow::openProjectFromPath);
+
+    // G39-G41 (US-2005): per-sequence sidecars on a switch, in the project file and across undo.
+    if (!mainTimeline) {
+        tally.gate(39, false, "MainWindow has no mainTimeline");
+        tally.gate(40, false, "MainWindow has no mainTimeline");
+        tally.gate(41, false, "MainWindow has no mainTimeline");
+    } else {
+        SequenceSidecarView view;
+        view.liveRemap = &window.m_timeRemapClipEntries;
+        view.parkedRemap = &window.m_timeRemapEntriesBySequence;
+        view.populate = [&window](ProjectData &data) { window.populateProjectData(data); };
+        view.collect = [&window] { return window.collectSidecarState(); };
+        view.save = [&window](const QString &path) { return window.saveProjectToPath(path); };
+        view.open = [&window](const QString &path) { return window.openProjectFromPath(path, nullptr, false); };
+        sequenceSwitchSidecarGate(tally, *mainTimeline, view);
+        sequenceSidecarPersistGate(tally, *mainTimeline, view);
+        sequenceSidecarUndoGate(tally, *mainTimeline, view);
+    }
 
     return tally.finish("connected-clip");
 }

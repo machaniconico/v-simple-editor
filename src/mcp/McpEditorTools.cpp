@@ -1,5 +1,6 @@
 #include "McpEditorTools.h"
 #include "../EdlImport.h"
+#include "../ExtrudedMesh.h"
 #include "../FcpxmlImport.h"
 #include "../ExportUserPresets.h"
 
@@ -858,7 +859,7 @@ bool parseText3DArgument(const QJsonValue& raw, QJsonObject* normalized, QString
     if (object.contains(QStringLiteral("extrudeBevelSegments"))) {
         const QJsonValue v = object.value(QStringLiteral("extrudeBevelSegments"));
         const double d = v.toDouble();
-        if (!v.isDouble() || !std::isfinite(d) || d != std::floor(d) || d < 0.0 || d > 8.0)
+        if (!v.isDouble() || !std::isfinite(d) || d != std::floor(d) || d < 0.0 || d > mesh3d::kMaxBevelSegments)
             return setError(err, QStringLiteral("text3d.extrudeBevelSegments must be an integer in 0..8"));
     }
     if (object.isEmpty()) {
@@ -867,7 +868,7 @@ bool parseText3DArgument(const QJsonValue& raw, QJsonObject* normalized, QString
     }
     Text3DLayer layer;
     layer.fromJson(object);
-    // 押し出しメッシュの中間プロファイルは (2*bevelDepth - depth) / (depth / (2*segs+1)) 回ループする (ExtrudedMesh.cpp:209-217)。
+    // 押し出しメッシュの中間プロファイルは (2*bevelDepth - depth) / (depth / (2*segs+1)) 回ループする (mesh3d::extrudeMidSteps、builder も同じ上限で面取りを落とす)。
     // 既定値を含む実効値で検査し、extrudeEnabled に関わらず拒否する (後から有効化されうる)。丸めずに拒否する。
     {
         const double depth = layer.extrudeDepth();
@@ -876,15 +877,13 @@ bool parseText3DArgument(const QJsonValue& raw, QJsonObject* normalized, QString
         const int segs = layer.extrudeBevelSegments();
         const QString tooComplex = QStringLiteral("text3d extrusion is too complex: reduce extrudeBevelDepth or raise extrudeDepth");
         if (!std::isfinite(depth) || !std::isfinite(bevelDepth) || !std::isfinite(bevelWidth)
-            || depth < 0.0 || depth > 5.0 || bevelDepth < 0.0 || bevelDepth > 1.0
-            || bevelWidth < 0.0 || bevelWidth > 1.0)
+            || depth < 0.0 || depth > mesh3d::kMaxExtrudeDepth || bevelDepth < 0.0 || bevelDepth > mesh3d::kMaxBevelSize
+            || bevelWidth < 0.0 || bevelWidth > mesh3d::kMaxBevelSize)
             return setError(err, QStringLiteral("text3d.extrudeDepth must be in 0..5 and extrudeBevelDepth / extrudeBevelWidth in 0..1"));
-        const double span = 2.0 * bevelDepth - depth;
-        if (segs > 0 && bevelDepth > 0.0 && span > 1e-6) {
-            const double steps = depth > 0.0 ? span * (2.0 * segs + 1.0) / depth
-                                             : std::numeric_limits<double>::infinity();
+        const double steps = mesh3d::extrudeMidSteps(mesh3d::ExtrudeParams{depth, bevelDepth, bevelWidth, segs, true});
+        if (steps > 0.0) {
             const double textLen = qMax(1, object.value(QStringLiteral("text")).toString().size());
-            if (!(steps <= 40000.0) || !(steps * textLen <= 1000000.0))
+            if (!(steps <= mesh3d::kMaxExtrudeMidSteps) || !(steps * textLen <= 1000000.0))
                 return setError(err, tooComplex);
         }
     }
@@ -4560,7 +4559,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_text3d"),
-        QStringLiteral("映像クリップの 3D テキスト設定を全置換する。text3d は Text3DLayer の JSON (text / fontFamily / fontPointSize / perCharRotation / perCharPosition / perCharScale / cameraDistance / rotationAnimAxis / extrudeEnabled / extrudeDepth / extrudeBevelDepth / extrudeBevelWidth / extrudeBevelSegments / frontColor / sideColor / ambient / lightDir / extrudeBaseYaw / extrudeBasePitch / camera / timeOffsetSec)。{} で解除。サイズは 64 KiB 以下、未知のトップレベルキーは拒否 (camera 等のネストは検査しない)。extrudeBevelSegments は整数 0..8、extrudeDepth は 0..5、extrudeBevelDepth / extrudeBevelWidth は 0..1 で、有効なベベルがあるとき (2*extrudeBevelDepth - extrudeDepth が正) は (その差 × (2*extrudeBevelSegments+1) / extrudeDepth) が 40000 以下かつ文字数との積が 1000000 以下 (extrudeDepth 0 は拒否)。保存は正規化後の値で、保存値と等しければ changed=false で何もしない。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("映像クリップの 3D テキスト設定を全置換する。text3d は Text3DLayer の JSON (text / fontFamily / fontPointSize / perCharRotation / perCharPosition / perCharScale / cameraDistance / rotationAnimAxis / extrudeEnabled / extrudeDepth / extrudeBevelDepth / extrudeBevelWidth / extrudeBevelSegments / frontColor / sideColor / ambient / lightDir / extrudeBaseYaw / extrudeBasePitch / camera / timeOffsetSec)。{} で解除。サイズは 64 KiB 以下、未知のトップレベルキーは拒否 (camera 等のネストは検査しない)。extrudeBevelSegments は整数 0..8、extrudeDepth は 0..5、extrudeBevelDepth / extrudeBevelWidth は 0..1 で、有効なベベルがあるとき (extrudeBevelSegments > 0 かつ extrudeBevelDepth > 0 かつ 2*extrudeBevelDepth - extrudeDepth が正) は (その差 × (2*extrudeBevelSegments+1) / extrudeDepth) が 40000 以下かつ文字数との積が 1000000 以下。その場合の extrudeDepth 0 は拒否 (それ以外の extrudeDepth 0 は受理)。頂点予算 (200 万) を超える文字列は面取り無しで描く。保存は正規化後の値で、保存値と等しければ changed=false で何もしない。音声クリップとロック中トラックは拒否する。Ctrl+Z / undo ツールで戻せる。"),
         sidecarSetInputSchema(clipProperties, /*brush=*/false),
         guardedWrite(QStringLiteral("set_clip_text3d"),
                      [this](const QJsonObject& args, QString* err) -> QJsonObject {

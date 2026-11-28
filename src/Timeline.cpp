@@ -2,6 +2,7 @@
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
 #include "AudioKeyframes.h"
+#include "EnvelopeGeometry.h"
 #include "CaptionOverlayBuilder.h"
 #include "CaptionTrack.h"
 #include "AudioClipEditor.h"
@@ -42,6 +43,7 @@
 #include <utility>
 #include <QFileInfo>
 #include <QSignalBlocker>
+#include <QScopedValueRollback>
 #include <QRubberBand>
 #include <QSet>
 #include <QThread>
@@ -261,22 +263,18 @@ inline int transBadgeWidth(double durSec, double pps, int clipWidth) {
 // audio clip interaction (drag, trim, transition badge) is unchanged.
 bool g_envelopeEditMode = false;
 constexpr int kEnvelopePointRadiusPx = 5;
-constexpr double kEnvelopeMaxGain = 2.0;     // rubber band display ceiling (not the ClipInfo::volume cap)
 constexpr double kEnvelopeHitRadiusPx = 5.0; // mouse hit radius for points
 constexpr qint64 kDefaultAdjustmentLayerDurationUs = 5LL * 1000000LL;
 constexpr int kAdjustmentLayerMinPaintWidthPx = 42;
 
 // Map a clip-local time + gain to widget pixel coords. The clipRect's top
-// row is gain=2.0 (max), the bottom row is gain=0.0; gain=1.0 sits at the
+// row is gain=kMaxClipGain, the bottom row is gain=0.0; unity sits at the
 // vertical centre. Time is laid out at the track pps.
 inline double envelopeGainToY(double gain, int rowHeight) {
-    const double clamped = qBound(0.0, gain, kEnvelopeMaxGain);
-    return rowHeight * (1.0 - clamped / kEnvelopeMaxGain);
+    return envgeom::gainToY(gain, rowHeight);
 }
 inline double envelopeYToGain(double y, int rowHeight) {
-    if (rowHeight <= 0) return 1.0;
-    const double t = qBound(0.0, 1.0 - y / static_cast<double>(rowHeight), 1.0);
-    return t * kEnvelopeMaxGain;
+    return envgeom::yToGain(y, rowHeight);
 }
 
 int adjustmentLayerTrackIndex(const Timeline *timeline, const TimelineTrack *track)
@@ -4903,10 +4901,11 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
         if (headerPtr) headerPtr->setFixedHeight(newH);
     });
 
-    connect(lockBtn, &QPushButton::toggled, this, [trackPtr, lockBtnPtr](bool checked) {
+    connect(lockBtn, &QPushButton::toggled, this, [this, trackPtr, lockBtnPtr](bool checked) {
         if (!trackPtr) return;
         qInfo() << "Timeline: lock toggled =" << checked << "track=" << trackPtr.data();
         trackPtr->setLocked(checked);
+        emit trackFlagsChanged();
         if (lockBtnPtr) {
             lockBtnPtr->setText(checked
                 ? QString::fromUtf8("\xF0\x9F\x94\x92")    // 🔒
@@ -4919,6 +4918,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             if (!trackPtr) return;
             qInfo() << "Timeline: mute toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setMuted(checked);
+            emit trackFlagsChanged();
             if (muteBtnPtr) {
                 muteBtnPtr->setText(checked
                     ? QString::fromUtf8("\xF0\x9F\x94\x87")    // 🔇
@@ -4948,6 +4948,7 @@ QWidget *Timeline::createTrackHeader(TimelineTrack *track, const QString &name, 
             if (!trackPtr) return;
             qInfo() << "Timeline: hide toggled =" << checked << "track=" << trackPtr.data();
             trackPtr->setHidden(checked);
+            emit trackFlagsChanged();
             if (hideBtnPtr) {
                 hideBtnPtr->setText(checked
                     ? QString::fromUtf8("\xE2\x8A\x98")    // ⊘
@@ -12502,6 +12503,7 @@ void Timeline::toggleMuteTrack(int audioTrackIndex)
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     auto *track = m_audioTracks[audioTrackIndex];
     track->setMuted(!track->isMuted());
+    emit trackFlagsChanged();
     syncTrackHeaderFlags(track);
     // Re-emit so AudioMixer picks up the new audioMuted flag for every
     // entry on this track. Without this the mute toggle stayed silent
@@ -12514,6 +12516,7 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
 {
     if (audioTrackIndex < 0 || audioTrackIndex >= m_audioTracks.size()) return;
     bool newSolo = !m_audioTracks[audioTrackIndex]->isSolo();
+    bool anyChanged = false;
     // Clear all solo first, then set the target
     for (int i = 0; i < m_audioTracks.size(); ++i) {
         const bool wasSolo = m_audioTracks[i]->isSolo();
@@ -12522,8 +12525,11 @@ void Timeline::toggleSoloTrack(int audioTrackIndex)
             m_audioTracks[i]->setSolo(nowSolo);
             syncTrackHeaderFlags(m_audioTracks[i]);
             emit trackSoloChanged(i, nowSolo);
+            anyChanged = true;
         }
     }
+    if (anyChanged)
+        emit trackFlagsChanged();
     // Solo state lives on the mixer (per-track effectiveGain), so the
     // PlaybackEntry-shaped schedule is unchanged — no audioSequenceChanged
     // re-emit needed. trackSoloChanged carries the only state the mixer
@@ -16180,6 +16186,9 @@ bool Timeline::createSequence(const QString &name,
     }
     TimelineSequence sequence;
     sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
+    // US-2005: a reused id must not pick up the parked sidecars of a sequence whose
+    // creation was undone.
+    m_parkedSidecarsBySequence.remove(sequence.id);
     sequence.name = name.trimmed();
     sequence.videoTracks = videoTracks;
     sequence.audioTracks = audioTracks;
@@ -16288,6 +16297,8 @@ bool Timeline::addSequence(const TimelineSequence &sequence)
     TimelineSequence normalized = sequence;
     QVector<TimelineSequence> existing = m_sequences;
     normalized.id = uniqueSequenceId(existing, normalized.id, existing.size());
+    // US-2005: a reused id (e.g. a precompose after an undone one) starts without sidecars.
+    m_parkedSidecarsBySequence.remove(normalized.id);
     if (normalized.name.trimmed().isEmpty())
         normalized.name = QStringLiteral("Sequence %1").arg(existing.size() + 1);
     upsertSequenceSnapshot(normalized);
@@ -16312,6 +16323,12 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     if (!target)
         return false;
 
+    // US-2005: a switch parks the sidecars of the sequence it leaves (the parent
+    // map raw, without the store key). Inside restoreState only the clips change;
+    // its end parks and restores once.
+    const QString oldId = m_activeSequenceId;
+    if (!m_restoringState)
+        m_parkedSidecarsBySequence[oldId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
     const TimelineSequence targetCopy = *target;
     m_activeSequenceId = sequenceId;
     clearReconcileBaseline();
@@ -16337,6 +16354,12 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
         m_audioTracks[i]->setClips(clips);
     }
     m_generatedCaptionOverlays = targetCopy.generatedCaptionOverlays;
+    if (!m_restoringState) {
+        const SequenceSidecars in = m_parkedSidecarsBySequence.take(sequenceId);
+        commitRotoEntries(in.roto, /*clearMemo=*/true);
+        commitTrackMatteEntries(in.matte);
+        m_clipParentEntries = in.parent;
+    }
 
     m_activeSequenceId = sequenceId;
     m_sequenceModelEnabled = true;
@@ -16348,7 +16371,15 @@ bool Timeline::setActiveSequence(const QString &sequenceId)
     scheduleEmitSequenceChanged();
     rebuildTimelineBreadcrumbBar(this);
     emit sequencesChanged();
+    if (!m_restoringState)
+        emit activeSequenceChanged(oldId, sequenceId);
     return true;
+}
+
+void Timeline::setParkedSidecarsBySequence(QHash<QString, SequenceSidecars> parked)
+{
+    parked.remove(m_activeSequenceId);
+    m_parkedSidecarsBySequence = std::move(parked);
 }
 
 ClipInfo Timeline::makeSequenceClip(const QString &sequenceId,
@@ -16708,6 +16739,11 @@ TimelineState Timeline::currentState() const
 
 void Timeline::restoreState(const TimelineState &state)
 {
+    QScopedValueRollback<bool> restoring(m_restoringState, true);
+    // US-2005: the live sidecars of the sequence being left, before the restore replaces them.
+    const QString leavingId = m_sequenceModelEnabled ? m_activeSequenceId
+                                                     : QString::fromLatin1(kDefaultSequenceId);
+    const SequenceSidecars leaving{rotoEntries(), trackMatteEntries(), m_clipParentEntries};
     undotrace::log("restoreState:enter");
     noteClipsChanged();
     const bool structureChanged = m_trackStructureRevision != state.trackStructureRevision
@@ -16751,6 +16787,8 @@ void Timeline::restoreState(const TimelineState &state)
     commitTrackMatteEntries(state.trackMatteEntries);
     commitRotoEntries(state.rotoEntries, true);
     setClipParentEntries(state.clipParentEntries);
+    // The sequence the state was recorded in (its store's active id).
+    const QString stateId = m_activeSequenceId;
     rebuildTimelineBreadcrumbBar(this);
 
     // Clear every track's UI selection (via blockSignals so we don't emit
@@ -16871,6 +16909,35 @@ void Timeline::restoreState(const TimelineState &state)
     const QString beforeSequenceCreation = state.externalTrackState
         .value(QStringLiteral("_sequenceCreationActiveId")).toString();
     if (!beforeSequenceCreation.isEmpty()) setActiveSequence(beforeSequenceCreation);
+    // US-2005: the landing sequence takes the state's sidecars and drops its parked
+    // ones; the sequence left keeps its live ones parked. A state recorded in another
+    // sequence than the landing one is parked there, and the landing one's parked
+    // sidecars become live.
+    if (m_sequenceModelEnabled) {
+        if (leavingId != m_activeSequenceId)
+            m_parkedSidecarsBySequence[leavingId] = leaving;
+        if (stateId != m_activeSequenceId) {
+            m_parkedSidecarsBySequence[stateId] = {rotoEntries(), trackMatteEntries(), m_clipParentEntries};
+            // Leaving == landing: its live sidecars (captured as leaving) stay live.
+            const SequenceSidecars in = (leavingId == m_activeSequenceId)
+                ? leaving : m_parkedSidecarsBySequence.take(m_activeSequenceId);
+            m_parkedSidecarsBySequence.remove(m_activeSequenceId);
+            commitRotoEntries(in.roto, /*clearMemo=*/true);
+            commitTrackMatteEntries(in.matte);
+            m_clipParentEntries = in.parent;
+        } else {
+            m_parkedSidecarsBySequence.remove(m_activeSequenceId);
+        }
+        // Sequences the restore removed must not leave parked sidecars for a reused id.
+        for (auto it = m_parkedSidecarsBySequence.begin(); it != m_parkedSidecarsBySequence.end();) {
+            const bool exists = std::any_of(m_sequences.cbegin(), m_sequences.cend(),
+                [&](const TimelineSequence &sequence) { return sequence.id == it.key(); });
+            it = exists ? std::next(it) : m_parkedSidecarsBySequence.erase(it);
+        }
+        if (leavingId != m_activeSequenceId)
+            emit activeSequenceChanged(leavingId, m_activeSequenceId);
+    }
+    emit restoreStateFinished();
     undotrace::log("restoreState:exit");
 }
 

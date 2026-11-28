@@ -2101,8 +2101,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
     if (roto.isNull())
         return QImage();
     // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
-    // that image feeds both the echo and the plain branch; the echo past-frame
-    // provider below stays brush-free.
+    // that image feeds both the echo and the plain branch.
     const QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
     if (stopAfterBrush)
         return raw;
@@ -2117,7 +2116,11 @@ QImage renderClipLayerSource(const Timeline *timeline,
                     projectLightViewPosition, sampleFromLeftBoundary);
                 if (sampleRaw.isNull())
                     return QImage();
-                return prepareClipSourceForEcho(sampleRaw, clip, sampleLocalSec);
+                // US-2010: each past sample carries the brush at its own local
+                // time, before VFX / grade like the current frame (no roto).
+                return prepareClipSourceForEcho(
+                    applyClipBrushSource(sampleRaw, clip, sampleLocalSec, scopedClipId),
+                    clip, sampleLocalSec);
             };
         fx = applyClipFxStackWithEchoFromSource(
             raw, clip, localSec, sourceSec, echoFrameProvider);

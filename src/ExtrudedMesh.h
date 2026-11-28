@@ -2,6 +2,7 @@
 
 #include <QFont>
 #include <QPolygonF>
+#include <QString>
 #include <QVector>
 #include <QVector3D>
 
@@ -56,8 +57,35 @@ QVector<QPolygonF> glyphContours(const QString &text, const QFont &font, double 
  * Returns flat triplet indices relative to the input ring vertices. */
 QVector<quint32> triangulateRing(const QPolygonF &ring);
 
+/* Extrusion limits shared by the builder, the Text3DLayer mesh cache key and
+ * the MCP set_clip_text3d guard (GUI Text3DExtrusionDialog uses the same ranges). */
+inline constexpr int    kMaxBevelSegments   = 8;
+inline constexpr double kMaxExtrudeDepth    = 5.0;
+inline constexpr double kMaxBevelSize       = 1.0;
+inline constexpr double kMaxExtrudeMidSteps = 40000.0;
+inline constexpr qint64 kMaxExtrudeVertices = 2000000;
+
+/* Middle-profile step count of the bevelled profile: 0 when there is no
+ * active bevel (segments > 0, bevelDepth > 0 and 2*bevelDepth - depth > 1e-6),
+ * otherwise (2*bevelDepth - depth) * (2*segments + 1) / depth (inf at depth 0). */
+double extrudeMidSteps(const ExtrudeParams &params);
+
+/* Non-finite depth / bevelDepth / bevelWidth become 0, then depth is clamped
+ * to 0..kMaxExtrudeDepth, the bevel sizes to 0..kMaxBevelSize and the segments
+ * to 0..kMaxBevelSegments; a step count over kMaxExtrudeMidSteps drops the
+ * bevel (segments 0). *changed is set when any value differs from the input. */
+ExtrudeParams sanitizeExtrudeParams(const ExtrudeParams &params, bool *changed = nullptr);
+
+/* Mesh cache key "text|font|depth|bevelDepth|bevelWidth|segments" built from
+ * already sanitised parameters. */
+QString extrudeMeshCacheKey(const QString &text, const QFont &font, const ExtrudeParams &sanitized);
+
 /* Build an extruded TriMesh from 2D contours.
- * Produces front cap, back cap, side walls, and optional bevel. */
-TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParams &params);
+ * Produces front cap, back cap, side walls, and optional bevel.
+ * The parameters are sanitised first (sanitizeExtrudeParams); a profile whose
+ * vertex count would exceed kMaxExtrudeVertices falls back to no bevel.
+ * *changed is set when either fallback altered the requested mesh. */
+TriMesh buildExtrudedMesh(const QVector<QPolygonF> &contours, const ExtrudeParams &params,
+                          bool *changed = nullptr);
 
 } // namespace mesh3d

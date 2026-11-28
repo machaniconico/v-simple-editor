@@ -2556,6 +2556,8 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     tl->restoreFromProject(data.videoTracks, data.audioTracks,
                            data.playheadPos, data.markIn, data.markOut,
                            data.zoomLevel);
+    // US-2000: the saved adjustment layers, after the tracks exist (trackIndex clamp).
+    tl->setAdjustmentLayers(data.adjustmentLayers);
     tl->setProperty(
         "timecodeBurnIn",
         QVariant::fromValue(data.loudnessSettings.value(

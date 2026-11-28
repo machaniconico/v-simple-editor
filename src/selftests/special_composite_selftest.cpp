@@ -56,11 +56,13 @@ constexpr int kW = 320;
 constexpr int kH = 180;
 constexpr int kFps = 10;
 
-bool writeClip(const QString &path, bool varying = false)
+// `solid` (when valid) fills every frame with that one colour, no white bar.
+bool writeClip(const QString &path, bool varying = false, const QColor &solid = QColor(),
+               int frames = kFps)
 {
     QImage frame(kW, kH, QImage::Format_RGB888);
-    frame.fill(Qt::black);
-    for (int y = 0; y < kH; ++y)
+    frame.fill(solid.isValid() ? solid : QColor(Qt::black));
+    for (int y = 0; y < kH && !solid.isValid(); ++y)
         for (int x = 222; x <= 226; ++x)
             frame.setPixelColor(x, y, Qt::white);
 
@@ -80,7 +82,7 @@ bool writeClip(const QString &path, bool varying = false)
         std::cerr << "special-composite fixture open: " << *error << '\n';
         return false;
     }
-    for (int i = 0; i < kFps; ++i) {
+    for (int i = 0; i < frames; ++i) {
         if (varying)
             frame.fill(QColor(i * 25, 255 - i * 25, 60 + i * 10));
         if (!encoder.pushFrameRgb24(frame.constBits(), frame.bytesPerLine(), i)) {
@@ -124,6 +126,25 @@ DiffStat compare(const QImage &a, const QImage &b)
         }
     }
     return stat;
+}
+
+// Mean absolute RGB (alpha ignored) channel difference over the whole frame;
+// -1 when either image is null or the sizes differ.
+double meanAbsDiff(const QImage &a, const QImage &b)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return -1.0;
+    const QImage ia = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage ib = b.convertToFormat(QImage::Format_RGBA8888);
+    double sum = 0.0;
+    for (int y = 0; y < ia.height(); ++y) {
+        const uchar *pa = ia.constScanLine(y);
+        const uchar *pb = ib.constScanLine(y);
+        for (int x = 0; x < ia.width(); ++x)
+            for (int c = 0; c < 3; ++c)
+                sum += std::abs(int(pa[x * 4 + c]) - int(pb[x * 4 + c]));
+    }
+    return sum / (3.0 * ia.width() * ia.height());
 }
 
 // Largest RGB (alpha ignored) channel difference inside `rect`.
@@ -207,7 +228,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 18; ++g)
+        for (int g = 1; g <= 20; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -476,13 +497,23 @@ int runSpecialCompositeSelftest()
     const G8Export freezeExport = exportFrame(freezeProject, QStringLiteral("g8-freeze"), g8FreezeTimelineSec);
     ProjectData freezeNoEntry = freezeProject;
     freezeNoEntry.timeRemapClipEntries.clear();
+    // ProjectFile now persists the clip's own curve (0b07da7): the control must drop it as well as the root entry.
+    for (QVector<ClipInfo> &track : freezeNoEntry.videoTracks)
+        for (ClipInfo &clip : track)
+            clip.timeRemapCurve = timeremap::TimeRemapCurve();
     const G8Export freezeHead = exportFrame(freezeNoEntry, QStringLiteral("g8-freeze-head"), g8FreezeTimelineSec);
+    // Clip-only positive: root entries cleared, the clip's own curve kept -> still equals the live freeze.
+    ProjectData freezeClipOnly = freezeProject;
+    freezeClipOnly.timeRemapClipEntries.clear();
+    const G8Export freezeClipOnlyExport = exportFrame(freezeClipOnly, QStringLiteral("g8-freeze-cliponly"), g8FreezeTimelineSec);
     const G8Diff freezeDiff = diffImages(freezeExport.image, liveFreeze);
     const G8Diff freezeHeadDiff = diffImages(freezeHead.image, liveFreeze);
+    const G8Diff freezeClipOnlyDiff = diffImages(freezeClipOnlyExport.image, liveFreeze);
     const int liveFreezeRed = centreRed(liveFreeze);
     const int freezeExportRed = centreRed(freezeExport.image);
     const int freezeHeadRed = centreRed(freezeHead.image);
     const bool freezeOk = freezeEntryPresent && !liveFreeze.isNull() && freezeExport.ok && freezeHead.ok
+        && freezeClipOnlyExport.ok && freezeClipOnlyDiff.equal()
         && freezeDiff.equal() && !freezeHeadDiff.equal()
         && std::abs(freezeHeadRed - liveFreezeRed) > 50;
 
@@ -519,6 +550,7 @@ int runSpecialCompositeSelftest()
               << " noEntryControlRed=" << freezeHeadRed
               << " exportOk=" << freezeExport.ok << " controlOk=" << freezeHead.ok
               << " export[" << diffText(freezeDiff) << "] noEntryControl[" << diffText(freezeHeadDiff)
+              << "] clipOnlyOk=" << freezeClipOnlyExport.ok << " clipOnly[" << diffText(freezeClipOnlyDiff)
               << "] ok=" << freezeOk << '\n';
     std::cerr << "special-composite G8 (4) plain timelineSec=" << g8TimelineSec
               << " localSec=" << g8PlainLocalSec << " sourceSec=" << g8PlainSourceSec
@@ -1956,6 +1988,160 @@ int runSpecialCompositeSelftest()
                        && g18.sizeMatch && g18.maxDiff == 0 && g18Brush.diffPixels > 100,
                    "matte + blend: eligibility or the brushless legacy composite is wrong (see values above)");
         timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+    }
+
+    // US-2010: the echo past-frame provider draws the clip's brush at each
+    // sample's own local time, before VFX / grade (no roto), in renderFrameAt
+    // and in both branches of the paused special-composite mirror. Solid 2 s
+    // sources; brush_progress {0:1, 1.0:1, 1.01:0} shows the full stroke up to
+    // 1.0 s and none after, so at t = 1.2 only the 0.7 s echo sample can carry
+    // a stroke. Echo createEcho(0.5, 1, 1.0, Add) (Step 0 S0-8) shows that one
+    // sample undecayed. The grey is 64, not S0-8's 128: Add of two 128 greys
+    // saturates to white and hides the white stroke.
+    // G19 (export): (a) brush vs no brush at 1.2 with echo, mean > 2.0, and
+    // equal without echo; (b) brush_progress {0:0, 2:1}: echo vs no echo
+    // differ; (c) black source + exposure 1.0: echo render(1.2) == no-echo
+    // render(0.7) byte for byte (the sample is brushed, then graded).
+    // G20 (preview parity): the (a) timeline on the brush special path and the
+    // same clip with timelineBrushWantsSpecialPath false (an opacity keyframe
+    // track, plus an identity time remap so the composite is still built) on
+    // the decodeClipFrameAtSourceTime branch: buildSpecialClipComposite(1.2)
+    // == renderFrameAt(1.2), AND brush vs no brush differs by mean > 2.0.
+    {
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+        timeline->setClipParentEntries({});
+        window.m_timeRemapClipEntries.clear();
+        window.m_projectConfig.fps = kFps;
+        const QString greyPath = dir.filePath(QStringLiteral("special-composite-grey64.mp4"));
+        const QString blackPath = dir.filePath(QStringLiteral("special-composite-black.mp4"));
+        const bool echoFixturesOk = writeClip(greyPath, false, QColor(64, 64, 64), 2 * kFps)
+            && writeClip(blackPath, false, QColor(Qt::black), 2 * kFps);
+        const auto solidClip = [&](const QString &path) {
+            ClipInfo clip = base;
+            clip.filePath = path;
+            clip.duration = clip.outPoint = 2.0;
+            return clip;
+        };
+        const auto withBrush = [](ClipInfo clip, const QVector<QPair<double, double>> &keys) {
+            BrushAnimation brush;
+            brush.setText(QStringLiteral("P"), QFont(QStringLiteral("Arial"), 110), QPointF(50.0, 75.0));
+            brush.setBrushWidth(12.0);
+            clip.brushData = brush.toJson();
+            KeyframeTrack progress(QStringLiteral("brush_progress"), 0.0);
+            for (const auto &key : keys)
+                progress.addKeyframe(key.first, key.second);
+            clip.keyframes.addTrack(progress);
+            return clip;
+        };
+        const QVector<QPair<double, double>> holdThenOff{{0.0, 1.0}, {1.0, 1.0}, {1.01, 0.0}};
+        const auto withEcho = [](ClipInfo clip) {
+            clip.effects = {VideoEffect::createEcho(0.5, 1, 1.0, 0)};
+            return clip;
+        };
+        const auto renderOne = [&](const ClipInfo &clip, double at) {
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{clip}},
+                QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            return tlrender::renderFrameAt(timeline, qint64(at * 1000000.0), size);
+        };
+        const auto compositeOne = [&](const ClipInfo &clip, double at, bool *wantsBrushPath) {
+            timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{clip}},
+                QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            if (wantsBrushPath)
+                *wantsBrushPath = tlrender::timelineBrushWantsSpecialPath(timeline, at);
+            return window.buildSpecialClipComposite(at);
+        };
+
+        // G19 (a)
+        const ClipInfo grey = solidClip(greyPath);
+        const ClipInfo greyBrush = withBrush(grey, holdThenOff);
+        const QImage aEchoBrush = renderOne(withEcho(greyBrush), 1.2);
+        const QImage aEchoPlain = renderOne(withEcho(grey), 1.2);
+        const QImage aBrush = renderOne(greyBrush, 1.2);
+        const QImage aPlain = renderOne(grey, 1.2);
+        const double aMean = meanAbsDiff(aEchoBrush, aEchoPlain);
+        const DiffStat aNoEcho = compare(aBrush, aPlain);
+        const bool g19a = aMean > 2.0 && aNoEcho.sizeMatch && aNoEcho.maxDiff == 0;
+        std::cerr << "special-composite G19 (a) t=1.2 echo: brush vs none mean=" << aMean
+                  << " (expect > 2.0, HEAD 0) ; control no echo: brush vs none sizeMatch="
+                  << aNoEcho.sizeMatch << " maxDiff=" << aNoEcho.maxDiff << " (expect 1 / 0) ok=" << g19a << '\n';
+
+        // G19 (b)
+        const ClipInfo greyRising = withBrush(grey, {{0.0, 0.0}, {2.0, 1.0}});
+        const QImage bEcho = renderOne(withEcho(greyRising), 1.2);
+        const QImage bNoEcho = renderOne(greyRising, 1.2);
+        const double bMean = meanAbsDiff(bEcho, bNoEcho);
+        const bool g19b = bMean > 0.0;
+        std::cerr << "special-composite G19 (b) brush_progress {0:0, 2:1} t=1.2: echo vs no echo mean="
+                  << bMean << " (expect > 0) ok=" << g19b << '\n';
+
+        // G19 (c)
+        ClipInfo blackGraded = withBrush(solidClip(blackPath), holdThenOff);
+        blackGraded.colorCorrection.exposure = 1.0;
+        const QImage cEcho12 = renderOne(withEcho(blackGraded), 1.2);
+        const QImage cNoEcho07 = renderOne(blackGraded, 0.7);
+        ClipInfo blackGradedPlain = solidClip(blackPath);
+        blackGradedPlain.colorCorrection.exposure = 1.0;
+        const QImage cPlain07 = renderOne(blackGradedPlain, 0.7);
+        const DiffStat cSame = compare(cEcho12, cNoEcho07);
+        const double cStroke = meanAbsDiff(cNoEcho07, cPlain07);
+        const bool g19c = cSame.sizeMatch && cSame.maxDiff == 0 && cStroke > 2.0;
+        std::cerr << "special-composite G19 (c) black + exposure 1.0: echo render(1.2) vs no-echo render(0.7) sizeMatch="
+                  << cSame.sizeMatch << " maxDiff=" << cSame.maxDiff << " diffPixels=" << cSame.diffPixels
+                  << " (expect 1 / 0, HEAD mean 16.45) mean=" << meanAbsDiff(cEcho12, cNoEcho07)
+                  << " ; non-empty: no-echo render(0.7) brush vs none mean=" << cStroke
+                  << " (expect > 2.0) ok=" << g19c << '\n';
+        tally.gate(19, echoFixturesOk && g19a && g19b && g19c,
+                   "the echo past sample does not carry its own brush before the grade (see values above)");
+
+        // G20 (a): brush special path (decodeClipSourceFrame).
+        bool aWants = false;
+        const QImage aComposite = compositeOne(withEcho(greyBrush), 1.2, &aWants);
+        const DiffStat aParity = compare(aComposite, aEchoBrush);
+        bool aPlainWants = true;
+        const QImage aPlainComposite = compositeOne(withEcho(grey), 1.2, &aPlainWants);
+        // Without brushData nothing special is active, so the paused preview
+        // builds no composite and shows the plain frame (renderFrameAt's).
+        const QImage aReference = aPlainComposite.isNull() ? aEchoPlain : aPlainComposite;
+        const double aCompositeMean = meanAbsDiff(aComposite, aReference);
+        const bool g20a = aWants && !aComposite.isNull() && aParity.sizeMatch && aParity.maxDiff == 0
+            && aCompositeMean > 2.0;
+        std::cerr << "special-composite G20 (a) branch=decodeClipSourceFrame timelineBrushWantsSpecialPath(1.2)="
+                  << aWants << " (expect 1) previewNull=" << aComposite.isNull()
+                  << " composite vs renderFrameAt sizeMatch=" << aParity.sizeMatch << " maxDiff=" << aParity.maxDiff
+                  << " formats=" << int(aComposite.format()) << '/' << int(aEchoBrush.format())
+                  << " (expect 1 / 0) ; brush vs none: no-brush composite null=" << aPlainComposite.isNull()
+                  << " (reference " << (aPlainComposite.isNull() ? "renderFrameAt" : "composite")
+                  << ") mean=" << aCompositeMean << " (expect > 2.0) ok=" << g20a << '\n';
+
+        // G20 (c): timelineBrushWantsSpecialPath false (decodeClipFrameAtSourceTime).
+        const auto offBrushPath = [](ClipInfo clip) {
+            KeyframeTrack opacity(QStringLiteral("opacity"), 1.0);
+            opacity.addKeyframe(0.0, 1.0);
+            clip.keyframes.addTrack(opacity);
+            clip.timeRemapCurve.sourceFps = kFps;
+            clip.timeRemapCurve.addKey(0.0, 0.0);
+            clip.timeRemapCurve.addKey(2.0, 2.0);
+            return clip;
+        };
+        bool cWants = true;
+        const ClipInfo cBrushClip = offBrushPath(withEcho(greyBrush));
+        const QImage cComposite = compositeOne(cBrushClip, 1.2, &cWants);
+        const QImage cExport = renderOne(cBrushClip, 1.2);
+        const DiffStat cParity = compare(cComposite, cExport);
+        bool cPlainWants = true;
+        const QImage cPlainComposite = compositeOne(offBrushPath(withEcho(grey)), 1.2, &cPlainWants);
+        const double cCompositeMean = meanAbsDiff(cComposite, cPlainComposite);
+        const bool g20c = !cWants && !cComposite.isNull() && cParity.sizeMatch && cParity.maxDiff == 0
+            && cCompositeMean > 2.0;
+        std::cerr << "special-composite G20 (c) branch=decodeClipFrameAtSourceTime timelineBrushWantsSpecialPath(1.2)="
+                  << cWants << " (expect 0) previewNull=" << cComposite.isNull()
+                  << " composite vs renderFrameAt sizeMatch=" << cParity.sizeMatch << " maxDiff=" << cParity.maxDiff
+                  << " formats=" << int(cComposite.format()) << '/' << int(cExport.format())
+                  << " (expect 1 / 0) ; brush vs none composite: plainNull=" << cPlainComposite.isNull()
+                  << " mean=" << cCompositeMean << " (expect > 2.0) ok=" << g20c << '\n';
+        tally.gate(20, echoFixturesOk && g20a && g20c,
+                   "the paused special composite's echo samples do not match renderFrameAt's brushed samples (see values above)");
     }
 
     return tally.finish("special-composite");

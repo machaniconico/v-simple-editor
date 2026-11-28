@@ -574,19 +574,6 @@ void Text3DLayer::ensureExtrudedMesh() const
     if (font.pointSizeF() <= 0.0 && font.pixelSize() <= 0)
         font.setPointSize(32);
 
-    const QString fontKey = font.toString();
-    const QString key = QStringLiteral("%1|%2|%3|%4|%5|%6")
-                            .arg(m_text)
-                            .arg(fontKey)
-                            .arg(m_extrudeDepth, 0, 'g', 12)
-                            .arg(m_extrudeBevelDepth, 0, 'g', 12)
-                            .arg(m_extrudeBevelWidth, 0, 'g', 12)
-                            .arg(m_extrudeBevelSegments);
-
-    if (m_cacheValid && m_cacheKey == key)
-        return;
-
-    const QVector<QPolygonF> contours = mesh3d::glyphContours(m_text, font, kExtrudeFlatness);
     const mesh3d::ExtrudeParams params{
         m_extrudeDepth,
         m_extrudeBevelDepth,
@@ -594,6 +581,13 @@ void Text3DLayer::ensureExtrudedMesh() const
         m_extrudeBevelSegments,
         true
     };
+    // The key holds the values the builder actually uses (non-finite / out-of-range input sanitised).
+    const QString key = mesh3d::extrudeMeshCacheKey(m_text, font, mesh3d::sanitizeExtrudeParams(params));
+
+    if (m_cacheValid && m_cacheKey == key)
+        return;
+
+    const QVector<QPolygonF> contours = mesh3d::glyphContours(m_text, font, kExtrudeFlatness);
     m_cachedMesh = mesh3d::buildExtrudedMesh(contours, params);
     m_cacheKey = key;
     m_cacheValid = true;

@@ -94,23 +94,38 @@ public:
 
     void clear();
     void updateCurrentExternalTrackState(const QJsonObject &state);
+    // Sets the current entry's projectExplicitOutput (an explicit-output-only
+    // settings change records no undo point of its own). No-op when empty.
+    void updateCurrentProjectOutput(bool explicitOutput);
     // Replaces the current entry's state (description kept) for an edit that
     // records no undo point of its own. Drops the redo stack, leaves saveSerial
     // unchanged and signals only when redo entries were dropped. No-op when empty.
     void updateCurrentState(const TimelineState &state);
 
+    // Clean state = the id of the entry that was last saved. Every saveState gets a
+    // new, monotonic id, so a clean entry dropped by MAX_UNDO or by a redo branch
+    // never comes back to the top. updateCurrentState makes the clean entry
+    // unreachable (its content no longer matches the saved file).
+    void markClean();
+    bool isClean() const;
+
 signals:
     void stateChanged();
     void historyChanged();
     void stateJumpRequested(const TimelineState &state);
+    // Emitted when isClean() changes (saveState / undo / redo / clear /
+    // updateCurrentState / markClean).
+    void cleanChanged();
 
 private:
     struct Entry {
         TimelineState state;
         QString description;
+        quint64 id = 0;
     };
 
     QStack<Entry> m_undoStack;
     QStack<Entry> m_redoStack;
     quint64 m_saveSerial = 0;
+    quint64 m_cleanEntryId = 0; // 0 = unreachable
 };

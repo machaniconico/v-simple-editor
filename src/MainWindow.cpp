@@ -173,6 +173,7 @@ double exporter_loudnessGainDb();
 // ED-3: EdlExport は ED-1 で追加された純粋エンジン (QApplication 不要) なので
 // 常時ビルドに含まれる。HAVE_* ガードは不要で直接 include する。
 #include "EdlExport.h"
+#include "OtioExport.h"
 #include "EdlImport.h"
 #include "FcpxmlImport.h"
 #if __has_include("SmartEditDialog.h")
@@ -2724,15 +2725,15 @@ MainWindow::MainWindow(QWidget *parent)
         if (selectedIndex < 0 || selectedIndex >= files.size())
             return;
 
+        if (!maybeSaveChanges())
+            return;
         const QString json = AutoSave::recoverFromFile(files.at(selectedIndex));
-        ProjectData data;
-        if (json.isEmpty() || !ProjectFile::fromJsonString(json, data)) {
+        if (!restoreFromAutosaveJson(json)) {
             QMessageBox::warning(this, "自動保存の復元",
                 "自動保存ファイルを読み込めませんでした。");
             return;
         }
 
-        applyLoadedProjectData(data, QString());
         statusBar()->showMessage("自動保存から復元しました: "
             + QFileInfo(files.at(selectedIndex)).fileName(), 5000);
     });
@@ -2776,6 +2777,49 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_timeline->undoManager(), &UndoManager::stateChanged, this, [this]() {
         updateEditActions();
     });
+    // US-2001: the dirty flag follows the clean undo entry and, after every
+    // restore, is re-synced; edits outside undo mark it explicitly.
+    connect(m_timeline->undoManager(), &UndoManager::cleanChanged,
+            this, &MainWindow::syncDirtyFromUndo);
+    connect(m_timeline, &Timeline::restoreStateFinished,
+            this, &MainWindow::syncDirtyFromUndo);
+    // US-2005: the time-remap entries follow the active sequence like Timeline's sidecars.
+    connect(m_timeline, &Timeline::activeSequenceChanged,
+            this, &MainWindow::onActiveSequenceChanged);
+    connect(m_timeline, &Timeline::restoreStateFinished, this, [this]() {
+        // No activeSequenceChanged fired (the slot clears these first): a restore that
+        // lands on the sequence it left keeps that sequence's live entries and parks
+        // the state's ones under the state's sequence, as Timeline::restoreState does.
+        const QString activeId = m_timeline->activeSequenceId();
+        if (m_hasRestoreLeaving && !m_restoreStateSequenceId.isEmpty()
+            && m_restoreStateSequenceId != activeId) {
+            m_timeRemapEntriesBySequence[m_restoreStateSequenceId] = m_timeRemapClipEntries;
+            m_timeRemapClipEntries = m_restoreLeavingTimeRemaps;
+            ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+            m_timeRemapEntriesBySequence.remove(activeId);
+            m_sidecarClipUidByKey.clear();
+            const auto &tracks = m_timeline->videoTracks();
+            for (int t = 0; t < tracks.size(); ++t) {
+                const auto &clips = tracks[t]->clips();
+                for (int c = 0; c < clips.size(); ++c)
+                    if (!clips[c].uid.isEmpty())
+                        m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+            }
+        }
+        // A restore can remove a sequence without a switch: drop its parked remaps.
+        const auto sequences = m_timeline->sequences();
+        for (auto it = m_timeRemapEntriesBySequence.begin(); it != m_timeRemapEntriesBySequence.end();) {
+            const bool exists = std::any_of(sequences.cbegin(), sequences.cend(),
+                [&](const TimelineSequence &sequence) { return sequence.id == it.key(); });
+            it = exists ? std::next(it) : m_timeRemapEntriesBySequence.erase(it);
+        }
+        m_restoreLeavingTimeRemaps.clear();
+        m_restoreStateSequenceId.clear();
+        m_hasRestoreLeaving = false;
+    });
+    connect(m_timeline, &Timeline::markersChanged, this, &MainWindow::markProjectDirty);
+    connect(m_timeline, &Timeline::adjustmentLayersChanged, this, &MainWindow::markProjectDirty);
+    connect(m_timeline, &Timeline::trackFlagsChanged, this, &MainWindow::markProjectDirty);
     // Audio FX docks (EQ / compressor / reverb / NR / de-esser): one catch-all
     // for audio track count changes (import / addClip auto-track, BGM, paste,
     // undo / redo, project load, removal). Reseeds only when the track set
@@ -2874,6 +2918,7 @@ MainWindow::MainWindow(QWidget *parent)
         m_timeline->undoManager()->clear();
         m_timeline->saveUndoState(QStringLiteral("Initial state"));
     }
+    markProjectClean();
 
     nodelib::registerBuiltinNodes();
     m_activeNodeGraph = new NodeGraph();
@@ -3519,6 +3564,14 @@ void MainWindow::updateBrushPreviewProgress(double timelineSec)
     const TimelineTrack *track = m_timeline->videoTracks().value(trackIdx, nullptr);
     if (!track || clipIdx < 0 || clipIdx >= track->clipCount())
         return;
+    // Outside the selected clip (the paused brush path's active rule, V1 clamping to
+    // its first clip at t <= 0) the GL must not draw its strokes: progress 0.
+    double activeStart = 0.0;
+    if (tlrender::activeClipOnTrack(track->clips(), timelineSec,
+                                    /*clampToFirst=*/trackIdx == 0, &activeStart) != clipIdx) {
+        m_player->glPreview()->setBrushAnimationProgress(0.0);
+        return;
+    }
     double localSec = 0.0;
     if (!tlrender::clipLocalSecAt(m_timeline, trackIdx, clipIdx, timelineSec, &localSec))
         return;
@@ -4165,6 +4218,7 @@ void MainWindow::setupMenuBar()
         }
 
         m_projectFilePath = targetPath;
+        markProjectClean();
         statusBar()->showMessage(QStringLiteral("Saved: ") + m_projectFilePath);
         updateTitle();
     });
@@ -4585,6 +4639,7 @@ void MainWindow::setupMenuBar()
     m_storylineModeAction->setCheckable(true);
     connect(m_storylineModeAction, &QAction::toggled, this, [this](bool on) {
         if (m_timeline) m_timeline->setStorylineMode(on);
+        markProjectDirty();
     });
     m_menuHelpEntries.append({m_storylineModeAction,
         QStringLiteral("オンの間、V1 への挿入・削除・並べ替え・リップルトリムで V1 だけが詰まり、V1 に隙間ができません。V1 のクリップのリンク音声と接続クリップはついてきます。既定はオフで、プロジェクトに保存されます。")});
@@ -5399,6 +5454,7 @@ void MainWindow::setupMenuBar()
                 if (applyDuckingToTimeline(m_timeline, ti, targets,
                                            m_duckingParams, &message)) {
                     m_duckingEnabled = true;
+                    markProjectDirty();
                     statusBar()->showMessage(message, 4000);
                 } else if (!message.isEmpty()) {
                     statusBar()->showMessage(message, 4000);
@@ -6078,6 +6134,38 @@ void MainWindow::setupMenuBar()
             this, &MainWindow::exportEdl);
     m_menuHelpEntries.append({edlExportAction,
         QStringLiteral("Avid / DaVinci / 放送ワークフロー互換の CMX3600 EDL を書き出します。")});
+
+    auto *otioExportAction = toolsMenu->addAction(
+        QStringLiteral("OTIO 書き出し…"));
+    otioExportAction->setObjectName("action_otio_export");
+    connect(otioExportAction, &QAction::triggered, this, [this]() {
+        if (!m_timeline) {
+            QMessageBox::warning(this, QStringLiteral("OTIO 書き出し"),
+                QStringLiteral("タイムラインが初期化されていません。"));
+            return;
+        }
+        const QString projectName = m_projectConfig.name.isEmpty()
+            ? QStringLiteral("Untitled") : m_projectConfig.name;
+        const QString outPath = QFileDialog::getSaveFileName(
+            this, QStringLiteral("OTIO 書き出し"),
+            QDir::homePath() + QDir::separator() + projectName + QStringLiteral(".otio"),
+            QStringLiteral("OpenTimelineIO (*.otio);;All Files (*)"));
+        if (outPath.isEmpty())
+            return;
+        QString err;
+        const double fps = m_projectConfig.fps > 0
+            ? static_cast<double>(m_projectConfig.fps) : 30.0;
+        if (!otio::writeOtio(m_timeline, fps, projectName, outPath, &err)) {
+            QMessageBox::warning(this, QStringLiteral("OTIO 書き出し"),
+                QStringLiteral("書き出しに失敗しました: %1").arg(err));
+            return;
+        }
+        if (statusBar())
+            statusBar()->showMessage(
+                QStringLiteral("OTIO を書き出しました: %1").arg(outPath), 5000);
+    });
+    m_menuHelpEntries.append({otioExportAction,
+        QStringLiteral("アクティブなシーケンスを OpenTimelineIO (.otio) として書き出します。")});
 
     // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
     auto *pptxExportAction = toolsMenu->addAction(
@@ -7282,24 +7370,28 @@ void MainWindow::setupMenuBar()
         if (!m_player)
             return;
         m_player->setPreviewGlow(enabled, threshold, radius, intensity);
+        markProjectDirty();
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::bloomChanged,
             this, [this](bool enabled, float threshold, float intensity, float spread) {
         if (!m_player)
             return;
         m_player->setPreviewBloom(enabled, threshold, intensity, spread);
+        markProjectDirty();
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::chromaticAberrationChanged,
             this, [this](bool enabled, float amount, float radialFalloff) {
         if (!m_player)
             return;
         m_player->setPreviewChromaticAberration(enabled, amount, radialFalloff);
+        markProjectDirty();
     });
     connect(m_vfxControlsPanel, &VfxControlsPanel::lightWrapChanged,
             this, [this](bool enabled, float amount, float radius) {
         if (!m_player)
             return;
         m_player->setPreviewLightWrap(enabled, amount, radius);
+        markProjectDirty();
     });
 
     // US-3D: 3-axis rotation + perspective foreshortening (Premiere "Basic
@@ -8805,7 +8897,7 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
             if (tlrender::hasActiveEcho(clip, localSeconds)
                 || tlrender::hasActiveRollingShutter(clip, localSeconds)) {
                 const tlrender::EchoFrameProvider echoProvider =
-                    [this, clip, brushWantsSpecialPath](
+                    [this, clip, clipId, brushWantsSpecialPath](
                         double sampleSourceSec, double sampleLocalSec) -> QImage {
                         // US-1805: the brush path samples export's source frame
                         // (renderClipSourceFrame), the rest keep grabFrameAt.
@@ -8818,8 +8910,11 @@ QImage MainWindow::buildSpecialClipComposite(double timelineSeconds, bool *drewB
                             : decodeClipFrameAtSourceTime(clip, sampleSourceSec);
                         if (sampleRaw.isNull())
                             return QImage();
+                        // US-2010: export's provider order on both branches:
+                        // the sample's own brush, then VFX / grade (no roto).
                         return tlrender::prepareClipSourceForEcho(
-                            sampleRaw, clip, sampleLocalSec);
+                            tlrender::applyClipBrushSource(sampleRaw, clip, sampleLocalSec, clipId),
+                            clip, sampleLocalSec);
                     };
                 frame = tlrender::applyClipFxStackWithEchoFromSource(
                     frame, clip, localSeconds, fxSourceSeconds, echoProvider);
@@ -9078,6 +9173,8 @@ void MainWindow::populateProjectData(ProjectData &data)
     data.markOut = m_timeline->markedOut();
     data.zoomLevel = 10; // TODO: expose zoom level getter
     data.storylineMode = m_timeline->storylineMode();
+    data.markers = m_timeline->markers();
+    data.adjustmentLayers = m_timeline->adjustmentLayers();
     data.rotoClipEntries.clear();
     const auto rotoEntries = m_timeline->rotoEntries();
     for (auto it = rotoEntries.cbegin(); it != rotoEntries.cend(); ++it)
@@ -9127,6 +9224,43 @@ void MainWindow::populateProjectData(ProjectData &data)
     }
     std::sort(data.clipParentEntries.begin(), data.clipParentEntries.end(),
               [](const ClipParentEntry &a, const ClipParentEntry &b) { return a.clipId < b.clipId; });
+    // US-2005: the parked sidecars of every stored sequence other than the active one.
+    data.sequenceSidecars.clear();
+    if (m_timeline) {
+        const auto parked = m_timeline->parkedSidecarsBySequence();
+        const QString activeId = m_timeline->activeSequenceId();
+        for (const TimelineSequence &sequence : m_timeline->sequences()) {
+            if (sequence.id == activeId)
+                continue;
+            const Timeline::SequenceSidecars sidecars = parked.value(sequence.id);
+            const QHash<QString, TimeRemapClipEntry> remaps = m_timeRemapEntriesBySequence.value(sequence.id);
+            SequenceSidecarEntries entries;
+            for (auto it = sidecars.roto.cbegin(); it != sidecars.roto.cend(); ++it) {
+                RotoClipEntry entry = it.value();
+                entry.clipId = it.key();
+                entries.rotoClipEntries.append(entry);
+            }
+            for (auto it = sidecars.matte.cbegin(); it != sidecars.matte.cend(); ++it)
+                entries.trackMatteClipEntries.append(
+                    TrackMatteClipEntry{it.key(), it.value().matteType, it.value().matteSourceClipId});
+            for (auto it = sidecars.parent.cbegin(); it != sidecars.parent.cend(); ++it)
+                entries.clipParentEntries.append(ClipParentEntry{it.key(), it.value()});
+            for (auto it = remaps.cbegin(); it != remaps.cend(); ++it) {
+                TimeRemapClipEntry entry = it.value();
+                entry.clipId = it.key();
+                entries.timeRemapClipEntries.append(entry);
+            }
+            if (entries.rotoClipEntries.isEmpty() && entries.trackMatteClipEntries.isEmpty()
+                && entries.clipParentEntries.isEmpty() && entries.timeRemapClipEntries.isEmpty())
+                continue;
+            auto byClipId = [](const auto &a, const auto &b) { return a.clipId < b.clipId; };
+            std::sort(entries.rotoClipEntries.begin(), entries.rotoClipEntries.end(), byClipId);
+            std::sort(entries.trackMatteClipEntries.begin(), entries.trackMatteClipEntries.end(), byClipId);
+            std::sort(entries.clipParentEntries.begin(), entries.clipParentEntries.end(), byClipId);
+            std::sort(entries.timeRemapClipEntries.begin(), entries.timeRemapClipEntries.end(), byClipId);
+            data.sequenceSidecars.insert(sequence.id, entries);
+        }
+    }
 
     // US-3D-11 / US-1706: the 3D text and the brush are saved with the clips.
     data.projectCamera = m_projectCamera.toJson();
@@ -9297,9 +9431,13 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     if (m_promptForMissingMedia) {
         const QStringList missing = mediapaths::missingFiles(data);
         if (!missing.isEmpty()) {
-            MediaRelinkDialog dialog(missing, this);
-            if (dialog.exec() == QDialog::Accepted)
-                relinkMapping = dialog.mapping();
+            if (m_missingMediaResolver) {
+                relinkMapping = m_missingMediaResolver(missing);
+            } else {
+                MediaRelinkDialog dialog(missing, this);
+                if (dialog.exec() == QDialog::Accepted)
+                    relinkMapping = dialog.mapping();
+            }
         }
     }
 
@@ -9389,6 +9527,39 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         // US-1203: the toggle drives Timeline::setStorylineMode.
         if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
         ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        // US-2005: the non-active sequences' sidecars (always replaced, the active one's
+        // are the root entries above).
+        QHash<QString, Timeline::SequenceSidecars> parkedSidecars;
+        m_timeRemapEntriesBySequence.clear();
+        const QString activeSequenceId = m_timeline->activeSequenceId();
+        for (auto it = data.sequenceSidecars.cbegin(); it != data.sequenceSidecars.cend(); ++it) {
+            if (it.key() == activeSequenceId)
+                continue;
+            Timeline::SequenceSidecars sidecars;
+            for (const auto &entry : it->rotoClipEntries)
+                if (!entry.clipId.isEmpty())
+                    sidecars.roto.insert(entry.clipId, entry);
+            for (const auto &entry : it->trackMatteClipEntries)
+                if (!entry.clipId.isEmpty())
+                    sidecars.matte.insert(entry.clipId,
+                        TimelineTrackMatteEntry{entry.matteType, entry.matteSourceClipId});
+            for (const auto &entry : it->clipParentEntries)
+                if (!entry.clipId.isEmpty() && !entry.parentClipId.isEmpty()
+                    && entry.clipId != entry.parentClipId)
+                    sidecars.parent.insert(entry.clipId, entry.parentClipId);
+            parkedSidecars.insert(it.key(), sidecars);
+            QHash<QString, TimeRemapClipEntry> remaps;
+            for (const auto &entry : it->timeRemapClipEntries)
+                if (!entry.clipId.isEmpty())
+                    remaps.insert(entry.clipId, entry);
+            if (!remaps.isEmpty())
+                m_timeRemapEntriesBySequence.insert(it.key(), remaps);
+        }
+        m_timeline->setParkedSidecarsBySequence(parkedSidecars);
+        // US-2000: always replace (an empty list clears the previous project's), after the
+        // tracks exist (trackIndex clamp) and before the undo baseline below takes them.
+        m_timeline->setAdjustmentLayers(data.adjustmentLayers);
+        m_timeline->setMarkers(data.markers);
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
     // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).
@@ -9512,6 +9683,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         m_timeline->undoManager()->clear();
         m_timeline->saveUndoState(QStringLiteral("Project loaded"));
     }
+    markProjectClean();
     if (m_timeline && !relinkMapping.isEmpty()) {
         QString relinkError;
         if (!relinkMediaPaths(relinkMapping, &relinkError)) {
@@ -9522,7 +9694,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
         } else {
             // The loaded file still contains the old paths. Keep the project
             // dirty until the successful relink is explicitly saved.
-            setWindowModified(true);
+            markProjectDirty();
         }
     }
 
@@ -9760,6 +9932,8 @@ void MainWindow::applyExternalTrackState(const QJsonObject &state)
 
 void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew)
 {
+    // US-2001: the removeTrack / moveTrack that remaps pushes its own undo entry.
+    QScopedValueRollback<bool> remapping(m_remappingTrackIndices, true);
     // Audit: the only retained TimelineTrack pointer outside Timeline is
     // this menu QPointer. VideoPlayer and docks retain no track widgets.
     m_noisePrintMenuTrack = nullptr;
@@ -9981,6 +10155,12 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     // on either side (unique only within a track) is paired by (track, uid), which
     // TimelineTrack::setClips keeps unique. An empty uid leaves its key as it is; a
     // uid with no pair drops its key, whose values are parked under (track, uid).
+    // US-2005: the sequence the state was recorded in and, when the restore crosses
+    // sequences, the live entries of the one being left (onActiveSequenceChanged parks them).
+    m_restoreStateSequenceId = state.value("sequenceId").toString();
+    m_hasRestoreLeaving = m_restoreStateSequenceId != m_timeline->activeSequenceId();
+    m_restoreLeavingTimeRemaps = m_hasRestoreLeaving ? m_timeRemapClipEntries
+                                                     : QHash<QString, TimeRemapClipEntry>{};
     QHash<QString, QString> restoredKeyByUid;
     QHash<QString, QString> restoredKeyById;
     QSet<QString> ambiguous;
@@ -10099,6 +10279,48 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     }
     // US-1706: the 3D text and the brush come back with the clips; the live brush
     // cache rebuilds from them when restoreState re-selects the clip.
+}
+
+void MainWindow::onActiveSequenceChanged(const QString &oldId, const QString &newId)
+{
+    if (!m_timeline->isRestoringState()) {
+        m_timeRemapEntriesBySequence[oldId] = m_timeRemapClipEntries;
+        m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
+        // The stored clips may carry an older curve than the parked entries: mirror them.
+        ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+    } else {
+        // Timeline::restoreState's rule: the sequence left keeps its pre-restore live
+        // entries; the live ones are the state's (US-1401), parked under the state's
+        // sequence when that is not the landing one, which then takes its parked ones.
+        // A sequence whose creation was undone is gone: nothing is parked for it, so a
+        // new sequence reusing its id starts empty.
+        bool oldStored = false;
+        for (const TimelineSequence &sequence : m_timeline->sequences())
+            oldStored = oldStored || sequence.id == oldId;
+        if (oldStored)
+            m_timeRemapEntriesBySequence[oldId] = m_hasRestoreLeaving ? m_restoreLeavingTimeRemaps
+                                                                      : m_timeRemapClipEntries;
+        else
+            m_timeRemapEntriesBySequence.remove(oldId);
+        if (!m_restoreStateSequenceId.isEmpty() && m_restoreStateSequenceId != newId) {
+            m_timeRemapEntriesBySequence[m_restoreStateSequenceId] = m_timeRemapClipEntries;
+            m_timeRemapClipEntries = m_timeRemapEntriesBySequence.take(newId);
+            ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+        } else {
+            m_timeRemapEntriesBySequence.remove(newId);
+        }
+        m_restoreLeavingTimeRemaps.clear();
+        m_restoreStateSequenceId.clear();
+        m_hasRestoreLeaving = false;
+    }
+    m_sidecarClipUidByKey.clear();
+    const auto &tracks = m_timeline->videoTracks();
+    for (int t = 0; t < tracks.size(); ++t) {
+        const auto &clips = tracks[t]->clips();
+        for (int c = 0; c < clips.size(); ++c)
+            if (!clips[c].uid.isEmpty())
+                m_sidecarClipUidByKey.insert(trackMatteClipKey(t, c), clips[c].uid);
+    }
 }
 
 void MainWindow::collectAudioState(ProjectData &data)
@@ -10226,49 +10448,55 @@ void MainWindow::applyAudioState(const ProjectData &data)
 
 void MainWindow::newProject()
 {
+    if (!maybeSaveChanges())
+        return;
     ProjectSettingsDialog dialog(this);
-    if (dialog.exec() == QDialog::Accepted) {
-        stopMeshEditTool();
-        stopPuppetPinTool();
-        applyAudioState(ProjectData{});
-        syncAudioClipEditorEq(true);
-        rebuildExpressionAudioEnv();
-        if (m_light3DDialog)
-            m_light3DDialog->close();
-        m_projectCamera = Camera3D{};
-        m_projectCameraUndoSlot = QJsonObject{};
-        m_projectCameraUndoTimelineDepth = -1;
-        m_projectCameraUndoSaveSerial = 0;
-        m_projectLights.clear();
-        m_projectOverlays.clear();
-        m_particleClipConfigs.clear();
-        syncProjectLightingToTimeline();
-        m_tcBurnIn = TimecodeBurnInSettings{};
-        if (m_storylineModeAction) m_storylineModeAction->setChecked(false);
-        applyProjectConfig(dialog.config());
-        // Undo ベースラインを実プロジェクトサイズで張り直す。Timeline 構築時の
-        // "Initial state" は projectWidth=-1 で積まれており、これを唯一のベースラインの
-        // まま残すと、新規プロジェクトで(クリップ追加前に)いきなり解像度を変更→undo
-        // したとき、restoreState の projectWidth>0 ガードでサイズ復元がスキップされ
-        // プロジェクトが新サイズ(縦長)のまま戻らない。プロジェクト読込(applyLoadedProjectData)
-        // と同じ clear()+saveState 規律で、サイズ入りのベースラインへ置き換える。
-        if (m_timeline && m_timeline->undoManager()) {
-            m_timeline->undoManager()->clear();
-            m_timeline->saveUndoState(QStringLiteral("新規プロジェクト"));
-        }
-        hideWelcomeScreen();
-        updateStatusInfo();
+    if (dialog.exec() == QDialog::Accepted)
+        resetProject(dialog.config());
+}
+
+// US-2001: a new project is an empty project loaded with the chosen config. The
+// load resets the timeline clips, the file path, the camera / lights / overlays /
+// particles / burn-in / storyline and lays the undo baseline with the project size.
+void MainWindow::resetProject(const ProjectConfig &config)
+{
+    ProjectData fresh;
+    fresh.config = config;
+    if (m_timeline) {
+        m_timeline->setMarkers({});
+        m_timeline->setAdjustmentLayers({});
     }
+    applyLoadedProjectData(fresh, QString());
+    markProjectClean();
 }
 
 void MainWindow::editProjectSettings()
 {
     SequenceSettingsDialog dialog(m_projectConfig, this);
-    if (dialog.exec() == QDialog::Accepted) {
+    if (dialog.exec() == QDialog::Accepted)
+        applyEditedProjectConfig(dialog.config());
+}
+
+void MainWindow::applyEditedProjectConfig(const ProjectConfig &newConfig)
+{
+    // US-2001: an OK without any change records neither undo nor dirty.
+    const bool changed = newConfig.name != m_projectConfig.name
+        || newConfig.width != m_projectConfig.width
+        || newConfig.height != m_projectConfig.height
+        || newConfig.fps != m_projectConfig.fps
+        || newConfig.explicitOutputResolution != m_projectConfig.explicitOutputResolution;
+    if (!changed) {
+        updateStatusInfo();
+        return;
+    }
+    {
         const QSize oldSize(m_projectConfig.width, m_projectConfig.height);
-        const ProjectConfig newConfig = dialog.config();
         const bool sizeChanged =
             newConfig.width != oldSize.width() || newConfig.height != oldSize.height();
+        const bool nonUndoFieldsChanged =
+            newConfig.name != m_projectConfig.name || newConfig.fps != m_projectConfig.fps;
+        const bool explicitChanged =
+            newConfig.explicitOutputResolution != m_projectConfig.explicitOutputResolution;
         applyProjectConfig(newConfig);
 
         // 出力サイズ(アスペクト)が変わったときだけクリップ再フィット + undo 記録を行う。
@@ -10307,10 +10535,18 @@ void MainWindow::editProjectSettings()
         // スナップショット(変更前サイズ + 旧 fit)へ undo で正しく戻れる。サイズは
         // 35a3dd2 で TimelineState に含まれているので projectOutputConfigRestored
         // 経由で canvas/出力サイズも復元される。サイズ未変更時は積まない(no-op)。
-        if (sizeChanged && m_timeline && m_timeline->undoManager())
+        const bool pushedUndo = sizeChanged && m_timeline && m_timeline->undoManager();
+        if (pushedUndo)
             m_timeline->saveUndoState(QStringLiteral("プロジェクト設定変更"));
 
+        // Without an undo point the current entry would keep the old flag, and a later
+        // undo to it (after a save marked it clean) would restore a stale value.
+        if (!pushedUndo && explicitChanged && m_timeline && m_timeline->undoManager())
+            m_timeline->undoManager()->updateCurrentProjectOutput(newConfig.explicitOutputResolution);
+
         updateStatusInfo();
+        if (!pushedUndo || nonUndoFieldsChanged)
+            markProjectDirty();
     }
 }
 
@@ -10364,15 +10600,17 @@ void MainWindow::saveProject()
                    ? QStringLiteral(" / 取り込み素材 %1 件をプロジェクトの隣へ移動しました")
                          .arg(m_lastSaveImportHubMoved)
                    : QString()));
-    else
+    else if (!m_saveFailureDialogSuppressed)
         QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
                               ? "Could not save project file." : errorMessage);
 }
 
 void MainWindow::saveProjectAs()
 {
-    QString filePath = QFileDialog::getSaveFileName(this, "Save Project As",
-        m_projectConfig.name + ".veditor", ProjectFile::fileFilter());
+    QString filePath = m_saveAsPathProvider
+        ? m_saveAsPathProvider()
+        : QFileDialog::getSaveFileName(this, "Save Project As",
+              m_projectConfig.name + ".veditor", ProjectFile::fileFilter());
     if (filePath.isEmpty()) return;
     QString errorMessage;
     if (saveProjectToPath(filePath, &errorMessage))
@@ -10381,13 +10619,15 @@ void MainWindow::saveProjectAs()
                    ? QStringLiteral(" / 取り込み素材 %1 件をプロジェクトの隣へ移動しました")
                          .arg(m_lastSaveImportHubMoved)
                    : QString()));
-    else
+    else if (!m_saveFailureDialogSuppressed)
         QMessageBox::critical(this, "Save Failed", errorMessage.isEmpty()
                               ? "Could not save project file." : errorMessage);
 }
 
 void MainWindow::openProject()
 {
+    if (!maybeSaveChanges())
+        return;
     QString filePath = QFileDialog::getOpenFileName(this, "Open Project",
         QString(), ProjectFile::fileFilter());
     if (filePath.isEmpty()) return;
@@ -10512,7 +10752,7 @@ bool MainWindow::saveProjectToPath(const QString &filePath, QString *errorMessag
             5000);
     }
     m_projectFilePath = path;
-    setWindowModified(false);
+    markProjectClean();
     updateTitle();
     return true;
 }
@@ -10574,9 +10814,110 @@ bool MainWindow::openProjectFromPath(const QString &filePath,
     // 開く。確認モーダルを出すと MCP 呼び出しが応答待ちのまま詰まるためである。
     const QScopedValueRollback<bool> promptGuard(
         m_promptForMissingMedia, promptForMissingMedia);
-    setWindowModified(false);
     applyLoadedProjectData(data, path);
     return true;
+}
+
+bool MainWindow::restoreFromAutosaveJson(const QString &json)
+{
+    ProjectData data;
+    if (json.isEmpty() || !ProjectFile::fromJsonString(json, data))
+        return false;
+    applyLoadedProjectData(data, QString());
+    // The restored state is not on disk yet.
+    markProjectDirty();
+    return true;
+}
+
+void MainWindow::markProjectClean()
+{
+    if (m_timeline && m_timeline->undoManager())
+        m_timeline->undoManager()->markClean();
+    m_dirtyOutsideUndo = false;
+    setWindowModified(false);
+}
+
+void MainWindow::markProjectDirty()
+{
+    if ((m_timeline && m_timeline->isRestoringState()) || m_remappingTrackIndices)
+        return;
+    m_dirtyOutsideUndo = true;
+    setWindowModified(true);
+}
+
+void MainWindow::syncDirtyFromUndo()
+{
+    const bool undoDirty = m_timeline && m_timeline->undoManager()
+        && !m_timeline->undoManager()->isClean();
+    m_syncingDirtyFromUndo = true;
+    setWindowModified(undoDirty || m_dirtyOutsideUndo);
+    m_syncingDirtyFromUndo = false;
+}
+
+void MainWindow::changeEvent(QEvent *event)
+{
+    QMainWindow::changeEvent(event);
+    // A call site that marks the window modified directly is an edit outside undo.
+    if (event->type() == QEvent::ModifiedChange && isWindowModified()
+        && !m_syncingDirtyFromUndo
+        && !(m_timeline && m_timeline->isRestoringState()))
+        m_dirtyOutsideUndo = true;
+}
+
+bool MainWindow::maybeSaveChanges()
+{
+    if (!isWindowModified())
+        return true;
+    ++m_unsavedChangesPromptCount;
+    UnsavedChangesChoice choice = UnsavedChangesChoice::Cancel;
+    if (m_unsavedChangesPrompt) {
+        choice = m_unsavedChangesPrompt();
+    } else {
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("未保存の変更"),
+                        QStringLiteral("保存されていない変更があります。保存しますか?"),
+                        QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel, this);
+        box.setDefaultButton(QMessageBox::Save);
+        box.button(QMessageBox::Save)->setText(QStringLiteral("保存"));
+        box.button(QMessageBox::Discard)->setText(QStringLiteral("破棄"));
+        box.button(QMessageBox::Cancel)->setText(QStringLiteral("キャンセル"));
+        const int answer = box.exec();
+        if (answer == QMessageBox::Save)
+            choice = UnsavedChangesChoice::Save;
+        else if (answer == QMessageBox::Discard)
+            choice = UnsavedChangesChoice::Discard;
+    }
+    switch (choice) {
+    case UnsavedChangesChoice::Save:
+        saveProject();
+        // A cancelled save-as or a failed save leaves the project dirty.
+        return !isWindowModified();
+    case UnsavedChangesChoice::Discard:
+        return true;
+    case UnsavedChangesChoice::Cancel:
+        break;
+    }
+    return false;
+}
+
+void MainWindow::setUnsavedChangesPromptForTest(std::function<UnsavedChangesChoice()> prompt)
+{
+    m_unsavedChangesPrompt = std::move(prompt);
+}
+
+void MainWindow::setSaveAsPathProviderForTest(std::function<QString()> provider)
+{
+    m_saveAsPathProvider = std::move(provider);
+}
+
+void MainWindow::setSaveFailureDialogSuppressedForTest(bool suppressed)
+{
+    m_saveFailureDialogSuppressed = suppressed;
+}
+
+void MainWindow::setMissingMediaResolverForTest(
+    std::function<QHash<QString, QString>(const QStringList &)> resolver)
+{
+    m_missingMediaResolver = std::move(resolver);
 }
 
 void MainWindow::openFile()
@@ -10654,6 +10995,7 @@ void MainWindow::importToMediaPool()
     if (m_mediaPoolDock)
         m_mediaPoolDock->refresh();
     if (added > 0) {
+        markProjectDirty();
         statusBar()->showMessage(
             QStringLiteral("メディアプールに %1 件取り込みました").arg(added));
     }
@@ -15692,13 +16034,13 @@ void MainWindow::editClipExpressionBindings()
     }
     ExpressionBindingDialog dialog(this);
     dialog.setWindowTitle(QStringLiteral("エクスプレッション - %1").arg(clip.displayName));
-    if (!clip.expressions.isEmpty())
-        dialog.setBindings(clip.expressions);
     const double projFps = (m_projectConfig.fps > 0) ? m_projectConfig.fps : 30.0;
     const QSize canvas = (m_projectConfig.width > 0 && m_projectConfig.height > 0)
         ? QSize(m_projectConfig.width, m_projectConfig.height)
         : QSize(1920, 1080);
-    dialog.setContextHints(clip.effectiveDuration(), projFps, canvas);
+    dialog.setContextHints(clip.effectiveDuration(), projFps, canvas, clip.dynamicTimeOffsetSec);
+    if (!clip.expressions.isEmpty())
+        dialog.setBindings(clip.expressions);
     if (dialog.exec() != QDialog::Accepted)
         return;
 
@@ -15819,6 +16161,7 @@ void MainWindow::openCameraMotionDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
     m_projectCamera = dialog.camera();
+    markProjectDirty();
     m_projectCameraUndoSlot = QJsonObject{};
     m_projectCameraUndoTimelineDepth = -1;
     m_projectCameraUndoSaveSerial = 0;
@@ -16092,6 +16435,7 @@ void MainWindow::onAudioDuckingSettings()
     m_duckingParams.attackMs = attackSpin->value();
     m_duckingParams.releaseMs = releaseSpin->value();
     m_duckingParams.targetReductionDb = duckSpin->value();
+    markProjectDirty();
 
     const int voiceTrack = voiceCombo->currentData().toInt();
     QSet<int> targets;
@@ -16143,6 +16487,7 @@ void MainWindow::onHDRSettings()
     if (dlg.exec() != QDialog::Accepted)
         return;
     m_hdrSettings = dlg.settings();
+    markProjectDirty();
     statusBar()->showMessage(
         QStringLiteral("HDR 出力設定を更新しました (%1)").arg(m_hdrSettings.mode),
         4000);
@@ -16188,6 +16533,7 @@ void MainWindow::onAIProcessing()
     if (dlg.exec() != QDialog::Accepted)
         return;
     m_aiSettings = dlg.settings();
+    markProjectDirty();
     statusBar()->showMessage(
         QStringLiteral("AI 処理設定を更新しました (upscale=%1, interp=%2)")
             .arg(m_aiSettings.upscaleEnabled ? QStringLiteral("ON") : QStringLiteral("OFF"))
@@ -16288,8 +16634,10 @@ void MainWindow::openPlanarTrackerDialog()
         // PRD-PROJECT-PRESET US-PP-4: write back state when dialog is closed.
         connect(m_planarTrackerDialog, &QDialog::finished, this,
                 [this](int /*result*/) {
-                    if (m_planarTrackerDialog)
+                    if (m_planarTrackerDialog) {
                         m_planarTrackerState = m_planarTrackerDialog->currentState();
+                        markProjectDirty();
+                    }
                 },
                 Qt::UniqueConnection);
     }
@@ -16362,6 +16710,7 @@ void MainWindow::showMotionTrackerDialog()
     dlg.setInitialState(m_motionTrackerState);   // PRD-PROJECT-PRESET US-PP-4: restore
     if (dlg.exec() == QDialog::Accepted) {
         m_motionTrackerState = dlg.currentState();  // PRD-PROJECT-PRESET US-PP-4: save
+        markProjectDirty();
         const auto preset = dlg.selectedPreset();
         tracker_preset::applyToMotionTracker(m_motionTracker, preset);
         statusBar()->showMessage(
@@ -19421,6 +19770,7 @@ void MainWindow::openColorManagement()
     dlg.setPipeline(m_acesPipeline);
     if (dlg.exec() == QDialog::Accepted) {
         m_acesPipeline = dlg.pipeline();
+        markProjectDirty();
         // AR-2: プレビュー即反映 (setAcesPipeline 内で表示中フレームを再描画) +
         // レガシー Exporter 経路への受け渡し。
         if (m_player)
@@ -19488,6 +19838,7 @@ void MainWindow::openDolbyVision()
 
     if (dlg.exec() == QDialog::Accepted) {
         m_dolbyVision = dlg.metadata();
+        markProjectDirty();
         statusBar()->showMessage(
             QStringLiteral("Dolby Vision メタデータ: プロファイル %1 / %2 ショット")
                 .arg(m_dolbyVision.profile)
@@ -19518,6 +19869,7 @@ void MainWindow::openBroadcastCaption()
             cues.append(cue);
         }
         m_broadcastCaption.cues = cues;
+        markProjectDirty();
     }
 
     BroadcastCaptionDialog dlg(this);
@@ -19557,6 +19909,7 @@ void MainWindow::openBroadcastCaption()
 
     if (dlg.exec() == QDialog::Accepted) {
         m_broadcastCaption = dlg.document();
+        markProjectDirty();
         statusBar()->showMessage(
             QStringLiteral("放送CC: %1 / CC%2 / %3 cue")
                 .arg(m_broadcastCaption.standard)
@@ -19665,9 +20018,10 @@ void MainWindow::openRecentFile(const QString &filePath)
 
     // Check if it's a project file or media file
     if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
+        if (!maybeSaveChanges())
+            return;
         ProjectData data;
         if (ProjectFile::load(filePath, data)) {
-            setWindowModified(false);
             applyLoadedProjectData(data, filePath);
             statusBar()->showMessage("Opened project: " + fi.fileName());
         }
@@ -20118,9 +20472,10 @@ void MainWindow::dropEvent(QDropEvent *event)
 
         if (filePath.endsWith(".veditor", Qt::CaseInsensitive)) {
             // Open as project
+            if (!maybeSaveChanges())
+                continue;
             ProjectData data;
             if (ProjectFile::load(filePath, data)) {
-                setWindowModified(false);
                 applyLoadedProjectData(data, filePath);
                 statusBar()->showMessage("Opened project: " + QFileInfo(filePath).fileName());
             }
@@ -20258,6 +20613,10 @@ void MainWindow::rebuildAudioMeters()
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
+    if (!maybeSaveChanges()) {
+        event->ignore();
+        return;
+    }
     saveWindowState();
     saveWorkspacesToSettings();  // WS-3: 名前付きワークスペースを永続化
     if (m_autoSave) m_autoSave->markCleanShutdown();
@@ -21946,6 +22305,7 @@ void MainWindow::openSmartReframe()
     m_smartReframe.setTargetAspect(params.aspectW, params.aspectH);
     m_smartReframe.setSmoothness(params.smoothness);
     m_smartReframe.setMotionWeight(params.motionWeight);
+    markProjectDirty();
 
     // Sample frames from the active clip(s) on the timeline.
     const auto &clips = m_timeline->videoClips();
@@ -22092,6 +22452,7 @@ void MainWindow::applyLoudnessNormalize(double targetLUFS, double gainDb)
 
     // Pass gain to exporter for render-time normalization.
     m_exporter->setLoudnessGainDb(gainDb);
+    markProjectDirty();
     if (m_renderQueue)
         m_renderQueue->setLoudnessGainDb(gainDb);
     if (m_renderQueueDialog && m_renderQueueDialog->queue())
