@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../TrimOps.h"
@@ -132,5 +133,6 @@ int runClipGroupSelftest()
     timeline.videoTracks()[0]->setSelectedClip(0);
     gate(5, ok && timeline.videoTracks()[1]->isClipSelected(0) && timeline.audioTracks()[0]->isClipSelected(0));
     std::fprintf(stderr, "[clip-group] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

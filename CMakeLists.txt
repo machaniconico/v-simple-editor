@@ -140,6 +140,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/camtrack_solve_selftest.cpp
     src/selftests/camtrack_ui_selftest.cpp
     src/selftests/camera_solve_selftest.cpp
+    src/selftests/camsolve_probe_selftest.cpp
     src/selftests/feature_tracker_selftest.cpp
     src/selftests/gate_tally_selftest.cpp
     src/selftests/sfm_two_view_selftest.cpp
@@ -168,6 +169,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     # PRD-SPLIT-MAIN-3 Phase 3-B: effects selftests (moved from src/main.cpp).
     src/selftests/effects_selftests.cpp
     src/selftests/Text3dPreviewSelftest.cpp
+    src/selftests/text3d_export_selftest.cpp
+    src/selftests/brush_export_selftest.cpp
     src/selftests/AeFxBlurSelftest.cpp
     src/selftests/AeFxColorSelftest.cpp
     src/selftests/AeFxColor2Selftest.cpp
@@ -180,6 +183,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/puppet_pin_selftest.cpp
     src/selftests/mesh_warp_selftest.cpp
     src/selftests/special_composite_selftest.cpp
+    src/selftests/filejob_parity_selftest.cpp
+    src/selftests/clip_sidecar_selftest.cpp
     src/selftests/surface_tool_selftest.cpp
     src/selftests/rolling_shutter_selftest.cpp
     src/selftests/fxgrain_echo_selftest.cpp

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../GraphEditorPanel.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -332,5 +333,6 @@ int runKeyframeCopySelftest()
     }
     gate(7, g7);
     std::fprintf(stderr, "[keyframe-copy] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

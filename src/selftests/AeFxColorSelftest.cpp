@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../VideoEffect.h"
 
@@ -289,5 +290,6 @@ int runAeFxColorSelftest()
     }
 
     std::printf("ae-fx-color summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

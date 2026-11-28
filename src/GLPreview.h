@@ -24,6 +24,7 @@
 class Timeline;
 class SurfaceTool;
 class BrushAnimation;
+class VideoPlayer;
 
 class GLPreview : public QOpenGLWidget, protected QOpenGLFunctions
 {
@@ -39,6 +40,10 @@ public:
     void setBrushAnimation(BrushAnimation *animation);
     void clearBrushAnimation();
     void setBrushAnimationProgress(double progress);
+    // US-1708 test seams: the progress the preview draws the brush at, and the
+    // image paintGL uploads (cameraBaked ? baked frame : decoded frame, brush drawn).
+    double brushAnimationProgressForTest() const { return m_brushAnimationProgress; }
+    QImage uploadFrameForTest() const;
     void setDisplayAspectRatio(double aspectRatio);
     void setColorCorrection(const ColorCorrection &cc);
     // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
@@ -326,6 +331,12 @@ private:
     void releaseRegisteredTexturesLocked();
     void renderPendingD3D11Frame();
     void paintTimecodeBurnInOverlay();
+    // US-1704: the VideoPlayer that owns this view. The view sits in the player's
+    // display stack, so the player is an ancestor rather than the direct parent.
+    VideoPlayer *ownerPlayer() const;
+    // US-1704: timeline seconds the project camera is evaluated at (no GL needed).
+    double resolveCameraSeconds() const;
+    friend int runCamera3DSelftest();
     // letterboxRect() moved to public section (US-T32).
 
     QOpenGLShaderProgram *m_program = nullptr;
@@ -336,6 +347,7 @@ private:
     Camera3D m_projectCamera;
     QImage m_projectCameraFrame;
     qint64 m_projectCameraFrameTimeUs = -1;
+    QImage brushedUploadFrame(bool cameraBaked) const;
     QImage m_currentFrame;
     BrushAnimation *m_brushAnimation = nullptr;
     double m_brushAnimationProgress = 0.0;

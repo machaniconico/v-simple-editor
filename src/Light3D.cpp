@@ -60,10 +60,10 @@ double statePropertyValue(const Light3DState &state, Light3DProperty property)
 
 QQuaternion rotationFor(const Layer3DTransform &xform)
 {
-    return QQuaternion::fromEulerAngles(
-        static_cast<float>(xform.rotationX),
-        static_cast<float>(xform.rotationY),
-        static_cast<float>(xform.rotationZ));
+    // Same Rz * Ry * Rx order as projectLayerQuad, so shading follows the projected quad.
+    return QQuaternion::fromAxisAndAngle(0.0f, 0.0f, 1.0f, static_cast<float>(xform.rotationZ))
+        * QQuaternion::fromAxisAndAngle(0.0f, 1.0f, 0.0f, static_cast<float>(xform.rotationY))
+        * QQuaternion::fromAxisAndAngle(1.0f, 0.0f, 0.0f, static_cast<float>(xform.rotationX));
 }
 
 double smoothStep(double value)

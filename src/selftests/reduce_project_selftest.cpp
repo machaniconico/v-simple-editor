@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../MainWindow.h"
 #include "../MediaPoolDock.h"
 #include "../Timeline.h"
@@ -236,5 +237,6 @@ int runReduceProjectSelftest()
     gate(4, confirmed && cancelled && filesIntact);
     window.setWindowModified(false);
     std::fprintf(stderr, "[reduce-project] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

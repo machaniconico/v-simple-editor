@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../VideoEffect.h"
 
@@ -326,5 +327,6 @@ int runAeFxDistort2Selftest()
     }
 
     std::printf("ae-fx-distort2 summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

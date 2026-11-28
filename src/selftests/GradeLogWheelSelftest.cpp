@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../ProjectFile.h"
 #include "../VideoEffect.h"
 
@@ -184,5 +185,6 @@ int runGradeLogWheelSelftest()
 
     qInfo().noquote() << QStringLiteral("[grade-log-wheel] summary: %1 PASS, %2 FAIL")
         .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

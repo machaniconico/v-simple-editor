@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../MeshEditTool.h"
 #include "../ProjectFile.h"
 #include "../Timeline.h"
@@ -284,5 +285,6 @@ int runMeshWarpSelftest()
     gate(7, pinsOk);
     tlrender::setMeshWarpDisabledForTesting(false);
     std::cerr << "summary: " << pass << " PASS, " << fail << " FAIL\n";
+    selftests::reportTally(pass, fail, 0);
     return fail;
 }

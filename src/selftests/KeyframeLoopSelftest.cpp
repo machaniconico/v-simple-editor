@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/KeyframeLoopSelftest.cpp
 // AE-ANIM-3: loopOut sampling and serialization regression gates.
 
@@ -184,5 +185,6 @@ int runKeyframeLoopSelftest()
     }
 
     std::printf("[keyframe-loop] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

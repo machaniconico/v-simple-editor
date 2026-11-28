@@ -3,6 +3,8 @@
 #include "libavcore/AudioExtract.h"
 #include <QDateTime>
 #include <QFileInfo>
+#include <QRunnable>
+#include <QThreadPool>
 #include <QTemporaryDir>
 #include <algorithm>
 #include <atomic>
@@ -176,6 +178,36 @@ std::shared_ptr<const Envelope> EnvelopeCache::envelope(const QString& filePath)
     return value;
 }
 
+QThreadPool& prefetchPool()
+{
+    // Leaked on purpose: a function-static pool would be destroyed (and waited on) during
+    // static teardown after QCoreApplication is gone. Production drains it on aboutToQuit.
+    static QThreadPool *const pool = [] {
+        auto *created = new QThreadPool;
+        created->setMaxThreadCount(2);
+        return created;
+    }();
+    return *pool;
+}
+
+void EnvelopeCache::prefetch(std::weak_ptr<EnvelopeCache> self, QStringList filePaths)
+{
+    for (const QString& path : filePaths) {
+        prefetchPool().start(QRunnable::create([self, path] {
+            if (const auto cache = self.lock()) cache->envelope(path);
+        }));
+    }
+}
+
+bool EnvelopeCache::isCachedForTest(const QString& filePath)
+{
+    const QFileInfo info(filePath);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto it = m_entries.constFind(info.absoluteFilePath());
+    return it != m_entries.cend() && it->size == info.size()
+        && it->modified == info.lastModified().toMSecsSinceEpoch();
+}
+
 std::function<double(double)> makeLinkedAudioSampler(
     int linkGroup, double clipStart,
     const QVector<const QVector<ClipInfo>*>& audioTracks,
@@ -200,6 +232,12 @@ std::function<double(double)> makeLinkedAudioSampler(
         }
     }
     return {};
+}
+
+std::shared_ptr<EnvelopeCache> sharedEnvelopeCache()
+{
+    static const std::shared_ptr<EnvelopeCache> cache = std::make_shared<EnvelopeCache>();
+    return cache;
 }
 
 std::function<double(double)> makeLinkedAudioSamplerFrom(

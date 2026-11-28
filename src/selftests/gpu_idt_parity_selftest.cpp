@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/gpu_idt_parity_selftest.cpp
 // Story1 GPU IDT capability parity: composite16Idt() vs direct aces:: CPU oracle.
 
@@ -607,6 +608,7 @@ int runGpuIdtParitySelftest()
     }
 
     std::printf("[gpu-idt-parity] Result: %d/%d PASSED\n", passed, total);
+    selftests::reportTally(passed, total - passed, 0);
     return (passed == total) ? 0 : 1;
 }
 

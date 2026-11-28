@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // gpu_composite_math_selftests.cpp
 // Headless selftest for the pure gpucomposite:: compositing-math engine
 // (src/playback/GpuCompositeMath.{h,cpp}).
@@ -468,5 +469,6 @@ int runGpuCompositeMathSelftest()
 
     std::printf("[gpu-composite-math] Result: %d/%d PASSED\n",
                 passed, passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed; // 0 = all PASS
 }

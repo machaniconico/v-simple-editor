@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../MotionPreset.h"
 #include "../Timeline.h"
 #include "../clipanim/ClipAnim.h"
@@ -219,5 +220,6 @@ int runMotionPresetSelftest()
     qInfo().noquote()
         << QStringLiteral("[motion-preset] selftest end, passed=%1 failed=%2")
                .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

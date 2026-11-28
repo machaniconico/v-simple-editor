@@ -10,6 +10,7 @@
 #include <mutex>
 
 struct ClipInfo;
+class QThreadPool;
 
 namespace audiokf {
 struct Envelope {
@@ -40,6 +41,13 @@ bool decodeMono(const QString& filePath, QVector<float>& mono,
 class EnvelopeCache {
 public:
     std::shared_ptr<const Envelope> envelope(const QString& filePath);
+    // US-1710: decode filePaths on prefetchPool() so the first audioLevel() read finds
+    // them cached. A worker decodes only while self still lives (weak_ptr::lock), so a
+    // cache released meanwhile is not kept alive past the decode in flight.
+    static void prefetch(std::weak_ptr<EnvelopeCache> self, QStringList filePaths);
+    // Acceptance seam: true when envelope(filePath) would be served from the cache
+    // (same key and size / mtime match as envelope()).
+    bool isCachedForTest(const QString& filePath);
 private:
     struct Entry {
         std::shared_ptr<const Envelope> value;
@@ -52,6 +60,13 @@ private:
     QHash<QString, Entry> m_entries;
     QStringList m_lru;
 };
+
+// US-1710: the pool EnvelopeCache::prefetch runs on (2 threads, outside any cache).
+QThreadPool& prefetchPool();
+
+// US-1709: the one EnvelopeCache of the process, shared by the live Timeline's
+// snapshot (MainWindow) and the Timelines that file-based render jobs load.
+std::shared_ptr<EnvelopeCache> sharedEnvelopeCache();
 
 // Clip lists are inspected only during construction; the sampler owns its source
 // snapshot and cache. No timeline widgets are needed, and decoding stays lazy.

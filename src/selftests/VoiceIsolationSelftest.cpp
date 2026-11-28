@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include <QDebug>
 #include <QCoreApplication>
 #include <QMetaObject>
@@ -530,5 +531,6 @@ int runVoiceIsolationSelftest()
 
     qInfo().noquote() << "[voice-isolation] selftest done passed="
                       << passed << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

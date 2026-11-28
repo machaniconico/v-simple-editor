@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // motion_blur_parity_selftest.cpp
 // Export SSOT motion-blur off-path and averaging helper regression gates.
 // Run via: --selftest=motion-blur-parity
@@ -387,5 +388,6 @@ int runMotionBlurParitySelftest()
         << QStringLiteral("MOTION-BLUR-PARITY: %1/%2 PASS")
                .arg(passed)
                .arg(passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

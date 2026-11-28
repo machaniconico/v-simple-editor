@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../CameraSolver.h"
 #include "../Camera3D.h"
 
@@ -229,5 +230,6 @@ int runCameraSolveSelftest()
     initiallyEmpty.fromJson(emptyBefore);
     gate(8, undoOk && initiallyEmpty.toJson() == emptyBefore);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../FrameClipboard.h"
 #include "../MainWindow.h"
 #include "../ShortcutManager.h"
@@ -418,5 +419,6 @@ int runFrameClipboardSelftest()
     qInfo().noquote()
         << QStringLiteral("[frame-clipboard] summary: %1 PASS, %2 FAIL")
                .arg(passed).arg(failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : failed;
 }

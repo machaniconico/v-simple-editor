@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../AudioMixer.h"
@@ -542,5 +543,6 @@ int runAudioXfadeSelftest()
          && near(aa[1].timelineStart, va[0][1].timelineStart), passed, failed);
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

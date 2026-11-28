@@ -257,7 +257,7 @@ struct ProjectData {
     QVector<planartrack::PlanarTrack> planarTracks;
 
     // US-BRUSH-5: brush animation persistence
-    QVector<BrushAnimationEntry> brushAnimations;
+    QVector<BrushAnimationEntry> brushAnimations;  // US-1706: legacy root section only, always empty after load
 
     // US-AETEXT-12: AE text feature persistence
     QVector<PathTextEntry> pathTexts;
@@ -281,7 +281,7 @@ struct ProjectData {
     ProjectVfxState vfxState;
 
     // US-3D-11: motion-graphics sprint persistence
-    QVector<Text3DClipEntry> text3DClipEntries;
+    QVector<Text3DClipEntry> text3DClipEntries;  // US-1706: legacy root section only, always empty after load
     QVector<ExpressionBindingsClipEntry> expressionBindingsEntries;  // US-1505: always empty after load
     QVector<WiggleClipEntry> wiggleClipEntries;  // US-1504: always empty after load
     QJsonObject projectCamera;   // Camera3D::toJson() — single per-project camera

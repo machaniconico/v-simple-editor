@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../ClipGeometry.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
@@ -603,5 +604,6 @@ int runFxGrainEchoSelftest()
         canvasRoutingValid, passed, failed);
 
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

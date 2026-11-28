@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../LumetriScopes.h"
 
 #include <QImage>
@@ -129,5 +130,6 @@ int runRgbParadeSelftest()
               failed);
 
     std::printf("[rgb-parade] summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

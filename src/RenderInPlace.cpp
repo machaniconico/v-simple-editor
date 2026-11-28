@@ -38,6 +38,8 @@ void copyComposition(const ClipInfo &from, ClipInfo &to)
     to.autoOrientToCamera = from.autoOrientToCamera;
     to.wiggle = from.wiggle;
     to.expressions = from.expressions;
+    to.text3DConfig = from.text3DConfig;
+    to.brushData = from.brushData;
     to.opacity = from.opacity;
     to.visible = from.visible;
     to.blendMode = from.blendMode;
@@ -52,7 +54,8 @@ bool compositionTrack(const QString &name)
 {
     return name.startsWith(QStringLiteral("motion."))
         || name == QStringLiteral("positionX") || name == QStringLiteral("positionY")
-        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY");
+        || name == QStringLiteral("scaleX") || name == QStringLiteral("scaleY")
+        || name == QStringLiteral("brush_progress");
 }
 
 QSize nativeVideoSize(const QString &path)

@@ -9,9 +9,12 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <map>
 
 #include <QByteArray>
 #include <QFile>
+#include <QFileInfo>
+#include <QJsonObject>
 #include <QString>
 #include <QTemporaryDir>
 #include <QtGlobal>
@@ -28,9 +31,11 @@ extern "C" {
 
 #include "../ClipGeometry.h"
 #include "../SmartRender.h"
+#include "../Timeline.h"
 #include "../libavcore/Concat.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/Probe.h"
+#include "SelftestRegistry.h"
 
 namespace {
 
@@ -612,11 +617,15 @@ int runSmartRenderSelftest()
 {
     int passed = 0;
     int failed = 0;
+    // A gate number may carry several checks; it passes only when all of them pass.
+    std::map<int, bool> gateOk;
 
     auto check = [&](int g, const char* desc, bool ok) {
         std::printf("[smart-render] %s G%d %s\n",
                     ok ? "PASS" : "FAIL", g, desc);
         ok ? ++passed : ++failed;
+        const auto it = gateOk.find(g);
+        gateOk[g] = ok && (it == gateOk.end() || it->second);
     };
 
     EnvGuard envGuard;
@@ -890,8 +899,64 @@ int runSmartRenderSelftest()
                         error.toUtf8().constData());
         check(26, "concatCopy reports injected read errors", ok);
     }
+    {
+        // A real full-length media clip on a Timeline, through the same entry point the
+        // render queue uses. The plain clip must be eligible, so the 3D text rejection
+        // cannot pass on an unrelated reason.
+        EnvGuard seamGuard("VEDITOR_SMARTRENDER_TEST_SEAM");
+        qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+        ClipInfo plain;
+        plain.filePath =
+            QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+        plain.displayName = QStringLiteral("smart-render-real");
+        const auto durationUs =
+            libavcore::probeDurationMicroseconds(plain.filePath.toStdString());
+        plain.duration = durationUs ? double(*durationUs) / 1'000'000.0 : 0.0;
+        plain.outPoint = plain.duration;
+        ClipInfo withText = plain;
+        withText.text3DConfig = QJsonObject{{QStringLiteral("text"), QStringLiteral("T3")}};
+        QTemporaryDir outDir;
+        const QString outputPath = outDir.filePath(QStringLiteral("smart-render-out.mp4"));
+        auto passThroughFor = [&](const ClipInfo& clip) {
+            Timeline tl;
+            tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{},
+                                  0, -1, -1, 10);
+            return smartrender::timelinePassThrough(&tl, outputPath, QStringLiteral("h264"),
+                                                    640, 360, 30.0, 0, 0, false, false,
+                                                    false, false, false, false, false);
+        };
+        const smartrender::PassThroughEligibility plainPass = passThroughFor(plain);
+        const smartrender::PassThroughEligibility textPass = passThroughFor(withText);
+        // canStreamCopy directly, with the probed signature the pass-through hands it.
+        auto streamCopyFor = [&](ClipInfo clip) {
+            clip.displayName = QStringLiteral(
+                "smartrender://clip?codec=h264&width=640&height=360&fps=30&pixfmt=yuv420p");
+            return eligibleFor(clip, QStringLiteral("h264"), 640, 360, 30.0);
+        };
+        const smartrender::SegmentEligibility plainCopy = streamCopyFor(plain);
+        const smartrender::SegmentEligibility textCopy = streamCopyFor(withText);
+        const bool ok = outDir.isValid() && plain.duration > 0.0
+            && plainPass.eligible && !textPass.eligible
+            && textPass.reason.contains(QStringLiteral("3D text"))
+            && plainCopy.eligible && !textCopy.eligible
+            && textCopy.reason.contains(QStringLiteral("3D text"));
+        std::printf("[smart-render] 3D text detail: duration=%.3f passThrough plain=%d [%s] "
+                    "text=%d [%s] canStreamCopy plain=%d [%s] text=%d [%s]\n",
+                    plain.duration, int(plainPass.eligible), plainPass.reason.toUtf8().constData(),
+                    int(textPass.eligible), textPass.reason.toUtf8().constData(),
+                    int(plainCopy.eligible), plainCopy.reason.toUtf8().constData(),
+                    int(textCopy.eligible), textCopy.reason.toUtf8().constData());
+        check(27, "timelinePassThrough and canStreamCopy reject a clip with 3D text", ok);
+    }
 
     std::printf("[smart-render] summary: passed=%d failed=%d\n",
                 passed, failed);
+    int gatesPassed = 0;
+    for (const auto& gate : gateOk) {
+        if (gate.second) ++gatesPassed;
+    }
+    const int gatesFailed = int(gateOk.size()) - gatesPassed;
+    std::printf("[smart-render] gates: passed=%d failed=%d\n", gatesPassed, gatesFailed);
+    selftests::reportTally(gatesPassed, gatesFailed, 0);
     return failed == 0 ? 0 : 1;
 }

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
@@ -231,5 +232,6 @@ int runSeqFromClipSelftest()
         && sequenceMenuEnabled(generated.videoTracks().value(0), false));
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

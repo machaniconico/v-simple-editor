@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../VideoEffect.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
@@ -154,5 +155,6 @@ int runSafeLeaveColorSelftest()
     gate(6, parity);
     VideoEffectProcessor::setSafeLeaveColorEnabledForTesting(true);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

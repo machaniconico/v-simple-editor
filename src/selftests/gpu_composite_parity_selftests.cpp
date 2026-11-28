@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/gpu_composite_parity_selftests.cpp
 // GPU vs CPU SSOT measured-parity selftest for the Stage 2 GpuLayerCompositor.
 //
@@ -609,5 +610,6 @@ int runGpuCompositeParitySelftest()
     }
 
     std::printf("[gpu-composite-parity] Result: %d/%d PASSED\n", passed, total);
+    selftests::reportTally(passed, total - passed, 0);
     return (passed == total) ? 0 : 1;
 }

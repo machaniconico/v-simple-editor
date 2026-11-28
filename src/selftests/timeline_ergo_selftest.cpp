@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../Timecode.h"
@@ -629,5 +630,6 @@ int runTimelineErgoSelftest()
                  && timeline.undoManager()->saveSerial() == serial && !timeline.canUndo());
     }
     std::fprintf(stderr, "[timeline-ergo] summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

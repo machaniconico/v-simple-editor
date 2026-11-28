@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/libavcore_selftests.cpp
 // PRD-SPLIT-MAIN-3 Phase 3-A: libavcore-backed selftests moved verbatim
 // from src/main.cpp. Dispatch via SelftestRegistry.{h,cpp}.
@@ -697,6 +698,7 @@ int runLibavcoreDecodeSelftest()
 //   Cleans up both temp files on all paths.
 int runVideostabDeshakeSelftest()
 {
+    int passed = 0;
     qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest: deshake in-process regression gate";
 
     constexpr int kWidth = 320;
@@ -707,6 +709,7 @@ int runVideostabDeshakeSelftest()
     QTemporaryDir tmpDir;
     if (!tmpDir.isValid()) {
         qCritical() << "VIDEOSTAB-DESHAKE selftest FAILED: could not create temp dir";
+        selftests::reportTally(passed, 1, 0);
         return 1;
     }
     const QString inputPath =
@@ -718,6 +721,7 @@ int runVideostabDeshakeSelftest()
         qCritical() << "VIDEOSTAB-DESHAKE selftest FAILED:" << message;
         QFile::remove(inputPath);
         QFile::remove(outputPath);
+        selftests::reportTally(passed, 1, 0);
         return 1;
     };
 
@@ -822,6 +826,8 @@ int runVideostabDeshakeSelftest()
                 << "encoder =" << QString::fromStdString(activeEncoder);
     }
 
+    ++passed;
+
     // -----------------------------------------------------------------------
     // (2) buildDeshakeFilter() structural validation
     // -----------------------------------------------------------------------
@@ -842,6 +848,8 @@ int runVideostabDeshakeSelftest()
             "buildDeshakeFilter() returned no ':' key=value separator: %1")
                         .arg(filterQStr));
     }
+
+    ++passed;
 
     // -----------------------------------------------------------------------
     // (3) VideoFilterGraph::run() — in-process deshake
@@ -873,6 +881,8 @@ int runVideostabDeshakeSelftest()
         qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest (3): VideoFilterGraph::run() OK";
     }
 
+    ++passed;
+
     // -----------------------------------------------------------------------
     // (4) Independent probe (tautology-free): codec name + positive duration
     // -----------------------------------------------------------------------
@@ -899,6 +909,8 @@ int runVideostabDeshakeSelftest()
                 << static_cast<qlonglong>(*durationUs);
     }
 
+    ++passed;
+
     // -----------------------------------------------------------------------
     // (5) Sanity guard: output file size > 0
     // -----------------------------------------------------------------------
@@ -912,6 +924,8 @@ int runVideostabDeshakeSelftest()
                 << fi.size() << "bytes";
     }
 
+    ++passed;
+
     // -----------------------------------------------------------------------
     // (8) cancel() callable smoke test
     // -----------------------------------------------------------------------
@@ -920,6 +934,8 @@ int runVideostabDeshakeSelftest()
         canceler.cancel();
         qInfo().noquote() << "[INFO] VIDEOSTAB-DESHAKE (8): VideoStabilizer::cancel() callable";
     }
+
+    ++passed;
 
     // -----------------------------------------------------------------------
     // (9) analyzeOnly / analysisComplete removal regression gate (US-VST-1)
@@ -935,6 +951,7 @@ int runVideostabDeshakeSelftest()
                                       "analysisComplete signal re-introduced - regression!";
             QFile::remove(inputPath);
             QFile::remove(outputPath);
+            selftests::reportTally(passed, 1, 0);
             return 1;
         }
         qInfo().noquote() << "[INFO] VIDEOSTAB-DESHAKE (9): analyzeOnly/analysisComplete removal confirmed";
@@ -947,6 +964,8 @@ int runVideostabDeshakeSelftest()
     QFile::remove(outputPath);
 
     qInfo() << "[INFO] VIDEOSTAB-DESHAKE selftest PASSED";
+    ++passed;
+    selftests::reportTally(passed, 0, 0);
     return 0;
 }
 
@@ -1075,6 +1094,7 @@ int runAIHighlightSelftest()
     if (failed == 0) qInfo().noquote() << summary;
     else             qCritical().noquote() << summary;
     writeLogLine("INFO", summary);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 
@@ -1170,6 +1190,7 @@ int runProxySelftestV2()
     if (failed == 0) qInfo().noquote() << summary;
     else             qCritical().noquote() << summary;
     writeLogLine("INFO", summary);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 

@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../VideoEffect.h"
 #include "../EffectPreset.h"
 #include "../ProjectFile.h"
@@ -235,5 +236,6 @@ int runEffectMaskSelftest()
     gate(8, preserved);
     VideoEffectProcessor::setEffectMaskDisabledForTesting(false);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

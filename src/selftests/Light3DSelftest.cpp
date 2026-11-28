@@ -12,6 +12,7 @@
 #include <QDoubleSpinBox>
 #include <QImage>
 #include <QJsonObject>
+#include <QMatrix4x4>
 #include <QMetaObject>
 #include <QTemporaryDir>
 #include <QVector3D>
@@ -691,6 +692,79 @@ int runLight3DSelftest()
             .arg(firstDiffuseCoeff, 0, 'g', 17)
             .arg(secondDiffuseCoeff, 0, 'g', 17)
             .toStdString());
+
+    // G18: the light rotation order is Rz * Ry * Rx (projectLayerQuad's), not Z-X-Y.
+    // X=30, Z=90 -> Rz*Ry*Rx maps (0,0,1) to (0.5, 0, 0.866). The two controls
+    // (Z=0 with X=30, X=Y=0 with Z=90) agree in either order.
+    {
+        Layer3DTransform mixed;
+        mixed.rotationX = 30.0;
+        mixed.rotationZ = 90.0;
+        Layer3DTransform onlyX;
+        onlyX.rotationX = 30.0;
+        Layer3DTransform onlyZ;
+        onlyZ.rotationZ = 90.0;
+        const QVector3D nMixed = light3d::layerNormal(mixed);
+        const QVector3D nOnlyX = light3d::layerNormal(onlyX);
+        const QVector3D nOnlyZ = light3d::layerNormal(onlyZ);
+        std::cerr << "light3d G18 mixed=(" << nMixed.x() << ',' << nMixed.y() << ',' << nMixed.z()
+                  << ") onlyX=(" << nOnlyX.x() << ',' << nOnlyX.y() << ',' << nOnlyX.z()
+                  << ") onlyZ=(" << nOnlyZ.x() << ',' << nOnlyZ.y() << ',' << nOnlyZ.z() << ")\n";
+        tally.gate(18,
+            closeTo(nMixed.x(), 0.5, 1.0e-5) && closeTo(nMixed.y(), 0.0, 1.0e-5)
+                && closeTo(nMixed.z(), 0.8660254, 1.0e-5)
+                && closeTo(nOnlyX.y(), -0.5, 1.0e-5) && closeTo(nOnlyX.z(), 0.8660254, 1.0e-5)
+                && closeTo(nOnlyZ.z(), 1.0, 1.0e-5),
+            "layerNormal did not follow the Rz*Ry*Rx order of projectLayerQuad");
+    }
+
+    // G19: an auto-oriented layer with rotZ 15 under a (1,0,1) parallel light is shaded
+    // with the projectLayerQuad normal (hand-built Rz, Ry, Rx), not the Z-X-Y one.
+    {
+        Camera3DState orientCam;
+        orientCam.position = QVector3D(0.0f, 0.0f, -500.0f);
+        orientCam.target = orientCam.position + QVector3D(0.0f, 0.0f, -1.0f);
+        orientCam.fov = 500.0;
+        orientCam.trueProjection = true;
+        ClipInfo tilted;
+        tilted.is3DLayer = true;
+        tilted.layer3D.rotationY = 60.0;
+        tilted.layer3D.rotationZ = 15.0;
+        tilted.autoOrientToCamera = true;
+        const Layer3DTransform eff = camera3d::effectiveLayer3DAt(
+            tilted, QPointF(150.0, 100.0), orientCam);
+        QMatrix4x4 m;
+        m.rotate(static_cast<float>(eff.rotationZ), 0, 0, 1);
+        m.rotate(static_cast<float>(eff.rotationY), 0, 1, 0);
+        m.rotate(static_cast<float>(eff.rotationX), 1, 0, 0);
+        const QVector3D quadNormal = m.mapVector(QVector3D(0, 0, 1)).normalized();
+        const QVector3D lightDir = QVector3D(1.0f, 0.0f, 1.0f).normalized();
+        const double expectedGain = 1.0 + qMax(0.0, static_cast<double>(
+            QVector3D::dotProduct(quadNormal, lightDir)));
+
+        Light3DState sun;
+        sun.type = LightType::Parallel;
+        sun.position = QVector3D(100.0f, 0.0f, 100.0f);
+        sun.target = QVector3D();
+        sun.intensity = 1.0;
+        sun.color = QColor(255, 255, 255);
+        LayerMaterial diffuseOnly;
+        diffuseOnly.ambientCoeff = 0.0;
+        diffuseOnly.diffuseCoeff = 1.0;
+        QImage flat(QSize(2, 2), QImage::Format_ARGB32);
+        flat.fill(qRgba(100, 100, 100, 255));
+        const QImage lit = light3d::applyLighting(
+            flat, {sun}, eff, QVector3D(), QSizeF(flat.size()), viewPos, diffuseOnly);
+        const int expectedValue = qBound(0, static_cast<int>(100.0 * expectedGain + 0.5), 255);
+        const int actual = qRed(lit.pixel(0, 0));
+        std::cerr << "light3d G19 eff=(" << eff.rotationX << ',' << eff.rotationY << ','
+                  << eff.rotationZ << ") actual=" << actual << " expected=" << expectedValue << '\n';
+        tally.gate(19,
+            actual == expectedValue && qRed(lit.pixel(1, 1)) == actual,
+            QStringLiteral("actual=%1 expected=%2 (lighting rotation order differs "
+                           "from projectLayerQuad)")
+                .arg(actual).arg(expectedValue).toStdString());
+    }
 
     return tally.finish("light3d");
 }

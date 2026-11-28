@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // US-200: run from the repository root in both baseline and HEAD builds.
 // Compare separate VEDITOR_RENDER_FIXTURE_OUT directories with diff -r.
 // Fixture (b) intentionally captures the US-201 transition defect correction.
@@ -284,6 +285,7 @@ int runRenderFixtureSelftest()
     };
     const auto summary = [&]() {
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+        selftests::reportTally(passed, failed, 0);
         return failed;
     };
     const QString path = qEnvironmentVariable("VEDITOR_RENDER_FIXTURE_OUT");

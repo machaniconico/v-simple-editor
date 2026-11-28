@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../EffectPreset.h"
 #include "../Timeline.h"
@@ -184,5 +185,6 @@ int runLensDistortSelftest()
     VideoEffectProcessor::setLensDistortionEnabledForTesting(true);
     VideoEffectProcessor::resetLensDistortionInvocationCount();
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

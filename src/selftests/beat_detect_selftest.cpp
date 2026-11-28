@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Beat detection headless selftest.
 //
 // QApplication 不要。beatdetect:: の純粋オンセット/BPM 検出を合成クリック
@@ -135,5 +136,6 @@ int runBeatDetectSelftest()
 
     qInfo().noquote() << "[beat-detect] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

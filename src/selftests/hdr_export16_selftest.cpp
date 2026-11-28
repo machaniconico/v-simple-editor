@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // hdr_export16_selftest.cpp
 // Headless selftest for HDR Stage2 export-side RGBA64 matte-free compositing.
 // Run via: --selftest=hdr-export16
@@ -247,5 +248,6 @@ int runHdrExport16Selftest()
 
     std::printf("[hdr-export16] summary: gates=8 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

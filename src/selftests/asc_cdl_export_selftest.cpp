@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // AscCdlExport headless selftest.
 //
 // QApplication 不要・QtCore のみ。asccdl:: 純粋エンジンが返す XML 文字列を
@@ -306,5 +307,6 @@ int runAscCdlExportSelftest()
     }
 
     qInfo().noquote().nospace() << "[asc-cdl-export] selftest end, passed=" << passed << " failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

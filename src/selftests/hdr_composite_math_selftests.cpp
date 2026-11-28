@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // hdr_composite_math_selftests.cpp
 // Headless selftest for the pure 16-bit-per-channel compositing engine
 // (src/playback/HdrCompositeMath.{h,cpp}, namespace hdrcomposite).
@@ -327,5 +328,6 @@ int runHdrCompositeMathSelftest()
 
     std::printf("[hdr-composite-math] Result: %d/%d PASSED\n",
                 passed, passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed; // 0 = all PASS
 }

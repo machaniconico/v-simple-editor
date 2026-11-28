@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../RenderQueue.h"
 
 #include <cstdio>
@@ -58,5 +59,6 @@ int runLoudnessExportWireSelftest()
     std::printf("[loudness-export-wire] summary: gates=4 passed=%d failed=%d\n",
                 passed,
                 failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

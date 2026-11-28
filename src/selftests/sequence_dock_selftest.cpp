@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../SequenceListDock.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
@@ -115,5 +116,6 @@ int runSequenceDockSelftest()
     gate(4, roundtrip && sequences.size() == 2
         && sequences[1].id == child.id && sequences[1].name == QStringLiteral("保存する名前"));
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

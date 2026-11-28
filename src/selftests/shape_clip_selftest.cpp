@@ -5,6 +5,7 @@
 #include "../VideoPlayer.h"
 #include "../GLPreview.h"
 #include "../UndoManager.h"
+#include "SelftestRegistry.h"
 #include "../BrushAnimation.h"
 #include "../ShapeModifierDialog.h"
 
@@ -1003,5 +1004,7 @@ int runShapeClipSelftest()
 
     std::fprintf(stderr, "[shape-clip] summary: %d PASS, %d FAIL\n",
                  passed, failed);
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

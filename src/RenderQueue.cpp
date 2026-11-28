@@ -1,5 +1,6 @@
 #include "LoudnessMaster.h"
 #include "RenderQueue.h"
+#include "selftests/SelftestGate.h"
 #include "SequenceExport.h"
 #include "SubtitleIO.h"
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include "TimelineFrameRenderer.h"
 #include "ProjectFile.h"
 #include "Timeline.h"
+#include "AudioKeyframes.h"
 #include "ExportRange.h"
 #include "TrackMatteKey.h"
 #include "CodecDetector.h"
@@ -494,6 +496,7 @@ int runRenderQueueAcesDecisionSelftest()
 
     std::printf("[renderqueue-aces] summary: gates=5 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 
@@ -525,6 +528,7 @@ int runRenderQueueFpsRationalSelftest()
 
     std::printf("[renderqueue-fps-rational] summary: gates=6 passed=%d failed=%d\n",
                 passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }
 
@@ -2565,6 +2569,11 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
         projectCamera.fromJson(data.projectCamera);
     tl->setProjectLights(projectLights);
     tl->setProjectLightViewPosition(projectCamera.camera().position);
+    tl->setProjectCamera(projectCamera);
+    // US-1709: the expression audioLevel() envelope, published once from the
+    // loaded audio tracks (the owned Timeline has no rebuild hook; the snapshot
+    // stays as published for the whole export).
+    tl->setExpressionAudioEnv(tl->buildExpressionAudioEnv(audiokf::sharedEnvelopeCache()));
 
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths

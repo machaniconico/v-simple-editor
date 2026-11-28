@@ -1266,7 +1266,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -7202,6 +7202,250 @@ int runMcpSelftest()
             && observeTerm(193, "get_timeline video[0].clips unchanged", mcpV1Clips == 1)
             && observeTerm(193, "get_timeline audio[0].clips unchanged", mcpA1Clips == 1),
             "import_media placed a clip on a locked track or reported a different error");
+    }
+
+    // G195-G199 (US-1711): camera auto-orient / 3D-layer switch / wiggle / expressions through MCP.
+    // HEAD has none of the three tools nor the two set_clip_property values, so every gate fails there.
+    {
+        Timeline* dynTimeline = projectInfoWindow.m_timeline;
+        int dynId = 19500;
+        const auto resetDynClips = [&]() {
+            ClipInfo dynV;
+            dynV.filePath = QStringLiteral("/selftests/mcp-dyn-v.mp4");
+            dynV.duration = dynV.outPoint = 4.0;
+            dynV.is3DLayer = true;
+            dynV.layer3D.positionZ = 50.0;
+            dynV.layer3D.rotationX = 10.0;
+            dynV.layer3D.rotationY = 20.0;
+            dynV.layer3D.rotationZ = 30.0;
+            ClipInfo dynA = dynV;
+            dynA.filePath = QStringLiteral("/selftests/mcp-dyn-a.wav");
+            dynA.is3DLayer = false;
+            dynA.layer3D = Layer3DTransform();
+            dynTimeline->restoreFromProject(
+                QVector<QVector<ClipInfo>>{{dynV}}, QVector<QVector<ClipInfo>>{{dynA}},
+                0.0, -1.0, -1.0, 100);
+            dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+            dynTimeline->undoManager()->clear();
+            dynTimeline->undoManager()->saveState(
+                dynTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+        };
+        const auto call = [&](const QString& name, const QJsonObject& args) {
+            return callProjectInfoTool(++dynId, name, args);
+        };
+        const auto vArgs = [](const QJsonObject& extra) {
+            QJsonObject args{{QStringLiteral("trackIndex"), 0}, {QStringLiteral("clipIndex"), 0}};
+            for (auto it = extra.constBegin(); it != extra.constEnd(); ++it)
+                args.insert(it.key(), it.value());
+            return args;
+        };
+        const auto isErr = [&](const QJsonObject& response) {
+            return toolResult(response).value(QStringLiteral("isError")).toBool(false);
+        };
+        const auto dynamics = [&]() {
+            return toolPayload(call(QStringLiteral("get_clip_dynamics"), vArgs({})));
+        };
+        const auto setProp = [&](const QString& property, bool value) {
+            return call(QStringLiteral("set_clip_property"),
+                        vArgs({{QStringLiteral("property"), property}, {QStringLiteral("value"), value}}));
+        };
+        const auto undoOnce = [&]() { return call(QStringLiteral("undo"), QJsonObject{}); };
+
+        // G195: autoOrientToCamera true -> get_clip_dynamics / get_timeline true, one undo -> false;
+        // is3DLayer true -> false zeroes positionZ / rotationX/Y/Z, one undo restores them.
+        {
+            resetDynClips();
+            const QJsonObject setCam = toolPayload(setProp(QStringLiteral("autoOrientToCamera"), true));
+            const bool camOn = dynamics().value(QStringLiteral("autoOrientToCamera")).toBool(false);
+            const QJsonObject timelinePayload = toolPayload(call(QStringLiteral("get_timeline"),
+                QJsonObject{{QStringLiteral("kind"), QStringLiteral("video")}}));
+            const bool timelineCamOn = timelinePayload.value(QStringLiteral("video")).toArray().at(0).toObject()
+                .value(QStringLiteral("clips")).toArray().at(0).toObject()
+                .value(QStringLiteral("autoOrientToCamera")).toBool(false);
+            undoOnce();
+            const bool camOff = !dynamics().value(QStringLiteral("autoOrientToCamera")).toBool(true);
+            const QJsonObject set3d = toolPayload(setProp(QStringLiteral("is3DLayer"), false));
+            const ClipInfo flat = dynTimeline->trackAt(false, 0)->clips().first();
+            const bool dyn3dOff = !dynamics().value(QStringLiteral("is3DLayer")).toBool(true);
+            undoOnce();
+            const ClipInfo restored = dynTimeline->trackAt(false, 0)->clips().first();
+            std::fprintf(stderr, "mcp G195 camOn=%d timelineCamOn=%d camOff=%d is3D(resp)=%d flat: is3D=%d z=%g rx=%g ry=%g rz=%g "
+                         "restored: is3D=%d z=%g rx=%g ry=%g rz=%g (expect 1,1,1,0, 0,0,0,0,0, 1,50,10,20,30)\n",
+                         camOn, timelineCamOn, camOff, set3d.value(QStringLiteral("is3DLayer")).toBool(true),
+                         flat.is3DLayer, flat.layer3D.positionZ, flat.layer3D.rotationX, flat.layer3D.rotationY,
+                         flat.layer3D.rotationZ, restored.is3DLayer, restored.layer3D.positionZ,
+                         restored.layer3D.rotationX, restored.layer3D.rotationY, restored.layer3D.rotationZ);
+            tallyObserved(195, observeTerm(195, "autoOrientToCamera set ok",
+                                           setCam.value(QStringLiteral("ok")).toBool(false))
+                && observeTerm(195, "dynamics autoOrientToCamera true", camOn)
+                && observeTerm(195, "get_timeline autoOrientToCamera true", timelineCamOn)
+                && observeTerm(195, "one undo -> false", camOff)
+                && observeTerm(195, "is3DLayer response false",
+                               set3d.contains(QStringLiteral("is3DLayer"))
+                                   && !set3d.value(QStringLiteral("is3DLayer")).toBool(true))
+                && observeTerm(195, "layer3D zeroed", !flat.is3DLayer && flat.layer3D.positionZ == 0.0
+                               && flat.layer3D.rotationX == 0.0 && flat.layer3D.rotationY == 0.0
+                               && flat.layer3D.rotationZ == 0.0)
+                && observeTerm(195, "dynamics is3DLayer false", dyn3dOff)
+                && observeTerm(195, "one undo restores layer3D", restored.is3DLayer
+                               && restored.layer3D.positionZ == 50.0 && restored.layer3D.rotationX == 10.0
+                               && restored.layer3D.rotationY == 20.0 && restored.layer3D.rotationZ == 30.0),
+                "autoOrientToCamera / is3DLayer through set_clip_property did not round-trip or undo");
+        }
+
+        // G196: set_clip_wiggle round trip, unknown key refused (state unchanged), octaves 7 -> 6, one undo.
+        {
+            resetDynClips();
+            const QJsonObject wiggleArg{
+                {QStringLiteral("enabled"), true}, {QStringLiteral("seed"), 7}, {QStringLiteral("octaves"), 7},
+                {QStringLiteral("positionFrequency"), 3.0},
+                {QStringLiteral("positionAmplitude"), QJsonObject{{QStringLiteral("x"), 4.0}, {QStringLiteral("y"), -2.0}}}};
+            const QJsonObject setResp = call(QStringLiteral("set_clip_wiggle"),
+                                             vArgs({{QStringLiteral("wiggle"), wiggleArg}}));
+            const QJsonObject stored = dynamics().value(QStringLiteral("wiggle")).toObject();
+            const wiggle::WiggleParams direct = dynTimeline->trackAt(false, 0)->clips().first().wiggle;
+            const QJsonObject badResp = call(QStringLiteral("set_clip_wiggle"),
+                vArgs({{QStringLiteral("wiggle"), QJsonObject{{QStringLiteral("enabled"), true},
+                                                              {QStringLiteral("bogusKey"), 1}}}}));
+            const QString badError = toolErrorText(badResp);
+            const wiggle::WiggleParams afterBad = dynTimeline->trackAt(false, 0)->clips().first().wiggle;
+            undoOnce();
+            const wiggle::WiggleParams afterUndo = dynTimeline->trackAt(false, 0)->clips().first().wiggle;
+            std::fprintf(stderr, "mcp G196 setErr=%d stored: enabled=%d seed=%d octaves=%d px=%g py=%g pf=%g "
+                         "bad isError=%d error=[%s] afterBad.octaves=%d afterUndo.enabled=%d "
+                         "(expect 0, 1,7,6,4,-2,3, 1, unknown wiggle key, 6, 0)\n",
+                         isErr(setResp), stored.value(QStringLiteral("enabled")).toBool(),
+                         stored.value(QStringLiteral("seed")).toInt(-1),
+                         stored.value(QStringLiteral("octaves")).toInt(-1),
+                         stored.value(QStringLiteral("positionAmplitude")).toObject().value(QStringLiteral("x")).toDouble(),
+                         stored.value(QStringLiteral("positionAmplitude")).toObject().value(QStringLiteral("y")).toDouble(),
+                         stored.value(QStringLiteral("positionFrequency")).toDouble(),
+                         isErr(badResp), qPrintable(badError), afterBad.octaves, afterUndo.enabled);
+            tallyObserved(196, observeTerm(196, "set ok", !isErr(setResp)
+                                           && toolPayload(setResp).value(QStringLiteral("ok")).toBool(false))
+                && observeTerm(196, "octaves clamped 7 -> 6",
+                               stored.value(QStringLiteral("octaves")).toInt(-1) == 6 && direct.octaves == 6)
+                && observeTerm(196, "round trip", stored.value(QStringLiteral("enabled")).toBool(false)
+                               && stored.value(QStringLiteral("seed")).toInt(-1) == 7
+                               && stored.value(QStringLiteral("positionFrequency")).toDouble() == 3.0
+                               && stored.value(QStringLiteral("positionAmplitude")).toObject()
+                                      .value(QStringLiteral("x")).toDouble() == 4.0
+                               && stored.value(QStringLiteral("positionAmplitude")).toObject()
+                                      .value(QStringLiteral("y")).toDouble() == -2.0)
+                && observeTerm(196, "unknown key refused", isErr(badResp)
+                               && badError.contains(QStringLiteral("unknown wiggle key: bogusKey")))
+                && observeTerm(196, "refused call left the wiggle", afterBad.enabled && afterBad.octaves == 6)
+                && observeTerm(196, "one undo disables", !afterUndo.enabled),
+                "set_clip_wiggle did not round-trip, clamp octaves, refuse unknown keys or undo in one step");
+        }
+
+        // G197: set_clip_expression set / clear / invalid propPath.
+        {
+            resetDynClips();
+            const QJsonObject setResp = call(QStringLiteral("set_clip_expression"),
+                vArgs({{QStringLiteral("propPath"), QStringLiteral("transform.position.x")},
+                       {QStringLiteral("code"), QStringLiteral("time * 10")}}));
+            const QJsonObject setExprs = dynamics().value(QStringLiteral("expressions")).toObject();
+            const QJsonObject badResp = call(QStringLiteral("set_clip_expression"),
+                vArgs({{QStringLiteral("propPath"), QStringLiteral("transform.bogus")},
+                       {QStringLiteral("code"), QStringLiteral("1")}}));
+            const QString badError = toolErrorText(badResp);
+            const QJsonObject afterBad = dynamics().value(QStringLiteral("expressions")).toObject();
+            const QJsonObject clearResp = call(QStringLiteral("set_clip_expression"),
+                vArgs({{QStringLiteral("propPath"), QStringLiteral("transform.position.x")},
+                       {QStringLiteral("code"), QStringLiteral("   ")}}));
+            const QJsonObject cleared = dynamics().value(QStringLiteral("expressions")).toObject();
+            std::fprintf(stderr, "mcp G197 set=[%s] bad isError=%d error=[%s] afterBad keys=%d "
+                         "clear cleared=%d after keys=%d (expect time * 10, 1, Unknown property path: transform.bogus, 1, 1, 0)\n",
+                         qPrintable(setExprs.value(QStringLiteral("transform.position.x")).toString()),
+                         isErr(badResp), qPrintable(badError), static_cast<int>(afterBad.size()),
+                         toolPayload(clearResp).value(QStringLiteral("cleared")).toBool(false), static_cast<int>(cleared.size()));
+            tallyObserved(197, observeTerm(197, "set ok", !isErr(setResp))
+                && observeTerm(197, "expression stored",
+                               setExprs.value(QStringLiteral("transform.position.x")).toString()
+                                   == QStringLiteral("time * 10"))
+                && observeTerm(197, "invalid propPath refused", isErr(badResp)
+                               && badError.contains(QStringLiteral("Unknown property path: transform.bogus")))
+                && observeTerm(197, "refused call left the binding", afterBad.size() == 1)
+                && observeTerm(197, "blank code clears", !isErr(clearResp)
+                               && toolPayload(clearResp).value(QStringLiteral("cleared")).toBool(false)
+                               && cleared.isEmpty()),
+                "set_clip_expression did not set, clear on blank code, or refuse an unknown propPath");
+        }
+
+        // G198: audio clips / audio track index are refused by all four entry points; clip untouched.
+        {
+            resetDynClips();
+            const QJsonObject audioSel{{QStringLiteral("kind"), QStringLiteral("audio")}};
+            const QJsonObject r1 = call(QStringLiteral("set_clip_property"),
+                vArgs({{QStringLiteral("kind"), QStringLiteral("audio")},
+                       {QStringLiteral("property"), QStringLiteral("is3DLayer")}, {QStringLiteral("value"), true}}));
+            const QJsonObject r2 = call(QStringLiteral("set_clip_wiggle"),
+                vArgs({{QStringLiteral("kind"), QStringLiteral("audio")},
+                       {QStringLiteral("wiggle"), QJsonObject{{QStringLiteral("enabled"), true}}}}));
+            const QJsonObject r3 = call(QStringLiteral("set_clip_expression"),
+                vArgs({{QStringLiteral("kind"), QStringLiteral("audio")},
+                       {QStringLiteral("propPath"), QStringLiteral("transform.scale")}, {QStringLiteral("code"), QStringLiteral("2")}}));
+            const QJsonObject r4 = call(QStringLiteral("get_clip_dynamics"),
+                vArgs({{QStringLiteral("kind"), QStringLiteral("audio")}}));
+            const QJsonObject r5 = call(QStringLiteral("set_clip_wiggle"),
+                vArgs({{QStringLiteral("trackIndex"), 5},
+                       {QStringLiteral("wiggle"), QJsonObject{{QStringLiteral("enabled"), true}}}}));
+            const ClipInfo audioClip = dynTimeline->trackAt(true, 0)->clips().first();
+            const ClipInfo videoClip = dynTimeline->trackAt(false, 0)->clips().first();
+            const QString e1 = toolErrorText(r1), e2 = toolErrorText(r2), e3 = toolErrorText(r3),
+                          e4 = toolErrorText(r4), e5 = toolErrorText(r5);
+            std::fprintf(stderr, "mcp G198 errors: [%s] | [%s] | [%s] | [%s] | out-of-range track [%s] "
+                         "audio is3D=%d wiggle=%d video wiggle=%d (expect 1 audio-clip wording x4, track index is out of range, 0,0,0)\n",
+                         qPrintable(e1), qPrintable(e2), qPrintable(e3), qPrintable(e4), qPrintable(e5),
+                         audioClip.is3DLayer, audioClip.wiggle.enabled, videoClip.wiggle.enabled);
+            const QString wording = QStringLiteral("音声クリップ");
+            tallyObserved(198, observeTerm(198, "set_clip_property refused", isErr(r1) && e1.contains(wording))
+                && observeTerm(198, "set_clip_wiggle refused", isErr(r2) && e2.contains(wording))
+                && observeTerm(198, "set_clip_expression refused", isErr(r3) && e3.contains(wording))
+                && observeTerm(198, "get_clip_dynamics refused", isErr(r4) && e4.contains(wording))
+                && observeTerm(198, "track index out of range", isErr(r5)
+                               && e5.contains(QStringLiteral("track index is out of range")))
+                && observeTerm(198, "nothing changed", !audioClip.is3DLayer && !audioClip.wiggle.enabled
+                               && !videoClip.wiggle.enabled),
+                "an audio clip or an out-of-range track index was accepted by a dynamics tool");
+        }
+
+        // G199: a locked video track refuses every dynamics write; reads still work; clip untouched.
+        {
+            resetDynClips();
+            const bool locked = toolPayload(call(QStringLiteral("set_track_locked"),
+                QJsonObject{{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                            {QStringLiteral("locked"), true}})).value(QStringLiteral("ok")).toBool(false)
+                && dynTimeline->trackAt(false, 0)->isLocked();
+            const QJsonObject r1 = setProp(QStringLiteral("autoOrientToCamera"), true);
+            const QJsonObject r2 = setProp(QStringLiteral("is3DLayer"), false);
+            const QJsonObject r3 = call(QStringLiteral("set_clip_wiggle"),
+                vArgs({{QStringLiteral("wiggle"), QJsonObject{{QStringLiteral("enabled"), true}}}}));
+            const QJsonObject r4 = call(QStringLiteral("set_clip_expression"),
+                vArgs({{QStringLiteral("propPath"), QStringLiteral("transform.scale")}, {QStringLiteral("code"), QStringLiteral("2")}}));
+            const QJsonObject readBack = dynamics();
+            const ClipInfo lockedClip = dynTimeline->trackAt(false, 0)->clips().first();
+            const QString e1 = toolErrorText(r1), e2 = toolErrorText(r2), e3 = toolErrorText(r3), e4 = toolErrorText(r4);
+            std::fprintf(stderr, "mcp G199 locked=%d errors: [%s] | [%s] | [%s] | [%s] clip: cam=%d is3D=%d z=%g wiggle=%d exprs=%d "
+                         "read is3DLayer=%d (expect 1, locked wording x4, 0,1,50,0,0, 1)\n",
+                         locked, qPrintable(e1), qPrintable(e2), qPrintable(e3), qPrintable(e4),
+                         lockedClip.autoOrientToCamera, lockedClip.is3DLayer, lockedClip.layer3D.positionZ,
+                         lockedClip.wiggle.enabled, static_cast<int>(lockedClip.expressions.boundPaths().size()),
+                         readBack.value(QStringLiteral("is3DLayer")).toBool(false));
+            const QString wording = QStringLiteral("ロック中");
+            tallyObserved(199, observeTerm(199, "V1 locked", locked)
+                && observeTerm(199, "autoOrientToCamera refused", isErr(r1) && e1.contains(wording))
+                && observeTerm(199, "is3DLayer refused", isErr(r2) && e2.contains(wording))
+                && observeTerm(199, "set_clip_wiggle refused", isErr(r3) && e3.contains(wording))
+                && observeTerm(199, "set_clip_expression refused", isErr(r4) && e4.contains(wording))
+                && observeTerm(199, "clip untouched", !lockedClip.autoOrientToCamera && lockedClip.is3DLayer
+                               && lockedClip.layer3D.positionZ == 50.0 && !lockedClip.wiggle.enabled
+                               && lockedClip.expressions.boundPaths().isEmpty())
+                && observeTerm(199, "get_clip_dynamics still reads", readBack.value(QStringLiteral("is3DLayer")).toBool(false)),
+                "a dynamics write changed a locked track or its error did not say the track is locked");
+            dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+        }
     }
 
     server.stop();

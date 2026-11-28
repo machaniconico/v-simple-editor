@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // src/selftests/effect_keyframe_parity_selftest.cpp
 // Render-time S2 effect-parameter keyframe parity gates.
 
@@ -634,5 +635,6 @@ int runEffectKeyframeParitySelftest()
         << QStringLiteral("EFFECT-KEYFRAME-PARITY: %1/%2 PASS")
                .arg(passed)
                .arg(passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

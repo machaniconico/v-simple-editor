@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // Subtitle karaoke headless selftest.
 //
 // QApplication 不要。subtitlekaraoke:: の純粋 word 選択ロジックを検証する。
@@ -86,5 +87,6 @@ int runSubtitleKaraokeSelftest()
 
     qInfo().noquote() << "[subtitle-karaoke] selftest done: passed=" << passed
                       << "failed=" << failed;
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

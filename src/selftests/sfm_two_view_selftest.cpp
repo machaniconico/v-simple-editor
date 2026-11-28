@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../TwoViewGeometry.h"
 
 #include <algorithm>
@@ -137,5 +138,6 @@ int runSfmTwoViewSelftest()
         && identical(timed,sfm::estimateRelativePose(hd,k,2,500,12345))
         && identical(robust,sfm::estimateRelativePose(contaminated,k,2)));
     std::cerr << "summary: " << passed << " PASS, " << failed << " FAIL\n";
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

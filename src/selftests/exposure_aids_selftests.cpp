@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 // =============================================================================
 //  exposure_aids_selftests.cpp
 // -----------------------------------------------------------------------------
@@ -337,5 +338,6 @@ int runExposureAidsSelftest()
     }
 
     std::printf("[exposure-aids] Result: %d/%d PASSED\n", passed, passed + failed);
+    selftests::reportTally(passed, failed, 0);
     return failed; // 0 = all PASS
 }

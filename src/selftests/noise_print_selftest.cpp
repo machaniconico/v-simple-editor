@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../NoisePrint.h"
 #include "../SpectralEngine.h"
 #include <algorithm>
@@ -83,5 +84,6 @@ int runNoisePrintSelftest() {
         && noiseprint::subtract(mixed, repeated, again, 12, -20, rate, &error)
         && maxError(repeated, cleaned) == 0);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
+    selftests::reportTally(pass, fail, 0);
     return fail;
 }

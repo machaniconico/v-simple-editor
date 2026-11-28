@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../EffectParamSchema.h"
 #include "../VideoEffect.h"
 
@@ -419,5 +420,6 @@ int runAeFxStylizeSelftest()
     }
 
     std::printf("ae-fx-stylize summary passed=%d failed=%d\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed == 0 ? 0 : 1;
 }

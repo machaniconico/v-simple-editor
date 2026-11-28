@@ -1,3 +1,4 @@
+#include "SelftestRegistry.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
 #include "../ProjectFile.h"
@@ -88,5 +89,6 @@ int runTrackManageSelftest()
         && timeline.currentState().audioTracks.size() == state.audioTracks.size();
     gate(3, g3);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }
