@@ -12,6 +12,8 @@
 #include <iostream>
 
 namespace {
+using TrackClips = QVector<QVector<ClipInfo>>;
+
 ClipInfo makeTestClip(const QString &name, double durSec, int linkGroup = 0)
 {
     ClipInfo c;
@@ -53,8 +55,8 @@ int runBladeMcpRippleSelftest()
     {
         Timeline tl;
         tl.restoreFromProject(
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
             0.0, -1.0, -1.0, 100);
         tl.setPlayheadPosition(3.0);
         const auto serial0 = tl.undoManager()->saveSerial();
@@ -76,9 +78,9 @@ int runBladeMcpRippleSelftest()
     {
         Timeline tl;
         tl.restoreFromProject(
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)},
-             {makeTestClip(QStringLiteral("LockedBroll"), 12.0, 0)}},
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)},
+                       {makeTestClip(QStringLiteral("LockedBroll"), 12.0, 0)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1), makeTestClip(QStringLiteral("B"), 5.0, 2)}},
             0.0, -1.0, -1.0, 100);
         tl.videoTracks()[1]->setLocked(true);
         tl.setPlayheadPosition(4.0);
@@ -99,8 +101,8 @@ int runBladeMcpRippleSelftest()
     {
         Timeline tl;
         tl.restoreFromProject(
-            {{makeTestClip(QStringLiteral("Base"), 10.0, 1)}},
-            {{}},
+            TrackClips{{makeTestClip(QStringLiteral("Base"), 10.0, 1)}},
+            TrackClips{{}},
             0.0, -1.0, -1.0, 100);
         const auto serial0 = tl.undoManager()->saveSerial();
         QString err;
@@ -124,7 +126,7 @@ int runBladeMcpRippleSelftest()
         Timeline tl;
         ClipInfo c = makeTestClip(QStringLiteral("Late"), 5.0);
         c.leadInSec = 4.0;
-        tl.restoreFromProject({{c}}, {{}}, 0.0, -1.0, -1.0, 100);
+        tl.restoreFromProject(TrackClips{{c}}, TrackClips{{}}, 0.0, -1.0, -1.0, 100);
         QString err;
         const bool gapOk = tl.rippleInsertClipAtTime(false, 0, makeTestClip(QStringLiteral("InGap"), 2.0), 1.0, &err);
         const auto afterGap = tl.videoTracks()[0]->clips();
@@ -158,8 +160,8 @@ int runBladeMcpRippleSelftest()
     // G5: MCP ripple_delete_range cuts [2.0, 5.0] across V1+A1 in 1 Undo step.
     {
         tl->restoreFromProject(
-            {{makeTestClip(QStringLiteral("V"), 10.0, 1)}},
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1)}},
+            TrackClips{{makeTestClip(QStringLiteral("V"), 10.0, 1)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1)}},
             0.0, -1.0, -1.0, 100);
         QString err;
         const QJsonObject res = callTool(QStringLiteral("ripple_delete_range"),
@@ -182,8 +184,8 @@ int runBladeMcpRippleSelftest()
     // G6: MCP blade_all_tracks tests none / before / after modes.
     {
         tl->restoreFromProject(
-            {{makeTestClip(QStringLiteral("V"), 10.0, 1)}},
-            {{makeTestClip(QStringLiteral("A"), 10.0, 1)}},
+            TrackClips{{makeTestClip(QStringLiteral("V"), 10.0, 1)}},
+            TrackClips{{makeTestClip(QStringLiteral("A"), 10.0, 1)}},
             0.0, -1.0, -1.0, 100);
         QString err1, err2, err3;
         const QJsonObject rNone = callTool(QStringLiteral("blade_all_tracks"),
@@ -208,8 +210,8 @@ int runBladeMcpRippleSelftest()
     // G7: MCP ripple_insert_clip inserts clip at timeSec=3.0 and splits straddling clip.
     {
         tl->restoreFromProject(
-            {{makeTestClip(QStringLiteral("Main"), 10.0, 1)}},
-            {{}},
+            TrackClips{{makeTestClip(QStringLiteral("Main"), 10.0, 1)}},
+            TrackClips{{}},
             0.0, -1.0, -1.0, 100);
         QString err;
         const QJsonObject res = callTool(QStringLiteral("ripple_insert_clip"), {
