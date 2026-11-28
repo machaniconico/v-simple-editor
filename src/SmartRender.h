@@ -28,6 +28,7 @@ struct PassThroughTimelineRequest {
     QVector<bool> audioTrackHidden;
     QHash<QString, TimelineTrackMatteEntry> trackMatteEntries;
     QHash<QString, QString> clipParentEntries;
+    bool hasRotoEntries = false;
     bool hasAdjustmentLayers = false;
     bool hasTimelineTextOverlays = false;
     bool hasMarkedRange = false;

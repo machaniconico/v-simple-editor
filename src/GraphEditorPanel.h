@@ -7,6 +7,7 @@
 #include <QVector>
 #include "Keyframe.h"
 
+struct ClipInfo;
 class GraphEditorCurveView;
 class QComboBox;
 class QLabel;
@@ -18,7 +19,12 @@ struct GraphEditorCurveTrack {
     QString displayName;
     KeyframeTrack track;
     QColor color;
+    // View-only, read-only destination; only explicit paste creates its track.
+    bool isPastePlaceholder = false;
 };
+
+QVector<GraphEditorCurveTrack> graphEditorEditableCurves(
+    const QVector<GraphEditorCurveTrack> &curves);
 
 class GraphEditorPanel : public QDockWidget
 {
@@ -28,6 +34,12 @@ public:
     explicit GraphEditorPanel(QWidget *parent = nullptr);
 
     void setTimeline(Timeline *timeline);
+    bool selectKeyframes(const QString &property, const QVector<int> &indices);
+    bool copySelectedKeyframes();
+    bool pasteKeyframes();
+    // Test hook: forwards to the paste-default table used by pasteKeyframes().
+    static bool pasteTrackDefaultForTest(const ClipInfo &clip, const QString &property,
+                                         double &value);
 
 public slots:
     void setSelectedClip(int trackIdx, int clipIdx);
@@ -35,6 +47,12 @@ public slots:
     void refreshFromTimeline();
 
 private:
+    friend class GraphEditorCurveView;
+    QVector<int> m_selectedKeyframeIndices;
+    QString m_keyframeSelectionProperty;
+    static QVector<KeyframePoint> s_keyframeClipboard;
+    static QString s_clipboardSourceProperty;
+
     void rebuildForSelection();
     void showEmptyState(const QString &message);
     void syncLoopOutControl();

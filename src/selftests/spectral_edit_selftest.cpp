@@ -85,7 +85,9 @@ int runSpectralEditSelftest()
             return static_cast<double>((seed >> 11) & 0xFFFFFFFFULL) / static_cast<double>(0xFFFFFFFFULL) - 0.5;
         };
         for (int i = 0; i < N; ++i) {
-            orig[static_cast<size_t>(i)] = std::complex<double>(next(), next());
+            const double real = next();
+            const double imaginary = next();
+            orig[static_cast<size_t>(i)] = std::complex<double>(real, imaginary);
         }
         std::vector<std::complex<double>> work = orig;
         spectral::fft(work, false);

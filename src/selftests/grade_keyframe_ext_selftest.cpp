@@ -1,8 +1,13 @@
 #include "../clipanim/ClipAnim.h"
 #include "../Timeline.h"
 #include "../ProjectFile.h"
-#include <QFile>
+#include "../TimelineFrameRenderer.h"
+#include "../libavcore/Encode.h"
+#include "SelftestGate.h"
+#include <QColor>
+#include <QImage>
 #include <QSet>
+#include <QTemporaryDir>
 #include <cmath>
 #include <cstdio>
 
@@ -21,20 +26,32 @@ void animate(ClipInfo &clip, const QString &name, double from, double to)
     clip.keyframes.addTrack(track);
 }
 bool near(double a, double b) { return std::abs(a - b) < 0.01; }
-bool sourceContains(const QString &path, const QByteArray &text)
+bool writeFrameClip(const QString &path)
 {
-    QFile file(path);
-    return file.open(QIODevice::ReadOnly) && file.readAll().contains(text);
+    libavcore::EncodeRequest request;
+    request.outputPath = path.toStdString();
+    request.width = request.height = 64;
+    request.fps = request.fpsNum = 10;
+    request.fpsDen = 1;
+    request.videoCodecName = "mpeg4";
+    request.videoBitrateBits = 300000;
+    request.hwVendorHint = "none";
+    request.useHardwareAccel = false;
+    libavcore::FrameEncoder encoder;
+    if (encoder.open(request)) return false;
+    QImage frame(64, 64, QImage::Format_RGB888);
+    // The decoded hue must fall inside the 60-degree qualifier at t=1s.
+    frame.fill(QColor::fromHsv(60, 190, 210));
+    for (int i = 0; i < 20; ++i)
+        if (!encoder.pushFrame(frame, i)) return false;
+    return !encoder.finalize().has_value();
 }
 }
 
 int runGradeKeyframeExtSelftest()
 {
-    int passed = 0, failed = 0;
-    const auto check = [&](int gate, bool ok) {
-        std::fprintf(stderr, "%s G%d\n", ok ? "PASS" : "FAIL", gate);
-        ok ? ++passed : ++failed;
-    };
+    selftest::GateTally tally;
+    const auto check = [&](int gate, bool ok) { tally.gate(gate, ok); };
     ClipInfo clip;
     clip.duration = clip.outPoint = 2.0;
     clip.colorCorrection.brightness = 7.0;
@@ -57,13 +74,52 @@ int runGradeKeyframeExtSelftest()
         && clipanim::extendedGradeCallCountForTest() == 0);
 
     animate(clip, QStringLiteral("grade.hsl.hueCenter"), 0.0, 120.0);
-    check(2, near(clipanim::effectiveHslSecondaryAt(clip, 1.0).hueCenter, 60.0)
-        && near(clipanim::effectiveHslSecondaryAt(clip, 0.0).hueCenter, 0.0)
-        && near(clipanim::effectiveHslSecondaryAt(clip, 2.0).hueCenter, 120.0)
-        && sourceContains(QStringLiteral("src/MainWindow.cpp"),
-                          "clipanim::effectiveHslSecondaryAt(*active, localSec)")
-        && sourceContains(QStringLiteral("src/TimelineFrameRenderer.cpp"),
-                          "clipanim::effectiveHslSecondaryAt(clip, clipLocalSeconds)"));
+    // Compare the actual timeline renderer at the same timestamp with the
+    // animated value and static references. The former source-text check did
+    // not verify that the evaluated grade reached rendered pixels.
+    QTemporaryDir renderTemp;
+    const QString source = renderTemp.filePath("grade-source.mp4");
+    const bool sourceReady = renderTemp.isValid() && writeFrameClip(source);
+    ClipInfo renderClip;
+    renderClip.filePath = source;
+    renderClip.duration = renderClip.outPoint = 2.0;
+    renderClip.hslSecondary.enabled = true;
+    renderClip.hslSecondary.hueCenter = 0.0;
+    renderClip.hslSecondary.hueRange = 20.0;
+    renderClip.hslSecondary.softness = 0.0;
+    renderClip.hslSecondary.satMin = 0.0;
+    renderClip.hslSecondary.satMax = 1.0;
+    renderClip.hslSecondary.lumaMin = 0.0;
+    renderClip.hslSecondary.lumaMax = 1.0;
+    renderClip.hslSecondary.liftG = 0.3;
+    animate(renderClip, QStringLiteral("grade.hsl.hueCenter"), 0.0, 120.0);
+    Timeline renderTimeline;
+    renderTimeline.setProjectOutputConfig(64, 64, true);
+    const auto renderAtOneSecond = [&](const ClipInfo &candidate) {
+        renderTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{candidate}},
+            QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        renderTimeline.refreshPlaybackSequence();
+        return tlrender::renderFrameAt(&renderTimeline, 1000000, QSize(64, 64), 100000.0);
+    };
+    const QImage animatedFrame = sourceReady ? renderAtOneSecond(renderClip) : QImage();
+    renderClip.keyframes = KeyframeManager{};
+    renderClip.hslSecondary.hueCenter = 60.0;
+    const QImage static60 = sourceReady ? renderAtOneSecond(renderClip) : QImage();
+    renderClip.hslSecondary.hueCenter = 0.0;
+    const QImage static0 = sourceReady ? renderAtOneSecond(renderClip) : QImage();
+    renderClip.hslSecondary.enabled = false;
+    const QImage unaffected = sourceReady ? renderAtOneSecond(renderClip) : QImage();
+    const bool renderMatch = !animatedFrame.isNull() && animatedFrame == static60
+        && static60 != unaffected && static0 == unaffected;
+    const double h0 = clipanim::effectiveHslSecondaryAt(clip, 0.0).hueCenter;
+    const double h1 = clipanim::effectiveHslSecondaryAt(clip, 1.0).hueCenter;
+    const double h2 = clipanim::effectiveHslSecondaryAt(clip, 2.0).hueCenter;
+    std::fprintf(stderr, "grade-keyframe-ext G2 sourceReady=%d framePresent=%d "
+        "matchStatic60=%d static60DiffersUnaffected=%d static0EqualsUnaffected=%d "
+        "h0=%g h1=%g h2=%g\n",
+        sourceReady, !animatedFrame.isNull(), animatedFrame == static60,
+        static60 != unaffected, static0 == unaffected, h0, h1, h2);
+    check(2, near(h0, 0.0) && near(h1, 60.0) && near(h2, 120.0) && renderMatch);
 
     clip.colorCorrection.hueSatWarp = HueSatWarp{};
     animate(clip, QStringLiteral("grade.hueSatWarp.shift.0.0"), 0.0, 30.0);
@@ -128,6 +184,5 @@ int runGradeKeyframeExtSelftest()
             && near(clipanim::effectiveColorCorrectionAt(copy, 1.0).hueSatWarp.hueShiftDeg[0][0], 1.0);
     }
     check(5, roundtrip);
-    std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
-    return failed;
+    return tally.finish("grade-keyframe-ext");
 }

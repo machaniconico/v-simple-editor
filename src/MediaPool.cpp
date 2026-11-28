@@ -111,6 +111,9 @@ int MediaPool::addAsset(const MediaAsset& asset)
 
     MediaAsset copy = asset;
     copy.id = m_nextAssetId++;
+    copy.stars = qBound(0, copy.stars, 5);
+    if (copy.flag != AssetFlag::Favorite && copy.flag != AssetFlag::Rejected)
+        copy.flag = AssetFlag::None;
     m_assets.append(copy);
     return copy.id;
 }
@@ -120,6 +123,54 @@ bool MediaPool::removeAsset(int id)
     for (int i = 0; i < m_assets.size(); ++i) {
         if (m_assets.at(i).id == id) {
             m_assets.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::setAssetTags(int id, const QStringList& tags)
+{
+    for (MediaAsset& asset : m_assets) {
+        if (asset.id == id) {
+            asset.tags = tags;
+            asset.tags.removeAll(QString());
+            asset.tags.removeDuplicates();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::setAssetFlag(int id, AssetFlag flag)
+{
+    if (flag != AssetFlag::None && flag != AssetFlag::Favorite && flag != AssetFlag::Rejected)
+        return false;
+    for (MediaAsset& asset : m_assets) {
+        if (asset.id == id) {
+            asset.flag = flag;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::setAssetStars(int id, int stars)
+{
+    for (MediaAsset& asset : m_assets) {
+        if (asset.id == id) {
+            asset.stars = qBound(0, stars, 5);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::renameAsset(int id, const QString& name)
+{
+    for (MediaAsset& asset : m_assets) {
+        if (asset.id == id) {
+            asset.displayName = name;
             return true;
         }
     }
@@ -255,6 +306,22 @@ QVector<MediaAsset> MediaPool::search(const QString& query) const
     return result;
 }
 
+QVector<MediaAsset> MediaPool::filtered(const QString& query, AssetFilterMode mode,
+                                       const QSet<QString>& usedPaths) const
+{
+    QVector<MediaAsset> result;
+    for (const MediaAsset& asset : search(query)) {
+        if (mode == AssetFilterMode::Favorites && asset.flag != AssetFlag::Favorite)
+            continue;
+        if (mode == AssetFilterMode::ExcludeRejected && asset.flag == AssetFlag::Rejected)
+            continue;
+        if (mode == AssetFilterMode::Unused && usedPaths.contains(asset.filePath))
+            continue;
+        result.append(asset);
+    }
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // smart bin
 // ---------------------------------------------------------------------------
@@ -264,6 +331,30 @@ QString MediaPool::addSmartBin(const SmartBin& smartBin)
     copy.id = QStringLiteral("smart-%1").arg(m_nextSmartBinId++);
     m_smartBins.append(copy);
     return copy.id;
+}
+
+bool MediaPool::removeSmartBin(const QString& id)
+{
+    for (int i = 0; i < m_smartBins.size(); ++i) {
+        if (m_smartBins[i].id == id) {
+            m_smartBins.removeAt(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool MediaPool::updateSmartBin(const QString& id, const SmartBin& smartBin)
+{
+    for (SmartBin& bin : m_smartBins) {
+        if (bin.id == id) {
+            const QString existingId = bin.id;
+            bin = smartBin;
+            bin.id = existingId;
+            return true;
+        }
+    }
+    return false;
 }
 
 const QVector<SmartBin>& MediaPool::smartBins() const
@@ -336,6 +427,10 @@ QJsonObject assetToJson(const MediaAsset& a)
     o.insert(QStringLiteral("binId"), a.binId);
     o.insert(QStringLiteral("colorLabel"), a.colorLabel);
     o.insert(QStringLiteral("comment"), a.comment);
+    if (a.flag != AssetFlag::None)
+        o.insert(QStringLiteral("flag"), static_cast<int>(a.flag));
+    if (a.stars != 0)
+        o.insert(QStringLiteral("stars"), a.stars);
     return o;
 }
 
@@ -359,6 +454,10 @@ MediaAsset assetFromJson(const QJsonObject& o)
     a.binId = o.value(QStringLiteral("binId")).toString();
     a.colorLabel = o.value(QStringLiteral("colorLabel")).toString();
     a.comment = o.value(QStringLiteral("comment")).toString();
+    const int flag = o.value(QStringLiteral("flag")).toInt();
+    if (flag == static_cast<int>(AssetFlag::Favorite) || flag == static_cast<int>(AssetFlag::Rejected))
+        a.flag = static_cast<AssetFlag>(flag);
+    a.stars = qBound(0, o.value(QStringLiteral("stars")).toInt(), 5);
     return a;
 }
 

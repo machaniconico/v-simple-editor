@@ -2,6 +2,7 @@
 
 #include "Expression.h"
 
+#include <utility>
 #include <QHash>
 #include <QJsonObject>
 #include <QString>
@@ -66,6 +67,11 @@ public:
                    const ExpressionContext &ctx,
                    double keyframeValue) const;
 
+    // Runtime-only source sampler, supplied by MainWindow; never serialized.
+    void setAudioLevelSampler(std::function<double(double)> sampler) {
+        m_audioLevelAtTime = std::move(sampler);
+    }
+
     // Serialisation: JSON object mapping propPath -> code for every bound path.
     QJsonObject toJson() const;
 
@@ -78,6 +84,7 @@ public:
     bool isEmpty() const;
 
 private:
+    std::function<double(double)> m_audioLevelAtTime;
     QHash<QString, QString> m_bindings; // propPath -> expression code
 };
 

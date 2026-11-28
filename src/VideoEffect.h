@@ -5,6 +5,8 @@
 #include <QVector>
 #include <QString>
 #include <QPointF>
+#include <functional>
+#include "MaskSystem.h"
 
 // --- Color Correction / Grading ---
 
@@ -46,6 +48,7 @@ struct ColorCorrection {
     double exposure = 0.0;      // -3.0 to 3.0
 
     // Lift/Gamma/Gain color wheels (DaVinci Resolve style)
+    double offsetR = 0.0, offsetG = 0.0, offsetB = 0.0; // -2.0 to 2.0; Stage 1 additive
     double liftR = 0.0, liftG = 0.0, liftB = 0.0;       // -1.0 to 1.0
     double gammaR = 0.0, gammaG = 0.0, gammaB = 0.0;     // -1.0 to 1.0
     double gainR = 0.0, gainG = 0.0, gainB = 0.0;        // -1.0 to 1.0
@@ -62,6 +65,7 @@ struct ColorCorrection {
             && hue == 0.0 && temperature == 0.0 && tint == 0.0
             && gamma == 1.0 && highlights == 0.0 && shadows == 0.0
             && exposure == 0.0
+            && offsetR == 0.0 && offsetG == 0.0 && offsetB == 0.0
             && liftR == 0.0 && liftG == 0.0 && liftB == 0.0
             && gammaR == 0.0 && gammaG == 0.0 && gammaB == 0.0
             && gainR == 0.0 && gainG == 0.0 && gainB == 0.0
@@ -172,7 +176,18 @@ enum class VideoEffectType {
     FilmGrain,
     Echo,
     LensDistortion,
-    RollingShutterRepair
+    RollingShutterRepair,
+    Flip,
+    LumaKey,
+    ColorKey,
+    LogToRec709,
+    WarpWave,
+    WarpRipple,
+    WarpSpherize,
+    WarpFisheye,
+    WarpPinch,
+    BroadcastSafe,
+    LeaveColor
 };
 
 struct VideoEffect {
@@ -220,11 +235,17 @@ struct VideoEffect {
     //   BrightnessContrast: p1=brightness(-100..100), p2=contrast(-100..100)
     //   Bulge: p1=amount(-100..100), p2=radius(0..1)
     //   Twirl: p1=angleDegrees, p2=radius(0..1)
+    //   Flip: p1=mode(0=horizontal,1=vertical,2=both), p2/p3 unused.
     //   Mirror: p1=mode(0=left->right,1=right->left,2=top->bottom,3=bottom->top). No neutral mode; mode<0 is no-op.
     //   PolarCoordinates: p1=type(0=rect->polar,1=polar->rect), p2=amount(0..1)
     //   MotionTile: p1=tilesX(1..10), p2=tilesY(1..10), p3=mirrorEdges(0/1). 1x1 is no-op.
     //   CornerPinSimple: p1=horizontalTilt(-100..100), p2=verticalTilt(-100..100)
     //   FilmGrain: p1=amount(0..1), p2=size(1..4), p3=colorAmount(0..1), keyColor.red=seedPerFrame(0/1)
+    //   WarpWave: p1=amplitude px(0..100), p2=cycles over height(0.1..20), p3=phase cycles(0..1)
+    //   WarpRipple: p1=amplitude px(0..100), p2=cycles over short side(0.1..20), p3=radius/short side(0..1)
+    //   WarpSpherize: p1=amount(-1..1), p2=radius/short side(0..1)
+    //   WarpFisheye: p1=amount(0..1), fixed radius=short side/2
+    //   WarpPinch: p1=amount(0..1), p2=radius/short side(0..1)
     //   LensDistortion: p1=k1, p2=k2, p3=scale (factory default 1).
     //     keyColor RGB packs two 12-bit centers: round(center*4000)+2000,
     //     X in high 12 bits, Y in low 12 bits (0.00025 precision, HexRgb-safe).
@@ -237,13 +258,26 @@ struct VideoEffect {
     QColor keyColor = QColor(0, 255, 0); // ChromaKey / Tint / GradientRamp / Fill / PhotoFilter / Tritone
     double startSec = -1.0; // clip-local seconds; -1 == no start limit
     double endSec = -1.0;   // clip-local seconds; -1 == no end limit
+    // Normalized coordinates; feather and expansion are fractions of the short side.
+    MaskSystem mask;
+    bool hasActiveEffectMask() const { return enabled && type != VideoEffectType::None && !mask.isDefault(); }
 
     static QString typeName(VideoEffectType t);
     static QVector<VideoEffectType> allTypes();
 
+    // BroadcastSafe: p1=standard (0=legal, 1=full RGB), p2=max chroma.
+    // LeaveColor: p1=hue tolerance (0..180 degrees), p2=desaturation.
+    static VideoEffect createBroadcastSafe(int standard = 0, double maxChroma = 1.0);
+    static VideoEffect createLeaveColor(QColor color = QColor(255, 0, 0),
+                                       double tolerance = 0.15, double desaturation = 1.0);
     static VideoEffect createBlur(double radius = 5.0);
     static VideoEffect createSharpen(double amount = 1.5);
     static VideoEffect createMosaic(double blockSize = 10.0);
+    // LumaKey: p1=lower, p2=upper, p3=softness; ColorKey: p1=tolerance, p2=softness.
+    static VideoEffect createLumaKey(double lower = 0.0, double upper = 0.3,
+                                     double softness = 0.05);
+    static VideoEffect createColorKey(QColor color = QColor(0, 255, 0),
+                                      double tolerance = 0.1, double softness = 0.05);
     static VideoEffect createChromaKey(QColor color = QColor(0, 255, 0),
                                        double tolerance = 40.0, double softness = 10.0);
     static VideoEffect createVignette(double intensity = 0.5, double radius = 0.8);
@@ -298,6 +332,8 @@ struct VideoEffect {
     static VideoEffect createRollingShutterRepair(double rate = 0.5,
                                                   int direction = 0,
                                                   double strength = 1.0);
+    // p1=input Log (0..3), p2=exposure stops, p3=output (0..2).
+    static VideoEffect createLogToRec709(int input = 0, double exposure = 0.0, int output = 0);
     static VideoEffect createEcho(double delaySec = 0.1, int count = 3,
                                   double decay = 0.5, int blend = 2);
 };
@@ -315,12 +351,37 @@ public:
     static void setLensDistortionEnabledForTesting(bool enabled);
     static void resetLensDistortionInvocationCount();
     static int lensDistortionInvocationCount();
+    // Calling-thread switch; also resets the Flip observation counter.
+    static void setFlipEnabledForTesting(bool enabled);
+    static int flipInvocationCountForTesting();
+    // Calling-thread switch; resets the counter for both new color effects.
+    static void setSafeLeaveColorEnabledForTesting(bool enabled);
+    static int safeLeaveColorInvocationCountForTesting();
+    // Calling-thread switch; resets the observation counter for both keyers.
+    static void setKeyersEnabledForTesting(bool enabled);
+    static int keyersInvocationCountForTesting();
+    static void setLogToRec709EnabledForTesting(bool enabled);
+    static int logToRec709InvocationCountForTesting();
+    // Scene-linear gamut conversion, shared by the CPU kernel and numerical gates.
+    static void logToRec709Gamut(int input, float &r, float &g, float &b);
+    // Calling-thread switch; resets the shared Warp kernel invocation counter.
+    static void setWarpEnabledForTesting(bool enabled);
+    static int warpInvocationCountForTesting();
+    static void setEffectMaskDisabledForTesting(bool disabled);
+    static int effectMaskInvocationCountForTesting();
+    static QImage blendEffectMask(const QImage &before, const QImage &after, const VideoEffect &effect);
     static QImage applyEffect(const QImage &input, const VideoEffect &effect);
     static QImage applyEffectStack(const QImage &input, const ColorCorrection &cc,
                                    const QVector<VideoEffect> &effects);
     static void adjustTemperatureTint(QImage &img, double temperature, double tint);
 
 private:
+    static QImage applyWarpWave(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpRipple(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpSpherize(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpFisheye(const QImage &input, const VideoEffect &effect);
+    static QImage applyWarpPinch(const QImage &input, const VideoEffect &effect);
+    static QImage applyLogToRec709(const QImage &input, const VideoEffect &effect);
     static void adjustBrightnessContrast(QImage &img, double brightness, double contrast);
     static void adjustSaturation(QImage &img, double saturation);
     static void adjustHue(QImage &img, double hue);
@@ -331,6 +392,8 @@ private:
     static QImage applyBlur(const QImage &img, double radius);
     static QImage applySharpen(const QImage &img, double amount);
     static QImage applyMosaic(const QImage &img, double blockSize);
+    static QImage applyLumaKey(const QImage &img, double lower, double upper, double softness);
+    static QImage applyColorKey(const QImage &img, QColor color, double tolerance, double softness);
     static QImage applyChromaKey(const QImage &img, QColor keyColor,
                                   double tolerance, double softness);
     static QImage applyVignette(const QImage &img, double intensity, double radius);
@@ -371,6 +434,7 @@ private:
     static QImage applyBrightnessContrastEffect(const QImage &img, double brightness, double contrast);
     static QImage applyBulge(const QImage &img, double amount, double radius);
     static QImage applyTwirl(const QImage &img, double angleDegrees, double radius);
+    static QImage applyFlip(const QImage &img, int mode);
     static QImage applyMirror(const QImage &img, int mode);
     static QImage applyPolarCoordinates(const QImage &img, int type, double amount);
     static QImage applyMotionTile(const QImage &img, int tilesX, int tilesY, bool mirrorEdges);
@@ -379,3 +443,15 @@ private:
     static QImage applyFilmGrain(const QImage &img, double amount, int size,
                                  double colorAmount, bool seedPerFrame);
 };
+
+// Shared dialog acceptance path; callback is VideoPlayer::setPreviewEffects in the UI.
+class Timeline;
+struct ClipInfo;
+struct RotoPath;
+namespace effectmaskui {
+bool updateMask(VideoEffect &effect, const RotoPath &path, const QSize &frameSize,
+                double featherPercent, bool hasBrushResult);
+void commitEffects(Timeline &timeline, int trackIndex, int clipIndex,
+                   const ClipInfo &clip, int selectedTrack, int selectedClip,
+                   const std::function<void(const QVector<VideoEffect> &, bool)> &setPreviewEffects);
+}

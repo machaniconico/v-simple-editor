@@ -136,6 +136,7 @@ public:
     QJsonObject toJson() const;
     void fromJson(const QJsonObject& obj);
     void clear();
+    void remapTrackIndices(const QVector<int> &oldToNew);
 
 private:
     // busId の配列インデックスを返す。無ければ -1。

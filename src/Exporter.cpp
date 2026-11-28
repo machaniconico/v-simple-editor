@@ -365,6 +365,10 @@ void Exporter::doExport(
     req.height = config.height;
     req.fps = config.fps;
     req.videoBitrateBits = static_cast<int64_t>(config.videoBitrate) * 1000;
+    req.rateControl = config.rateControl == ExportConfig::RateControl::Crf
+        ? libavcore::EncodeRequest::RateControl::Crf
+        : libavcore::EncodeRequest::RateControl::Bitrate;
+    req.crf = config.crf;
     req.outputPath = config.outputPath.toUtf8().toStdString();
     req.videoCodecName = resolvedCodec.toUtf8().toStdString();
     req.hwVendorHint = config.hwEncoder.toLower().toUtf8().toStdString();

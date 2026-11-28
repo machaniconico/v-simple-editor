@@ -533,6 +533,10 @@ KeyframeDialog::KeyframeDialog(const KeyframeTrack &track, double clipDuration, 
     m_valueSpin = new QDoubleSpinBox();
     m_valueSpin->setRange(-10000, 10000);
     m_valueSpin->setDecimals(2);
+    m_valueSpin->setObjectName(QStringLiteral("keyframeValueSpin"));
+    // New keys start from the track's value at 0 s (the time spin's initial
+    // time); an empty track uses its default value.
+    m_valueSpin->setValue(track.count() > 0 ? track.valueAt(0.0) : track.defaultValue());
     addLayout->addWidget(m_valueSpin);
 
     m_interpCombo = new QComboBox();

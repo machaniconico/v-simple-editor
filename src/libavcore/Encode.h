@@ -13,10 +13,15 @@
 // wrapper is provided behind VEDITOR_LIBAVCORE_WITH_QIMAGE.
 // ===========================================================================
 
+#include <QList>
+#include <QPair>
+#include <QString>
+
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -33,6 +38,9 @@ class QImage;
 
 namespace libavcore {
 
+// Single source of truth for alpha export; NONE means unsupported.
+AVPixelFormat alphaExportPixelFormat(const std::string &codec, int proresProfile);
+
 // Generate an x265 'master-display' parameter string for HDR10 exports.
 // Chromaticity coordinates (G/B/R/WP) are fixed to P3-D65-in-BT2020 primaries
 // (x265 units: 1/50000 of CIE xy). Luminance terms L(max,min) are derived from
@@ -42,16 +50,26 @@ namespace libavcore {
 //   "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,50)"
 std::string hdr10MasterDisplayString(double masterMaxNits, double masterMinNits);
 
+struct SubtitleCue {
+    int64_t startUs = 0;
+    int64_t endUs = 0;
+    std::string text; // UTF-8, at most 65535 bytes per sample
+};
+
 // Request descriptor mirroring the relevant fields of Exporter's ExportConfig.
-// All fields here are pure data (no Qt types) so the header can be included
-// from non-Qt callers.
+// The descriptor uses standard C++ types; codecOptionsFor exposes Qt pairs.
 struct EncodeRequest {
+    enum class RateControl { Bitrate, Crf };
+    RateControl rateControl = RateControl::Bitrate;
+    std::vector<SubtitleCue> subtitles; // Empty: no subtitle stream or mux changes.
+    int crf = -1;
     int width = 0;
     int height = 0;
     int fps = 30;                       // Legacy integral fps fallback.
     int fpsNum = 0;                     // Optional rational fps numerator.
     int fpsDen = 0;                     // Optional rational fps denominator.
     int64_t videoBitrateBits = 0;       // Video bitrate in bits per second (caller multiplies kbps×1000)
+    std::string title, author, copyright, comment; // UTF-8; empty tags are omitted.
     std::string outputPath;             // UTF-8
     std::string audioSourcePath;        // Optional UTF-8 source for stream-copy audio muxing
     int64_t audioStartUs = 0;            // Optional stream-copy audio trim start; 0 preserves legacy behavior
@@ -77,6 +95,7 @@ struct EncodeRequest {
 
     // ProRes profile index (-1 = not ProRes, 0..5 = prores_ks profile id).
     int proresProfile = -1;
+    bool keepAlpha = false;
 
     // HDR10 mastering metadata (used by x265 only when isHdr10 is true).
     double hdrMasterMaxNits = 1000.0;
@@ -92,9 +111,13 @@ struct EncodeRequest {
     // Used by Exporter to restore CodecDetector::isEncoderAvailable()
     // functional-probe semantics that were dropped during the libavcore
     // refactor. Kept as std::function (not Qt callable) so the header stays
-    // Qt-free.
+    // independent of Qt callbacks.
     std::function<bool(const std::string&)> encoderAvailableHook;
 };
+
+// Resolved encoder options; bit_rate denotes AVCodecContext::bit_rate.
+QList<QPair<QString, QString>> codecOptionsFor(
+    const EncodeRequest& req, const QString& resolvedEncoderName);
 
 // RAII encoder session. Construct, then call open(), then pushFrameRgb24()
 // repeatedly with monotonically-increasing pts, then finalize() once.
@@ -117,6 +140,19 @@ public:
     // EncodeRequest. stride is bytes per row in src. pts increments once per
     // output frame and is interpreted in encoderTimeBase().
     bool pushFrameRgb24(const uint8_t* src, int stride, int64_t pts);
+    // Packed straight RGBA; valid only for an open keepAlpha session.
+    bool pushFrameRgba32(const uchar* rgba, int stride, int64_t pts);
+    static void setSubtitleMuxEnabledForTest(bool enabled);
+    static void resetSubtitleStreamCountForTest();
+    static int subtitleStreamCountForTest();
+    // Test seam for checking that default exports never enter metadata code.
+    static void setMetadataEnabledForTest(bool enabled);
+    static void resetMetadataWriteCountForTest();
+    static int metadataWriteCountForTest();
+    // Test seam: disabling RGBA input must leave opaque exports unaffected.
+    static void setAlphaInputEnabledForTest(bool enabled);
+    static void resetAlphaFrameCountForTest();
+    static int alphaFrameCountForTest();
 
 #ifdef VEDITOR_LIBAVCORE_WITH_QIMAGE
     // Convenience wrapper: pushes a QImage. The image is converted to
@@ -160,6 +196,8 @@ private:
     bool configureEncoderContext(const EncodeRequest& request,
                                   const AVCodec* encoder,
                                   AVDictionary** outOpts);
+    bool configureSubtitles(const EncodeRequest& request);
+    bool muxSubtitles();
     bool configureAudioPassthrough(const std::string& audioSourcePath);
     void muxAudioPassthroughPackets();
     bool configureAudioEncoder(const EncodeRequest& request);
@@ -176,10 +214,14 @@ private:
     AVFormatContext* m_audioInFmt = nullptr;
     AVCodecContext* m_encCtx = nullptr;
     AVCodecContext* m_audioEncCtx = nullptr;
+    AVStream* m_subtitleStream = nullptr;
+    std::vector<SubtitleCue> m_subtitles;
     AVStream* m_outStream = nullptr;
     AVStream* m_audioInStream = nullptr;
     AVStream* m_audioOutStream = nullptr;
     AVAudioFifo* m_audioFifo = nullptr;
+    SwsContext* m_rgbaToYuvCtx = nullptr;
+    bool m_keepAlpha = false;
     SwsContext* m_rgbToYuvCtx = nullptr;   // used by pushFrameRgb24
     AVFrame* m_scratchFrame = nullptr;     // pre-allocated YUV frame for RGB path
     AVFrame* m_audioScratchFrame = nullptr;

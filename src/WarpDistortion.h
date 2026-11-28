@@ -3,6 +3,7 @@
 #include "PlanarTracker.h"
 
 #include <QImage>
+#include <atomic>
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPointF>
@@ -129,3 +130,30 @@ private:
     // Bilinear pixel sampling from a 32-bit ARGB image
     static QRgb bilinearSample(const QImage &image, double x, double y);
 };
+
+// Clip storage uses UV positions and a radius relative to the shorter frame side.
+// The engine above intentionally continues to accept absolute source pixels.
+namespace puppetpin {
+inline std::atomic<bool> disabledForTesting{false};
+inline std::atomic<quint64> invocationCountForTesting{0};
+inline bool equal(const QVector<WarpPin> &a, const QVector<WarpPin> &b)
+{
+    if (a.size() != b.size()) return false;
+    for (int i = 0; i < a.size(); ++i)
+        if (a[i].originalPos != b[i].originalPos || a[i].deformedPos != b[i].deformedPos
+            || a[i].radius != b[i].radius || a[i].stiffness != b[i].stiffness) return false;
+    return true;
+}
+inline QImage applyNormalized(const QImage &source, const QVector<WarpPin> &normalized)
+{
+    if (source.isNull() || normalized.isEmpty() || disabledForTesting) return source;
+    QVector<WarpPin> pixels = normalized;
+    for (auto &pin : pixels) {
+        pin.originalPos = QPointF(pin.originalPos.x() * source.width(), pin.originalPos.y() * source.height());
+        pin.deformedPos = QPointF(pin.deformedPos.x() * source.width(), pin.deformedPos.y() * source.height());
+        pin.radius *= qMin(source.width(), source.height());
+    }
+    ++invocationCountForTesting;
+    return WarpDistortion::applyPuppetPin(source, pixels).convertToFormat(source.format());
+}
+}

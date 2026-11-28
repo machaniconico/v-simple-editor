@@ -1,5 +1,7 @@
 #include "ReverbPanel.h"
 
+#include <QScopedValueRollback>
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDial>
@@ -63,7 +65,7 @@ void ReverbPanel::setMixer(AudioMixer *mixer) {
 
 void ReverbPanel::setTrackList(const QList<int> &trackIds) {
     const int prevId = currentTrackId();
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->clear();
     m_trackCombo->addItem(tr("Master"), 0);
     for (int id : trackIds) {
@@ -73,17 +75,15 @@ void ReverbPanel::setTrackList(const QList<int> &trackIds) {
     int idx = m_trackCombo->findData(prevId);
     if (idx < 0) idx = 0;
     m_trackCombo->setCurrentIndex(idx);
-    m_suppressEmit = false;
 }
 
 void ReverbPanel::loadSettings(int trackId,
                                const AudioMixer::ReverbSettings &r) {
     int idx = m_trackCombo->findData(trackId);
     if (idx < 0) idx = 0;
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->setCurrentIndex(idx);
     applySettingsToControls(r);
-    m_suppressEmit = false;
 }
 
 int ReverbPanel::currentTrackId() const {
@@ -135,24 +135,34 @@ void ReverbPanel::buildUi() {
     addColumn(4, tr("Width"),     m_width,    m_widthLabel,
               kWidthMin, kWidthMax, 50);
     root->addLayout(grid);
+    m_trackCombo->setObjectName(QStringLiteral("reverb_track"));
+    m_enable->setObjectName(QStringLiteral("reverb_enable"));
+    m_mix->setObjectName(QStringLiteral("reverb_mix"));
+    m_decay->setObjectName(QStringLiteral("reverb_decay"));
+    m_preDelay->setObjectName(QStringLiteral("reverb_preDelay"));
+    m_damping->setObjectName(QStringLiteral("reverb_damping"));
+    m_width->setObjectName(QStringLiteral("reverb_width"));
 
     // Preset row.
     auto *presets = new QHBoxLayout();
     presets->setSpacing(4);
     presets->addWidget(new QLabel(tr("Preset:")));
-    auto makePreset = [&](const QString &name) {
+    auto makePreset = [&](const QString &name, const char *key) {
         auto *btn = new QPushButton(name);
+        btn->setObjectName(QStringLiteral("reverb_preset_%1").arg(QLatin1String(key)));
         btn->setMinimumWidth(70);
         connect(btn, &QPushButton::clicked,
                 this, &ReverbPanel::onPresetClicked);
+        // One preset click is one undo gesture however many dials it moves.
+        connect(btn, &QPushButton::clicked, this, &ReverbPanel::finishGesture);
         presets->addWidget(btn);
         return btn;
     };
-    m_presetHall      = makePreset(tr("Hall"));
-    m_presetRoom      = makePreset(tr("Room"));
-    m_presetPlate     = makePreset(tr("Plate"));
-    m_presetCathedral = makePreset(tr("Cathedral"));
-    m_presetOff       = makePreset(tr("Off"));
+    m_presetHall      = makePreset(tr("Hall"), "hall");
+    m_presetRoom      = makePreset(tr("Room"), "room");
+    m_presetPlate     = makePreset(tr("Plate"), "plate");
+    m_presetCathedral = makePreset(tr("Cathedral"), "cathedral");
+    m_presetOff       = makePreset(tr("Off"), "off");
     presets->addStretch(1);
     root->addLayout(presets);
 
@@ -170,8 +180,18 @@ void ReverbPanel::buildUi() {
             this, &ReverbPanel::onAnyControlChanged);
     connect(m_trackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ReverbPanel::onTrackChanged);
+    // Undo gestures (after the change slots above): a drag ends on release;
+    // wheel / keyboard steps and the checkbox are complete on their own.
+    for (QDial *d : {m_mix, m_decay, m_preDelay, m_damping, m_width}) {
+        connect(d, &QDial::valueChanged, this, [this, d] {
+            if (!d->isSliderDown()) finishGesture();
+        });
+        connect(d, &QDial::sliderReleased, this, &ReverbPanel::finishGesture);
+    }
+    connect(m_enable, &QCheckBox::toggled, this, &ReverbPanel::finishGesture);
 
     onAnyControlChanged(); // refresh labels (no emit due to initial state)
+    m_gestureDirty = false;
 }
 
 AudioMixer::ReverbSettings ReverbPanel::collectSettings() const {
@@ -220,9 +240,8 @@ void ReverbPanel::onTrackChanged(int /*idx*/) {
     if (m_suppressEmit) return;
     if (m_mixer) {
         const auto r = m_mixer->reverbForTrack(currentTrackId());
-        m_suppressEmit = true;
+        QScopedValueRollback<bool> suppress(m_suppressEmit, true);
         applySettingsToControls(r);
-        m_suppressEmit = false;
     }
 }
 
@@ -237,18 +256,27 @@ void ReverbPanel::onPresetClicked() {
     else if (btn == m_presetOff)       p = &kPresetOff;
     if (!p) return;
 
-    m_suppressEmit = true;
-    m_mix->setValue(p->mix);
-    m_decay->setValue(p->decay);
-    m_preDelay->setValue(p->preDelay);
-    m_damping->setValue(p->damping);
-    m_width->setValue(p->width);
-    m_enable->setChecked(p->enabled);
-    m_suppressEmit = false;
+    {
+        QScopedValueRollback<bool> suppress(m_suppressEmit, true);
+        m_mix->setValue(p->mix);
+        m_decay->setValue(p->decay);
+        m_preDelay->setValue(p->preDelay);
+        m_damping->setValue(p->damping);
+        m_width->setValue(p->width);
+        m_enable->setChecked(p->enabled);
+    }
     onAnyControlChanged();
 }
 
 void ReverbPanel::emitChange() {
     if (m_suppressEmit) return;
+    ++m_emitCount;
+    m_gestureDirty = true;
     emit reverbChanged(currentTrackId(), collectSettings());
+}
+
+void ReverbPanel::finishGesture() {
+    if (!m_gestureDirty || m_suppressEmit) return;
+    m_gestureDirty = false;
+    emit gestureFinished(currentTrackId());
 }

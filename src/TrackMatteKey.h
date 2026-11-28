@@ -32,11 +32,9 @@ struct TimelineTrackMatteEntry;
 // splitAtPlayhead / pasteClip): a surviving clip's filePath, linkGroup, and
 // inPoint are never mutated by those ops.
 //
-// NOTE: the walk below assumes per-track identity uniqueness. paste()
-// deliberately violates this (byte-identical ClipInfo copy), so runs of
-// equal-identity clips are broken by position-within-run (k-th surviving
-// duplicate maps to k-th old duplicate still present). See
-// remapTrackMatteEntriesAfterMutation for the tie-break logic.
+// paste() can create byte-identical ClipInfo copies. The monotonic walk
+// binds each old duplicate to the next new duplicate at or after its low
+// water mark. See alignedClipKeyMap for the tie-break logic.
 struct ClipKeyId {
     QString filePath;
     int linkGroup = 0;
@@ -52,11 +50,17 @@ using TrackClipSnapshot = QVector<QVector<ClipKeyId>>;
 // immediately before the mutation so the snapshot reflects pre-mutation state.
 TrackClipSnapshot snapshotTrackClips(const Timeline *timeline);
 
+// Shared survivor alignment for matte, parent, and roto carriers.
+QHash<QString, QString> alignedClipKeyMap(
+    const Timeline *timeline, const TrackClipSnapshot &before);
+
 // After a mutation, align old (snapshot) clip indices against the new
 // Timeline state via an order-preserving monotonic two-pointer walk and
 // rewrite every positional key in `entries` (MainWindow GUI map type).
 // Entries whose owning clip or matte-source clip no longer exists are dropped.
 // Ownership: called by MainWindow mutation slots on m_trackMatteClipEntries.
+// This and the two helpers below first call Timeline's roto remap. Its
+// post-mutation snapshot memo skips repeated calls for the same placement.
 void remapTrackMatteEntriesAfterMutation(
     Timeline *timeline,
     QHash<QString, TrackMatteClipEntry> &entries,
@@ -70,7 +74,9 @@ void remapTrackMatteEntriesAfterMutation(
 // Ownership rule: Timeline owns its carrier remap on reorder/drop/delete
 // paths; MainWindow slots own m_trackMatteClipEntries remap on their 4
 // mutation paths and then sync the carrier via syncTrackMatteEntriesToTimeline.
-// The two are never called on the same mutation event, so no double-remap.
+// Timeline and MainWindow may both remap a mutation. Each helper calls
+// Timeline::remapRotoEntriesAfterMutation first; its memo prevents a repeated
+// roto remap when the clip placement has not changed.
 void remapTimelineCarrierAfterMutation(
     Timeline *timeline,
     QHash<QString, TimelineTrackMatteEntry> &carrier,

@@ -11,6 +11,8 @@
 #include "PlanarTrackerPreset.h"
 #include "ProjectFile.h"
 #include "CameraSolver.h"
+#include "BundleAdjustment.h"
+#include <functional>
 
 class QComboBox;
 class QDialogButtonBox;
@@ -18,6 +20,7 @@ class QLabel;
 class QProgressBar;
 class QPushButton;
 class QSpinBox;
+class QThread;
 
 // ---------------------------------------------------------------------------
 // PlanarCornerWidget — reference image display with 4 draggable corner pins
@@ -62,6 +65,31 @@ class PlanarTrackerDialog : public QDialog {
 public:
     explicit PlanarTrackerDialog(QWidget* parent = nullptr);
 
+    ~PlanarTrackerDialog() override;
+    // Source-media sample indices at fps (independent of timeline speed/trim).
+    // Zero-based; end is inclusive.
+    void setFeatureTrackingSource(const QString& path, double fps, int frameCount);
+    void setFeatureClipTiming(double inPoint, double outPoint, double speed, bool reversed,
+                              bool nonLinearTiming = false);
+    void setFeatureTrackingResult(const sfm::MultiViewTracks& tracks, QSize size, int first);
+    bool solveFeatureCamera();
+    const sfm::CameraTrackSolve& featureSolveResult() const { return m_featureSolveResult; }
+    const sfm::MultiViewTracks& featureTracks() const { return m_featureTracks; }
+    QSize featureAnalysisSize() const { return m_featureAnalysisSize; }
+    int featureStartFrame() const { return m_featureStartFrame; }
+    double featureFps() const { return m_featureFps; }
+    bool featureTrackingRunning() const { return m_featureWorker != nullptr; }
+    int featureFrameCount() const { return m_featureFrameCount; }
+    QThread* featureWorkerThread() const { return m_featureWorker; }
+    QObject* featureWorkerContext() const { return m_featureWorkerContext; }
+    // Test seam: the feature worker decodes through this function. The default
+    // wraps libavcore::grabFrameAt, so production behavior is unchanged.
+    static std::function<QImage(const QString&, double, const QSize&)>& featureGrabFunctionForTest();
+    // Test seam: called on the GUI thread when a worker callback arrives after
+    // the dialog was destroyed (the callback is dropped). Empty by default.
+    static std::function<void()>& featureOrphanCallbackHookForTest();
+    void setPlanarFrameLoader(std::function<QList<QImage>()> loader);
+
     // Set the reference frame (first frame / anchor image)
     void setReferenceFrame(const QImage& frame);
 
@@ -84,6 +112,7 @@ public slots:
     void accept() override;
 
 signals:
+    void featureTrackingFinished(bool success);
     void trackComputed(const QList<planar::Frame>& frames);
     void cameraSolveApplied(const QVector<camsolve::Pose>& poses, double fps, double startSec);
     void presetApplied(planar_tracker_preset::PlanarTrackerPreset);
@@ -98,6 +127,7 @@ private slots:
     void onResetCorners();
     void onTrackClicked();
     void onCameraSolveClicked();
+    void onFeatureTrackClicked();
     void onPatchSizeChanged(int value);
     void onSearchRadiusChanged(int value);
     void onDampingChanged(int value);
@@ -110,6 +140,32 @@ private:
     void updateDeletePresetButton();
     int currentPresetIndex() const;
     void rebuildSummary();
+
+    std::function<QList<QImage>()> m_planarFrameLoader;
+    sfm::CameraTrackSolve m_featureSolveResult;
+    double m_featureIn = 0, m_featureOut = 0, m_featureSpeed = 1;
+    bool m_featureReversed = false;
+    // A speed ramp or a time remap makes source time a non-linear function of
+    // timeline time, which the linear inverse below cannot express.
+    bool m_featureNonLinearTiming = false;
+    QPushButton* m_featureSolveButton = nullptr;
+    QLabel* m_featureSolveSummary = nullptr;
+    QString m_featurePath;
+    double m_featureFps = 0;
+    int m_featureFrameCount = 0;
+    int m_featureStartFrame = 0;
+    QSize m_featureAnalysisSize;
+    sfm::MultiViewTracks m_featureTracks;
+    QThread* m_featureWorker = nullptr;
+    // Per-run GUI-thread object receiving the worker's queued callbacks. It is
+    // not parented to the dialog, so it outlives it until the worker finishes.
+    QObject* m_featureWorkerContext = nullptr;
+    QSpinBox* m_featureStart = nullptr;
+    QSpinBox* m_featureEnd = nullptr;
+    QSpinBox* m_featureMaxPoints = nullptr;
+    QPushButton* m_featureButton = nullptr;
+    QLabel* m_featureSummary = nullptr;
+    QProgressBar* m_featureProgress = nullptr;
 
     QImage               m_reference;
     QList<QImage>        m_frames;

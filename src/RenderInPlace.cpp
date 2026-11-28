@@ -2,6 +2,7 @@
 #include "ClipGeometry.h"
 #include "Timeline.h"
 #include "RenderQueue.h"
+#include "RotoApply.h"
 #include "UndoManager.h"
 #include "libavcore/Probe.h"
 #include <QDateTime>
@@ -168,6 +169,13 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
             isolated.reversed = false;
             isolated.speedRamp = speedramp::SpeedRamp::identity();
             isolated.timeRemapCurve.keys.clear();
+            // The renderer indexes roto by the curve's sourceFps once the clip
+            // has a curve. A synthetic curve must carry the rate the source
+            // timeline uses (stream rate, else project fps), not the 30 Hz
+            // default. The picture decode does not read sourceFps.
+            if (!original.hasTimeRemap() || !(original.timeRemapCurve.sourceFps > 0.0))
+                isolated.timeRemapCurve.sourceFps = roto::clipEffectiveSourceFps(
+                    roto::probeVideoStreamFps(original.filePath), timeline.projectFrameRate());
             const int frames = int(std::ceil((length + 2.0 * handles) * options.fps));
             for (int f = 0; f <= frames; ++f) {
                 const double t = f / options.fps;
@@ -246,11 +254,22 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         isolatedVideo.append(black);
     };
     appendBlack(prefix - handles);
+    const int prefixCount = isolatedVideo.size();
     isolatedVideo.append(isolated);
     appendBlack(suffix - handles);
     Timeline temporary;
     temporary.restoreFromProject(QVector<QVector<ClipInfo>>{isolatedVideo},
                                  QVector<QVector<ClipInfo>>{linked}, 0.0, -1.0, -1.0, 10);
+    // Bake the clip's roto entry: key it to the isolated clip (after the
+    // optional prefix black clip). The isolated clip maps each frame to the
+    // same source second as on the source timeline (directly, or through the
+    // synthetic curve whose sourceFps is the source timeline's roto rate), so
+    // the renderer samples the same roto source frame.
+    const QString rotoKey = trackMatteClipKey(trackIndex, clipIndex);
+    const QHash<QString, RotoClipEntry> sourceRoto = timeline.rotoEntries();
+    const bool bakesRoto = sourceRoto.contains(rotoKey);
+    if (bakesRoto)
+        temporary.setRotoEntries({{trackMatteClipKey(0, prefixCount), sourceRoto.value(rotoKey)}});
     temporary.setProjectOutputConfig(outputSize.width(), outputSize.height(), true);
 
     QString directory = options.outputDir;
@@ -266,13 +285,17 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     name.replace(QRegularExpression(QStringLiteral("[<>:\"/\\\\|?*\\x00-\\x1f]")), QStringLiteral("_"));
     if (name.isEmpty()) name = QStringLiteral("clip");
     name += QDateTime::currentDateTime().toString(QStringLiteral("_yyyyMMdd_hhmmss"));
+    // Roto leaves alpha 0 outside the path and lower tracks show through it.
+    // H.264 and ProRes 422 flatten that to black, so a roto bake always uses
+    // the alpha path: ProRes 4444 (keepAlpha) in MOV.
+    const QString codec = bakesRoto ? QStringLiteral("prores") : options.codec;
     // ProRes requires MOV; MP4 cannot mux ProRes in the existing encoder.
-    const QString extension = options.codec == QStringLiteral("prores") ? QStringLiteral(".mov") : QStringLiteral(".mp4");
+    const QString extension = codec == QStringLiteral("prores") ? QStringLiteral(".mov") : QStringLiteral(".mp4");
     QString path = QDir(directory).absoluteFilePath(name + extension);
     for (int suffix = 1; QFileInfo::exists(path); ++suffix)
         path = QDir(directory).absoluteFilePath(name + QStringLiteral("_%1").arg(suffix) + extension);
     RenderPreset preset{QStringLiteral("クリップ焼き込み"), outputSize.width(),
-        outputSize.height(), options.codec, 100000000, extension.mid(1)};
+        outputSize.height(), codec, 100000000, extension.mid(1)};
     RenderJob job = RenderQueue::jobFromPreset(preset, path, 0,
         qRound64((length + prefix + suffix) * 1000000.0));
     job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -307,7 +330,9 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
         job.projectFilePath = mixPath;
     }
     job.exportConfig["fps"] = options.fps;
-    job.exportConfig["proresProfile"] = 3;
+    job.exportConfig["proresProfile"] = bakesRoto ? 4 : 3;
+    if (bakesRoto)
+        job.exportConfig["keepAlpha"] = true;
     RenderQueue queue;
     QEventLoop loop;
     bool completed = false;
@@ -365,8 +390,19 @@ bool renderClipInPlace(Timeline &timeline, int trackIndex, int clipIndex,
     replacement.audioChannelMode = original.audioChannelMode;
     replacement.volumeEnvelope = original.volumeEnvelope;
     replacement.renderInPlaceOriginal = std::make_shared<ClipInfo>(original);
+    // The baked media already carries the roto. Drop the entry so it is not
+    // applied twice; replaceRenderedClip's undo state records the removal, so
+    // undo restores it together with the original clip.
+    const QHash<QString, RotoClipEntry> rotoBeforeReplace = timeline.rotoEntries();
+    if (rotoBeforeReplace.contains(rotoKey)) {
+        QHash<QString, RotoClipEntry> withoutBaked = rotoBeforeReplace;
+        withoutBaked.remove(rotoKey);
+        timeline.setRotoEntries(withoutBaked);
+    }
     if (!timeline.replaceRenderedClip(trackIndex, clipIndex, replacement,
                                      QStringLiteral("効果を焼き込んで差し替え"))) {
+        if (rotoBeforeReplace.contains(rotoKey))
+            timeline.setRotoEntries(rotoBeforeReplace);
         QFile::remove(path);
         return fail(QStringLiteral("クリップを差し替えられません"));
     }

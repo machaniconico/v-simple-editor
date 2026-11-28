@@ -10,8 +10,12 @@
 #include <QStringList>
 #include <QVector>
 #include <QJsonObject>
+#include <QSet>
 
 namespace mediapool {
+
+enum class AssetFlag { None, Favorite, Rejected };
+enum class AssetFilterMode { All, Favorites, ExcludeRejected, Unused };
 
 // メディア種別。Unknown は型不問 / 未判定を表す。
 enum class MediaType {
@@ -40,6 +44,8 @@ struct MediaAsset {
     QString   binId;           // 所属ビン id。空=ルート直下
     QString   colorLabel;
     QString   comment;
+    AssetFlag flag = AssetFlag::None;
+    int       stars = 0;
 };
 
 // ビン (フォルダ)。parentId 空=ルート直下。階層対応。
@@ -69,6 +75,10 @@ public:
     // 新規は monotonic id を採番して返す。
     int addAsset(const MediaAsset& asset);
     bool removeAsset(int id);
+    bool setAssetFlag(int id, AssetFlag flag);
+    bool setAssetStars(int id, int stars); // 0..5 に制限する。
+    bool setAssetTags(int id, const QStringList& tags);
+    bool renameAsset(int id, const QString& name);
     const QVector<MediaAsset>& assets() const;
     const MediaAsset* getAsset(int id) const;   // 無ければ nullptr
 
@@ -87,9 +97,13 @@ public:
     // displayName + tags + comment + filePath を case-insensitive 部分一致。
     // 空クエリは全件。
     QVector<MediaAsset> search(const QString& query) const;
+    QVector<MediaAsset> filtered(const QString& query, AssetFilterMode mode,
+                                const QSet<QString>& usedPaths = {}) const;
 
     // --- smart bin ---------------------------------------------------------
     QString addSmartBin(const SmartBin& smartBin);   // id 採番して返す
+    bool removeSmartBin(const QString& id);
+    bool updateSmartBin(const QString& id, const SmartBin& smartBin);
     const QVector<SmartBin>& smartBins() const;
     // nameQuery (displayName 部分一致) AND typeFilter (Unknown 以外なら一致)
     // AND tagFilter (空でなければ tags に含む) で絞り込み。

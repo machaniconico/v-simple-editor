@@ -120,6 +120,7 @@ double ClipExpressionBindings::resolve(const QString &propPath,
     ctxCopy.canvasHeight    = ctx.canvasHeight;
     ctxCopy.value           = keyframeValue;
     ctxCopy.sampleValueAtTime = ctx.sampleValueAtTime;
+    ctxCopy.audioLevelAtTime = ctx.audioLevelAtTime ? ctx.audioLevelAtTime : m_audioLevelAtTime;
 
     const ExpressionResult result = Expression::evaluate(code, ctxCopy);
 
@@ -146,6 +147,7 @@ QJsonObject ClipExpressionBindings::toJson() const
 void ClipExpressionBindings::fromJson(const QJsonObject &obj)
 {
     m_bindings.clear();
+    m_audioLevelAtTime = {};
     for (auto it = obj.constBegin(); it != obj.constEnd(); ++it) {
         // Only accept string values (lenient: skip arrays, objects, numbers, etc.)
         if (!it.value().isString()) {

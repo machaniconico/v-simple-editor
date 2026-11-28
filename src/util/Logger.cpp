@@ -5,7 +5,6 @@
 #include <QFile>
 #include <QMutexLocker>
 #include <QStandardPaths>
-#include <QTextStream>
 
 // PRD-SPLIT-MAIN-1: g_logFilePath, g_logMutex, defaultLogPath(), and
 // writeLogLine() are placed outside the anonymous namespace so that
@@ -29,10 +28,9 @@ void writeLogLine(const QString &level, const QString &msg)
     QFile f(g_logFilePath);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
         return;
-    QTextStream ts(&f);
-    ts.setEncoding(QStringConverter::Utf8);
-    ts << QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
-       << " [" << level << "] " << msg << "\n";
-    ts.flush();
+    // Raw write, no QTextStream: this runs inside the Qt message handler, which
+    // may be entered while Qt holds a signal/slot pool mutex (see CrashHandler).
+    f.write((QDateTime::currentDateTime().toString("HH:mm:ss.zzz")
+             + QStringLiteral(" [") + level + QStringLiteral("] ") + msg + QLatin1Char('\n')).toUtf8());
     f.close();
 }

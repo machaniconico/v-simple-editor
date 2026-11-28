@@ -1,7 +1,13 @@
 #include "AudioExtract.h"
 
+#include <QFileInfo>
+#include <algorithm>
 #include <QFile>
 #include <QIODevice>
+#include <QSaveFile>
+#include <QtEndian>
+#include <cstring>
+#include <utility>
 #include <QString>
 
 extern "C" {
@@ -19,6 +25,275 @@ extern "C" {
 #include <limits>
 
 namespace libavcore {
+
+bool readWavFloatInterleaved(const QString &path, std::vector<float> *samples,
+                             int *sampleRate, int *channels, QString *error)
+{
+    auto invalid = [&]() {
+        if (error) *error = QStringLiteral("32bit float WAV を読み込めません: %1").arg(path);
+        return false;
+    };
+    QFile file(path);
+    if (!samples || !sampleRate || !channels || !file.open(QIODevice::ReadOnly))
+        return invalid();
+    const QByteArray header = file.read(12);
+    if (header.size() != 12 || header.left(4) != "RIFF" || header.mid(8, 4) != "WAVE")
+        return invalid();
+    const qint64 end = 8LL + qFromLittleEndian<quint32>(header.constData() + 4);
+    if (end > file.size() || end < 12) return invalid();
+    QByteArray format;
+    qint64 dataOffset = -1;
+    quint32 dataSize = 0;
+    while (file.pos() + 8 <= end) {
+        const QByteArray chunk = file.read(8);
+        if (chunk.size() != 8) return invalid();
+        const quint32 size = qFromLittleEndian<quint32>(chunk.constData() + 4);
+        const qint64 next = file.pos() + size + (size & 1u);
+        if (next > end) return invalid();
+        if (chunk.left(4) == "fmt ") {
+            if (size < 16) return invalid();
+            format = file.read(qMin<quint32>(size, 40));
+        } else if (chunk.left(4) == "data") {
+            dataOffset = file.pos();
+            dataSize = size;
+        }
+        if (!file.seek(next)) return invalid();
+    }
+    if (format.size() < 16 || dataOffset < 0) return invalid();
+    const auto u16 = [&](int off) { return qFromLittleEndian<quint16>(format.constData() + off); };
+    const quint32 rate = qFromLittleEndian<quint32>(format.constData() + 4);
+    const int count = u16(2);
+    bool ieee = u16(0) == 3;
+    // FFmpeg emits WAVE_FORMAT_EXTENSIBLE for float32 stereo.
+    if (u16(0) == 0xfffe && format.size() >= 40 && u16(16) >= 22 && u16(18) == 32) {
+        const QByteArray floatGuid = QByteArray::fromHex("0300000000001000800000aa00389b71");
+        ieee = format.mid(24, 16) == floatGuid;
+    }
+    if (!ieee || u16(14) != 32 || count < 1 || count > 64 || !rate
+        || rate > static_cast<quint32>(std::numeric_limits<int>::max())
+        || u16(12) != count * 4 || dataSize % (count * 4) != 0)
+        return invalid();
+    if (!file.seek(dataOffset)) return invalid();
+    std::vector<float> result(dataSize / 4);
+    size_t offset = 0;
+    while (offset < result.size()) {
+        const size_t n = std::min<size_t>(16384, result.size() - offset);
+        const QByteArray block = file.read(static_cast<qint64>(n * 4));
+        if (block.size() != static_cast<qint64>(n * 4)) return invalid();
+        for (size_t i = 0; i < n; ++i) {
+            const quint32 bits = qFromLittleEndian<quint32>(block.constData() + i * 4);
+            std::memcpy(&result[offset + i], &bits, 4);
+        }
+        offset += n;
+    }
+    *samples = std::move(result);
+    *sampleRate = static_cast<int>(rate);
+    *channels = count;
+    return true;
+}
+
+bool writeWavFloatInterleaved(const QString &path, const std::vector<float> &samples,
+                              int sampleRate, int channels, QString *error)
+{
+    auto invalid = [&]() {
+        if (error) *error = QStringLiteral("32bit float WAV を保存できません: %1").arg(path);
+        return false;
+    };
+    static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559,
+                  "IEEE float32 required");
+    if (sampleRate <= 0 || channels < 1 || channels > 64
+        || samples.size() % channels != 0
+        || samples.size() > (std::numeric_limits<quint32>::max() - 48ULL) / 4
+        || static_cast<quint64>(sampleRate) * channels * 4 > std::numeric_limits<quint32>::max())
+        return invalid();
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) return invalid();
+    QByteArray header(56, '\0');
+    auto u16 = [&](int off, quint16 v) { qToLittleEndian(v, header.data() + off); };
+    auto u32 = [&](int off, quint32 v) { qToLittleEndian(v, header.data() + off); };
+    std::memcpy(header.data(), "RIFF", 4);
+    u32(4, static_cast<quint32>(samples.size() * 4 + 48));
+    std::memcpy(header.data() + 8, "WAVEfmt ", 8);
+    u32(16, 16); u16(20, 3); u16(22, static_cast<quint16>(channels));
+    u32(24, sampleRate); u32(28, static_cast<quint32>(sampleRate) * channels * 4);
+    u16(32, static_cast<quint16>(channels * 4)); u16(34, 32);
+    std::memcpy(header.data() + 36, "fact", 4);
+    u32(40, 4); u32(44, static_cast<quint32>(samples.size() / channels));
+    std::memcpy(header.data() + 48, "data", 4);
+    u32(52, static_cast<quint32>(samples.size() * 4));
+    if (file.write(header) != header.size()) return invalid();
+    for (size_t offset = 0; offset < samples.size();) {
+        const size_t n = std::min<size_t>(16384, samples.size() - offset);
+        QByteArray block(static_cast<qsizetype>(n * 4), '\0');
+        for (size_t i = 0; i < n; ++i) {
+            quint32 bits;
+            std::memcpy(&bits, &samples[offset + i], 4);
+            qToLittleEndian(bits, block.data() + i * 4);
+        }
+        if (file.write(block) != block.size()) return invalid();
+        offset += n;
+    }
+    return file.commit() ? true : invalid();
+}
+
+// 16bit PCM WAV (RIFF/fmt/data) を読み込み mono の double サンプル列へ展開する。
+// 多チャンネルは平均してモノラル化。成功時 true、sampleRate を *sampleRate へ。
+// 簡易パーサ — float WAV や 24/32bit は非対応 (抽出側を 16bit に固定する前提)。
+bool readPcm16WavToMono(const QString &wavPath,
+                        std::vector<double> &outSamples,
+                        int &sampleRate,
+                        QString *error)
+{
+    outSamples.clear();
+    sampleRate = 0;
+
+    constexpr qint64 kMaxWavBytes = 512LL * 1024LL * 1024LL;
+    const QFileInfo info(wavPath);
+    if (!info.exists()) {
+        if (error) *error = QStringLiteral("WAV が存在しません: %1").arg(wavPath);
+        return false;
+    }
+    if (info.size() <= 0) {
+        if (error) *error = QStringLiteral("WAV が空です: %1").arg(wavPath);
+        return false;
+    }
+    if (info.size() > kMaxWavBytes) {
+        if (error) *error =
+            QStringLiteral("WAV が大きすぎます (%1 MB、上限 %2 MB)。")
+                .arg(info.size() / (1024.0 * 1024.0), 0, 'f', 1)
+                .arg(kMaxWavBytes / (1024 * 1024));
+        return false;
+    }
+
+    QFile f(wavPath);
+    if (!f.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("WAV を開けません: %1").arg(wavPath);
+        return false;
+    }
+    const QByteArray data = f.readAll();
+    f.close();
+
+    if (data.size() != info.size()) {
+        if (error) *error =
+            QStringLiteral("WAV の読み込みが途中で終了しました (%1/%2 bytes)。")
+                .arg(data.size()).arg(info.size());
+        return false;
+    }
+    if (data.size() < 44 || !data.startsWith("RIFF") ||
+        data.mid(8, 4) != QByteArray("WAVE")) {
+        if (error) *error = QStringLiteral("RIFF/WAVE ヘッダが不正です。");
+        return false;
+    }
+
+    const auto rdU16 = [&](int off) -> quint16 {
+        return static_cast<quint16>(static_cast<unsigned char>(data[off])) |
+               (static_cast<quint16>(static_cast<unsigned char>(data[off + 1])) << 8);
+    };
+    const auto rdU32 = [&](int off) -> quint32 {
+        return static_cast<quint32>(static_cast<unsigned char>(data[off])) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 1])) << 8) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 2])) << 16) |
+               (static_cast<quint32>(static_cast<unsigned char>(data[off + 3])) << 24);
+    };
+
+    int channels = 1;
+    int sr = 0;
+    int bitsPerSample = 16;
+    int audioFormat = 1;
+    int blockAlign = 0;
+    bool haveFmt = false;
+    int dataOff = -1;
+    int dataLen = 0;
+
+    // チャンク走査 (fmt と data を探す)。
+    int pos = 12;
+    while (pos + 8 <= data.size()) {
+        const QByteArray id = data.mid(pos, 4);
+        const quint32 sz = rdU32(pos + 4);
+        const int body = pos + 8;
+        const qint64 chunkEnd = static_cast<qint64>(body) + static_cast<qint64>(sz);
+        const qint64 nextChunk = chunkEnd + ((sz & 1u) ? 1 : 0);
+        if (chunkEnd > data.size()) {
+            if (error) *error =
+                QStringLiteral("WAV チャンク '%1' がファイル終端を越えています。")
+                    .arg(QString::fromLatin1(id.constData(), id.size()));
+            return false;
+        }
+
+        if (id == QByteArray("fmt ")) {
+            if (sz < 16) {
+                if (error) *error = QStringLiteral("WAV fmt チャンクが短すぎます。");
+                return false;
+            }
+            audioFormat   = rdU16(body);
+            channels      = rdU16(body + 2);
+            const quint32 parsedSr = rdU32(body + 4);
+            if (parsedSr > static_cast<quint32>(std::numeric_limits<int>::max())) {
+                if (error) *error = QStringLiteral("WAV の sample rate が大きすぎます。");
+                return false;
+            }
+            sr            = static_cast<int>(parsedSr);
+            blockAlign    = rdU16(body + 12);
+            bitsPerSample = rdU16(body + 14);
+            haveFmt = true;
+        } else if (id == QByteArray("data")) {
+            dataOff = body;
+            dataLen = static_cast<int>(sz);
+        }
+        // チャンクは 2byte 境界 (奇数長は +1 パディング)。
+        pos = static_cast<int>(std::min<qint64>(nextChunk, data.size()));
+        if (dataOff >= 0 && haveFmt) break;
+    }
+
+    if (audioFormat != 1 || bitsPerSample != 16) {
+        if (error) *error =
+            QStringLiteral("対応するのは 16bit PCM WAV のみです (format=%1, bits=%2)。")
+                .arg(audioFormat).arg(bitsPerSample);
+        return false;
+    }
+    if (!haveFmt || dataOff < 0 || dataLen <= 0 || sr <= 0 || channels <= 0) {
+        if (error) *error = QStringLiteral("WAV の data/fmt チャンクが見つかりません。");
+        return false;
+    }
+
+    if (channels > 64) {
+        if (error) *error = QStringLiteral("WAV の channel 数が大きすぎます (%1)。").arg(channels);
+        return false;
+    }
+
+    const int frameBytes = 2 * channels;
+    if (blockAlign != frameBytes) {
+        if (error) *error =
+            QStringLiteral("WAV の block align が不正です (blockAlign=%1, expected=%2)。")
+                .arg(blockAlign).arg(frameBytes);
+        return false;
+    }
+
+    const int frameCount = dataLen / frameBytes;
+    if (frameCount <= 0) {
+        if (error) *error = QStringLiteral("WAV の data チャンクにサンプルがありません。");
+        return false;
+    }
+
+    outSamples.clear();
+    outSamples.reserve(frameCount);
+    const char *p = data.constData() + dataOff;
+    for (int i = 0; i < frameCount; ++i) {
+        double acc = 0.0;
+        for (int c = 0; c < channels; ++c) {
+            const int o = i * frameBytes + c * 2;
+            const qint16 s = static_cast<qint16>(
+                static_cast<quint16>(static_cast<unsigned char>(p[o])) |
+                (static_cast<quint16>(static_cast<unsigned char>(p[o + 1])) << 8));
+            acc += static_cast<double>(s) / 32768.0;
+        }
+        outSamples.push_back(acc / channels);
+    }
+    sampleRate = sr;
+    return true;
+}
+
+
 
 namespace {
 

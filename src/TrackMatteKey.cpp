@@ -50,7 +50,7 @@ TrackClipSnapshot snapshotTrackClips(const Timeline *timeline)
 // may be pruned rather than remapped. This is deliberate conservative behaviour
 // (prune rather than misassign). A true fix requires a stable per-clip UID
 // threaded through ClipInfo and ProjectFile serialization — out of scope here.
-static QHash<QString, QString> buildOldToNewMap(
+QHash<QString, QString> alignedClipKeyMap(
     const Timeline *timeline,
     const TrackClipSnapshot &before)
 {
@@ -96,14 +96,17 @@ static QHash<QString, QString> buildOldToNewMap(
 
 // MainWindow GUI-map variant (TrackMatteClipEntry, has clipId field).
 // Ownership: called by the 4 MainWindow mutation slots on m_trackMatteClipEntries.
+// Each remap helper first asks Timeline to remap roto; its post-mutation
+// snapshot memo skips repeated calls from the same mutation site.
 void remapTrackMatteEntriesAfterMutation(
     Timeline *timeline,
     QHash<QString, TrackMatteClipEntry> &entries,
     const TrackClipSnapshot &before)
 {
+    if (timeline) timeline->remapRotoEntriesAfterMutation(before);
     if (!timeline || entries.isEmpty())
         return;
-    const QHash<QString, QString> oldToNew = buildOldToNewMap(timeline, before);
+    const QHash<QString, QString> oldToNew = alignedClipKeyMap(timeline, before);
     QHash<QString, TrackMatteClipEntry> rebuilt;
     rebuilt.reserve(entries.size());
     for (auto it = entries.cbegin(); it != entries.cend(); ++it) {
@@ -135,14 +138,18 @@ void remapTrackMatteEntriesAfterMutation(
 //     first, then MainWindow's remapTrackMatteEntriesAfterMutation + sync runs
 //     after — the final syncTrackMatteEntriesToTimeline overwrites the carrier
 //     with the GUI-map result, so the double-remap is redundant but harmless.
+// All three helpers call Timeline::remapRotoEntriesAfterMutation first, even
+// when their own carrier is empty. Roto's post-mutation snapshot memo skips
+// repeated remaps at the same site, including the carrier/parent pair.
 void remapTimelineCarrierAfterMutation(
     Timeline *timeline,
     QHash<QString, TimelineTrackMatteEntry> &carrier,
     const TrackClipSnapshot &before)
 {
+    if (timeline) timeline->remapRotoEntriesAfterMutation(before);
     if (!timeline || carrier.isEmpty())
         return;
-    const QHash<QString, QString> oldToNew = buildOldToNewMap(timeline, before);
+    const QHash<QString, QString> oldToNew = alignedClipKeyMap(timeline, before);
     QHash<QString, TimelineTrackMatteEntry> rebuilt;
     rebuilt.reserve(carrier.size());
     for (auto it = carrier.cbegin(); it != carrier.cend(); ++it) {
@@ -164,9 +171,10 @@ void remapClipParentEntriesAfterMutation(
     QHash<QString, QString> &entries,
     const TrackClipSnapshot &before)
 {
+    if (timeline) timeline->remapRotoEntriesAfterMutation(before);
     if (!timeline || entries.isEmpty())
         return;
-    const QHash<QString, QString> oldToNew = buildOldToNewMap(timeline, before);
+    const QHash<QString, QString> oldToNew = alignedClipKeyMap(timeline, before);
     QHash<QString, QString> rebuilt;
     rebuilt.reserve(entries.size());
     for (auto it = entries.cbegin(); it != entries.cend(); ++it) {

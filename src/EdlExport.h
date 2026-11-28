@@ -34,6 +34,9 @@ QString framesToTimecode(qint64 frames, double frameRate, bool dropFrame);
 // 秒 → フレーム数 (四捨五入)。負の sec は 0 にクランプ。
 qint64 secToFrames(double sec, double frameRate);
 
+// Inverse of framesToTimecode; rejects invalid/skipped labels (EdlImport.cpp).
+bool timecodeToFrames(const QString &text, double frameRate, bool dropFrame, qint64 *frames);
+
 // ---------------------------------------------------------------------------
 // 中間ドキュメントモデル
 // ---------------------------------------------------------------------------

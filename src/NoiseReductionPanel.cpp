@@ -1,5 +1,7 @@
 #include "NoiseReductionPanel.h"
 
+#include <QScopedValueRollback>
+
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDial>
@@ -52,7 +54,7 @@ void NoiseReductionPanel::setMixer(AudioMixer *mixer) {
 
 void NoiseReductionPanel::setTrackList(const QList<int> &trackIds) {
     const int prevId = currentTrackId();
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->clear();
     m_trackCombo->addItem(tr("Master"), 0);
     for (int id : trackIds) {
@@ -62,17 +64,15 @@ void NoiseReductionPanel::setTrackList(const QList<int> &trackIds) {
     int idx = m_trackCombo->findData(prevId);
     if (idx < 0) idx = 0;
     m_trackCombo->setCurrentIndex(idx);
-    m_suppressEmit = false;
 }
 
 void NoiseReductionPanel::loadSettings(
         int trackId, const AudioMixer::NoiseReductionSettings &nr) {
     int idx = m_trackCombo->findData(trackId);
     if (idx < 0) idx = 0;
-    m_suppressEmit = true;
+    QScopedValueRollback<bool> suppress(m_suppressEmit, true);
     m_trackCombo->setCurrentIndex(idx);
     applySettingsToControls(nr);
-    m_suppressEmit = false;
 }
 
 int NoiseReductionPanel::currentTrackId() const {
@@ -125,12 +125,20 @@ void NoiseReductionPanel::buildUi() {
     addColumn(4, tr("Manual Floor"), m_manualFloor, m_manualFloorLabel,
               kManualFloorMin, kManualFloorMax, -50);
     root->addLayout(grid);
+    m_trackCombo->setObjectName(QStringLiteral("nr_track"));
+    m_enable->setObjectName(QStringLiteral("nr_enable"));
+    m_threshold->setObjectName(QStringLiteral("nr_threshold"));
+    m_reduction->setObjectName(QStringLiteral("nr_reduction"));
+    m_attack->setObjectName(QStringLiteral("nr_attack"));
+    m_release->setObjectName(QStringLiteral("nr_release"));
+    m_manualFloor->setObjectName(QStringLiteral("nr_manualFloor"));
 
     // Auto-floor row — checkbox + real-time floor estimate readout.
     auto *autoRow = new QHBoxLayout();
     autoRow->setSpacing(8);
     m_autoFloor = new QCheckBox(tr("Auto Floor"));
     m_autoFloor->setChecked(true);
+    m_autoFloor->setObjectName(QStringLiteral("nr_autoFloor"));
     autoRow->addWidget(m_autoFloor);
     autoRow->addWidget(new QLabel(tr("Estimated floor:")));
     m_floorReadout = new QLabel(tr("-- dB"));
@@ -155,6 +163,16 @@ void NoiseReductionPanel::buildUi() {
             this, &NoiseReductionPanel::onAutoFloorToggled);
     connect(m_trackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &NoiseReductionPanel::onTrackChanged);
+    // Undo gestures (after the change slots above): a drag ends on release;
+    // wheel / keyboard steps and the checkboxes are complete on their own.
+    for (QDial *d : {m_threshold, m_reduction, m_attack, m_release, m_manualFloor}) {
+        connect(d, &QDial::valueChanged, this, [this, d] {
+            if (!d->isSliderDown()) finishGesture();
+        });
+        connect(d, &QDial::sliderReleased, this, &NoiseReductionPanel::finishGesture);
+    }
+    connect(m_enable, &QCheckBox::toggled, this, &NoiseReductionPanel::finishGesture);
+    connect(m_autoFloor, &QCheckBox::toggled, this, &NoiseReductionPanel::finishGesture);
 
     // Floor estimate readout poll — only meaningful when the audio
     // engine is running and the track has the NR stage enabled. Always
@@ -166,6 +184,7 @@ void NoiseReductionPanel::buildUi() {
     m_pollTimer->start();
 
     onAnyControlChanged();        // refresh labels (no emit due to initial state)
+    m_gestureDirty = false;
     updateFloorReadoutEnabled();  // initial enable/disable for manual-floor dial
 }
 
@@ -226,9 +245,8 @@ void NoiseReductionPanel::onTrackChanged(int /*idx*/) {
     if (m_suppressEmit) return;
     if (m_mixer) {
         const auto nr = m_mixer->noiseReductionForTrack(currentTrackId());
-        m_suppressEmit = true;
+        QScopedValueRollback<bool> suppress(m_suppressEmit, true);
         applySettingsToControls(nr);
-        m_suppressEmit = false;
     }
 }
 
@@ -245,5 +263,13 @@ void NoiseReductionPanel::onPollFloorReadout() {
 
 void NoiseReductionPanel::emitChange() {
     if (m_suppressEmit) return;
+    ++m_emitCount;
+    m_gestureDirty = true;
     emit noiseReductionChanged(currentTrackId(), collectSettings());
+}
+
+void NoiseReductionPanel::finishGesture() {
+    if (!m_gestureDirty || m_suppressEmit) return;
+    m_gestureDirty = false;
+    emit gestureFinished(currentTrackId());
 }

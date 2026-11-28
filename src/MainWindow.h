@@ -1,6 +1,8 @@
 #pragma once
 
 #include <QMainWindow>
+class MeshEditTool;
+class PuppetPinTool;
 #include <QMenuBar>
 #include <QActionGroup>  // WS-3: ワークスペース切替アクションの排他グループ
 #include <QToolBar>
@@ -21,6 +23,8 @@
 #include <QPointer>
 #include <QRectF>
 #include <QString>
+#include <QStringList>
+#include <QList>
 #include "ProjectSettings.h"
 #include "Exporter.h"
 #include "ProjectFile.h"
@@ -45,6 +49,8 @@
 #include "VideoStabilizer.h"
 #include "SpeedRamp.h"
 #include "AudioEQ.h"
+#include "AudioMixer.h"
+#include <vector>
 #include "TimelineMarker.h"
 #include "RenderQueue.h"
 #include "ScreenRecorder.h"
@@ -57,6 +63,7 @@
 #include "Light3D.h"
 #include "Expression.h"
 #include "ClipExpressionBindings.h"
+#include "AudioKeyframes.h"
 #include "WiggleTransform.h"
 #include "ShapeLayer.h"
 #include "TextAnimator.h"
@@ -104,6 +111,7 @@ class Timeline;
 class TimelineTrack;
 class SourceMonitorDock;
 class StillGalleryDock;
+class SequenceListDock;
 class AudioBusPanel;
 class ExportDialog;
 class BrushAnimation;
@@ -243,10 +251,20 @@ class MainWindow : public QMainWindow
     // 呼ばれない (McpHttpServer が GUI スレッドのイベントループで動く)。
     friend class mcp::McpEditorTools;
     friend int runMcpSelftest();
+    friend int runExportCfgSelftest();
+    friend int runLoudnessAutoSelftest();
+    friend int runSpecialCompositeSelftest();
+    friend int runDeEsserSelftest();
+    friend int runAudioTrackFxSelftest();
+    friend int runRotoSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
+
+    // Apply a file LUT to the selected video clip with one undo step.
+    bool applyLutFileToSelectedClip(const QString &path);
+    void clearLutIntensity();
 
     struct PrecomposeResult {
         bool success = false;
@@ -296,6 +314,7 @@ public:
     // for keyframe insertion at the current timeline position.
     double currentPlayheadSeconds() const;
     QString projectDirectory() const;
+    void convertAudioToKeyframes(int trackIndex, int clipIndex);
     // MCP の選択確認とセルフテストが、Timeline 側と同じ追跡値を確認できるようにする。
     int selectedVideoTrackIndex() const { return m_selectedVideoTrackIndex; }
     int selectedVideoClipIndexTracked() const { return m_selectedVideoClipIndexTracked; }
@@ -369,6 +388,7 @@ private slots:
     void saveEffectPreset();
     void manageEffectPresets();
     void addShapeLayer();
+    void addSolidLayer();
     void addParticleEffect();
     void addVfxGenerator();
     void addVfxGeneratorForType(int typeIndex);
@@ -385,7 +405,6 @@ private slots:
     void openDeflicker();
     void applyLut();
     void loadLutCubeFile();
-    void clearLutIntensity();
     void manageLuts();
     void toggleProxyMode();
     void generateProxies();
@@ -441,6 +460,9 @@ private slots:
     // Consolidation slots — wire panels and dialogs implemented in
     // earlier sprint stories into the menu bar.
     void openEqualizerPanel();
+    void openDeEsserPanel();
+    void reseedAudioFxDocks();
+    void syncAudioFxDocks();
     void openCompressorPanel();
     void openReverbPanel();
     void openNoiseReductionPanel();
@@ -668,6 +690,12 @@ protected:
     void showEvent(QShowEvent *event) override;
 
 private:
+    enum class ExportEntry { Normal, MobileBatch };
+    // Also runs loudnessauto::prepareJob (the single normal / mobile call site). When
+    // projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
+    // measurement (what RenderQueue::setLoudnessGainDb must keep receiving).
+    RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry,
+                                   double *projectLoudnessGainDb = nullptr);
     noiseprint::NoisePrint m_noisePrint;
     QPointer<TimelineTrack> m_noisePrintMenuTrack;
     int m_noisePrintMenuClip = -1;
@@ -722,15 +750,33 @@ private:
     // 書き出し用の音声ミックス (.m4a) を temp に作り、そのパスを返す。ミックスが
     // 不要 (パススルーで正しい) なら空文字列。失敗時は *error に日本語メッセージ。
     // GUI の exportVideo と MCP の export_video が同じ経路で使う。
-    QString prepareExportAudioMix(QString *error);
+    QString prepareExportAudioMix(QString *error, int audioKbps = 192);
+    // exportVideo's step between buildExportRenderJob and addJob: makes the OFF-side audio
+    // mix and attaches it to the job. On failure it removes every temp file the job holds
+    // (including those prepareJob made) and returns false with *error set.
+    bool finalizeExportJobAudio(RenderJob &job, const ExportConfig &config, QString *error);
+    QString m_exportAudioMixErrorForTest; // selftest: non-empty forces a mix failure
+    int exportAudioMixCallCountForTest = 0; // selftest: prepareExportAudioMix calls
+    bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
+    void stopMeshEditTool();
+    void stopPuppetPinTool();
     void applyLoadedProjectData(const ProjectData &data, const QString &filePath);
     bool relinkMediaPaths(const QHash<QString, QString> &oldToNew,
                           QString *errorOut = nullptr);
     bool relinkMediaSidecars(const QHash<QString, QString> &oldToNew);
     void captureMediaRelinkSidecarsAtCurrentUndoIndex();
     void handleMediaRelinkHistoryChanged();
+    // Audio FX dock undo (US-911): the one gesture -> saveUndoState hook of the
+    // five docks, and the restore of a history entry's dock-edited FX.
+    template <typename Panel>
+    void connectAudioFxDockUndo(Panel *panel, const QString &tag);
+    void restoreAudioFxUndoState(const QJsonObject &audioFx);
+    QJsonObject collectExternalTrackState() const;
+    void applyExternalTrackState(const QJsonObject &state);
+    void syncTrackMatteEntriesFromTimeline();
+    void remapExternalTrackIndices(bool audio, const QVector<int> &oldToNew);
     void collectAudioState(ProjectData &data);
     void applyAudioState(const ProjectData &data);
     bool m_promptForMissingMedia = true;
@@ -771,6 +817,9 @@ private:
 
     QImage buildSpecialClipComposite(double timelineSeconds) const;
     QImage applyStoredRotoData(const QString &clipId, const QImage &frame, int sourceFrameIndex) const;
+    // roto carrier (Timeline::rotoEntries) の唯一の書き手。空 entry なら削除し、
+    // 1 回の saveUndoState で 1 undo にする。
+    void storeRotoEntry(const QString &clipId, const RotoClipEntry &entry);
     void setBrushAnimationEntries(const QVector<BrushAnimationEntry> &entries);
     void upsertBrushAnimationEntry(const BrushAnimationEntry &entry);
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
@@ -816,16 +865,20 @@ private:
     struct MediaRelinkSidecarState {
         QVector<OverlayItem> overlays;
         QHash<QString, ParticleEmitterConfig> particleClipConfigs;
+        QJsonObject audioFx; // audiofxui::undoState of the mixer at this entry
     };
     QVector<MediaRelinkSidecarState> m_mediaRelinkSidecarHistory;
     quint64 m_mediaRelinkObservedSaveSerial = 0;
     int m_mediaRelinkObservedUndoIndex = -1;
     QHash<QString, BrushAnimation *> m_liveBrushAnimations;
-    QHash<QString, RotoClipEntry> m_rotoClipEntries;
     QHash<QString, TimeRemapClipEntry> m_timeRemapClipEntries;
     QHash<QString, TrackMatteClipEntry> m_trackMatteClipEntries;
     // US-3D-11: per-clip motion-graphics sidecars, keyed by "trackIdx:clipIdx"
     QHash<QString, QJsonObject> m_text3DClipConfigs;          // Text3DLayer::toJson() blobs
+    std::function<double(double)> linkedAudioSampler(const ClipInfo &clip,
+                                                    double clipStart) const;
+    std::shared_ptr<audiokf::EnvelopeCache> m_audioEnvelopeCache =
+        std::make_shared<audiokf::EnvelopeCache>();
     QHash<QString, exprbind::ClipExpressionBindings> m_clipExpressionBindings;
     QHash<QString, wiggle::WiggleParams> m_clipWiggleParams;
     Camera3D m_projectCamera;                                 // single per-project camera
@@ -834,6 +887,10 @@ private:
     quint64 m_projectCameraUndoSaveSerial = 0;
     QVector<Light3D> m_projectLights;                         // project-level 3D lights
     QPointer<Light3DDialog> m_light3DDialog;
+    QPointer<PuppetPinTool> m_puppetPinTool;
+    QPointer<QAction> m_puppetPinAction;
+    QPointer<MeshEditTool> m_meshEditTool;
+    QPointer<QAction> m_meshEditAction;
     int m_selectedVideoTrackIndex = -1;
     int m_selectedVideoClipIndexTracked = -1;
 
@@ -858,6 +915,24 @@ private:
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)
+    QAction *m_zoomToFitSequenceAction = nullptr;
+    QAction *m_zoomToSelectionAction = nullptr;
+    QAction *m_jumpTimecodeAction = nullptr;
+    QAction *m_moveClipHeadAction = nullptr;
+    QAction *m_moveClipTailAction = nullptr;
+    QAction *m_selectSameLabelAction = nullptr;
+    QAction *m_selectAllClipsAction = nullptr;
+    QAction *m_selectForwardAction = nullptr;
+    QAction *m_selectBackwardAction = nullptr;
+    QAction *m_bladeAllAction = nullptr;
+    QAction *m_liftAction = nullptr;
+    QAction *m_duplicateAction = nullptr;
+    QAction *m_nudgeLeftAction = nullptr;
+    QAction *m_nudgeRightAction = nullptr;
+    QAction *m_nudgeLeft10Action = nullptr;
+    QAction *m_nudgeRight10Action = nullptr;
+    QAction *m_closeAllGapsAction = nullptr;
+
     QAction *m_splitAction;
     QAction *m_deleteAction;
     QAction *m_rippleDeleteAction;
@@ -922,6 +997,7 @@ private:
     // STILLS-WIPE: AppData のスチル一覧と、その表示専用比較状態。
     stillstore::StillStore m_stillStore;
     StillGalleryDock *m_stillGalleryDock = nullptr;
+    SequenceListDock *m_sequenceListDock = nullptr;
     stillcompare::Config m_stillCompare;
     QString m_activeStillId;
     QAction *m_stillCompareAction = nullptr;
@@ -1019,6 +1095,7 @@ private:
 
     // Audio meters dock
     QDockWidget *m_audioMetersDock = nullptr;
+    QDockWidget *m_audioMixerDock = nullptr;
     QList<QMetaObject::Connection> m_meterConnections;
     QList<class AudioMeterWidget *> m_audioMeterWidgets;
     class AudioMeterWidget *m_masterMeter = nullptr;
@@ -1063,6 +1140,7 @@ private:
     // re-used on subsequent menu invocations so toggling the action
     // shows/hides the same dock.
     QDockWidget *m_equalizerDock = nullptr;
+    QDockWidget *m_deesserDock = nullptr;
     QDockWidget *m_compressorDock = nullptr;
     QDockWidget *m_reverbDock = nullptr;
     QDockWidget *m_noiseReductionDock = nullptr;
@@ -1177,3 +1255,34 @@ private:
     void onNodeGraphChanged();
     void onNodeSelected(int id);
 };
+
+// Shared by audio export and its DSP regression gates. Entries are stereo 48kHz
+// PreFx buffers; processing retains per-track histories and skips timeline gaps.
+namespace audioexport {
+struct DspEntry {
+    qint64 frameStart = 0;
+    std::vector<float> samples;
+};
+void processTrackEntries(std::vector<DspEntry> &entries, const trackfx::Chain &chain,
+                         const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
+                         bool eqEnabled, double preampDb);
+}
+
+class QComboBox;
+class EqualizerPanel;
+
+// Shared by the four audio panels and their headless regression gate.
+namespace audiofxui {
+void suppressEqualizerSelectionWrites(EqualizerPanel *panel);
+void buildAudioTrackList(int audioTrackCount, QStringList &names,
+                        QList<int> &ids, bool includeMaster = true);
+void setTrackComboItems(QComboBox *combo, const QStringList &names,
+                       const QList<int> &ids);
+// Undo-relevant FX of the mixer: per-track chains + master EQ / DeEsser
+// ("chains" / "masterChain"), with the DeEsser listen monitor cleared.
+QJsonObject undoState(AudioMixer *mixer);
+}
+namespace audiofxexport {
+void setMasterEqBypassForTest(bool bypass);
+quint64 masterEqPassesForTest();
+}
