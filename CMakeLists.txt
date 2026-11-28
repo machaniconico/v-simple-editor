@@ -1139,6 +1139,7 @@ if(MSVC)
         # over (error C1128), so /bigobj is required for every configuration.
         /bigobj
         $<$<CONFIG:Release>:/Zi>
+        $<$<CONFIG:Release>:/FS>
     )
     target_link_options(${PROJECT_NAME} PRIVATE
         $<$<CONFIG:Release>:/DEBUG>

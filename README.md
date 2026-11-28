@@ -684,9 +684,9 @@ v-simple-editor/
 - [x] Wave 31 (AE-Grade Animated Mesh Puppet — Phase 1+2): alpha-aware silhouette triangulation (transparent PNGs with configurable `expansionPx` / `density`) plus automatic full-frame grid mesh (opaque videos), Igarashi 2-step ARAP solver (`src/PuppetEngine.*`, zero external deps), 5 pin types (`Position` / `Bend` / `Advanced` / `Starch` / `Overlap` Z-depth premultiplied SrcOver compositing), per-pin keyframe animation & easing curves with auto-key drag, live deformed wireframe overlay in `PuppetPinTool`, `PuppetRigDialog`, SSOT `tlrender::renderFrameAt` parity, 1-step Undo, and `.veditor` JSON persistence (`puppet-arap` 10 gates; legacy `puppet-pin` & `surface-tool` preserved).
 - [x] Wave 32 (Animated Mesh Puppet — Phase 3): `Ctrl+Drag` Puppet Sketch real-time trajectory recording with Ramer-Douglas-Peucker simplification & motion trail (`simplifySketchRdp` / `applySketchToPin`, 1-step Undo), per-pin `PinDynamics` Wiggle & `Expression` secondary motion with 1-click Sway Presets (Hair/Ribbon, Breathing, Wind Gust) in `PuppetRigDialog`, and 2 MCP tools (`get_clip_puppet` / `set_clip_puppet`, total 63 MCP tools; `puppet-phase3` 8 gates).
 - [x] Wave 33 (Context-Aware Right-Click Menu Expansion — 8 Targets): expanded `ctxmenu::Target` from 4 to 8 customizable targets (`PreviewShape`, `PreviewExternalGenerator`, `TimelineVideoClip`, `TimelineGap` added), added auto hit-test classification for Shape & External Generator (Lottie/MOGRT/HTML/AudioViz) clips, wired ARAP Puppet / Color Versions / Creative FX / Pitch Shift / Role / Gap Marker & Text shortcuts into customizable menus (`context-menu-order` 12 gates).
-- [ ] CI green run + auto trigger on push / PR
+- [x] CI green run + auto trigger on push / PR (`.github/workflows/selftest.yml`: `Docs & LF Hygiene (Ubuntu)` + `Windows MSVC Build & Selftest Smoke` Ninja/MSVC + Qt 6.8.3 + FFmpeg 8.1)
 - [x] `src/main.cpp` split refactor (selftest functions → `src/selftests/`, dispatcher → SelftestRegistry module)
-- [ ] CRLF → LF wholesale normalization (per repo-root `.gitattributes`)
+- [x] CRLF → LF wholesale normalization (per repo-root `.gitattributes`, enforced in CI via `scripts/check_eol.py`)
 - [ ] Streaming pipeline real-authentication harness (YouTube / Vimeo / Twitch / X / Instagram currently no-op stub for CI)
 
 ### Wave 10 で据え置いた制限事項
