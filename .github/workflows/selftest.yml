@@ -1,36 +1,46 @@
 name: selftest
 
-# Smoke + light sweep for the selftest argv-switch table.
-#
-# STATUS: DRAFT — `workflow_dispatch` only (manual trigger). Auto-trigger
-# on push / pull_request is intentionally disabled until the first successful
-# run pins the vcpkg + Qt provisioning costs. Promote to `on: push, pull_request`
-# once a green run is achieved end-to-end.
-#
-# Exercises (light, no external footage):
-#   1. --selftest=list           : verify kArgvSelftests table populates
-#   2. --selftest=tracker-preset : QApplication-free entry
-#   3. --selftest=hdr-routing    : QApplication-free entry
-#   4. --selftest=unknown-foo    : guard returns exit 2
-#
-# Heavy entries (--selftest=all sweep with parity / e2e / libavcore-encode)
-# are out of scope here — they need real footage assets and stronger DLL
-# surface than the runner ships. Add a separate workflow once asset/DLL
-# provisioning is solved.
-
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: selftest-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  docs-and-eol-hygiene:
+    name: Docs & LF Hygiene (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify doc_ref_check.py (exit 0)
+        run: |
+          python3 -I scripts/doc_ref_check.py \
+            --allow scripts/doc_ref_allow.txt \
+            --anchors scripts/doc_ref_anchors.txt \
+            README.md 機能一覧と検証ガイド.txt ツールバーと機能ガイド.txt
+
+      - name: Verify CRLF -> LF compliance per .gitattributes
+        run: python3 -I scripts/check_eol.py
+
   windows-msvc-smoke:
+    name: Windows MSVC Build & Selftest Smoke
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     env:
-      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+      QT_QPA_PLATFORM: offscreen
+      VEDITOR_MCP_PORT: "18299"
 
     steps:
       - name: Checkout
@@ -41,20 +51,30 @@ jobs:
         with:
           arch: x64
 
-      - name: Set up vcpkg
-        uses: lukka/run-vcpkg@v11
+      - name: Cache vcpkg FFmpeg packages
+        id: cache-vcpkg
+        uses: actions/cache@v4
         with:
-          vcpkgGitCommitId: "2024.07.12"
+          path: |
+            C:\vcpkg\installed\x64-windows
+            C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: vcpkg-ffmpeg-core-x64-win-v1-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            vcpkg-ffmpeg-core-x64-win-v1-
 
       - name: Install FFmpeg (vcpkg)
         shell: cmd
         run: |
-          %VCPKG_ROOT%\vcpkg install ffmpeg:x64-windows
+          if not exist "C:\vcpkg\installed\x64-windows\include\libavformat\avformat.h" (
+            C:\vcpkg\vcpkg.exe install "ffmpeg[core,avcodec,avformat,avfilter,swscale,swresample]:x64-windows" --clean-after-build
+          ) else (
+            echo FFmpeg headers already cached in C:\vcpkg\installed\x64-windows
+          )
 
       - name: Install Qt 6
         uses: jurplel/install-qt-action@v4
         with:
-          version: "6.7.0"
+          version: "6.8.3"
           host: windows
           target: desktop
           arch: win64_msvc2022_64
@@ -65,34 +85,52 @@ jobs:
         shell: cmd
         run: |
           cmake -S . -B build_win -G "Visual Studio 17 2022" -A x64 ^
-            -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake
+            -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build Release
         shell: cmd
         run: |
-          cmake --build build_win --config Release
+          cmake --build build_win --config Release -- /m /v:m
 
-      - name: Smoke — --selftest=list
-        shell: cmd
+      - name: Run Selftest Smoke Suite
+        shell: pwsh
         run: |
-          build_win\Release\v-simple-editor.exe --selftest=list
+          $env:PATH = "$env:Qt6_DIR\bin;C:\vcpkg\installed\x64-windows\bin;$env:PATH"
+          $exe = "build_win\Release\v-simple-editor.exe"
+          $suites = @("list", "tracker-preset", "hdr-routing", "radeon-amf", "puppet-arap", "context-menu-order")
+          $fail = 0
+          foreach ($s in $suites) {
+            $log = Join-Path $env:TEMP ("ci_st_" + $s + ".log")
+            Write-Host "=== SELFTEST: $s ==="
+            & cmd.exe /c "$exe --selftest=$s > `"$log`" 2>&1"
+            $rc = $LASTEXITCODE
+            if (Test-Path $log) {
+              if ($s -eq "list") {
+                Get-Content $log | Select-Object -First 25
+                Write-Host ("Total lines: " + (Get-Content $log).Count)
+              } else {
+                Get-Content $log | Select-String -Pattern "PASS|FAIL|SKIP|summary|gate-count"
+                if ($rc -ne 0) {
+                  Write-Host "--- TAIL ---"
+                  Get-Content $log | Select-Object -Last 40
+                }
+              }
+              Remove-Item $log -Force -ErrorAction SilentlyContinue
+            }
+            Write-Host "EXIT($s)=$rc"
+            if ($rc -ne 0) { $fail = 1 }
+          }
 
-      - name: Smoke — --selftest=tracker-preset (QApp-free)
-        shell: cmd
-        run: |
-          build_win\Release\v-simple-editor.exe --selftest=tracker-preset
-
-      - name: Smoke — --selftest=hdr-routing (QApp-free)
-        shell: cmd
-        run: |
-          build_win\Release\v-simple-editor.exe --selftest=hdr-routing
-
-      - name: Guard — --selftest=<unknown> exits 2
-        shell: cmd
-        run: |
-          build_win\Release\v-simple-editor.exe --selftest=unknown-foo
-          if %ERRORLEVEL% NEQ 2 (
-            echo Expected exit 2 for unknown selftest, got %ERRORLEVEL%
-            exit /b 1
-          )
-          echo PASS: unknown selftest correctly returned exit 2
+          Write-Host "=== GUARD: --selftest=unknown-foo (expect exit 2) ==="
+          $log = Join-Path $env:TEMP "ci_st_unknown.log"
+          & cmd.exe /c "$exe --selftest=unknown-foo > `"$log`" 2>&1"
+          $rc = $LASTEXITCODE
+          if (Test-Path $log) { Get-Content $log; Remove-Item $log -Force -ErrorAction SilentlyContinue }
+          if ($rc -ne 2) {
+            Write-Host "FAIL: expected exit 2 for unknown selftest, got $rc"
+            $fail = 1
+          } else {
+            Write-Host "PASS: unknown selftest returned exit 2"
+          }
+          exit $fail
