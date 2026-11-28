@@ -15,6 +15,7 @@
 #include "MogrtTemplate.h"
 #include "OtioImport.h"
 #include "PowerBinStore.h"
+#include "QrhiPreviewWidget.h"
 #include "SubclipStore.h"
 #include "TimelineIndexDock.h"
 #include "TimelineMinimap.h"
@@ -6953,6 +6954,21 @@ void MainWindow::setupMenuBar()
     });
     m_menuHelpEntries.append({gpuDiagAction,
         QStringLiteral("AMD Radeon / NVIDIA / Intel GPU のエンコード・デコード・WGL-DX・DirectML/Vulkan 設定を確認します。")});
+
+    auto *qrhiPreviewAction = toolsMenu->addAction(
+        QStringLiteral("Qt6 QRhi クロスベンダ・プレビュー (D3D11 / Vulkan)…"));
+    qrhiPreviewAction->setObjectName("action_qrhi_preview_test");
+    connect(qrhiPreviewAction, &QAction::triggered, this, [this]() {
+        QImage frame;
+        if (m_timeline) {
+            const qint64 us = qRound64(m_timeline->playheadPosition() * 1e6);
+            frame = tlrender::renderFrameAt(m_timeline, us, QSize(640, 360));
+        }
+        qrhipreview::QrhiPreviewDialog dlg(frame, this);
+        dlg.exec();
+    });
+    m_menuHelpEntries.append({qrhiPreviewAction,
+        QStringLiteral("Qt6 QRhi (Direct3D 11 / Vulkan / OpenGL) によるベンダー非依存プレビューと GPU 能力を確認します。")});
 
     // PPTX: 文字起こし / マーカー / タイトルから PowerPoint 資料 (.pptx) を書き出す。
     auto *pptxExportAction = toolsMenu->addAction(
