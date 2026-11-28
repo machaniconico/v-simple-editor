@@ -1,11 +1,11 @@
 # doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
 # The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
 # A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.
-README.md:822	ブラシを持つクリップの RenderInPlace
+README.md:823	ブラシを持つクリップの RenderInPlace
 src/AudioExportMix.cpp:211	audioexport::sortedDedupedEnvelope(
 src/AudioExportMix.cpp:223	audio::clampClipGain(point.gain)
 src/AudioExportMix.cpp:237	audioexport::mergeDuckingEnvelope(
-src/AudioExportMix.cpp:390-398	const auto trackAudible = [&](int track)
+src/AudioExportMix.cpp:391-399	const auto trackAudible = [&](int track)
 src/AudioExportMix.cpp:51	audio::clampClipGain(entry.volume)
 src/AudioMixer.cpp:934	double gain = audio::clampClipGain(clipGain);
 src/AudioMixerDock.cpp:198-203	m_timeline->toggleMuteTrack(i);
@@ -19,15 +19,15 @@ src/GLPreview.cpp:1259	if (m_brushAnimation && !cameraBaked && !specialComposite
 src/GLPreview.cpp:159	clipanim::layer3DAt(clip, clipLocalSeconds)
 src/GLPreview.cpp:2255	m_projectCameraFrame = tlrender::renderFrameAt(
 src/GLPreview.cpp:2998	!m_solvePointOverlay.isEmpty()
-src/MainWindow.cpp:13292	400% = max
-src/MainWindow.cpp:16954	MainWindow::createNullAtSolvePoint(int index)
-src/MainWindow.cpp:17848-17851	applied.poses.cbegin(), applied.poses.cend()
-src/MainWindow.cpp:17868-17876	3D カメラ解析を適用できませんでした
-src/MainWindow.cpp:9668	preview/text3dProxyThreshold
-src/MainWindow.cpp:10072	active.layer.zOrder = trackIdx;
-src/MainWindow.cpp:10073	active.layer.layer3D = clipanim::layer3DAt(
-src/MainWindow.cpp:10115	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
-src/MainWindow.cpp:10162-10169	if (!hasTrackMatteLayer)
+src/MainWindow.cpp:13300	400% = max
+src/MainWindow.cpp:16962	MainWindow::createNullAtSolvePoint(int index)
+src/MainWindow.cpp:17856-17859	applied.poses.cbegin(), applied.poses.cend()
+src/MainWindow.cpp:17876-17884	3D カメラ解析を適用できませんでした
+src/MainWindow.cpp:9675	preview/text3dProxyThreshold
+src/MainWindow.cpp:10079	active.layer.zOrder = trackIdx;
+src/MainWindow.cpp:10080	active.layer.layer3D = clipanim::layer3DAt(
+src/MainWindow.cpp:10122	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
+src/MainWindow.cpp:10169-10176	if (!hasTrackMatteLayer)
 src/PlanarTrackerDialog.cpp:920	m_cameraFovWarning->setText(
 src/ProjectFile.cpp:1706	clip.dynamicTimeOffsetSec != 0.0
 src/RenderInPlace.cpp:27-29	The brush (brushData, brush_progress) is drawn
