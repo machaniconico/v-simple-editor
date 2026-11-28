@@ -1,5 +1,6 @@
 #pragma once
 
+#include "CameraSolver.h"
 #include "Keyframe.h"
 #include "LayerCompositor.h"
 
@@ -11,6 +12,8 @@
 #include <QSize>
 #include <QVector>
 #include <QVector3D>
+
+#include <optional>
 
 // --- Camera state at a point in time ---
 
@@ -131,6 +134,17 @@ public:
     void setShake(const CameraShake &s);
     CameraShake shake() const { return m_shake; }
 
+    // --- Feature camera-solve mapping (JSON "solveMapping"; absent when unset) ---
+
+    void setSolveMapping(const std::optional<camsolve::SolveMapping> &mapping) { m_solveMapping = mapping; }
+    std::optional<camsolve::SolveMapping> solveMapping() const { return m_solveMapping; }
+
+    // Bundle point cloud in reference-centred solver units (JSON "solvePoints"; omitted when empty).
+    void setSolvePoints(const QVector<QVector3D> &points) { m_solvePoints = points; }
+    const QVector<QVector3D> &solvePoints() const { return m_solvePoints; }
+    // The cloud in world px, S*p - f*e3; empty without a solve mapping.
+    QVector<QVector3D> solvePointsWorldPx() const;
+
     // --- Built-in camera moves (static factory methods) ---
 
     static Camera3D createDollyZoom(double startZ, double endZ, double duration);
@@ -167,6 +181,9 @@ private:
 
     CameraShake m_shake;
 
+    std::optional<camsolve::SolveMapping> m_solveMapping;
+    QVector<QVector3D> m_solvePoints;
+
     // --- Deterministic value-noise helpers (shake) ---
 
     static unsigned int hashMix(unsigned int h);
@@ -189,6 +206,18 @@ namespace camera3d {
 // (canvas px, centre origin, y down) at the camera position (rotationZ is kept).
 Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
                                     const Camera3DState &camera);
+// US-1813: layer3D for a projection done at uploadSize instead of the canvas: worldX / worldY
+// (canvas px) scale by uploadW / canvasW, Z and the rotations are kept (fov is not scaled).
+// Unchanged when either size is empty.
+Layer3DTransform layer3DForPreviewScale(const Layer3DTransform &layer3D, const QSize &uploadSize,
+                                        const QSize &canvasSize);
+// US-1810: canvas px of a world point (canvas px, centre origin, y down) under the
+// projectLayerQuad projection; nullopt when fov + view z <= 1e-3 (at / behind the pinhole).
+std::optional<QPointF> projectWorldPoint(const QVector3D &worldPx, const Camera3DState &camera,
+                                         const QSize &canvas);
+// US-1817: canvas px of the camera's solve point cloud at sec; points at / behind the pinhole
+// are left out, so the result can be shorter than solvePoints().
+QVector<QPointF> projectedSolvePoints(const Camera3D &camera, double sec, const QSize &canvas);
 } // namespace camera3d
 
 // Shared opt-in compositing step for preview and export.

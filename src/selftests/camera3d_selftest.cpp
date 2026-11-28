@@ -52,6 +52,19 @@ double mse(const QImage &a, const QImage &b)
     return sum / (aa.width() * aa.height() * 4.0);
 }
 
+double meanAbsDiff(const QImage &a, const QImage &b)
+{
+    if (a.isNull() || b.isNull() || a.size() != b.size())
+        return std::numeric_limits<double>::infinity();
+    const QImage aa = a.convertToFormat(QImage::Format_RGBA8888);
+    const QImage bb = b.convertToFormat(QImage::Format_RGBA8888);
+    double sum = 0;
+    for (int y = 0; y < aa.height(); ++y)
+        for (int x = 0; x < aa.width() * 4; ++x)
+            sum += std::abs(double(aa.constScanLine(y)[x]) - bb.constScanLine(y)[x]);
+    return sum / (aa.width() * aa.height() * 4.0);
+}
+
 QPointF centroid(const QPolygonF &quad)
 {
     QPointF sum;
@@ -582,6 +595,245 @@ int runCamera3DSelftest()
             gate(11, seeked && owned && cameraSec == 2.0);
         }
     }
+    // G12 (US-1813): worldX = worldY = 0 keeps the projectLayerQuad corners of a rotated, pushed
+    // layer at the pre-worldX values (pinned literals of the same formula, default camera,
+    // 200x100), and isDefault / isDefaultIgnoringWorld split on the world fields.
+    {
+        Layer3DTransform pinned;
+        pinned.positionZ = 40.0;
+        pinned.rotationX = 10.0;
+        pinned.rotationY = 20.0;
+        pinned.rotationZ = 30.0;
+        const QPolygonF quad = Camera3D::projectLayerQuad(pinned, Camera3DState{}, QSize(200, 100));
+        const QPointF expected[4] = {QPointF(71.7567, 6.6278), QPointF(207.6645, 52.9734),
+                                     QPointF(148.1346, 123.9184), QPointF(56.4087, 48.7961)};
+        bool cornersOk = quad.size() == 4;
+        for (int i = 0; cornersOk && i < 4; ++i) {
+            std::fprintf(stderr, "camera3d G12: corner %d = (%.4f, %.4f) expected (%.4f, %.4f)\n", i,
+                         quad[i].x(), quad[i].y(), expected[i].x(), expected[i].y());
+            cornersOk = std::abs(quad[i].x() - expected[i].x()) < 1e-3
+                && std::abs(quad[i].y() - expected[i].y()) < 1e-3;
+        }
+        Layer3DTransform worldOnly;
+        worldOnly.worldX = 1.0;
+        Layer3DTransform worldYOnly;
+        worldYOnly.worldY = 1.0;
+        Layer3DTransform zOnly;
+        zOnly.positionZ = 1.0;
+        Layer3DTransform cleared = worldOnly;
+        cleared.reset();
+        const bool defaultOk = !worldOnly.isDefault() && !worldYOnly.isDefault()
+            && worldOnly.isDefaultIgnoringWorld() && worldYOnly.isDefaultIgnoringWorld()
+            && !zOnly.isDefaultIgnoringWorld() && Layer3DTransform{}.isDefault()
+            && cleared.isDefault() && cleared.worldX == 0.0;
+        std::fprintf(stderr, "camera3d G12: cornersOk=%d defaultOk=%d\n", cornersOk, defaultOk);
+        gate(12, cornersOk && defaultOk);
+    }
+
+    // G13 (US-1813): worldX moves the trueProjection quad by worldX * fov / (fov + Z) and the
+    // auto-orient aim point, while the legacy applyPerspective never reads it: (a) an RGBA8888
+    // image with only worldX set stays on the short-circuit (same image, same format; a
+    // short-circuit on isDefault() repaints it as ARGB32_Premultiplied), (b) with Z = 10 the
+    // output does not depend on worldX.
+    {
+        const QSize quadCanvas(200, 100);
+        const Camera3DState identityCamera;
+        Layer3DTransform atZ;
+        atZ.positionZ = 40.0;
+        Layer3DTransform shifted = atZ;
+        shifted.worldX = 100.0;
+        const QPointF delta = centroid(Camera3D::projectLayerQuad(shifted, identityCamera, quadCanvas))
+            - centroid(Camera3D::projectLayerQuad(atZ, identityCamera, quadCanvas));
+        const double expectedDx = 100.0 * identityCamera.fov / (identityCamera.fov + atZ.positionZ);
+        Layer3DTransform shiftedY = atZ;
+        shiftedY.worldY = -60.0;
+        const QPointF deltaY = centroid(Camera3D::projectLayerQuad(shiftedY, identityCamera, quadCanvas))
+            - centroid(Camera3D::projectLayerQuad(atZ, identityCamera, quadCanvas));
+        const double expectedDy = -60.0 * identityCamera.fov / (identityCamera.fov + atZ.positionZ);
+        const bool quadOk = std::abs(delta.x() - expectedDx) < 1e-3 && std::abs(delta.y()) < 1e-3
+            && std::abs(deltaY.y() - expectedDy) < 1e-3 && std::abs(deltaY.x()) < 1e-3;
+
+        Camera3DState orientCam;
+        orientCam.position = QVector3D(0.0f, 0.0f, -500.0f);
+        orientCam.target = orientCam.position + QVector3D(0.0f, 0.0f, -1.0f);
+        orientCam.trueProjection = true;
+        ClipInfo oriented;
+        oriented.is3DLayer = true;
+        oriented.autoOrientToCamera = true;
+        const double rotY0 = camera3d::effectiveLayer3DAt(oriented, QPointF(), orientCam).rotationY;
+        oriented.layer3D.worldX = 100.0;
+        const double rotY100 = camera3d::effectiveLayer3DAt(oriented, QPointF(), orientCam).rotationY;
+        const double expectedRotY = std::atan2(100.0, 500.0) * 180.0 / 3.14159265358979323846;
+        oriented.layer3D.worldX = 0.0;
+        const double rotX0 = camera3d::effectiveLayer3DAt(oriented, QPointF(), orientCam).rotationX;
+        oriented.layer3D.worldY = 100.0;
+        const double rotX100 = camera3d::effectiveLayer3DAt(oriented, QPointF(), orientCam).rotationX;
+        const bool orientOk = std::abs(rotY0) < 1e-9 && std::abs(rotY100 - expectedRotY) < 1e-3
+            && std::abs(rotX100 - rotX0) > 1.0;
+
+        QImage rgba(64, 48, QImage::Format_RGBA8888);
+        for (int y = 0; y < rgba.height(); ++y)
+            for (int x = 0; x < rgba.width(); ++x)
+                rgba.setPixelColor(x, y, QColor(x * 4, y * 5, 90, 255));
+        Layer3DTransform worldOnly;
+        worldOnly.worldX = 100.0;
+        const QImage shortCircuit = Camera3D::applyPerspective(rgba, worldOnly, Camera3DState{},
+                                                               rgba.size());
+        const bool shortOk = shortCircuit == rgba && shortCircuit.format() == QImage::Format_RGBA8888;
+        Layer3DTransform pushed;
+        pushed.positionZ = 10.0;
+        Layer3DTransform pushedWorld = pushed;
+        pushedWorld.worldX = 100.0;
+        const QImage bodyNoWorld = Camera3D::applyPerspective(rgba, pushed, Camera3DState{}, rgba.size());
+        const QImage bodyWorld = Camera3D::applyPerspective(rgba, pushedWorld, Camera3DState{},
+                                                            rgba.size());
+        const bool bodyOk = sameBytes(bodyNoWorld, bodyWorld) && !sameBytes(bodyNoWorld, rgba);
+        std::fprintf(stderr, "camera3d G13: centroidDx=%.6f centroidDy=%.6f expectedDx=%.6f "
+                     "worldY centroidDy=%.6f expectedDy=%.6f quadOk=%d "
+                     "rotY0=%.6f rotY100=%.6f expectedRotY=%.6f rotX0=%.6f rotX100=%.6f orientOk=%d "
+                     "shortCircuitFormat=%d (RGBA8888=%d) sameImage=%d shortOk=%d bodyOk=%d\n",
+                     delta.x(), delta.y(), expectedDx, deltaY.y(), expectedDy, quadOk, rotY0, rotY100,
+                     expectedRotY, rotX0, rotX100, orientOk,
+                     int(shortCircuit.format()), int(QImage::Format_RGBA8888), shortCircuit == rgba,
+                     shortOk, bodyOk);
+        gate(13, quadOk && orientOk && shortOk && bodyOk);
+    }
+
+    // G14 (US-1813): worldX / worldY survive a JSON round trip and are absent at zero.
+    {
+        Layer3DTransform full;
+        full.positionZ = 3.0;
+        full.rotationY = 4.0;
+        full.worldX = 12.5;
+        full.worldY = -7.25;
+        const QJsonObject fullJson = full.toJson();
+        const Layer3DTransform back = Layer3DTransform::fromJson(
+            QJsonDocument::fromJson(QJsonDocument(fullJson).toJson()).object());
+        const bool roundTripOk = back.worldX == 12.5 && back.worldY == -7.25
+            && back.positionZ == 3.0 && back.rotationY == 4.0;
+        Layer3DTransform xOnly;
+        xOnly.worldX = 5.0;
+        const QJsonObject zeroJson = Layer3DTransform{}.toJson();
+        const QJsonObject xOnlyJson = xOnly.toJson();
+        const bool absentOk = !zeroJson.contains(QStringLiteral("worldX"))
+            && !zeroJson.contains(QStringLiteral("worldY"))
+            && xOnlyJson.contains(QStringLiteral("worldX"))
+            && !xOnlyJson.contains(QStringLiteral("worldY"))
+            && Layer3DTransform::fromJson(zeroJson).isDefault();
+        std::fprintf(stderr, "camera3d G14: json=%s roundTripOk=%d zeroKeys=%lld absentOk=%d\n",
+                     QJsonDocument(fullJson).toJson(QJsonDocument::Compact).constData(), roundTripOk,
+                     static_cast<long long>(zeroJson.size()), absentOk);
+        gate(14, roundTripOk && absentOk);
+    }
+
+    // G15 (US-1813): the GL preview. (a) layer3DForPreviewScale halves worldX / worldY for a
+    // half-size upload and keeps Z / rotations. (b) A GLPreview without a Timeline whose owner
+    // player's canvas is 1920x1080 projects a 960x540 upload with worldX scaled to it: half of
+    // the 1920 projection (control: worldX 100 unscaled at 960). (c) With a Timeline the
+    // trueProjection upload is renderFrameAt's frame, which carries worldX.
+    {
+        Layer3DTransform source;
+        source.positionZ = 7.0;
+        source.rotationX = 1.0;
+        source.rotationY = 2.0;
+        source.rotationZ = 3.0;
+        source.worldX = 100.0;
+        source.worldY = 40.0;
+        const Layer3DTransform half = camera3d::layer3DForPreviewScale(source, QSize(960, 540),
+                                                                       QSize(1920, 1080));
+        const Layer3DTransform noCanvas = camera3d::layer3DForPreviewScale(source, QSize(960, 540),
+                                                                           QSize());
+        const bool scaleOk = half.worldX == 50.0 && half.worldY == 20.0 && half.positionZ == 7.0
+            && half.rotationX == 1.0 && half.rotationY == 2.0 && half.rotationZ == 3.0
+            && noCanvas.worldX == 100.0 && noCanvas.worldY == 40.0;
+        std::fprintf(stderr, "camera3d G15 (a): half worldX=%.6f worldY=%.6f z=%.3f rot=(%.3f,%.3f,%.3f) "
+                     "noCanvas worldX=%.6f scaleOk=%d\n", half.worldX, half.worldY, half.positionZ,
+                     half.rotationX, half.rotationY, half.rotationZ, noCanvas.worldX, scaleOk);
+
+        Camera3DState projCam;
+        projCam.trueProjection = true;
+        VideoPlayer player;
+        GLPreview *view = player.glPreview();
+        if (!view) {
+            if (scaleOk) {
+                std::fprintf(stderr, "SKIP G15 (no GLPreview in VideoPlayer)\n");
+                ++skipped;
+            } else {
+                gate(15, false);
+            }
+        } else {
+            const QSize bigCanvas(1920, 1080);
+            const QSize uploadSize(960, 540);
+            player.setProjectOutputSize(bigCanvas);
+            view->setTimeline(nullptr);
+            view->setProjectCamera(projCam);
+            QImage frame1920(bigCanvas, QImage::Format_ARGB32);
+            for (int y = 0; y < frame1920.height(); ++y) {
+                QRgb *line = reinterpret_cast<QRgb *>(frame1920.scanLine(y));
+                for (int x = 0; x < frame1920.width(); ++x)
+                    line[x] = qRgba(x * 255 / 1919, y * 255 / 1079, 128, 255);
+            }
+            const QImage upload = frame1920.scaled(uploadSize, Qt::IgnoreAspectRatio,
+                                                   Qt::SmoothTransformation);
+            Layer3DTransform world100;
+            world100.worldX = 100.0;
+            view->displayFrame(upload);
+            const QImage projected = view->projectedUploadFrameForTest(true, world100);
+            const QImage expected = applyProjectCameraProjection(frame1920, world100, true, projCam,
+                                                                 bigCanvas)
+                                        .scaled(uploadSize, Qt::IgnoreAspectRatio,
+                                                Qt::SmoothTransformation);
+            const QImage unscaled = applyProjectCameraProjection(upload, world100, true, projCam,
+                                                                 uploadSize);
+            const double diffScaled = meanAbsDiff(projected, expected);
+            const double diffControl = meanAbsDiff(unscaled, expected);
+            const bool previewOk = diffScaled <= 1.0 && diffControl > 5.0;
+            std::fprintf(stderr, "camera3d G15 (b): owner=%d canvas=%dx%d projected=%dx%d "
+                         "meanAbsDiff(scaled)=%.4f meanAbsDiff(control unscaled)=%.4f previewOk=%d\n",
+                         view->ownerPlayer() == &player, player.projectOutputSize().width(),
+                         player.projectOutputSize().height(), projected.width(), projected.height(),
+                         diffScaled, diffControl, previewOk);
+
+            if (!scaleOk || !previewOk) {
+                gate(15, false);
+            } else if (!player.isGLAccelerated()) {
+                std::fprintf(stderr, "SKIP G15 (OpenGL preview unavailable in this environment)\n");
+                ++skipped;
+            } else {
+                const QSize bakeCanvas(160, 90);
+                ClipInfo worldClip = fixtureClip(QColor(220, 80, 40), bakeCanvas);
+                worldClip.is3DLayer = true;
+                worldClip.layer3D.worldX = 20.0;
+                ClipInfo flatClip = worldClip;
+                flatClip.layer3D.worldX = 0.0;
+                Timeline bakeTl;
+                Timeline flatTl;
+                for (Timeline *tl : {&bakeTl, &flatTl}) {
+                    while (tl->videoTracks().isEmpty())
+                        tl->addVideoTrack();
+                    tl->setProjectCamera(Camera3D{projCam});
+                }
+                bakeTl.videoTracks()[0]->setClips({worldClip});
+                flatTl.videoTracks()[0]->setClips({flatClip});
+                const QImage bakeExpected = tlrender::renderFrameAt(&bakeTl, 0, bakeCanvas);
+                const QImage flatFrame = tlrender::renderFrameAt(&flatTl, 0, bakeCanvas);
+                player.setProjectOutputSize(bakeCanvas);
+                view->setTimeline(&bakeTl);
+                view->setProjectCamera(projCam);
+                view->grabFramebuffer(); // runs paintGL, which bakes m_projectCameraFrame
+                const QImage bakedUpload = view->uploadFrameForTest();
+                view->setTimeline(nullptr);
+                const bool bakedSame = sameBytes(bakedUpload, bakeExpected);
+                const double worldVisible = meanAbsDiff(bakeExpected, flatFrame);
+                const bool bakedOk = bakedSame && worldVisible > 1.0;
+                std::fprintf(stderr, "camera3d G15 (c): upload=%dx%d uploadEqualsRenderFrameAt=%d "
+                             "meanAbsDiff(worldX 20 vs 0)=%.4f bakedOk=%d\n", bakedUpload.width(),
+                             bakedUpload.height(), bakedSame, worldVisible, bakedOk);
+                gate(15, bakedOk);
+            }
+        }
+    }
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL, %d SKIP\n", passed, failed, skipped);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, skipped);

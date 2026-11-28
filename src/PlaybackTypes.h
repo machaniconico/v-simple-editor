@@ -24,6 +24,31 @@ struct AudioGainPoint {
     double gain = 1.0;
 };
 
+namespace audio {
+// Linear-interpolate the per-clip volume envelope at a given clip-local
+// time (seconds, 0.0 == clip start on the timeline). Empty envelope falls
+// back to the static `volume` field so existing behaviour is preserved
+// when no automation has been authored. Endpoints clamp (no extrapolation).
+inline double evaluateVolumeEnvelope(const QVector<AudioGainPoint> &env,
+                                     double clipLocalSec,
+                                     double fallbackGain) {
+    if (env.isEmpty()) return fallbackGain;
+    if (clipLocalSec <= env.first().time) return env.first().gain;
+    if (clipLocalSec >= env.last().time) return env.last().gain;
+    for (int i = 0; i + 1 < env.size(); ++i) {
+        const double aT = env[i].time;
+        const double bT = env[i + 1].time;
+        if (clipLocalSec >= aT && clipLocalSec <= bT) {
+            const double span = bT - aT;
+            if (span <= 0.0) return env[i + 1].gain;
+            const double u = (clipLocalSec - aT) / span;
+            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
+        }
+    }
+    return fallbackGain;
+}
+} // namespace audio
+
 // Resolved playback descriptor used to communicate the timeline schedule from
 // Timeline to VideoPlayer. Independent from ClipInfo (which carries editor-side
 // metadata like waveforms, effects, keyframes) so VideoPlayer stays lean and

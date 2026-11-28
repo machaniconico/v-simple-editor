@@ -1436,6 +1436,8 @@ QImage applyTextOverlays(const QImage &composited,
     return result;
 }
 
+} // namespace
+
 // Locate the clip on a single track active at `targetSec`. Returns the clip
 // index plus its timeline-start, or -1. Mirrors the S2 footprint walk
 // (ClipInfo::leadInSec + effectiveDuration(), Timeline.h:124-127). The
@@ -1463,6 +1465,8 @@ int activeClipOnTrack(const QVector<ClipInfo> &clips, double targetSec,
     }
     return -1;
 }
+
+namespace {
 
 double sourceSecondForClipAtLocalTime(const ClipInfo &clip, double localSec,
                                       bool reverseCompositionActive)
@@ -1940,13 +1944,16 @@ std::map<QByteArray, std::unique_ptr<BrushAnimation>> &brushAnimationCache()
     return *cache;
 }
 
+} // namespace
+
 // US-1708: draw the clip's brush strokes onto the roto'd raw source, before
 // VFX / grade (the preview's non-composite-baked stage: the brush goes on the
 // decoded frame and the shader grades it afterwards). Progress follows the
 // clip's "brush_progress" keyframes. No strokes, or progress 0, leave the
-// source byte-unchanged.
-QImage applyClipBrush(const QImage &raw, const ClipInfo &clip, double localSec,
-                      const QString &clipId)
+// source byte-unchanged. US-1805: public so the special-composite preview draws
+// at the same stage through the same cache.
+QImage applyClipBrushSource(const QImage &raw, const ClipInfo &clip, double localSec,
+                            const QString &clipId)
 {
     if (clip.brushData.isEmpty() || raw.isNull())
         return raw;
@@ -1973,6 +1980,53 @@ QImage applyClipBrush(const QImage &raw, const ClipInfo &clip, double localSec,
     OverlayRenderer::renderBrushOverlay(out, it->second.get(), progress);
     return out;
 }
+
+bool timelineBrushWantsSpecialPath(const Timeline *timeline)
+{
+    if (!timeline)
+        return false;
+    // Nor parenting, which renderFrameAt applies and the special composite
+    // does not.
+    if (veditor::parentingEnabledFromEnv() && !timeline->clipParentEntries().isEmpty())
+        return false;
+    bool hasBrush = false;
+    for (const auto *track : timeline->videoTracks()) {
+        if (!track)
+            continue;
+        for (const ClipInfo &clip : track->clips()) {
+            if (clip.blendMode != BlendMode::Normal || clip.isAdjustment || clip.hasMask())
+                return false;
+            // Nor clips the special composite cannot draw as renderFrameAt does
+            // (shape, nested sequence, disabled): those timelines keep their
+            // HEAD preview instead of losing the layer.
+            if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
+                return false;
+            // Nor what it places statically or skips: keyframed transform /
+            // opacity (any track but brush_progress), SNS fit, transitions.
+            for (const KeyframeTrack &kf : clip.keyframes.tracks()) {
+                if (kf.propertyName() != QLatin1String("brush_progress"))
+                    return false;
+            }
+            if (clip.fitContain || clip.fitCover)
+                return false;
+            if (!clip.layerStyle.isIdentity())
+                return false;
+            if (clip.leadIn.type != TransitionType::None
+                || clip.trailOut.type != TransitionType::None)
+                return false;
+            hasBrush = hasBrush || !clip.brushData.isEmpty();
+        }
+    }
+    return hasBrush;
+}
+
+QImage decodeClipSourceFrame(const QString &filePath, double sourceSec,
+                             bool usePreviousSourceFrame, double sourceInSec)
+{
+    return decodeClipFrameNative(filePath, sourceSec, usePreviousSourceFrame, sourceInSec);
+}
+
+namespace {
 
 // US-1707: the native layer source of one clip (rule (78)): roto -> VFX ->
 // grade -> FX pack / echo stack / mesh warp -> clip mask -> 3D text, before
@@ -2008,7 +2062,7 @@ QImage renderClipLayerSource(const Timeline *timeline,
     // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
     // that image feeds both the echo and the plain branch; the echo past-frame
     // provider below stays brush-free.
-    const QImage raw = applyClipBrush(roto, clip, localSec, scopedClipId);
+    const QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
     if (stopAfterBrush)
         return raw;
     QImage fx;

@@ -39,6 +39,8 @@ const QStringList &motionTrackNames()
         QStringLiteral("motion.rotation"),
         QStringLiteral("motion.opacity"),
         QStringLiteral("motion.position.z"),
+        QStringLiteral("motion.world.x"),
+        QStringLiteral("motion.world.y"),
         QStringLiteral("motion.rotation.x"),
         QStringLiteral("motion.rotation.y"),
         QStringLiteral("motion.rotation.z"),
@@ -754,7 +756,9 @@ void EffectControlsPanel::refreshFromCurrentClip()
         clip.layer3D.positionZ,
         clip.layer3D.rotationX,
         clip.layer3D.rotationY,
-        clip.layer3D.rotationZ
+        clip.layer3D.rotationZ,
+        clip.layer3D.worldX,
+        clip.layer3D.worldY
     });
     setLayerStyleControls(clip.layerStyle, true);
 

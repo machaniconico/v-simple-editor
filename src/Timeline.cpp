@@ -2019,6 +2019,62 @@ bool splitClipByConsumedSource(const ClipInfo &clip, double localSec, bool audio
     return makePiece(0.0, localSec, left) && makePiece(localSec, totalSec, right);
 }
 
+// US-1807: effect keyframe tracks are named by effect index,
+// "effect.<i>.<rest>" (parsed as EffectControlsPanel's parseEffectTrackName).
+bool parseSplitEffectTrackName(const QString &trackName, int *effectIndex, QString *rest)
+{
+    static const QString prefix = QStringLiteral("effect.");
+    if (!trackName.startsWith(prefix)) return false;
+    const int indexStart = prefix.size();
+    const int dotPos = trackName.indexOf(QLatin1Char('.'), indexStart);
+    if (dotPos <= indexStart) return false;
+    bool ok = false;
+    const int parsedIndex = trackName.mid(indexStart, dotPos - indexStart).toInt(&ok);
+    if (!ok || parsedIndex < 0) return false;
+    *effectIndex = parsedIndex;
+    *rest = trackName.mid(dotPos + 1);
+    return true;
+}
+
+// Drops the tracks of the removed effect and moves the tracks of every later
+// effect down by one index, as the Effect Controls delete path does.
+void removeSplitEffectTracks(KeyframeManager &keyframes, int removedIndex)
+{
+    QStringList removedNames;
+    QVector<QPair<int, QString>> laterTracks;
+    for (const KeyframeTrack &track : keyframes.tracks()) {
+        int index = -1;
+        QString rest;
+        if (!parseSplitEffectTrackName(track.propertyName(), &index, &rest)) continue;
+        if (index == removedIndex) removedNames.append(track.propertyName());
+        else if (index > removedIndex) laterTracks.append({index, rest});
+    }
+    for (const QString &name : removedNames) keyframes.removeTrack(name);
+    std::stable_sort(laterTracks.begin(), laterTracks.end(),
+                     [](const QPair<int, QString> &a, const QPair<int, QString> &b) {
+                         return a.first < b.first;
+                     });
+    for (const QPair<int, QString> &ref : laterTracks) {
+        keyframes.renameTrack(QStringLiteral("effect.%1.%2").arg(ref.first).arg(ref.second),
+                              QStringLiteral("effect.%1.%2").arg(ref.first - 1).arg(ref.second));
+    }
+    QVector<StringKeyframeTrack> &stringTracks = keyframes.stringTracks();
+    for (int s = stringTracks.size() - 1; s >= 0; --s) {
+        int index = -1;
+        QString rest;
+        if (!parseSplitEffectTrackName(stringTracks[s].propertyName(), &index, &rest)) continue;
+        if (index == removedIndex) {
+            stringTracks.removeAt(s);
+        } else if (index > removedIndex) {
+            StringKeyframeTrack renamed(QStringLiteral("effect.%1.%2").arg(index - 1).arg(rest),
+                                        stringTracks[s].defaultValue());
+            for (const StringKeyframePoint &point : stringTracks[s].keyframes())
+                renamed.addKeyframe(point.time, point.value);
+            stringTracks[s] = renamed;
+        }
+    }
+}
+
 } // namespace
 
 void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
@@ -2073,10 +2129,77 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // is no longer the original's trailOut. Reset those so neither transition
     // is duplicated onto both halves.
     secondHalf.leadIn = Transition{};
-    // US-1706: the 3D text and the brush stay on the left half only (the rule the
-    // position-keyed sidecars had: every split path comes through here).
-    secondHalf.text3DConfig = QJsonObject();
-    secondHalf.brushData = QJsonObject();
+    // US-1807: both halves keep the 3D text and the brush. Everything the right
+    // half reads in clip-local seconds moves by the cut (timeline seconds, not
+    // the source-second splitPoint) so it plays as it did before the split.
+    // Every split path comes through here.
+    const double cutLocalSec = localSeconds;
+    // Keyframes: shift every key, keep the negative ones (valueAt interpolates
+    // from them) and write back in ascending index order so the sort that
+    // setKeyframePoint / setKeyframeTime run keeps the order.
+    for (KeyframeTrack &track : secondHalf.keyframes.tracks()) {
+        for (int k = 0; k < track.count(); ++k) {
+            KeyframePoint point = track.keyframes()[k];
+            point.time -= cutLocalSec;
+            track.setKeyframePoint(k, point);
+        }
+    }
+    for (StringKeyframeTrack &track : secondHalf.keyframes.stringTracks()) {
+        for (int k = 0; k < track.count(); ++k)
+            track.setKeyframeTime(k, track.keyframes()[k].time - cutLocalSec);
+    }
+    // Effect windows (>= 0 is a limit): a window that ended before the cut
+    // leaves the right half; endSec at the cut stays (effectActiveAt includes
+    // endSec); a start before the cut becomes 0.
+    for (int e = secondHalf.effects.size() - 1; e >= 0; --e) {
+        VideoEffect &fx = secondHalf.effects[e];
+        if (fx.endSec >= 0.0) {
+            if (fx.endSec - cutLocalSec < 0.0) {
+                secondHalf.effects.removeAt(e);
+                // Its tracks go too, and the later effects' tracks follow
+                // their effects down one index (the key times are already
+                // shifted above, so they move with the renamed tracks).
+                removeSplitEffectTracks(secondHalf.keyframes, e);
+                continue;
+            }
+            fx.endSec -= cutLocalSec;
+        }
+        if (fx.startSec >= 0.0)
+            fx.startSec = std::max(0.0, fx.startSec - cutLocalSec);
+    }
+    // Volume envelope: shift, drop the points before the cut and start the
+    // right half at the gain the original had at the cut (evaluated on a
+    // time-sorted copy) unless a point already sits at the cut (within 1e-9 s).
+    if (!secondHalf.volumeEnvelope.isEmpty()) {
+        constexpr double kEnvelopeCutEps = 1e-9;
+        QVector<AudioGainPoint> sortedEnvelope = secondHalf.volumeEnvelope;
+        std::stable_sort(sortedEnvelope.begin(), sortedEnvelope.end(),
+                         [](const AudioGainPoint &a, const AudioGainPoint &b) {
+                             return a.time < b.time;
+                         });
+        const double gainAtCut = audio::evaluateVolumeEnvelope(
+            sortedEnvelope, cutLocalSec, secondHalf.volume);
+        QVector<AudioGainPoint> shifted;
+        bool hasPointAtCut = false;
+        for (AudioGainPoint point : secondHalf.volumeEnvelope) {
+            point.time -= cutLocalSec;
+            if (point.time < -kEnvelopeCutEps) continue;
+            if (std::abs(point.time) <= kEnvelopeCutEps) {
+                point.time = 0.0;
+                hasPointAtCut = true;
+            }
+            shifted.append(point);
+        }
+        if (!hasPointAtCut) shifted.prepend(AudioGainPoint{0.0, gainAtCut});
+        secondHalf.volumeEnvelope = shifted;
+    }
+    // 3D text: the animation time offset accumulates over repeated splits.
+    if (!secondHalf.text3DConfig.isEmpty()) {
+        const double previousOffset =
+            secondHalf.text3DConfig.value(QStringLiteral("timeOffsetSec")).toDouble(0.0);
+        secondHalf.text3DConfig[QStringLiteral("timeOffsetSec")] =
+            std::isfinite(previousOffset) ? previousOffset + cutLocalSec : cutLocalSec;
+    }
     // The right half is a new clip; the left half keeps the original's uid.
     secondHalf.uid.clear();
     ensureUid(secondHalf);
@@ -9364,6 +9487,10 @@ void Timeline::setClipMotion(int trackIdx, int clipIdx,
     clip.is3DLayer = motion.is3DLayer;
     clip.layer3D.positionZ = motion.is3DLayer
         ? qBound(-10000.0, motion.posZ, 10000.0) : 0.0;
+    clip.layer3D.worldX = motion.is3DLayer
+        ? qBound(-10000.0, motion.worldX, 10000.0) : 0.0;
+    clip.layer3D.worldY = motion.is3DLayer
+        ? qBound(-10000.0, motion.worldY, 10000.0) : 0.0;
     clip.layer3D.rotationX = motion.is3DLayer
         ? qBound(-360.0, motion.rotX, 360.0) : 0.0;
     clip.layer3D.rotationY = motion.is3DLayer

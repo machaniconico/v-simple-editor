@@ -540,6 +540,7 @@ private slots:
     void configureTrackMatte();
     void configureClipParent();
     void createNullObjectForSelection();
+    bool createNullAtSolvePoint(int index);
 
     // US-3D-11: motion-graphics sprint — 4 new menu actions
     void open3DExtrudedText();
@@ -572,7 +573,7 @@ private slots:
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
     void openPlanarTrackerDialog();
-    void applyCameraSolve(const QVector<camsolve::Pose>& poses, double fps, double startSec);
+    void applyCameraSolve(const camsolve::CameraSolveApplied& applied);
 
     // US-TP-6: PRD-TP — モーショントラッカー preset 適用ダイアログ
     void showMotionTrackerDialog();
@@ -887,6 +888,7 @@ private:
     BrushAnimation *materializeBrushAnimation(const QString &clipId);
     void syncBrushAnimationPreviewForClip(int trackIdx, int clipIdx);
     void updateBrushPreviewProgress(double timelineSec);
+    void refreshSolvePointOverlay(double timelineSec);
     // selftest: the clipId syncBrushAnimationPreviewForClip last bound (empty once cleared).
     QString m_brushPreviewClipIdForTest;
     QString brushPreviewClipIdForTest() const { return m_brushPreviewClipIdForTest; }
@@ -982,6 +984,7 @@ private:
 
     QAction *m_trackMotionAction = nullptr; // US-FEAT-D: motion tracking UI
     class QSlider *m_lutIntensitySlider = nullptr; // LUT intensity slider (0..100)
+    QAction *m_solvePointOverlayAction = nullptr;  // US-1817: checkable, default off
     QAction *m_zoomToFitSequenceAction = nullptr;
     QAction *m_zoomToSelectionAction = nullptr;
     QAction *m_jumpTimecodeAction = nullptr;

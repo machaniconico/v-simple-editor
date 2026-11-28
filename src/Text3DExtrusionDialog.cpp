@@ -28,6 +28,9 @@
 namespace {
 
 constexpr const char *kSourceCameraProperty = "vseText3DSourceCamera";
+// US-1807: the source layer's animation-time offset, carried through the edit
+// (the widgets do not show it) and restored by layer().
+constexpr const char *kSourceTimeOffsetProperty = "vseText3DSourceTimeOffset";
 
 } // namespace
 
@@ -309,6 +312,7 @@ void Text3DExtrusionDialog::setLayer(const Text3DLayer &src)
     const QJsonObject jo = src.toJson();
     setProperty(kSourceCameraProperty,
                 QJsonDocument(src.camera().toJson()).toJson(QJsonDocument::Compact));
+    setProperty(kSourceTimeOffsetProperty, src.timeOffsetSec());
 
     // Text
     m_textEdit->setText(jo.value(QStringLiteral("text")).toString());
@@ -431,6 +435,9 @@ Text3DLayer *Text3DExtrusionDialog::layer(QObject *layerParent) const
 {
     auto *result = new Text3DLayer(layerParent);
     buildLayer(*result);
+    const QVariant timeOffset = property(kSourceTimeOffsetProperty);
+    if (timeOffset.isValid())
+        result->setTimeOffsetSec(timeOffset.toDouble());
     return result;
 }
 

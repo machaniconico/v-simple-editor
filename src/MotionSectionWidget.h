@@ -27,6 +27,8 @@ struct MotionState {
     double rotX = 0.0;
     double rotY = 0.0;
     double rotZ = 0.0;
+    double worldX = 0.0;
+    double worldY = 0.0;
 };
 
 class MotionSectionWidget : public QWidget
@@ -86,11 +88,15 @@ private:
     QDoubleSpinBox *m_opacitySpin = nullptr;
 
     EffectKeyframeToggle *m_posZToggle = nullptr;
+    EffectKeyframeToggle *m_worldXToggle = nullptr;
+    EffectKeyframeToggle *m_worldYToggle = nullptr;
     EffectKeyframeToggle *m_rotXToggle = nullptr;
     EffectKeyframeToggle *m_rotYToggle = nullptr;
     EffectKeyframeToggle *m_rotZToggle = nullptr;
 
     QDoubleSpinBox *m_posZSpin = nullptr;
+    QDoubleSpinBox *m_worldXSpin = nullptr;
+    QDoubleSpinBox *m_worldYSpin = nullptr;
     QDoubleSpinBox *m_rotXSpin = nullptr;
     QDoubleSpinBox *m_rotYSpin = nullptr;
     QDoubleSpinBox *m_rotZSpin = nullptr;

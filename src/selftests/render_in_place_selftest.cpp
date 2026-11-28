@@ -1,4 +1,6 @@
 #include "../RenderInPlace.h"
+#include "../RotoApply.h"
+#include "../TrackMatteKey.h"
 #include "../AudioMixer.h"
 #include <QDataStream>
 #include <QtEndian>
@@ -249,6 +251,61 @@ bool videoOnly(const QString &path)
     avformat_close_input(&context);
     return probed && video && !audio;
 }
+// First video stream's average frame rate and packet count (US-1802 G12).
+bool videoStreamRateAndFrames(const QString &path, double *fps, int *frames)
+{
+    AVFormatContext *context = nullptr;
+    if (avformat_open_input(&context, path.toUtf8().constData(), nullptr, nullptr) < 0)
+        return false;
+    const int stream = avformat_find_stream_info(context, nullptr) >= 0
+        ? av_find_best_stream(context, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0) : -1;
+    if (stream >= 0) {
+        const AVRational rate = context->streams[stream]->avg_frame_rate;
+        *fps = rate.den > 0 ? double(rate.num) / rate.den : 0.0;
+        *frames = 0;
+        AVPacket *packet = av_packet_alloc();
+        while (av_read_frame(context, packet) >= 0) {
+            if (packet->stream_index == stream) ++*frames;
+            av_packet_unref(packet);
+        }
+        av_packet_free(&packet);
+    }
+    avformat_close_input(&context);
+    return stream >= 0;
+}
+
+// Mean absolute RGB difference of two premultiplied frames (US-1802 G12).
+double meanAbsDiffPremultiplied(const QImage &left, const QImage &right)
+{
+    if (left.isNull() || right.isNull() || left.size() != right.size())
+        return std::numeric_limits<double>::infinity();
+    const auto a = left.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    const auto b = right.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    double sum = 0.0;
+    for (int y = 0; y < a.height(); ++y) {
+        const auto *pa = reinterpret_cast<const QRgb *>(a.constScanLine(y));
+        const auto *pb = reinterpret_cast<const QRgb *>(b.constScanLine(y));
+        for (int x = 0; x < a.width(); ++x)
+            sum += std::abs(qRed(pa[x]) - qRed(pb[x])) + std::abs(qGreen(pa[x]) - qGreen(pb[x]))
+                + std::abs(qBlue(pa[x]) - qBlue(pb[x]));
+    }
+    return sum / (double(a.width()) * a.height() * 3.0);
+}
+
+RotoPath rectRotoPath(double x0, double y0, double x1, double y1)
+{
+    RotoPath path;
+    for (const QPointF &corner : {QPointF(x0, y0), QPointF(x1, y0), QPointF(x1, y1), QPointF(x0, y1)}) {
+        RotoPoint point;
+        point.position = corner;
+        point.handleIn = corner;
+        point.handleOut = corner;
+        path.points.append(point);
+    }
+    path.closed = true;
+    return path;
+}
+
 // Check stream duration AND packet coverage, independent of AudioMixer seeks.
 bool audioCoversJob(const QString &path, double expected)
 {
@@ -325,7 +382,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 11; ++number) gate(number, false);
+        for (int number = 1; number <= 12; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         selftests::reportTally(passed, failed, 0);
         return failed;
@@ -807,6 +864,57 @@ int runRenderInPlaceSelftest()
         "(expect 1 / 1)\n", int(orientBaked), qPrintable(orientError), int(orientReplaced),
         int(orientAfter.autoOrientToCamera), int(orientAfter.is3DLayer));
     gate(11, orientReplaced && orientAfter.autoOrientToCamera && orientAfter.is3DLayer);
+
+    // G12 (US-1802): the temporary timeline renderClipInPlace bakes through carries the
+    // source timeline's project fps, so a roto clip whose probe returns 0 (fps fallback)
+    // indexes the same roto frame before and after the bake. Source timeline 24 fps,
+    // output 30 fps, probe forced to 0 by the override seam. Detects a temporary timeline
+    // left at the 30 fps default (negative control: the fps argument removed from the
+    // setProjectOutputConfig call in RenderInPlace.cpp measures 8.21 at 0.5 s, above T).
+    constexpr double kRipFpsThreshold = 0.30;
+    ClipInfo rotoClip = original;
+    rotoClip.effects.clear();
+    Timeline rotoTimeline;
+    rotoTimeline.restoreFromProject(QVector<QVector<ClipInfo>>{{rotoClip}},
+        QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    rotoTimeline.setProjectOutputConfig(640, 360, true, 24.0);
+    RotoClipEntry rotoEntry;
+    RotoKeyframe rotoKeyA, rotoKeyB;
+    rotoKeyA.frameNumber = 0;
+    rotoKeyA.path = rectRotoPath(20, 80, 200, 280);
+    rotoKeyB.frameNumber = 150;
+    rotoKeyB.path = rectRotoPath(440, 80, 620, 280);
+    rotoEntry.path = rotoKeyA.path;
+    rotoEntry.keyframes = {rotoKeyA, rotoKeyB};
+    rotoTimeline.setRotoEntries({{trackMatteClipKey(0, 0), rotoEntry}});
+    roto::setProbeVideoStreamFpsOverrideForTest(0.0);
+    const qint64 rotoTicks[3] = {100000, 500000, 900000};
+    QImage rotoBefore[3];
+    for (int i = 0; i < 3; ++i)
+        rotoBefore[i] = tlrender::renderFrameAt(&rotoTimeline, rotoTicks[i], options.outputSize);
+    auto rotoOptions = options;
+    rotoOptions.handlesSec = 0.0;
+    rotoOptions.outputDir = output.filePath(QStringLiteral("rotofps"));
+    QString rotoPath, rotoError;
+    const bool rotoBaked = renderinplace::renderClipInPlace(
+        rotoTimeline, 0, 0, rotoOptions, &rotoPath, &rotoError);
+    double rotoDiff[3] = {-1.0, -1.0, -1.0};
+    for (int i = 0; rotoBaked && i < 3; ++i)
+        rotoDiff[i] = meanAbsDiffPremultiplied(rotoBefore[i],
+            tlrender::renderFrameAt(&rotoTimeline, rotoTicks[i], options.outputSize));
+    roto::setProbeVideoStreamFpsOverrideForTest(std::nullopt);
+    double rotoStreamFps = 0.0;
+    int rotoFrames = 0;
+    const bool rotoProbed = rotoBaked && videoStreamRateAndFrames(rotoPath, &rotoStreamFps, &rotoFrames);
+    const int expectedFrames = int(std::lround(original.effectiveDuration() * rotoOptions.fps));
+    const bool rotoDiffOk = rotoBaked && rotoDiff[1] >= 0.0 && rotoDiff[1] <= kRipFpsThreshold;
+    const bool rotoStreamOk = rotoProbed && std::abs(rotoStreamFps - double(rotoOptions.fps)) < 1e-6
+        && rotoFrames == expectedFrames;
+    std::fprintf(stderr, "G12 baked=%d [%s] meanAbsDiff 0.1s=%.4f 0.5s=%.4f 0.9s=%.4f "
+        "(0.5s must be <= %.2f) streamFps=%.4f (expect %d) frames=%d (expect %d)\n",
+        int(rotoBaked), qPrintable(rotoError), rotoDiff[0], rotoDiff[1], rotoDiff[2],
+        kRipFpsThreshold, rotoStreamFps, int(rotoOptions.fps), rotoFrames, expectedFrames);
+    gate(12, rotoDiffOk && rotoStreamOk);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

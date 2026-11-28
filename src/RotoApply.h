@@ -3,6 +3,7 @@
 #include "RotoClipEntry.h"
 #include <QImage>
 #include <QtGlobal>
+#include <optional>
 
 enum class VideoEffectType;
 
@@ -41,6 +42,12 @@ int lastRenderSourceFrameIndex();
 // (thread-safe); failed opens are not cached. Feed it to
 // clipEffectiveSourceFps for the fallback.
 double probeVideoStreamFps(const QString &filePath);
+
+// Test seam (US-1802): while set, probeVideoStreamFps returns this value for
+// every path before the veditor:// check and the cache, so a selftest can force
+// the fps fallback (0) on real media. std::nullopt restores the real probe.
+// Thread-safe (the export workers read it). Production never sets it.
+void setProbeVideoStreamFpsOverrideForTest(std::optional<double> fps);
 
 // US-1301: whether the media's first video stream carries alpha: decided by
 // its pixel format when known (an rgb24 PNG / 24-bit QTRLE is opaque); the

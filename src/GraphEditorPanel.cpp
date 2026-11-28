@@ -97,6 +97,8 @@ bool pasteTrackDefault(const ClipInfo &clip, const QString &property, double &va
         {QStringLiteral("motion.rotation"), clip.rotation2DDegrees},
         {QStringLiteral("motion.opacity"), clip.opacity},
         {QStringLiteral("motion.position.z"), clip.layer3D.positionZ},
+        {QStringLiteral("motion.world.x"), clip.layer3D.worldX},
+        {QStringLiteral("motion.world.y"), clip.layer3D.worldY},
         {QStringLiteral("motion.rotation.x"), clip.layer3D.rotationX},
         {QStringLiteral("motion.rotation.y"), clip.layer3D.rotationY},
         {QStringLiteral("motion.rotation.z"), clip.layer3D.rotationZ},
@@ -179,6 +181,8 @@ QString motionTrackLabel(const QString &propertyName)
         map.insert(QStringLiteral("motion.rotation"), QStringLiteral("Motion: Rotation 2D"));
         map.insert(QStringLiteral("motion.opacity"), QStringLiteral("Motion: Opacity"));
         map.insert(QStringLiteral("motion.position.z"), QStringLiteral("Motion: Position Z"));
+        map.insert(QStringLiteral("motion.world.x"), QStringLiteral("モーション: ワールド X"));
+        map.insert(QStringLiteral("motion.world.y"), QStringLiteral("モーション: ワールド Y"));
         map.insert(QStringLiteral("motion.rotation.x"), QStringLiteral("Motion: Rotation X"));
         map.insert(QStringLiteral("motion.rotation.y"), QStringLiteral("Motion: Rotation Y"));
         map.insert(QStringLiteral("motion.rotation.z"), QStringLiteral("Motion: Rotation Z"));

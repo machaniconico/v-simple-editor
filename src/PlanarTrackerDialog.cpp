@@ -15,6 +15,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
@@ -34,6 +35,7 @@
 #include <QPolygonF>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QRectF>
 #include <QSizePolicy>
 #include <QSpinBox>
@@ -399,7 +401,18 @@ PlanarTrackerDialog::PlanarTrackerDialog(QWidget* parent)
     m_featureSolveSummary = new QLabel(this);
     m_featureSolveSummary->setObjectName(QStringLiteral("featureSolveSummary"));
     m_featureSolveSummary->setWordWrap(true);
+    m_featureScaleSpin = new QDoubleSpinBox(this);
+    m_featureScaleSpin->setObjectName(QStringLiteral("featureScale"));
+    m_featureScaleSpin->setRange(0.001, 1e6);
+    m_featureScaleSpin->setDecimals(3);
+    m_featureScaleSpin->setValue(100.0);
+    connect(m_featureScaleSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this,
+            [this] { m_featureScaleEdited = true; });
+    auto* scaleRow = new QHBoxLayout;
+    scaleRow->addWidget(new QLabel(tr("スケール (px/単位)"), this));
+    scaleRow->addWidget(m_featureScaleSpin);
     rightLayout->addWidget(m_featureSolveButton);
+    rightLayout->addLayout(scaleRow);
     rightLayout->addWidget(m_featureSolveSummary);
     connect(m_featureSolveButton, &QPushButton::clicked, this,
             [this] { solveFeatureCamera(); });
@@ -929,7 +942,14 @@ void PlanarTrackerDialog::onCameraSolveClicked()
     if (QMessageBox::question(this, tr("3D カメラ解析"),
             summary + tr("\nカメラのキーフレームとして適用しますか？"),
             QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
-        emit cameraSolveApplied(poses, m_cameraFps, m_cameraStartSec);
+    {
+        camsolve::CameraSolveApplied applied;
+        applied.poses = poses;
+        applied.fps = m_cameraFps;
+        applied.startSec = m_cameraStartSec;
+        applied.mapping.legacy = true; // the planar path keeps the pose mapping (decision C5)
+        emit cameraSolveApplied(applied);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1053,7 @@ void PlanarTrackerDialog::setFeatureTrackingSource(const QString& path, double f
     if (m_featureWorker) return;
     m_featureSolveButton->setEnabled(false);
     m_featureSolveSummary->clear();
+    m_featureScaleEdited = false;
     m_featureSolveResult = {};
     m_featureIn = 0;
     m_featureOut = fps > 0 ? frameCount / fps : 0;
@@ -1064,6 +1085,7 @@ void PlanarTrackerDialog::onFeatureTrackClicked()
     if (m_featureWorker) return;
     m_featureTracks = {};
     m_featureSolveResult = {};
+    m_featureScaleEdited = false;
     m_featureSolveButton->setEnabled(false);
     m_featureSolveSummary->clear();
     m_featureAnalysisSize = {};
@@ -1218,6 +1240,7 @@ void PlanarTrackerDialog::setFeatureTrackingResult(const sfm::MultiViewTracks& t
     m_featureAnalysisSize = size;
     m_featureStartFrame = first;
     m_featureSolveResult = {};
+    m_featureScaleEdited = false;
     m_featureSolveSummary->clear();
     m_featureSolveButton->setEnabled(tracks.frameCount >= 2 && tracks.tracks.size() >= 8);
 }
@@ -1229,6 +1252,7 @@ bool PlanarTrackerDialog::solveFeatureCamera()
     const double first = m_featureStartFrame / m_featureFps;
     const double last = (double(m_featureStartFrame) + m_featureTracks.frameCount - 1) / m_featureFps;
     QString error;
+    double focal = 0;
     if (!std::isfinite(m_featureFps) || m_featureFps <= 0
         || !std::isfinite(m_featureIn) || !std::isfinite(m_featureOut)
         || m_featureIn < 0 || m_featureOut <= m_featureIn
@@ -1243,7 +1267,7 @@ bool PlanarTrackerDialog::solveFeatureCamera()
     else if (m_featureAnalysisSize.isEmpty() || m_cameraCanvas.isEmpty())
         error = tr("解析画像のサイズが不正です。");
     else {
-        const double focal = m_cameraFov * std::max(
+        focal = m_cameraFov * std::max(
             double(m_featureAnalysisSize.width()) / m_cameraCanvas.width(),
             double(m_featureAnalysisSize.height()) / m_cameraCanvas.height());
         m_featureSolveResult = sfm::solveCameraTracks(m_featureTracks,
@@ -1270,6 +1294,31 @@ bool PlanarTrackerDialog::solveFeatureCamera()
     }
     const double start = m_cameraStartSec + (m_featureReversed
         ? m_featureOut - last : first - m_featureIn) / m_featureSpeed;
-    emit cameraSolveApplied(timed, m_featureFps * m_featureSpeed, start);
+    camsolve::CameraSolveApplied applied;
+    applied.poses = timed;
+    applied.fps = m_featureFps * m_featureSpeed;
+    applied.startSec = start;
+    applied.points = result.bundle.points;
+    applied.mapping.focalPx = focal;
+    applied.mapping.analysisSize = m_featureAnalysisSize;
+    applied.mapping.canvasSize = m_cameraCanvas;
+    applied.mapping.referenceIndex = camsolve::referencePoseIndex(timed);
+    // The default S is measured on the reference-centred points, as the apply step will see them.
+    auto normPoses = timed;
+    auto normPoints = result.bundle.points;
+    const double canvasFocal = camsolve::canvasFocalPx(applied.mapping);
+    m_featureDefaultScale = camsolve::normaliseToReference(normPoses, normPoints,
+            applied.mapping.referenceIndex)
+        ? camsolve::defaultUnitScale(normPoints, canvasFocal) : canvasFocal;
+    if (!m_featureScaleEdited) {
+        const QSignalBlocker blocker(m_featureScaleSpin);
+        m_featureScaleSpin->setValue(m_featureDefaultScale);
+    }
+    // The exact default is applied unrounded; the field shows it to three decimals.
+    const bool inRange = m_featureDefaultScale >= m_featureScaleSpin->minimum()
+        && m_featureDefaultScale <= m_featureScaleSpin->maximum();
+    applied.mapping.unitScalePx = m_featureScaleEdited || !inRange
+        ? m_featureScaleSpin->value() : m_featureDefaultScale;
+    emit cameraSolveApplied(applied);
     return true;
 }

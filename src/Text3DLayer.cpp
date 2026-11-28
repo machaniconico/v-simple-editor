@@ -254,6 +254,16 @@ const Camera3D &Text3DLayer::camera() const
     return m_camera;
 }
 
+void Text3DLayer::setTimeOffsetSec(double offsetSec)
+{
+    m_timeOffsetSec = std::isfinite(offsetSec) ? offsetSec : 0.0;
+}
+
+double Text3DLayer::timeOffsetSec() const
+{
+    return m_timeOffsetSec;
+}
+
 void Text3DLayer::setExtrudeEnabled(bool on)
 {
     m_extrudeEnabled = on;
@@ -354,6 +364,7 @@ double Text3DLayer::characterProgress(int characterIndex, double time) const
 
 QImage Text3DLayer::renderFrame(QSize size, double time, const Camera3D &cam) const
 {
+    time += m_timeOffsetSec;
     if (m_extrudeEnabled)
         return renderFrameExtruded(size, time, cam);
     return renderFrameQuads(size, time, cam);
@@ -658,6 +669,8 @@ QJsonObject Text3DLayer::toJson() const
     obj[QStringLiteral("extrudeBasePitch")] = m_extrudeBasePitch;
     if (!cameraEqualsDefault(m_camera))
         obj[QStringLiteral("camera")] = m_camera.toJson();
+    if (m_timeOffsetSec != 0.0)
+        obj[QStringLiteral("timeOffsetSec")] = m_timeOffsetSec;
     return obj;
 }
 
@@ -724,6 +737,7 @@ void Text3DLayer::fromJson(const QJsonObject &obj)
 
     m_extrudeBaseYaw = obj[QStringLiteral("extrudeBaseYaw")].toDouble(m_extrudeBaseYaw);
     m_extrudeBasePitch = obj[QStringLiteral("extrudeBasePitch")].toDouble(m_extrudeBasePitch);
+    setTimeOffsetSec(obj[QStringLiteral("timeOffsetSec")].toDouble(0.0));
 
     m_cacheValid = false;
 }

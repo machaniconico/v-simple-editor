@@ -15,6 +15,7 @@
 #include <functional>
 
 class QComboBox;
+class QDoubleSpinBox;
 class QDialogButtonBox;
 class QLabel;
 class QProgressBar;
@@ -114,7 +115,7 @@ public slots:
 signals:
     void featureTrackingFinished(bool success);
     void trackComputed(const QList<planar::Frame>& frames);
-    void cameraSolveApplied(const QVector<camsolve::Pose>& poses, double fps, double startSec);
+    void cameraSolveApplied(const camsolve::CameraSolveApplied& applied);
     void presetApplied(planar_tracker_preset::PlanarTrackerPreset);
 
 private slots:
@@ -149,6 +150,11 @@ private:
     // timeline time, which the linear inverse below cannot express.
     bool m_featureNonLinearTiming = false;
     QPushButton* m_featureSolveButton = nullptr;
+    // Scale S (px per solver unit): the exact default after a solve, or the user's value once
+    // they edit the field (kept until the next tracking result).
+    QDoubleSpinBox* m_featureScaleSpin = nullptr;
+    double m_featureDefaultScale = 0;
+    bool m_featureScaleEdited = false;
     QLabel* m_featureSolveSummary = nullptr;
     QString m_featurePath;
     double m_featureFps = 0;

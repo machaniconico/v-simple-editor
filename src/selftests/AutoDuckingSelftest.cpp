@@ -1,4 +1,5 @@
 #include "../audio/AutoDucking.h"
+#include "../AudioExportMix.h"
 
 #include <algorithm>
 #include <cmath>
@@ -247,6 +248,51 @@ int runAutoDuckingSelftest()
                 "silent-sidechain analysis changed input buffers",
                 passed,
                 failed);
+
+    // G16: the merge applied to a clip's existing envelope (US-1820 C-01). Expected
+    // values are stated literally: a unity envelope ducked to 0.2 at t=1 must become the
+    // three points {0:1, 1:0.2, 2:1}, so the midpoints interpolate to 0.6; points within
+    // 1 ms collapse to one point at the first time with the minimum gain.
+    {
+        const double eps = 1e-9;
+        const QVector<AudioGainPoint> existing{{0.0, 1.0}, {1.0, 1.0}, {2.0, 1.0}};
+        const QVector<AudioGainPoint> ducking{{0.0, 1.0}, {1.0, 0.2}, {2.0, 1.0}};
+        const QVector<AudioGainPoint> merged =
+            audioexport::mergeDuckingEnvelope(existing, ducking, 1.0);
+        const QVector<AudioGainPoint> expected{{0.0, 1.0}, {1.0, 0.2}, {2.0, 1.0}};
+        bool pointsOk = merged.size() == expected.size();
+        for (int i = 0; pointsOk && i < expected.size(); ++i) {
+            pointsOk = std::abs(merged[i].time - expected[i].time) <= eps
+                       && std::abs(merged[i].gain - expected[i].gain) <= eps;
+        }
+        const double atHalf = audio::evaluateVolumeEnvelope(merged, 0.5, 1.0);
+        const double atOneHalf = audio::evaluateVolumeEnvelope(merged, 1.5, 1.0);
+        const bool midpointsOk = std::abs(atHalf - 0.6) <= eps
+                                 && std::abs(atOneHalf - 0.6) <= eps;
+
+        const QVector<AudioGainPoint> nearExisting{{1.0005, 0.9}};
+        const QVector<AudioGainPoint> nearDucking{{1.0, 0.3}};
+        const QVector<AudioGainPoint> nearMerged =
+            audioexport::mergeDuckingEnvelope(nearExisting, nearDucking, 1.0);
+        const bool nearOk = nearMerged.size() == 1
+                            && std::abs(nearMerged.first().time - 1.0) <= eps
+                            && std::abs(nearMerged.first().gain - 0.3) <= eps;
+
+        std::cerr << "[auto-ducking] G16 merged points=" << merged.size();
+        for (const AudioGainPoint &p : merged)
+            std::cerr << " {" << p.time << ':' << p.gain << '}';
+        std::cerr << " gain(0.5)=" << atHalf << " gain(1.5)=" << atOneHalf
+                  << " near points=" << nearMerged.size();
+        for (const AudioGainPoint &p : nearMerged)
+            std::cerr << " {" << p.time << ':' << p.gain << '}';
+        std::cerr << '\n';
+        requireGate(pointsOk && midpointsOk && nearOk,
+                    "G16 ducking merge collapses same-time points to the minimum",
+                    "expected {0:1,1:0.2,2:1} with gain 0.6 at t=0.5 and t=1.5, "
+                    "and {1.0005:0.9}+{1:0.3} collapsing to {1:0.3}",
+                    passed,
+                    failed);
+    }
 
     std::cout << "[auto-ducking] summary: "
               << passed << " passed, " << failed << " failed\n";

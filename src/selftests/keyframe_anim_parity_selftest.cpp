@@ -1,14 +1,22 @@
 // src/selftests/keyframe_anim_parity_selftest.cpp
 // Render-time S1 motion/opacity keyframe parity gates.
 
+#include "../Camera3D.h"
 #include "../clipanim/ClipAnim.h"
 #include "../ClipGeometry.h"
+#include "../EffectClipboard.h"
+#include "../EffectControlsPanel.h"
 #include "../FrameDiff.h"
 #include "../Keyframe.h"
 #include "../LayerStyle.h"
+#include "../MainWindow.h"
+#include "../MotionSectionWidget.h"
 #include "../Timeline.h"
 #include "../TimelineFrameRenderer.h"
 #include "../libavcore/Encode.h"
+#include "../mcp/McpEditorTools.h"
+#include "../mcp/McpProtocol.h"
+#include "../mcp/McpToolRegistry.h"
 #include "SelftestRegistry.h"
 
 #include <cmath>
@@ -18,6 +26,11 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QDebug>
+#include <QDoubleSpinBox>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QMetaObject>
+#include <QToolButton>
 #include <QStringList>
 #include <QTemporaryDir>
 
@@ -425,6 +438,224 @@ int runKeyframeAnimParitySelftest()
         }
         check(7, "lone V1 effective opacity == same clip on V2 over empty V1",
               ok, parts.join(QStringLiteral("; ")));
+    }
+
+    // G8 (US-1814): the 3D layer world x/y through the motion UI surfaces. (a) setClipMotion stores
+    // worldX / worldY (+-10000 clamp) and the static value moves the trueProjection quad by
+    // worldX * fov / (fov + Z) like camera3d G13; (b) motion.world.x leaves the motion.position.x
+    // (2D) track alone; (c) turning the 3D layer off zeroes worldX through MCP set_clip_property,
+    // the EffectControls motion widget and MainWindow::pasteEffects, while MCP is3DLayer=true on a
+    // flat clip that already holds worldX keeps it (the control that fails if the MCP motion is
+    // built without worldX).
+    {
+        bool ok = true;
+        QStringList parts;
+        const auto alphaCentroidX = [](const QImage &image) {
+            const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
+            double sum = 0.0;
+            double count = 0.0;
+            for (int y = 0; y < rgba.height(); ++y) {
+                const uchar *row = rgba.constScanLine(y);
+                for (int x = 0; x < rgba.width(); ++x) {
+                    if (row[x * 4 + 3] > 128) {
+                        sum += x;
+                        count += 1.0;
+                    }
+                }
+            }
+            return count > 0.0 ? sum / count : -1.0;
+        };
+        const auto firstClip = [](Timeline &timeline) {
+            return timeline.videoTracks().first()->clips().first();
+        };
+
+        // (a) static value reaches storage, the clamp and the render.
+        {
+            Camera3DState camera;
+            camera.trueProjection = true;
+            Timeline timeline;
+            timeline.setProjectCamera(camera);
+            ClipInfo clip = makeClip(clipPath);
+            clip.is3DLayer = true;
+            clip.layer3D.positionZ = 40.0;
+            setTimelineClip(timeline, clip);
+
+            const QSize outSize(160, 90);
+            const double baseX = alphaCentroidX(tlrender::renderFrameAt(&timeline, 0, outSize));
+
+            effectctrl::MotionState motion;
+            motion.scale = clip.videoScale;
+            motion.is3DLayer = true;
+            motion.posZ = 40.0;
+            motion.worldX = 20.0;
+            timeline.setClipMotion(0, 0, motion);
+            const ClipInfo stored = firstClip(timeline);
+            const double shiftedX = alphaCentroidX(tlrender::renderFrameAt(&timeline, 0, outSize));
+            const double expectedDx = 20.0 * camera.fov / (camera.fov + 40.0);
+
+            motion.worldX = 123.0;
+            motion.worldY = -45.0;
+            timeline.setClipMotion(0, 0, motion);
+            const ClipInfo exact = firstClip(timeline);
+            motion.worldX = 99999.0;
+            motion.worldY = -99999.0;
+            timeline.setClipMotion(0, 0, motion);
+            const ClipInfo clamped = firstClip(timeline);
+
+            const bool storedOk = stored.layer3D.worldX == 20.0 && exact.layer3D.worldX == 123.0
+                && exact.layer3D.worldY == -45.0 && clamped.layer3D.worldX == 10000.0
+                && clamped.layer3D.worldY == -10000.0;
+            const bool renderOk = baseX >= 0.0 && shiftedX >= 0.0
+                && std::abs((shiftedX - baseX) - expectedDx) < 1.0 && expectedDx > 5.0;
+            parts << QStringLiteral("(a) stored=%1 world(20,123,99999)=(%2,%3,%4) worldY(-45,-99999)=(%5,%6) "
+                                    "centroidX base=%7 shifted=%8 dx=%9 expected=%10 renderOk=%11")
+                         .arg(storedOk ? QStringLiteral("yes") : QStringLiteral("no"))
+                         .arg(stored.layer3D.worldX).arg(exact.layer3D.worldX).arg(clamped.layer3D.worldX)
+                         .arg(exact.layer3D.worldY).arg(clamped.layer3D.worldY)
+                         .arg(baseX, 0, 'f', 3).arg(shiftedX, 0, 'f', 3)
+                         .arg(shiftedX - baseX, 0, 'f', 3).arg(expectedDx, 0, 'f', 3)
+                         .arg(renderOk ? QStringLiteral("yes") : QStringLiteral("no"));
+            ok = ok && storedOk && renderOk;
+        }
+
+        // (b) a motion.world.x track does not touch the 2D position track or its evaluation.
+        {
+            ClipInfo plain = makeClip(clipPath);
+            KeyframeTrack posX(QStringLiteral("motion.position.x"), 0.0);
+            posX.addKeyframe(0.0, 0.1);
+            posX.addKeyframe(1.0, 0.3);
+            plain.keyframes.addTrack(posX);
+            ClipInfo withWorld = plain;
+            KeyframeTrack worldX(QStringLiteral("motion.world.x"), 0.0);
+            worldX.addKeyframe(0.0, 10.0);
+            worldX.addKeyframe(1.0, 500.0);
+            withWorld.keyframes.addTrack(worldX);
+            const double plainDx = clipanim::effectiveTransformAt(plain, 0.5).videoDx;
+            const double worldDx = clipanim::effectiveTransformAt(withWorld, 0.5).videoDx;
+            const KeyframeTrack *posAfter = withWorld.keyframes.track(QStringLiteral("motion.position.x"));
+            ClipInfo shifted = plain;
+            KeyframeTrack posXMoved(QStringLiteral("motion.position.x"), 0.0);
+            posXMoved.addKeyframe(0.0, 0.5);
+            posXMoved.addKeyframe(1.0, 0.9);
+            shifted.keyframes.addTrack(posXMoved);
+            const double movedDx = clipanim::effectiveTransformAt(shifted, 0.5).videoDx;
+            const bool trackOk = withWorld.keyframes.hasTrack(QStringLiteral("motion.world.x"))
+                && posAfter && posAfter->count() == 2
+                && near(posAfter->valueAt(0.0), 0.1) && near(posAfter->valueAt(1.0), 0.3);
+            const bool evalOk = near(plainDx, 0.2) && near(worldDx, plainDx) && !near(movedDx, plainDx);
+            parts << QStringLiteral("(b) plainDx=%1 withWorldDx=%2 (expect 0.2 both) controlMovedDx=%3 trackOk=%4")
+                         .arg(plainDx, 0, 'f', 6).arg(worldDx, 0, 'f', 6).arg(movedDx, 0, 'f', 6)
+                         .arg(trackOk ? QStringLiteral("yes") : QStringLiteral("no"));
+            ok = ok && trackOk && evalOk;
+        }
+
+        // (c) keep / zero across the three routes.
+        {
+            ClipInfo threeD = makeClip(clipPath);
+            threeD.is3DLayer = true;
+            threeD.layer3D.positionZ = 50.0;
+            threeD.layer3D.worldX = 123.0;
+            threeD.layer3D.worldY = -45.0;
+            ClipInfo flatWorld = threeD;
+            flatWorld.is3DLayer = false;
+            flatWorld.layer3D.positionZ = 0.0;
+
+            // EffectControls: the widget is filled from the clip, then the 3D toggle is switched off.
+            double panelLoaded = -1.0;
+            double panelAfter = -1.0;
+            bool panelFound = false;
+            {
+                Timeline timeline;
+                setTimelineClip(timeline, threeD);
+                effectctrl::EffectControlsPanel panel;
+                panel.setTimeline(&timeline);
+                timeline.videoTracks().first()->setSelectedClip(0);
+                QMetaObject::invokeMethod(&timeline, "clipSelectedOnTrack", Qt::DirectConnection,
+                                          Q_ARG(int, 0), Q_ARG(int, 0));
+                auto *motionWidget = panel.findChild<effectctrl::MotionSectionWidget *>(
+                    QStringLiteral("motionSectionWidget"));
+                QToolButton *toggle3D = motionWidget
+                    ? motionWidget->findChild<QToolButton *>(QStringLiteral("motionToggle3D"))
+                    : nullptr;
+                panelFound = motionWidget && toggle3D;
+                if (panelFound) {
+                    panelLoaded = motionWidget->currentMotion().worldX;
+                    toggle3D->click();
+                    panelAfter = firstClip(timeline).layer3D.worldX;
+                }
+            }
+            const bool panelOk = panelFound && panelLoaded == 123.0 && panelAfter == 0.0;
+
+            // MCP set_clip_property + MainWindow::pasteEffects on one MainWindow timeline.
+            mcp::McpToolRegistry registry;
+            MainWindow window;
+            window.hide();
+            mcp::McpEditorTools tools(&window, &registry);
+            tools.registerReadTools();
+            tools.registerWriteTools();
+            mcp::McpProtocol protocol(&registry, mcp::ServerInfo{});
+            Timeline *winTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+            int requestId = 800;
+            const auto setIs3D = [&](bool value) {
+                const QJsonObject request{
+                    {QStringLiteral("jsonrpc"), QStringLiteral("2.0")},
+                    {QStringLiteral("id"), ++requestId},
+                    {QStringLiteral("method"), QStringLiteral("tools/call")},
+                    {QStringLiteral("params"), QJsonObject{
+                        {QStringLiteral("name"), QStringLiteral("set_clip_property")},
+                        {QStringLiteral("arguments"), QJsonObject{
+                            {QStringLiteral("trackIndex"), 0},
+                            {QStringLiteral("clipIndex"), 0},
+                            {QStringLiteral("property"), QStringLiteral("is3DLayer")},
+                            {QStringLiteral("value"), value}}}}}};
+                const QJsonObject response = QJsonDocument::fromJson(protocol.handleMessage(
+                    QJsonDocument(request).toJson(QJsonDocument::Compact))).object();
+                return !response.value(QStringLiteral("result")).toObject()
+                            .value(QStringLiteral("isError")).toBool(true);
+            };
+            const auto loadWindowClip = [&](const ClipInfo &clip) {
+                winTimeline->restoreFromProject(
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{clip}},
+                    QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}}, 0.0, -1.0, -1.0, 100);
+            };
+            bool mcpOff = false, mcpOn = false, pasted = false;
+            double mcpOffX = -1.0, mcpOnX = -1.0, mcpOnY = -1.0, pasteX = -1.0, pasteBefore = -1.0;
+            if (winTimeline) {
+                loadWindowClip(threeD);
+                mcpOff = setIs3D(false);
+                mcpOffX = winTimeline->videoTracks().first()->clips().first().layer3D.worldX;
+
+                loadWindowClip(flatWorld);
+                mcpOn = setIs3D(true);
+                const ClipInfo turnedOn = winTimeline->videoTracks().first()->clips().first();
+                mcpOnX = turnedOn.layer3D.worldX;
+                mcpOnY = turnedOn.layer3D.worldY;
+
+                loadWindowClip(threeD);
+                pasteBefore = winTimeline->videoTracks().first()->clips().first().layer3D.worldX;
+                effectctrl::EffectClipboard &clipboard = effectctrl::EffectClipboard::instance();
+                const QVector<VideoEffect> savedEffects = clipboard.effects();
+                const effectctrl::ClipMotion savedMotion = clipboard.motion();
+                clipboard.capture(QVector<VideoEffect>{VideoEffect{}}, effectctrl::ClipMotion{});
+                winTimeline->videoTracks().first()->setSelectedClip(0);
+                QMetaObject::invokeMethod(winTimeline, "clipSelectedOnTrack", Qt::DirectConnection,
+                                          Q_ARG(int, 0), Q_ARG(int, 0));
+                pasted = QMetaObject::invokeMethod(&window, "pasteEffects", Qt::DirectConnection);
+                pasteX = winTimeline->videoTracks().first()->clips().first().layer3D.worldX;
+                clipboard.capture(savedEffects, savedMotion);
+            }
+            const bool mcpOk = winTimeline && mcpOff && mcpOffX == 0.0
+                && mcpOn && mcpOnX == 123.0 && mcpOnY == -45.0;
+            const bool pasteOk = winTimeline && pasted && pasteBefore == 123.0 && pasteX == 0.0;
+            parts << QStringLiteral("(c) panel found=%1 loaded=%2 after=%3 | mcp off ok=%4 worldX=%5 "
+                                    "on(flat 123) ok=%6 worldX=%7 worldY=%8 | pasteEffects invoked=%9 "
+                                    "before=%10 after=%11")
+                         .arg(panelFound).arg(panelLoaded).arg(panelAfter)
+                         .arg(mcpOff).arg(mcpOffX).arg(mcpOn).arg(mcpOnX).arg(mcpOnY)
+                         .arg(pasted).arg(pasteBefore).arg(pasteX);
+            ok = ok && panelOk && mcpOk && pasteOk;
+        }
+        check(8, "3D layer world x/y through motion UI surfaces", ok, parts.join(QStringLiteral("; ")));
     }
 
     qInfo().noquote()

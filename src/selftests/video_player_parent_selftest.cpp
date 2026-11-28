@@ -43,6 +43,9 @@
 //   G9 each admission path produced records.
 //   G10 offline parent does not change displayed child pixels; a decodable
 //       parent on the same timeline does change them.
+//   G11 (US-1812, characterisation pin) a zero-byte parent file: parentLayerAt
+//       reports it decodable, yet neither renderFrameAt nor VideoPlayer lets
+//       the child follow it (child pixels == parentless, != online-parent).
 
 #include "SelftestGate.h"
 #include "../ClipGeometry.h"
@@ -58,6 +61,7 @@
 #include <QByteArray>
 #include <QColor>
 #include <QFile>
+#include <QFileInfo>
 #include <QImage>
 #include <QSettings>
 #include <QSignalSpy>
@@ -470,7 +474,7 @@ int runVideoPlayerParentSelftest()
     const QString parentPath = tmpDir.filePath(QStringLiteral("parent.mp4"));
     const QString childPath = tmpDir.filePath(QStringLiteral("child.mp4"));
     if (!CodecDetector::isEncoderAvailable(QStringLiteral("mpeg4"))) {
-        for (int g = 1; g <= 10; ++g)
+        for (int g = 1; g <= 11; ++g)
             tally.skip(g, "mpeg4 encoder not registered (CodecDetector::isEncoderAvailable)");
         return tally.finish("[video-player-parent]");
     }
@@ -483,7 +487,7 @@ int runVideoPlayerParentSelftest()
         const std::string reason = tmpDir.isValid()
             ? "mpeg4 fixture media could not be written: " + mediaError.toStdString()
             : std::string("temporary directory invalid");
-        for (int g = 1; g <= 10; ++g)
+        for (int g = 1; g <= 11; ++g)
             tally.gate(g, false, reason.c_str());
         return tally.finish("[video-player-parent]");
     }
@@ -1028,6 +1032,128 @@ int runVideoPlayerParentSelftest()
                        && !online.isNull() && online.size() == onlineWithoutParent.size()
                        && offlineDiff.maxChannel <= 2 && onlineDiff.changedPixels > 0,
                    "offline display differs from parentless reference or online control has no visible parent effect");
+    }
+
+    // ── G11: zero-byte parent (characterisation pin, HEAD behaviour) ──────
+    // A = parent file is an empty .mp4, B = online parent with opacity 0,
+    // C = no parent. parentLayerAt calls the empty file decodable, but
+    // VideoPlayer builds no parent DecodedLayer for it (parentHit false) and
+    // renderFrameAt leaves the child unparented: A == C and A != B on both.
+    {
+        const QString zeroPath = tmpDir.filePath(QStringLiteral("g11-zero-parent.mp4"));
+        const QString g11BasePath = tmpDir.filePath(QStringLiteral("g11-base.mp4"));
+        const QString g11SpacerPath = tmpDir.filePath(QStringLiteral("g11-spacer.mp4"));
+        const QString g11ParentPath = tmpDir.filePath(QStringLiteral("g11-parent.mp4"));
+        const QString g11ChildPath = tmpDir.filePath(QStringLiteral("g11-child.mp4"));
+        QString fixtureError;
+        bool fixtureReady =
+            writeSyntheticClip(g11BasePath, QColor(40, 40, 40), &fixtureError, false)
+            && writeSyntheticClip(g11SpacerPath, QColor(0, 200, 0), &fixtureError, false)
+            && writeSyntheticClip(g11ParentPath, QColor(0, 0, 220), &fixtureError, false)
+            && writeSyntheticClip(g11ChildPath, QColor(220, 0, 0), &fixtureError, false);
+        {
+            QFile zero(zeroPath);
+            fixtureReady = fixtureReady && zero.open(QIODevice::WriteOnly) && zero.size() == 0;
+        }
+        auto makeTimeline = [&](Timeline &tl, const QString &parentFile,
+                                double parentOpacity, bool linked) {
+            ClipInfo base = makeClip(g11BasePath, QStringLiteral("base"), 0.0, 6.0);
+            base.opacity = 0.0; // Keep a real V1 decoder, expose V2/V3 pixels.
+            addClip(tl, 0, base);
+            addClip(tl, 1, makeClip(g11SpacerPath, QStringLiteral("spacer"),
+                                    0.0, 1.0, kParentT));
+            ClipInfo parent = makeClip(parentFile, QStringLiteral("parent"),
+                                       0.0, 4.0, kParentT);
+            parent.opacity = parentOpacity;
+            addClip(tl, 1, parent);
+            addClip(tl, kChildTrack, makeClip(g11ChildPath, QStringLiteral("child"),
+                                             0.0, 6.0, kChildT));
+            if (linked)
+                tl.setClipParent(childKey, parentKey);
+        };
+        Timeline zeroTl;
+        Timeline onlineTl;
+        Timeline noParentTl;
+        makeTimeline(zeroTl, zeroPath, 1.0, true);
+        makeTimeline(onlineTl, g11ParentPath, 0.0, true);
+        makeTimeline(noParentTl, g11ParentPath, 0.0, false);
+
+        PathPair a;
+        PathPair b;
+        PathPair c;
+        if (fixtureReady) {
+            a = observeCase(zeroTl, 2.0, 4.0, 1, 1, -1);
+            b = observeCase(onlineTl, 2.0, 4.0, 1, 1, -1);
+            c = observeCase(noParentTl, 2.0, 4.0, 1, 1, -1);
+        }
+        const qint64 renderUs = usecOf(2.5);
+        const QImage renderA = fixtureReady ? tlrender::renderFrameAt(&zeroTl, renderUs, kCanvas) : QImage();
+        const QImage renderB = fixtureReady ? tlrender::renderFrameAt(&onlineTl, renderUs, kCanvas) : QImage();
+        const QImage renderC = fixtureReady ? tlrender::renderFrameAt(&noParentTl, renderUs, kCanvas) : QImage();
+        const PixelDifference renderAC = comparePixels(renderA, renderC);
+        const PixelDifference renderAB = comparePixels(renderA, renderB);
+        const PixelDifference renderBC = comparePixels(renderB, renderC);
+        const PixelDifference playerAC = comparePixels(a.d.cpuFrame, c.d.cpuFrame);
+        const PixelDifference playerAB = comparePixels(a.d.cpuFrame, b.d.cpuFrame);
+
+        // The divergence this gate pins: the existence check says decodable,
+        // the decoded-layer result says there is no parent.
+        const bool aHitDecodable = a.cpu.hit && a.cpu.hit->decodable
+            && a.track.hit && a.track.hit->decodable;
+        auto vpUnparented = [](const PathResult &r) {
+            return r.recorded && !r.parentLayerPresent && !r.child.parentHit
+                && !r.child.parentHitDecodable && r.child.parentSourceIndex == -1;
+        };
+        auto vpParented = [](const PathResult &r) {
+            return r.recorded && r.parentLayerPresent && r.child.parentHit
+                && r.child.parentHitDecodable && r.child.parentSourceIndex == 1;
+        };
+        std::cerr << "  G11 fixtureReady=" << fixtureReady
+                  << " fixtureError=" << fixtureError.toStdString()
+                  << " zeroSize=" << QFileInfo(zeroPath).size()
+                  << " DIVERGENCE parentLayerAt(parent).decodable cpu="
+                  << (a.cpu.hit ? int(a.cpu.hit->decodable) : -1) << " track="
+                  << (a.track.hit ? int(a.track.hit->decodable) : -1)
+                  << " but VideoPlayer parentHit cpu=" << a.cpu.child.parentHit
+                  << " track=" << a.track.child.parentHit << '\n';
+        std::cerr << "  G11 A(zero) cpu: parentLayerPresent=" << a.cpu.parentLayerPresent
+                  << " parentHit=" << a.cpu.child.parentHit
+                  << " parentHitDecodable=" << a.cpu.child.parentHitDecodable
+                  << " parentSourceIndex=" << a.cpu.child.parentSourceIndex
+                  << " | track: parentLayerPresent=" << a.track.parentLayerPresent
+                  << " parentHit=" << a.track.child.parentHit
+                  << " parentHitDecodable=" << a.track.child.parentHitDecodable
+                  << " parentSourceIndex=" << a.track.child.parentSourceIndex << '\n';
+        std::cerr << "  G11 B(online) cpu: parentHit=" << b.cpu.child.parentHit
+                  << " parentHitDecodable=" << b.cpu.child.parentHitDecodable
+                  << " parentSourceIndex=" << b.cpu.child.parentSourceIndex
+                  << " | track: parentHit=" << b.track.child.parentHit
+                  << " parentHitDecodable=" << b.track.child.parentHitDecodable
+                  << " parentSourceIndex=" << b.track.child.parentSourceIndex << '\n';
+        std::cerr << "  G11 renderFrameAt t=2.5 maxChannel(A,C)=" << renderAC.maxChannel
+                  << " changed=" << renderAC.changedPixels
+                  << " maxChannel(A,B)=" << renderAB.maxChannel
+                  << " changed=" << renderAB.changedPixels
+                  << " maxChannel(B,C)=" << renderBC.maxChannel
+                  << " changed=" << renderBC.changedPixels << '\n';
+        std::cerr << "  G11 VideoPlayer cpuFrame sizes A/B/C=" << a.d.cpuFrame.width() << 'x'
+                  << a.d.cpuFrame.height() << '/' << b.d.cpuFrame.width() << 'x'
+                  << b.d.cpuFrame.height() << '/' << c.d.cpuFrame.width() << 'x'
+                  << c.d.cpuFrame.height() << " maxChannel(A,C)=" << playerAC.maxChannel
+                  << " changed=" << playerAC.changedPixels
+                  << " maxChannel(A,B)=" << playerAB.maxChannel
+                  << " changed=" << playerAB.changedPixels << '\n';
+        const bool renderOk = !renderA.isNull() && renderA.size() == renderC.size()
+            && renderA.size() == renderB.size()
+            && renderAC.maxChannel <= 2 && renderAB.maxChannel > 2 && renderBC.maxChannel > 2;
+        const bool playerOk = !a.d.cpuFrame.isNull()
+            && a.d.cpuFrame.size() == b.d.cpuFrame.size()
+            && a.d.cpuFrame.size() == c.d.cpuFrame.size()
+            && playerAC.maxChannel <= 2 && playerAB.maxChannel > 2;
+        const bool admissionOk = vpUnparented(a.cpu) && vpUnparented(a.track)
+            && vpParented(b.cpu) && vpParented(b.track);
+        tally.gate(11, fixtureReady && aHitDecodable && admissionOk && renderOk && playerOk,
+                   "zero-byte parent no longer behaves as parentless on renderFrameAt / VideoPlayer, or the online-parent control stopped aligning");
     }
 
     return tally.finish("[video-player-parent]");

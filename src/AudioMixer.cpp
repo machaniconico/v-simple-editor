@@ -264,29 +264,6 @@ inline qint64 reverseInstanceForEntry(const PlaybackEntry &entry,
         : 0;
 }
 
-// Linear-interpolate the per-clip volume envelope at a given clip-local
-// time (seconds, 0.0 == clip start on the timeline). Empty envelope falls
-// back to the static `volume` field so existing behaviour is preserved
-// when no automation has been authored. Endpoints clamp (no extrapolation).
-inline double evaluateVolumeEnvelope(const QVector<AudioGainPoint> &env,
-                                     double clipLocalSec,
-                                     double fallbackGain) {
-    if (env.isEmpty()) return fallbackGain;
-    if (clipLocalSec <= env.first().time) return env.first().gain;
-    if (clipLocalSec >= env.last().time) return env.last().gain;
-    for (int i = 0; i + 1 < env.size(); ++i) {
-        const double aT = env[i].time;
-        const double bT = env[i + 1].time;
-        if (clipLocalSec >= aT && clipLocalSec <= bT) {
-            const double span = bT - aT;
-            if (span <= 0.0) return env[i + 1].gain;
-            const double u = (clipLocalSec - aT) / span;
-            return env[i].gain + (env[i + 1].gain - env[i].gain) * u;
-        }
-    }
-    return fallbackGain;
-}
-
 constexpr double kMaxReversedClipSeconds = 10.0 * 60.0;
 
 template<typename Sample>
@@ -949,7 +926,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
         if (!e->entry.volumeEnvelope.isEmpty()) {
             const double envT = static_cast<double>(cursorUs) / 1e6
                                 - e->entry.timelineStart;
-            clipGain = evaluateVolumeEnvelope(e->entry.volumeEnvelope,
+            clipGain = audio::evaluateVolumeEnvelope(e->entry.volumeEnvelope,
                                               envT, e->entry.volume);
         }
         double gain = qBound(0.0, clipGain, 4.0);

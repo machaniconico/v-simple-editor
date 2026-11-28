@@ -396,6 +396,9 @@ QJsonObject clipOutputItemSchema()
         {QStringLiteral("autoOrient"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
         // US-1711: optional (required に入れない)。
         {QStringLiteral("autoOrientToCamera"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+        // US-1815: optional (required に入れない)。非 0 の時だけ返す。
+        {QStringLiteral("worldX"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+        {QStringLiteral("worldY"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("volume"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("opacity"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
         {QStringLiteral("enabled"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
@@ -1171,6 +1174,11 @@ QJsonObject clipToJson(const ClipInfo& clip, int clipIndex, double startSec,
         }},
         {QStringLiteral("textOverlayCount"), clip.textManager.count()}
     };
+    // US-1815: the 3D world x/y appear only when non-zero.
+    if (clip.layer3D.worldX != 0.0)
+        result.insert(QStringLiteral("worldX"), clip.layer3D.worldX);
+    if (clip.layer3D.worldY != 0.0)
+        result.insert(QStringLiteral("worldY"), clip.layer3D.worldY);
     // US-1201: only a connected clip carries the two connection keys.
     if (!clip.anchorUid.isEmpty()) {
         result.insert(QStringLiteral("anchorUid"), clip.anchorUid);
@@ -4097,7 +4105,7 @@ void McpEditorTools::registerWriteTools()
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("set_clip_property"),
-        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。autoOrientToCamera と is3DLayer は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
+        QStringLiteral("指定クリップのプロパティを設定する。property と有効範囲: volume 0..2、opacity 0..1、speed 0.25..4、pan -1..1、videoScale 0.1..10、reversed true/false、autoOrient true/false、autoOrientToCamera true/false (3D レイヤーをプロジェクトのカメラへ向ける。is3DLayer と trueProjection カメラがあるときだけ効く)、is3DLayer true/false。autoOrient はパスの進行方向へ回す別機能。is3DLayer=false にすると positionZ / rotationX/Y/Z は 0 に消える (Ctrl+Z / undo で戻る)。worldX / worldY ±10000 (3D レイヤーのみ、プロジェクトカメラ (trueProjection) でのみ効く。is3DLayer=false のクリップは拒否)。autoOrientToCamera / is3DLayer / worldX / worldY は映像クリップのみ。speed と reversed は同じ linkGroup の映像・音声にも同時に適用する (応答の linkedApplied)。現在値は get_timeline で確認でき、Ctrl+Z / undo ツールで戻せる。"),
         schemaWithRequired(mergedProperties(clipProperties, QJsonObject{
             {QStringLiteral("property"), QJsonObject{
                 {QStringLiteral("type"), QStringLiteral("string")},
@@ -4107,10 +4115,11 @@ void McpEditorTools::registerWriteTools()
                     QStringLiteral("speed"), QStringLiteral("pan"),
                     QStringLiteral("videoScale"), QStringLiteral("reversed"),
                     QStringLiteral("autoOrient"), QStringLiteral("autoOrientToCamera"),
-                    QStringLiteral("is3DLayer")
+                    QStringLiteral("is3DLayer"),
+                    QStringLiteral("worldX"), QStringLiteral("worldY")
                 }},
                 {QStringLiteral("description"),
-                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed / autoOrient / autoOrientToCamera / is3DLayer")}
+                 QStringLiteral("設定対象。volume / opacity / speed / pan / videoScale / reversed / autoOrient / autoOrientToCamera / is3DLayer / worldX / worldY")}
             }},
             {QStringLiteral("value"), QJsonObject{
                 {QStringLiteral("oneOf"), QJsonArray{
@@ -4136,6 +4145,8 @@ void McpEditorTools::registerWriteTools()
             const bool isAutoOrientProperty = property == QStringLiteral("autoOrient");
             const bool isAutoOrientToCameraProperty = property == QStringLiteral("autoOrientToCamera");
             const bool isIs3DLayerProperty = property == QStringLiteral("is3DLayer");
+            const bool isWorldXProperty = property == QStringLiteral("worldX");
+            const bool isWorldYProperty = property == QStringLiteral("worldY");
             const bool isBooleanProperty = isReversedProperty || isAutoOrientProperty
                 || isAutoOrientToCameraProperty || isIs3DLayerProperty;
             double value = 0.0;
@@ -4152,6 +4163,9 @@ void McpEditorTools::registerWriteTools()
             } else if (!requiredFiniteNumber(args, QStringLiteral("value"), &value, err)) {
                 return {};
             }
+            if ((isWorldXProperty || isWorldYProperty) && std::fabs(value) > 10000.0)
+                return setError(err, QStringLiteral("%1 must be between -10000 and 10000").arg(property)),
+                       QJsonObject();
 
             ClipTarget target;
             if (!readClipTarget(args, m_window, timeline(), &target, err))
@@ -4177,8 +4191,9 @@ void McpEditorTools::registerWriteTools()
                     return setError(err, QStringLiteral("clip auto-orient update failed")),
                            QJsonObject();
                 }
-            } else if (isAutoOrientToCameraProperty || isIs3DLayerProperty) {
-                // US-1711: 映像クリップ専用。音声 / ロック中トラックは理由付きで断る。
+            } else if (isAutoOrientToCameraProperty || isIs3DLayerProperty
+                       || isWorldXProperty || isWorldYProperty) {
+                // US-1711 / US-1815: 映像クリップ専用。音声 / ロック中トラックは理由付きで断る。
                 if (target.audio)
                     return setError(err, QStringLiteral("%1 は音声クリップには指定できません (kind は video のみ)")
                                              .arg(property)),
@@ -4196,20 +4211,30 @@ void McpEditorTools::registerWriteTools()
                     // setClipMotion は undo 点を作らないので、値が変わるときだけ
                     // ここで 1 回積む (GUI の motion 編集と同じ 1 操作 = 1 undo)。
                     const ClipInfo current = target.track->clips().at(target.clipIndex);
-                    if (current.is3DLayer != booleanValue) {
+                    const bool isWorldProperty = isWorldXProperty || isWorldYProperty;
+                    if (isWorldProperty && !current.is3DLayer)
+                        return setError(err, QStringLiteral("%1 は 3D レイヤーのクリップにだけ指定できます (is3DLayer を true にしてください)")
+                                                 .arg(property)),
+                               QJsonObject();
+                    const bool worldChanged = isWorldXProperty ? current.layer3D.worldX != value
+                                                               : current.layer3D.worldY != value;
+                    if (isWorldProperty ? worldChanged : current.is3DLayer != booleanValue) {
                         effectctrl::MotionState motion;
                         motion.scale = current.videoScale;
                         motion.dx = current.videoDx;
                         motion.dy = current.videoDy;
                         motion.rotation2DDeg = current.rotation2DDegrees;
                         motion.opacity = current.opacity;
-                        motion.is3DLayer = booleanValue;
+                        motion.is3DLayer = isWorldProperty ? current.is3DLayer : booleanValue;
                         motion.posZ = current.layer3D.positionZ;
+                        motion.worldX = isWorldXProperty ? value : current.layer3D.worldX;
+                        motion.worldY = isWorldYProperty ? value : current.layer3D.worldY;
                         motion.rotX = current.layer3D.rotationX;
                         motion.rotY = current.layer3D.rotationY;
                         motion.rotZ = current.layer3D.rotationZ;
                         currentTimeline->setClipMotion(target.trackIndex, target.clipIndex, motion);
-                        currentTimeline->saveUndoState(QStringLiteral("3D レイヤーを変更"));
+                        currentTimeline->saveUndoState(isWorldProperty
+                            ? QStringLiteral("3D ワールド位置を変更") : QStringLiteral("3D レイヤーを変更"));
                     }
                 }
             } else if (!currentTimeline->setClipPropertyByIndex(

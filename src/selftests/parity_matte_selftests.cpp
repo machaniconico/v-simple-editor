@@ -2048,14 +2048,16 @@ int runParitySelftest()
 
     // ── S3-STACK: inter-layer z-order regression guard ───────────────────────
     // Z-ORDER CONTRACT (locked here):
-    //   V1 = base layer (bottom). V2, V3 … are overlays painted ON TOP in
-    //   ASCENDING sourceTrack order ("overlays win"). This is the contract
-    //   of EVERY SSOT path:
-    //     • tlrender::renderFrameAt (export SSOT)
-    //     • trackmatte::composite
-    //     • MainWindow::buildSpecialClipComposite
-    //     • VideoPlayer::composeMultiTrackFrame (realtime preview) — FIXED in
-    //       R4-1 (was descending / V1-on-top until that commit).
+    //   Without an active track matte, V1 is painted LAST (frontmost) and the
+    //   overlays V2, V3 … go underneath it, highest track backmost ("V1
+    //   wins", PlaybackTypes.h). This is the contract of:
+    //     • tlrender::renderFrameAt (export SSOT, matte-free branch)
+    //     • VideoPlayer::composeMultiTrackFrame (realtime preview)
+    //     • MainWindow::buildSpecialClipComposite when no matte is active at
+    //       the frame (US-1804)
+    //   When a track matte is active at the frame, trackmatte::composite keeps
+    //   the ascending track order (V1 backmost) for the matte adjacency, in
+    //   both renderFrameAt's matte branch and buildSpecialClipComposite.
     //
     // REGRESSION HISTORY: R3 review found that composeMultiTrackFrame sorted
     // layers DESCENDING, painting V1 over V2. The R4-1 fix flipped the sort to

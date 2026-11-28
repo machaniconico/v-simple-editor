@@ -206,7 +206,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 13; ++g)
+        for (int g = 1; g <= 16; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -248,7 +248,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 13; ++g)
+        for (int g = 5; g <= 16; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -526,6 +526,96 @@ int runSpecialCompositeSelftest()
               << " export[" << diffText(plainDiff) << "] ok=" << plainOk << '\n';
     tally.gate(8, remapOk && freezeOk && plainOk,
                "file-backed export lost the saved time-remap or freeze-frame (see values above)");
+
+    // G14-G16 (US-1804): the special path's stacking order must follow
+    // renderFrameAt's per-frame matte test. V1 = the time-remapped stripe clip
+    // (opaque, full canvas), V2 = the opaque colour clip at dx +0.5 (a 160x180
+    // overlap with V1). The comparisons are whole-frame, every channel.
+    //   G14: no matte -> V1 frontmost: buildSpecialClipComposite(t) ==
+    //        renderFrameAt(t) (maxDiff 0). HEAD stacked V2 over V1 (FAIL,
+    //        maxDiff 147 over the 28800-pixel overlap).
+    //   G15: V2 luma-inverted-matted by V3 -> ascending kept: preview == export
+    //        (maxDiff 0), and that export shows V2 over V1 (it differs from the
+    //        G14 export in > 5000 pixels), so a V1-frontmost stack would fail.
+    //   G16: the same matte entry, but V3 ends at 0.3 s: at t = 0.5 no matte is
+    //        active, so preview == export (HEAD FAIL); at t = 0.2 the matte is
+    //        active and preview == export too, and the two exports differ
+    //        (> 5000 pixels), i.e. the decision is made per frame.
+    {
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+        window.m_timeRemapClipEntries.clear();
+        window.m_projectConfig.fps = kFps;
+        ClipInfo zV2 = base;
+        zV2.filePath = varyPath;
+        zV2.videoDx = 0.5;
+        ClipInfo zV3 = base;
+        ClipInfo zV3Short = base;
+        zV3Short.outPoint = 0.3;
+        const auto setZTracks = [&](const QVector<QVector<ClipInfo>> &tracks, bool matte) {
+            timeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            QHash<QString, TimelineTrackMatteEntry> entries;
+            if (matte) {
+                TimelineTrackMatteEntry entry;
+                entry.matteType = TrackMatteType::LumaInvertedMatte;
+                entry.matteSourceClipId = trackMatteClipKey(2, 0);
+                entries.insert(trackMatteClipKey(1, 0), entry);
+            }
+            timeline->setTrackMatteEntries(entries);
+        };
+        const auto exportAt = [&](double sec) {
+            return tlrender::renderFrameAt(timeline, qint64(sec * 1000000.0), size);
+        };
+        const double zt = 0.5;
+
+        setZTracks({{remapped}, {zV2}}, false);
+        const QImage g14Preview = window.buildSpecialClipComposite(zt);
+        const QImage g14Export = exportAt(zt);
+        const DiffStat g14 = compare(g14Preview, g14Export);
+        std::cerr << "special-composite G14 no matte previewNull=" << g14Preview.isNull()
+                  << " sizeMatch=" << g14.sizeMatch << " maxDiff=" << g14.maxDiff
+                  << " diffPixels=" << g14.diffPixels << " (expect 0 / 0, HEAD maxDiff 147 / 28800 px)\n";
+        tally.gate(14, varyOk && !g14Preview.isNull() && g14.sizeMatch && g14.maxDiff == 0,
+                   "special preview stacks V2 over V1 without a matte, unlike renderFrameAt (see values above)");
+
+        setZTracks({{remapped}, {zV2}, {zV3}}, true);
+        const QImage g15Preview = window.buildSpecialClipComposite(zt);
+        const QImage g15Export = exportAt(zt);
+        const DiffStat g15 = compare(g15Preview, g15Export);
+        const DiffStat g15VsNoMatte = compare(g15Export, g14Export);
+        std::cerr << "special-composite G15 V3 matte previewNull=" << g15Preview.isNull()
+                  << " sizeMatch=" << g15.sizeMatch << " maxDiff=" << g15.maxDiff
+                  << " diffPixels=" << g15.diffPixels << " (expect 0 / 0) export vs no-matte export diffPixels="
+                  << g15VsNoMatte.diffPixels << " (expect > 5000)\n";
+        tally.gate(15, varyOk && !g15Preview.isNull() && g15.sizeMatch && g15.maxDiff == 0
+                       && g15VsNoMatte.diffPixels > 5000,
+                   "matte frame: special preview != renderFrameAt or V2 not over V1 (see values above)");
+
+        setZTracks({{remapped}, {zV2}, {zV3Short}}, true);
+        const double ztActive = 0.2;
+        const QImage g16Preview = window.buildSpecialClipComposite(zt);
+        const QImage g16Export = exportAt(zt);
+        const QImage g16PreviewActive = window.buildSpecialClipComposite(ztActive);
+        const QImage g16ExportActive = exportAt(ztActive);
+        const DiffStat g16 = compare(g16Preview, g16Export);
+        const DiffStat g16Active = compare(g16PreviewActive, g16ExportActive);
+        const DiffStat g16Frames = compare(g16Export, g16ExportActive);
+        const bool g16ok1 = !g16Preview.isNull() && g16.sizeMatch && g16.maxDiff == 0;
+        const bool g16ok2 = !g16PreviewActive.isNull() && g16Active.sizeMatch && g16Active.maxDiff == 0;
+        const bool g16ok3 = g16Frames.sizeMatch && g16Frames.diffPixels > 5000;
+        std::cerr << "special-composite G16 (1) matte source ended, timelineSec=" << zt
+                  << " sizeMatch=" << g16.sizeMatch << " maxDiff=" << g16.maxDiff << " diffPixels="
+                  << g16.diffPixels << " (expect 0 / 0, HEAD maxDiff 147 / 28800 px) ok=" << g16ok1 << '\n'
+                  << "special-composite G16 (2) matte active, timelineSec=" << ztActive
+                  << " sizeMatch=" << g16Active.sizeMatch << " maxDiff=" << g16Active.maxDiff << " diffPixels="
+                  << g16Active.diffPixels << " (expect 0 / 0) ok=" << g16ok2 << '\n'
+                  << "special-composite G16 (3) export " << zt << " s vs " << ztActive
+                  << " s diffPixels=" << g16Frames.diffPixels << " (expect > 5000) ok=" << g16ok3 << '\n';
+        tally.gate(16, varyOk && g16ok1 && g16ok2 && g16ok3,
+                   "stale matte entry: special preview stacking not decided per frame (see values above)");
+
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
+    }
 
     // G5-G7 (US-1106): GLPreview output of a special-composite frame. The
     // widget is the frame's logical size with no display transform and the
