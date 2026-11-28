@@ -63,9 +63,11 @@
 #include "../CaptionEditorDialog.h"
 #include "../CaptionTrack.h"
 #include "../MainWindow.h"
+#include "../BrushAnimation.h"
 #include "../MusicRemix.h"
 #include "../RenderQueue.h"
 #include "../ShapeLayer.h"
+#include "../Text3DLayer.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../Timeline.h"
@@ -73,6 +75,7 @@
 #include "../libavcore/AudioExtract.h"
 #include "../libavcore/Probe.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
 #include <functional>
 
 namespace {
@@ -1267,7 +1270,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */ + 4 /* US-1911 */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics; US-1911: get/set_clip_text3d + get/set_clip_brush
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -7595,6 +7598,651 @@ int runMcpSelftest()
                                    && setEnum.contains(QStringLiteral("worldY"))),
                 "worldX / worldY through set_clip_property / get_timeline did not round-trip, validate, or undo");
         }
+        // G201-G206 (US-1911): get/set_clip_text3d and get/set_clip_brush. HEAD has none of the four tools
+        // (57 tools), so G201 fails there and every other gate fails on the unknown tool.
+        // The gates live in a type-erased lambda so their locals get their own stack frame:
+        // runMcpSelftest's frame plus registerWriteTools' frame is already close to the 1 MiB stack.
+        const std::function<void()> sidecarGates = [&]() {
+            const auto serial = [&]() { return dynTimeline->undoManager()->saveSerial(); };
+            const auto clipAt = [&](int trackIndex) {
+                return dynTimeline->trackAt(false, trackIndex)->clips().first();
+            };
+            const auto placeClips = [&](const QVector<QVector<ClipInfo>>& video) {
+                dynTimeline->restoreFromProject(video, QVector<QVector<ClipInfo>>{{}},
+                                                0.0, -1.0, -1.0, 100);
+                dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+                dynTimeline->undoManager()->clear();
+                dynTimeline->undoManager()->saveState(
+                    dynTimeline->currentState(), QStringLiteral("MCP selftest baseline"));
+            };
+            const auto baseClip = [&]() {
+                ClipInfo clip;
+                clip.filePath = QStringLiteral("/selftests/mcp-sidecar-v.mp4");
+                clip.duration = clip.outPoint = 4.0;
+                return clip;
+            };
+            const QString progressName = QStringLiteral("brush_progress");
+            const auto progressKeys = [&](const ClipInfo& clip) {
+                const KeyframeTrack* track = clip.keyframes.track(progressName);
+                if (!track)
+                    return QStringLiteral("none");
+                QStringList keys;
+                for (const KeyframePoint& point : track->keyframes())
+                    keys << QStringLiteral("%1:%2").arg(point.time).arg(point.value);
+                return QStringLiteral("[") + keys.join(QLatin1Char(',')) + QStringLiteral("]");
+            };
+            const auto withProgress = [&](ClipInfo clip, const QVector<QPair<double, double>>& keys) {
+                KeyframeTrack track(progressName, 0.0);
+                for (const auto& key : keys)
+                    track.addKeyframe(key.first, key.second);
+                clip.keyframes.addTrack(track);
+                return clip;
+            };
+            const auto brushArgs = [&](const QJsonValue& brush, const QJsonObject& extra = QJsonObject()) {
+                QJsonObject args = vArgs({{QStringLiteral("brush"), brush}});
+                for (auto it = extra.constBegin(); it != extra.constEnd(); ++it)
+                    args.insert(it.key(), it.value());
+                return args;
+            };
+            const auto brushNormalized = [&](QJsonObject input) {
+                input.remove(QStringLiteral("fontSize"));
+                input.remove(QStringLiteral("progress"));
+                BrushAnimation reference;
+                reference.fromJson(input);
+                return reference.toJson();
+            };
+            const QJsonObject brushIn{
+                {QStringLiteral("text"), QStringLiteral("Hi")}, {QStringLiteral("fontFamily"), QStringLiteral("Arial")},
+                {QStringLiteral("fontPointSizeF"), 96.0}, {QStringLiteral("fontWeight"), 700},
+                {QStringLiteral("fontItalic"), true}, {QStringLiteral("fontUnderline"), false},
+                {QStringLiteral("basePositionX"), 40.0}, {QStringLiteral("basePositionY"), 200.0},
+                {QStringLiteral("brushWidth"), 16.0}, {QStringLiteral("mode"), QStringLiteral("PerCharacter")},
+                {QStringLiteral("fontSize"), 12}, {QStringLiteral("progress"), 0.7}};
+            const QJsonObject brushNorm = brushNormalized(brushIn);
+            const auto withKey = [](QJsonObject object, const QString& key, const QJsonValue& value) {
+                object.insert(key, value);
+                return object;
+            };
+
+            // G201: tools/list carries the four tools and the total is 61.
+            {
+                QStringList names;
+                for (const QJsonValue& descriptor : projectInfoToolDescriptors)
+                    names << descriptor.toObject().value(QStringLiteral("name")).toString();
+                const bool all4 = names.contains(QStringLiteral("get_clip_text3d"))
+                    && names.contains(QStringLiteral("set_clip_text3d"))
+                    && names.contains(QStringLiteral("get_clip_brush"))
+                    && names.contains(QStringLiteral("set_clip_brush"));
+                std::fprintf(stderr, "mcp G201 tools=%d all4=%d (expect 61, 1)\n",
+                             static_cast<int>(names.size()), all4);
+                tallyObserved(201, observeTerm(201, "tools/list has the four sidecar tools", all4)
+                    && observeTerm(201, "tools/list total is 61", names.size() == 61),
+                    "tools/list is missing get/set_clip_text3d / get/set_clip_brush or the total is not 61");
+            }
+
+            // G202: text3d round trip (timeOffsetSec 0 accepted and omitted by toJson, 1.5 kept),
+            // unchanged re-set is a no-op, one undo per change.
+            {
+                placeClips({{baseClip()}});
+                const QJsonObject in{{QStringLiteral("text"), QStringLiteral("Hello 3D")},
+                                     {QStringLiteral("fontPointSize"), 48.0},
+                                     {QStringLiteral("extrudeEnabled"), true},
+                                     {QStringLiteral("cameraDistance"), 500.0},
+                                     {QStringLiteral("timeOffsetSec"), 0}};
+                Text3DLayer reference;
+                reference.fromJson(in);
+                const QJsonObject norm = reference.toJson();
+                const QJsonObject empty0 = toolPayload(call(QStringLiteral("get_clip_text3d"), vArgs({})));
+                const quint64 s0 = serial();
+                const QJsonObject setR = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                          vArgs({{QStringLiteral("text3d"), in}})));
+                const QJsonObject getR = toolPayload(call(QStringLiteral("get_clip_text3d"), vArgs({})));
+                const quint64 s1 = serial();
+                const QJsonObject again = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                           vArgs({{QStringLiteral("text3d"), norm}})));
+                const quint64 s2 = serial();
+                const QJsonObject offIn = withKey(in, QStringLiteral("timeOffsetSec"), 1.5);
+                const QJsonObject setOff = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                            vArgs({{QStringLiteral("text3d"), offIn}})));
+                const quint64 s3 = serial();
+                const QJsonObject offGet = toolPayload(call(QStringLiteral("get_clip_text3d"), vArgs({})));
+                undoOnce();
+                const QJsonObject afterUndo1 = clipAt(0).text3DConfig;
+                undoOnce();
+                const QJsonObject afterUndo2 = clipAt(0).text3DConfig;
+                const QJsonObject clearSet = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                              vArgs({{QStringLiteral("text3d"), in}})));
+                const quint64 s4 = serial();
+                const QJsonObject cleared = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                             vArgs({{QStringLiteral("text3d"), QJsonObject{}}})));
+                const quint64 s5 = serial();
+                const QJsonObject clearedAgain = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                                                                  vArgs({{QStringLiteral("text3d"), QJsonObject{}}})));
+                const quint64 s6 = serial();
+                std::fprintf(stderr, "mcp G202 empty present=%d set changed=%d present=%d get==norm=%d serial %llu->%llu "
+                             "again changed=%d serial=%llu off changed=%d serial=%llu offKept=%g undo1==norm=%d undo2 empty=%d "
+                             "normText=%s normPt=%g normExtrude=%d normHasOffset=%d keys=%d clear changed=%d/%d/%d serial %llu/%llu/%llu "
+                             "(expect 0 1 1 1 +1 0 same 1 +1 1.5 1 1 Hello 3D 48 1 0 >=15 1/1/0 +1 +1 same)\n",
+                             empty0.value(QStringLiteral("present")).toBool(true),
+                             setR.value(QStringLiteral("changed")).toBool(false), setR.value(QStringLiteral("present")).toBool(false),
+                             getR.value(QStringLiteral("text3d")).toObject() == norm,
+                             static_cast<unsigned long long>(s0), static_cast<unsigned long long>(s1),
+                             again.value(QStringLiteral("changed")).toBool(true), static_cast<unsigned long long>(s2),
+                             setOff.value(QStringLiteral("changed")).toBool(false), static_cast<unsigned long long>(s3),
+                             offGet.value(QStringLiteral("text3d")).toObject().value(QStringLiteral("timeOffsetSec")).toDouble(-1),
+                             afterUndo1 == norm, afterUndo2.isEmpty(),
+                             qPrintable(norm.value(QStringLiteral("text")).toString()),
+                             norm.value(QStringLiteral("fontPointSize")).toDouble(-1),
+                             norm.value(QStringLiteral("extrudeEnabled")).toBool(false),
+                             norm.contains(QStringLiteral("timeOffsetSec")), static_cast<int>(norm.size()),
+                             clearSet.value(QStringLiteral("changed")).toBool(false),
+                             cleared.value(QStringLiteral("changed")).toBool(false),
+                             clearedAgain.value(QStringLiteral("changed")).toBool(true),
+                             static_cast<unsigned long long>(s4), static_cast<unsigned long long>(s5),
+                             static_cast<unsigned long long>(s6));
+                tallyObserved(202, observeTerm(202, "text3d starts absent",
+                                   !empty0.value(QStringLiteral("present")).toBool(true)
+                                       && empty0.value(QStringLiteral("text3d")).toObject().isEmpty())
+                    && observeTerm(202, "normalized value sanity",
+                                   norm.value(QStringLiteral("text")).toString() == QStringLiteral("Hello 3D")
+                                       && norm.value(QStringLiteral("fontPointSize")).toDouble(-1) == 48.0
+                                       && norm.value(QStringLiteral("extrudeEnabled")).toBool(false)
+                                       && !norm.contains(QStringLiteral("timeOffsetSec")) && norm.size() >= 15)
+                    && observeTerm(202, "set changed + present, get == normalized",
+                                   setR.value(QStringLiteral("changed")).toBool(false)
+                                       && setR.value(QStringLiteral("present")).toBool(false)
+                                       && getR.value(QStringLiteral("text3d")).toObject() == norm
+                                       && getR.value(QStringLiteral("present")).toBool(false))
+                    && observeTerm(202, "saveSerial +1 for the first set", s1 == s0 + 1)
+                    && observeTerm(202, "identical set is changed=false with no undo point",
+                                   !again.value(QStringLiteral("changed")).toBool(true) && s2 == s1)
+                    && observeTerm(202, "timeOffsetSec 1.5 kept, +1 serial",
+                                   setOff.value(QStringLiteral("changed")).toBool(false) && s3 == s2 + 1
+                                       && offGet.value(QStringLiteral("text3d")).toObject()
+                                              .value(QStringLiteral("timeOffsetSec")).toDouble(-1) == 1.5)
+                    && observeTerm(202, "undo x2 returns normalized then empty",
+                                   afterUndo1 == norm && afterUndo2.isEmpty())
+                    && observeTerm(202, "{} clears (+1), clearing again is a no-op",
+                                   clearSet.value(QStringLiteral("changed")).toBool(false)
+                                       && cleared.value(QStringLiteral("changed")).toBool(false)
+                                       && !cleared.value(QStringLiteral("present")).toBool(true)
+                                       && s5 == s4 + 1
+                                       && !clearedAgain.value(QStringLiteral("changed")).toBool(true) && s6 == s5),
+                    "set_clip_text3d did not round-trip, normalize, no-op on equal values, clear, or undo");
+            }
+
+            // G203: text3d refusals leave state and saveSerial untouched; the 64 KiB boundary is exact.
+            {
+                placeClips({{baseClip()}});
+                const QJsonObject seed{{QStringLiteral("text"), QStringLiteral("seed")}};
+                call(QStringLiteral("set_clip_text3d"), vArgs({{QStringLiteral("text3d"), seed}}));
+                const QJsonObject stored = clipAt(0).text3DConfig;
+                const quint64 s0 = serial();
+                const int base = QJsonDocument(QJsonObject{{QStringLiteral("text"), QString()}})
+                                     .toJson(QJsonDocument::Compact).size();
+                const QJsonObject r1 = call(QStringLiteral("set_clip_text3d"),
+                    vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("bogusKey"), 1}}}}));
+                const QJsonObject r2 = call(QStringLiteral("set_clip_text3d"),
+                    vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"),
+                        QString(65536 - base + 1, QLatin1Char('a'))}}}}));
+                const QJsonObject r3 = call(QStringLiteral("set_clip_text3d"),
+                                            vArgs({{QStringLiteral("text3d"), QStringLiteral("text")}}));
+                const QJsonObject r4 = call(QStringLiteral("set_clip_text3d"),
+                                            vArgs({{QStringLiteral("text3d"), QJsonArray{1, 2}}}));
+                const QJsonObject r5 = call(QStringLiteral("set_clip_text3d"),
+                                            vArgs({{QStringLiteral("text3d"), QJsonValue(QJsonValue::Null)}}));
+                const QJsonObject r6 = call(QStringLiteral("set_clip_text3d"), vArgs({}));
+                // extrudeEnabled を付けない: 検査を欠いた変異体でもメッシュ生成で固まらない。
+                const auto segCall = [&](const QJsonValue& segments) {
+                    return call(QStringLiteral("set_clip_text3d"),
+                        vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"), QStringLiteral("seg")},
+                                {QStringLiteral("extrudeBevelSegments"), segments}}}}));
+                };
+                const QJsonObject s9 = segCall(9);
+                const QJsonObject s1e8 = segCall(100000000);
+                const QJsonObject sNeg = segCall(-1);
+                const QJsonObject sFrac = segCall(2.5);
+                const QJsonObject sStr = segCall(QStringLiteral("3"));
+                // 深さ / ベベルの実効値の検査 (ExtrudedMesh.cpp:209-217 の中間ループ回数)。extrudeEnabled は付けない。
+                const auto extCall = [&](const QString& text, const QJsonObject& extra) {
+                    QJsonObject o = extra;
+                    if (!text.isEmpty())
+                        o.insert(QStringLiteral("text"), text);
+                    return call(QStringLiteral("set_clip_text3d"), vArgs({{QStringLiteral("text3d"), o}}));
+                };
+                const QJsonObject d1 = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 1e-7},
+                    {QStringLiteral("extrudeBevelDepth"), 0.1}, {QStringLiteral("extrudeBevelSegments"), 8}});
+                const QJsonObject d2 = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0},
+                    {QStringLiteral("extrudeBevelDepth"), 0.02}});
+                // 40000 の上限だけが拒否する帯 (steps 約 340000 は積の上限 1000000 以下)。
+                const QJsonObject dMid = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0.00001},
+                    {QStringLiteral("extrudeBevelDepth"), 0.1}, {QStringLiteral("extrudeBevelSegments"), 8}});
+                const QJsonObject dNeg = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), -1}});
+                const QJsonObject dBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 5.01}});
+                const QJsonObject bdBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeBevelDepth"), 1.01}});
+                const QJsonObject bwBig = extCall(QStringLiteral("A"), {{QStringLiteral("extrudeBevelWidth"), 1.01}});
+                const QJsonObject longText = extCall(QString(100, QLatin1Char('a')), {{QStringLiteral("extrudeDepth"), 0.001},
+                    {QStringLiteral("extrudeBevelDepth"), 1.0}, {QStringLiteral("extrudeBevelSegments"), 8}});
+                const bool unchanged = clipAt(0).text3DConfig == stored && serial() == s0;
+                const QJsonObject exact = toolPayload(call(QStringLiteral("set_clip_text3d"),
+                    vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"),
+                        QString(65536 - base, QLatin1Char('a'))}}}})));
+                const int storedSize = clipAt(0).text3DConfig.value(QStringLiteral("text")).toString().size();
+                const QJsonObject seg8 = toolPayload(segCall(8));
+                const int stored8 = clipAt(0).text3DConfig.value(QStringLiteral("extrudeBevelSegments")).toInt(-99);
+                const QJsonObject seg0 = toolPayload(segCall(0));
+                const int stored0 = clipAt(0).text3DConfig.value(QStringLiteral("extrudeBevelSegments")).toInt(-99);
+                const QJsonObject edge = toolPayload(extCall(QStringLiteral("A"), {{QStringLiteral("extrudeDepth"), 0.001},
+                    {QStringLiteral("extrudeBevelDepth"), 1.0}, {QStringLiteral("extrudeBevelSegments"), 8}}));
+                const QJsonObject edgeCfg = clipAt(0).text3DConfig;
+                std::fprintf(stderr, "mcp G203 extrusion refusals [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] | [%s] acceptEdge ok=%d depth=%g bevelDepth=%g segs=%d\n",
+                             qPrintable(toolErrorText(d1)), qPrintable(toolErrorText(d2)), qPrintable(toolErrorText(dMid)), qPrintable(toolErrorText(dNeg)),
+                             qPrintable(toolErrorText(dBig)), qPrintable(toolErrorText(bdBig)), qPrintable(toolErrorText(bwBig)),
+                             qPrintable(toolErrorText(longText)), edge.value(QStringLiteral("ok")).toBool(false),
+                             edgeCfg.value(QStringLiteral("extrudeDepth")).toDouble(-99),
+                             edgeCfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99),
+                             edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99));
+                std::fprintf(stderr, "mcp G203 bevelSegments refusals [%s] | [%s] | [%s] | [%s] | [%s] accept8 ok=%d stored=%d accept0 ok=%d stored=%d\n",
+                             qPrintable(toolErrorText(s9)), qPrintable(toolErrorText(s1e8)), qPrintable(toolErrorText(sNeg)),
+                             qPrintable(toolErrorText(sFrac)), qPrintable(toolErrorText(sStr)),
+                             seg8.value(QStringLiteral("ok")).toBool(false), stored8,
+                             seg0.value(QStringLiteral("ok")).toBool(false), stored0);
+                std::fprintf(stderr, "mcp G203 errs [%s] | [%s] | [%s] | [%s] | [%s] | [%s] unchanged=%d "
+                             "exact64KiB ok=%d changed=%d storedTextLen=%d (expect 6 errors, 1, 1, 1, %d)\n",
+                             qPrintable(toolErrorText(r1)), qPrintable(toolErrorText(r2)), qPrintable(toolErrorText(r3)),
+                             qPrintable(toolErrorText(r4)), qPrintable(toolErrorText(r5)), qPrintable(toolErrorText(r6)),
+                             unchanged, exact.value(QStringLiteral("ok")).toBool(false),
+                             exact.value(QStringLiteral("changed")).toBool(false), storedSize, 65536 - base);
+                tallyObserved(203, observeTerm(203, "unknown top-level key refused", isErr(r1))
+                    && observeTerm(203, "65537-byte object refused", isErr(r2))
+                    && observeTerm(203, "string / array / null / missing refused",
+                                   isErr(r3) && isErr(r4) && isErr(r5) && isErr(r6))
+                    && observeTerm(203, "extrudeBevelSegments 9 refused", isErr(s9))
+                    && observeTerm(203, "extrudeBevelSegments 100000000 refused", isErr(s1e8))
+                    && observeTerm(203, "extrudeBevelSegments -1 refused", isErr(sNeg))
+                    && observeTerm(203, "extrudeBevelSegments 2.5 refused", isErr(sFrac))
+                    && observeTerm(203, "extrudeBevelSegments \"3\" refused", isErr(sStr))
+                    && observeTerm(203, "depth 1e-7 with bevelDepth 0.1 and 8 segments refused", isErr(d1))
+                    && observeTerm(203, "step count 340000 (over 40000, under the product limit) refused", isErr(dMid))
+                    && observeTerm(203, "depth 0 with an active bevel refused", isErr(d2))
+                    && observeTerm(203, "extrudeDepth -1 / 5.01 refused", isErr(dNeg) && isErr(dBig))
+                    && observeTerm(203, "extrudeBevelDepth 1.01 refused", isErr(bdBig))
+                    && observeTerm(203, "extrudeBevelWidth 1.01 refused", isErr(bwBig))
+                    && observeTerm(203, "100-char text over the step-times-length product limit refused", isErr(longText))
+                    && observeTerm(203, "state and saveSerial unchanged after refusals", unchanged)
+                    && observeTerm(203, "exactly 65536 bytes is accepted",
+                                   exact.value(QStringLiteral("ok")).toBool(false)
+                                       && exact.value(QStringLiteral("changed")).toBool(false)
+                                       && storedSize == 65536 - base)
+                    && observeTerm(203, "extrudeBevelSegments 8 accepted and stored exactly",
+                                   seg8.value(QStringLiteral("ok")).toBool(false) && stored8 == 8)
+                    && observeTerm(203, "extrudeBevelSegments 0 accepted and stored exactly",
+                                   seg0.value(QStringLiteral("ok")).toBool(false) && stored0 == 0)
+                    && observeTerm(203, "single-glyph depth 0.001 / bevelDepth 1.0 / 8 segments accepted and stored exactly",
+                                   edge.value(QStringLiteral("ok")).toBool(false)
+                                       && edgeCfg.value(QStringLiteral("extrudeDepth")).toDouble(-99) == 0.001
+                                       && edgeCfg.value(QStringLiteral("extrudeBevelDepth")).toDouble(-99) == 1.0
+                                       && edgeCfg.value(QStringLiteral("extrudeBevelSegments")).toInt(-99) == 8),
+                    "set_clip_text3d accepted an invalid text3d, changed state on refusal, or mis-measured the 64 KiB limit");
+            }
+
+            // G204: brush round trip, validation, undo, keyframe preservation, clear boundaries,
+            // and the non-selected-clip preview control.
+            {
+                // (a) set -> get == normalized (fontSize / progress dropped), {0:1} placed, +1 serial.
+                placeClips({{baseClip()}});
+                const quint64 sa0 = serial();
+                const QJsonObject setA = toolPayload(call(QStringLiteral("set_clip_brush"), brushArgs(brushIn)));
+                const QJsonObject getA = toolPayload(call(QStringLiteral("get_clip_brush"), vArgs({})));
+                const quint64 sa1 = serial();
+                const QString keysA = progressKeys(clipAt(0));
+                // (b) get output goes straight back into set: changed=false, same value, same serial.
+                const QJsonObject roundTrip = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(getA.value(QStringLiteral("brush")))));
+                const QJsonObject getB = toolPayload(call(QStringLiteral("get_clip_brush"), vArgs({})));
+                const quint64 sb = serial();
+                // (e) one undo restores both brushData and the (absent) brush_progress track.
+                undoOnce();
+                const bool undoRestored = clipAt(0).brushData.isEmpty() && progressKeys(clipAt(0)) == QStringLiteral("none");
+
+                // (c) refusals: brushData / track / serial unchanged.
+                placeClips({{baseClip()}});
+                call(QStringLiteral("set_clip_brush"), brushArgs(brushIn));
+                const ClipInfo beforeBad = clipAt(0);
+                const quint64 sBad0 = serial();
+                const QString badKeysBefore = progressKeys(beforeBad);
+                QStringList badErrors;
+                bool allBadRefused = true;
+                const auto expectRefused = [&](const QJsonObject& args) {
+                    const QJsonObject response = call(QStringLiteral("set_clip_brush"), args);
+                    allBadRefused = allBadRefused && isErr(response);
+                    badErrors << toolErrorText(response).left(40);
+                };
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("fontWeight"), 0)));
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("fontWeight"), 1.5)));
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("text"), QString(257, QLatin1Char('a')))));
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("text"), QString())));
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("mode"), QStringLiteral("Bogus"))));
+                expectRefused(brushArgs(withKey(brushIn, QStringLiteral("foo"), 1)));
+                expectRefused(brushArgs(brushIn, {{QStringLiteral("revealDurationSec"), 0}}));
+                expectRefused(brushArgs(brushIn, {{QStringLiteral("revealDurationSec"), 0.0005}}));
+                expectRefused(vArgs({}));
+                expectRefused(brushArgs(QJsonArray{}));
+                expectRefused(brushArgs(QStringLiteral("text")));
+                expectRefused(brushArgs(1));
+                expectRefused(brushArgs(true));
+                expectRefused(brushArgs(brushIn, {{QStringLiteral("revealDurationSec"), QStringLiteral("2")}}));
+                expectRefused(brushArgs(QJsonValue(QJsonValue::Null), {{QStringLiteral("revealDurationSec"), 1.0}}));
+                expectRefused(brushArgs(QJsonObject{}, {{QStringLiteral("revealDurationSec"), 1.0}}));
+                const ClipInfo afterBad = clipAt(0);
+                const bool badUnchanged = afterBad.brushData == beforeBad.brushData
+                    && progressKeys(afterBad) == badKeysBefore && serial() == sBad0;
+
+                // (d) M-3: a GUI-style reveal {0:0, 3:1} survives get -> set; a colour-only edit keeps it.
+                ClipInfo reveal = withProgress(baseClip(), {{0.0, 0.0}, {3.0, 1.0}});
+                reveal.brushData = brushNorm;
+                placeClips({{reveal}});
+                const quint64 sd0 = serial();
+                const QJsonObject keep = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(toolPayload(call(QStringLiteral("get_clip_brush"), vArgs({}))).value(QStringLiteral("brush")))));
+                const QString keysKeep = progressKeys(clipAt(0));
+                const quint64 sd1 = serial();
+                const QJsonObject colour = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(withKey(brushIn, QStringLiteral("fontWeight"), 900))));
+                const QString keysColour = progressKeys(clipAt(0));
+                const int weightColour = clipAt(0).brushData.value(QStringLiteral("fontWeight")).toInt(-1);
+                const quint64 sd2 = serial();
+                const QJsonObject replaced = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(withKey(brushIn, QStringLiteral("fontWeight"), 900), {{QStringLiteral("revealDurationSec"), 2.0}})));
+                const QString keysReplaced = progressKeys(clipAt(0));
+                const quint64 sd3 = serial();
+                const QJsonObject replacedAgain = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(withKey(brushIn, QStringLiteral("fontWeight"), 900), {{QStringLiteral("revealDurationSec"), 2.0}})));
+                const quint64 sd4 = serial();
+                // (d) boundary: 0.001 is the smallest honoured reveal; both keys survive the track's merge threshold.
+                placeClips({{baseClip()}});
+                const QJsonObject boundary = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(brushIn, {{QStringLiteral("revealDurationSec"), 0.001}})));
+                const ClipInfo boundaryClip = clipAt(0);
+                const KeyframeTrack* boundaryTrack = boundaryClip.keyframes.track(progressName);
+                const int boundaryCount = boundaryTrack ? boundaryTrack->count() : -1;
+                const bool boundaryKeys = boundaryCount == 2
+                    && boundaryTrack->keyframes().at(0).time == 0.0 && boundaryTrack->keyframes().at(0).value == 0.0
+                    && boundaryTrack->keyframes().at(1).time == 0.001 && boundaryTrack->keyframes().at(1).value == 1.0;
+
+                // (f) clear boundaries.
+                ClipInfo brushOnly = baseClip();
+                brushOnly.brushData = brushNorm;
+                ClipInfo trackOnly = withProgress(baseClip(), {{0.0, 1.0}});
+                ClipInfo plain = baseClip();
+                ClipInfo full = withProgress(baseClip(), {{0.0, 1.0}});
+                full.brushData = brushNorm;
+                placeClips({{full}});
+                const quint64 sf0 = serial();
+                const QJsonObject clearNull = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(QJsonValue(QJsonValue::Null))));
+                const bool nullCleared = clipAt(0).brushData.isEmpty() && progressKeys(clipAt(0)) == QStringLiteral("none");
+                const quint64 sf1 = serial();
+                undoOnce();
+                const bool nullUndone = clipAt(0).brushData == brushNorm && progressKeys(clipAt(0)) == QStringLiteral("[0:1]");
+                const QJsonObject clearEmpty = toolPayload(call(QStringLiteral("set_clip_brush"), brushArgs(QJsonObject{})));
+                const bool emptyCleared = clipAt(0).brushData.isEmpty() && progressKeys(clipAt(0)) == QStringLiteral("none");
+                placeClips({{trackOnly}});
+                const quint64 sf2 = serial();
+                const QJsonObject clearTrack = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(QJsonValue(QJsonValue::Null))));
+                const quint64 sf3 = serial();
+                const bool trackGone = progressKeys(clipAt(0)) == QStringLiteral("none") && clipAt(0).brushData.isEmpty();
+                placeClips({{plain}});
+                const quint64 sf4 = serial();
+                const QJsonObject clearNothing = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(QJsonValue(QJsonValue::Null))));
+                const quint64 sf5 = serial();
+
+                // (g) non-selected clip: B edits never bind B's brush to the preview or unbind A's.
+                const bool glOk = projectInfoWindow.m_player && projectInfoWindow.m_player->glPreview();
+                ClipInfo clipA = withProgress(baseClip(), {{0.0, 1.0}});
+                clipA.brushData = brushNorm;
+                ClipInfo clipB = baseClip();
+                clipB.filePath = QStringLiteral("/selftests/mcp-sidecar-b.mp4");
+                placeClips({{clipA}, {clipB}});
+                const auto selArgs = [](int track) {
+                    return QJsonObject{{QStringLiteral("kind"), QStringLiteral("video")},
+                                       {QStringLiteral("trackIndex"), track}, {QStringLiteral("clipIndex"), 0}};
+                };
+                call(QStringLiteral("select_clip"), selArgs(0));
+                const QString idSelected = projectInfoWindow.brushPreviewClipIdForTest();
+                const auto bArgs = [&](const QJsonValue& brush) {
+                    QJsonObject args = brushArgs(brush);
+                    args.insert(QStringLiteral("trackIndex"), 1);
+                    return args;
+                };
+                const bool bStartsEmpty = dynTimeline->trackAt(false, 1)->clips().first().brushData.isEmpty()
+                    && progressKeys(dynTimeline->trackAt(false, 1)->clips().first()) == QStringLiteral("none");
+                const QJsonObject bSet = toolPayload(call(QStringLiteral("set_clip_brush"), bArgs(brushIn)));
+                const QString idAfterBSet = projectInfoWindow.brushPreviewClipIdForTest();
+                const QJsonObject bStored = dynTimeline->trackAt(false, 1)->clips().first().brushData;
+                const QString bKeysSet = progressKeys(dynTimeline->trackAt(false, 1)->clips().first());
+                const QJsonObject bNull = toolPayload(call(QStringLiteral("set_clip_brush"), bArgs(QJsonValue(QJsonValue::Null))));
+                const QString idAfterBNull = projectInfoWindow.brushPreviewClipIdForTest();
+                const bool bNullCleared = dynTimeline->trackAt(false, 1)->clips().first().brushData.isEmpty();
+                const QString bKeysNull = progressKeys(dynTimeline->trackAt(false, 1)->clips().first());
+                const QJsonObject liveBefore = projectInfoWindow.m_liveBrushAnimations.value(QStringLiteral("0:0")).brushData;
+                const QJsonObject aEdit = withKey(brushIn, QStringLiteral("text"), QStringLiteral("Edited"));
+                call(QStringLiteral("set_clip_brush"), brushArgs(aEdit));
+                const QString idAfterAEdit = projectInfoWindow.brushPreviewClipIdForTest();
+                const QJsonObject liveAfter = projectInfoWindow.m_liveBrushAnimations.value(QStringLiteral("0:0")).brushData;
+                const QJsonObject aStored = dynTimeline->trackAt(false, 0)->clips().first().brushData;
+                dynTimeline->clearSelection();
+                const QString idCleared = projectInfoWindow.brushPreviewClipIdForTest();
+                const QJsonObject bSetCleared = toolPayload(call(QStringLiteral("set_clip_brush"), bArgs(brushIn)));
+                const QString idAfterClearedBSet = projectInfoWindow.brushPreviewClipIdForTest();
+                const QJsonObject bStoredCleared = dynTimeline->trackAt(false, 1)->clips().first().brushData;
+
+                std::fprintf(stderr, "mcp G204 (a) set changed=%d present=%d get==norm=%d progress=%g keys=%s serial %llu->%llu "
+                             "roundtrip changed=%d get==norm=%d serial=%llu undo restored=%d | (c) refused all=%d unchanged=%d errs[%s] | "
+                             "(d) boundary 0.001 changed=%d keys=%d ok=%d | (d) keep changed=%d keys=%s serial %llu->%llu colour changed=%d weight=%d keys=%s serial=%llu "
+                             "reveal2 changed=%d keys=%s serial=%llu again changed=%d serial=%llu | "
+                             "(f) null changed=%d cleared=%d serial %llu->%llu undone=%d {} changed=%d cleared=%d "
+                             "trackOnly changed=%d gone=%d serial %llu->%llu nothing changed=%d serial %llu->%llu | "
+                             "(g) gl=%d ids sel=%s bSet=%s bNull=%s aEdit=%s cleared=%s clearedBSet=%s liveBefore==old=%d liveAfter==new=%d old!=new=%d | "
+                             "(g) B startsEmpty=%d set changed=%d stored==norm=%d keys=%s null changed=%d cleared=%d keys=%s "
+                             "clearedSet changed=%d stored==norm=%d\n",
+                             setA.value(QStringLiteral("changed")).toBool(false), setA.value(QStringLiteral("present")).toBool(false),
+                             getA.value(QStringLiteral("brush")).toObject() == brushNorm,
+                             brushNorm.value(QStringLiteral("progress")).toDouble(-1), qPrintable(keysA),
+                             static_cast<unsigned long long>(sa0), static_cast<unsigned long long>(sa1),
+                             roundTrip.value(QStringLiteral("changed")).toBool(true),
+                             getB.value(QStringLiteral("brush")).toObject() == brushNorm,
+                             static_cast<unsigned long long>(sb), undoRestored,
+                             allBadRefused, badUnchanged, qPrintable(badErrors.join(QStringLiteral(" / "))),
+                             boundary.value(QStringLiteral("changed")).toBool(false), boundaryCount, boundaryKeys,
+                             keep.value(QStringLiteral("changed")).toBool(true), qPrintable(keysKeep),
+                             static_cast<unsigned long long>(sd0), static_cast<unsigned long long>(sd1),
+                             colour.value(QStringLiteral("changed")).toBool(false), weightColour, qPrintable(keysColour),
+                             static_cast<unsigned long long>(sd2),
+                             replaced.value(QStringLiteral("changed")).toBool(false), qPrintable(keysReplaced),
+                             static_cast<unsigned long long>(sd3),
+                             replacedAgain.value(QStringLiteral("changed")).toBool(true), static_cast<unsigned long long>(sd4),
+                             clearNull.value(QStringLiteral("changed")).toBool(false), nullCleared,
+                             static_cast<unsigned long long>(sf0), static_cast<unsigned long long>(sf1), nullUndone,
+                             clearEmpty.value(QStringLiteral("changed")).toBool(false), emptyCleared,
+                             clearTrack.value(QStringLiteral("changed")).toBool(false), trackGone,
+                             static_cast<unsigned long long>(sf2), static_cast<unsigned long long>(sf3),
+                             clearNothing.value(QStringLiteral("changed")).toBool(true),
+                             static_cast<unsigned long long>(sf4), static_cast<unsigned long long>(sf5),
+                             glOk, qPrintable(idSelected), qPrintable(idAfterBSet), qPrintable(idAfterBNull),
+                             qPrintable(idAfterAEdit), qPrintable(idCleared), qPrintable(idAfterClearedBSet),
+                             liveBefore == brushNorm, liveAfter == aStored, brushNorm != aStored,
+                             bStartsEmpty, bSet.value(QStringLiteral("changed")).toBool(false), bStored == brushNorm,
+                             qPrintable(bKeysSet), bNull.value(QStringLiteral("changed")).toBool(false), bNullCleared,
+                             qPrintable(bKeysNull), bSetCleared.value(QStringLiteral("changed")).toBool(false),
+                             bStoredCleared == brushNorm);
+
+                tallyObserved(204, observeTerm(204, "(a) normalized value sanity (progress 0, 12 keys, text Hi)",
+                                   brushNorm.value(QStringLiteral("progress")).toDouble(-1) == 0.0
+                                       && brushNorm.size() == 12
+                                       && brushNorm.value(QStringLiteral("text")).toString() == QStringLiteral("Hi")
+                                       && brushNorm.value(QStringLiteral("fontWeight")).toInt(-1) == 700)
+                    && observeTerm(204, "(a) set changed, get == normalized, {0:1} placed, +1 serial",
+                                   setA.value(QStringLiteral("changed")).toBool(false)
+                                       && getA.value(QStringLiteral("brush")).toObject() == brushNorm
+                                       && getA.value(QStringLiteral("present")).toBool(false)
+                                       && keysA == QStringLiteral("[0:1]") && sa1 == sa0 + 1)
+                    && observeTerm(204, "(b) get output fed back to set round-trips with changed=false",
+                                   !roundTrip.value(QStringLiteral("changed")).toBool(true)
+                                       && getB.value(QStringLiteral("brush")).toObject() == brushNorm && sb == sa1)
+                    && observeTerm(204, "(e) one undo restores empty brushData and no brush_progress track", undoRestored)
+                    && observeTerm(204, "(c) every invalid brush / revealDurationSec refused",
+                                   allBadRefused && badErrors.size() == 16)
+                    && observeTerm(204, "(c) refusals leave brushData / track / saveSerial untouched", badUnchanged)
+                    && observeTerm(204, "(d) get -> set keeps {0:0,3:1}: changed=false, serial unchanged",
+                                   !keep.value(QStringLiteral("changed")).toBool(true)
+                                       && keysKeep == QStringLiteral("[0:0,3:1]") && sd1 == sd0)
+                    && observeTerm(204, "(d) colour-only edit keeps the track, changes brushData, +1 serial",
+                                   colour.value(QStringLiteral("changed")).toBool(false)
+                                       && keysColour == QStringLiteral("[0:0,3:1]") && weightColour == 900
+                                       && sd2 == sd1 + 1)
+                    && observeTerm(204, "(d) revealDurationSec 2.0 replaces the track with {0:0,2:1}; repeat is a no-op",
+                                   replaced.value(QStringLiteral("changed")).toBool(false)
+                                       && keysReplaced == QStringLiteral("[0:0,2:1]") && sd3 == sd2 + 1
+                                       && !replacedAgain.value(QStringLiteral("changed")).toBool(true) && sd4 == sd3)
+                    && observeTerm(204, "(d) revealDurationSec 0.001 succeeds with exactly {0:0, 0.001:1}",
+                                   boundary.value(QStringLiteral("changed")).toBool(false) && boundaryKeys)
+                    && observeTerm(204, "(f) null clears brushData and the track (changed, +1, one undo restores both)",
+                                   clearNull.value(QStringLiteral("changed")).toBool(false) && nullCleared
+                                       && sf1 == sf0 + 1 && nullUndone)
+                    && observeTerm(204, "(f) {} clears like null",
+                                   clearEmpty.value(QStringLiteral("changed")).toBool(false) && emptyCleared)
+                    && observeTerm(204, "(f) empty brush + track: null deletes the track (changed, +1)",
+                                   clearTrack.value(QStringLiteral("changed")).toBool(false) && trackGone
+                                       && sf3 == sf2 + 1)
+                    && observeTerm(204, "(f) empty brush + no track: null is changed=false, serial unchanged",
+                                   !clearNothing.value(QStringLiteral("changed")).toBool(true) && sf5 == sf4)
+                    && observeTerm(204, "(g) the preview GL widget exists", glOk)
+                    && observeTerm(204, "(g) selecting A binds 0:0", idSelected == QStringLiteral("0:0"))
+                    && observeTerm(204, "(g) B set / B null leave the preview on 0:0",
+                                   idAfterBSet == QStringLiteral("0:0") && idAfterBNull == QStringLiteral("0:0"))
+                    && observeTerm(204, "(g) B writes land on the non-selected clip: set stores norm with [0:1], null clears, post-clearSelection set stores",
+                                   bStartsEmpty && bSet.value(QStringLiteral("changed")).toBool(false)
+                                       && bStored == brushNorm && bKeysSet == QStringLiteral("[0:1]")
+                                       && bNull.value(QStringLiteral("changed")).toBool(false) && bNullCleared
+                                       && bKeysNull == QStringLiteral("none")
+                                       && bSetCleared.value(QStringLiteral("changed")).toBool(false)
+                                       && bStoredCleared == brushNorm)
+                    && observeTerm(204, "(g) editing A rebinds: preview stays 0:0 and the live brush equals the new brushData",
+                                   idAfterAEdit == QStringLiteral("0:0") && liveBefore == brushNorm
+                                       && liveAfter == aStored && brushNorm != aStored)
+                    && observeTerm(204, "(g) clearSelection empties the preview and a later B set keeps it empty",
+                                   idCleared.isEmpty() && idAfterClearedBSet.isEmpty()),
+                    "set_clip_brush did not round-trip, validate, undo, keep keyframes, clear at the boundaries, or bind the preview only for the selected clip");
+            }
+
+            // G205: a locked video track refuses both set tools; both get tools still read.
+            {
+                ClipInfo seeded = withProgress(baseClip(), {{0.0, 1.0}});
+                seeded.brushData = brushNorm;
+                seeded.text3DConfig = QJsonObject{{QStringLiteral("text"), QStringLiteral("seed")}};
+                placeClips({{seeded}});
+                const bool locked = toolPayload(call(QStringLiteral("set_track_locked"),
+                    QJsonObject{{QStringLiteral("kind"), QStringLiteral("video")}, {QStringLiteral("trackIndex"), 0},
+                                {QStringLiteral("locked"), true}})).value(QStringLiteral("ok")).toBool(false)
+                    && dynTimeline->trackAt(false, 0)->isLocked();
+                const quint64 s0 = serial();
+                const QJsonObject r1 = call(QStringLiteral("set_clip_text3d"),
+                    vArgs({{QStringLiteral("text3d"), QJsonObject{{QStringLiteral("text"), QStringLiteral("x")}}}}));
+                const QJsonObject r2 = call(QStringLiteral("set_clip_brush"), brushArgs(brushIn));
+                const QJsonObject r3 = call(QStringLiteral("set_clip_brush"), brushArgs(QJsonValue(QJsonValue::Null)));
+                const QJsonObject read3 = toolPayload(call(QStringLiteral("get_clip_text3d"), vArgs({})));
+                const QJsonObject readB = toolPayload(call(QStringLiteral("get_clip_brush"), vArgs({})));
+                const ClipInfo lockedClip = clipAt(0);
+                const QString e1 = toolErrorText(r1), e2 = toolErrorText(r2), e3 = toolErrorText(r3);
+                std::fprintf(stderr, "mcp G205 locked=%d errors [%s] | [%s] | [%s] unchanged: text3d=%d brush=%d keys=%s serial=%d "
+                             "reads present=%d/%d (expect 1, locked wording x3, 1 1 [0:1] 1, 1/1)\n",
+                             locked, qPrintable(e1), qPrintable(e2), qPrintable(e3),
+                             lockedClip.text3DConfig == seeded.text3DConfig, lockedClip.brushData == brushNorm,
+                             qPrintable(progressKeys(lockedClip)), serial() == s0,
+                             read3.value(QStringLiteral("present")).toBool(false), readB.value(QStringLiteral("present")).toBool(false));
+                const QString wording = QStringLiteral("ロック中");
+                tallyObserved(205, observeTerm(205, "V1 locked", locked)
+                    && observeTerm(205, "set_clip_text3d refused as locked", isErr(r1) && e1.contains(wording))
+                    && observeTerm(205, "set_clip_brush (object / null) refused as locked",
+                                   isErr(r2) && e2.contains(wording) && isErr(r3) && e3.contains(wording))
+                    && observeTerm(205, "clip and saveSerial untouched",
+                                   lockedClip.text3DConfig == seeded.text3DConfig && lockedClip.brushData == brushNorm
+                                       && progressKeys(lockedClip) == QStringLiteral("[0:1]") && serial() == s0)
+                    && observeTerm(205, "get tools still read",
+                                   read3.value(QStringLiteral("present")).toBool(false)
+                                       && readB.value(QStringLiteral("present")).toBool(false)
+                                       && readB.value(QStringLiteral("brush")).toObject() == brushNorm),
+                    "a sidecar write changed a locked track or its error did not say the track is locked");
+                dynTimeline->applyTrackFlagsFromJson(QJsonObject{});
+            }
+
+            // G206: the brush set through MCP alone is drawn; revealDurationSec drives the progress.
+            {
+                const QString path = QFileInfo(QStringLiteral("test_assets/e2e_clip.mp4")).absoluteFilePath();
+                ClipInfo video;
+                video.filePath = path;
+                const auto probed = libavcore::probeDurationMicroseconds(path.toStdString());
+                video.duration = probed ? double(*probed) / 1000000.0 : 0.0;
+                video.inPoint = 0.0;
+                video.outPoint = std::min(video.duration, 4.0);
+                placeClips({{video}});
+                const QSize size(640, 360);
+                const auto frame = [&](qint64 us) { return tlrender::renderFrameAt(dynTimeline, us, size); };
+                const auto meanAbsDiff = [](const QImage& a, const QImage& b) {
+                    if (a.isNull() || b.isNull() || a.size() != b.size() || a.format() != b.format())
+                        return -1.0;
+                    double sum = 0.0;
+                    qint64 count = 0;
+                    for (int y = 0; y < a.height(); ++y) {
+                        const uchar* la = a.constScanLine(y);
+                        const uchar* lb = b.constScanLine(y);
+                        const int bytes = a.width() * (a.depth() / 8);
+                        for (int x = 0; x < bytes; ++x)
+                            sum += std::abs(int(la[x]) - int(lb[x]));
+                        count += bytes;
+                    }
+                    return count > 0 ? sum / double(count) : -1.0;
+                };
+                const QImage plain0 = frame(0), plain05 = frame(500000), plain1 = frame(1000000), plain2 = frame(2000000);
+                const QJsonObject wipe{
+                    {QStringLiteral("text"), QStringLiteral("WIPE")}, {QStringLiteral("fontFamily"), QStringLiteral("Arial")},
+                    {QStringLiteral("fontPointSizeF"), 120.0}, {QStringLiteral("fontWeight"), 700},
+                    {QStringLiteral("basePositionX"), 40.0}, {QStringLiteral("basePositionY"), 220.0},
+                    {QStringLiteral("brushWidth"), 24.0}, {QStringLiteral("mode"), QStringLiteral("PerStroke")}};
+                const QJsonObject full = toolPayload(call(QStringLiteral("set_clip_brush"), brushArgs(wipe)));
+                const QImage full05 = frame(500000), full1 = frame(1000000), full2 = frame(2000000);
+                const double fullDiff = meanAbsDiff(plain05, full05);
+                const QJsonObject timed = toolPayload(call(QStringLiteral("set_clip_brush"),
+                    brushArgs(wipe, {{QStringLiteral("revealDurationSec"), 2.0}})));
+                const QString timedKeys = progressKeys(clipAt(0));
+                const QImage timed0 = frame(0), timed1 = frame(1000000), timed2 = frame(2000000);
+                const double midVsPlain = meanAbsDiff(timed1, plain1), midVsFull = meanAbsDiff(timed1, full1);
+                std::fprintf(stderr, "mcp G206 durationSec=%g full ok=%d changed=%d meanAbsDiff(plain,full@0.5)=%.3f | "
+                             "timed ok=%d keys=%s t0==plain=%d t2==full=%d t1==plain=%d t1==full=%d midVsPlain=%.3f midVsFull=%.3f "
+                             "plainSane=%d (expect >2.0 | [0:0,2:1] 1 1 0 0 both > 0)\n",
+                             video.duration, full.value(QStringLiteral("ok")).toBool(false),
+                             full.value(QStringLiteral("changed")).toBool(false), fullDiff,
+                             timed.value(QStringLiteral("ok")).toBool(false), qPrintable(timedKeys),
+                             timed0 == plain0, timed2 == full2, timed1 == plain1, timed1 == full1, midVsPlain, midVsFull,
+                             !plain05.isNull() && plain05 != plain2);
+                tallyObserved(206, observeTerm(206, "source clip is long enough (>= 2 s)", video.outPoint >= 2.0)
+                    && observeTerm(206, "plain frames render", !plain0.isNull() && !plain05.isNull()
+                                   && !plain1.isNull() && !plain2.isNull())
+                    && observeTerm(206, "set_clip_brush without revealDurationSec draws: meanAbsDiff > 2.0",
+                                   full.value(QStringLiteral("ok")).toBool(false) && fullDiff > 2.0)
+                    && observeTerm(206, "revealDurationSec 2.0 -> track {0:0,2:1}",
+                                   timed.value(QStringLiteral("ok")).toBool(false) && timedKeys == QStringLiteral("[0:0,2:1]"))
+                    && observeTerm(206, "local 0.0 is byte-identical to plain (progress 0)", timed0 == plain0)
+                    && observeTerm(206, "local 2.0 equals the full-reveal frame", timed2 == full2 && full2 != plain2)
+                    && observeTerm(206, "local 1.0 is a partial draw: differs from plain and from full",
+                                   timed1 != plain1 && timed1 != full1 && midVsPlain > 0.0 && midVsFull > 0.0),
+                    "the brush set through MCP was not drawn, or revealDurationSec did not drive the progress");
+            }
+        };
+        sidecarGates();
     }
 
     server.stop();

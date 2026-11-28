@@ -489,17 +489,23 @@ namespace camera3d {
 Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
                                     const Camera3DState &camera)
 {
+    return effectiveLayer3DAt(clip, clip.layer3D, layerPosPx, camera);
+}
+
+Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, const Layer3DTransform &base,
+                                    QPointF layerPosPx, const Camera3DState &camera)
+{
     if (!clip.autoOrientToCamera || !clip.is3DLayer || !camera.trueProjection)
-        return clip.layer3D;
+        return base;
     // Layer -> camera. The layer is a plane, so the normal may point either way along
     // that line: take the +z side, which is the identity rotation for a centred layer.
     // US-1813: the layer sits at its 2D position plus its pre-projection world x / y.
-    double dx = static_cast<double>(camera.position.x()) - (layerPosPx.x() + clip.layer3D.worldX);
-    double dy = static_cast<double>(camera.position.y()) - (layerPosPx.y() + clip.layer3D.worldY);
-    double dz = static_cast<double>(camera.position.z()) - clip.layer3D.positionZ;
+    double dx = static_cast<double>(camera.position.x()) - (layerPosPx.x() + base.worldX);
+    double dy = static_cast<double>(camera.position.y()) - (layerPosPx.y() + base.worldY);
+    double dz = static_cast<double>(camera.position.z()) - base.positionZ;
     const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
     if (length < 1e-9)
-        return clip.layer3D;
+        return base;
     if (dz < 0.0) {
         dx = -dx;
         dy = -dy;
@@ -509,11 +515,11 @@ Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
     // Rz*(Ry*Rx*(0,0,1)). Un-rotate the target direction by Rz^-1 first, then solve X/Y so that
     // Ry*Rx*(0,0,1) = (sin(ry)cos(rx), -sin(rx), cos(ry)cos(rx)) equals that direction.
     constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
-    const double rz = clip.layer3D.rotationZ / kRadiansToDegrees;
+    const double rz = base.rotationZ / kRadiansToDegrees;
     const double c = std::cos(rz), s = std::sin(rz);
     const double ux = c * dx + s * dy;
     const double uy = -s * dx + c * dy;
-    Layer3DTransform result = clip.layer3D;
+    Layer3DTransform result = base;
     result.rotationX = -std::asin(std::clamp(uy / length, -1.0, 1.0)) * kRadiansToDegrees;
     result.rotationY = std::atan2(ux, dz) * kRadiansToDegrees;
     return result;

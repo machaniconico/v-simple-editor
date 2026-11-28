@@ -218,7 +218,7 @@ struct ClipInfo {
     double leadInSec = 0.0; // leading gap before the clip on the timeline, grows on left-trim to keep the right edge fixed
     double speed = 1.0;   // 0.25x - 4.0x
     bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
-    double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
+    double volume = 1.0;  // 0.0 - 4.0 (0=mute, 1=normal, 4=max boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
     // US-1110 per-clip 4-band EQ. Off by default; saved as "clipEq" only when
     // clipEqEnabled. Nested sequences take the child's EQ when it is on,
@@ -260,6 +260,11 @@ struct ClipInfo {
     // US-1505: per-clip expression bindings (propPath -> code), evaluated by
     // clipanim::applyDynamicOverlay after autoOrient and before the wiggle (empty by default).
     exprbind::ClipExpressionBindings expressions;
+    // US-1912: seconds added to the clip-local time of the wiggle and of the expression
+    // `time` variable, so both continue across a split: TimelineTrack::splitClipAt adds the
+    // cut to the right half (cumulative), a trim leaves it. Other clip-local data is shifted
+    // by the split instead. 0 = none.
+    double dynamicTimeOffsetSec = 0.0;
     // US-1706: the clip's 3D extruded text (Text3DLayer::toJson()) and brush animation
     // (BrushAnimation::toJson()), formerly the "track:clip" keyed MainWindow sidecars.
     // Empty = none. A split leaves both on the left half only.

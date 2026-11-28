@@ -1,4 +1,5 @@
 #include "../RenderInPlace.h"
+#include "../ClipGeometry.h"
 #include "../RotoApply.h"
 #include "../TrackMatteKey.h"
 #include "../AudioMixer.h"
@@ -11,10 +12,12 @@
 #include "../UndoManager.h"
 #include "SelftestRegistry.h"
 #include "../libavcore/Probe.h"
+#include <QCryptographicHash>
 #include <QFileInfo>
 #include <QFile>
 #include <QDir>
 #include <QEventLoop>
+#include <QFont>
 #include <QSet>
 #include <QUuid>
 #include <QJsonArray>
@@ -382,7 +385,7 @@ int runRenderInPlaceSelftest()
             "fixture=%s, exists=%d, duration=%.6f (required >= 3.0 seconds); "
             "run from the repository root\n", int(output.isValid()),
             qPrintable(original.filePath), int(QFileInfo::exists(original.filePath)), original.duration);
-        for (int number = 1; number <= 12; ++number) gate(number, false);
+        for (int number = 1; number <= 14; ++number) gate(number, false);
         std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
         selftests::reportTally(passed, failed, 0);
         return failed;
@@ -915,6 +918,211 @@ int runRenderInPlaceSelftest()
         int(rotoBaked), qPrintable(rotoError), rotoDiff[0], rotoDiff[1], rotoDiff[2],
         kRipFpsThreshold, rotoStreamFps, int(rotoOptions.fps), rotoFrames, expectedFrames);
     gate(12, rotoDiffOk && rotoStreamOk);
+
+    // G13 (US-1903): an overlay keeps its timeline span through the bake. Baked frames
+    // match the pre-bake render (T = the start-0 control 1.9992 + 0.3; 2.2 s has no
+    // overlay, so its limit is the codec floor 1.1634 + 0.3). HEAD shifted by handles
+    // alone and measures 21.3 at 2.6 s; the sub-checks are HEAD failures too, except
+    // the V2 start-2.0 sample, which detects the shift without the first-track rule.
+    constexpr double kOverlayThreshold = 2.30;
+    constexpr double kOverlayCodecFloor = 1.47;
+    constexpr double kOverlayAbsent = 0.5;
+    constexpr double kOverlayVisible = 10.0;
+    const auto overlaySpan = [](double start, double end) {
+        EnhancedTextOverlay overlay;
+        overlay.text = QStringLiteral("OVERLAY");
+        overlay.font = QFont(QStringLiteral("Arial"), 60, QFont::Bold);
+        overlay.startTime = start;
+        overlay.endTime = end;
+        overlay.color = Qt::yellow;
+        overlay.backgroundColor = QColor(0, 0, 255, 255);
+        return overlay;
+    };
+    const auto overlayClip = [&](double inPoint, double outPoint) {
+        ClipInfo clip = original;
+        clip.effects.clear();
+        clip.inPoint = inPoint;
+        clip.outPoint = outPoint;
+        return clip;
+    };
+    const auto overlayLoad = [](Timeline &target, const QVector<QVector<ClipInfo>> &video) {
+        target.restoreFromProject(video, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+    };
+    const auto overlayFrame = [&](const Timeline &target, double sec) {
+        return tlrender::renderFrameAt(&target, qRound64(sec * 1000000.0), options.outputSize);
+    };
+    int overlayBakes = 0;
+    const auto overlayBake = [&](Timeline &target, int trackIndex, int clipIndex, double handles) {
+        auto bakeOptions = options;
+        bakeOptions.handlesSec = handles;
+        bakeOptions.outputDir = output.filePath(QStringLiteral("overlay%1").arg(++overlayBakes));
+        QString bakeError;
+        const bool bakeOk = renderinplace::renderClipInPlace(
+            target, trackIndex, clipIndex, bakeOptions, nullptr, &bakeError);
+        if (!bakeOk) std::fprintf(stderr, "G13 bake failed: %s\n", qPrintable(bakeError));
+        return bakeOk;
+    };
+    bool overlayTimebaseOk = true;
+    for (const double handles : {0.0, 0.5}) {
+        ClipInfo target = overlayClip(1.0, 2.5);
+        const ClipInfo plain = target;
+        target.textManager.setOverlays({overlaySpan(2.5, 3.0)});
+        Timeline overlayTimeline, plainTimeline;
+        overlayLoad(overlayTimeline, {{overlayClip(0.0, 2.0), target}});
+        overlayLoad(plainTimeline, {{overlayClip(0.0, 2.0), plain}});
+        const QImage before[3] = {overlayFrame(overlayTimeline, 2.2),
+                                  overlayFrame(overlayTimeline, 2.6),
+                                  overlayFrame(overlayTimeline, 2.9)};
+        const double drawn = meanAbsDiffPremultiplied(before[1], overlayFrame(plainTimeline, 2.6));
+        const bool baked13 = overlayBake(overlayTimeline, 0, 1, handles);
+        const double mean22 = meanAbsDiffPremultiplied(before[0], overlayFrame(overlayTimeline, 2.2));
+        const double mean26 = meanAbsDiffPremultiplied(before[1], overlayFrame(overlayTimeline, 2.6));
+        const double mean29 = meanAbsDiffPremultiplied(before[2], overlayFrame(overlayTimeline, 2.9));
+        std::fprintf(stderr, "G13 handles=%.1f baked=%d drawn=%.4f (must be >= %.1f) 2.2=%.4f "
+            "(<= %.2f) 2.6=%.4f 2.9=%.4f (<= %.2f)\n", handles, int(baked13), drawn,
+            kOverlayVisible, mean22, kOverlayCodecFloor, mean26, mean29, kOverlayThreshold);
+        overlayTimebaseOk = overlayTimebaseOk && baked13 && drawn >= kOverlayVisible
+            && mean22 <= kOverlayCodecFloor && mean26 <= kOverlayThreshold
+            && mean29 <= kOverlayThreshold;
+    }
+    // (a) (b) an overlay that ends before, or exactly at, the clip's start: a shifted
+    // end at or below 0 would read as "no end".
+    bool overlayBeforeClipOk = true;
+    {
+        Timeline plainTimeline;
+        overlayLoad(plainTimeline, {{overlayClip(0.0, 2.0), overlayClip(1.0, 2.5)}});
+        const bool plainBaked = overlayBake(plainTimeline, 0, 1, 0.0);
+        const QImage plainFrame = overlayFrame(plainTimeline, 2.6);
+        for (const double endTime : {1.5, 2.0}) {
+            ClipInfo target = overlayClip(1.0, 2.5);
+            target.textManager.setOverlays({overlaySpan(0.5, endTime)});
+            Timeline overlayTimeline;
+            overlayLoad(overlayTimeline, {{overlayClip(0.0, 2.0), target}});
+            const bool baked13 = overlayBake(overlayTimeline, 0, 1, 0.0);
+            const double mean = meanAbsDiffPremultiplied(overlayFrame(overlayTimeline, 2.6), plainFrame);
+            std::fprintf(stderr, "G13 (a/b) endTime=%.1f baked=%d/%d vs no-overlay 2.6=%.4f (<= %.2f)\n",
+                endTime, int(baked13), int(plainBaked), mean, kOverlayAbsent);
+            overlayBeforeClipOk = overlayBeforeClipOk && plainBaked && baked13 && mean <= kOverlayAbsent;
+        }
+    }
+    // Open-ended, popping overlays stay on the baked clip. Clip at 2.0: the shift leaves a
+    // negative start, which keeps the pop's elapsed time. Clip at 0 with handles: the
+    // positive shift leaves endTime == 0 alone, so the overlay does not gain an end.
+    bool overlayOpenEndedOk = true;
+    for (const double start : {2.0, 0.0}) {
+        ClipInfo target = overlayClip(1.0, 2.5);
+        auto overlay = overlaySpan(qMax(0.0, start - 0.5), 0.0);
+        overlay.animIn.type = TextAnimationType::Pop;
+        overlay.animIn.duration = 2.0;
+        target.textManager.setOverlays({overlay});
+        Timeline overlayTimeline;
+        if (start > 0.0) overlayLoad(overlayTimeline, {{overlayClip(0.0, 2.0), target}});
+        else overlayLoad(overlayTimeline, {{target}});
+        const double sec = start + 0.7;
+        const QImage beforeBake = overlayFrame(overlayTimeline, sec);
+        const bool baked13 = overlayBake(overlayTimeline, 0, start > 0.0 ? 1 : 0, start > 0.0 ? 0.0 : 0.5);
+        const double mean = meanAbsDiffPremultiplied(beforeBake, overlayFrame(overlayTimeline, sec));
+        std::fprintf(stderr, "G13 open-ended start=%.1f baked=%d %.1f=%.4f (<= %.2f)\n",
+            start, int(baked13), sec, mean, kOverlayThreshold);
+        overlayOpenEndedOk = overlayOpenEndedOk && baked13 && mean <= kOverlayThreshold;
+    }
+    // A prefix wider than the handles (linked audio one second ahead of the video).
+    bool overlayLinkedPrefixOk = false;
+    {
+        ClipInfo target = overlayClip(1.0, 2.5);
+        target.textManager.setOverlays({overlaySpan(2.5, 3.0)});
+        target.linkGroup = 313;
+        ClipInfo audio = target;
+        audio.textManager.setOverlays({});
+        audio.leadInSec = 1.0;
+        audio.filePath = output.filePath(QStringLiteral("overlay-linked-tone.wav"));
+        audio.duration = 8.0;
+        audio.inPoint = 0.0;
+        audio.outPoint = 3.0;
+        const bool toneReady = writeTone(audio.filePath, 440.0);
+        Timeline overlayTimeline;
+        overlayTimeline.restoreFromProject(
+            QVector<QVector<ClipInfo>>{{overlayClip(0.0, 2.0), target}},
+            QVector<QVector<ClipInfo>>{{audio}}, 0, -1, -1, 10);
+        const QImage beforeBake = overlayFrame(overlayTimeline, 2.6);
+        const bool baked13 = overlayBake(overlayTimeline, 0, 1, 0.0);
+        const double mean = meanAbsDiffPremultiplied(beforeBake, overlayFrame(overlayTimeline, 2.6));
+        std::fprintf(stderr, "G13 linked prefix tone=%d baked=%d 2.6=%.4f (<= %.2f)\n",
+            int(toneReady), int(baked13), mean, kOverlayThreshold);
+        overlayLinkedPrefixOk = toneReady && baked13 && mean <= kOverlayThreshold;
+    }
+    // (c) a V2 clip's overlays are not drawn before the bake and are not burned in it.
+    bool overlaySecondTrackOk = true;
+    for (const double start : {0.0, 2.0}) {
+        ClipInfo background = overlayClip(0.0, 5.0);
+        background.videoScale = 0.3;
+        background.videoDx = -0.35;
+        ClipInfo secondTrack = overlayClip(1.0, 2.5);
+        secondTrack.leadInSec = start;
+        const ClipInfo plain = secondTrack;
+        secondTrack.textManager.setOverlays({overlaySpan(start + 0.5, start + 1.0)});
+        Timeline overlayTimeline, plainTimeline;
+        overlayLoad(overlayTimeline, {{background}, {secondTrack}});
+        overlayLoad(plainTimeline, {{background}, {plain}});
+        const bool baked13 = overlayBake(overlayTimeline, 1, 0, 0.0);
+        const bool plainBaked = overlayBake(plainTimeline, 1, 0, 0.0);
+        const double mean = meanAbsDiffPremultiplied(overlayFrame(overlayTimeline, start + 0.6),
+                                                     overlayFrame(plainTimeline, start + 0.6));
+        std::fprintf(stderr, "G13 (c) V2 start=%.1f baked=%d/%d vs no-overlay %.1f=%.4f (<= %.2f)\n",
+            start, int(baked13), int(plainBaked), start + 0.6, mean, kOverlayAbsent);
+        overlaySecondTrackOk = overlaySecondTrackOk && baked13 && plainBaked && mean <= kOverlayAbsent;
+    }
+    // (d) start 0 / handles 0: shift 0. The sha is compared with the base exe's value in
+    // the raw log, not here (rule 95).
+    bool overlayShaOk = false;
+    {
+        ClipInfo target = overlayClip(1.0, 2.5);
+        target.textManager.setOverlays({overlaySpan(0.5, 1.0)});
+        Timeline overlayTimeline;
+        overlayLoad(overlayTimeline, {{target}});
+        const bool baked13 = overlayBake(overlayTimeline, 0, 0, 0.0);
+        overlayShaOk = baked13;
+        for (const double sec : {0.25, 0.75}) {
+            const QImage image = overlayFrame(overlayTimeline, sec);
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            hash.addData(QByteArray::fromRawData(reinterpret_cast<const char *>(image.constBits()),
+                                                 int(image.sizeInBytes())));
+            std::fprintf(stderr, "G13 (d) baked=%d t=%.2f format=%d %dx%d sha=%s\n", int(baked13), sec,
+                int(image.format()), image.width(), image.height(), hash.result().toHex().constData());
+            overlayShaOk = overlayShaOk && !image.isNull();
+        }
+    }
+    gate(13, overlayTimebaseOk && overlayBeforeClipOk && overlayOpenEndedOk && overlayLinkedPrefixOk
+        && overlaySecondTrackOk && overlayShaOk);
+
+    // G14 (US-1903, pin, passes at HEAD): a clip with no decodable video is refused with the
+    // same message and leaves the Timeline alone. Fallback media is not supported (decision D6).
+    bool noVideoRefused = true;
+    for (const QString &missingPath : {clipgeom::nullObjectFilePath(), QString(),
+             QFileInfo(QStringLiteral("test_assets/does-not-exist.mp4")).absoluteFilePath()}) {
+        ClipInfo target = overlayClip(0.0, 2.0);
+        target.filePath = missingPath;
+        target.duration = 2.0;
+        Timeline refused;
+        refused.restoreFromProject(QVector<QVector<ClipInfo>>{{target}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        refused.undoManager()->clear();
+        refused.saveUndoState(QStringLiteral("素材なし初期状態"));
+        const quint64 initialSerial = refused.undoManager()->saveSerial();
+        auto refuseOptions = options;
+        refuseOptions.outputDir = output.filePath(QStringLiteral("novideo"));
+        QString refusedPath, refusedError;
+        const bool accepted = renderinplace::renderClipInPlace(
+            refused, 0, 0, refuseOptions, &refusedPath, &refusedError);
+        const bool messageOk = refusedError == QStringLiteral("素材の映像サイズを取得できません");
+        const bool pathKept = refused.videoTracks()[0]->clips()[0].filePath == missingPath;
+        const bool serialKept = refused.undoManager()->saveSerial() == initialSerial;
+        std::fprintf(stderr, "G14 path=[%s] accepted=%d message=%d pathKept=%d serialKept=%d\n",
+            qUtf8Printable(missingPath), int(accepted), int(messageOk), int(pathKept), int(serialKept));
+        noVideoRefused = noVideoRefused && !accepted && refusedPath.isEmpty() && messageOk
+            && pathKept && serialKept;
+    }
+    gate(14, noVideoRefused);
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     // The registry checks the declared "(N gates)" against this count.
     selftests::reportTally(passed, failed, 0);

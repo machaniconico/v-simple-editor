@@ -46,6 +46,7 @@
 #include <QByteArray>
 #include <QCryptographicHash>
 #include <QFile>
+#include <QFileInfo>
 #include <QHash>
 #include <QJsonDocument>
 #include <QMutex>
@@ -1981,41 +1982,81 @@ QImage applyClipBrushSource(const QImage &raw, const ClipInfo &clip, double loca
     return out;
 }
 
-bool timelineBrushWantsSpecialPath(const Timeline *timeline)
+bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
 {
     if (!timeline)
         return false;
     // Nor parenting, which renderFrameAt applies and the special composite
-    // does not.
-    if (veditor::parentingEnabledFromEnv() && !timeline->clipParentEntries().isEmpty())
-        return false;
+    // does not: an entry is checked against the active clips below.
+    const QHash<QString, QString> parentEntries = veditor::parentingEnabledFromEnv()
+        ? timeline->clipParentEntries() : QHash<QString, QString>();
+    // An effective blend (the rule of the overlay loop below: VFX footage above
+    // V1) is drawn by the composite, except with a matte source anywhere in the
+    // timeline: that stays on the legacy path. A non-VFX blend is ignored here
+    // as in the export.
+    const bool hasMatteSource = !timeline->trackMatteEntries().isEmpty();
+    QSet<QString> activeClipIds;
     bool hasBrush = false;
-    for (const auto *track : timeline->videoTracks()) {
-        if (!track)
+    const auto &videoTracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
+        const auto *track = videoTracks[trackIdx];
+        if (!track || track->isHidden())
             continue;
-        for (const ClipInfo &clip : track->clips()) {
-            if (clip.blendMode != BlendMode::Normal || clip.isAdjustment || clip.hasMask())
+        // The layer loop's choice, so a clip elsewhere on the timeline does not
+        // change this frame's route.
+        const QVector<ClipInfo> &clips = track->clips();
+        double clipStart = 0.0;
+        const int clipIdx = activeClipOnTrack(clips, timelineSec,
+                                              /*clampToFirst=*/trackIdx == 0, &clipStart);
+        if (clipIdx < 0)
+            continue;
+        const ClipInfo &clip = clips[clipIdx];
+        const double clipEnd = clipStart + clip.effectiveDuration();
+        activeClipIds.insert(renderClipId(trackIdx, clipIdx));
+        const bool effectiveBlend = clip.isVfxFootage && trackIdx > 0
+            && clip.blendMode != BlendMode::Normal;
+        if ((effectiveBlend && hasMatteSource) || clip.isAdjustment || clip.hasMask())
+            return false;
+        // Nor clips the special composite cannot draw as renderFrameAt does
+        // (shape, nested sequence, disabled): those frames keep their HEAD
+        // preview instead of losing the layer.
+        if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
+            return false;
+        // Nor what it places statically: keyframed transform / opacity (any
+        // track but brush_progress), SNS fit.
+        for (const KeyframeTrack &kf : clip.keyframes.tracks()) {
+            if (kf.propertyName() != QLatin1String("brush_progress"))
                 return false;
-            // Nor clips the special composite cannot draw as renderFrameAt does
-            // (shape, nested sequence, disabled): those timelines keep their
-            // HEAD preview instead of losing the layer.
-            if (!clip.shapes.isEmpty() || clip.isSequenceReference() || !clip.visible)
-                return false;
-            // Nor what it places statically or skips: keyframed transform /
-            // opacity (any track but brush_progress), SNS fit, transitions.
-            for (const KeyframeTrack &kf : clip.keyframes.tracks()) {
-                if (kf.propertyName() != QLatin1String("brush_progress"))
-                    return false;
-            }
-            if (clip.fitContain || clip.fitCover)
-                return false;
-            if (!clip.layerStyle.isIdentity())
-                return false;
-            if (clip.leadIn.type != TransitionType::None
-                || clip.trailOut.type != TransitionType::None)
-                return false;
-            hasBrush = hasBrush || !clip.brushData.isEmpty();
         }
+        if (clip.fitContain || clip.fitCover)
+            return false;
+        if (!clip.layerStyle.isIdentity())
+            return false;
+        // Nor the windows of the transitions it skips: an edge fade draws
+        // whatever the neighbours (applyEdgeFadeStep), a neighbour's transition
+        // overlaps this clip. Any type, whatever the alignment: conservative.
+        if ((clip.leadIn.type != TransitionType::None
+             && timelineSec < clipStart + clip.leadIn.duration)
+            || (clip.trailOut.type != TransitionType::None
+                && timelineSec >= clipEnd - clip.trailOut.duration))
+            return false;
+        if (clipIdx > 0 && clip.leadInSec <= 0.0) {
+            const ClipInfo &previous = clips[clipIdx - 1];
+            if (previous.trailOut.type != TransitionType::None
+                && timelineSec < clipStart + previous.trailOut.duration)
+                return false;
+        }
+        if (clipIdx + 1 < clips.size() && clips[clipIdx + 1].leadInSec <= 0.0) {
+            const ClipInfo &next = clips[clipIdx + 1];
+            if (next.leadIn.type != TransitionType::None
+                && timelineSec >= clipEnd - next.leadIn.duration)
+                return false;
+        }
+        hasBrush = hasBrush || !clip.brushData.isEmpty();
+    }
+    for (auto it = parentEntries.cbegin(); it != parentEntries.cend(); ++it) {
+        if (activeClipIds.contains(it.key()) || activeClipIds.contains(it.value()))
+            return false;
     }
     return hasBrush;
 }
@@ -2328,9 +2369,10 @@ std::optional<ParentLayerHit> parentLayerAtInTracks(
     hit.sourceSeconds = sourceSecondOnTrack(
         tracks, intervals, overlapA, overlapB, trackIdx, c,
         hit.clipLocalSeconds, reverse, /*countDisabled=*/false);
+    const QFileInfo parentFileInfo(c.filePath);
     hit.decodable = clipgeom::isNullObjectFilePath(c.filePath)
         || !c.sequenceRefId.isEmpty()
-        || QFile::exists(c.filePath);
+        || (parentFileInfo.exists() && parentFileInfo.size() > 0);
     return hit;
 }
 
@@ -2462,7 +2504,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             neighbour = applyProjectCameraProjection(
                 neighbour,
                 camera3d::effectiveLayer3DAt(
-                    c, layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
+                    c, clipanim::layer3DAt(c, local),
+                    layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
                 c.is3DLayer, projectCamera, outSize);
         neighbour = prepareTransitionLayer(neighbour, neighbourTransform, outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
@@ -2484,6 +2527,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     double v1EffectiveOpacity = 0.0;
     int v1Idx = -1;
     double v1Start = 0.0;
+    double v1LocalSec = 0.0;
     QImage base;
     QImage v1LayerSource;
     clipgeom::ClipTransform v1Transform;
@@ -2514,7 +2558,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Timeline-second -> source-second mapping. Empty time-remap curves keep
         // the legacy inPoint + local*speed path; one-key curves resolve to the
         // constant held source time used by computePlaybackSequence.
-        const double v1LocalSec = targetSec - v1Start;            // >= 0
+        v1LocalSec = targetSec - v1Start;                     // >= 0
         const bool v1ReverseComposition = sampleFromLeftBoundary
             || clipParticipatesInReverseComposition(
                 v1Clip, sequenceSnapshot);
@@ -2562,7 +2606,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             v1Contained = applyProjectCameraProjection(
                 v1Contained,
                 camera3d::effectiveLayer3DAt(
-                    v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
+                    v1Clip, clipanim::layer3DAt(v1Clip, v1LocalSec),
+                    layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
                 v1Clip.is3DLayer, projectCamera, outSize);
         v1LayerSource = v1Contained;
 
@@ -2636,7 +2681,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
         baseLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
-            v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
+            v1Clip, clipanim::layer3DAt(v1Clip, v1LocalSec),
+            layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
         baseLayer.layer.material = v1Clip.material;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
@@ -2692,7 +2738,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
             renderLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
-                c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+                c, clipanim::layer3DAt(c, localSec),
+                layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
             renderLayer.layer.material = c.material;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
@@ -2725,7 +2772,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
         const Layer3DTransform cLayer3D = camera3d::effectiveLayer3DAt(
-            c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+            c, clipanim::layer3DAt(c, localSec),
+            layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
         renderLayer.layer.layer3D = cLayer3D;
         renderLayer.layer.material = c.material;
         // Scale the overlay source to the shared canvas grid first; the

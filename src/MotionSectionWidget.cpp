@@ -105,6 +105,10 @@ MotionSectionWidget::MotionSectionWidget(QWidget *parent)
     m_rotXSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
     m_rotYSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
     m_rotZSpin = createSpinBox(-360.0, 360.0, 1.0, 3, 0.0);
+    m_posZSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) が ON の時だけ描画されます"));
+    m_rotXSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) が ON の時だけ描画されます"));
+    m_rotYSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) が ON の時だけ描画されます"));
+    m_rotZSpin->setToolTip(tr("プロジェクトカメラ (trueProjection) が ON の時だけ描画されます"));
 
     m_posZToggle = new EffectKeyframeToggle(this);
     m_worldXToggle = new EffectKeyframeToggle(this);

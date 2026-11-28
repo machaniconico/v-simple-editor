@@ -11,6 +11,7 @@
 #include "PlanarTrackerPreset.h"
 #include "ProjectFile.h"
 #include "CameraSolver.h"
+#include "Camera3D.h"
 #include "BundleAdjustment.h"
 #include <functional>
 
@@ -150,6 +151,7 @@ private:
     // timeline time, which the linear inverse below cannot express.
     bool m_featureNonLinearTiming = false;
     QPushButton* m_featureSolveButton = nullptr;
+    QLabel* m_cameraFovWarning = nullptr;
     // Scale S (px per solver unit): the exact default after a solve, or the user's value once
     // they edit the field (kept until the next tracking result).
     QDoubleSpinBox* m_featureScaleSpin = nullptr;

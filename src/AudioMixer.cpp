@@ -725,7 +725,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
 
     // Accumulator for the sum-mix. int32 lets us add many s16 sources before
     // saturating; gains are clamped per entry below so the headroom math
-    // holds even if PlaybackEntry::volume bypassed the Timeline 0..2 clamp.
+    // holds even if PlaybackEntry::volume bypassed the Timeline 0..4 clamp.
     QVarLengthArray<int32_t, 16384> accum(sampleCount);
     std::memset(accum.data(), 0, sampleCount * sizeof(int32_t));
 
@@ -929,7 +929,7 @@ qint64 MixerIODevice::readData(char *data, qint64 maxlen) {
             clipGain = audio::evaluateVolumeEnvelope(e->entry.volumeEnvelope,
                                               envT, e->entry.volume);
         }
-        double gain = qBound(0.0, clipGain, 4.0);
+        double gain = audio::clampClipGain(clipGain);
         // Clip-level gain for a track tap: everything in `gain` except the
         // timeline mute (audioMuted) and the track factor (fader, mute / solo,
         // bus routing) applied below.
