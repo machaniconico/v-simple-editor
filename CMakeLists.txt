@@ -222,6 +222,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/FrameExport.h
     src/SequenceExport.cpp
     src/SequenceExport.h
+    src/ExrSequenceWriter.cpp
+    src/ExrSequenceWriter.h
     src/FrameExport.cpp
     src/FrameClipboard.h
     src/FrameClipboard.cpp
@@ -423,6 +425,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/FcpxmlImport.cpp
     src/selftests/export_pro_selftest.cpp
     src/selftests/img_sequence_selftest.cpp
+    src/selftests/exr_writer_selftest.cpp
     src/selftests/export_alpha_selftest.cpp
     src/selftests/export_cfg_selftest.cpp
     src/selftests/sub_movtext_selftest.cpp
@@ -481,6 +484,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/clip_enable_selftest.cpp
     src/selftests/clip_eq_selftest.cpp
     src/selftests/clip_uid_selftest.cpp
+    src/selftests/connected_clip_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
     src/selftests/parent_gate_selftest.cpp
     src/selftests/video_player_parent_selftest.cpp

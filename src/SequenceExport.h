@@ -13,6 +13,7 @@ struct Settings {
     int digits = 6;
     int start = 0;
     bool keepAlpha = false;
+    bool exrLinear = false; // EXR only: scene-linear instead of display-referred values
     static Settings fromJson(const QJsonObject &json, const QString &fallbackFolder);
 };
 QString validate(const Settings &settings);

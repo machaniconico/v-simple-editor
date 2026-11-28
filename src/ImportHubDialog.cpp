@@ -55,7 +55,7 @@ ImportHubDialog::ImportHubDialog(QWidget* parent)
     connect(edlButton, &QPushButton::clicked, this, &ImportHubDialog::onEdlBrowseClicked);
     root->addWidget(edlButton);
     auto *fcpxmlButton = new QPushButton(tr("FCPXML を読み込み…"), this);
-    fcpxmlButton->setToolTip(tr("素材クリップを最大 2 トラックの新規シーケンスに読み込みます。未対応要素は警告として報告します。"));
+    fcpxmlButton->setToolTip(tr("素材クリップと接続クリップを、lane ごとに 1 トラックで新規シーケンスに読み込みます (トラック数の上限なし)。未対応要素は警告として報告します。"));
     connect(fcpxmlButton, &QPushButton::clicked, this, &ImportHubDialog::onFcpxmlBrowseClicked);
     root->addWidget(fcpxmlButton);
     setLayout(root);

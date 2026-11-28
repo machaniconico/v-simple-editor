@@ -621,7 +621,7 @@ bool droppedIntoV3(const Timeline &tl)
 
 int runRotoSelftest()
 {
-    constexpr int kRotoGateCount = 44;
+    constexpr int kRotoGateCount = 45;
     selftest::GateTally gates;
     QTemporaryDir media;
     gSyntheticClipPath = media.filePath(QStringLiteral("roto-synthetic.mp4"));
@@ -3414,6 +3414,55 @@ int runRotoSelftest()
         const bool promotionOk = bandPromotion(true, "G44");
         gates.gate(44, ignored && controlOk && externalOk && promotionOk,
                    "new-track band accepted a clip of the other kind, or the audio band is dead");
+    }
+
+    // ── G45 (US-1211): an opaque source with a keyer keeps the alpha the keyer
+    // cut through the non-geometric effects after it. V1 hidden, V2 = the blue
+    // synthetic clip with [ColorKey on its own colour, Blur]. (a) alpha stays 0
+    // (+-2) after the blur (HEAD: applyEffectStack's blur returns RGB888 -> 255)
+    // and the alpha-carry loop is entered exactly once. (b) control: the same
+    // clip with Blur only stays opaque and never enters the loop (an
+    // unconditional loop entry would count 1 here; it cannot be seen in pixels
+    // because the loop feeds every effect the same image).
+    {
+        VideoEffect colorKey = VideoEffect::createColorKey(QColor(32, 80, 160), 0.3, 0.0);
+        const VideoEffect blur = VideoEffect::createBlur(3.0);
+        const auto renderV2 = [&](int id, const QVector<VideoEffect> &effects) {
+            Timeline tl;
+            ClipInfo v2 = clip(id);
+            v2.effects = effects;
+            tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip(310)}, {v2}},
+                                  QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            tl.videoTracks()[0]->setHidden(true);
+            return renderAt(&tl, 0.5);
+        };
+        const auto alphaSpan = [](const QImage &image) {
+            std::pair<int, int> span{256, -1};
+            if (image.isNull()) return span;
+            for (int y = 0; y < image.height(); ++y)
+                for (int x = 0; x < image.width(); ++x) {
+                    const int a = qAlpha(image.pixel(x, y));
+                    span.first = qMin(span.first, a);
+                    span.second = qMax(span.second, a);
+                }
+            return span;
+        };
+        const quint64 entriesBefore = tlrender::alphaCarryLoopEntryCountForTest();
+        const QImage keyed = renderV2(311, {colorKey, blur});
+        const quint64 keyedEntries = tlrender::alphaCarryLoopEntryCountForTest() - entriesBefore;
+        const quint64 plainBefore = tlrender::alphaCarryLoopEntryCountForTest();
+        const QImage plain = renderV2(312, {blur});
+        const quint64 plainEntries = tlrender::alphaCarryLoopEntryCountForTest() - plainBefore;
+        const auto keyedAlpha = alphaSpan(keyed);
+        const auto plainAlpha = alphaSpan(plain);
+        std::cerr << "G45 keyer+blur alpha=" << keyedAlpha.first << ".." << keyedAlpha.second
+                  << " (max <= 2) loopEntries=" << keyedEntries << " (== 1); blur only alpha="
+                  << plainAlpha.first << ".." << plainAlpha.second << " (min == 255) loopEntries="
+                  << plainEntries << " (== 0)\n";
+        gates.gate(45, keyedAlpha.second >= 0 && keyedAlpha.second <= 2 && keyedEntries == 1
+                       && plainAlpha.first == 255 && plainAlpha.second == 255 && plainEntries == 0,
+                   "keyer alpha restored to opaque by a later effect on an opaque source, "
+                   "or the alpha-carry loop entered without a keyer");
     }
 
     return gates.finish("roto");

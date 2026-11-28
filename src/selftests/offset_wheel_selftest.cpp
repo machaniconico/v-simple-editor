@@ -210,7 +210,7 @@ int runOffsetWheelSelftest()
 
     MainWindow window;
     window.hide();
-    auto *timeline = window.findChild<Timeline *>();
+    auto *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
     mcp::McpToolRegistry registry;
     mcp::McpEditorTools tools(&window,&registry);
     tools.registerWriteTools();

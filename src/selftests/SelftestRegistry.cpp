@@ -98,6 +98,7 @@ int runColorMatchSelftest();
 int runColorWarperSelftest();
 int runCommandSearchSelftest();
 int runCompositeFrameCacheSelftest();
+int runConnectedClipSelftest();
 int runCredAuditLogSelftest();
 int runCredTtlSelftest();
 int runCredentialVaultSelftest();
@@ -125,6 +126,7 @@ int runExportMetaSelftest();
 int runExportPresetsSelftest();
 int runExportProSelftest();
 int runExportRangeSelftest();
+int runExrWriterSelftest();
 int runExposureAidsSelftest();
 int runFcpxmlImportSelftest();
 int runFcpxmlSelftest();
@@ -667,9 +669,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "versioned-save",   "VEDITOR_VERSIONED_SAVE_SELFTEST",    runVersionedSaveSelftest,      false,
       "Increment and Save filename resolver: numbered suffix, unnumbered v002, collision skip, digit width" },
     { "project-diff", "VEDITOR_PROJECT_DIFF_SELFTEST", runProjectDiffSelftest, false,
-      "Structural project comparison: matching, properties, effects, transitions and epsilon (7 gates)" },
+      "Structural project comparison: matching, properties, effects, transitions and epsilon (8 gates)" },
     { "img-sequence", "VEDITOR_IMG_SEQUENCE_SELFTEST", runImgSequenceSelftest, true,
-      "PNG/TIFF sequence export, alpha, configuration and cancellation (6 gates)" },
+      "PNG/TIFF/EXR sequence export, alpha, configuration and cancellation (10 gates)" },
     { "export-alpha", "VEDITOR_EXPORT_ALPHA_SELFTEST", runExportAlphaSelftest, true,
       "ProRes/VP9 alpha export and opaque default path (7 gates)" },
     { "export-cfg", "VEDITOR_EXPORT_CFG_SELFTEST", runExportCfgSelftest, true,
@@ -682,6 +684,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Export rate control options and queue persistence" },
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
+    { "exr-writer",        "VEDITOR_EXR_WRITER_SELFTEST",          runExrWriterSelftest,         false,
+      "EXR half/float encoding, ZIP/None, alpha channels and linearization (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
       "MotionTracker preset 7 built-in + Registry + JSON round-trip (10 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET
@@ -868,6 +872,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
     { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
       "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (5 gates)" },
+    { "connected-clip", "VEDITOR_CONNECTED_CLIP_SELFTEST", runConnectedClipSelftest, true,
+      "Connected clips: connect, follow at the undo commit point (insert / MCP move / ripple), undo / redo, carriers by uid, save / load, sequence switch, load baseline, linear / non-linear anchors (26 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
@@ -970,14 +976,14 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
-      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (18 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
+      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (23 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
       "Preview vs export pixel-parity (S1-S11, framediff::mse, 10-bit HDR10)" },
     { "parent-gate", "VEDITOR_PARENT_GATE_SELFTEST", runParentGateSelftest, true, "tlrender::parentLayerAt shared parent-layer gate vs renderFrameAt: times, offline parent, overlap pick, Start trail, outside interval, per-layer call count, V1 empty/ended boundary (7 gates)" },
     { "video-player-parent", "VEDITOR_VIDEO_PLAYER_PARENT_SELFTEST", runVideoPlayerParentSelftest, true,
-      "VideoPlayer real parent admission (cpu-composite / multi-track) vs tlrender::parentLayerAt: normal, V1, adjustment, disabled, overlap incoming, Start trail, offline parent, observation OFF, per-path records (9 gates)" },
+      "VideoPlayer real parent admission (cpu-composite / multi-track) vs tlrender::parentLayerAt: normal, V1, adjustment, disabled, overlap incoming, Start trail, offline parent, observation OFF, per-path records (10 gates)" },
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
@@ -1013,7 +1019,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
       "MainWindow lifecycle: construct/destroy once, repeat three times, and clear dependent dock objects (3 gates)" },
     { "track-ops", "VEDITOR_TRACK_OPS_SELFTEST", runTrackOpsSelftest, true,
-      "Track removal/reorder: header menus, external state undo, exact row restoration and project persistence (12 gates)" },
+      "Track removal/reorder: header menus, external state undo, exact row restoration and project persistence (21 gates)" },
     { "track-manage", "VEDITOR_TRACK_MANAGE_SELFTEST", runTrackManageSelftest, true,
       "Track names/colors: project roundtrip, single-step undo and invalid targets (3 gates)" },
     { "timeline-skim", "VEDITOR_TIMELINE_SKIM_SELFTEST", runTimelineSkimSelftest, true,
@@ -1023,7 +1029,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "roto", "VEDITOR_ROTO_SELFTEST", runRotoSelftest, true,
-      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (44 gates)" },
+      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (45 gates)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
@@ -1073,7 +1079,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (189 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (192 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
@@ -1115,7 +1121,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "davinci",           "VEDITOR_DAVINCI_SELFTEST",            runDavinciSelftest,            true,
       "DaVinci Resolve XML round-trip I/O smoke (timeline + grade export)" },
     { "fcpxml-import", "VEDITOR_FCPXML_IMPORT_SELFTEST", runFcpxmlImportSelftest, true,
-      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (17 gates)" },
+      "FCPXML roundtrip, rational times, connected-clip lanes (gap children, J-cuts, invalid parents, empty spine), warnings and sequence undo (33 gates)" },
     { "fcpxml",            "VEDITOR_FCPXML_SELFTEST",             runFcpxmlSelftest,             true,
       "FCPXML import/export round-trip smoke (Final Cut Pro X interchange)" },
     { "smartedit",         "VEDITOR_SMARTEDIT_SELFTEST",          runSmartEditSelftest,          true,

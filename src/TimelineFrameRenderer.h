@@ -70,6 +70,9 @@ QImage prepareTransitionLayer(QImage source, const clipgeom::ClipTransform &tran
 // Test switch also resets the calling thread's observation count.
 void setTransitionStepsEnabledForTest(bool enabled);
 int transitionStepCallCountForTest();
+// Monotonic count of applyClipFxPack alpha-carry loop entries (translucent
+// input, or a keyer in the stack); tests compare a before / after difference.
+quint64 alphaCarryLoopEntryCountForTest();
 QImage applyEdgeFadeStep(QImage composed, const OverlapInterval &entry, double T);
 QImage applyEdgeFadeStep(QImage composed, const PlaybackEntry &entry, double T);
 // Uses the outgoing interval edge parameters in OverlayRenderer::applyTransition.

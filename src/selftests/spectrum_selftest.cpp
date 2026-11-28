@@ -222,7 +222,7 @@ int runSpectrumSelftest()
         // G5 also checks the MainWindow wiring: its Dock lists the window's
         // audio tracks (setTimeline) next to the master.
         const auto *windowCombo = dock ? dock->findChild<QComboBox *>("spectrumSourceCombo") : nullptr;
-        const auto *windowTimeline = window.findChild<Timeline *>();
+        const auto *windowTimeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
         windowComboCount = windowCombo ? windowCombo->count() : -1;
         windowAudioTracks = windowTimeline ? windowTimeline->audioTrackCount() : -1;
         if (dock) dock->hide();

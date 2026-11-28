@@ -530,7 +530,7 @@ int runMixerDockSelftest()
         window.hide();
         Timeline *timeline = window.m_timeline;
         AudioMixer *mixer = window.m_player->audioMixer();
-        auto *dock = window.findChild<AudioMixerDock *>();
+        auto *dock = window.findChild<AudioMixerDock *>(QStringLiteral("AudioMixerDock"));
         if (dock && timeline && timeline->audioTrackCount() == 0) timeline->addAudioTrack();
         if (dock) dock->synchronize();
         const bool wired = dock && mixer && timeline->audioMixer() == mixer && dock->stripCount() >= 1;

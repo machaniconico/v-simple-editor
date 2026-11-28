@@ -12,6 +12,7 @@
 #include <QImageWriter>
 #include <QRegularExpression>
 #include "SequenceExport.h"
+#include "ExrSequenceWriter.h"
 #include <QGroupBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -65,6 +66,8 @@ void ExportConfig::appendSequenceSettings(QJsonObject &json) const
     json["sequenceDigits"] = sequenceDigits;
     json["sequenceStart"] = sequenceStart;
     json["keepAlpha"] = keepAlpha;
+    if (QFileInfo(sequencePattern).suffix().compare(QLatin1String("exr"), Qt::CaseInsensitive) == 0)
+        json["exrLinear"] = exrLinear;
 }
 
 QJsonObject exportcfg::toJobJson(const ExportConfig &config)
@@ -161,7 +164,7 @@ void ExportDialog::setupUI()
     m_exportTypeCombo->setObjectName("exportType");
     m_exportTypeCombo->addItem("動画ファイル (Video)", static_cast<int>(ExportType::Video));
     m_exportTypeCombo->addItem("Premiere Pro XML (FCP7)", static_cast<int>(ExportType::PremiereXml));
-    m_exportTypeCombo->addItem(tr("連番静止画 (PNG / TIFF)"), static_cast<int>(ExportType::ImageSequence));
+    m_exportTypeCombo->addItem(tr("連番静止画 (PNG / TIFF / EXR)"), static_cast<int>(ExportType::ImageSequence));
     typeLayout->addWidget(m_exportTypeCombo);
     m_audioOnlyCheckbox = new QCheckBox(tr("音声のみ (映像なし)"), this);
     m_audioOnlyCheckbox->setObjectName("audioOnly");
@@ -679,6 +682,8 @@ void ExportDialog::ensureSequenceSettings()
     m_sequenceFormat->addItem("PNG", "png");
     if (QImageWriter::supportedImageFormats().contains("tiff"))
         m_sequenceFormat->addItem("TIFF", "tiff");
+    if (exrseq::encoderAvailable())
+        m_sequenceFormat->addItem("EXR", "exr");
     m_sequencePattern = new QLineEdit(m_config.sequencePattern, m_sequenceSettings);
     m_sequencePattern->setObjectName("sequencePattern");
     m_sequenceDigits = new QSpinBox(m_sequenceSettings);
@@ -693,10 +698,19 @@ void ExportDialog::ensureSequenceSettings()
     sequenceForm->addRow(tr("ファイル名パターン:"), m_sequencePattern);
     sequenceForm->addRow(tr("番号の桁数:"), m_sequenceDigits);
     sequenceForm->addRow(tr("開始番号:"), m_sequenceStart);
+    m_exrLinear = new QCheckBox(tr("EXR をシーンリニアで書き出す"), m_sequenceSettings);
+    m_exrLinear->setObjectName("exrLinear");
+    m_exrLinear->setChecked(m_config.exrLinear);
+    sequenceForm->addRow(m_exrLinear);
     sequenceForm->addRow(new QLabel(tr("出力先にはフォルダを指定してください。音声は含まれません。\n音声が必要な場合は「音声のみ」で別途書き出してください。"), this));
     // Keep the sequence settings immediately below the export type selector.
     static_cast<QVBoxLayout *>(layout())->insertWidget(1, m_sequenceSettings);
     m_sequenceSettings->hide();
+    const auto syncExrLinear = [this]() {
+        m_exrLinear->setVisible(m_sequenceFormat->currentData().toString() == QLatin1String("exr"));
+    };
+    syncExrLinear();
+    connect(m_sequenceFormat, &QComboBox::currentIndexChanged, this, syncExrLinear);
     connect(m_sequenceFormat, &QComboBox::currentIndexChanged, this, [this]() {
         QString pattern = m_sequencePattern->text();
         const int dot = pattern.lastIndexOf('.');
@@ -708,11 +722,14 @@ void ExportDialog::ensureSequenceSettings()
         pattern.replace(QRegularExpression("%d|%0[1-9][0-9]*d"), QStringLiteral("%0") + QString::number(digits) + QLatin1Char('d'));
         m_sequencePattern->setText(pattern);
     });
-    connect(m_sequencePattern, &QLineEdit::textChanged, this, [this](const QString &pattern) {
+    connect(m_sequencePattern, &QLineEdit::textChanged, this, [this, syncExrLinear](const QString &pattern) {
         const int format = m_sequenceFormat->findData(QFileInfo(pattern).suffix().toLower());
         if (format >= 0) {
-            const QSignalBlocker blocker(m_sequenceFormat);
-            m_sequenceFormat->setCurrentIndex(format);
+            {
+                const QSignalBlocker blocker(m_sequenceFormat);
+                m_sequenceFormat->setCurrentIndex(format);
+            }
+            syncExrLinear();
         }
         const auto match = QRegularExpression("%0([1-9][0-9]*)d").match(pattern);
         if (match.hasMatch()) {
@@ -720,6 +737,13 @@ void ExportDialog::ensureSequenceSettings()
             m_sequenceDigits->setValue(match.captured(1).toInt());
         }
     });
+    // The pattern was created from m_config; sync the combo to it once (no pattern rewrite).
+    const int initialFormat = m_sequenceFormat->findData(QFileInfo(m_sequencePattern->text()).suffix().toLower());
+    if (initialFormat >= 0) {
+        const QSignalBlocker blocker(m_sequenceFormat);
+        m_sequenceFormat->setCurrentIndex(initialFormat);
+    }
+    syncExrLinear();
 }
 
 // Loudness normalization is not applied to image sequences (config() ignores it too).
@@ -941,6 +965,7 @@ void ExportDialog::applyPreset(const ExportConfig &config, bool userPreset)
         m_sequencePattern->setText(config.sequencePattern);
         m_sequenceDigits->setValue(config.sequenceDigits);
         m_sequenceStart->setValue(config.sequenceStart);
+        m_exrLinear->setChecked(config.exrLinear);
         if (!config.sequenceFolder.isEmpty()) restoredOutput = config.sequenceFolder;
     }
     m_outputEdit->setText(restoredOutput);
@@ -965,6 +990,7 @@ ExportConfig ExportDialog::currentSettings() const
         c.sequencePattern = m_sequencePattern->text();
         c.sequenceDigits = m_sequenceDigits->value();
         c.sequenceStart = m_sequenceStart->value();
+        c.exrLinear = m_exrLinear->isChecked();
     }
     c.audioOnly = !c.imageSequence && m_audioOnlyCheckbox->isChecked();
     c.videoCodec = m_videoCodecCombo->currentData().toString();

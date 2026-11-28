@@ -241,9 +241,14 @@ QJsonObject projection(const ProjectData &data)
                 // The clip uid is identity, not a property; persistence nests
                 // one renderInPlaceOriginal level, so strip it there too.
                 obj.remove("uid");
+                // US-1201: the connection is identity too, compared by neither key.
+                obj.remove("anchorUid");
+                obj.remove("anchorOffsetSec");
                 if (obj.contains("renderInPlaceOriginal")) {
                     auto original = obj.value("renderInPlaceOriginal").toObject();
                     original.remove("uid");
+                    original.remove("anchorUid");
+                    original.remove("anchorOffsetSec");
                     obj.insert("renderInPlaceOriginal", original);
                 }
                 clips[c] = obj;

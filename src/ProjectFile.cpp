@@ -732,6 +732,8 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+    if (data.storylineMode)
+        root["storylineMode"] = true;
 
     // Audio mixer
     {
@@ -1080,6 +1082,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
+    data.storylineMode = root.value("storylineMode").toBool(false);
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
@@ -1379,6 +1382,8 @@ QString ProjectFile::toJsonString(const ProjectData &data)
     root["markIn"] = data.markIn;
     root["markOut"] = data.markOut;
     root["zoomLevel"] = data.zoomLevel;
+    if (data.storylineMode)
+        root["storylineMode"] = true;
 
     // Audio mixer
     {
@@ -1697,6 +1702,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.markIn = root["markIn"].toDouble(-1.0);
     data.markOut = root["markOut"].toDouble(-1.0);
     data.zoomLevel = root["zoomLevel"].toInt(10);
+    data.storylineMode = root.value("storylineMode").toBool(false);
 
     // Audio mixer (tolerate missing keys)
     data.trackEqStates.clear();
@@ -2015,6 +2021,11 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["displayName"] = clip.displayName;
     if (!clip.uid.isEmpty())
         obj["uid"] = clip.uid;
+    // US-1201: written only for a connected clip.
+    if (!clip.anchorUid.isEmpty()) {
+        obj["anchorUid"] = clip.anchorUid;
+        obj["anchorOffsetSec"] = clip.anchorOffsetSec;
+    }
     if (!clip.shapes.isEmpty()) {
         QJsonArray shapes;
         for (const Shape &shape : clip.shapes)
@@ -2154,6 +2165,10 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.displayName = obj["displayName"].toString();
     // Read as saved; a missing uid is minted by TimelineTrack::setClips on load.
     clip.uid = obj["uid"].toString();
+    // A missing anchor uid is detached (with a warning) by the load reconcile.
+    clip.anchorUid = obj.value("anchorUid").toString();
+    clip.anchorOffsetSec = clip.anchorUid.isEmpty()
+        ? 0.0 : obj.value("anchorOffsetSec").toDouble(0.0);
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())
             clip.shapes.append(Shape::fromJson(value.toObject()));

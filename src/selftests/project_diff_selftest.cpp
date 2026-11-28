@@ -179,6 +179,22 @@ int runProjectDiffSelftest()
          && count(properties, Change::TrackFlagChanged) == 1
          && properties[0].path == QStringLiteral("audio[0].clips[0].volume"));
 
+    // G8 (US-1201): the connection (anchorUid / anchorOffsetSec) is identity,
+    // not a property; a filePath change still diffs (control).
+    ProjectData connected = a;
+    connected.videoTracks[0][0].anchorUid = QStringLiteral("anchor-uid");
+    connected.videoTracks[0][0].anchorOffsetSec = 2.5;
+    ProjectData reconnected = a;
+    reconnected.videoTracks[0][0].anchorUid = QStringLiteral("other-anchor-uid");
+    reconnected.videoTracks[0][0].anchorOffsetSec = -1.0;
+    ProjectData moved = connected;
+    moved.videoTracks[0][0].filePath = QStringLiteral("moved.mp4");
+    const int connectionChanges = diff(connected, reconnected).size() + diff(a, connected).size();
+    const int pathChanges = diff(connected, moved).size();
+    std::fprintf(stderr, "project-diff G8 connectionChanges=%d (expect 0) pathChanges=%d (expect >0)\n",
+                 connectionChanges, pathChanges);
+    gate(8, connectionChanges == 0 && pathChanges > 0);
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

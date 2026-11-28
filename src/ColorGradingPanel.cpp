@@ -186,8 +186,8 @@ bool writeCurvesToSelectedClip(Timeline *timeline,
 
     clips[clipIdx].colorCurves = curves;
     track->setClips(clips);
-    if (UndoManager *undo = timeline->undoManager())
-        undo->saveState(timeline->currentState(), QStringLiteral("Clip RGB curves"));
+    if (timeline->undoManager())
+        timeline->saveUndoState(QStringLiteral("Clip RGB curves"));
     timeline->refreshPlaybackSequence();
     return true;
 }
@@ -213,8 +213,8 @@ bool writeHslSecondaryToSelectedClip(Timeline *timeline,
 
     clips[clipIdx].hslSecondary = hsl;
     track->setClips(clips);
-    if (UndoManager *undo = timeline->undoManager())
-        undo->saveState(timeline->currentState(), QStringLiteral("Clip HSL secondary"));
+    if (timeline->undoManager())
+        timeline->saveUndoState(QStringLiteral("Clip HSL secondary"));
     timeline->refreshPlaybackSequence();
     return true;
 }

@@ -573,6 +573,17 @@ namespace {
 // may delete (a stray tempFiles entry from elsewhere is ignored).
 QMutex ownedTempFilesMutex;
 QSet<QString> ownedTempFiles;
+
+// The project file a job without a live Timeline loads: projectFilePath, or the recorded source
+// once setIntermediateProjectFile put an audio mix there (US-1210 RenderQueueDialog file jobs).
+QString projectFileToLoad(const RenderJob &job)
+{
+    const QString source = job.exportConfig.value(QStringLiteral("sourceProjectFilePath")).toString();
+    if (!job.timeline && !RenderQueue::isProjectFilePath(job.projectFilePath)
+        && RenderQueue::isProjectFilePath(source))
+        return source;
+    return job.projectFilePath;
+}
 }
 
 void RenderQueue::setIntermediateProjectFile(RenderJob &job, const QString &path)
@@ -1333,9 +1344,9 @@ void RenderQueue::startRenderPipe(int jobIndex)
     }
     if (subtitle::embeds(subtitleMode)
         && !subtitleJob.exportConfig.contains("subtitleTrack")
-        && isProjectFilePath(subtitleJob.projectFilePath)) {
+        && isProjectFilePath(projectFileToLoad(subtitleJob))) {
         ProjectData data;
-        if (ProjectFile::load(subtitleJob.projectFilePath, data)) {
+        if (ProjectFile::load(projectFileToLoad(subtitleJob), data)) {
             QVector<SubtitleSegment> segments;
             for (const auto &entry : data.subtitleSegments) {
                 SubtitleSegment segment;
@@ -2492,12 +2503,13 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     if (job.timeline)
         return job.timeline;
 
-    if (job.projectFilePath.isEmpty()
-        || !QFile::exists(job.projectFilePath))
+    const QString projectPath = projectFileToLoad(job);
+    if (projectPath.isEmpty()
+        || !QFile::exists(projectPath))
         return nullptr;
 
     ProjectData data;
-    if (!ProjectFile::load(job.projectFilePath, data))
+    if (!ProjectFile::load(projectPath, data))
         return nullptr;
 
     auto *tl = new Timeline();

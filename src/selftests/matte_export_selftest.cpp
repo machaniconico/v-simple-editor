@@ -406,7 +406,7 @@ int runMatteExportSelftest()
         serverWarningGuard.start();
         MainWindow window;
         window.hide();
-        Timeline *tl = window.findChild<Timeline *>();
+        Timeline *tl = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
         timelineReady = tl != nullptr;
         if (tl) {
             tl->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
@@ -414,7 +414,7 @@ int runMatteExportSelftest()
         }
         window.toggleMcpServer(true);
         serverWarningGuard.stop();
-        auto *server = window.findChild<mcp::McpHttpServer *>();
+        auto *server = window.findChild<mcp::McpHttpServer *>(QStringLiteral("mcpHttpServer"));
         serverReady = server && server->isRunning();
         if (serverReady) {
             selected = timelineReady && toolOk(callMcp(server, QStringLiteral("select_clip"),
