@@ -1,5 +1,6 @@
 #include "MeshEditTool.h"
 #include "PuppetPinTool.h"
+#include "PuppetEngine.h"
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
@@ -7464,6 +7465,19 @@ void MainWindow::setupMenuBar()
         }
         stopMeshEditTool();
         auto *tool = new PuppetPinTool(m_timeline, trackIdx, clipIdx, this);
+        tool->setUseArapMode(true);
+        tool->setTimeProvider([this, trackIdx, clipIdx]() -> double {
+            if (!m_timeline || trackIdx < 0 || trackIdx >= m_timeline->videoTracks().size())
+                return 0.0;
+            const auto &clips = m_timeline->videoTracks()[trackIdx]->clips();
+            if (clipIdx < 0 || clipIdx >= clips.size()) return 0.0;
+            double start = 0.0;
+            for (int i = 0; i <= clipIdx; ++i) {
+                start += qMax(0.0, clips[i].leadInSec);
+                if (i < clipIdx) start += clips[i].effectiveDuration();
+            }
+            return qMax(0.0, currentPlayheadSeconds() - start);
+        });
         m_puppetPinTool = tool;
         tool->setViewRect(m_player->glPreview()->letterboxRect());
         // US-707: the tool maps through the clip fit + placement the renderer applies
@@ -7502,6 +7516,35 @@ void MainWindow::setupMenuBar()
         stopPuppetPinTool();
         m_timeline->setClipPuppetPins(trackIdx, clipIdx, {});
         refreshSpecialClipPreview();
+    });
+
+    auto *puppetRigDlgAction = compMenu->addAction(
+        QStringLiteral("パペット設定 (ARAP メッシュ / キーフレーム)…"));
+    connect(puppetRigDlgAction, &QAction::triggered, this, [this]() {
+        int trackIdx = -1, clipIdx = -1;
+        if (!selectedVideoClipRef(trackIdx, clipIdx)
+            || !m_timeline->videoTracks()[trackIdx]->isClipSelected(clipIdx)) {
+            QMessageBox::information(this, QStringLiteral("パペット設定"),
+                                     QStringLiteral("映像クリップを選択してください。"));
+            return;
+        }
+        const auto &clips = m_timeline->videoTracks()[trackIdx]->clips();
+        double clipStart = 0.0;
+        for (int i = 0; i <= clipIdx; ++i) {
+            clipStart += qMax(0.0, clips[i].leadInSec);
+            if (i < clipIdx) clipStart += clips[i].effectiveDuration();
+        }
+        const double clipLocalSec = qMax(0.0, currentPlayheadSeconds() - clipStart);
+        puppet::PuppetRigDialog dlg(
+            m_timeline, trackIdx, clipIdx, clipLocalSec,
+            [this]() {
+                refreshSpecialClipPreview();
+                if (m_player && m_player->glPreview()) m_player->glPreview()->update();
+            },
+            this);
+        if (dlg.exec() == QDialog::Accepted && m_puppetPinTool) {
+            m_puppetPinTool->setToolMode(dlg.selectedToolMode());
+        }
     });
 
     auto *meshEditAction = compMenu->addAction(QStringLiteral("メッシュワープを編集"));

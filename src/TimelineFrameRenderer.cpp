@@ -1,6 +1,7 @@
 #include "TimelineFrameRenderer.h"
 #include "CreativeEffects.h"
 #include "ExternalGenerator.h"
+#include "PuppetEngine.h"
 #include "Timeline.h"
 #include "OpticalFlow.h"
 #include <atomic>
@@ -908,10 +909,15 @@ namespace {
 std::atomic<bool> meshWarpDisabled{false};
 std::atomic<quint64> meshWarpCalls{0};
 
-QImage applyClipMeshWarp(const QImage &source, const ClipInfo &clip)
+QImage applyClipMeshWarp(const QImage &source, const ClipInfo &clip,
+                         double clipLocalSeconds = 0.0)
 {
     const auto puppet = [&](const QImage &frame) {
-        return clip.hasPuppetPins() ? puppetpin::applyNormalized(frame, clip.puppetPins) : frame;
+        if (!clip.hasPuppetPins())
+            return frame;
+        if (!clip.uid.isEmpty() && puppet::hasRig(clip.uid))
+            return puppet::renderPuppetFrame(frame, puppet::rigForClip(clip.uid), clipLocalSeconds);
+        return puppetpin::applyNormalized(frame, clip.puppetPins);
     };
     if (source.isNull() || !hasActiveMeshWarp(clip))
         return puppet(source);
@@ -3956,7 +3962,7 @@ QImage applyClipFxStackFromSource(const QImage &source, const ClipInfo &clip,
 {
     return applyClipMeshWarp(applyClipFxPack(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
-        clip, clipLocalSeconds), clip);
+        clip, clipLocalSeconds), clip, clipLocalSeconds);
 }
 
 QImage applyClipFxStackWithEchoFromSource(
@@ -3972,7 +3978,7 @@ QImage applyClipFxStackWithEchoFromSource(
         return applyClipFxStackFromSource(source, clip, clipLocalSeconds);
     return applyClipMeshWarp(applyClipFxPackWithEcho(
         prepareClipSourceForEcho(source, clip, clipLocalSeconds),
-        clip, clipLocalSeconds, sourceSeconds, frameProvider, rampMapping), clip);
+        clip, clipLocalSeconds, sourceSeconds, frameProvider, rampMapping), clip, clipLocalSeconds);
 }
 
 QImage detail::renderFrameAtSingle(const Timeline *timeline, qint64 usec, QSize outSize)

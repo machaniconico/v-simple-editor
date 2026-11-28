@@ -196,6 +196,7 @@ int runCompetitorGapP2Selftest();
 int runRadeonAmfSelftest();
 int runAmdGpuSupportSelftest();
 int runQrhiPreviewSelftest();
+int runPuppetArapSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -990,6 +991,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 29 Phases 1-5 AMD GPU full support: RDNA arch detection, D3D11VA matrix, WGL-DX circuit breaker, strict GLSL auditor, DirectML/Vulkan/ROCm backend routing, GpuDiagnosticsDialog (10 gates)" },
     { "qrhi-preview", "VEDITOR_QRHI_PREVIEW_SELFTEST", runQrhiPreviewSelftest, true,
       "Wave 30 Qt6 QRhi cross-vendor preview backend: Direct3D 11 / Vulkan / OpenGL / Null probe, real D3D11 QRhiTexture upload+readback pixel round-trip, QrhiPreviewWidget & Dialog (8 gates)" },
+    { "puppet-arap", "VEDITOR_PUPPET_ARAP_SELFTEST", runPuppetArapSelftest, true,
+      "Wave 31 AE-grade Animated Mesh Puppet: alpha silhouette & opaque grid mesh, 2-step ARAP solver, keyframes/easing, Starch/Bend/Advanced/Overlap Z-sort, SSOT renderFrameAt, Undo & ProjectFile round-trip, PuppetPinTool & Dialog (10 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
