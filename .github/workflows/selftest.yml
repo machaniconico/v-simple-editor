@@ -40,6 +40,7 @@ jobs:
 
     env:
       QT_QPA_PLATFORM: offscreen
+      QT_OPENGL: software
       VEDITOR_MCP_PORT: "18299"
 
     steps:
@@ -73,22 +74,23 @@ jobs:
           modules: "qtmultimedia qtimageformats"
           cache: true
 
-      - name: Configure CMake
+      - name: Configure CMake (Ninja + MSVC)
         shell: cmd
         run: |
-          cmake -S . -B build_win -G "Visual Studio 17 2022" -A x64 ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%;%FFMPEG_ROOT%"
+          cmake -S . -B build_win -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_PREFIX_PATH="%QT_ROOT_DIR%;%FFMPEG_ROOT%"
 
       - name: Build Release
         shell: cmd
         run: |
-          cmake --build build_win --config Release -- /m /v:m
+          cmake --build build_win
 
       - name: Run Selftest Smoke Suite
         shell: pwsh
         run: |
-          $env:PATH = "$env:Qt6_DIR\bin;$env:FFMPEG_ROOT\bin;$env:PATH"
-          $exe = "build_win\Release\v-simple-editor.exe"
+          $env:PATH = "$env:QT_ROOT_DIR\bin;$env:FFMPEG_ROOT\bin;$env:PATH"
+          $exe = "build_win\v-simple-editor.exe"
           $suites = @("list", "tracker-preset", "hdr-routing", "radeon-amf", "puppet-arap", "context-menu-order")
           $fail = 0
           foreach ($s in $suites) {
