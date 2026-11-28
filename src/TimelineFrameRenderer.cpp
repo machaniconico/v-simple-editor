@@ -2047,10 +2047,9 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
     const QHash<QString, QString> parentEntries = veditor::parentingEnabledFromEnv()
         ? timeline->clipParentEntries() : QHash<QString, QString>();
     // An effective blend (the rule of the overlay loop below: VFX footage above
-    // V1) is drawn by the composite, except with a matte source anywhere in the
-    // timeline: that stays on the legacy path. A non-VFX blend is ignored here
-    // as in the export.
-    const bool hasMatteSource = !timeline->trackMatteEntries().isEmpty();
+    // V1) is drawn by the composite, with or without a track matte (both go
+    // through trackmatte::composite's blend rule). A non-VFX blend is ignored
+    // here as in the export.
     QSet<QString> activeClipIds;
     bool hasBrush = false;
     // US-2113: a borrowed overlap window (two active clips on a track) is a
@@ -2082,9 +2081,7 @@ bool timelineBrushWantsSpecialPath(const Timeline *timeline, double timelineSec)
         const ClipInfo &clip = clips[clipIdx];
         const double clipEnd = clipStart + clip.effectiveDuration();
         activeClipIds.insert(renderClipId(trackIdx, clipIdx));
-        const bool effectiveBlend = clip.isVfxFootage && trackIdx > 0
-            && clip.blendMode != BlendMode::Normal;
-        if ((effectiveBlend && hasMatteSource) || clip.isAdjustment || clip.hasMask())
+        if (clip.isAdjustment || clip.hasMask())
             return false;
         // Nor clips the special composite cannot draw as renderFrameAt does
         // (shape, nested sequence, disabled): those frames keep their HEAD
@@ -2173,8 +2170,9 @@ QImage renderClipLayerSource(const Timeline *timeline,
     // US-1708: the brush goes on the raw (after roto, before VFX / grade) and
     // that image feeds both the echo and the plain branch.
     QImage raw = applyClipBrushSource(roto, clip, localSec, scopedClipId);
-    // US-2111: V1's stabilizer on the brushed source, before VFX / grade, at the
-    // export's source time and the decoded size (stabwarp::applyForExport decides).
+    // US-2111 / US-2300: the stabilizer of every layer that carries keys (any track,
+    // a nested child at its own source time) on the brushed source, before VFX /
+    // grade, at the export's source time and the decoded size.
     raw = stabwarp::applyForExport(raw, clip, trackIdx, sequenceDepth, sourceSec);
     if (stopAfterBrush)
         return raw;
@@ -3413,6 +3411,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
                 d.matteType = static_cast<gpucomposite::MatteType>(
                     static_cast<int>(rl.layer.matteType));
                 d.matteSourceIndex = rl.layer.matteSourceLayerIndex;
+                d.blendModeOrdinal = static_cast<int>(rl.layer.blendMode);
                 descs.append(d);
 
                 QImage img = rl.image;

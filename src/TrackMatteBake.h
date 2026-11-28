@@ -16,7 +16,11 @@ namespace trackmatte {
 // MaskSystem::applyTrackMatte, and that matte-source layer is NOT drawn
 // standalone. Out-of-range / self-referential / null-image matteSourceLayerIndex
 // => that layer composites normally (no matte applied, never crashes).
-// Blending uses LayerCompositor::blendImages with each layer's blendMode+opacity.
+// Layers are stacked with premultiplied SourceOver at their opacity. A visible
+// layer with a blendMode other than Normal (and not a matte source) is left out
+// of that stack and then blended over the result in ascending order through
+// LayerCompositor::blendImages with its blendMode+opacity, after its own matte
+// (if any) has cut its alpha. With no such layer the stack is the whole result.
 QImage composite(const QVector<CompositeLayer>& layers,
                  const QVector<QImage>& layerImages,
                  QSize canvasSize);

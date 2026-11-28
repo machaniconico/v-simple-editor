@@ -3,6 +3,7 @@
 // is replaced. The gates never call closeEvent (it writes the real QSettings
 // and the real autosave directory); they observe maybeSaveChanges() and the
 // prompt / save-as / failure-dialog / missing-media seams.
+#include "../AudioBusPanel.h"
 #include "../AudioMixer.h"
 #include "../AudioMixerDock.h"
 #include "../CompressorPanel.h"
@@ -164,7 +165,7 @@ int runUnsavedPromptSelftest()
     selftest::GateTally tally;
     QTemporaryDir dir;
     if (!dir.isValid()) {
-        for (int g = 1; g <= 14; ++g)
+        for (int g = 1; g <= 15; ++g)
             tally.gate(g, false, "temporary directory unavailable");
         return tally.finish("unsaved-prompt");
     }
@@ -1618,6 +1619,125 @@ int runUnsavedPromptSelftest()
                 + " afterTimeout=" + b(stillNone);
         }
         tally.gate(14, ok, d);
+    }
+
+    // ---- G15 (US-2308): an absorb takes the live drag / motion burst's point first, so the replace lands
+    // on that point (burst + the absorbed edit) and the point before the burst keeps its state; every leg
+    // reads the content of each undo step ----
+    {
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        MainWindow w15;
+        Timeline &tl = *w15.m_timeline;
+        UndoManager *um = tl.undoManager();
+        const QString clipPath = tmp("g15-clip.mp4");
+        const bool filesOk = touchFile(clipPath);
+        const auto setup = [&] {
+            tl.videoTracks()[0]->setClips({makeClip(clipPath)});
+            tl.videoTracks()[0]->setSelectedClip(0);
+            tl.setTrackMatteEntries({});
+            um->clear();
+            tl.saveUndoState(QStringLiteral("Initial"));
+            w15.markProjectClean();
+        };
+        const auto sig = [&]() -> QString {
+            const auto &clips = tl.videoClips();
+            const QString matte = QStringLiteral(" m%1").arg(tl.trackMatteEntries().size());
+            if (clips.isEmpty()) return QStringLiteral("none") + matte;
+            const ClipInfo &c = clips.first();
+            return QStringLiteral("s%1 x%2 y%3 r%4").arg(c.videoScale, 0, 'f', 2).arg(c.videoDx, 0, 'f', 2)
+                .arg(c.videoDy, 0, 'f', 2).arg(c.rotation2DDegrees, 0, 'f', 1) + matte;
+        };
+        const auto expect = [](double scale, double dx, double dy, double rot, int mattes) {
+            return QStringLiteral("s%1 x%2 y%3 r%4 m%5").arg(scale, 0, 'f', 2).arg(dx, 0, 'f', 2)
+                .arg(dy, 0, 'f', 2).arg(rot, 0, 'f', 1).arg(mattes);
+        };
+        const auto motionWrite = [&] {
+            Q_EMIT tl.clipSelectedOnTrack(0, 0);
+            auto *motion = w15.m_effectControlsPanel->findChild<effectctrl::MotionSectionWidget *>();
+            if (!motion) return;
+            effectctrl::MotionState state = motion->currentMotion();
+            state.rotation2DDeg = 30.0;
+            Q_EMIT motion->motionChanged(state);
+        };
+        const auto dragWrite = [&](double scale) {
+            Q_EMIT w15.m_player->videoSourceTransformChanged(0, 0, scale, -0.3, 0.25);
+        };
+        const auto setMatte = [&] {
+            QHash<QString, TimelineTrackMatteEntry> mattes;
+            mattes.insert(QStringLiteral("0:0"), TimelineTrackMatteEntry{TrackMatteType::AlphaMatte, QStringLiteral("1:0")});
+            tl.setTrackMatteEntries(mattes);
+        };
+        const auto wait = [](int ms) { QCoreApplication::processEvents(); QTest::qWait(ms); };
+        // The content at the top, then after each undo; redo walks back up and must meet the same contents.
+        const auto walk = [&](bool &roundTrip) {
+            QStringList topFirst{sig()};
+            while (um->canUndo()) {
+                tl.undo();
+                topFirst << sig();
+            }
+            QStringList up{sig()};
+            while (um->canRedo()) {
+                tl.redo();
+                up << sig();
+            }
+            QStringList down = topFirst;
+            std::reverse(down.begin(), down.end());
+            roundTrip = up == down;
+            return topFirst;
+        };
+        bool ok = filesOk;
+        std::string d = "files=" + b(filesOk);
+        setup();
+        const QString base = sig();
+        const auto leg = [&](const char *name, const QStringList &want, const std::function<void()> &run) {
+            setup();
+            run();
+            bool roundTrip = false;
+            const QStringList got = walk(roundTrip);
+            const bool legOk = got == want && roundTrip;
+            ok = ok && legOk;
+            d += std::string(" | ") + name + " " + b(legOk) + " [" + got.join(" > ").toStdString() + "] want ["
+                + want.join(" > ").toStdString() + "] roundTrip=" + b(roundTrip);
+        };
+        const QString D = expect(2.0, -0.3, 0.25, 0.0, 0);
+        const QString DT = expect(2.0, -0.3, 0.25, 0.0, 1);
+        const QString M = expect(1.0, 0.0, 0.0, 30.0, 0);
+        // (a) the matte path: setTrackMatteEntries, then the absorb, inside the drag's window.
+        leg("(a) drag,matte absorb", {DT, base}, [&] {
+            dragWrite(2.0); wait(50); setMatte(); tl.absorbIntoCurrentUndoPoint(); wait(400); });
+        // (b) the bus routing path: AudioBusPanel::routingChanged reaches the absorb through MainWindow's connection.
+        bool panelOk = w15.m_audioBusPanel != nullptr;
+        leg("(b) motion,routingChanged", {M, base}, [&] {
+            if (!w15.m_audioBusPanel) return;
+            motionWrite(); wait(50); Q_EMIT w15.m_audioBusPanel->routingChanged(); wait(400); });
+        ok = ok && panelOk;
+        d += " panel=" + b(panelOk);
+        // (c) no burst: an absorb takes no point of its own.
+        {
+            setup();
+            tl.saveUndoState(QStringLiteral("edit"));
+            const int before = um->currentIndex();
+            setMatte();
+            tl.absorbIntoCurrentUndoPoint();
+            wait(400);
+            const bool same = um->currentIndex() == before && um->canUndo();
+            bool roundTrip = false;
+            const QStringList got = walk(roundTrip);
+            const QStringList wantC{expect(1.0, 0.0, 0.0, 0.0, 1), base};  // matte joined the edit point; no third step
+            const bool steps = got == wantC && roundTrip;
+            ok = ok && same && steps;
+            d += std::string(" | (c) noBurst sameIndex=") + b(same) + " steps=" + std::to_string(got.size())
+                + " roundTrip=" + b(roundTrip) + " [" + got.join(" > ").toStdString() + "] want ["
+                + wantC.join(" > ").toStdString() + "]";
+        }
+        // (d) an undo that bypasses MainWindow makes the drag's point stale; the absorb's flush leaves it dropped.
+        leg("(d) bypass undo,absorb", {expect(1.0, 0.0, 0.0, 0.0, 1)}, [&] {
+            tl.saveUndoState(QStringLiteral("point"));  // a point past the base, for the MCP undo to remove
+            dragWrite(2.0); wait(50);
+            tl.undo(); wait(20);                        // bypasses MainWindow: the burst is stale
+            setMatte(); tl.absorbIntoCurrentUndoPoint(); wait(400);
+        });
+        tally.gate(15, ok, d);
     }
 
     window.setUnsavedChangesPromptForTest({});

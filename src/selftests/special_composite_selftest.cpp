@@ -11,6 +11,7 @@
 #include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../SequenceExport.h"
+#include "../TrackMatteBake.h"
 #include "../TrackMatteKey.h"
 #include "../VideoPlayer.h"
 #include "../Text3DLayer.h"
@@ -23,6 +24,7 @@
 #include "../libavcore/AudioExtract.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
+#include "../playback/hdrmatte16_flag.h"
 #include "SelftestGate.h"
 #include "SelftestGl.h"
 
@@ -230,7 +232,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 22; ++g)
+        for (int g = 1; g <= 24; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -272,7 +274,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 22; ++g)
+        for (int g = 5; g <= 24; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -1927,8 +1929,10 @@ int runSpecialCompositeSelftest()
     // G17: an effective blend (VFX footage above V1) on the brush special path:
     // buildSpecialClipComposite(t) == renderFrameAt(t) (HEAD: the helper refused
     // every blend, so the composite was null).
-    // G18: with a matte source a non-VFX blend stays eligible, an effective
-    // blend keeps the legacy path, which draws no brush in the composite.
+    // G18 (US-2303): with a matte source a non-VFX blend stays eligible and
+    // composes as Normal; an effective blend now takes the special path too
+    // (HEAD kept it on the legacy path, which draws no brush in the composite)
+    // and the composite == renderFrameAt with the blend applied.
     {
         timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
         timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
@@ -2063,28 +2067,35 @@ int runSpecialCompositeSelftest()
         setBlendTracks({{v1}, {blendedV2(false, BlendMode::Multiply)}, {v3}});
         matteV2();
         const bool nonVfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline, bt);
-        const bool nonVfxMatteSame = parity("G18 matte + non-VFX Multiply");
+        QImage nonVfxMatteExport;
+        const bool nonVfxMatteSame = parity("G18 matte + non-VFX Multiply", &nonVfxMatteExport);
+        setBlendTracks({{v1}, {blendedV2(true, BlendMode::Normal)}, {v3}});
+        matteV2();
+        const QImage normalMatteExport = exportAt();
+        const DiffStat g18NonVfx = compare(nonVfxMatteExport, normalMatteExport);
 
         setBlendTracks({{v1}, {blendedV2(true, BlendMode::Multiply)}, {v3}});
         matteV2();
         const bool vfxHelper = tlrender::timelineBrushWantsSpecialPath(timeline, bt);
+        QImage vfxMatteExport;
+        const bool vfxMatteSame = parity("G18 matte + VFX Multiply", &vfxMatteExport);
         const QImage vfxPreview = window.buildSpecialClipComposite(bt);
-        const QImage vfxExport = exportAt();
+        // Control: the blend shows against the Normal matte frame.
+        const DiffStat g18Blend = compare(vfxMatteExport, normalMatteExport);
         setBlendTracks({{withoutBrush(v1)}, {withoutBrush(blendedV2(true, BlendMode::Multiply))}, {v3}});
         matteV2();
         const QImage unbrushedPreview = window.buildSpecialClipComposite(bt);
-        const QImage unbrushedExport = exportAt();
-        const DiffStat g18 = compare(vfxPreview, unbrushedPreview);
-        // Control: on this frame a drawn brush would show.
-        const DiffStat g18Brush = compare(vfxExport, unbrushedExport);
+        // Control: the special composite draws the brush on this frame.
+        const DiffStat g18Brush = compare(vfxPreview, unbrushedPreview);
         std::cerr << "special-composite G18 helper nonVfx/vfx=" << nonVfxHelper << '/' << vfxHelper
-                  << " (expect 1/0) vfx previewNull=" << vfxPreview.isNull()
-                  << " vs unbrushed sizeMatch=" << g18.sizeMatch << " maxDiff=" << g18.maxDiff
-                  << " (expect 1 / 0) export brushed vs unbrushed diffPixels=" << g18Brush.diffPixels
+                  << " (expect 1/1) non-VFX vs Normal matte export maxDiff=" << g18NonVfx.maxDiff
+                  << " (expect 0) VFX vs Normal matte export diffPixels=" << g18Blend.diffPixels
+                  << " (expect > 100) VFX composite brushed vs unbrushed diffPixels=" << g18Brush.diffPixels
                   << " (expect > 100)\n";
-        tally.gate(18, varyOk && nonVfxHelper && nonVfxMatteSame && !vfxHelper && !vfxPreview.isNull()
-                       && g18.sizeMatch && g18.maxDiff == 0 && g18Brush.diffPixels > 100,
-                   "matte + blend: eligibility or the brushless legacy composite is wrong (see values above)");
+        tally.gate(18, varyOk && nonVfxHelper && nonVfxMatteSame && g18NonVfx.sizeMatch
+                       && g18NonVfx.maxDiff == 0 && vfxHelper && vfxMatteSame
+                       && g18Blend.diffPixels > 100 && g18Brush.diffPixels > 100,
+                   "matte + blend: eligibility, parity or the blend / brush controls are wrong (see values above)");
         timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
     }
 
@@ -2442,6 +2453,335 @@ int runSpecialCompositeSelftest()
                                    "renderFrameAt (see values above); (d) failing sample times:")
                            + (dFailures.empty() ? std::string(" none") : dFailures));
         setAdjTracks({{adjV1Half}}, false, false);
+    }
+
+    // US-2303 (G23): trackmatte::composite's blend rule on synthetic images (no
+    // media). The Normal layers stack as before; each visible blended layer that
+    // is not a matte source is cut by its own matte and then blended over that
+    // stack ascending through LayerCompositor::blendImages, premultiplied once at
+    // the end. References are built here from composite() on the Normal part and
+    // blendImages, and compared byte for byte (format, size, every scanline).
+    // HEAD drew every layer as Normal: (b)(c)(f)(h) FAIL there, (a)(d)(e)(g) pin.
+    {
+        const QSize ks(96, 64);
+        const auto blank = [&ks] {
+            QImage img(ks, QImage::Format_ARGB32_Premultiplied);
+            img.fill(Qt::transparent);
+            return img;
+        };
+        const auto rectImage = [&blank](const QColor &colour, const QRect &rect) {
+            QImage img = blank();
+            QPainter painter(&img);
+            painter.fillRect(rect, colour);
+            return img;
+        };
+        QImage baseImg(ks, QImage::Format_ARGB32_Premultiplied);
+        for (int y = 0; y < ks.height(); ++y)
+            for (int x = 0; x < ks.width(); ++x)
+                baseImg.setPixelColor(x, y, QColor(x * 255 / (ks.width() - 1),
+                                                   y * 255 / (ks.height() - 1), 90));
+        const QImage fgImg = rectImage(QColor(200, 40, 40), QRect(10, 8, 50, 40));
+        QImage matteImg = rectImage(Qt::black, QRect(QPoint(0, 0), ks));
+        {
+            QPainter painter(&matteImg);
+            painter.fillRect(QRect(30, 0, 40, ks.height()), Qt::white);
+        }
+        const QImage topImg = rectImage(QColor(60, 180, 220, 200), QRect(20, 10, 60, 44));
+        const QImage top2Img = rectImage(QColor(240, 200, 40), QRect(0, 20, 70, 30));
+
+        const auto layerOf = [](BlendMode mode, double opacity = 1.0,
+                                TrackMatteType matte = TrackMatteType::None, int source = -1) {
+            CompositeLayer layer;
+            layer.blendMode = mode;
+            layer.opacity = opacity;
+            layer.matteType = matte;
+            layer.matteSourceLayerIndex = source;
+            return layer;
+        };
+        const auto premul = [](const QImage &img) {
+            return img.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        };
+        const auto sameBytes = [](const QImage &a, const QImage &b) {
+            if (a.isNull() || b.isNull() || a.format() != b.format() || a.size() != b.size()
+                || a.depth() != 32)
+                return false;
+            for (int y = 0; y < a.height(); ++y)
+                if (std::memcmp(a.constScanLine(y), b.constScanLine(y), size_t(a.width()) * 4) != 0)
+                    return false;
+            return true;
+        };
+        const auto shaOf = [](const QImage &img) {
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            hash.addData(QByteArray::number(int(img.format())));
+            for (int y = 0; y < img.height(); ++y)
+                hash.addData(QByteArrayView(reinterpret_cast<const char *>(img.constScanLine(y)),
+                                            img.width() * 4));
+            return hash.result().toHex().left(16).toStdString();
+        };
+        const auto K = [&ks](const QVector<CompositeLayer> &layers, const QVector<QImage> &images) {
+            return trackmatte::composite(layers, images, ks);
+        };
+        const auto blend = [](const QImage &base, const QImage &top, BlendMode mode, double opacity) {
+            return LayerCompositor::blendImages(base, top, mode, opacity);
+        };
+
+        // The Normal part: V1, a red layer under a luma matte from index 2, the matte.
+        const QVector<CompositeLayer> normalLayers{
+            layerOf(BlendMode::Normal),
+            layerOf(BlendMode::Normal, 1.0, TrackMatteType::LumaMatte, 2),
+            layerOf(BlendMode::Normal)};
+        const QVector<QImage> normalImages{baseImg, fgImg, matteImg};
+        const QImage normalPart = K(normalLayers, normalImages);
+        std::string fails;
+        const auto leg = [&fails](const char *name, bool ok, const std::string &detail) {
+            std::cerr << "special-composite G23 (" << name << ") " << detail << " ok=" << ok << '\n';
+            if (!ok)
+                fails += std::string(" ") + name;
+        };
+
+        // (a) No blended layer: the stack as before (pin, the sha HEAD's kernel gives).
+        const std::string shaA = shaOf(normalPart);
+        const char *const kShaA = "f469296d11a57b8b";
+        leg("a", normalPart.format() == QImage::Format_ARGB32_Premultiplied && shaA == kShaA,
+            "no blend layer sha=" + shaA + " (expect " + kShaA + ")");
+
+        // (b) A Multiply layer over the matte'd set.
+        {
+            QVector<CompositeLayer> layers = normalLayers;
+            layers.append(layerOf(BlendMode::Multiply, 0.8));
+            const QVector<QImage> images = normalImages + QVector<QImage>{topImg};
+            const QImage got = K(layers, images);
+            const QImage want = premul(blend(normalPart, topImg, BlendMode::Multiply, 0.8));
+            layers.last().blendMode = BlendMode::Normal;
+            const QImage asNormal = K(layers, images);
+            leg("b", sameBytes(got, want) && !sameBytes(want, asNormal),
+                "Multiply over composite(Normal part): got==ref " + std::to_string(sameBytes(got, want))
+                    + " got==Normal drawing " + std::to_string(sameBytes(got, asNormal))
+                    + " ref==Normal drawing " + std::to_string(sameBytes(want, asNormal))
+                    + " formats " + std::to_string(int(got.format())) + '/' + std::to_string(int(want.format())));
+        }
+
+        // (c) The blended layer has its own matte: the matte cuts it before the blend.
+        {
+            const QVector<CompositeLayer> layers{
+                layerOf(BlendMode::Normal),
+                layerOf(BlendMode::Screen, 0.9, TrackMatteType::LumaMatte, 2),
+                layerOf(BlendMode::Normal)};
+            const QVector<QImage> images{baseImg, topImg, matteImg};
+            const QImage got = K(layers, images);
+            const QImage baseOnly = K({layerOf(BlendMode::Normal)}, {baseImg});
+            const QImage want = premul(blend(baseOnly,
+                MaskSystem::applyTrackMatte(topImg, matteImg, TrackMatteType::LumaMatte),
+                BlendMode::Screen, 0.9));
+            const QImage unmatted = premul(blend(baseOnly, topImg, BlendMode::Screen, 0.9));
+            const QImage matteAfter = premul(MaskSystem::applyTrackMatte(
+                blend(baseOnly, topImg, BlendMode::Screen, 0.9), matteImg, TrackMatteType::LumaMatte));
+            leg("c", sameBytes(got, want) && !sameBytes(want, unmatted) && !sameBytes(want, matteAfter),
+                "matte then Screen: got==ref " + std::to_string(sameBytes(got, want))
+                    + " ref==unmatted blend " + std::to_string(sameBytes(want, unmatted))
+                    + " ref==matte after blend " + std::to_string(sameBytes(want, matteAfter)));
+        }
+
+        // (d) A matte source with a blend mode is not drawn.
+        {
+            QVector<CompositeLayer> layers = normalLayers;
+            layers[2].blendMode = BlendMode::Multiply;
+            const QImage got = K(layers, normalImages);
+            leg("d", sameBytes(got, normalPart),
+                "blended matte source == Normal part " + std::to_string(sameBytes(got, normalPart)));
+        }
+
+        // (e) An invisible, a null-image and an opacity-0 blended layer change nothing.
+        {
+            QVector<CompositeLayer> invisible = normalLayers;
+            invisible.append(layerOf(BlendMode::Multiply));
+            invisible.last().visible = false;
+            const QImage e1 = K(invisible, normalImages + QVector<QImage>{topImg});
+            QVector<CompositeLayer> nullImage = normalLayers;
+            nullImage.append(layerOf(BlendMode::Multiply));
+            const QImage e2 = K(nullImage, normalImages + QVector<QImage>{QImage()});
+            QVector<CompositeLayer> transparent = normalLayers;
+            transparent.append(layerOf(BlendMode::Multiply, 0.0));
+            const QImage e3 = K(transparent, normalImages + QVector<QImage>{topImg});
+            leg("e", sameBytes(e1, normalPart) && sameBytes(e2, normalPart) && sameBytes(e3, normalPart),
+                "invisible/null/opacity 0 == Normal part " + std::to_string(sameBytes(e1, normalPart)) + '/'
+                    + std::to_string(sameBytes(e2, normalPart)) + '/' + std::to_string(sameBytes(e3, normalPart)));
+        }
+
+        // (f) Two blended layers (Overlay, then Multiply) in ascending order.
+        {
+            QVector<CompositeLayer> layers = normalLayers;
+            layers.append(layerOf(BlendMode::Overlay, 0.85));
+            layers.append(layerOf(BlendMode::Multiply, 0.7));
+            const QImage got = K(layers, normalImages + QVector<QImage>{topImg, top2Img});
+            const QImage want = premul(blend(blend(normalPart, topImg, BlendMode::Overlay, 0.85),
+                                             top2Img, BlendMode::Multiply, 0.7));
+            const QImage reversed = premul(blend(blend(normalPart, top2Img, BlendMode::Multiply, 0.7),
+                                                 topImg, BlendMode::Overlay, 0.85));
+            // The same chain over a partially transparent Normal part (alpha 40..135
+            // across x), where a premultiplied round trip after each blend changes the
+            // rounding: the kernel converts once after the chain, not per layer.
+            QImage translucentImg(ks, QImage::Format_ARGB32_Premultiplied);
+            for (int y = 0; y < ks.height(); ++y)
+                for (int x = 0; x < ks.width(); ++x)
+                    translucentImg.setPixelColor(x, y, QColor(x * 255 / (ks.width() - 1),
+                                                              y * 255 / (ks.height() - 1), 90, 40 + x));
+            const QImage translucentPart = K({layerOf(BlendMode::Normal)}, {translucentImg});
+            const QImage gotT = K({layerOf(BlendMode::Normal), layerOf(BlendMode::Overlay, 0.85),
+                                   layerOf(BlendMode::Multiply, 0.7)},
+                                  {translucentImg, topImg, top2Img});
+            const QImage wantT = premul(blend(blend(translucentPart, topImg, BlendMode::Overlay, 0.85),
+                                              top2Img, BlendMode::Multiply, 0.7));
+            const QImage perLayerT = premul(blend(premul(blend(translucentPart, topImg, BlendMode::Overlay, 0.85)),
+                                                  top2Img, BlendMode::Multiply, 0.7));
+            leg("f", sameBytes(got, want) && !sameBytes(want, reversed) && sameBytes(gotT, wantT)
+                         && !sameBytes(wantT, perLayerT),
+                "Overlay then Multiply: got==ref " + std::to_string(sameBytes(got, want))
+                    + " ref==reversed order " + std::to_string(sameBytes(want, reversed))
+                    + " | translucent Normal part: got==ref " + std::to_string(sameBytes(gotT, wantT))
+                    + " ref==per-layer premultiplied " + std::to_string(sameBytes(wantT, perLayerT)));
+        }
+
+        // (g) A blended layer whose matte index is invalid (V1 / out of range) blends unmatted.
+        {
+            const QImage want = premul(blend(K({layerOf(BlendMode::Normal)}, {baseImg}),
+                                             topImg, BlendMode::Screen, 0.9));
+            bool same = true;
+            std::string values;
+            for (int source : {0, 1, 9}) {
+                const QImage got = K({layerOf(BlendMode::Normal),
+                                      layerOf(BlendMode::Screen, 0.9, TrackMatteType::LumaMatte, source)},
+                                     {baseImg, topImg});
+                same = same && sameBytes(got, want);
+                values += " index " + std::to_string(source) + ": " + std::to_string(sameBytes(got, want));
+            }
+            leg("g", same, "invalid matte index == unmatted blend" + values);
+        }
+
+        // (h) [V1, V2 Screen, V3 Normal opaque, overlapping V2 in part]: V2 lands on
+        // top of V3 (blending V2 in place would leave it under V3).
+        {
+            const QImage got = K({layerOf(BlendMode::Normal), layerOf(BlendMode::Screen),
+                                  layerOf(BlendMode::Normal)},
+                                 {baseImg, topImg, top2Img});
+            const QImage want = premul(blend(K({layerOf(BlendMode::Normal), layerOf(BlendMode::Normal)},
+                                               {baseImg, top2Img}),
+                                             topImg, BlendMode::Screen, 1.0));
+            QImage inPlace = premul(blend(K({layerOf(BlendMode::Normal)}, {baseImg}),
+                                          topImg, BlendMode::Screen, 1.0));
+            {
+                QPainter painter(&inPlace);
+                painter.drawImage(0, 0, top2Img);
+            }
+            leg("h", sameBytes(got, want) && !sameBytes(want, inPlace),
+                "Screen over the whole Normal stack: got==ref " + std::to_string(sameBytes(got, want))
+                    + " ref==in-place blend " + std::to_string(sameBytes(want, inPlace)));
+        }
+        if (fails.empty())
+            tally.gate(23, true);
+        else
+            tally.gate(23, false,
+                       "trackmatte::composite blend rule, failing legs:" + fails + " (see values above)");
+    }
+
+    // US-2303 (G24): the export's matte branch blends an effective (VFX) blend.
+    // V1 varying, V2 under an inverted luma matte from V3, V4 a solid VFX Screen
+    // clip at 0.8: renderFrameAt == blendImages(the same frame with V4 at opacity
+    // 0, V4's frame, Screen, 0.8) within 1 and differs from the Normal drawing
+    // HEAD gave. Pins (HEAD sha): non-VFX Multiply + matte, and VFX Screen
+    // without a matte (G17's path).
+    {
+        const QString screenPath = dir.filePath(QStringLiteral("special-composite-screen.mp4"));
+        const bool screenOk = writeClip(screenPath, false, QColor(40, 90, 170));
+        const bool hdr16 = hdrmatte16::enabledFromEnv();
+        const double et = 0.5;
+        const auto exportAt = [&] {
+            return tlrender::renderFrameAt(timeline, qint64(et * 1000000.0), size);
+        };
+        const auto shaOf = [](const QImage &img) {
+            const QImage rgba = img.convertToFormat(QImage::Format_RGBA8888);
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            for (int y = 0; y < rgba.height(); ++y)
+                hash.addData(QByteArrayView(reinterpret_cast<const char *>(rgba.constScanLine(y)),
+                                            rgba.width() * 4));
+            return hash.result().toHex().left(16).toStdString();
+        };
+        const auto rgbAt = [](const QImage &image, int x, int y) {
+            if (image.isNull())
+                return std::string("null");
+            const QColor c = image.convertToFormat(QImage::Format_RGBA8888).pixelColor(x, y);
+            std::ostringstream out;
+            out << c.red() << ',' << c.green() << ',' << c.blue() << ",a" << c.alpha();
+            return out.str();
+        };
+        ClipInfo v1 = base;
+        v1.filePath = varyPath;
+        ClipInfo v2 = base;
+        v2.videoDx = 0.25;
+        const ClipInfo v3 = base;
+        ClipInfo v4 = base;
+        v4.filePath = screenPath;
+        v4.opacity = 0.8;
+        const auto withV4 = [&v4](bool vfx, BlendMode mode, double opacity = 0.8) {
+            ClipInfo clip = v4;
+            clip.isVfxFootage = vfx;
+            clip.blendMode = mode;
+            clip.opacity = opacity;
+            return clip;
+        };
+        const auto setTracks = [&](const QVector<QVector<ClipInfo>> &tracks, bool matte) {
+            timeline->restoreFromProject(tracks, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+            QHash<QString, TimelineTrackMatteEntry> entries;
+            if (matte) {
+                TimelineTrackMatteEntry entry;
+                entry.matteType = TrackMatteType::LumaInvertedMatte;
+                entry.matteSourceClipId = trackMatteClipKey(2, 0);
+                entries.insert(trackMatteClipKey(1, 0), entry);
+            }
+            timeline->setTrackMatteEntries(entries);
+        };
+        timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+        timeline->setClipParentEntries({});
+        window.m_projectLights.clear();
+        timeline->setProjectLights({});
+
+        setTracks({{v1}, {v2}, {v3}, {withV4(true, BlendMode::Screen)}}, true);
+        const QImage screenExport = exportAt();
+        setTracks({{v1}, {v2}, {v3}, {withV4(true, BlendMode::Screen, 0.0)}}, true);
+        const QImage normalPart = exportAt();
+        setTracks({{v1}, {v2}, {v3}, {withV4(true, BlendMode::Normal)}}, true);
+        const QImage normalDrawing = exportAt();
+        setTracks({{withV4(false, BlendMode::Normal, 1.0)}}, false);
+        const QImage v4Frame = exportAt();
+        const QImage want = LayerCompositor::blendImages(normalPart, v4Frame, BlendMode::Screen, 0.8)
+                                .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        const DiffStat g24Rule = compare(screenExport, want);
+        const DiffStat g24Head = compare(screenExport, normalDrawing);
+
+        setTracks({{v1}, {v2}, {v3}, {withV4(false, BlendMode::Multiply)}}, true);
+        const QImage nonVfxExport = exportAt();
+        const DiffStat g24NonVfx = compare(nonVfxExport, normalDrawing);
+        setTracks({{v1}, {v2}, {v3}, {withV4(true, BlendMode::Screen)}}, false);
+        const QImage matteFreeExport = exportAt();
+        const std::string shaNonVfx = shaOf(nonVfxExport);
+        const std::string shaMatteFree = shaOf(matteFreeExport);
+        const char *const kShaNonVfx = "f2b98010915d8d5e";
+        const char *const kShaMatteFree = "4fe0c6d3940b394a";
+        std::cerr << "special-composite G24 screenOk=" << screenOk << " hdrmatte16=" << hdr16
+                  << " (expect 1 / 0) matte + VFX Screen vs blendImages(V4 at opacity 0, V4 frame) sizeMatch="
+                  << g24Rule.sizeMatch << " maxDiff=" << g24Rule.maxDiff << " (expect 1 / <= 1)"
+                  << " vs Normal drawing diffPixels=" << g24Head.diffPixels << " (expect > 100)"
+                  << " | non-VFX Multiply + matte vs Normal drawing maxDiff=" << g24NonVfx.maxDiff
+                  << " (expect 0) sha=" << shaNonVfx << " (expect " << kShaNonVfx << ")"
+                  << " | matte-free VFX Screen sha=" << shaMatteFree << " (expect " << kShaMatteFree
+                  << ") | sanity px(5,5) screen/normalPart/v4=" << rgbAt(screenExport, 5, 5) << ' '
+                  << rgbAt(normalPart, 5, 5) << ' ' << rgbAt(v4Frame, 5, 5) << '\n';
+        tally.gate(24, varyOk && screenOk && !hdr16 && g24Rule.sizeMatch && g24Rule.maxDiff <= 1
+                       && g24Head.diffPixels > 100 && g24NonVfx.sizeMatch && g24NonVfx.maxDiff == 0
+                       && shaNonVfx == kShaNonVfx && shaMatteFree == kShaMatteFree,
+                   "the export's matte branch does not blend the VFX layer by the kernel rule, or a pinned "
+                   "export changed (see values above)");
+        timeline->setTrackMatteEntries(QHash<QString, TimelineTrackMatteEntry>{});
     }
 
     return tally.finish("special-composite");

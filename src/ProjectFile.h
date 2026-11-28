@@ -392,6 +392,11 @@ public:
     static PlanarTrackerProjectState planarTrackerStateFromJson(const QJsonObject &obj);
 
 private:
+    // US-2306: the one body that builds the project JSON (save writes it indented, toJsonString
+    // compact) and the one that reads it (load and fromJsonString).
+    static QJsonDocument buildProjectDocument(const ProjectData &data);
+    static bool readProjectBytes(const QByteArray &json, ProjectData &data, QString *errorMessage);
+
     // Serialization helpers
     static QJsonObject configToJson(const ProjectConfig &config);
     static ProjectConfig configFromJson(const QJsonObject &obj);

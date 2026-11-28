@@ -56,9 +56,10 @@ QTransform inverseTransform(const StabSample &sample, int srcW, int srcH, int ds
 QImage warpClampToEdge(const QImage &src, const QTransform &inverse);
 
 // The export stage: warps `frame` (the decoded, brushed source, before FX) by the
-// clip's stabilizer keyframes at `sourceSec` when the clip lies on V1
-// (`trackIdx` 0) of the top-level sequence (`sequenceDepth` 0) and has keys;
-// otherwise, or when the sample is the identity, returns `frame` unchanged.
+// clip's stabilizer keyframes at `sourceSec` when the clip has keys, on any track
+// and at any nesting depth (US-2300: `trackIdx` / `sequenceDepth` are unused and
+// kept for the callers); otherwise, or when the sample is the identity, returns
+// `frame` unchanged.
 // US-2202: a valid `sourceSize` is the size the keys were analysed at (dx / dy are
 // its pixels) when `frame` is a smaller decode such as a proxy; invalid (the
 // export) = `frame`'s own size.

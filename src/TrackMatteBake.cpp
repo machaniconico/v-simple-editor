@@ -69,10 +69,39 @@ QImage composite(const QVector<CompositeLayer>& layers,
         matteSourceIndices.insert(matteIndex);
     }
 
+    // US-2303: a visible layer with a blend mode that is not a matte source is
+    // left out of the stack and blended over it afterwards, ascending, as the
+    // matte-free paths overlay their blended layers after the Normal stack.
+    // Without one the loop below runs exactly as before.
+    QVector<int> blendedIndices;
+    for (int i = 0; i < layerCount; ++i) {
+        const CompositeLayer &layer = layers[i];
+        if (layer.visible && !matteSourceIndices.contains(i)
+            && layer.blendMode != BlendMode::Normal) {
+            blendedIndices.append(i);
+        }
+    }
+
     auto imageAt = [&layerImages, imageCount](int index) -> QImage {
         if (index < 0 || index >= imageCount)
             return QImage();
         return layerImages[index];
+    };
+
+    // The layer's own matte, when it has a usable one, cuts its alpha.
+    auto mattedImage = [&](int i, QImage layerImage) -> QImage {
+        const CompositeLayer &layer = layers[i];
+        if (layer.matteType == TrackMatteType::None)
+            return layerImage;
+        const int matteIndex = layer.matteSourceLayerIndex;
+        if (!isValidMatteSource(i, matteIndex, layerCount))
+            return layerImage;
+        const QImage matteImage = imageAt(matteIndex);
+        if (matteImage.isNull())
+            return layerImage;
+        if (g_observeAppliedMatte)
+            g_appliedMatte.store(true, std::memory_order_release);
+        return MaskSystem::applyTrackMatte(layerImage, matteImage, layer.matteType);
     };
 
     QPainter p(&canvas);
@@ -85,25 +114,14 @@ QImage composite(const QVector<CompositeLayer>& layers,
         if (!layer.visible)
             continue;
 
-        if (matteSourceIndices.contains(i))
+        if (matteSourceIndices.contains(i) || blendedIndices.contains(i))
             continue;
 
         QImage layerImage = imageAt(i);
         if (layerImage.isNull())
             continue;
 
-        if (layer.matteType != TrackMatteType::None) {
-            const int matteIndex = layer.matteSourceLayerIndex;
-            if (isValidMatteSource(i, matteIndex, layerCount)) {
-                const QImage matteImage = imageAt(matteIndex);
-                if (!matteImage.isNull()) {
-                    layerImage = MaskSystem::applyTrackMatte(
-                        layerImage, matteImage, layer.matteType);
-                    if (g_observeAppliedMatte)
-                        g_appliedMatte.store(true, std::memory_order_release);
-                }
-            }
-        }
+        layerImage = mattedImage(i, layerImage);
 
         // MaskSystem::applyTrackMatte returns ARGB32_Premultiplied;
         // renderLayer images are already canvas-sized. Drawing a
@@ -117,7 +135,24 @@ QImage composite(const QVector<CompositeLayer>& layers,
     }
     p.end();
 
-    return canvas;
+    if (blendedIndices.isEmpty())
+        return canvas;
+
+    // Each blended layer, cut by its own matte first, goes through the blend
+    // equation of the matte-free paths (LayerCompositor::blendImages, chained
+    // in its Format_ARGB32), and the result is premultiplied once at the end
+    // as they do.
+    QImage blended = canvas;
+    for (int i : blendedIndices) {
+        const CompositeLayer &layer = layers[i];
+        const QImage layerImage = imageAt(i);
+        if (layerImage.isNull() || layer.opacity <= 0.001)
+            continue;
+        blended = LayerCompositor::blendImages(
+            blended, mattedImage(i, layerImage), layer.blendMode,
+            qBound(0.0, layer.opacity, 1.0));
+    }
+    return blended.convertToFormat(QImage::Format_ARGB32_Premultiplied);
 }
 
 } // namespace trackmatte

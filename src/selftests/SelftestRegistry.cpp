@@ -68,6 +68,7 @@ int runBatchExportE2ESelftest();
 int runBatchExportSelftest();
 int runBeatDetectSelftest();
 int runBezierEasingSelftest();
+int runBlendImagesSelftest();
 int runBlenderSelftest();
 int runBroadcastCaptionSelftest();
 int runBundleAdjustSelftest();
@@ -723,7 +724,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
       "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "stabilizer-export", "VEDITOR_STABILIZER_EXPORT_SELFTEST",  runStabilizerExportSelftest,   true,
-      "V1 stabilizer keyframes on export (StabilizerWarp) after the brush, before FX: identity, translation, interpolation, edge fill, V1 only / nested / matrix, brush order and the special composite (12 gates)" },
+      "stabilizer keyframes (StabilizerWarp) after the brush, before FX, on every layer that carries keys wherever renderFrameAt or the special composite draws it, a nested child at its source time, upper tracks: identity, translation, interpolation, edge fill, matrix, brush order and record, special composite, preview (16 gates)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
@@ -764,6 +765,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "AutoDucking: thresholded VO envelope + non-destructive BGM gain keyframes (21 gates)" },
     { "bezier-easing",     "VEDITOR_BEZIER_EASING_SELFTEST",      runBezierEasingSelftest,       false,
       "Per-keyframe cubic-bezier easing: legacy invariance, identity curve, ease-in, JSON round-trip (4 gates)" },
+    { "blend-images",      "VEDITOR_BLEND_IMAGES_SELFTEST",       runBlendImagesSelftest,        false,
+      "LayerCompositor::blendImages banded on the global pool: byte-identical to the serial loop for every blend mode, stored sha256, concurrency and saturated-pool re-entrancy (3 gates)" },
     { "easing-presets",    "VEDITOR_EASING_PRESETS_SELFTEST",     runEasingPresetsSelftest,      false,
       "Elastic/Bounce/Back keyframe easing presets: math, overshoot, legacy invariance, JSON round-trip (6 gates)" },
     { "keyers", "VEDITOR_KEYERS_SELFTEST", runKeyersSelftest, false,
@@ -775,7 +778,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (22 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (24 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
@@ -879,7 +882,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "text3d-export", "VEDITOR_TEXT3D_EXPORT_SELFTEST", runText3dExportSelftest, true,
       "3D text export: drawn on the clip layer source after the mask and before placement, empty configs unchanged, z order, transform, time, worker thread, production path, transition neighbour (10 gates)" },
     { "extrude-mesh", "VEDITOR_EXTRUDE_MESH_SELFTEST", runExtrudeMeshSelftest, true,
-      "Extruded mesh guard: parameters sanitised in the builder, step limit and vertex budget fall back to no bevel, shared cache key and MCP limits (G1-G7) (7 gates)" },
+      "Extruded mesh guard: parameters sanitised in the builder, step limit, vertex budget reduces bevel segments one at a time to the largest that fits (no bevel if one does not fit), shared cache key and MCP limits (G1-G7) (7 gates)" },
     { "brush-export", "VEDITOR_BRUSH_EXPORT_SELFTEST", runBrushExportSelftest, true,
       "Brush export: strokes drawn on the roto'd raw source before VFX / grade, progress 0 and no strokes unchanged, growth, two tracks, transform and z order, preview upload parity, playhead-following progress, transition neighbour (18 gates)" },
     { "text3d-preview",    "VEDITOR_TEXT3D_PREVIEW_SELFTEST",     runText3dPreviewSelftest,      true,
@@ -1055,7 +1058,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "sequence-dock", "VEDITOR_SEQUENCE_DOCK_SELFTEST", runSequenceDockSelftest, true,
       "Sequence dock: list, rename/create undo, active tracks and project persistence (4 gates)" },
     { "nest-sequence", "VEDITOR_NEST_SEQUENCE_SELFTEST", runNestSequenceSelftest, true,
-      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity (14 gates)" },
+      "Nested sequences: recursive render, cycle/depth guards, audio flatten, store roundtrip, no-nest byte identity (16 gates)" },
     { "precompose-e2e", "VEDITOR_PRECOMPOSE_E2E_SELFTEST", runPrecomposeE2ESelftest, true,
       "MainWindow precompose UI-flow backend: sequence ref replacement plus single/double undo store cleanup (4 gates)" },
     { "mainwindow-lifecycle", "VEDITOR_MAINWINDOW_LIFECYCLE_SELFTEST", runMainWindowLifecycleSelftest, true,
@@ -1087,7 +1090,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hdr-composite-parity", "VEDITOR_HDR_COMPOSITE_PARITY_SELFTEST", runHdrCompositeParitySelftest, true,
       "GPU RGBA16 FBO (composite16) vs CPU 16-bit oracle (HdrCompositeMath), matte-free (8 gates); includes 16-bit precision proof, graceful GL skip" },
     { "matte16-parity", "VEDITOR_MATTE16_PARITY_SELFTEST", runMatte16ParitySelftest, true,
-      "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (8 gates)" },
+      "16-bit RGBA64 track-matte (trackmatte16::composeExport) vs 8-bit trackmatte:: SSOT parity, all 4 matte types + 16-bit precision + ODT luma-space proof (9 gates)" },
     { "vfx",               "VEDITOR_VFX_SELFTEST",                runVfxSelftest,                true,
       "VFX module smoke: Sprint-6 effect graph + GLSL primitive pipeline" },
     { "vfx-generators",    "VEDITOR_VFX_GENERATORS_SELFTEST",     runVfxGeneratorsSelftest,     true,
@@ -1121,9 +1124,9 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "media-relink",     "VEDITOR_MEDIA_RELINK_SELFTEST",       runMediaRelinkSelftest,         true,
       "Offline media path enumeration, nested sequences, undo-safe relink, and persistence (8 gates)" },
     { "unsaved-prompt", nullptr, runUnsavedPromptSelftest, true,
-      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (14 gates)" },
+      "Unsaved changes: clean undo entry id, explicit dirty, save / discard / cancel prompt, new project reset, track flags, project settings, relink and autosave restore (15 gates)" },
     { "project-persist", nullptr, runProjectPersistSelftest, true,
-      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (14 gates)" },
+      "Project file markers and adjustment layers: save / open round trip, string round trip, replace on load and reset, old files, clamp and ids, file-backed render queue, clean load and undo baseline (17 gates)" },
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,

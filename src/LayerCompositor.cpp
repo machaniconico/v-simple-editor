@@ -2,11 +2,16 @@
 #include "TrackMatteBake.h"
 
 #include <QPainter>
+#include <QSemaphore>
+#include <QThread>
+#include <QThreadPool>
 #include <QTransform>
 #include <QVariant>
 #include <QtMath>
 
 #include <algorithm>
+#include <atomic>
+#include <memory>
 
 // ===== CompositeLayer — name helpers =====
 
@@ -310,8 +315,8 @@ QRgb LayerCompositor::blendPixel(QRgb base, QRgb top, BlendMode mode, double opa
 
 // ===== Image-level blending =====
 
-QImage LayerCompositor::blendImages(const QImage &base, const QImage &top,
-                                    BlendMode mode, double opacity)
+QImage LayerCompositor::blendImagesSerial(const QImage &base, const QImage &top,
+                                          BlendMode mode, double opacity)
 {
     QImage result = base.convertToFormat(QImage::Format_ARGB32);
     QImage topImg = top.convertToFormat(QImage::Format_ARGB32);
@@ -326,6 +331,62 @@ QImage LayerCompositor::blendImages(const QImage &base, const QImage &top,
             baseLine[x] = blendPixel(baseLine[x], topLine[x], mode, opacity);
         }
     }
+
+    return result;
+}
+
+QImage LayerCompositor::blendImages(const QImage &base, const QImage &top,
+                                    BlendMode mode, double opacity)
+{
+    // Convert keeps the size, so the band count can be decided up front.
+    constexpr qint64 kMinBandedPixels = 256 * 256;
+    const int w = qMin(base.width(),  top.width());
+    const int h = qMin(base.height(), top.height());
+    const int bands = qMin(QThread::idealThreadCount(), h / 64);
+    if (bands <= 1 || static_cast<qint64>(w) * h < kMinBandedPixels)
+        return blendImagesSerial(base, top, mode, opacity);
+
+    QImage result = base.convertToFormat(QImage::Format_ARGB32);
+    const QImage topImg = top.convertToFormat(QImage::Format_ARGB32);
+
+    // Take both pointers once before spawning so the detach happens here,
+    // not concurrently in the workers.
+    uchar *baseBits = result.bits();
+    const uchar *topBits = topImg.constBits();
+    const qsizetype baseStride = result.bytesPerLine();
+    const qsizetype topStride = topImg.bytesPerLine();
+
+    // Disjoint row bands; the last band takes the remainder. Workers and the
+    // calling thread claim bands from one counter, so the caller alone finishes
+    // every band when the global pool has no free thread (QtConcurrent's
+    // blockingMap does not make progress in that case, which would deadlock a
+    // caller that is itself a pool thread).
+    struct Bands {
+        std::atomic<int> next{0};
+        QSemaphore done;
+    };
+    auto bandState = std::make_shared<Bands>();
+    const int rowsPerBand = h / qMax(bands, 1);
+    auto runBands = [=]() {
+        for (;;) {
+            const int i = bandState->next.fetch_add(1);
+            if (i >= bands)
+                return;
+            const int y0 = i * rowsPerBand;
+            const int y1 = (i == bands - 1) ? h : y0 + rowsPerBand;
+            for (int y = y0; y < y1; ++y) {
+                QRgb *baseLine = reinterpret_cast<QRgb *>(baseBits + y * baseStride);
+                const QRgb *topLine = reinterpret_cast<const QRgb *>(topBits + y * topStride);
+                for (int x = 0; x < w; ++x)
+                    baseLine[x] = blendPixel(baseLine[x], topLine[x], mode, opacity);
+            }
+            bandState->done.release();
+        }
+    };
+    for (int i = 1; i < bands; ++i)
+        QThreadPool::globalInstance()->tryStart(runBands);
+    runBands();
+    bandState->done.acquire(bands);
 
     return result;
 }

@@ -1,10 +1,15 @@
 #include "TrackMatteCompose16.h"
 
+#include "../LayerCompositor.h"
+
 #include <QColor>
 #include <QPainter>
 #include <QRgba64>
 #include <QSet>
 #include <QtGlobal>
+
+static_assert(static_cast<int>(BlendMode::Normal) == 0,
+              "gpucomposite::LayerDesc::blendModeOrdinal 0 must be BlendMode::Normal");
 
 namespace trackmatte16 {
 namespace {
@@ -111,6 +116,60 @@ QImage composeExport(const QVector<gpucomposite::LayerDesc>& layers,
         return canvasSizedImages[index];
     };
 
+    // The layer's own matte, when it has a usable one, cuts its premultiplied
+    // RGBA64 image (alpha included).
+    auto mattedImage = [&](int i, QImage layerImage64) -> QImage {
+        const gpucomposite::LayerDesc& layer = layers[i];
+        if (layer.matteType == gpucomposite::MatteType::None
+            || !gpucomposite::isValidMatteSource(layer.matteSourceIndex, i, layerCount))
+            return layerImage64;
+        QImage matte64 = imageAt(layer.matteSourceIndex);
+        if (matte64.isNull())
+            return layerImage64;
+        matte64 = matte64.convertToFormat(QImage::Format_RGBA64_Premultiplied);
+        if (usesLuma(layer.matteType) && ctx.matteSourceIsLinear)
+            matte64 = clipodt::applyOdt16(matte64, ctx.odtForLuma);
+        if (matte64.size() != canvas)
+            matte64 = matte64.scaled(canvas, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                               .convertToFormat(QImage::Format_RGBA64_Premultiplied);
+
+        const int w = qMin(layerImage64.width(), matte64.width());
+        const int h = qMin(layerImage64.height(), matte64.height());
+        for (int y = 0; y < h; ++y) {
+            QRgba64* layerLine = reinterpret_cast<QRgba64*>(layerImage64.scanLine(y));
+            const QRgba64* matteLine = reinterpret_cast<const QRgba64*>(matte64.constScanLine(y));
+            for (int x = 0; x < w; ++x) {
+                const QRgba64 mattePx = matteLine[x];
+                const quint16 premulA = mattePx.alpha();
+                const quint16 straightR = usesLuma(layer.matteType)
+                    ? unpremultiply16(mattePx.red(), premulA)
+                    : 0;
+                const quint16 straightG = usesLuma(layer.matteType)
+                    ? unpremultiply16(mattePx.green(), premulA)
+                    : 0;
+                const quint16 straightB = usesLuma(layer.matteType)
+                    ? unpremultiply16(mattePx.blue(), premulA)
+                    : 0;
+                const quint16 maskVal = matteMaskValue16(
+                    layer.matteType, straightR, straightG, straightB, premulA);
+                hdrcomposite::Rgba16 px = readRgba16(layerLine[x]);
+                applyMaskPremul16(px, maskVal);
+                layerLine[x] = writeRgba16(px);
+            }
+        }
+        return layerImage64;
+    };
+
+    // A visible layer with a blend mode that is not a matte source is left out
+    // of the Normal stack and blended over it afterwards, ascending, as
+    // trackmatte::composite does. Without one pass 1 is the whole composite.
+    QVector<int> blendedIndices;
+    for (int i = 0; i < layerCount; ++i) {
+        const gpucomposite::LayerDesc& layer = layers[i];
+        if (layer.visible && !matteSourceIndices.contains(i) && layer.blendModeOrdinal != 0)
+            blendedIndices.append(i);
+    }
+
     QPainter painter(&out);
     painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
     painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
@@ -119,56 +178,74 @@ QImage composeExport(const QVector<gpucomposite::LayerDesc>& layers,
         const gpucomposite::LayerDesc& layer = layers[i];
         if (!layer.visible)
             continue;
-        if (matteSourceIndices.contains(i))
+        if (matteSourceIndices.contains(i) || blendedIndices.contains(i))
             continue;
 
         QImage layerImage64 = imageAt(i);
         if (layerImage64.isNull())
             continue;
         layerImage64 = layerImage64.convertToFormat(QImage::Format_RGBA64_Premultiplied);
-
-        if (layer.matteType != gpucomposite::MatteType::None
-            && gpucomposite::isValidMatteSource(layer.matteSourceIndex, i, layerCount)) {
-            QImage matte64 = imageAt(layer.matteSourceIndex);
-            if (!matte64.isNull()) {
-                matte64 = matte64.convertToFormat(QImage::Format_RGBA64_Premultiplied);
-                if (usesLuma(layer.matteType) && ctx.matteSourceIsLinear)
-                    matte64 = clipodt::applyOdt16(matte64, ctx.odtForLuma);
-                if (matte64.size() != canvas)
-                    matte64 = matte64.scaled(canvas, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
-                                       .convertToFormat(QImage::Format_RGBA64_Premultiplied);
-
-                const int w = qMin(layerImage64.width(), matte64.width());
-                const int h = qMin(layerImage64.height(), matte64.height());
-                for (int y = 0; y < h; ++y) {
-                    QRgba64* layerLine = reinterpret_cast<QRgba64*>(layerImage64.scanLine(y));
-                    const QRgba64* matteLine = reinterpret_cast<const QRgba64*>(matte64.constScanLine(y));
-                    for (int x = 0; x < w; ++x) {
-                        const QRgba64 mattePx = matteLine[x];
-                        const quint16 premulA = mattePx.alpha();
-                        const quint16 straightR = usesLuma(layer.matteType)
-                            ? unpremultiply16(mattePx.red(), premulA)
-                            : 0;
-                        const quint16 straightG = usesLuma(layer.matteType)
-                            ? unpremultiply16(mattePx.green(), premulA)
-                            : 0;
-                        const quint16 straightB = usesLuma(layer.matteType)
-                            ? unpremultiply16(mattePx.blue(), premulA)
-                            : 0;
-                        const quint16 maskVal = matteMaskValue16(
-                            layer.matteType, straightR, straightG, straightB, premulA);
-                        hdrcomposite::Rgba16 px = readRgba16(layerLine[x]);
-                        applyMaskPremul16(px, maskVal);
-                        layerLine[x] = writeRgba16(px);
-                    }
-                }
-            }
-        }
+        layerImage64 = mattedImage(i, layerImage64);
 
         painter.setOpacity(qBound(0.0, layer.opacity, 1.0));
         painter.drawImage(0, 0, layerImage64);
     }
     painter.end();
+
+    // Pass 2: the blend equations of LayerCompositor::blendPixel on straight
+    // values in double, one rounding back to premultiplied RGBA64 at the end.
+    constexpr double kMax = static_cast<double>(kMax16);
+    for (int i : blendedIndices) {
+        const gpucomposite::LayerDesc& layer = layers[i];
+        const double opacity = qBound(0.0, layer.opacity, 1.0);
+        QImage topImage = imageAt(i);
+        if (topImage.isNull() || layer.opacity <= 0.001)
+            continue;
+        topImage = mattedImage(
+            i, topImage.convertToFormat(QImage::Format_RGBA64_Premultiplied));
+        const BlendMode mode = static_cast<BlendMode>(layer.blendModeOrdinal);
+
+        const int w = qMin(out.width(), topImage.width());
+        const int h = qMin(out.height(), topImage.height());
+        for (int y = 0; y < h; ++y) {
+            QRgba64* baseLine = reinterpret_cast<QRgba64*>(out.scanLine(y));
+            const QRgba64* topLine = reinterpret_cast<const QRgba64*>(topImage.constScanLine(y));
+            for (int x = 0; x < w; ++x) {
+                const QRgba64 top = topLine[x];
+                const double topA = top.alpha() / kMax * opacity;
+                if (topA <= 0.0)
+                    continue;
+                const QRgba64 base = baseLine[x];
+                const double baseA = base.alpha() / kMax;
+                const double topAlpha = top.alpha() / kMax;
+
+                const double baseRgb[3] = {
+                    baseA > 0.0 ? base.red() / kMax / baseA : 0.0,
+                    baseA > 0.0 ? base.green() / kMax / baseA : 0.0,
+                    baseA > 0.0 ? base.blue() / kMax / baseA : 0.0};
+                const double topRgb[3] = {
+                    top.red() / kMax / topAlpha,
+                    top.green() / kMax / topAlpha,
+                    top.blue() / kMax / topAlpha};
+
+                const double outA = topA + baseA * (1.0 - topA);
+                if (outA <= 0.0) {
+                    baseLine[x] = qRgba64(0, 0, 0, 0);
+                    continue;
+                }
+                quint16 outPx[3];
+                for (int c = 0; c < 3; ++c) {
+                    const double blend = LayerCompositor::blendChannel(baseRgb[c], topRgb[c], mode);
+                    const double outRgb = (topA * ((1.0 - baseA) * topRgb[c] + baseA * blend)
+                                           + baseRgb[c] * baseA * (1.0 - topA)) / outA;
+                    outPx[c] = static_cast<quint16>(
+                        qBound(0.0, outRgb * outA * kMax + 0.5, kMax));
+                }
+                baseLine[x] = qRgba64(outPx[0], outPx[1], outPx[2],
+                                      static_cast<quint16>(qBound(0.0, outA * kMax + 0.5, kMax)));
+            }
+        }
+    }
 
     return out;
 }

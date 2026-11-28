@@ -121,11 +121,16 @@ public:
     QJsonObject toJson() const;
     static LayerCompositor fromJson(const QJsonObject &obj);
 
+    // Blend math helper (operates on normalised 0-1 floats)
+    static double blendChannel(double base, double top, BlendMode mode);
+
 private:
     QVector<CompositeLayer> m_layers;
 
-    // Blend math helpers (operate on normalised 0-1 floats)
-    static double blendChannel(double base, double top, BlendMode mode);
+    // Serial reference for blendImages (also its path for small images).
+    static QImage blendImagesSerial(const QImage &base, const QImage &top,
+                                    BlendMode mode, double opacity);
+    friend int runBlendImagesSelftest();
 
     // Transform a layer image according to position/scale/rotation/anchor
     static QImage transformLayer(const QImage &source, const CompositeLayer &layer,
