@@ -7,6 +7,7 @@
 #include "GradeVersions.h"
 #include "LoudnessPresets.h"
 #include "PitchShifter.h"
+#include "PuppetEngine.h"
 #include "SubclipStore.h"
 #include <QFileDialog>
 #include "Timeline.h"
@@ -11388,6 +11389,7 @@ void Timeline::undo()
     undotrace::log("undo:enter");
     if (!canUndo()) return;
     restoreState(m_undoManager->undo());
+    puppet::restoreTimelineUndoSnapshot(this, m_undoManager->currentIndex());
     updateInfoLabel();
 }
 
@@ -11395,6 +11397,7 @@ void Timeline::redo()
 {
     if (!canRedo()) return;
     restoreState(m_undoManager->redo());
+    puppet::restoreTimelineUndoSnapshot(this, m_undoManager->currentIndex());
     updateInfoLabel();
 }
 
@@ -11924,9 +11927,13 @@ void Timeline::setClipPuppetPins(int trackIdx, int clipIdx, const QVector<WarpPi
     if (!track || track->isLocked()) return;
     auto clips = track->clips();
     if (clipIdx < 0 || clipIdx >= clips.size()) return;
-    if (puppetpin::equal(clips[clipIdx].puppetPins, pins)) return;
+    const bool hadRig = pins.isEmpty() && !clips[clipIdx].uid.isEmpty()
+        && puppet::hasRig(clips[clipIdx].uid);
+    if (!hadRig && puppetpin::equal(clips[clipIdx].puppetPins, pins)) return;
     const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
     clips[clipIdx].puppetPins = pins;
+    if (pins.isEmpty() && !clips[clipIdx].uid.isEmpty())
+        puppet::removeRigForClip(clips[clipIdx].uid);
     track->setClips(clips);
     remapTrackMatteLocked(snapBefore);
     remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
@@ -15045,6 +15052,7 @@ void Timeline::saveUndoState(const QString &description)
     reconcileConnectedClips();
     flushPendingKeyRemap();
     m_undoManager->saveState(currentState(), description);
+    puppet::recordTimelineUndoSnapshot(this, m_undoManager->currentIndex());
     captureReconcileBaseline();
     updateConnectionOverlay();
 }

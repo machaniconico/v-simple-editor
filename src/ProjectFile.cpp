@@ -1,5 +1,6 @@
 #include "ProjectFile.h"
 #include "ClipGeometry.h"
+#include "PuppetEngine.h"
 #include "AudioMixer.h"
 #include "MarkerData.h"
 #include "AdjustmentLayer.h"
@@ -1763,6 +1764,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         for (const auto &pin : clip.puppetPins) pins.append(pin.toJson());
         obj["puppetPins"] = pins;
     }
+    if (!clip.uid.isEmpty() && puppet::hasRig(clip.uid))
+        obj["puppetRig"] = puppet::rigForClip(clip.uid).toJson();
     if (clip.hasMeshWarp())
         obj["meshWarp"] = clip.meshWarp.toJson();
     if (!clip.hslSecondary.isDefault())
@@ -1944,6 +1947,14 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
             && pin.radius > 0.0 && pin.radius <= 2.0
             && pin.stiffness >= 0.0 && pin.stiffness <= 1.0)
             clip.puppetPins.append(pin);
+    }
+    if (obj.contains("puppetRig") && !clip.uid.isEmpty()) {
+        const puppet::PuppetRig rig = puppet::PuppetRig::fromJson(obj["puppetRig"].toObject());
+        if (!rig.isEmpty()) {
+            puppet::setRigForClip(clip.uid, rig);
+            if (clip.puppetPins.isEmpty())
+                clip.puppetPins = puppet::toLegacyPreviewPins(rig, 0.0);
+        }
     }
     if (obj.contains("meshWarp"))
         clip.meshWarp = MeshGrid::fromJson(obj["meshWarp"].toObject());

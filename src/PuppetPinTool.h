@@ -1,9 +1,11 @@
 #pragma once
 
+#include "PuppetEngine.h"
 #include "SurfaceTool.h"
 #include "WarpDistortion.h"
 #include <QPointer>
 #include <QString>
+#include <functional>
 
 class Timeline;
 
@@ -14,6 +16,12 @@ public:
     PuppetPinTool(Timeline *timeline, int trackIndex, int clipIndex,
                  QObject *parent = nullptr);
     void setViewRect(const QRectF &rect) { m_viewRect = rect; }
+    void setUseArapMode(bool enabled) { m_useArapMode = enabled; }
+    bool useArapMode() const { return m_useArapMode; }
+    void setToolMode(puppet::PinType mode) { m_toolMode = mode; }
+    puppet::PinType toolMode() const { return m_toolMode; }
+    void setTimeProvider(std::function<double()> provider) { m_timeProvider = std::move(provider); }
+
     int hitTestCorner(const QPoint &pos, const QRectF &rect) const override;
     void cancelDrag();
     bool isEnabled() const override;
@@ -26,18 +34,35 @@ signals:
     void previewChanged();
 
 private:
+    bool arapActive() const;
+    double currentClipLocalSec() const;
+    QString currentClipUid() const;
+    puppet::PuppetRig currentRig() const;
     QVector<WarpPin> currentPins() const;
     QPointF toUv(const QPoint &pos) const;
     QPointF toWidget(const QPointF &uv) const;
+
     QPointer<Timeline> m_timeline;
     int m_trackIndex;
     int m_clipIndex;
     QString m_targetFilePath;
     double m_targetInPoint = 0.0;
     QRectF m_viewRect;
+
+    // Legacy static pin drag state (kept for backward-compatible unit tests)
     QVector<WarpPin> m_before;
     QVector<WarpPin> m_dragPins;
     QVector<WarpPin> m_previewPins;
+
+    // Wave 31 ARAP animated rig state
+    bool m_useArapMode = false;
+    puppet::PinType m_toolMode = puppet::PinType::Position;
+    std::function<double()> m_timeProvider;
+    puppet::PuppetRig m_beforeRig;
+    puppet::PuppetRig m_dragRig;
+    puppet::PuppetRig m_previewRig;
+    double m_dragStartRotDeg = 0.0;
+
     bool m_previewApplied = false;
     QPoint m_pressPos;
     int m_handle = -1;
