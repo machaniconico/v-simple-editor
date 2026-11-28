@@ -192,6 +192,7 @@ int runWave25ParitySelftest();
 int runExtGeneratorSelftest();
 int runCompetitorGapSelftest();
 int runCompetitorGapP1Selftest();
+int runCompetitorGapP2Selftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -978,6 +979,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 26 competitor-gap features: DuplicateFrameDetector, OtioImport round-trip, ClipRoles & multi-stem WAV export, PowerBins, GradeVersions+undo, TimelineIndex, SplitScreenCollage, AudioVisualizer SSOT, BeatSyncAutoCut (10 gates)" },
     { "competitor-gap-p1", "VEDITOR_COMPETITOR_GAP_P1_SELFTEST", runCompetitorGapP1Selftest, true,
       "Wave 27 P1 competitor-gap features: Subclips+Undo, TimelineMinimap overview, Film Halation, Posterize Time SSOT, 3D Camera DOF/Bokeh, Speed Graph |dv/dt|, Shy Layers, CreativeEffectsDialog (8 gates)" },
+    { "competitor-gap-p2", "VEDITOR_COMPETITOR_GAP_P2_SELFTEST", runCompetitorGapP2Selftest, true,
+      "Wave 28 P2 competitor-gap features: Lottie JSON vector animation SSOT, Pitch Shift & Voice Changer DSP + WAV bounce + Undo, MOGRT PKZIP archive & SSOT rendering, AAF OLE2/CFB v3 binary export/import round-trip (8 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

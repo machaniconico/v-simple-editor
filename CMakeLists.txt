@@ -362,6 +362,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/ext_generator_selftest.cpp
     src/selftests/competitor_gap_selftest.cpp
     src/selftests/competitor_gap_p1_selftest.cpp
+    src/selftests/competitor_gap_p2_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -778,6 +779,14 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/CreativeEffects.cpp
     src/AeProTools.h
     src/AeProTools.cpp
+    src/LottiePlayer.h
+    src/LottiePlayer.cpp
+    src/PitchShifter.h
+    src/PitchShifter.cpp
+    src/MogrtTemplate.h
+    src/MogrtTemplate.cpp
+    src/AafExchange.h
+    src/AafExchange.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp

@@ -6,6 +6,7 @@
 #include "ExternalGenerator.h"
 #include "GradeVersions.h"
 #include "LoudnessPresets.h"
+#include "PitchShifter.h"
 #include "SubclipStore.h"
 #include <QFileDialog>
 #include "Timeline.h"
@@ -10491,6 +10492,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                 aMenu.addSeparator();
         }
         aMenu.addSeparator();
+        QAction *aPitchShiftAct = aMenu.addAction(QStringLiteral("ピッチシフト / ボイスチェンジャー…"));
         QMenu *aRoleMenu = aMenu.addMenu(QStringLiteral("ロールを設定"));
         QList<QPair<QAction *, cliproles::Role>> aRoleActions;
         const cliproles::Role curAudioRole = cliproles::effectiveRoleForClip(aClip, true);
@@ -10506,6 +10508,33 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aCustomize = aMenu.addAction(QStringLiteral("メニューをカスタマイズ…"));
         QAction *aChosen = aMenu.exec(globalPos);
         if (!aChosen) return;
+        if (aChosen == aPitchShiftAct) {
+            const QString label = aClip.displayName.isEmpty()
+                ? QFileInfo(aClip.filePath).fileName() : aClip.displayName;
+            pitchshift::PitchShiftDialog dlg(aClip.uid, label, this);
+            if (dlg.exec() == QDialog::Accepted) {
+                const auto params = dlg.currentParams();
+                const int trackIdx = m_audioTracks.indexOf(track);
+                if (params.enabled && aClip.filePath.endsWith(QStringLiteral(".wav"), Qt::CaseInsensitive)
+                    && QFileInfo::exists(aClip.filePath)) {
+                    const QFileInfo fi(aClip.filePath);
+                    const QString outWav = fi.absolutePath() + QLatin1Char('/')
+                        + fi.completeBaseName() + QStringLiteral("_pitched.wav");
+                    QString err;
+                    if (pitchshift::applyPitchShiftToAudioClip(this, trackIdx, clipIndex, params, outWav, &err)) {
+                        scheduleEmitSequenceChanged();
+                        emit statusMessageRequested(
+                            QStringLiteral("ピッチシフトを適用しました: %1").arg(pitchshift::presetDisplayName(params.preset)), 4000);
+                    } else {
+                        emit statusMessageRequested(QStringLiteral("ピッチシフト失敗: %1").arg(err), 4000);
+                    }
+                } else {
+                    emit statusMessageRequested(
+                        QStringLiteral("ピッチシフト設定を保存しました (%1)").arg(pitchshift::presetDisplayName(params.preset)), 3500);
+                }
+            }
+            return;
+        }
         for (const auto &pair : aRoleActions) {
             if (aChosen == pair.first) {
                 cliproles::setRoleForClip(aClip.uid, pair.second);

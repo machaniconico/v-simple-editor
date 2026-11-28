@@ -1,6 +1,8 @@
 #include "ExternalGenerator.h"
 #include "CreatorTools.h"
 #include "ExternalGeneratorEdge.h"
+#include "LottiePlayer.h"
+#include "MogrtTemplate.h"
 #include "Timeline.h"
 #include "libavcore/Encode.h"
 
@@ -378,7 +380,10 @@ PluginManifest findPlugin(const QString &rendererId)
 
 bool isRendererAvailable(const QString &rendererId)
 {
-    if (rendererId == QStringLiteral("dummy") || rendererId == QStringLiteral("visualizer"))
+    if (rendererId == QStringLiteral("dummy")
+        || rendererId == QStringLiteral("visualizer")
+        || rendererId == QStringLiteral("lottie")
+        || rendererId == QStringLiteral("mogrt"))
         return true;
     {
         QMutexLocker lock(&g_testRendererMutex);
@@ -813,6 +818,12 @@ QImage renderGeneratorClipFrame(const ClipInfo &clip,
     if (spec.renderer == QStringLiteral("visualizer")) {
         return creatortools::renderAudioVisualizerFrame(spec.params, clipLocalSec, outSize, timeline);
     }
+    if (spec.renderer == QStringLiteral("lottie")) {
+        return lottie::renderLottieFileAtTime(spec.entryPath, clipLocalSec, outSize);
+    }
+    if (spec.renderer == QStringLiteral("mogrt")) {
+        return mogrt::renderMogrtFromParams(spec.params, clipLocalSec, outSize);
+    }
     const double fps = (spec.fps > 0.0) ? spec.fps : 30.0;
     const int frameIndex = qMax(0, static_cast<int>(std::floor(qMax(0.0, clipLocalSec) * fps + 1e-6)));
     const bool usePreview = isPreview || previewModeHintForCurrentThread();
@@ -960,6 +971,8 @@ ExternalGeneratorDialog::ExternalGeneratorDialog(const GeneratorSpec &initialSpe
     addRendererOption(QStringLiteral("edge"), QStringLiteral("HTML / React (Edge Headless CDP)"));
     addRendererOption(QStringLiteral("quickjs"), QStringLiteral("JavaScript スクリプト (QuickJS プラグイン)"));
     addRendererOption(QStringLiteral("visualizer"), QStringLiteral("オーディオビジュアライザ (音声連動スペクトラム/波形)"));
+    addRendererOption(QStringLiteral("lottie"), QStringLiteral("Lottie ベクタアニメーション (.json)"));
+    addRendererOption(QStringLiteral("mogrt"), QStringLiteral("MOGRT モーショングラフィックス・テンプレート"));
     addRendererOption(QStringLiteral("dummy"), QStringLiteral("組み込みダミー描画係 (テスト／プレースホルダ)"));
     for (const auto &p : discoverPlugins()) {
         if (p.id != QStringLiteral("quickjs") && p.id != QStringLiteral("edge") && p.id != QStringLiteral("dummy"))
