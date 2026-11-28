@@ -208,6 +208,11 @@ QImage applyOverlapTransitionStep(QImage composed, const QImage &neighbourLayer,
     return applyOverlapTransitionStep(composed, neighbourLayer, transitionInterval(e), T);
 }
 
+// US-1509: the layer position (canvas px, centre origin) camera3d::effectiveLayer3DAt orients from.
+static QPointF layer3DPositionPx(const clipgeom::ClipTransform &t, const QSize &canvas)
+{
+    return QPointF(t.videoDx * canvas.width(), t.videoDy * canvas.height());
+}
 
 namespace detail {
 
@@ -1768,7 +1773,7 @@ QImage renderClipSourceFrame(const Timeline *timeline,
                              bool sampleFromLeftBoundary)
 {
     if (!clip.shapes.isEmpty())
-        return ShapeLayer::renderShapesToImage(clip.shapes, outSize);
+        return ShapeLayer::renderShapesToImage(clip.shapes, outSize, clipLocalSec);
 
     // `sampleFromLeftBoundary` carries an ancestor sequence's source-time
     // direction. Compose it with this clip's resolved local direction. The
@@ -2097,6 +2102,17 @@ QImage renderFrameFromTracks(const Timeline *timeline,
     const double targetSec = static_cast<double>(sampledUsec) / 1'000'000.0;
     const Camera3DState projectCamera = applyTimelineGlobals && timeline
         ? timeline->projectCameraAt(targetSec) : Camera3DState{};
+    const clipanim::EvalEnv evalEnv = dynamicEvalEnv(timeline);
+    // US-1505: the env of one clip (timeline start clipStartSec). Only at the root
+    // (sequence depth 0, a Timeline) does a clip with expression bindings get its
+    // audioLevel() sampler, from the Timeline's audio-level snapshot; a nested
+    // sequence's clips (other link groups / clip starts) read level 0.
+    const auto clipEvalEnv = [&](const ClipInfo &clip, double clipStartSec) {
+        clipanim::EvalEnv env = evalEnv;
+        if (sequenceDepth == 0 && timeline && !clip.expressions.isEmpty())
+            env.audioLevelAtTime = timeline->expressionAudioLevelSampler(clip, clipStartSec);
+        return env;
+    };
     QVector<ActiveAdjustmentClip> activeAdjustments;
 
     bool hasTransitions = false;
@@ -2206,11 +2222,15 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             : applyClipFxStackFromSource(raw, c, local);
         neighbour = applyClipMask(neighbour, c, source);
         neighbour = snsfit::maybeFit(neighbour, c.fitContain, c.fitCover, outSize);
+        const clipgeom::ClipTransform neighbourTransform =
+            clipanim::effectiveTransformAt(c, local, clipEvalEnv(c, b.timelineStart));
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             neighbour = applyProjectCameraProjection(
-                neighbour, c.layer3D, c.is3DLayer, projectCamera, outSize);
-        neighbour = prepareTransitionLayer(neighbour,
-            clipanim::effectiveTransformAt(c, local), outSize);
+                neighbour,
+                camera3d::effectiveLayer3DAt(
+                    c, layer3DPositionPx(neighbourTransform, evalEnv.canvas), projectCamera),
+                c.is3DLayer, projectCamera, outSize);
+        neighbour = prepareTransitionLayer(neighbour, neighbourTransform, outSize);
         return applyOverlapTransitionStep(composed, neighbour, a, targetSec);
     };
 
@@ -2264,13 +2284,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             || clipParticipatesInReverseComposition(
                 v1Clip, sequenceSnapshot);
         const double v1SourceSec = sourceAt(0, v1Clip, v1LocalSec, v1ReverseComposition);
-        const bool v1HasKeyframes = v1Clip.keyframes.hasAnyKeyframes();
+        const bool v1HasKeyframes = clipanim::hasAnyDynamicTransform(v1Clip);
+        const clipanim::EvalEnv v1Env = v1HasKeyframes ? clipEvalEnv(v1Clip, v1Start) : evalEnv;
         v1Transform = v1HasKeyframes
-            ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec)
+            ? clipanim::effectiveTransformAt(v1Clip, v1LocalSec, v1Env)
             : clipgeom::ClipTransform{v1Clip.videoScale, v1Clip.videoDx,
                                       v1Clip.videoDy, v1Clip.rotation2DDegrees};
         v1EffectiveOpacity = v1HasKeyframes
-            ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity)
+            ? clipanim::effectiveOpacityAt(v1Clip, v1LocalSec, v1Clip.opacity, v1Env)
             : v1Clip.opacity;
         v1NullObject = v1Clip.isAdjustment
             || (v1Clip.shapes.isEmpty()
@@ -2357,8 +2378,10 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Nested sequence contents are projected once, as the parent reference layer.
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             v1Contained = applyProjectCameraProjection(
-                v1Contained, v1Clip.layer3D, v1Clip.is3DLayer,
-                projectCamera, outSize);
+                v1Contained,
+                camera3d::effectiveLayer3DAt(
+                    v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera),
+                v1Clip.is3DLayer, projectCamera, outSize);
         v1LayerSource = v1Contained;
 
         // Base canvas placement — V1 clip transform applied via clipgeom SSOT.
@@ -2430,7 +2453,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         baseLayer.layerStyle = v1Clip.layerStyle;
         baseLayer.nullObject = v1NullObject;
         baseLayer.colorMeta = v1Clip.colorMeta;
-        baseLayer.layer.layer3D = v1Clip.layer3D;
+        baseLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
+            v1Clip, layer3DPositionPx(v1Transform, evalEnv.canvas), projectCamera);
         baseLayer.layer.material = v1Clip.material;
         baseLayer.layer.name = v1Clip.displayName;
         baseLayer.layer.visible = !v1NullObject && v1EffectiveOpacity > 0.001;
@@ -2461,13 +2485,14 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             || clipParticipatesInReverseComposition(c, sequenceSnapshot);
         const double srcSec = sourceAt(t, c, localSec, reverseComposition);
         observeLayerTime(t, idx, localSec, srcSec);
-        const bool cHasKeyframes = c.keyframes.hasAnyKeyframes();
+        const bool cHasKeyframes = clipanim::hasAnyDynamicTransform(c);
+        const clipanim::EvalEnv cEnv = cHasKeyframes ? clipEvalEnv(c, start) : evalEnv;
         const clipgeom::ClipTransform cTransform = cHasKeyframes
-            ? clipanim::effectiveTransformAt(c, localSec)
+            ? clipanim::effectiveTransformAt(c, localSec, cEnv)
             : clipgeom::ClipTransform{c.videoScale, c.videoDx,
                                       c.videoDy, c.rotation2DDegrees};
         const double cOpacity = cHasKeyframes
-            ? clipanim::effectiveOpacityAt(c, localSec, c.opacity)
+            ? clipanim::effectiveOpacityAt(c, localSec, c.opacity, cEnv)
             : c.opacity;
         if (c.isAdjustment) {
             activeAdjustments.append(ActiveAdjustmentClip{t, &c, localSec});
@@ -2484,7 +2509,8 @@ QImage renderFrameFromTracks(const Timeline *timeline,
             renderLayer.colorMeta = c.colorMeta;
             renderLayer.transform = cTransform;
             renderLayer.layerStyle = c.layerStyle;
-            renderLayer.layer.layer3D = c.layer3D;
+            renderLayer.layer.layer3D = camera3d::effectiveLayer3DAt(
+                c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
             renderLayer.layer.material = c.material;
             renderLayer.nullObject = true;
             renderLayer.layer.name = c.displayName;
@@ -2556,7 +2582,9 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         renderLayer.colorMeta = c.colorMeta;
         renderLayer.transform = cTransform;
         renderLayer.layerStyle = c.layerStyle;
-        renderLayer.layer.layer3D = c.layer3D;
+        const Layer3DTransform cLayer3D = camera3d::effectiveLayer3DAt(
+            c, layer3DPositionPx(cTransform, evalEnv.canvas), projectCamera);
+        renderLayer.layer.layer3D = cLayer3D;
         renderLayer.layer.material = c.material;
         // Scale the overlay source to the shared canvas grid first; the
         // compositor's videoScale then sizes the dst rect relative to the
@@ -2566,7 +2594,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         // Nested sequence contents are projected once, as the parent reference layer.
         if (applyTimelineGlobals && timeline && projectCamera.trueProjection)
             rgb = applyProjectCameraProjection(
-                rgb, c.layer3D, c.is3DLayer, projectCamera, outSize);
+                rgb, cLayer3D, c.is3DLayer, projectCamera, outSize);
         renderLayer.sourceRgb = rgb;
         renderLayer.layer.name = c.displayName;
         renderLayer.layer.visible = cOpacity > 0.001;
@@ -2601,7 +2629,7 @@ QImage renderFrameFromTracks(const Timeline *timeline,
         overlay.rotationDeg = cTransform.rotationDeg;   // G3: carry clip rotation
         overlay.layerStyle = c.layerStyle;
         overlay.colorMeta = c.colorMeta;
-        overlay.layer3D = c.layer3D;
+        overlay.layer3D = cLayer3D;
         overlay.material = c.material;
         overlays.append(overlay);
 
@@ -3292,6 +3320,16 @@ QImage renderFrameAt(const Timeline *timeline, qint64 usec, QSize outSize,
         ? renderFrameAtSingleWithSequenceSnapshot(timeline, usec, outSize,
                                                   sequenceSnapshot)
         : averaged;
+}
+
+clipanim::EvalEnv dynamicEvalEnv(const Timeline *timeline)
+{
+    clipanim::EvalEnv env;
+    if (timeline) {
+        env.fps = timeline->projectFrameRate();
+        env.canvas = timeline->projectOutputSize();
+    }
+    return env;
 }
 
 std::optional<ParentLayerHit> parentLayerAt(const Timeline *timeline, qint64 usec,

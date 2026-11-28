@@ -1,6 +1,7 @@
 #include "SpeedRampData.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace speedramp {
 
@@ -188,6 +189,196 @@ qint64 SpeedRamp::outputDuration(qint64 sourceDuration) const
 {
     if (sourceDuration <= 0) return 0;
     return sourceToTimelineUs(sourceDuration);
+}
+
+namespace {
+
+// timelineToSourceUs in double-precision seconds (same segment rules: no
+// source advance before the first keyframe, last speed held after the last).
+double sourceSecondsAt(const QVector<SpeedKeyframe> &kfs, double tauSec)
+{
+    if (kfs.isEmpty())
+        return tauSec;
+    if (tauSec <= 0.0)
+        return 0.0;
+    double sourceAccum = 0.0;
+    for (int i = 0; i + 1 < kfs.size(); ++i) {
+        const SpeedKeyframe &a = kfs[i];
+        const SpeedKeyframe &b = kfs[i + 1];
+        if (b.clipTimeUs <= a.clipTimeUs)
+            continue;
+        const double segStart = static_cast<double>(a.clipTimeUs) / 1'000'000.0;
+        const double segEnd = static_cast<double>(b.clipTimeUs) / 1'000'000.0;
+        if (tauSec <= segStart)
+            return sourceAccum;
+        if (tauSec >= segEnd) {
+            sourceAccum += (segEnd - segStart) * (a.speed + b.speed) * 0.5;
+        } else {
+            const double dt = tauSec - segStart;
+            const double sAtT = a.speed + (b.speed - a.speed) * dt / (segEnd - segStart);
+            return sourceAccum + dt * (a.speed + sAtT) * 0.5;
+        }
+    }
+    const double lastSec = static_cast<double>(kfs.last().clipTimeUs) / 1'000'000.0;
+    if (tauSec > lastSec)
+        sourceAccum += (tauSec - lastSec) * kfs.last().speed;
+    return sourceAccum;
+}
+
+// First ramp time (seconds) at which sourceSecondsAt reaches limitSec, or
+// +inf when it never does. Inside a segment the source is quadratic in tau
+// and is solved in the stable form u = 2R / (v + sqrt(v^2 + 2aR)).
+double saturationTauSec(const QVector<SpeedKeyframe> &kfs, double limitSec)
+{
+    if (kfs.isEmpty())
+        return limitSec;
+    if (limitSec <= 0.0)
+        return 0.0;
+    double sourceAccum = 0.0;
+    for (int i = 0; i + 1 < kfs.size(); ++i) {
+        const SpeedKeyframe &a = kfs[i];
+        const SpeedKeyframe &b = kfs[i + 1];
+        if (b.clipTimeUs <= a.clipTimeUs)
+            continue;
+        const double segStart = static_cast<double>(a.clipTimeUs) / 1'000'000.0;
+        const double segEnd = static_cast<double>(b.clipTimeUs) / 1'000'000.0;
+        const double advance = (segEnd - segStart) * (a.speed + b.speed) * 0.5;
+        if (sourceAccum + advance >= limitSec) {
+            const double remaining = limitSec - sourceAccum;
+            const double accel = (b.speed - a.speed) / (segEnd - segStart);
+            const double denom = a.speed
+                + std::sqrt(std::max(0.0, a.speed * a.speed + 2.0 * accel * remaining));
+            const double u = denom > 0.0 ? 2.0 * remaining / denom : segEnd - segStart;
+            return segStart + std::min(u, segEnd - segStart);
+        }
+        sourceAccum += advance;
+    }
+    const double lastSec = static_cast<double>(kfs.last().clipTimeUs) / 1'000'000.0;
+    const double lastSpeed = kfs.last().speed;
+    if (lastSpeed <= 0.0)
+        return std::numeric_limits<double>::infinity();
+    return lastSec + (limitSec - sourceAccum) / lastSpeed;
+}
+
+} // namespace
+
+bool SpeedRamp::sliced(qint64 fromUs, qint64 toUs, double timeScale, double speedScale,
+                       SpeedRamp *out) const
+{
+    if (!out || keyframes.isEmpty() || toUs <= fromUs || !(timeScale > 0.0)
+        || !(speedScale > 0.0)) {
+        return false;
+    }
+    if (fromUs < keyframes.first().clipTimeUs)
+        return false;
+
+    constexpr double kSpeedTolerance = 1e-9;
+    SpeedRamp piece;
+    double minSpeed = std::numeric_limits<double>::infinity();
+    double maxSpeed = -std::numeric_limits<double>::infinity();
+    const auto append = [&](qint64 clipTimeUs, double speed) {
+        minSpeed = std::min(minSpeed, speed);
+        maxSpeed = std::max(maxSpeed, speed);
+        const double pieceSpeed = speed * speedScale;
+        if (pieceSpeed < kMinSpeed - kSpeedTolerance || pieceSpeed > kMaxSpeed + kSpeedTolerance)
+            return false;
+        const qint64 pieceUs = qRound64(static_cast<double>(clipTimeUs - fromUs) * timeScale);
+        if (piece.keyframes.isEmpty() || pieceUs > piece.keyframes.last().clipTimeUs)
+            piece.keyframes.append({pieceUs, clampSpeed(pieceSpeed)});
+        return true;
+    };
+    if (!append(fromUs, speedAt(fromUs)))
+        return false;
+    for (const SpeedKeyframe &kf : keyframes) {
+        if (kf.clipTimeUs > fromUs && kf.clipTimeUs < toUs && !append(kf.clipTimeUs, kf.speed))
+            return false;
+    }
+    if (!append(toUs, speedAt(toUs)))
+        return false;
+    // A ramp that varies on the piece must not collapse to identity, which
+    // consumers evaluate as uniform speed and would drop the curvature.
+    if (maxSpeed - minSpeed > kSpeedTolerance && piece.isIdentity())
+        return false;
+    *out = piece;
+    return true;
+}
+
+QVector<SpeedRamp::CurvePoint> SpeedRamp::approximateSourceCurve(
+    double fromSec, double toSec, double speed, double limitSec, double *epsilonOut) const
+{
+    constexpr int kMaxKeys = 4096;
+    double epsilon = 1e-5;
+    QVector<CurvePoint> points;
+    if (epsilonOut)
+        *epsilonOut = epsilon;
+    if (!(toSec > fromSec) || !(speed > 0.0))
+        return points;
+
+    const auto sourceAt = [&](double localSec) {
+        return std::min(sourceSecondsAt(keyframes, localSec * speed), limitSec);
+    };
+    const auto speedAtLocal = [&](double localSec) {
+        return speedAt(qRound64(localSec * speed * 1'000'000.0));
+    };
+
+    // Span breaks: both ends, every keyframe and the saturation time t*.
+    QVector<double> breaks{fromSec, toSec};
+    for (const SpeedKeyframe &kf : keyframes) {
+        const double localSec = static_cast<double>(kf.clipTimeUs) / 1'000'000.0 / speed;
+        if (localSec > fromSec && localSec < toSec)
+            breaks.append(localSec);
+    }
+    const double saturationSec = saturationTauSec(keyframes, limitSec) / speed;
+    if (saturationSec > fromSec && saturationSec < toSec)
+        breaks.append(saturationSec);
+    std::sort(breaks.begin(), breaks.end());
+    breaks.erase(std::unique(breaks.begin(), breaks.end()), breaks.end());
+
+    // speed * |dv| * dt per span. Spans before the first keyframe (no source
+    // advance) and after t* (held at limitSec) are linear: 0.
+    const double firstKeySec = keyframes.isEmpty()
+        ? 0.0
+        : static_cast<double>(keyframes.first().clipTimeUs) / 1'000'000.0 / speed;
+    QVector<double> spanCurvature;
+    for (int i = 0; i + 1 < breaks.size(); ++i) {
+        const double t0 = breaks[i];
+        const double t1 = breaks[i + 1];
+        if (keyframes.isEmpty() || t1 <= firstKeySec || t0 >= saturationSec) {
+            spanCurvature.append(0.0);
+            continue;
+        }
+        const double dv = std::abs(speedAtLocal(t1) - speedAtLocal(t0));
+        spanCurvature.append(speed * dv * (t1 - t0));
+    }
+
+    QVector<int> spanCounts(spanCurvature.size(), 1);
+    for (;;) {
+        double total = 1.0;
+        bool anySubdivided = false;
+        for (int i = 0; i < spanCurvature.size(); ++i) {
+            const double n = std::max(1.0, std::ceil(std::sqrt(spanCurvature[i] / (8.0 * epsilon))));
+            anySubdivided = anySubdivided || n > 1.0;
+            total += n;
+            spanCounts[i] = n > kMaxKeys ? kMaxKeys + 1 : static_cast<int>(n);
+        }
+        if (total <= kMaxKeys || !anySubdivided)
+            break;
+        epsilon *= 2.0;
+    }
+    if (epsilonOut)
+        *epsilonOut = epsilon;
+
+    for (int i = 0; i + 1 < breaks.size(); ++i) {
+        const double t0 = breaks[i];
+        const double t1 = breaks[i + 1];
+        const int n = spanCounts[i];
+        for (int j = 0; j < n; ++j) {
+            const double localSec = t0 + (t1 - t0) * static_cast<double>(j) / n;
+            points.append({localSec - fromSec, sourceAt(localSec)});
+        }
+    }
+    points.append({toSec - fromSec, sourceAt(toSec)});
+    return points;
 }
 
 void SpeedRamp::addKeyframe(qint64 clipTimeUs, double speed)

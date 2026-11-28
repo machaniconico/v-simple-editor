@@ -4,12 +4,14 @@
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
 #include "../RenderInPlace.h"
+#include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../Text3DLayer.h"
 #include "../ThreePointEdit.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 #include "../libavcore/Encode.h"
+#include "../libavcore/FrameGrab.h"
 #include "../libavcore/Probe.h"
 #include "../mcp/McpEditorTools.h"
 #include "../mcp/McpToolRegistry.h"
@@ -18,12 +20,14 @@
 #include <QAbstractButton>
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QDataStream>
 #include <QDir>
 #include <QColor>
 #include <QDoubleSpinBox>
 #include <QDropEvent>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
@@ -39,6 +43,7 @@
 #include <QThread>
 #include <QTimer>
 #include <QUrl>
+#include <QUuid>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -173,6 +178,29 @@ extern "C" {
 //        direct map write without an undo point is rolled back by an unrelated undo (the former
 //        G32 (6) contract, inverted).
 //        Detects: commits that record no undo point / a sidecar state without the four values (HEAD).
+//        US-1504: the wiggle is ClipInfo::wiggle (an entry = clip.wiggle.enabled, the commit is
+//        Timeline::setClipWiggle); G32 / G36 read it through ClipWiggleView.
+//   G37 (US-1504): setClipWiggle is one undo point (none for an equal value) undone to disabled and
+//        redone; the wiggle saves / opens with the clip; a legacy root "wiggleClipEntries" "0:1"
+//        moves onto V1[1] through ProjectFile::load / fromJsonString / MainWindow's open and is not
+//        written again; RenderQueue::resolveTimeline has it (and the 1280x720 project canvas); a
+//        split puts it on both halves; with VEDITOR_SMART_RENDER=1 a full-length V1 wiggle clip
+//        is encoded (moved at 0.5 s), not stream-copied like the same clip without the wiggle.
+//        Detects: the clip JSON key not read back (mutation build: clipFromJson ignores
+//        "wiggle"); a Smart Render guard that ignores the wiggle (mutation build:
+//        timelineHasDynamicTransform returns false); HEAD has no ClipInfo::wiggle.
+//        US-1505: the expression bindings are ClipInfo::expressions too (an entry = non-empty
+//        bindings, the commit is Timeline::setClipExpressions); G32 / G36 read them through
+//        ClipExpressionView.
+//   G38 (US-1505): G37's six items for the expression bindings: setClipExpressions is one undo
+//        point (none for an equal value) undone to none and redone; they save / open with the
+//        clip (clip key "expressions" on V1[1] only); a legacy root "expressionBindingsEntries"
+//        "0:1" moves onto V1[1] through ProjectFile::load / fromJsonString / MainWindow's open and
+//        is not written again; RenderQueue::resolveTimeline has them (and no audio-level
+//        snapshot: level 0, user decision D); a split puts them on both halves; with
+//        VEDITOR_SMART_RENDER=1 a full-length V1 clip with transform.position.x = 0.3 is encoded
+//        (moved at 0.5 s), not stream-copied. Detects: HEAD has no ClipInfo::expressions (and
+//        the root section is written there); hasAnyDynamicTransform ignoring the bindings.
 // US-1214 (copy paths, explicit delete, track operations):
 //   G12: blading the connected clip leaves the right piece in place, connected,
 //       offset = original + left length; with setRederiveDisabledForTest the
@@ -786,13 +814,126 @@ bool loadSharedSameOrder(Timeline &tl)
     return v3a == v2a && v3b == v2b;
 }
 
+// US-1504: the wiggle is ClipInfo::wiggle, no MainWindow map. G32 / G36 read it through
+// this view of the Timeline's video clips ("t:i"), where an enabled wiggle is an entry;
+// insert / clear write the clips directly with no undo point, as the map writes did.
+struct ClipWiggleView {
+    Timeline *tl = nullptr;
+    wiggle::WiggleParams value(const QString &key) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        const TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        return track && index >= 0 && index < track->clipCount() ? track->clips().at(index).wiggle
+                                                                 : wiggle::WiggleParams{};
+    }
+    bool contains(const QString &key) const { return value(key).enabled; }
+    QStringList keys() const
+    {
+        QStringList out;
+        const auto &tracks = tl->videoTracks();
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c = 0; c < tracks[t]->clipCount(); ++c)
+                if (tracks[t]->clips().at(c).wiggle.enabled) out.append(trackMatteClipKey(t, c));
+        return out;
+    }
+    void insert(const QString &key, const wiggle::WiggleParams &params) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        if (!track || index < 0 || index >= track->clipCount()) return;
+        QVector<ClipInfo> clips = track->clips();
+        clips[index].wiggle = params;
+        track->setClips(clips);
+    }
+    // The dialog commit: Timeline::setClipWiggle on the clip the key names (nullopt = the
+    // default, disabled wiggle).
+    void commit(const QString &key, const std::optional<wiggle::WiggleParams> &params) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        if (parts.size() == 2)
+            tl->setClipWiggle(parts[0].toInt(), parts[1].toInt(), params.value_or(wiggle::WiggleParams{}));
+    }
+    void clear() const
+    {
+        for (TimelineTrack *track : tl->videoTracks()) {
+            QVector<ClipInfo> clips = track->clips();
+            bool changed = false;
+            for (ClipInfo &clip : clips) {
+                if (wiggle::toJson(clip.wiggle) == wiggle::toJson(wiggle::WiggleParams{})) continue;
+                clip.wiggle = wiggle::WiggleParams{};
+                changed = true;
+            }
+            if (changed) track->setClips(clips);
+        }
+    }
+};
+
+// US-1505: the expression bindings are ClipInfo::expressions, no MainWindow map. G32 / G36
+// read them through this view of the Timeline's video clips ("t:i"), where non-empty
+// bindings are an entry; insert / clear write the clips directly with no undo point, as the
+// map writes did, and commit is the dialog's Timeline::setClipExpressions.
+struct ClipExpressionView {
+    Timeline *tl = nullptr;
+    exprbind::ClipExpressionBindings value(const QString &key) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        const TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        return track && index >= 0 && index < track->clipCount() ? track->clips().at(index).expressions
+                                                                 : exprbind::ClipExpressionBindings{};
+    }
+    bool contains(const QString &key) const { return !value(key).isEmpty(); }
+    QStringList keys() const
+    {
+        QStringList out;
+        const auto &tracks = tl->videoTracks();
+        for (int t = 0; t < tracks.size(); ++t)
+            for (int c = 0; c < tracks[t]->clipCount(); ++c)
+                if (!tracks[t]->clips().at(c).expressions.isEmpty()) out.append(trackMatteClipKey(t, c));
+        return out;
+    }
+    void insert(const QString &key, const exprbind::ClipExpressionBindings &bindings) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        TimelineTrack *track = parts.size() == 2 ? tl->trackAt(false, parts[0].toInt()) : nullptr;
+        const int index = parts.size() == 2 ? parts[1].toInt() : -1;
+        if (!track || index < 0 || index >= track->clipCount()) return;
+        QVector<ClipInfo> clips = track->clips();
+        clips[index].expressions = bindings;
+        track->setClips(clips);
+    }
+    // nullopt = no bindings (the dialog's empty result).
+    void commit(const QString &key, const std::optional<exprbind::ClipExpressionBindings> &bindings) const
+    {
+        const QStringList parts = key.split(QLatin1Char(':'));
+        if (parts.size() == 2)
+            tl->setClipExpressions(parts[0].toInt(), parts[1].toInt(),
+                                   bindings.value_or(exprbind::ClipExpressionBindings{}));
+    }
+    void clear() const
+    {
+        for (TimelineTrack *track : tl->videoTracks()) {
+            QVector<ClipInfo> clips = track->clips();
+            bool changed = false;
+            for (ClipInfo &clip : clips) {
+                if (clip.expressions.isEmpty()) continue;
+                clip.expressions = exprbind::ClipExpressionBindings{};
+                changed = true;
+            }
+            if (changed) track->setClips(clips);
+        }
+    }
+};
+
 // G32 (US-1302) reaches MainWindow's private sidecars through the addresses the friend
 // runConnectedClipSelftest hands over.
 struct SidecarView {
     QHash<QString, TimeRemapClipEntry> *timeRemap = nullptr;
     QHash<QString, QJsonObject> *text3D = nullptr;
-    QHash<QString, exprbind::ClipExpressionBindings> *expressions = nullptr;
-    QHash<QString, wiggle::WiggleParams> *wiggle = nullptr;
+    const ClipExpressionView *expressions = nullptr;
+    const ClipWiggleView *wiggle = nullptr;
     QVector<BrushAnimationEntry> *brush = nullptr;
     QHash<QString, BrushAnimation *> *liveBrush = nullptr;
     BrushAnimation *(MainWindow::*materializeBrush)(const QString &) = nullptr;
@@ -804,9 +945,6 @@ struct SidecarView {
     void (MainWindow::*sourceOverwrite)(const threepoint::SourceSelection &) = nullptr;
     void (MainWindow::*commitTimeRemap)(const QString &, const timeremap::TimeRemapCurve &) = nullptr;
     void (MainWindow::*commitText3D)(const QString &, const std::optional<QJsonObject> &) = nullptr;
-    void (MainWindow::*commitExpressions)(const QString &,
-                                          const std::optional<exprbind::ClipExpressionBindings> &) = nullptr;
-    void (MainWindow::*commitWiggle)(const QString &, const std::optional<wiggle::WiggleParams> &) = nullptr;
     void (MainWindow::*editWiggle)() = nullptr;
 };
 
@@ -953,7 +1091,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
     // the sidecar values stay.
     wiggle::WiggleParams editedWiggle = view.wiggle->value(QStringLiteral("1:0"));
     editedWiggle.seed = 77;
-    (window.*view.commitWiggle)(QStringLiteral("1:0"), editedWiggle);
+    view.wiggle->commit(QStringLiteral("1:0"), editedWiggle);
     (window.*view.commitText3D)(QStringLiteral("1:0"),
                                 QJsonObject{{QStringLiteral("text"), QStringLiteral("edited")}});
     timeremap::TimeRemapCurve editedCurve = view.timeRemap->value(QStringLiteral("1:0")).curve;
@@ -962,7 +1100,7 @@ void sidecarRekeyGate(selftest::GateTally &tally, MainWindow &window, Timeline &
     (window.*view.commitTimeRemap)(QStringLiteral("1:0"), editedCurve);
     exprbind::ClipExpressionBindings editedBindings = view.expressions->value(QStringLiteral("1:0"));
     editedBindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("75"));
-    (window.*view.commitExpressions)(QStringLiteral("1:0"), editedBindings);
+    view.expressions->commit(QStringLiteral("1:0"), editedBindings);
     QString speedErr;
     const bool sped = tl.setClipPropertyByIndex(false, 0, 0, QStringLiteral("speed"), 2.0, &speedErr);
     tl.undo();
@@ -1295,9 +1433,9 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     };
     auto commitAll = [&](const QString &key, int n) {
         (window.*view.commitTimeRemap)(key, curveFor(n));
-        (window.*view.commitWiggle)(key, wiggleFor(n));
+        view.wiggle->commit(key, wiggleFor(n));
         (window.*view.commitText3D)(key, textFor(n));
-        (window.*view.commitExpressions)(key, bindingsFor(n));
+        view.expressions->commit(key, bindingsFor(n));
     };
     // The tag each kind carries on `key` ("-" when absent; "!id" when the remap's clipId differs).
     auto tagsAt = [&](const QString &key) {
@@ -1397,12 +1535,12 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
     const bool ok3t = roundTrip("text3D", [&] { (window.*view.commitText3D)(bKey, textFor(3)); },
         [&] { (window.*view.commitText3D)(bKey, std::nullopt); },
         [&] { return view.text3D->value(bKey) == textFor(3); });
-    const bool ok3e = roundTrip("expression", [&] { (window.*view.commitExpressions)(bKey, bindingsFor(3)); },
-        [&] { (window.*view.commitExpressions)(bKey, std::nullopt); },
+    const bool ok3e = roundTrip("expression", [&] { view.expressions->commit(bKey, bindingsFor(3)); },
+        [&] { view.expressions->commit(bKey, std::nullopt); },
         [&] { return view.expressions->contains(bKey)
                   && view.expressions->value(bKey).toJson() == bindingsFor(3).toJson(); });
-    const bool ok3w = roundTrip("wiggle", [&] { (window.*view.commitWiggle)(bKey, wiggleFor(3)); },
-        [&] { (window.*view.commitWiggle)(bKey, std::nullopt); },
+    const bool ok3w = roundTrip("wiggle", [&] { view.wiggle->commit(bKey, wiggleFor(3)); },
+        [&] { view.wiggle->commit(bKey, std::nullopt); },
         [&] { return view.wiggle->contains(bKey)
                   && wiggle::toJson(view.wiggle->value(bKey)) == wiggle::toJson(wiggleFor(3)); });
     const bool ok3 = ok3t && ok3e && ok3w;
@@ -1518,6 +1656,13 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                 spin->setValue(amplitude);
                 return;
             }
+            // US-1504: an entry is an enabled wiggle (clip.wiggle.enabled), so the
+            // amplitude run also ticks 有効.
+            auto *enabled = modal->findChild<QCheckBox *>(QStringLiteral("wiggleEnabled"));
+            if (amplitude != 0.0 && enabled && !enabled->isChecked()) {
+                enabled->setChecked(true);
+                return;
+            }
             ++*dialogs;
             dialog->accept();
         });
@@ -1556,11 +1701,13 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
         if (s.name == QStringLiteral("G36")) seqId = s.id;
     const QString seqBefore = tl.activeSequenceId();
     const bool switched = !seqId.isEmpty() && tl.setActiveSequence(seqId);
-    (window.*view.commitWiggle)(b8Key, wiggleFor(82));
+    view.wiggle->commit(b8Key, wiggleFor(82));
     const QString inOther = tagsAt(b8Key);
     tl.undo();
     const QString afterSeqUndo = tagsAt(b8Key);
-    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=81")
+    // US-1505: the expressions ride on b's clip like the wiggle, so G36's "1:0" (clip z) has
+    // none (formerly the position-keyed map value 81).
+    const bool ok8 = added && switched && inOther == QStringLiteral("tr=81 wg=82 t3=81 ex=-")
         && afterSeqUndo == tagged(81);
     if (!seqBefore.isEmpty()) tl.setActiveSequence(seqBefore);
 
@@ -1615,7 +1762,7 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                  selected, qPrintable(selectErr), dialogs, others, d7, d7Default, defaultNoEntry, d7Set, setEntry,
                  undoNoEntry, ok7);
     std::fprintf(stderr, "connected-clip G36 (8) added=%d switched=%d [%s -> %s] in G36 %s (expect tr=81 wg=82 t3=81 "
-                 "ex=81) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
+                 "ex=-) undo %s (expect %s) ok=%d\n", added, switched, qPrintable(seqBefore), qPrintable(seqId),
                  qPrintable(inOther), qPrintable(afterSeqUndo), qPrintable(tagged(81)), ok8);
     std::fprintf(stderr, "connected-clip G36 (9) committed %s, written directly %s (expect %s) depth %d->%d (expect same) "
                  "| sped=%d [%s] x speed after undo=%.3f (expect 1) undo %s (expect %s, the direct write gone) ok=%d\n",
@@ -1628,6 +1775,523 @@ void sidecarUndoValuesGate(selftest::GateTally &tally, MainWindow &window, Timel
                "shared-uid track lost), a save / load moved them, the real wiggle dialog recorded none, or a "
                "direct map write without an undo point survived an unrelated undo");
     clearFour();
+}
+
+// RenderQueue::resolveTimeline (the file-backed export's Timeline) is private: reach it
+// the same way as the slots above.
+struct ResolveTimelineTag {
+    using Type = Timeline *(*)(const RenderJob &, Timeline **);
+    friend Type member(ResolveTimelineTag);
+};
+template struct Access<ResolveTimelineTag, &RenderQueue::resolveTimeline>;
+
+// G37 (6): the "[smart-render]" lines a render-queue job logs.
+QStringList *g_smartRenderLog = nullptr;
+QtMessageHandler g_previousSmartRenderHandler = nullptr;
+void captureSmartRender(QtMsgType type, const QMessageLogContext &context, const QString &message)
+{
+    if (g_smartRenderLog && message.contains(QStringLiteral("[smart-render]")))
+        g_smartRenderLog->append(message);
+    if (g_previousSmartRenderHandler)
+        g_previousSmartRenderHandler(type, context, message);
+}
+
+// G37 (US-1504): the wiggle is ClipInfo::wiggle. One Timeline::setClipWiggle is one undo
+// point (none for an equal value), it saves and opens with the clip, a legacy root
+// "wiggleClipEntries" section moves onto the clip it names through ProjectFile::load,
+// fromJsonString and MainWindow's open and is never written again, the file-backed export
+// Timeline has it (and the project canvas), and a split puts it on both halves.
+void clipWiggleGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                    bool (MainWindow::*save)(const QString &, QString *),
+                    bool (MainWindow::*open)(const QString &, QString *, bool))
+{
+    SidecarView view;
+    view.save = save;
+    view.open = open;
+    auto depth = [&tl] { return tl.undoManager()->currentIndex(); };
+    auto wiggleAt = [&tl](int track, int index) {
+        const TimelineTrack *t = tl.trackAt(false, track);
+        return t && index >= 0 && index < t->clipCount() ? t->clips().at(index).wiggle : wiggle::WiggleParams{};
+    };
+    wiggle::WiggleParams wp;
+    wp.enabled = true;
+    wp.seed = 37;
+    wp.positionAmplitude = QPointF(6.0, 2.0);
+    const QJsonObject wpJson = wiggle::toJson(wp);
+    auto isWp = [&wpJson](const wiggle::WiggleParams &p) { return p.enabled && wiggle::toJson(p) == wpJson; };
+    auto fileRoot = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    };
+    const QString section = QStringLiteral("wiggleClipEntries");
+
+    // (1) V1 [x | w]: set on w (+1), the same value again (+0), undo -> disabled, redo -> back.
+    load(tl, {{clipFor("x", 2.0), clipFor("w", 2.0)}});
+    const int d0 = depth();
+    const bool set1 = tl.setClipWiggle(0, 1, wp);
+    const int d1 = depth();
+    const bool onClip = isWp(wiggleAt(0, 1)) && !wiggleAt(0, 0).enabled;
+    const bool setAgain = tl.setClipWiggle(0, 1, wp);
+    const int d1b = depth();
+    tl.undo();
+    const bool undoDisabled = !wiggleAt(0, 1).enabled;
+    tl.redo();
+    const bool redoBack = isWp(wiggleAt(0, 1));
+    const bool ok1 = set1 && d1 == d0 + 1 && onClip && setAgain && d1b == d1 && undoDisabled && redoBack;
+
+    // (2) saved and opened through MainWindow: on w again; the file has the clip key and
+    // no root section.
+    QTemporaryDir dir;
+    const QString savedPath = dir.filePath(QStringLiteral("g37.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*view.save)(savedPath, &saveErr);
+    const QJsonObject savedRoot = fileRoot(savedPath);
+    load(tl, {{clipFor("x", 2.0), clipFor("w", 2.0)}});
+    const bool wiped = !wiggleAt(0, 1).enabled;
+    const bool opened = saved && (window.*view.open)(savedPath, &openErr, false);
+    const bool onW2 = isWp(wiggleAt(0, 1)) && !wiggleAt(0, 0).enabled;
+    const bool ok2 = saved && opened && wiped && onW2 && !savedRoot.isEmpty() && !savedRoot.contains(section);
+
+    // (3) a legacy project: no clip key, the root section names "0:1".
+    ProjectData legacyData;
+    legacyData.config.width = 1280;
+    legacyData.config.height = 720;
+    legacyData.config.fps = 30;
+    legacyData.videoTracks = {{clipFor("x", 2.0), clipFor("w", 2.0)}};
+    legacyData.audioTracks = {{}};
+    QJsonObject legacyRoot = QJsonDocument::fromJson(ProjectFile::toJsonString(legacyData).toUtf8()).object();
+    legacyRoot.insert(section, QJsonArray{QJsonObject{{QStringLiteral("clipId"), QStringLiteral("0:1")},
+                                                      {QStringLiteral("params"), wpJson}}});
+    const QByteArray legacyBytes = QJsonDocument(legacyRoot).toJson();
+    const QString legacyPath = dir.filePath(QStringLiteral("g37-legacy.veditor"));
+    {
+        QFile file(legacyPath);
+        if (file.open(QIODevice::WriteOnly)) file.write(legacyBytes);
+    }
+    ProjectData loaded;
+    const bool legacyLoaded = ProjectFile::load(legacyPath, loaded);
+    const bool loadMigrated = legacyLoaded && loaded.videoTracks.size() == 1 && loaded.videoTracks[0].size() == 2
+        && isWp(loaded.videoTracks[0][1].wiggle) && !loaded.videoTracks[0][0].wiggle.enabled
+        && loaded.wiggleClipEntries.isEmpty();
+    const QString resavedPath = dir.filePath(QStringLiteral("g37-resaved.veditor"));
+    const bool resaved = ProjectFile::save(resavedPath, loaded);
+    const QJsonObject resavedRoot = fileRoot(resavedPath);
+    const bool resavedNoSection = resaved && !resavedRoot.isEmpty() && !resavedRoot.contains(section);
+    ProjectData fromString;
+    const bool stringLoaded = ProjectFile::fromJsonString(QString::fromUtf8(legacyBytes), fromString);
+    const bool stringMigrated = stringLoaded && fromString.videoTracks.size() == 1
+        && fromString.videoTracks[0].size() == 2 && isWp(fromString.videoTracks[0][1].wiggle)
+        && !fromString.videoTracks[0][0].wiggle.enabled && fromString.wiggleClipEntries.isEmpty()
+        && !QJsonDocument::fromJson(ProjectFile::toJsonString(fromString).toUtf8()).object().contains(section);
+    QString legacyOpenErr;
+    const bool legacyOpened = (window.*view.open)(legacyPath, &legacyOpenErr, false);
+    const bool openMigrated = legacyOpened && isWp(wiggleAt(0, 1)) && !wiggleAt(0, 0).enabled;
+    const bool ok3 = loadMigrated && resavedNoSection && stringMigrated && openMigrated;
+
+    // (4) the file-backed export Timeline (RenderQueue::resolveTimeline) of the legacy and of
+    // the MainWindow-saved project: wiggle on w, the project canvas from the config.
+    auto resolved = [](const QString &path, QSize *canvas) {
+        RenderJob job;
+        job.projectFilePath = path;
+        Timeline *owned = nullptr;
+        Timeline *timeline = member(ResolveTimelineTag{})(job, &owned);
+        wiggle::WiggleParams out;
+        if (timeline && !timeline->videoTracks().isEmpty() && timeline->videoTracks()[0]->clipCount() > 1)
+            out = timeline->videoTracks()[0]->clips().at(1).wiggle;
+        if (canvas) *canvas = timeline ? timeline->projectOutputSize() : QSize();
+        delete owned;
+        return out;
+    };
+    QSize legacyCanvas, savedCanvas;
+    const wiggle::WiggleParams resolvedLegacy = resolved(legacyPath, &legacyCanvas);
+    const wiggle::WiggleParams resolvedSaved = resolved(savedPath, &savedCanvas);
+    const bool ok4 = isWp(resolvedLegacy) && isWp(resolvedSaved) && legacyCanvas == QSize(1280, 720);
+
+    // (5) a split of the wiggle clip: both halves carry it.
+    load(tl, {{clipFor("w", 4.0)}});
+    const bool set5 = tl.setClipWiggle(0, 0, wp);
+    QString splitErr;
+    const bool split = tl.splitClipByIndex(false, 0, 0, 2.0, &splitErr);
+    const int pieces = tl.trackAt(false, 0)->clipCount();
+    const bool halvesWp = isWp(wiggleAt(0, 0)) && isWp(wiggleAt(0, 1));
+    const bool ok5 = set5 && split && pieces == 2 && halvesWp;
+
+    // (6) Smart Render on (VEDITOR_SMART_RENDER=1, restored after; VEDITOR_SMARTRENDER_TEST_SEAM=1,
+    // restored after, because SmartRender's segment predicate reads the probed source signature
+    // from ClipInfo::displayName only under that seam): a single full-length V1 mpeg4 clip with compatible output is stream-copied without wiggle (control: the setup is
+    // eligible) and encoded with the wiggle (no keyframes), so the output frame at 0.5 s is
+    // moved off the source frame.
+    const QString srcPath = dir.filePath(QStringLiteral("g37-src.mp4"));
+    const QString silentPath = dir.filePath(QStringLiteral("g37-silent.png"));
+    QImage silent(2, 2, QImage::Format_RGB32);
+    silent.fill(Qt::black);
+    const bool fixture6 = writeVideoFile(srcPath, 20) && silent.save(silentPath);
+    const bool envSet6 = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+    const QByteArray env6 = qgetenv("VEDITOR_SMART_RENDER");
+    const bool seamSet6 = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+    const QByteArray seam6 = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    auto exportOnce = [&](bool withWiggle, const QString &outName, QStringList *log, QString *err) {
+        ClipInfo clip;
+        clip.filePath = srcPath;
+        clip.displayName = QStringLiteral("g37-src");
+        clip.duration = 2.0;
+        clip.outPoint = 2.0;
+        wiggle::WiggleParams strong = wp;
+        strong.positionAmplitude = QPointF(14.0, 8.0);
+        if (withWiggle) clip.wiggle = strong;
+        Timeline export6;
+        export6.setProjectOutputConfig(40, 24, true, 10.0);
+        export6.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QString outPath = dir.filePath(outName);
+        RenderPreset preset{QStringLiteral("G37"), 40, 24, QStringLiteral("mpeg4"), 600000, QStringLiteral("mp4")};
+        RenderJob job = RenderQueue::jobFromPreset(preset, outPath, 0, 2000000);
+        job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        job.timeline = &export6;
+        job.projectFilePath = silentPath;
+        job.exportConfig["fps"] = 10;
+        job.exportConfig["videoCodec"] = QStringLiteral("mpeg4");
+        const QByteArray hadEnv = qgetenv("VEDITOR_SMART_RENDER");
+        const bool envWasSet = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+        const QByteArray hadSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        const bool seamWasSet = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+        qputenv("VEDITOR_SMART_RENDER", "1");
+        qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+        g_smartRenderLog = log;
+        g_previousSmartRenderHandler = qInstallMessageHandler(captureSmartRender);
+        RenderQueue queue;
+        QEventLoop loop;
+        bool done = false, success = false;
+        QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                         [&](const QString &uuid, bool okJob, const QString &message) {
+                             if (uuid != job.uuid) return;
+                             done = true;
+                             success = okJob;
+                             *err = message;
+                             loop.quit();
+                         });
+        queue.addJob(job);
+        queue.start();
+        if (!done) loop.exec();
+        qInstallMessageHandler(g_previousSmartRenderHandler);
+        g_previousSmartRenderHandler = nullptr;
+        g_smartRenderLog = nullptr;
+        if (envWasSet) qputenv("VEDITOR_SMART_RENDER", hadEnv);
+        else qunsetenv("VEDITOR_SMART_RENDER");
+        if (seamWasSet) qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", hadSeam);
+        else qunsetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        return success ? outPath : QString();
+    };
+    auto logHas = [](const QStringList &log, const char *needle) {
+        for (const QString &line : log)
+            if (line.contains(QLatin1String(needle))) return true;
+        return false;
+    };
+    auto maxDiff = [](const QImage &a, const QImage &b) {
+        if (a.isNull() || b.isNull() || a.size() != b.size()) return -1;
+        const QImage x = a.convertToFormat(QImage::Format_RGB32), y = b.convertToFormat(QImage::Format_RGB32);
+        int worst = 0;
+        for (int yy = 0; yy < x.height(); ++yy)
+            for (int xx = 0; xx < x.width(); ++xx) {
+                const QRgb p = x.pixel(xx, yy), q = y.pixel(xx, yy);
+                worst = std::max({worst, std::abs(qRed(p) - qRed(q)), std::abs(qGreen(p) - qGreen(q)),
+                                  std::abs(qBlue(p) - qBlue(q))});
+            }
+        return worst;
+    };
+    QStringList plainLog, wiggleLog;
+    QString plainErr, wiggleErr;
+    const QString plainOut = fixture6 ? exportOnce(false, QStringLiteral("g37-plain.mp4"), &plainLog, &plainErr) : QString();
+    const QString wiggleOut = fixture6 ? exportOnce(true, QStringLiteral("g37-wiggle.mp4"), &wiggleLog, &wiggleErr) : QString();
+    const bool envRestored = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER") == envSet6
+        && qgetenv("VEDITOR_SMART_RENDER") == env6
+        && qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM") == seamSet6
+        && qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM") == seam6;
+    const QImage srcFrame = fixture6 ? libavcore::grabFrameAt(srcPath, 0.5) : QImage();
+    const int plainDiff = plainOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(plainOut, 0.5));
+    const int wiggleDiff = wiggleOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(wiggleOut, 0.5));
+    const bool plainCopied = !plainOut.isEmpty() && logHas(plainLog, "stream-copied whole timeline");
+    const bool wiggleCopied = logHas(wiggleLog, "stream-copied whole timeline");
+    const bool wiggleReason = logHas(wiggleLog, "timeline has a dynamic transform (wiggle)");
+    const bool ok6 = fixture6 && plainCopied && plainDiff >= 0 && plainDiff <= 2 && !wiggleOut.isEmpty()
+        && !wiggleCopied && wiggleReason && wiggleDiff > 60 && envRestored;
+
+    std::fprintf(stderr, "connected-clip G37 (1) set=%d depth %d->%d (expect +1) onClip=%d same again=%d depth %d "
+                 "(expect same) undo disabled=%d redo back=%d ok=%d\n", set1, d0, d1, onClip, setAgain, d1b,
+                 undoDisabled, redoBack, ok1);
+    std::fprintf(stderr, "connected-clip G37 (2) saved=%d [%s] wiped=%d opened=%d [%s] on w=%d root %s=%d (expect 0) "
+                 "ok=%d\n", saved, qPrintable(saveErr), wiped, opened, qPrintable(openErr), int(onW2),
+                 qPrintable(section), int(savedRoot.contains(section)), ok2);
+    std::fprintf(stderr, "connected-clip G37 (3) legacy \"0:1\": load=%d migrated=%d resaved=%d root section=%d "
+                 "(expect 0) | fromJsonString=%d migrated=%d | open=%d [%s] on V1[1]=%d ok=%d\n", legacyLoaded,
+                 loadMigrated, resaved, int(resavedRoot.contains(section)), stringLoaded, stringMigrated,
+                 legacyOpened, qPrintable(legacyOpenErr), openMigrated, ok3);
+    std::fprintf(stderr, "connected-clip G37 (4) resolveTimeline legacy enabled=%d seed=%u canvas=%dx%d (expect 1 / 37 / "
+                 "1280x720) | saved enabled=%d seed=%u ok=%d\n", int(resolvedLegacy.enabled), resolvedLegacy.seed,
+                 legacyCanvas.width(), legacyCanvas.height(), int(resolvedSaved.enabled), resolvedSaved.seed, ok4);
+    std::fprintf(stderr, "connected-clip G37 (5) set=%d split=%d [%s] pieces=%d (expect 2) both halves carry it=%d ok=%d\n",
+                 set5, split, qPrintable(splitErr), pieces, int(halvesWp), ok5);
+    std::fprintf(stderr, "connected-clip G37 (6) smart render: fixture=%d | no wiggle out=%d [%s] stream-copied=%d "
+                 "(expect 1) maxdiff@0.5=%d (expect <=2) | wiggle out=%d [%s] stream-copied=%d (expect 0) "
+                 "dynamic-transform reason=%d maxdiff@0.5=%d (expect >60) env restored=%d ok=%d\n", int(fixture6),
+                 int(!plainOut.isEmpty()), qPrintable(plainErr), int(plainCopied), plainDiff, int(!wiggleOut.isEmpty()),
+                 qPrintable(wiggleErr), int(wiggleCopied), int(wiggleReason), wiggleDiff, int(envRestored), ok6);
+    tally.gate(37, ok1 && ok2 && ok3 && ok4 && ok5 && ok6,
+               "the clip wiggle commit recorded no / an extra undo point or did not undo / redo, it did not save "
+               "and open with the clip, a legacy root wiggleClipEntries section was not moved onto V1[1] by load / "
+               "fromJsonString / open or was written again, the file-backed export Timeline lost it, or a split "
+               "left a half without it, or Smart Render stream-copied a wiggle clip");
+}
+
+// G38 (US-1505): the expression bindings are ClipInfo::expressions, the same six items as
+// G37: one Timeline::setClipExpressions is one undo point (none for an equal value), they save
+// and open with the clip, a legacy root "expressionBindingsEntries" section moves onto the clip
+// it names through ProjectFile::load, fromJsonString and MainWindow's open and is never written
+// again, the file-backed export Timeline has them, a split puts them on both halves, and Smart
+// Render encodes (does not stream-copy) a full-length V1 expression clip.
+void clipExpressionGate(selftest::GateTally &tally, MainWindow &window, Timeline &tl,
+                        bool (MainWindow::*save)(const QString &, QString *),
+                        bool (MainWindow::*open)(const QString &, QString *, bool))
+{
+    auto depth = [&tl] { return tl.undoManager()->currentIndex(); };
+    auto exprAt = [&tl](int track, int index) {
+        const TimelineTrack *t = tl.trackAt(false, track);
+        return t && index >= 0 && index < t->clipCount() ? t->clips().at(index).expressions
+                                                         : exprbind::ClipExpressionBindings{};
+    };
+    exprbind::ClipExpressionBindings eb;
+    eb.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    eb.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    const QJsonObject ebJson = eb.toJson();
+    auto isEb = [&ebJson](const exprbind::ClipExpressionBindings &b) {
+        return !b.isEmpty() && b.toJson() == ebJson;
+    };
+    auto fileRoot = [](const QString &path) {
+        QFile file(path);
+        return file.open(QIODevice::ReadOnly) ? QJsonDocument::fromJson(file.readAll()).object() : QJsonObject{};
+    };
+    auto clipKeyOnV1 = [](const QJsonObject &root, int index) {
+        const QJsonArray v1 = root.value(QStringLiteral("videoTracks")).toArray().at(0).toArray();
+        return v1.at(index).toObject().contains(QStringLiteral("expressions"));
+    };
+    const QString section = QStringLiteral("expressionBindingsEntries");
+
+    // (1) V1 [x | e]: set on e (+1), the same value again (+0), undo -> none, redo -> back.
+    load(tl, {{clipFor("x", 2.0), clipFor("e", 2.0)}});
+    const int d0 = depth();
+    const bool set1 = tl.setClipExpressions(0, 1, eb);
+    const int d1 = depth();
+    const bool onClip = isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool setAgain = tl.setClipExpressions(0, 1, eb);
+    const int d1b = depth();
+    tl.undo();
+    const bool undoNone = exprAt(0, 1).isEmpty();
+    tl.redo();
+    const bool redoBack = isEb(exprAt(0, 1));
+    const bool ok1 = set1 && d1 == d0 + 1 && onClip && setAgain && d1b == d1 && undoNone && redoBack;
+
+    // (2) saved and opened through MainWindow: on e again; the file has the clip key on V1[1]
+    // and no root section.
+    QTemporaryDir dir;
+    const QString savedPath = dir.filePath(QStringLiteral("g38.veditor"));
+    QString saveErr, openErr;
+    const bool saved = dir.isValid() && (window.*save)(savedPath, &saveErr);
+    const QJsonObject savedRoot = fileRoot(savedPath);
+    load(tl, {{clipFor("x", 2.0), clipFor("e", 2.0)}});
+    const bool wiped = exprAt(0, 1).isEmpty();
+    const bool opened = saved && (window.*open)(savedPath, &openErr, false);
+    const bool onE2 = isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool clipKey = clipKeyOnV1(savedRoot, 1) && !clipKeyOnV1(savedRoot, 0);
+    const bool ok2 = saved && opened && wiped && onE2 && clipKey && !savedRoot.isEmpty()
+        && !savedRoot.contains(section);
+
+    // (3) a legacy project: no clip key, the root section names "0:1".
+    ProjectData legacyData;
+    legacyData.config.width = 1280;
+    legacyData.config.height = 720;
+    legacyData.config.fps = 30;
+    legacyData.videoTracks = {{clipFor("x", 2.0), clipFor("e", 2.0)}};
+    legacyData.audioTracks = {{}};
+    QJsonObject legacyRoot = QJsonDocument::fromJson(ProjectFile::toJsonString(legacyData).toUtf8()).object();
+    legacyRoot.insert(section, QJsonArray{QJsonObject{{QStringLiteral("clipId"), QStringLiteral("0:1")},
+                                                      {QStringLiteral("bindings"), ebJson}}});
+    const QByteArray legacyBytes = QJsonDocument(legacyRoot).toJson();
+    const QString legacyPath = dir.filePath(QStringLiteral("g38-legacy.veditor"));
+    {
+        QFile file(legacyPath);
+        if (file.open(QIODevice::WriteOnly)) file.write(legacyBytes);
+    }
+    ProjectData loaded;
+    const bool legacyLoaded = ProjectFile::load(legacyPath, loaded);
+    const bool loadMigrated = legacyLoaded && loaded.videoTracks.size() == 1 && loaded.videoTracks[0].size() == 2
+        && isEb(loaded.videoTracks[0][1].expressions) && loaded.videoTracks[0][0].expressions.isEmpty()
+        && loaded.expressionBindingsEntries.isEmpty();
+    const QString resavedPath = dir.filePath(QStringLiteral("g38-resaved.veditor"));
+    const bool resaved = ProjectFile::save(resavedPath, loaded);
+    const QJsonObject resavedRoot = fileRoot(resavedPath);
+    const bool resavedNoSection = resaved && !resavedRoot.isEmpty() && !resavedRoot.contains(section)
+        && clipKeyOnV1(resavedRoot, 1);
+    ProjectData fromString;
+    const bool stringLoaded = ProjectFile::fromJsonString(QString::fromUtf8(legacyBytes), fromString);
+    const bool stringMigrated = stringLoaded && fromString.videoTracks.size() == 1
+        && fromString.videoTracks[0].size() == 2 && isEb(fromString.videoTracks[0][1].expressions)
+        && fromString.videoTracks[0][0].expressions.isEmpty() && fromString.expressionBindingsEntries.isEmpty()
+        && !QJsonDocument::fromJson(ProjectFile::toJsonString(fromString).toUtf8()).object().contains(section);
+    QString legacyOpenErr;
+    const bool legacyOpened = (window.*open)(legacyPath, &legacyOpenErr, false);
+    const bool openMigrated = legacyOpened && isEb(exprAt(0, 1)) && exprAt(0, 0).isEmpty();
+    const bool ok3 = loadMigrated && resavedNoSection && stringMigrated && openMigrated;
+
+    // (4) the file-backed export Timeline (RenderQueue::resolveTimeline) of the legacy and of
+    // the MainWindow-saved project: the bindings on e, and no audio-level snapshot (level 0).
+    auto resolved = [](const QString &path, bool *noSnapshot) {
+        RenderJob job;
+        job.projectFilePath = path;
+        Timeline *owned = nullptr;
+        Timeline *timeline = member(ResolveTimelineTag{})(job, &owned);
+        exprbind::ClipExpressionBindings out;
+        if (timeline && !timeline->videoTracks().isEmpty() && timeline->videoTracks()[0]->clipCount() > 1)
+            out = timeline->videoTracks()[0]->clips().at(1).expressions;
+        if (noSnapshot) *noSnapshot = timeline && !timeline->expressionAudioEnvForRead();
+        delete owned;
+        return out;
+    };
+    bool legacyNoSnapshot = false, savedNoSnapshot = false;
+    const exprbind::ClipExpressionBindings resolvedLegacy = resolved(legacyPath, &legacyNoSnapshot);
+    const exprbind::ClipExpressionBindings resolvedSaved = resolved(savedPath, &savedNoSnapshot);
+    const bool ok4 = isEb(resolvedLegacy) && isEb(resolvedSaved) && legacyNoSnapshot && savedNoSnapshot;
+
+    // (5) a split of the expression clip: both halves carry the bindings.
+    load(tl, {{clipFor("e", 4.0)}});
+    const bool set5 = tl.setClipExpressions(0, 0, eb);
+    QString splitErr;
+    const bool split = tl.splitClipByIndex(false, 0, 0, 2.0, &splitErr);
+    const int pieces = tl.trackAt(false, 0)->clipCount();
+    const bool halvesEb = isEb(exprAt(0, 0)) && isEb(exprAt(0, 1));
+    const bool ok5 = set5 && split && pieces == 2 && halvesEb;
+
+    // (6) Smart Render on (VEDITOR_SMART_RENDER=1 and VEDITOR_SMARTRENDER_TEST_SEAM=1, both
+    // restored after, as in G37): a single full-length V1 mpeg4 clip is stream-copied without
+    // bindings (control) and encoded with transform.position.x = 0.3, so the output frame at
+    // 0.5 s is moved off the source frame.
+    const QString srcPath = dir.filePath(QStringLiteral("g38-src.mp4"));
+    const QString silentPath = dir.filePath(QStringLiteral("g38-silent.png"));
+    QImage silent(2, 2, QImage::Format_RGB32);
+    silent.fill(Qt::black);
+    const bool fixture6 = writeVideoFile(srcPath, 20) && silent.save(silentPath);
+    const bool envSet6 = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+    const QByteArray env6 = qgetenv("VEDITOR_SMART_RENDER");
+    const bool seamSet6 = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+    const QByteArray seam6 = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+    auto exportOnce = [&](bool withExpressions, const QString &outName, QStringList *log, QString *err) {
+        ClipInfo clip;
+        clip.filePath = srcPath;
+        clip.displayName = QStringLiteral("g38-src");
+        clip.duration = 2.0;
+        clip.outPoint = 2.0;
+        if (withExpressions)
+            clip.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("0.3"));
+        Timeline export6;
+        export6.setProjectOutputConfig(40, 24, true, 10.0);
+        export6.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        const QString outPath = dir.filePath(outName);
+        RenderPreset preset{QStringLiteral("G38"), 40, 24, QStringLiteral("mpeg4"), 600000, QStringLiteral("mp4")};
+        RenderJob job = RenderQueue::jobFromPreset(preset, outPath, 0, 2000000);
+        job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        job.timeline = &export6;
+        job.projectFilePath = silentPath;
+        job.exportConfig["fps"] = 10;
+        job.exportConfig["videoCodec"] = QStringLiteral("mpeg4");
+        const QByteArray hadEnv = qgetenv("VEDITOR_SMART_RENDER");
+        const bool envWasSet = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER");
+        const QByteArray hadSeam = qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        const bool seamWasSet = qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM");
+        qputenv("VEDITOR_SMART_RENDER", "1");
+        qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", "1");
+        g_smartRenderLog = log;
+        g_previousSmartRenderHandler = qInstallMessageHandler(captureSmartRender);
+        RenderQueue queue;
+        QEventLoop loop;
+        bool done = false, success = false;
+        QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                         [&](const QString &uuid, bool okJob, const QString &message) {
+                             if (uuid != job.uuid) return;
+                             done = true;
+                             success = okJob;
+                             *err = message;
+                             loop.quit();
+                         });
+        queue.addJob(job);
+        queue.start();
+        if (!done) loop.exec();
+        qInstallMessageHandler(g_previousSmartRenderHandler);
+        g_previousSmartRenderHandler = nullptr;
+        g_smartRenderLog = nullptr;
+        if (envWasSet) qputenv("VEDITOR_SMART_RENDER", hadEnv);
+        else qunsetenv("VEDITOR_SMART_RENDER");
+        if (seamWasSet) qputenv("VEDITOR_SMARTRENDER_TEST_SEAM", hadSeam);
+        else qunsetenv("VEDITOR_SMARTRENDER_TEST_SEAM");
+        return success ? outPath : QString();
+    };
+    auto logHas = [](const QStringList &log, const char *needle) {
+        for (const QString &line : log)
+            if (line.contains(QLatin1String(needle))) return true;
+        return false;
+    };
+    auto maxDiff = [](const QImage &a, const QImage &b) {
+        if (a.isNull() || b.isNull() || a.size() != b.size()) return -1;
+        const QImage x = a.convertToFormat(QImage::Format_RGB32), y = b.convertToFormat(QImage::Format_RGB32);
+        int worst = 0;
+        for (int yy = 0; yy < x.height(); ++yy)
+            for (int xx = 0; xx < x.width(); ++xx) {
+                const QRgb p = x.pixel(xx, yy), q = y.pixel(xx, yy);
+                worst = std::max({worst, std::abs(qRed(p) - qRed(q)), std::abs(qGreen(p) - qGreen(q)),
+                                  std::abs(qBlue(p) - qBlue(q))});
+            }
+        return worst;
+    };
+    QStringList plainLog, exprLog;
+    QString plainErr, exprErr;
+    const QString plainOut = fixture6 ? exportOnce(false, QStringLiteral("g38-plain.mp4"), &plainLog, &plainErr) : QString();
+    const QString exprOut = fixture6 ? exportOnce(true, QStringLiteral("g38-expr.mp4"), &exprLog, &exprErr) : QString();
+    const bool envRestored = qEnvironmentVariableIsSet("VEDITOR_SMART_RENDER") == envSet6
+        && qgetenv("VEDITOR_SMART_RENDER") == env6
+        && qEnvironmentVariableIsSet("VEDITOR_SMARTRENDER_TEST_SEAM") == seamSet6
+        && qgetenv("VEDITOR_SMARTRENDER_TEST_SEAM") == seam6;
+    const QImage srcFrame = fixture6 ? libavcore::grabFrameAt(srcPath, 0.5) : QImage();
+    const int plainDiff = plainOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(plainOut, 0.5));
+    const int exprDiff = exprOut.isEmpty() ? -1 : maxDiff(srcFrame, libavcore::grabFrameAt(exprOut, 0.5));
+    const bool plainCopied = !plainOut.isEmpty() && logHas(plainLog, "stream-copied whole timeline");
+    const bool exprCopied = logHas(exprLog, "stream-copied whole timeline");
+    const bool exprReason = logHas(exprLog, "timeline has a dynamic transform");
+    const bool ok6 = fixture6 && plainCopied && plainDiff >= 0 && plainDiff <= 2 && !exprOut.isEmpty()
+        && !exprCopied && exprReason && exprDiff > 60 && envRestored;
+
+    std::fprintf(stderr, "connected-clip G38 (1) set=%d depth %d->%d (expect +1) onClip=%d same again=%d depth %d "
+                 "(expect same) undo none=%d redo back=%d ok=%d\n", set1, d0, d1, onClip, setAgain, d1b,
+                 undoNone, redoBack, ok1);
+    std::fprintf(stderr, "connected-clip G38 (2) saved=%d [%s] wiped=%d opened=%d [%s] on e=%d clip key V1[1] only=%d "
+                 "root %s=%d (expect 0) ok=%d\n", saved, qPrintable(saveErr), wiped, opened, qPrintable(openErr),
+                 int(onE2), int(clipKey), qPrintable(section), int(savedRoot.contains(section)), ok2);
+    std::fprintf(stderr, "connected-clip G38 (3) legacy \"0:1\": load=%d migrated=%d resaved=%d root section=%d "
+                 "(expect 0) | fromJsonString=%d migrated=%d | open=%d [%s] on V1[1]=%d ok=%d\n", legacyLoaded,
+                 loadMigrated, resaved, int(resavedRoot.contains(section)), stringLoaded, stringMigrated,
+                 legacyOpened, qPrintable(legacyOpenErr), openMigrated, ok3);
+    std::fprintf(stderr, "connected-clip G38 (4) resolveTimeline legacy bindings=%d no snapshot=%d | saved bindings=%d "
+                 "no snapshot=%d ok=%d\n", int(isEb(resolvedLegacy)), int(legacyNoSnapshot),
+                 int(isEb(resolvedSaved)), int(savedNoSnapshot), ok4);
+    std::fprintf(stderr, "connected-clip G38 (5) set=%d split=%d [%s] pieces=%d (expect 2) both halves carry them=%d "
+                 "ok=%d\n", set5, split, qPrintable(splitErr), pieces, int(halvesEb), ok5);
+    std::fprintf(stderr, "connected-clip G38 (6) smart render: fixture=%d | no bindings out=%d [%s] stream-copied=%d "
+                 "(expect 1) maxdiff@0.5=%d (expect <=2) | expression out=%d [%s] stream-copied=%d (expect 0) "
+                 "dynamic-transform reason=%d maxdiff@0.5=%d (expect >60) env restored=%d ok=%d\n", int(fixture6),
+                 int(!plainOut.isEmpty()), qPrintable(plainErr), int(plainCopied), plainDiff, int(!exprOut.isEmpty()),
+                 qPrintable(exprErr), int(exprCopied), int(exprReason), exprDiff, int(envRestored), ok6);
+    tally.gate(38, ok1 && ok2 && ok3 && ok4 && ok5 && ok6,
+               "the clip expression commit recorded no / an extra undo point or did not undo / redo, the "
+               "bindings did not save and open with the clip, a legacy root expressionBindingsEntries section "
+               "was not moved onto V1[1] by load / fromJsonString / open or was written again, the file-backed "
+               "export Timeline lost them (or had a snapshot), a split left a half without them, or Smart Render "
+               "stream-copied an expression clip");
 }
 
 // G33 (US-1320): one composed clipKeysRemapped for a storyline media drop on V1 whose
@@ -2016,6 +2680,494 @@ void threePointCarrierGate(selftest::GateTally &tally, Timeline &tl, const Sidec
 
 } // namespace
 
+// G6: carriers follow by uid (in its own function to keep the runConnectedClipSelftest frame
+// small: US-1504 made ClipInfo larger and that frame overflowed the main thread stack).
+static void carriersByUidGate(selftest::GateTally &tally, Timeline *mainTimeline)
+{
+    // (a) X (connected, roto + parent -> Y) overtakes Y (unconnected, roto).
+    Timeline timeline;
+    load(timeline, {{clipFor("b", 10.0)}, {clipFor("x", 1.0, 1.0), clipFor("y", 1.0, 1.0)}});
+    const QString bUid = uidAt(timeline, 0, 0);
+    const QString xUid = uidAt(timeline, 1, 0);
+    const QString yUid = uidAt(timeline, 1, 1);
+    timeline.connectClip(TrackKind::Video, 1, 0, bUid);
+    RotoClipEntry xRoto;
+    xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
+    RotoClipEntry yRoto;
+    yRoto.brushMask = QImage(2, 2, QImage::Format_ARGB32);
+    timeline.setRotoEntries({{QStringLiteral("1:0"), xRoto}, {QStringLiteral("1:1"), yRoto}});
+    timeline.setClipParent(QStringLiteral("1:0"), QStringLiteral("1:1"));
+    timeline.absorbIntoCurrentUndoPoint();
+    Timeline::MoveClipResult result;
+    timeline.moveClipByIndex(false, 0, 0, 5.0, 0, &result, nullptr);
+    const Located x = locate(timeline, false, xUid);
+    const Located y = locate(timeline, false, yUid);
+    const auto roto = timeline.rotoEntries();
+    const auto parents = timeline.clipParentEntries();
+    const QString xKey = QStringLiteral("%1:%2").arg(x.track).arg(x.index);
+    const QString yKey = QStringLiteral("%1:%2").arg(y.track).arg(y.index);
+    const bool aOk = near(x.startSec, 6.0) && x.index == 1 && y.index == 0
+        && roto.value(xKey).brushMask.width() == 1 && roto.value(yKey).brushMask.width() == 2
+        && parents.value(xKey) == yKey;
+    std::fprintf(stderr, "connected-clip G6a xStart=%.6f xKey=%s yKey=%s rotoX=%d rotoY=%d "
+                 "parent[x]=%s rotoCount=%lld\n", x.startSec, qPrintable(xKey), qPrintable(yKey),
+                 roto.value(xKey).brushMask.width(), roto.value(yKey).brushMask.width(),
+                 qPrintable(parents.value(xKey)), static_cast<long long>(roto.size()));
+
+    // (b) / (c) X (connected, matte with source Z, parent of Z) collides with Z.
+    auto collision = [&](bool nested, const char *label) {
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 1.0)}, {}});
+        if (nested) {
+            TimelineSequence sequence;
+            sequence.id = QStringLiteral("nested");
+            sequence.name = QStringLiteral("Nested");
+            sequence.videoTracks = {{clipFor("n", 3.0)}};
+            sequence.audioTracks = {{}};
+            tl.addSequence(sequence);
+            tl.saveUndoState(QStringLiteral("nested"));
+        }
+        const QString anchor = uidAt(tl, 0, 0);
+        const QString xId = uidAt(tl, 1, 0);
+        const QString zId = uidAt(tl, 1, 1);
+        tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        TimelineTrackMatteEntry matte;
+        matte.matteType = TrackMatteType::AlphaMatte;
+        matte.matteSourceClipId = QStringLiteral("1:1");
+        tl.setTrackMatteEntries({{QStringLiteral("1:0"), matte}});
+        tl.setClipParent(QStringLiteral("1:1"), QStringLiteral("1:0"));
+        tl.absorbIntoCurrentUndoPoint();
+        const int tracksBefore = tl.videoTrackCount();
+        const int sequencesBefore = tl.sequences().size();
+        Timeline::MoveClipResult moveResult;
+        tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        const Located xl = locate(tl, false, xId);
+        const Located zl = locate(tl, false, zId);
+        const QString xKey2 = QStringLiteral("%1:%2").arg(xl.track).arg(xl.index);
+        const QString zKey2 = QStringLiteral("%1:%2").arg(zl.track).arg(zl.index);
+        const auto mattes = tl.trackMatteEntries();
+        const auto parentMap = tl.clipParentEntries();
+        const bool ok = xl.track == 2 && near(xl.startSec, 3.5)
+            && tl.videoTrackCount() == tracksBefore
+            && mattes.size() == 1 && mattes.contains(xKey2)
+            && mattes.value(xKey2).matteSourceClipId == zKey2
+            && parentMap.value(zKey2) == xKey2
+            && tl.sequences().size() == sequencesBefore;
+        std::fprintf(stderr, "connected-clip G6%s xKey=%s (track %d start %.6f) zKey=%s "
+                     "tracks %d->%d matteKeys=%s matteSource=%s parent[z]=%s sequences %d->%lld\n",
+                     label, qPrintable(xKey2), xl.track, xl.startSec, qPrintable(zKey2),
+                     tracksBefore, tl.videoTrackCount(),
+                     qPrintable(QStringList(mattes.keys()).join(',')),
+                     qPrintable(mattes.value(xKey2).matteSourceClipId),
+                     qPrintable(parentMap.value(zKey2)), sequencesBefore,
+                     static_cast<long long>(tl.sequences().size()));
+        return std::make_pair(ok, sequencesBefore);
+    };
+    const auto b = collision(false, "b");
+    const auto c = collision(true, "c");
+
+    // (d) No free track (V2 only): X goes back to its own start, detached
+    // with one warning; the track count stays and undo brings the connection back.
+    bool dOk = false;
+    {
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 1.0)}});
+        const QString anchor = uidAt(tl, 0, 0);
+        const QString xId = uidAt(tl, 1, 0);
+        tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        tl.takeConnectionWarnings();
+        const int tracksBefore = tl.videoTrackCount();
+        Timeline::MoveClipResult moveResult;
+        tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        const Located xl = locate(tl, false, xId);
+        const int warnings = tl.takeConnectionWarnings().size();
+        const int tracksAfter = tl.videoTrackCount();
+        tl.undo();
+        const Located xu = locate(tl, false, xId);
+        dOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
+            && warnings == 1 && tracksAfter == tracksBefore
+            && xu.clip.anchorUid == anchor && near(xu.startSec, 1.0);
+        std::fprintf(stderr, "connected-clip G6d xTrack=%d (expect 1) xStart=%.6f (expect 1) "
+                     "anchorUid=[%s] (expect empty) warnings=%d (expect 1) tracks %d->%d "
+                     "(expect unchanged) undo anchorUid=%d (expect 1) start=%.6f\n", xl.track,
+                     xl.startSec, qPrintable(xl.clip.anchorUid), warnings, tracksBefore,
+                     tracksAfter, xu.clip.anchorUid == anchor, xu.startSec);
+    }
+
+    // (e) V3 holds an unconnected Y with X's uid (load fixture; uids are
+    // unique only per track). X collides with Z on V2 and evacuates past V3
+    // to the free V4; deleting the anchor then deletes X and keeps Y.
+    bool eOk = false;
+    {
+        ClipInfo x = clipFor("x", 2.0, 1.0);
+        ClipInfo y = clipFor("y", 2.0);
+        x.uid = y.uid = QStringLiteral("selftest-shared-uid");
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}, {}});
+        shareUid(tl, 2, 0, x.uid);
+        const QString anchor = uidAt(tl, 0, 0);
+        const QString xId = uidAt(tl, 1, 0);
+        const QString zId = uidAt(tl, 1, 1);
+        const bool sharedLoaded = xId == x.uid && uidAt(tl, 2, 0) == x.uid;
+        tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        // X carries roto, a matte sourced from Z and a parent (Z) at its V2
+        // key; Y carries roto at its V3 key.
+        RotoClipEntry xRoto;
+        xRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
+        RotoClipEntry yRoto;
+        yRoto.brushMask = QImage(4, 4, QImage::Format_ARGB32);
+        tl.setRotoEntries({{trackMatteClipKey(1, 0), xRoto}, {trackMatteClipKey(2, 0), yRoto}});
+        TimelineTrackMatteEntry xMatte;
+        xMatte.matteType = TrackMatteType::AlphaMatte;
+        xMatte.matteSourceClipId = trackMatteClipKey(1, 1);
+        tl.setTrackMatteEntries({{trackMatteClipKey(1, 0), xMatte}});
+        tl.setClipParent(trackMatteClipKey(1, 0), trackMatteClipKey(1, 1));
+        tl.absorbIntoCurrentUndoPoint();
+        Timeline::MoveClipResult moveResult;
+        tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        int maxSameUid = 0;
+        int xTrack = -1;
+        int xIndex = -1;
+        bool xConnected = false;
+        for (int t = 0; t < tl.videoTrackCount(); ++t) {
+            int same = 0;
+            const QVector<ClipInfo> &clips = tl.trackAt(false, t)->clips();
+            for (int i = 0; i < clips.size(); ++i) {
+                if (clips[i].uid == xId) ++same;
+                if (clips[i].displayName == QStringLiteral("x")) {
+                    xTrack = t;
+                    xIndex = i;
+                    xConnected = clips[i].anchorUid == anchor;
+                }
+            }
+            maxSameUid = qMax(maxSameUid, same);
+        }
+        const Located zl = locate(tl, false, zId);
+        const QString xKeyE = trackMatteClipKey(3, xIndex);
+        const QString zKeyE = trackMatteClipKey(zl.track, zl.index);
+        const QString yKeyE = trackMatteClipKey(2, 0);
+        const auto rotoE = tl.rotoEntries();
+        const auto mattesE = tl.trackMatteEntries();
+        const auto parentsE = tl.clipParentEntries();
+        const bool carriersOk = rotoE.size() == 2 && rotoE.value(xKeyE).brushMask.width() == 3
+            && rotoE.value(yKeyE).brushMask.width() == 4 && mattesE.size() == 1
+            && mattesE.contains(xKeyE) && mattesE.value(xKeyE).matteSourceClipId == zKeyE
+            && parentsE.value(xKeyE) == zKeyE;
+        std::fprintf(stderr, "connected-clip G6e carriers xKey=%s zKey=%s rotoCount=%lld "
+                     "(expect 2) roto[x]=%d (expect 3) roto[y %s]=%d (expect 4) matteKeys=%s "
+                     "(expect x) matteSource=%s (expect z) parent[x]=%s (expect z)\n",
+                     qPrintable(xKeyE), qPrintable(zKeyE), static_cast<long long>(rotoE.size()),
+                     rotoE.value(xKeyE).brushMask.width(), qPrintable(yKeyE),
+                     rotoE.value(yKeyE).brushMask.width(),
+                     qPrintable(QStringList(mattesE.keys()).join(',')),
+                     qPrintable(mattesE.value(xKeyE).matteSourceClipId),
+                     qPrintable(parentsE.value(xKeyE)));
+        for (int t = 0; t < tl.videoTrackCount(); ++t)
+            tl.trackAt(false, t)->setSelectedClip(t == 0 ? 0 : -1);
+        for (int t = 0; t < tl.audioTrackCount(); ++t)
+            tl.trackAt(true, t)->setSelectedClip(-1);
+        tl.takeConnectionWarnings();
+        tl.deleteSelectedClip(); // saveUndoState("Delete clip") runs the reconcile
+        const QStringList warnings = tl.takeConnectionWarnings();
+        const QVector<ClipInfo> v3After = tl.trackAt(false, 2)->clips();
+        const bool yKept = v3After.size() == 1 && v3After[0].uid == xId
+            && v3After[0].displayName == QStringLiteral("y");
+        int xLeft = 0;
+        for (int t = 0; t < tl.videoTrackCount(); ++t)
+            for (const ClipInfo &clip : tl.trackAt(false, t)->clips())
+                if (clip.displayName == QStringLiteral("x")) ++xLeft;
+        eOk = sharedLoaded && xTrack == 3 && xConnected && maxSameUid == 1 && carriersOk && yKept
+            && xLeft == 0 && warnings.isEmpty() && tl.trackAt(false, 0)->clipCount() == 0
+            && tl.videoTrackCount() == 4;
+        std::fprintf(stderr, "connected-clip G6e sharedLoaded=%d xTrack=%d (expect 3, not V3=2) "
+                     "xConnected=%d maxSameUidPerTrack=%d (expect 1) carriersOk=%d afterDelete v3Clips=%lld "
+                     "v3[0]=%s yKept=%d xLeft=%d (expect 0) warnings=%lld (expect 0) v1Clips=%d "
+                     "tracks=%d (expect 4)\n", sharedLoaded, xTrack, xConnected, maxSameUid,
+                     carriersOk, static_cast<long long>(v3After.size()),
+                     qPrintable(v3After.isEmpty() ? QString() : v3After[0].displayName), yKept,
+                     xLeft, static_cast<long long>(warnings.size()),
+                     tl.trackAt(false, 0)->clipCount(), tl.videoTrackCount());
+    }
+
+    // (f) Connected X (V2) and connected Y (V3) share a uid; V2 also holds an
+    // unconnected Z. X collides with Z, and V3 is still reserved for the
+    // pending Y, so X goes back to its own start on V2 (detached, one
+    // warning) and Y follows on V3 connected. Without the reservation X
+    // lands on V3 first, Y falls back beside it with the same uid, and the
+    // uid remap swaps Y's roto entry onto X and drops X's.
+    bool fOk = false;
+    {
+        ClipInfo x = clipFor("x", 2.0, 1.0);
+        ClipInfo y = clipFor("y", 2.0, 6.0);
+        x.uid = y.uid = QStringLiteral("selftest-shared-uid");
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}});
+        shareUid(tl, 2, 0, x.uid);
+        const QString anchor = uidAt(tl, 0, 0);
+        const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
+        const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        const bool yConnect = tl.connectClip(TrackKind::Video, 2, 0, anchor);
+        RotoClipEntry xRoto;
+        xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
+        RotoClipEntry yRoto;
+        yRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
+        tl.setRotoEntries({{QStringLiteral("1:0"), xRoto}, {QStringLiteral("2:0"), yRoto}});
+        tl.absorbIntoCurrentUndoPoint();
+        tl.takeConnectionWarnings();
+        const int tracksBefore = tl.videoTrackCount();
+        // x and y share the uid; key = "track:index".
+        auto byName = [&tl](const QString &name) { return locateByName(tl, false, name); };
+        auto keyOf = [](const Located &l) { return QStringLiteral("%1:%2").arg(l.track).arg(l.index); };
+        auto describe = [&](const Located &l) {
+            return QStringLiteral("track=%1 start=%2 anchored=%3")
+                .arg(l.track).arg(l.startSec, 0, 'f', 6).arg(l.clip.anchorUid == anchor);
+        };
+        Timeline::MoveClipResult moveResult;
+        const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        const int warnings = tl.takeConnectionWarnings().size();
+        int maxSameUid = 0;
+        for (int t = 0; t < tl.videoTrackCount(); ++t) {
+            QHash<QString, int> perTrack;
+            for (const ClipInfo &clip : tl.trackAt(false, t)->clips())
+                if (!clip.uid.isEmpty()) maxSameUid = qMax(maxSameUid, ++perTrack[clip.uid]);
+        }
+        const Located xl = byName(QStringLiteral("x"));
+        const Located yl = byName(QStringLiteral("y"));
+        const auto roto = tl.rotoEntries();
+        const int rotoX = roto.value(keyOf(xl)).brushMask.width();
+        const int rotoY = roto.value(keyOf(yl)).brushMask.width();
+        const bool placedOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
+            && yl.track == 2 && near(yl.startSec, 8.5) && yl.clip.anchorUid == anchor;
+        const bool carriersOk = rotoX == 1 && rotoY == 3 && roto.size() == 2;
+        const int tracksAfter = tl.videoTrackCount();
+        tl.undo();
+        const Located xu = byName(QStringLiteral("x"));
+        const Located yu = byName(QStringLiteral("y"));
+        const bool undoOk = xu.track == 1 && near(xu.startSec, 1.0) && xu.clip.anchorUid == anchor
+            && yu.track == 2 && near(yu.startSec, 6.0) && yu.clip.anchorUid == anchor;
+        tl.redo();
+        const Located xr = byName(QStringLiteral("x"));
+        const Located yr = byName(QStringLiteral("y"));
+        const bool redoOk = xr.track == xl.track && xr.index == xl.index
+            && near(xr.startSec, xl.startSec) && xr.clip.anchorUid == xl.clip.anchorUid
+            && yr.track == yl.track && yr.index == yl.index
+            && near(yr.startSec, yl.startSec) && yr.clip.anchorUid == yl.clip.anchorUid;
+        fOk = sharedLoaded && xConnect && yConnect && moved && maxSameUid == 1 && placedOk
+            && warnings == 1 && carriersOk && tracksAfter == tracksBefore && undoOk && redoOk;
+        std::fprintf(stderr, "connected-clip G6f sharedLoaded=%d connect x=%d y=%d moved=%d "
+                     "maxSameUidPerTrack=%d (expect 1) x[%s] key=%s (expect track=1 start=1 "
+                     "anchored=0) y[%s] key=%s (expect track=2 start=8.5 anchored=1) warnings=%d "
+                     "(expect 1) rotoX=%d (expect 1) rotoY=%d (expect 3) rotoCount=%lld (expect 2) "
+                     "tracks %d->%d undo x[%s] y[%s] undoOk=%d redo x[%s] y[%s] redoOk=%d\n",
+                     sharedLoaded, xConnect, yConnect, moved, maxSameUid, qPrintable(describe(xl)),
+                     qPrintable(keyOf(xl)), qPrintable(describe(yl)), qPrintable(keyOf(yl)),
+                     warnings, rotoX, rotoY, static_cast<long long>(roto.size()), tracksBefore,
+                     tracksAfter, qPrintable(describe(xu)), qPrintable(describe(yu)), undoOk,
+                     qPrintable(describe(xr)), qPrintable(describe(yr)), redoOk);
+    }
+
+    // (g) Connected X (V2, collides with Z) and connected Y (V3, collides
+    // with W) share a uid and both leave their own track: Y (earlier target)
+    // goes to the free V4, X skips V3 (W) and V4 (Y's uid) for V5. Pairing
+    // the leftover keys of the uid in track order swaps their roto / parent
+    // entries; the reconcile's own old -> new keys keep each with its clip.
+    bool gOk = false;
+    {
+        ClipInfo x = clipFor("x", 2.0, 1.0);
+        ClipInfo y = clipFor("y", 2.0, 0.5);
+        x.uid = y.uid = QStringLiteral("selftest-shared-uid");
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 0.5)},
+                  {y, clipFor("w", 2.0, 0.5)}, {}, {}});
+        shareUid(tl, 2, 0, x.uid);
+        const QString anchor = uidAt(tl, 0, 0);
+        const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
+        const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        const bool yConnect = tl.connectClip(TrackKind::Video, 2, 0, anchor);
+        RotoClipEntry xRoto;
+        xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
+        RotoClipEntry yRoto;
+        yRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
+        tl.setRotoEntries({{trackMatteClipKey(1, 0), xRoto}, {trackMatteClipKey(2, 0), yRoto}});
+        tl.setClipParent(trackMatteClipKey(1, 0), trackMatteClipKey(1, 1)); // X -> Z
+        tl.absorbIntoCurrentUndoPoint();
+        tl.takeConnectionWarnings();
+        struct State { Located x, y, z; int rotoX = 0, rotoY = 0; qsizetype rotoCount = 0; QString parentX; };
+        auto capture = [&tl] {
+            State s;
+            s.x = locateByName(tl, false, QStringLiteral("x"));
+            s.y = locateByName(tl, false, QStringLiteral("y"));
+            s.z = locateByName(tl, false, QStringLiteral("z"));
+            const auto roto = tl.rotoEntries();
+            s.rotoX = roto.value(trackMatteClipKey(s.x.track, s.x.index)).brushMask.width();
+            s.rotoY = roto.value(trackMatteClipKey(s.y.track, s.y.index)).brushMask.width();
+            s.rotoCount = roto.size();
+            s.parentX = tl.clipParentEntries().value(trackMatteClipKey(s.x.track, s.x.index));
+            return s;
+        };
+        auto describe = [&anchor](const State &s) {
+            return QStringLiteral("x[%1:%2 start=%3 anchored=%4 roto=%5 parent=%6] "
+                                  "y[%7:%8 start=%9 anchored=%10 roto=%11] z=%12:%13 rotoCount=%14")
+                .arg(s.x.track).arg(s.x.index).arg(s.x.startSec, 0, 'f', 6)
+                .arg(s.x.clip.anchorUid == anchor).arg(s.rotoX).arg(s.parentX)
+                .arg(s.y.track).arg(s.y.index).arg(s.y.startSec, 0, 'f', 6)
+                .arg(s.y.clip.anchorUid == anchor).arg(s.rotoY)
+                .arg(s.z.track).arg(s.z.index).arg(s.rotoCount);
+        };
+        Timeline::MoveClipResult moveResult;
+        const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        const State after = capture();
+        const QString zKey = trackMatteClipKey(after.z.track, after.z.index);
+        const bool afterOk = after.x.track == 4 && near(after.x.startSec, 3.5)
+            && after.x.clip.anchorUid == anchor && after.y.track == 3 && near(after.y.startSec, 3.0)
+            && after.y.clip.anchorUid == anchor && after.rotoX == 1 && after.rotoY == 3
+            && after.rotoCount == 2 && after.parentX == zKey;
+        tl.undo();
+        const State undone = capture();
+        const bool undoOk = undone.x.track == 1 && undone.x.index == 0 && near(undone.x.startSec, 1.0)
+            && undone.x.clip.anchorUid == anchor && undone.y.track == 2 && undone.y.index == 0
+            && near(undone.y.startSec, 0.5) && undone.y.clip.anchorUid == anchor
+            && undone.rotoX == 1 && undone.rotoY == 3 && undone.rotoCount == 2
+            && undone.parentX == trackMatteClipKey(1, 1);
+        tl.redo();
+        const State redone = capture();
+        const bool redoOk = describe(redone) == describe(after);
+        gOk = sharedLoaded && xConnect && yConnect && moved && afterOk && undoOk && redoOk;
+        std::fprintf(stderr, "connected-clip G6g sharedLoaded=%d connect x=%d y=%d moved=%d "
+                     "after %s zKey=%s (expect x 4:0 start 3.5 roto 1 parent z, y 3:0 start 3 "
+                     "roto 3, rotoCount 2) afterOk=%d undo %s undoOk=%d redo %s redoOk=%d\n",
+                     sharedLoaded, xConnect, yConnect, moved, qPrintable(describe(after)),
+                     qPrintable(zKey), afterOk, qPrintable(describe(undone)), undoOk,
+                     qPrintable(describe(redone)), redoOk);
+    }
+
+    // (h) / (i) Connected X (V2) is linked to connected XA (A1). (h) X
+    // collides with Z and there is no V3 while XA's target is free; (i) no
+    // collision but V2 is locked. The group is kept whole: both stay at 1,
+    // detached, with one warning (a per-clip fallback moves XA to 3.5 and
+    // keeps it connected); undo reconnects both.
+    auto linkedGroup = [&](bool locked, const char *label) {
+        ClipInfo x = clipFor("x", 2.0, 1.0);
+        ClipInfo xa = clipFor("xa", 2.0, 1.0);
+        x.linkGroup = xa.linkGroup = 11;
+        QVector<ClipInfo> v2{x};
+        if (!locked) v2.append(clipFor("z", 2.0, 1.0));
+        Timeline tl;
+        load(tl, {{clipFor("b", 10.0)}, v2}, {{xa}});
+        const QString anchor = uidAt(tl, 0, 0);
+        const bool connected = tl.connectClip(TrackKind::Video, 1, 0, anchor);
+        const bool linked = locateByName(tl, false, QStringLiteral("x")).clip.linkGroup == 11
+            && locateByName(tl, true, QStringLiteral("xa")).clip.anchorUid == anchor;
+        if (locked) tl.trackAt(false, 1)->setLocked(true);
+        tl.takeConnectionWarnings();
+        const int videoTracks = tl.videoTrackCount();
+        const int audioTracks = tl.audioTrackCount();
+        auto describe = [&anchor](const Located &l) {
+            return QStringLiteral("%1:%2 start=%3 anchored=%4").arg(l.track).arg(l.index)
+                .arg(l.startSec, 0, 'f', 6).arg(l.clip.anchorUid == anchor);
+        };
+        Timeline::MoveClipResult moveResult;
+        const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
+        const QStringList warnings = tl.takeConnectionWarnings();
+        const Located xl = locateByName(tl, false, QStringLiteral("x"));
+        const Located al = locateByName(tl, true, QStringLiteral("xa"));
+        const bool afterOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
+            && al.track == 0 && near(al.startSec, 1.0) && al.clip.anchorUid.isEmpty()
+            && warnings.size() == 1 && tl.videoTrackCount() == videoTracks
+            && tl.audioTrackCount() == audioTracks;
+        tl.undo();
+        const Located xu = locateByName(tl, false, QStringLiteral("x"));
+        const Located au = locateByName(tl, true, QStringLiteral("xa"));
+        const bool undoOk = xu.track == 1 && near(xu.startSec, 1.0) && xu.clip.anchorUid == anchor
+            && au.track == 0 && near(au.startSec, 1.0) && au.clip.anchorUid == anchor;
+        tl.redo();
+        const Located xr = locateByName(tl, false, QStringLiteral("x"));
+        const Located ar = locateByName(tl, true, QStringLiteral("xa"));
+        const bool redoOk = describe(xr) == describe(xl) && describe(ar) == describe(al);
+        const bool ok = connected && linked && moved && afterOk && undoOk && redoOk;
+        std::fprintf(stderr, "connected-clip G6%s connected=%d linked=%d moved=%d x[%s] xa[%s] "
+                     "(expect both start=1 anchored=0) warnings=%lld (expect 1) [%s] tracks v%d->%d "
+                     "a%d->%d afterOk=%d undo x[%s] xa[%s] undoOk=%d redo x[%s] xa[%s] redoOk=%d\n",
+                     label, connected, linked, moved, qPrintable(describe(xl)),
+                     qPrintable(describe(al)), static_cast<long long>(warnings.size()),
+                     qPrintable(warnings.join(QStringLiteral(" | "))), videoTracks,
+                     tl.videoTrackCount(), audioTracks, tl.audioTrackCount(), afterOk,
+                     qPrintable(describe(xu)), qPrintable(describe(au)), undoOk,
+                     qPrintable(describe(xr)), qPrintable(describe(ar)), redoOk);
+        return ok;
+    };
+    const bool hOk = linkedGroup(false, "h");
+    const bool iOk = linkedGroup(true, "i");
+
+    // (b, main) The same evacuation on the MainWindow timeline, whose
+    // external undo hooks carry the mattes: V1 = [A (matte), B], X on V2 is
+    // connected to A and collides with Z when A moves after B; it goes to
+    // the free V3 and the track count stays. Undo must bring A's matte back
+    // at 0:0 and keep a solo toggled with no undo point (a structural undo
+    // would apply the stale external mixer state).
+    bool bMainOk = false;
+    if (!mainTimeline) {
+        std::fprintf(stderr, "connected-clip G6b-main mainTimeline missing\n");
+    } else {
+        load(*mainTimeline, {{clipFor("a", 5.0), clipFor("b", 5.0)},
+                             {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 7.5)}, {}});
+        const QString aId = uidAt(*mainTimeline, 0, 0);
+        const QString xId = uidAt(*mainTimeline, 1, 0);
+        mainTimeline->connectClip(TrackKind::Video, 1, 0, aId);
+        TimelineTrackMatteEntry matte;
+        matte.matteType = TrackMatteType::AlphaMatte;
+        matte.matteSourceClipId = QStringLiteral("1:1");
+        mainTimeline->setTrackMatteEntries({{QStringLiteral("0:0"), matte}});
+        mainTimeline->absorbIntoCurrentUndoPoint();
+        // A solo toggled with no undo point after this save must survive
+        // the undo across the evacuation's new track.
+        mainTimeline->saveUndoState(QStringLiteral("solo base"));
+        mainTimeline->toggleSoloTrack(0);
+        const int tracksBefore = mainTimeline->videoTrackCount();
+        Timeline::MoveClipResult moveResult;
+        const bool moved = mainTimeline->moveClipByIndex(false, 0, 0, 10.0, 0, &moveResult, nullptr);
+        const Located xl = locate(*mainTimeline, false, xId);
+        const int tracksAfterEdit = mainTimeline->videoTrackCount();
+        const QStringList editKeys = mainTimeline->trackMatteEntries().keys();
+        mainTimeline->undo();
+        const auto undone = mainTimeline->trackMatteEntries();
+        const Located al = locate(*mainTimeline, false, aId);
+        const AudioMixer *mixer = mainTimeline->audioMixer();
+        const QJsonArray mixerStates = mixer
+            ? mixer->collectTrackState().value("states").toArray() : QJsonArray{};
+        const bool mixerSolo = !mixerStates.isEmpty()
+            && mixerStates.at(0).toObject().value("solo").toBool();
+        const bool headerSolo = mainTimeline->audioTrackCount() > 0
+            && mainTimeline->audioTracks()[0]->isSolo();
+        bMainOk = moved && xl.track == 2 && near(xl.startSec, 11.0)
+            && tracksAfterEdit == tracksBefore
+            && al.track == 0 && al.index == 0 && near(al.startSec, 0.0)
+            && undone.contains(QStringLiteral("0:0")) && !undone.contains(QStringLiteral("0:1"))
+            && undone.value(QStringLiteral("0:0")).matteSourceClipId == QStringLiteral("1:1")
+            && mainTimeline->videoTrackCount() == tracksBefore
+            && mixerSolo && mixerSolo == headerSolo;
+        std::fprintf(stderr, "connected-clip G6b-main moved=%d xTrack=%d xStart=%.6f (expect 11) "
+                     "tracks %d->%d editMatteKeys=%s undoMatteKeys=%s (expect 0:0) "
+                     "undoMatteSource=%s (expect 1:1) undoTracks=%d (expect %d) aKey=%d:%d "
+                     "mixer=%d states=%lld mixerSolo0=%d (expect 1) headerSolo0=%d (expect 1)\n",
+                     moved, xl.track, xl.startSec, tracksBefore, tracksAfterEdit,
+                     qPrintable(editKeys.join(',')),
+                     qPrintable(QStringList(undone.keys()).join(',')),
+                     qPrintable(undone.value(QStringLiteral("0:0")).matteSourceClipId),
+                     mainTimeline->videoTrackCount(), tracksBefore, al.track, al.index,
+                     mixer != nullptr, static_cast<long long>(mixerStates.size()), mixerSolo,
+                     headerSolo);
+    }
+    tally.gate(6, aOk && b.first && bMainOk && c.first && c.second == 2 && dOk && eOk && fOk
+                   && gOk && hOk && iOk,
+               "a carrier entry did not follow its clip by uid (overtake / evacuation, also "
+               "two uid twins both leaving their tracks), undo of an evacuation lost the "
+               "pre-edit matte or a later solo, the nested sequence store was lost, reconcile "
+               "changed the track count, an evacuation shared a track with its uid twin (also "
+               "when the twin is a pending connected clip), or a link group was left partly "
+               "moved / connected (no slot, or a locked member)");
+}
+
 int runConnectedClipSelftest()
 {
     selftest::GateTally tally;
@@ -2175,490 +3327,7 @@ int runConnectedClipSelftest()
     }
 
     // G6: carriers follow by uid.
-    {
-        // (a) X (connected, roto + parent -> Y) overtakes Y (unconnected, roto).
-        Timeline timeline;
-        load(timeline, {{clipFor("b", 10.0)}, {clipFor("x", 1.0, 1.0), clipFor("y", 1.0, 1.0)}});
-        const QString bUid = uidAt(timeline, 0, 0);
-        const QString xUid = uidAt(timeline, 1, 0);
-        const QString yUid = uidAt(timeline, 1, 1);
-        timeline.connectClip(TrackKind::Video, 1, 0, bUid);
-        RotoClipEntry xRoto;
-        xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
-        RotoClipEntry yRoto;
-        yRoto.brushMask = QImage(2, 2, QImage::Format_ARGB32);
-        timeline.setRotoEntries({{QStringLiteral("1:0"), xRoto}, {QStringLiteral("1:1"), yRoto}});
-        timeline.setClipParent(QStringLiteral("1:0"), QStringLiteral("1:1"));
-        timeline.absorbIntoCurrentUndoPoint();
-        Timeline::MoveClipResult result;
-        timeline.moveClipByIndex(false, 0, 0, 5.0, 0, &result, nullptr);
-        const Located x = locate(timeline, false, xUid);
-        const Located y = locate(timeline, false, yUid);
-        const auto roto = timeline.rotoEntries();
-        const auto parents = timeline.clipParentEntries();
-        const QString xKey = QStringLiteral("%1:%2").arg(x.track).arg(x.index);
-        const QString yKey = QStringLiteral("%1:%2").arg(y.track).arg(y.index);
-        const bool aOk = near(x.startSec, 6.0) && x.index == 1 && y.index == 0
-            && roto.value(xKey).brushMask.width() == 1 && roto.value(yKey).brushMask.width() == 2
-            && parents.value(xKey) == yKey;
-        std::fprintf(stderr, "connected-clip G6a xStart=%.6f xKey=%s yKey=%s rotoX=%d rotoY=%d "
-                     "parent[x]=%s rotoCount=%lld\n", x.startSec, qPrintable(xKey), qPrintable(yKey),
-                     roto.value(xKey).brushMask.width(), roto.value(yKey).brushMask.width(),
-                     qPrintable(parents.value(xKey)), static_cast<long long>(roto.size()));
-
-        // (b) / (c) X (connected, matte with source Z, parent of Z) collides with Z.
-        auto collision = [&](bool nested, const char *label) {
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 1.0)}, {}});
-            if (nested) {
-                TimelineSequence sequence;
-                sequence.id = QStringLiteral("nested");
-                sequence.name = QStringLiteral("Nested");
-                sequence.videoTracks = {{clipFor("n", 3.0)}};
-                sequence.audioTracks = {{}};
-                tl.addSequence(sequence);
-                tl.saveUndoState(QStringLiteral("nested"));
-            }
-            const QString anchor = uidAt(tl, 0, 0);
-            const QString xId = uidAt(tl, 1, 0);
-            const QString zId = uidAt(tl, 1, 1);
-            tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            TimelineTrackMatteEntry matte;
-            matte.matteType = TrackMatteType::AlphaMatte;
-            matte.matteSourceClipId = QStringLiteral("1:1");
-            tl.setTrackMatteEntries({{QStringLiteral("1:0"), matte}});
-            tl.setClipParent(QStringLiteral("1:1"), QStringLiteral("1:0"));
-            tl.absorbIntoCurrentUndoPoint();
-            const int tracksBefore = tl.videoTrackCount();
-            const int sequencesBefore = tl.sequences().size();
-            Timeline::MoveClipResult moveResult;
-            tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            const Located xl = locate(tl, false, xId);
-            const Located zl = locate(tl, false, zId);
-            const QString xKey2 = QStringLiteral("%1:%2").arg(xl.track).arg(xl.index);
-            const QString zKey2 = QStringLiteral("%1:%2").arg(zl.track).arg(zl.index);
-            const auto mattes = tl.trackMatteEntries();
-            const auto parentMap = tl.clipParentEntries();
-            const bool ok = xl.track == 2 && near(xl.startSec, 3.5)
-                && tl.videoTrackCount() == tracksBefore
-                && mattes.size() == 1 && mattes.contains(xKey2)
-                && mattes.value(xKey2).matteSourceClipId == zKey2
-                && parentMap.value(zKey2) == xKey2
-                && tl.sequences().size() == sequencesBefore;
-            std::fprintf(stderr, "connected-clip G6%s xKey=%s (track %d start %.6f) zKey=%s "
-                         "tracks %d->%d matteKeys=%s matteSource=%s parent[z]=%s sequences %d->%lld\n",
-                         label, qPrintable(xKey2), xl.track, xl.startSec, qPrintable(zKey2),
-                         tracksBefore, tl.videoTrackCount(),
-                         qPrintable(QStringList(mattes.keys()).join(',')),
-                         qPrintable(mattes.value(xKey2).matteSourceClipId),
-                         qPrintable(parentMap.value(zKey2)), sequencesBefore,
-                         static_cast<long long>(tl.sequences().size()));
-            return std::make_pair(ok, sequencesBefore);
-        };
-        const auto b = collision(false, "b");
-        const auto c = collision(true, "c");
-
-        // (d) No free track (V2 only): X goes back to its own start, detached
-        // with one warning; the track count stays and undo brings the connection back.
-        bool dOk = false;
-        {
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 1.0)}});
-            const QString anchor = uidAt(tl, 0, 0);
-            const QString xId = uidAt(tl, 1, 0);
-            tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            tl.takeConnectionWarnings();
-            const int tracksBefore = tl.videoTrackCount();
-            Timeline::MoveClipResult moveResult;
-            tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            const Located xl = locate(tl, false, xId);
-            const int warnings = tl.takeConnectionWarnings().size();
-            const int tracksAfter = tl.videoTrackCount();
-            tl.undo();
-            const Located xu = locate(tl, false, xId);
-            dOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
-                && warnings == 1 && tracksAfter == tracksBefore
-                && xu.clip.anchorUid == anchor && near(xu.startSec, 1.0);
-            std::fprintf(stderr, "connected-clip G6d xTrack=%d (expect 1) xStart=%.6f (expect 1) "
-                         "anchorUid=[%s] (expect empty) warnings=%d (expect 1) tracks %d->%d "
-                         "(expect unchanged) undo anchorUid=%d (expect 1) start=%.6f\n", xl.track,
-                         xl.startSec, qPrintable(xl.clip.anchorUid), warnings, tracksBefore,
-                         tracksAfter, xu.clip.anchorUid == anchor, xu.startSec);
-        }
-
-        // (e) V3 holds an unconnected Y with X's uid (load fixture; uids are
-        // unique only per track). X collides with Z on V2 and evacuates past V3
-        // to the free V4; deleting the anchor then deletes X and keeps Y.
-        bool eOk = false;
-        {
-            ClipInfo x = clipFor("x", 2.0, 1.0);
-            ClipInfo y = clipFor("y", 2.0);
-            x.uid = y.uid = QStringLiteral("selftest-shared-uid");
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}, {}});
-            shareUid(tl, 2, 0, x.uid);
-            const QString anchor = uidAt(tl, 0, 0);
-            const QString xId = uidAt(tl, 1, 0);
-            const QString zId = uidAt(tl, 1, 1);
-            const bool sharedLoaded = xId == x.uid && uidAt(tl, 2, 0) == x.uid;
-            tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            // X carries roto, a matte sourced from Z and a parent (Z) at its V2
-            // key; Y carries roto at its V3 key.
-            RotoClipEntry xRoto;
-            xRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
-            RotoClipEntry yRoto;
-            yRoto.brushMask = QImage(4, 4, QImage::Format_ARGB32);
-            tl.setRotoEntries({{trackMatteClipKey(1, 0), xRoto}, {trackMatteClipKey(2, 0), yRoto}});
-            TimelineTrackMatteEntry xMatte;
-            xMatte.matteType = TrackMatteType::AlphaMatte;
-            xMatte.matteSourceClipId = trackMatteClipKey(1, 1);
-            tl.setTrackMatteEntries({{trackMatteClipKey(1, 0), xMatte}});
-            tl.setClipParent(trackMatteClipKey(1, 0), trackMatteClipKey(1, 1));
-            tl.absorbIntoCurrentUndoPoint();
-            Timeline::MoveClipResult moveResult;
-            tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            int maxSameUid = 0;
-            int xTrack = -1;
-            int xIndex = -1;
-            bool xConnected = false;
-            for (int t = 0; t < tl.videoTrackCount(); ++t) {
-                int same = 0;
-                const QVector<ClipInfo> &clips = tl.trackAt(false, t)->clips();
-                for (int i = 0; i < clips.size(); ++i) {
-                    if (clips[i].uid == xId) ++same;
-                    if (clips[i].displayName == QStringLiteral("x")) {
-                        xTrack = t;
-                        xIndex = i;
-                        xConnected = clips[i].anchorUid == anchor;
-                    }
-                }
-                maxSameUid = qMax(maxSameUid, same);
-            }
-            const Located zl = locate(tl, false, zId);
-            const QString xKeyE = trackMatteClipKey(3, xIndex);
-            const QString zKeyE = trackMatteClipKey(zl.track, zl.index);
-            const QString yKeyE = trackMatteClipKey(2, 0);
-            const auto rotoE = tl.rotoEntries();
-            const auto mattesE = tl.trackMatteEntries();
-            const auto parentsE = tl.clipParentEntries();
-            const bool carriersOk = rotoE.size() == 2 && rotoE.value(xKeyE).brushMask.width() == 3
-                && rotoE.value(yKeyE).brushMask.width() == 4 && mattesE.size() == 1
-                && mattesE.contains(xKeyE) && mattesE.value(xKeyE).matteSourceClipId == zKeyE
-                && parentsE.value(xKeyE) == zKeyE;
-            std::fprintf(stderr, "connected-clip G6e carriers xKey=%s zKey=%s rotoCount=%lld "
-                         "(expect 2) roto[x]=%d (expect 3) roto[y %s]=%d (expect 4) matteKeys=%s "
-                         "(expect x) matteSource=%s (expect z) parent[x]=%s (expect z)\n",
-                         qPrintable(xKeyE), qPrintable(zKeyE), static_cast<long long>(rotoE.size()),
-                         rotoE.value(xKeyE).brushMask.width(), qPrintable(yKeyE),
-                         rotoE.value(yKeyE).brushMask.width(),
-                         qPrintable(QStringList(mattesE.keys()).join(',')),
-                         qPrintable(mattesE.value(xKeyE).matteSourceClipId),
-                         qPrintable(parentsE.value(xKeyE)));
-            for (int t = 0; t < tl.videoTrackCount(); ++t)
-                tl.trackAt(false, t)->setSelectedClip(t == 0 ? 0 : -1);
-            for (int t = 0; t < tl.audioTrackCount(); ++t)
-                tl.trackAt(true, t)->setSelectedClip(-1);
-            tl.takeConnectionWarnings();
-            tl.deleteSelectedClip(); // saveUndoState("Delete clip") runs the reconcile
-            const QStringList warnings = tl.takeConnectionWarnings();
-            const QVector<ClipInfo> v3After = tl.trackAt(false, 2)->clips();
-            const bool yKept = v3After.size() == 1 && v3After[0].uid == xId
-                && v3After[0].displayName == QStringLiteral("y");
-            int xLeft = 0;
-            for (int t = 0; t < tl.videoTrackCount(); ++t)
-                for (const ClipInfo &clip : tl.trackAt(false, t)->clips())
-                    if (clip.displayName == QStringLiteral("x")) ++xLeft;
-            eOk = sharedLoaded && xTrack == 3 && xConnected && maxSameUid == 1 && carriersOk && yKept
-                && xLeft == 0 && warnings.isEmpty() && tl.trackAt(false, 0)->clipCount() == 0
-                && tl.videoTrackCount() == 4;
-            std::fprintf(stderr, "connected-clip G6e sharedLoaded=%d xTrack=%d (expect 3, not V3=2) "
-                         "xConnected=%d maxSameUidPerTrack=%d (expect 1) carriersOk=%d afterDelete v3Clips=%lld "
-                         "v3[0]=%s yKept=%d xLeft=%d (expect 0) warnings=%lld (expect 0) v1Clips=%d "
-                         "tracks=%d (expect 4)\n", sharedLoaded, xTrack, xConnected, maxSameUid,
-                         carriersOk, static_cast<long long>(v3After.size()),
-                         qPrintable(v3After.isEmpty() ? QString() : v3After[0].displayName), yKept,
-                         xLeft, static_cast<long long>(warnings.size()),
-                         tl.trackAt(false, 0)->clipCount(), tl.videoTrackCount());
-        }
-
-        // (f) Connected X (V2) and connected Y (V3) share a uid; V2 also holds an
-        // unconnected Z. X collides with Z, and V3 is still reserved for the
-        // pending Y, so X goes back to its own start on V2 (detached, one
-        // warning) and Y follows on V3 connected. Without the reservation X
-        // lands on V3 first, Y falls back beside it with the same uid, and the
-        // uid remap swaps Y's roto entry onto X and drops X's.
-        bool fOk = false;
-        {
-            ClipInfo x = clipFor("x", 2.0, 1.0);
-            ClipInfo y = clipFor("y", 2.0, 6.0);
-            x.uid = y.uid = QStringLiteral("selftest-shared-uid");
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 1.0)}, {y}});
-            shareUid(tl, 2, 0, x.uid);
-            const QString anchor = uidAt(tl, 0, 0);
-            const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
-            const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            const bool yConnect = tl.connectClip(TrackKind::Video, 2, 0, anchor);
-            RotoClipEntry xRoto;
-            xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
-            RotoClipEntry yRoto;
-            yRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
-            tl.setRotoEntries({{QStringLiteral("1:0"), xRoto}, {QStringLiteral("2:0"), yRoto}});
-            tl.absorbIntoCurrentUndoPoint();
-            tl.takeConnectionWarnings();
-            const int tracksBefore = tl.videoTrackCount();
-            // x and y share the uid; key = "track:index".
-            auto byName = [&tl](const QString &name) { return locateByName(tl, false, name); };
-            auto keyOf = [](const Located &l) { return QStringLiteral("%1:%2").arg(l.track).arg(l.index); };
-            auto describe = [&](const Located &l) {
-                return QStringLiteral("track=%1 start=%2 anchored=%3")
-                    .arg(l.track).arg(l.startSec, 0, 'f', 6).arg(l.clip.anchorUid == anchor);
-            };
-            Timeline::MoveClipResult moveResult;
-            const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            const int warnings = tl.takeConnectionWarnings().size();
-            int maxSameUid = 0;
-            for (int t = 0; t < tl.videoTrackCount(); ++t) {
-                QHash<QString, int> perTrack;
-                for (const ClipInfo &clip : tl.trackAt(false, t)->clips())
-                    if (!clip.uid.isEmpty()) maxSameUid = qMax(maxSameUid, ++perTrack[clip.uid]);
-            }
-            const Located xl = byName(QStringLiteral("x"));
-            const Located yl = byName(QStringLiteral("y"));
-            const auto roto = tl.rotoEntries();
-            const int rotoX = roto.value(keyOf(xl)).brushMask.width();
-            const int rotoY = roto.value(keyOf(yl)).brushMask.width();
-            const bool placedOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
-                && yl.track == 2 && near(yl.startSec, 8.5) && yl.clip.anchorUid == anchor;
-            const bool carriersOk = rotoX == 1 && rotoY == 3 && roto.size() == 2;
-            const int tracksAfter = tl.videoTrackCount();
-            tl.undo();
-            const Located xu = byName(QStringLiteral("x"));
-            const Located yu = byName(QStringLiteral("y"));
-            const bool undoOk = xu.track == 1 && near(xu.startSec, 1.0) && xu.clip.anchorUid == anchor
-                && yu.track == 2 && near(yu.startSec, 6.0) && yu.clip.anchorUid == anchor;
-            tl.redo();
-            const Located xr = byName(QStringLiteral("x"));
-            const Located yr = byName(QStringLiteral("y"));
-            const bool redoOk = xr.track == xl.track && xr.index == xl.index
-                && near(xr.startSec, xl.startSec) && xr.clip.anchorUid == xl.clip.anchorUid
-                && yr.track == yl.track && yr.index == yl.index
-                && near(yr.startSec, yl.startSec) && yr.clip.anchorUid == yl.clip.anchorUid;
-            fOk = sharedLoaded && xConnect && yConnect && moved && maxSameUid == 1 && placedOk
-                && warnings == 1 && carriersOk && tracksAfter == tracksBefore && undoOk && redoOk;
-            std::fprintf(stderr, "connected-clip G6f sharedLoaded=%d connect x=%d y=%d moved=%d "
-                         "maxSameUidPerTrack=%d (expect 1) x[%s] key=%s (expect track=1 start=1 "
-                         "anchored=0) y[%s] key=%s (expect track=2 start=8.5 anchored=1) warnings=%d "
-                         "(expect 1) rotoX=%d (expect 1) rotoY=%d (expect 3) rotoCount=%lld (expect 2) "
-                         "tracks %d->%d undo x[%s] y[%s] undoOk=%d redo x[%s] y[%s] redoOk=%d\n",
-                         sharedLoaded, xConnect, yConnect, moved, maxSameUid, qPrintable(describe(xl)),
-                         qPrintable(keyOf(xl)), qPrintable(describe(yl)), qPrintable(keyOf(yl)),
-                         warnings, rotoX, rotoY, static_cast<long long>(roto.size()), tracksBefore,
-                         tracksAfter, qPrintable(describe(xu)), qPrintable(describe(yu)), undoOk,
-                         qPrintable(describe(xr)), qPrintable(describe(yr)), redoOk);
-        }
-
-        // (g) Connected X (V2, collides with Z) and connected Y (V3, collides
-        // with W) share a uid and both leave their own track: Y (earlier target)
-        // goes to the free V4, X skips V3 (W) and V4 (Y's uid) for V5. Pairing
-        // the leftover keys of the uid in track order swaps their roto / parent
-        // entries; the reconcile's own old -> new keys keep each with its clip.
-        bool gOk = false;
-        {
-            ClipInfo x = clipFor("x", 2.0, 1.0);
-            ClipInfo y = clipFor("y", 2.0, 0.5);
-            x.uid = y.uid = QStringLiteral("selftest-shared-uid");
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, {x, clipFor("z", 2.0, 0.5)},
-                      {y, clipFor("w", 2.0, 0.5)}, {}, {}});
-            shareUid(tl, 2, 0, x.uid);
-            const QString anchor = uidAt(tl, 0, 0);
-            const bool sharedLoaded = uidAt(tl, 1, 0) == x.uid && uidAt(tl, 2, 0) == x.uid;
-            const bool xConnect = tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            const bool yConnect = tl.connectClip(TrackKind::Video, 2, 0, anchor);
-            RotoClipEntry xRoto;
-            xRoto.brushMask = QImage(1, 1, QImage::Format_ARGB32);
-            RotoClipEntry yRoto;
-            yRoto.brushMask = QImage(3, 3, QImage::Format_ARGB32);
-            tl.setRotoEntries({{trackMatteClipKey(1, 0), xRoto}, {trackMatteClipKey(2, 0), yRoto}});
-            tl.setClipParent(trackMatteClipKey(1, 0), trackMatteClipKey(1, 1)); // X -> Z
-            tl.absorbIntoCurrentUndoPoint();
-            tl.takeConnectionWarnings();
-            struct State { Located x, y, z; int rotoX = 0, rotoY = 0; qsizetype rotoCount = 0; QString parentX; };
-            auto capture = [&tl] {
-                State s;
-                s.x = locateByName(tl, false, QStringLiteral("x"));
-                s.y = locateByName(tl, false, QStringLiteral("y"));
-                s.z = locateByName(tl, false, QStringLiteral("z"));
-                const auto roto = tl.rotoEntries();
-                s.rotoX = roto.value(trackMatteClipKey(s.x.track, s.x.index)).brushMask.width();
-                s.rotoY = roto.value(trackMatteClipKey(s.y.track, s.y.index)).brushMask.width();
-                s.rotoCount = roto.size();
-                s.parentX = tl.clipParentEntries().value(trackMatteClipKey(s.x.track, s.x.index));
-                return s;
-            };
-            auto describe = [&anchor](const State &s) {
-                return QStringLiteral("x[%1:%2 start=%3 anchored=%4 roto=%5 parent=%6] "
-                                      "y[%7:%8 start=%9 anchored=%10 roto=%11] z=%12:%13 rotoCount=%14")
-                    .arg(s.x.track).arg(s.x.index).arg(s.x.startSec, 0, 'f', 6)
-                    .arg(s.x.clip.anchorUid == anchor).arg(s.rotoX).arg(s.parentX)
-                    .arg(s.y.track).arg(s.y.index).arg(s.y.startSec, 0, 'f', 6)
-                    .arg(s.y.clip.anchorUid == anchor).arg(s.rotoY)
-                    .arg(s.z.track).arg(s.z.index).arg(s.rotoCount);
-            };
-            Timeline::MoveClipResult moveResult;
-            const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            const State after = capture();
-            const QString zKey = trackMatteClipKey(after.z.track, after.z.index);
-            const bool afterOk = after.x.track == 4 && near(after.x.startSec, 3.5)
-                && after.x.clip.anchorUid == anchor && after.y.track == 3 && near(after.y.startSec, 3.0)
-                && after.y.clip.anchorUid == anchor && after.rotoX == 1 && after.rotoY == 3
-                && after.rotoCount == 2 && after.parentX == zKey;
-            tl.undo();
-            const State undone = capture();
-            const bool undoOk = undone.x.track == 1 && undone.x.index == 0 && near(undone.x.startSec, 1.0)
-                && undone.x.clip.anchorUid == anchor && undone.y.track == 2 && undone.y.index == 0
-                && near(undone.y.startSec, 0.5) && undone.y.clip.anchorUid == anchor
-                && undone.rotoX == 1 && undone.rotoY == 3 && undone.rotoCount == 2
-                && undone.parentX == trackMatteClipKey(1, 1);
-            tl.redo();
-            const State redone = capture();
-            const bool redoOk = describe(redone) == describe(after);
-            gOk = sharedLoaded && xConnect && yConnect && moved && afterOk && undoOk && redoOk;
-            std::fprintf(stderr, "connected-clip G6g sharedLoaded=%d connect x=%d y=%d moved=%d "
-                         "after %s zKey=%s (expect x 4:0 start 3.5 roto 1 parent z, y 3:0 start 3 "
-                         "roto 3, rotoCount 2) afterOk=%d undo %s undoOk=%d redo %s redoOk=%d\n",
-                         sharedLoaded, xConnect, yConnect, moved, qPrintable(describe(after)),
-                         qPrintable(zKey), afterOk, qPrintable(describe(undone)), undoOk,
-                         qPrintable(describe(redone)), redoOk);
-        }
-
-        // (h) / (i) Connected X (V2) is linked to connected XA (A1). (h) X
-        // collides with Z and there is no V3 while XA's target is free; (i) no
-        // collision but V2 is locked. The group is kept whole: both stay at 1,
-        // detached, with one warning (a per-clip fallback moves XA to 3.5 and
-        // keeps it connected); undo reconnects both.
-        auto linkedGroup = [&](bool locked, const char *label) {
-            ClipInfo x = clipFor("x", 2.0, 1.0);
-            ClipInfo xa = clipFor("xa", 2.0, 1.0);
-            x.linkGroup = xa.linkGroup = 11;
-            QVector<ClipInfo> v2{x};
-            if (!locked) v2.append(clipFor("z", 2.0, 1.0));
-            Timeline tl;
-            load(tl, {{clipFor("b", 10.0)}, v2}, {{xa}});
-            const QString anchor = uidAt(tl, 0, 0);
-            const bool connected = tl.connectClip(TrackKind::Video, 1, 0, anchor);
-            const bool linked = locateByName(tl, false, QStringLiteral("x")).clip.linkGroup == 11
-                && locateByName(tl, true, QStringLiteral("xa")).clip.anchorUid == anchor;
-            if (locked) tl.trackAt(false, 1)->setLocked(true);
-            tl.takeConnectionWarnings();
-            const int videoTracks = tl.videoTrackCount();
-            const int audioTracks = tl.audioTrackCount();
-            auto describe = [&anchor](const Located &l) {
-                return QStringLiteral("%1:%2 start=%3 anchored=%4").arg(l.track).arg(l.index)
-                    .arg(l.startSec, 0, 'f', 6).arg(l.clip.anchorUid == anchor);
-            };
-            Timeline::MoveClipResult moveResult;
-            const bool moved = tl.moveClipByIndex(false, 0, 0, 2.5, 0, &moveResult, nullptr);
-            const QStringList warnings = tl.takeConnectionWarnings();
-            const Located xl = locateByName(tl, false, QStringLiteral("x"));
-            const Located al = locateByName(tl, true, QStringLiteral("xa"));
-            const bool afterOk = xl.track == 1 && near(xl.startSec, 1.0) && xl.clip.anchorUid.isEmpty()
-                && al.track == 0 && near(al.startSec, 1.0) && al.clip.anchorUid.isEmpty()
-                && warnings.size() == 1 && tl.videoTrackCount() == videoTracks
-                && tl.audioTrackCount() == audioTracks;
-            tl.undo();
-            const Located xu = locateByName(tl, false, QStringLiteral("x"));
-            const Located au = locateByName(tl, true, QStringLiteral("xa"));
-            const bool undoOk = xu.track == 1 && near(xu.startSec, 1.0) && xu.clip.anchorUid == anchor
-                && au.track == 0 && near(au.startSec, 1.0) && au.clip.anchorUid == anchor;
-            tl.redo();
-            const Located xr = locateByName(tl, false, QStringLiteral("x"));
-            const Located ar = locateByName(tl, true, QStringLiteral("xa"));
-            const bool redoOk = describe(xr) == describe(xl) && describe(ar) == describe(al);
-            const bool ok = connected && linked && moved && afterOk && undoOk && redoOk;
-            std::fprintf(stderr, "connected-clip G6%s connected=%d linked=%d moved=%d x[%s] xa[%s] "
-                         "(expect both start=1 anchored=0) warnings=%lld (expect 1) [%s] tracks v%d->%d "
-                         "a%d->%d afterOk=%d undo x[%s] xa[%s] undoOk=%d redo x[%s] xa[%s] redoOk=%d\n",
-                         label, connected, linked, moved, qPrintable(describe(xl)),
-                         qPrintable(describe(al)), static_cast<long long>(warnings.size()),
-                         qPrintable(warnings.join(QStringLiteral(" | "))), videoTracks,
-                         tl.videoTrackCount(), audioTracks, tl.audioTrackCount(), afterOk,
-                         qPrintable(describe(xu)), qPrintable(describe(au)), undoOk,
-                         qPrintable(describe(xr)), qPrintable(describe(ar)), redoOk);
-            return ok;
-        };
-        const bool hOk = linkedGroup(false, "h");
-        const bool iOk = linkedGroup(true, "i");
-
-        // (b, main) The same evacuation on the MainWindow timeline, whose
-        // external undo hooks carry the mattes: V1 = [A (matte), B], X on V2 is
-        // connected to A and collides with Z when A moves after B; it goes to
-        // the free V3 and the track count stays. Undo must bring A's matte back
-        // at 0:0 and keep a solo toggled with no undo point (a structural undo
-        // would apply the stale external mixer state).
-        bool bMainOk = false;
-        if (!mainTimeline) {
-            std::fprintf(stderr, "connected-clip G6b-main mainTimeline missing\n");
-        } else {
-            load(*mainTimeline, {{clipFor("a", 5.0), clipFor("b", 5.0)},
-                                 {clipFor("x", 2.0, 1.0), clipFor("z", 2.0, 7.5)}, {}});
-            const QString aId = uidAt(*mainTimeline, 0, 0);
-            const QString xId = uidAt(*mainTimeline, 1, 0);
-            mainTimeline->connectClip(TrackKind::Video, 1, 0, aId);
-            TimelineTrackMatteEntry matte;
-            matte.matteType = TrackMatteType::AlphaMatte;
-            matte.matteSourceClipId = QStringLiteral("1:1");
-            mainTimeline->setTrackMatteEntries({{QStringLiteral("0:0"), matte}});
-            mainTimeline->absorbIntoCurrentUndoPoint();
-            // A solo toggled with no undo point after this save must survive
-            // the undo across the evacuation's new track.
-            mainTimeline->saveUndoState(QStringLiteral("solo base"));
-            mainTimeline->toggleSoloTrack(0);
-            const int tracksBefore = mainTimeline->videoTrackCount();
-            Timeline::MoveClipResult moveResult;
-            const bool moved = mainTimeline->moveClipByIndex(false, 0, 0, 10.0, 0, &moveResult, nullptr);
-            const Located xl = locate(*mainTimeline, false, xId);
-            const int tracksAfterEdit = mainTimeline->videoTrackCount();
-            const QStringList editKeys = mainTimeline->trackMatteEntries().keys();
-            mainTimeline->undo();
-            const auto undone = mainTimeline->trackMatteEntries();
-            const Located al = locate(*mainTimeline, false, aId);
-            const AudioMixer *mixer = mainTimeline->audioMixer();
-            const QJsonArray mixerStates = mixer
-                ? mixer->collectTrackState().value("states").toArray() : QJsonArray{};
-            const bool mixerSolo = !mixerStates.isEmpty()
-                && mixerStates.at(0).toObject().value("solo").toBool();
-            const bool headerSolo = mainTimeline->audioTrackCount() > 0
-                && mainTimeline->audioTracks()[0]->isSolo();
-            bMainOk = moved && xl.track == 2 && near(xl.startSec, 11.0)
-                && tracksAfterEdit == tracksBefore
-                && al.track == 0 && al.index == 0 && near(al.startSec, 0.0)
-                && undone.contains(QStringLiteral("0:0")) && !undone.contains(QStringLiteral("0:1"))
-                && undone.value(QStringLiteral("0:0")).matteSourceClipId == QStringLiteral("1:1")
-                && mainTimeline->videoTrackCount() == tracksBefore
-                && mixerSolo && mixerSolo == headerSolo;
-            std::fprintf(stderr, "connected-clip G6b-main moved=%d xTrack=%d xStart=%.6f (expect 11) "
-                         "tracks %d->%d editMatteKeys=%s undoMatteKeys=%s (expect 0:0) "
-                         "undoMatteSource=%s (expect 1:1) undoTracks=%d (expect %d) aKey=%d:%d "
-                         "mixer=%d states=%lld mixerSolo0=%d (expect 1) headerSolo0=%d (expect 1)\n",
-                         moved, xl.track, xl.startSec, tracksBefore, tracksAfterEdit,
-                         qPrintable(editKeys.join(',')),
-                         qPrintable(QStringList(undone.keys()).join(',')),
-                         qPrintable(undone.value(QStringLiteral("0:0")).matteSourceClipId),
-                         mainTimeline->videoTrackCount(), tracksBefore, al.track, al.index,
-                         mixer != nullptr, static_cast<long long>(mixerStates.size()), mixerSolo,
-                         headerSolo);
-        }
-        tally.gate(6, aOk && b.first && bMainOk && c.first && c.second == 2 && dOk && eOk && fOk
-                       && gOk && hOk && iOk,
-                   "a carrier entry did not follow its clip by uid (overtake / evacuation, also "
-                   "two uid twins both leaving their tracks), undo of an evacuation lost the "
-                   "pre-edit matte or a later solo, the nested sequence store was lost, reconcile "
-                   "changed the track count, an evacuation shared a track with its uid twin (also "
-                   "when the twin is a pending connected clip), or a link group was left partly "
-                   "moved / connected (no slot, or a locked member)");
-    }
+    carriersByUidGate(tally, mainTimeline);
 
     // G7: save / load, missing anchor, ProjectDiff.
     {
@@ -4513,6 +5182,11 @@ int runConnectedClipSelftest()
     // G31 (US-1303), in its own function to keep this frame small.
     keyRemapGate(tally);
 
+    // US-1504: G32 / G36 read and commit the wiggle on the Timeline's clips.
+    const ClipWiggleView wiggleView{mainTimeline};
+    // US-1505: and the expression bindings.
+    const ClipExpressionView expressionView{mainTimeline};
+
     // G32 (US-1302): the friend hands the private sidecars to the gate function.
     if (!mainTimeline) {
         tally.gate(32, false, "MainWindow has no mainTimeline");
@@ -4520,8 +5194,8 @@ int runConnectedClipSelftest()
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
         view.text3D = &window.m_text3DClipConfigs;
-        view.expressions = &window.m_clipExpressionBindings;
-        view.wiggle = &window.m_clipWiggleParams;
+        view.expressions = &expressionView;
+        view.wiggle = &wiggleView;
         view.brush = &window.m_brushAnimationEntries;
         view.liveBrush = &window.m_liveBrushAnimations;
         view.materializeBrush = &MainWindow::materializeBrushAnimation;
@@ -4530,8 +5204,6 @@ int runConnectedClipSelftest()
         view.open = &MainWindow::openProjectFromPath;
         view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
         view.commitText3D = &MainWindow::commitText3DConfig;
-        view.commitExpressions = &MainWindow::commitExpressionBindings;
-        view.commitWiggle = &MainWindow::commitWiggleParams;
         sidecarRekeyGate(tally, window, *mainTimeline, view);
     }
 
@@ -4564,17 +5236,30 @@ int runConnectedClipSelftest()
         SidecarView view;
         view.timeRemap = &window.m_timeRemapClipEntries;
         view.text3D = &window.m_text3DClipConfigs;
-        view.expressions = &window.m_clipExpressionBindings;
-        view.wiggle = &window.m_clipWiggleParams;
+        view.expressions = &expressionView;
+        view.wiggle = &wiggleView;
         view.save = &MainWindow::saveProjectToPath;
         view.open = &MainWindow::openProjectFromPath;
         view.commitTimeRemap = &MainWindow::commitTimeRemapEntry;
         view.commitText3D = &MainWindow::commitText3DConfig;
-        view.commitExpressions = &MainWindow::commitExpressionBindings;
-        view.commitWiggle = &MainWindow::commitWiggleParams;
         view.editWiggle = &MainWindow::editClipWiggle;
         sidecarUndoValuesGate(tally, window, *mainTimeline, view);
     }
+
+    // G37 (US-1504): the clip wiggle's undo, persistence, legacy migration, export Timeline and split.
+    if (!mainTimeline)
+        tally.gate(37, false, "MainWindow has no mainTimeline");
+    else
+        clipWiggleGate(tally, window, *mainTimeline, &MainWindow::saveProjectToPath,
+                       &MainWindow::openProjectFromPath);
+
+    // G38 (US-1505): the clip expressions' undo, persistence, legacy migration, export Timeline,
+    // split and Smart Render.
+    if (!mainTimeline)
+        tally.gate(38, false, "MainWindow has no mainTimeline");
+    else
+        clipExpressionGate(tally, window, *mainTimeline, &MainWindow::saveProjectToPath,
+                           &MainWindow::openProjectFromPath);
 
     return tally.finish("connected-clip");
 }

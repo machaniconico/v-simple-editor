@@ -1347,5 +1347,73 @@ int runBatchExportE2ESelftest()
                   && g23LegacyKept);
     }
 
+    // G24 (US-1510): a task whose preset name resolves to neither a built-in nor a saved
+    // user preset when dispatched (and was never captured at queue time) is failed with the
+    // name in the message and writes nothing; the next task still runs. Without the check the
+    // unknown name silently exported with the 1080p defaults.
+    {
+        QTemporaryDir presetDir;
+        QTemporaryDir work;
+        const bool hadEnv = qEnvironmentVariableIsSet("VEDITOR_EXPORT_PRESET_DIR");
+        const QByteArray oldEnv = qgetenv("VEDITOR_EXPORT_PRESET_DIR");
+        qputenv("VEDITOR_EXPORT_PRESET_DIR", presetDir.path().toUtf8());
+        const QString video = work.filePath("video.mp4");
+        const bool fixture = presetDir.isValid() && work.isValid() && writeG8Video(video);
+        ClipInfo picture;
+        picture.filePath = video;
+        picture.duration = picture.outPoint = 4.0;
+        Timeline timeline;
+        timeline.restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+            QVector<QVector<ClipInfo>>{}, 0, -1, -1, 10);
+        auto makeTask = [&](const QString &preset, const QString &out) {
+            batchexport::ExportTask t;
+            t.projectPath = QStringLiteral("g24.veditor");
+            t.outputPath = out;
+            t.preset = preset;
+            t.timeline = &timeline;
+            t.source = batchexport::TaskSource::CurrentProject;
+            t.width = t.height = 64;
+            t.fps = 10.0;
+            t.codec = QStringLiteral("mpeg4");
+            t.videoCodec = QStringLiteral("mpeg4");
+            t.videoBitrateKbps = 200;
+            t.audioCodec = QStringLiteral("aac");
+            t.audioBitrateKbps = 192;
+            return t;
+        };
+        const QString nopeOut = work.filePath("nope.mp4");
+        const QString nextOut = work.filePath("next.mp4");
+        batchexport::Queue q;
+        QString nopeId, nextId;
+        bool finished = false;
+        if (fixture) {
+            nopeId = q.addTask(makeTask(QStringLiteral("nope"), nopeOut));
+            nextId = q.addTask(makeTask(QStringLiteral("720p"), nextOut));
+            QSignalSpy done(&q, &batchexport::Queue::queueFinished);
+            q.start();
+            finished = done.wait(180000) || !done.isEmpty();
+        }
+        batchexport::ExportTask nopeTask, nextTask;
+        for (const auto &t : q.tasks()) {
+            if (t.id == nopeId) nopeTask = t;
+            else if (t.id == nextId) nextTask = t;
+        }
+        const bool nopeFailed = nopeTask.state == batchexport::TaskState::Failed
+            && nopeTask.message == QStringLiteral("プリセット 'nope' が見つかりません");
+        const bool noOutput = !QFileInfo::exists(nopeOut);
+        const bool nextDone = nextTask.state == batchexport::TaskState::Done
+            && QFileInfo::exists(nextOut);
+        qInfo().noquote() << QStringLiteral(
+            "[batchexport-e2e] G24 values: fixture=%1 finished=%2 nopeState=%3 nopeMessage=%4 "
+            "nopeOutputExists=%5 nextState=%6 nextOutputExists=%7")
+            .arg(fixture).arg(finished).arg(static_cast<int>(nopeTask.state))
+            .arg(nopeTask.message).arg(QFileInfo::exists(nopeOut))
+            .arg(static_cast<int>(nextTask.state)).arg(QFileInfo::exists(nextOut));
+        check(24, "unresolvable preset name fails the task and the next task still runs",
+              fixture && finished && nopeFailed && noOutput && nextDone);
+        if (hadEnv) qputenv("VEDITOR_EXPORT_PRESET_DIR", oldEnv);
+        else qunsetenv("VEDITOR_EXPORT_PRESET_DIR");
+    }
+
     return tally.finish("batchexport-e2e");
 }

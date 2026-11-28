@@ -260,9 +260,14 @@ void RenderQueueDialog::buildUi()
     m_removeBtn = new QPushButton(QStringLiteral("削除"), this);
     m_removeBtn->setObjectName(QStringLiteral("renderQueueRemoveJobButton"));
     m_startBtn  = new QPushButton(QStringLiteral("開始"), this);
-    m_stopBtn   = new QPushButton(QStringLiteral("停止"), this);
+    m_cancelJobBtn = new QPushButton(QStringLiteral("選択ジョブを中止"), this);
+    m_cancelJobBtn->setObjectName(QStringLiteral("renderQueueCancelJobButton"));
+    m_stopBtn   = new QPushButton(QStringLiteral("キュー全体を停止"), this);
+    m_stopBtn->setToolTip(QStringLiteral(
+        "実行中のジョブを中止してキューを止めます (待機中のジョブは一覧に残ります) / MCP・通常書き出しのジョブも止まります"));
     toolbar->addWidget(m_addBtn);
     toolbar->addWidget(m_removeBtn);
+    toolbar->addWidget(m_cancelJobBtn);
     toolbar->addStretch(1);
     toolbar->addWidget(m_startBtn);
     toolbar->addWidget(m_stopBtn);
@@ -303,6 +308,7 @@ void RenderQueueDialog::buildUi()
 
     connect(m_addBtn,    &QPushButton::clicked, this, &RenderQueueDialog::onAddJobClicked);
     connect(m_removeBtn, &QPushButton::clicked, this, &RenderQueueDialog::onRemoveJobClicked);
+    connect(m_cancelJobBtn, &QPushButton::clicked, this, &RenderQueueDialog::onCancelJobClicked);
     connect(m_startBtn,  &QPushButton::clicked, this, &RenderQueueDialog::onStartClicked);
     connect(m_stopBtn,   &QPushButton::clicked, this, &RenderQueueDialog::onStopClicked);
     connect(m_closeBtn,  &QPushButton::clicked, this, &QDialog::close);
@@ -377,6 +383,19 @@ void RenderQueueDialog::updateButtons()
     // removeJob emits no terminal status, so an MCP observation would stay 'queued'.
     const bool ownSelected = hasSelect && m_ownJobUuids.contains(uuidForRow(m_table->currentRow()));
     m_removeBtn->setEnabled(ownSelected && !running);
+
+    bool cancellable = false;
+    const QString selUuid = hasSelect ? uuidForRow(m_table->currentRow()) : QString();
+    if (!selUuid.isEmpty()) {
+        for (const RenderJob &j : m_queue->jobs()) {
+            if (j.uuid == selUuid) {
+                cancellable = j.status == RenderJobStatus::Pending
+                           || j.status == RenderJobStatus::Rendering;
+                break;
+            }
+        }
+    }
+    m_cancelJobBtn->setEnabled(cancellable);
 }
 
 int RenderQueueDialog::rowForUuid(const QString &uuid) const
@@ -540,6 +559,22 @@ void RenderQueueDialog::onRemoveJobClicked()
         return;
     m_ownJobUuids.remove(uuid);
     m_queue->removeJob(uuid);
+}
+
+void RenderQueueDialog::onCancelJobClicked()
+{
+    if (!m_queue)
+        return;
+    const QString uuid = uuidForRow(m_table->currentRow());
+    if (uuid.isEmpty())
+        return;
+    bool wasPending = false;
+    for (const RenderJob &job : m_queue->jobs())
+        if (job.uuid == uuid) wasPending = job.status == RenderJobStatus::Pending;
+    m_queue->cancelJob(uuid);
+    // a pending job leaves the list, so its ownership goes; a running one stays as Cancelled and stays removable
+    if (wasPending)
+        m_ownJobUuids.remove(uuid);
 }
 
 void RenderQueueDialog::onStartClicked()

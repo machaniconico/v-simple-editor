@@ -366,8 +366,19 @@ void BatchExportDialog::onTaskStateChanged(const QString &id,
     if (row < 0)
         return;
     QTableWidgetItem *stateItem = m_table->item(row, COL_STATE);
-    if (stateItem)
-        stateItem->setText(stateLabel(state));
+    if (!stateItem)
+        return;
+    stateItem->setText(stateLabel(state));
+    stateItem->setToolTip(QString());
+    if (state != batchexport::TaskState::Failed)
+        return;
+    for (const auto &task : m_queue->tasks()) {
+        if (task.id != id || task.message.isEmpty())
+            continue;
+        stateItem->setText(QStringLiteral("%1: %2").arg(stateLabel(state), task.message));
+        stateItem->setToolTip(task.message);
+        break;
+    }
 }
 
 void BatchExportDialog::onTaskProgress(const QString &id, int percent)

@@ -4,10 +4,14 @@
 #include "../Timeline.h"
 #include "../clipanim/ClipAnim.h"
 #include "../libavcore/AudioExtract.h"
+#include <QElapsedTimer>
 #include <QTemporaryDir>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <thread>
 
 int runAudioKeyframesSelftest()
 {
@@ -70,14 +74,16 @@ int runAudioKeyframesSelftest()
     const double bound = bindings.resolve(QStringLiteral("transform.opacity"), ctx, 42.0);
     ctx.audioLevelAtTime = {};
     const auto silent = Expression::evaluate(QStringLiteral("audioLevel()"), ctx);
-    bindings.setAudioLevelSampler([](double time) { return time * 2.0; });
+    // US-1505: the sampler reaches resolve() through ctx.audioLevelAtTime only (the
+    // bindings carry none, formerly a setter on the bindings).
+    ctx.audioLevelAtTime = [](double time) { return time * 2.0; };
     const double supplied = bindings.resolve(QStringLiteral("transform.opacity"), ctx, 42.0);
     const auto time = Expression::evaluate(QStringLiteral("time"), ctx);
     const auto ease = Expression::evaluate(QStringLiteral("ease(0.5, 0, 1, 0, 100)"), ctx);
     audiokf::EnvelopeCache cache;
-    bindings.setAudioLevelSampler([&](double t) {
+    ctx.audioLevelAtTime = [&](double t) {
         return audiokf::levelAt(*cache.envelope(QStringLiteral("unused-audio.wav")), t);
-    });
+    };
     bindings.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("time * 100"));
     audiokf::resetInvocationCountForTest();
     bool unused = true;
@@ -162,6 +168,49 @@ int runAudioKeyframesSelftest()
         && repeated.success && repeated.value == inside.value
         && audiokf::invocationCountForTest() == 2;
     gate(6, linkedOk);
+
+    // G7 (US-1505): EnvelopeCache decodes outside its mutex. B is cached before the
+    // delay is armed; A's decode then sleeps 300 ms (setDecodeDelayForTest) on a worker
+    // thread, and once A is inside that sleep, B's cached envelope() returns before A
+    // has finished. Detects: decodeMono run under m_mutex (B waits for A).
+    const QString wavA = temp.filePath(QStringLiteral("g7-a.wav"));
+    const QString wavB = temp.filePath(QStringLiteral("g7-b.wav"));
+    QByteArray g7Pcm;
+    for (int i = 0; i < sr / 4; ++i) {
+        g7Pcm.append(char(0x00));
+        g7Pcm.append(char(0x20));
+    }
+    const bool g7Wavs = temp.isValid() && libavcore::writePcm16AsWav(wavA, g7Pcm, sr, 1, &error)
+        && libavcore::writePcm16AsWav(wavB, g7Pcm, sr, 1, &error);
+    audiokf::EnvelopeCache g7Cache;
+    const bool bCached = g7Wavs && !g7Cache.envelope(wavB)->rms.isEmpty();
+    bool aEnteredDelay = false, aDoneWhenBReturned = true, aDoneAtEnd = false, bServed = false;
+    {
+        struct DelayReset {
+            ~DelayReset() { audiokf::setDecodeDelayForTest(0); }
+        } delayReset;
+        audiokf::setDecodeDelayForTest(300);
+        const int entriesBefore = audiokf::decodeDelayEntriesForTest();
+        std::atomic<bool> aDone{false};
+        std::thread decodeA([&] {
+            g7Cache.envelope(wavA);
+            aDone = true;
+        });
+        QElapsedTimer waitDelay;
+        waitDelay.start();
+        while (audiokf::decodeDelayEntriesForTest() == entriesBefore && waitDelay.elapsed() < 5000)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        aEnteredDelay = audiokf::decodeDelayEntriesForTest() > entriesBefore;
+        const auto bEnvelope = g7Cache.envelope(wavB);
+        aDoneWhenBReturned = aDone.load();
+        bServed = bEnvelope && !bEnvelope->rms.isEmpty();
+        decodeA.join();
+        aDoneAtEnd = aDone.load();
+    }
+    std::fprintf(stderr, "audio-keyframes G7 wavs=%d bCached=%d aEnteredDelay=%d bServed=%d "
+                 "aDoneWhenBReturned=%d (expect 0) aDoneAtEnd=%d\n", int(g7Wavs), int(bCached),
+                 int(aEnteredDelay), int(bServed), int(aDoneWhenBReturned), int(aDoneAtEnd));
+    gate(7, bCached && aEnteredDelay && bServed && !aDoneWhenBReturned && aDoneAtEnd);
 
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", pass, fail);
     return fail;

@@ -18,6 +18,10 @@
 #include <functional>
 #include <memory>
 #include <QApplication>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QThread>
 #include <QLineEdit>
 #include <QPushButton>
 #include <QTimer>
@@ -282,6 +286,7 @@ int runRenderNotifySelftest()
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderReason)) {
         const QByteArray reason = encoderReason.toUtf8();
         for (int n = 1; n <= 5; ++n) tally.skip(n, reason.constData());
+        tally.skip(8, reason.constData());
         gateAcesPerJob();
         gateDialogShare();
         return tally.finish("render-notify");
@@ -538,6 +543,141 @@ int runRenderNotifySelftest()
             && unknownNoop && pendingRemoved && stillRunning && runningCancelled && finishedNoop
             && dialogClosed && otherCount == 0 && otherValue == valueBefore
             && ownCount == 1 && ownValue == 41);
+    }
+    // G8: the dialog's "選択ジョブを中止" (renderQueueCancelJobButton) cancels only the selected
+    // job: (1) a pending row leaves the list and jobs(), the first stays Pending (HEAD: no
+    // button); (2) a Rendering row becomes Cancelled while the queue keeps running (real
+    // fixture render, observed in jobProgressUuid like G5); (3) "キュー全体を停止" stops the
+    // queue (isRunning false) and the pending job stays (regression).
+    {
+        MainWindow window;
+        window.hide();
+        window.openRenderQueueDialog();
+        RenderQueue *queue = window.m_renderQueue;
+        RenderQueueDialog *dlg = window.m_renderQueueDialog;
+        auto *table = dlg ? dlg->findChild<QTableWidget *>(QStringLiteral("renderQueueJobTable")) : nullptr;
+        auto *cancelBtn = dlg ? dlg->findChild<QPushButton *>(QStringLiteral("renderQueueCancelJobButton")) : nullptr;
+        QPushButton *stopBtn = nullptr;
+        if (dlg)
+            for (QPushButton *b : dlg->findChildren<QPushButton *>())
+                if (b->text() == QStringLiteral("キュー全体を停止")) stopBtn = b;
+        QVector<RenderJob> seen;
+        QMetaObject::Connection seenConn;
+        QSignalSpy completed(queue, &RenderQueue::jobCompletedUuid);
+        if (queue)
+            seenConn = QObject::connect(queue, &RenderQueue::jobsChanged, queue,
+                                        [&]() { seen = queue->jobs(); });
+        const auto statusOf = [&](const QString &uuid) {
+            for (const RenderJob &job : seen)
+                if (job.uuid == uuid) return static_cast<int>(job.status);
+            return -1;
+        };
+        // Condition wait for the worker's finishCurrentJob (jobCompletedUuid) of one job; returns
+        // its success flag through `ok` and whether it arrived at all.
+        const auto waitCompleted = [&](const QString &uuid, bool *ok = nullptr) {
+            QElapsedTimer t;
+            t.start();
+            for (;;) {
+                for (const QList<QVariant> &args : completed)
+                    if (args.value(0).toString() == uuid) {
+                        if (ok) *ok = args.value(1).toBool();
+                        return true;
+                    }
+                if (t.elapsed() >= 60000) return false;
+                completed.wait(200);
+            }
+        };
+        const auto selectRowOf = [&](const QString &uuid) {
+            for (int row = 0; table && row < table->rowCount(); ++row) {
+                QTableWidgetItem *item = table->item(row, 0);
+                if (item && item->data(Qt::UserRole).toString() == uuid) {
+                    table->selectRow(row);
+                    table->setCurrentCell(row, 0);
+                    return true;
+                }
+            }
+            return false;
+        };
+        const int pend = static_cast<int>(RenderJobStatus::Pending);
+        const int rend = static_cast<int>(RenderJobStatus::Rendering);
+        const int canc = static_cast<int>(RenderJobStatus::Cancelled);
+        const bool ui = queue && dlg && table && cancelBtn && stopBtn;
+
+        // (1) two pending jobs, never started: cancel the second.
+        bool pendOk = false;
+        int pendJobs = -1, pendRows = -1;
+        if (ui) {
+            RenderJob a = makeJob(nullptr, work.filePath("g8-a.mp4"));
+            RenderJob b = makeJob(nullptr, work.filePath("g8-b.mp4"));
+            queue->addJob(a);
+            queue->addJob(b);
+            const bool selected = selectRowOf(b.uuid);
+            const bool enabled = cancelBtn->isEnabled();
+            if (selected && enabled) cancelBtn->click();
+            pendJobs = seen.size();
+            pendRows = table->rowCount();
+            pendOk = selected && enabled && pendJobs == 1 && pendRows == 1
+                && statusOf(a.uuid) == pend && statusOf(b.uuid) == -1;
+            queue->removeJob(a.uuid);
+        }
+
+        // (2) + (3): X renders, Y waits. Cancel X from its row, then (after X ends) a second
+        // run stops the whole queue with Y pending.
+        bool rendEnabled = false, rendCancelled = false, rendRunning = false, rendDone = false;
+        bool stopFired = false, stopIdle = false, stopKept = false, stopDone = false;
+        bool xOk = true, yOk = true, x2Ok = true, yEnded = true;
+        if (ui && fixture) {
+            RenderJob x = makeJob(&tl, work.filePath("g8-x.mp4"));
+            RenderJob y = makeJob(&tl, work.filePath("g8-y.mp4"));
+            queue->addJob(x);
+            queue->addJob(y);
+            QMetaObject::Connection conn = QObject::connect(queue, &RenderQueue::jobProgressUuid, queue,
+                [&](QString uuid, int) {
+                    if (rendEnabled || uuid != x.uuid) return;
+                    if (statusOf(x.uuid) != rend || !selectRowOf(x.uuid)) return;
+                    rendEnabled = cancelBtn->isEnabled();
+                    cancelBtn->click();
+                    rendCancelled = statusOf(x.uuid) == canc;
+                    rendRunning = queue->isRunning();
+                });
+            queue->start();
+            bool xArrived = waitCompleted(x.uuid, &xOk);
+            rendDone = xArrived && !xOk && statusOf(x.uuid) == canc;
+            QObject::disconnect(conn);
+            // y may have started after x ended: stop, then wait for its completion before clear().
+            const bool yRendering = statusOf(y.uuid) == rend;
+            queue->stop();
+            if (yRendering) yEnded = waitCompleted(y.uuid, &yOk);
+            queue->clear();
+
+            RenderJob x2 = makeJob(&tl, work.filePath("g8-x2.mp4"));
+            RenderJob y2 = makeJob(&tl, work.filePath("g8-y2.mp4"));
+            queue->addJob(x2);
+            queue->addJob(y2);
+            conn = QObject::connect(queue, &RenderQueue::jobProgressUuid, queue,
+                [&](QString uuid, int) {
+                    if (stopFired || uuid != x2.uuid) return;
+                    stopFired = true;
+                    stopBtn->click();
+                    stopIdle = !queue->isRunning();
+                    stopKept = statusOf(y2.uuid) == pend;
+                });
+            queue->start();
+            stopDone = waitCompleted(x2.uuid, &x2Ok) && !x2Ok;
+            QObject::disconnect(conn);
+            queue->stop();
+            queue->clear();
+        }
+        QObject::disconnect(seenConn);
+        std::fprintf(stderr, "[render-notify] G8 completions xSuccess=%d yEnded=%d ySuccess=%d x2Success=%d\n",
+                     xOk, yEnded, yOk, x2Ok);
+        std::fprintf(stderr, "[render-notify] G8 ui=%d (1) pending jobs=%d rows=%d ok=%d\n"
+            "[render-notify] G8 (2) rendering enabled=%d cancelled=%d running=%d done=%d\n"
+            "[render-notify] G8 (3) stop fired=%d idle=%d pendingKept=%d done=%d\n",
+            ui, pendJobs, pendRows, pendOk, rendEnabled, rendCancelled, rendRunning, rendDone,
+            stopFired, stopIdle, stopKept, stopDone);
+        tally.gate(8, ui && fixture && pendOk && rendEnabled && rendCancelled && rendRunning
+            && rendDone && yEnded && stopFired && stopIdle && stopKept && stopDone);
     }
     gateAcesPerJob();
     gateDialogShare();

@@ -5,13 +5,20 @@
 #include "../ProjectFile.h"
 #include "../RenderQueue.h"
 #include "../MainWindow.h"
+#include "../RotoApply.h"
 #include "../RotoClipEntry.h"
+#include "../ShapeLayer.h"
 #include "../Timeline.h"
 #include "../SequenceExport.h"
 #include "../TrackMatteKey.h"
 #include "../VideoPlayer.h"
 #include "../TimelineFrameRenderer.h"
 #include "../WarpDistortion.h"
+#include "../WiggleTransform.h"
+#include "../AudioKeyframes.h"
+#include "../TrimOps.h"
+#include "../clipanim/ClipAnim.h"
+#include "../libavcore/AudioExtract.h"
 #include "../libavcore/Encode.h"
 #include "../libavcore/FrameGrab.h"
 #include "SelftestGate.h"
@@ -27,11 +34,17 @@
 #include <QTest>
 #include <QString>
 #include <QTemporaryDir>
+#include <QUuid>
 #include <QVector>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <iomanip>
+#include <sstream>
+#include <utility>
 #include <iostream>
 
 namespace {
@@ -191,7 +204,7 @@ int runSpecialCompositeSelftest()
     QString encoderWhy;
     if (!selftest::requireEncoder(QStringLiteral("mpeg4"), &encoderWhy)) {
         std::cerr << "special-composite: " << encoderWhy.toStdString() << '\n';
-        for (int g = 1; g <= 8; ++g)
+        for (int g = 1; g <= 12; ++g)
             tally.skip(g, "mpeg4 encoder unavailable");
         return tally.finish("special-composite");
     }
@@ -233,7 +246,7 @@ int runSpecialCompositeSelftest()
         tally.gate(2, false, "fixture or timeline missing");
         tally.gate(3, false, "fixture or timeline missing");
         tally.gate(4, false, "fixture or timeline missing");
-        for (int g = 5; g <= 8; ++g)
+        for (int g = 5; g <= 12; ++g)
             tally.gate(g, false, "fixture or timeline missing");
         return tally.finish("special-composite");
     }
@@ -326,6 +339,10 @@ int runSpecialCompositeSelftest()
     if (!glOk) {
         for (int g = 5; g <= 7; ++g)
             tally.skip(g, "no usable QOpenGLWidget context");
+        tally.skip(9, "no usable QOpenGLWidget context");
+        tally.skip(10, "no usable QOpenGLWidget context");
+        tally.skip(11, "no usable QOpenGLWidget context");
+        tally.skip(12, "no usable QOpenGLWidget context");
         return tally.finish("special-composite");
     }
     // grabFramebuffer returns device pixels (dpr x the logical kW x kH). The
@@ -941,6 +958,700 @@ int runSpecialCompositeSelftest()
               << " export[" << diffText(plainDiff) << "] ok=" << plainOk << '\n';
     tally.gate(8, remapOk && freezeOk && plainOk,
                "file-backed export lost the saved time-remap or freeze-frame (see values above)");
+
+    // G9 (US-1504): the wiggle is ClipInfo::wiggle, evaluated by the one shared overlay
+    // (clipanim::applyDynamicOverlay) on top of keyframes -> autoOrient, so export
+    // (renderFrameAt), both previews and the special composite carry it once.
+    //   (1) renderFrameAt at t = 0.5 with the wiggle (seed 3, 20 px) differs from without
+    //       (HEAD: the export ignores the wiggle sidecar -> equal).
+    //   (2') effectiveTransformAt(clip, 0.5, env{1920x1080}).videoDx == base + off.x / 1920
+    //       (1e-9, also dy), the two-argument form == base, two env calls byte-equal.
+    //   (3) a keyframe-less wiggle clip: the GLPreview motion (makePreviewMotion through
+    //       paintGL -> videoSourceDx/Dy), the VideoPlayer layer values (cpu-composite record)
+    //       and renderFrameAt (== a static clip holding the evaluated transform, pixel-exact)
+    //       all carry the env value (mutation control: the three gates left on
+    //       keyframes.hasAnyKeyframes() -> the base values).
+    //   (4') time remap + wiggle, single clip: the window's GL upload of the special composite
+    //       == renderFrameAt (inner rect), and the baked frame's GL motion is keyframes-only
+    //       (no second wiggle; mutation control: the env form under compositeBaked).
+    //   (5) arrange (Left) writes the same videoDx with and without the wiggle.
+    //   (6) a 1920x1080 project rendered at 1280x720 and 1920x1080 both equal a static clip
+    //       holding the wiggle normalized by the 1920x1080 project canvas (control: by 1280).
+    timeline->setProjectOutputConfig(kW, kH, true, kFps); // MainWindow keeps it with m_projectConfig
+    wiggle::WiggleParams g9Wiggle;
+    g9Wiggle.enabled = true;
+    g9Wiggle.seed = 3;
+    g9Wiggle.positionAmplitude = QPointF(20.0, 20.0);
+    const double g9t = 0.5;
+    const wiggle::WiggleOffset g9Off = wiggle::evaluate(g9Wiggle, g9t);
+    // Sanity band on the shared evaluator itself: a real, bounded pixel offset.
+    const bool g9OffSane = std::abs(g9Off.positionOffset.x()) > 0.5 && std::abs(g9Off.positionOffset.x()) <= 40.0
+        && std::abs(g9Off.positionOffset.y()) <= 40.0;
+    const auto staticHolding = [](ClipInfo clip, const clipgeom::ClipTransform &tr) {
+        clip.wiggle = wiggle::WiggleParams{};
+        clip.videoScale = tr.videoScale;
+        clip.videoDx = tr.videoDx;
+        clip.videoDy = tr.videoDy;
+        clip.rotation2DDegrees = tr.rotationDeg;
+        return clip;
+    };
+    const auto renderOne = [](const ClipInfo &clip, QSize project, double sec, QSize out) {
+        Timeline tl;
+        tl.setProjectOutputConfig(project.width(), project.height(), true, kFps);
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+        return tlrender::renderFrameAt(&tl, qint64(sec * 1000000.0), out);
+    };
+
+    // (1)
+    ClipInfo g9Clip = base;
+    g9Clip.wiggle = g9Wiggle;
+    const QImage g9Plain = renderOne(base, size, g9t, size);
+    const QImage g9Wig = renderOne(g9Clip, size, g9t, size);
+    const DiffStat g9d1 = compare(g9Wig, g9Plain);
+    const bool g9ok1 = g9OffSane && g9d1.sizeMatch && g9d1.diffPixels > 50;
+
+    // (2')
+    ClipInfo g9Based = g9Clip;
+    g9Based.videoDx = 0.1;
+    g9Based.videoDy = -0.05;
+    clipanim::EvalEnv env1080;
+    env1080.canvas = QSize(1920, 1080);
+    const clipgeom::ClipTransform g9EnvA = clipanim::effectiveTransformAt(g9Based, g9t, env1080);
+    const clipgeom::ClipTransform g9EnvB = clipanim::effectiveTransformAt(g9Based, g9t, env1080);
+    const clipgeom::ClipTransform g9Two = clipanim::effectiveTransformAt(g9Based, g9t);
+    const double g9ExpDx = 0.1 + g9Off.positionOffset.x() / 1920.0;
+    const double g9ExpDy = -0.05 + g9Off.positionOffset.y() / 1080.0;
+    const bool g9ok2 = g9OffSane && std::abs(g9EnvA.videoDx - g9ExpDx) <= 1e-9
+        && std::abs(g9EnvA.videoDy - g9ExpDy) <= 1e-9 && g9Two.videoDx == 0.1 && g9Two.videoDy == -0.05
+        && std::memcmp(&g9EnvA, &g9EnvB, sizeof g9EnvA) == 0;
+
+    // (3)
+    Timeline g9tl;
+    g9tl.setProjectOutputConfig(kW, kH, true, kFps);
+    g9tl.restoreFromProject(QVector<QVector<ClipInfo>>{{g9Clip}}, QVector<QVector<ClipInfo>>{}, 0.0, -1.0, -1.0, 100);
+    g9tl.refreshPlaybackSequence();
+    const clipanim::EvalEnv g9Env = tlrender::dynamicEvalEnv(&g9tl);
+    const auto envAt = [&](double localSec) { return clipanim::effectiveTransformAt(g9Clip, localSec, g9Env); };
+    const clipgeom::ClipTransform g9Exp05 = envAt(g9t);
+    const QImage g9Static = renderOne(staticHolding(base, g9Exp05), size, g9t, size);
+    const DiffStat g9d3 = compare(g9Wig, g9Static);
+    double glDx = 0.0, glDy = 0.0, glLocal = -1.0, vpDx = 0.0, vpDy = 0.0, vpLocal = -1.0;
+    clipgeom::ClipTransform glExp, vpExp;
+    bool glBaked = true, vpRecorded = false, g9Seeked = false;
+    int vpAttempts = 0;
+    {
+        VideoPlayer vp;
+        vp.resize(kW, kH);
+        vp.setCanvasSize(kW, kH);
+        vp.setProjectOutputSize(size);
+        vp.glPreview()->setTimeline(&g9tl);
+        vp.setSequence(g9tl.computePlaybackSequence());
+        vp.show();
+        QSignalSpy vpFrames(&vp, &VideoPlayer::frameComposited);
+        vp.seek(int(g9t * 1000));
+        g9Seeked = QTest::qWaitFor([&] {
+            return vpFrames.count() > 0 && std::llabs(vp.timelinePositionUs() - qint64(g9t * 1000000.0)) < 50000;
+        }, 15000);
+        QApplication::processEvents(QEventLoop::AllEvents, 50);
+        (void)vp.glPreview()->grabFramebuffer(); // paintGL resolves the clip motion
+        glBaked = vp.glPreview()->compositeBakedMode();
+        glDx = vp.glPreview()->videoSourceDx();
+        glDy = vp.glPreview()->videoSourceDy();
+        glLocal = double(vp.timelinePositionUs()) / 1000000.0;
+        glExp = envAt(glLocal);
+        // The cpu-composite path (a CPU-only preview stack) records the layer values
+        // applyLayerMotionOpacity produced; a paused seek alone may leave its V1 base
+        // empty, so a short playback fills it (as in video-player-parent).
+        const auto cpuRecord = [&]() {
+            vp.setParentAdmissionObservationForTest(true);
+            const int before = vpFrames.count();
+            vp.setPreviewEffects({VideoEffect::createFilmGrain(0.3, 1, 0.0, false)});
+            (void)QTest::qWaitFor([&] { return vpFrames.count() > before; }, 3000);
+            const auto records = vp.parentAdmissionRecordsForTest();
+            vp.setPreviewEffects({});
+            vp.setParentAdmissionObservationForTest(false);
+            ++vpAttempts;
+            for (const auto &record : records) {
+                if (record.path != QLatin1String("cpu-composite") || record.sourceTrack != 0) continue;
+                vpRecorded = true;
+                vpDx = record.localTransform.videoDx;
+                vpDy = record.localTransform.videoDy;
+                vpLocal = double(record.timelineUs) / 1000000.0;
+            }
+        };
+        cpuRecord();
+        if (!vpRecorded) {
+            const int beforePlay = vpFrames.count();
+            vp.play();
+            (void)QTest::qWaitFor([&] { return vpFrames.count() >= beforePlay + 3; }, 5000);
+            vp.pause();
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            cpuRecord();
+        }
+        vpExp = envAt(vpLocal);
+        vp.hide();
+    }
+    const bool glMoves = std::abs(glExp.videoDx - base.videoDx) > 1e-4;
+    const bool g9ok3 = g9Seeked && !glBaked && glMoves
+        && g9Env.canvas == size
+        && std::abs(glDx - glExp.videoDx) <= 1e-9 && std::abs(glDy - glExp.videoDy) <= 1e-9
+        && vpRecorded && std::abs(vpDx - vpExp.videoDx) <= 1e-9 && std::abs(vpDy - vpExp.videoDy) <= 1e-9
+        && std::abs(vpExp.videoDx - base.videoDx) > 1e-4
+        && g9d3.sizeMatch && g9d3.maxDiff == 0 && g9d1.diffPixels > 50;
+
+    // (4') the window route: GL shows the special composite of a time-remap + wiggle clip.
+    ClipInfo remapWig = remapped;
+    remapWig.wiggle = g9Wiggle;
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapped}},
+        QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+    const QImage remapNoWig = tlrender::renderFrameAt(timeline, qint64(g9t * 1000000.0), size);
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapWig}},
+        QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    const QImage remapExpected = tlrender::renderFrameAt(timeline, qint64(g9t * 1000000.0), size);
+    const QImage remapSpecial = window.buildSpecialClipComposite(g9t);
+    // The GL framebuffer grab is compared inside the band the wiggle shifts: that edge band is
+    // transparent in the export and the GL clear grey on screen. Band = ceil(max |baked offset| px) + 1.
+    const clipgeom::ClipTransform g9RemapEnv =
+        clipanim::effectiveTransformAt(remapWig, g9t, tlrender::dynamicEvalEnv(timeline));
+    const clipgeom::ClipTransform g9RemapKf = clipanim::effectiveTransformAt(remapWig, g9t);
+    const double g9ShiftPx = std::max(std::abs(g9RemapEnv.videoDx - g9RemapKf.videoDx) * size.width(),
+        std::abs(g9RemapEnv.videoDy - g9RemapKf.videoDy) * size.height());
+    const int g9Band = int(std::ceil(g9ShiftPx)) + 1;
+    const QRect g9Inner(g9Band, g9Band, kW - 2 * g9Band, kH - 2 * g9Band);
+    int g9GlInner = 255;
+    double g9BakedDx = 1.0, g9BakedDy = 1.0;
+    bool g9WOk = false, g9WBaked = false;
+    DeviceGrab g9Grab;
+    {
+        VideoPlayer *wp = window.m_player;
+        GLPreview *wgl = wp ? wp->glPreview() : nullptr;
+        if (wp && wgl) {
+            wgl->setFixedSize(kW, kH);
+            wgl->setFrameTextureNearestForTest(true);
+            window.show();
+            for (int i = 0; i < 8 && !g9WOk; ++i) {
+                QApplication::processEvents(QEventLoop::AllEvents, 25);
+                const QImage probe = wgl->grabFramebuffer();
+                g9WOk = wgl->context() && wgl->context()->isValid() && !probe.isNull();
+            }
+            bool seeked = false;
+            const auto conn = QObject::connect(wp, &VideoPlayer::positionChanged, wp,
+                [&](double pos) { if (std::abs(pos - g9t) < 0.001) seeked = true; });
+            wp->seek(int(g9t * 1000) + 1);
+            wp->seek(int(g9t * 1000));
+            (void)QTest::qWaitFor([&] { return seeked; }, 15000);
+            QObject::disconnect(conn);
+            QApplication::processEvents(QEventLoop::AllEvents, 50);
+            window.refreshSpecialClipPreview();
+            QApplication::processEvents(QEventLoop::AllEvents, 25);
+            const QImage g9GlFrame = g9Grab.toFrame(wgl->grabFramebuffer(), wgl->devicePixelRatioF());
+            g9WBaked = wgl->compositeBakedMode();
+            g9BakedDx = wgl->videoSourceDx();
+            g9BakedDy = wgl->videoSourceDy();
+            g9GlInner = rgbMaxDiff(g9GlFrame, remapExpected, g9Inner);
+        }
+    }
+    const DiffStat g9WigVisible = compare(remapExpected, remapNoWig);
+    // The upload frame is a CPU QImage (no GL clear): it must equal renderFrameAt over the full frame, RGBA.
+    const DiffStat g9SpecialFull = compare(remapSpecial, remapExpected);
+    const bool g9ok4 = g9WOk && g9Grab.rawSizeOk && g9WBaked && g9WigVisible.diffPixels > 50
+        && g9SpecialFull.sizeMatch && g9SpecialFull.maxDiff == 0 && g9GlInner <= 2 && g9Band > 1
+        && g9BakedDx == remapWig.videoDx && g9BakedDy == remapWig.videoDy;
+
+    // (5) arrange writes static values from the keyframes only.
+    const auto arrangedDx = [&](bool withWiggle) {
+        ClipInfo clip = base;
+        clip.videoScale = 0.5;
+        clip.videoDx = 0.1;
+        if (withWiggle) clip.wiggle = g9Wiggle;
+        Timeline tl;
+        tl.restoreFromProject(QVector<QVector<ClipInfo>>{{clip}}, QVector<QVector<ClipInfo>>{}, g9t, -1.0, -1.0, 100);
+        tl.setProjectOutputConfig(kW, kH, true, kFps);
+        tl.setLinkedSelectionEnabled(false);
+        tl.clearSelection();
+        tl.videoTracks()[0]->toggleClipSelection(0);
+        const bool arranged = tl.arrangeSelectedLayers(Timeline::LayerArrangement::Left);
+        return std::make_pair(arranged, tl.videoTracks()[0]->clips().value(0).videoDx);
+    };
+    const auto arrangedWig = arrangedDx(true);
+    const auto arrangedPlain = arrangedDx(false);
+    const bool g9ok5 = arrangedWig.first && arrangedPlain.first && arrangedWig.second == arrangedPlain.second
+        && std::abs(arrangedPlain.second - 0.1) > 1e-6;
+
+    // (6) the project canvas, not the output size, normalizes the pixel amplitude.
+    const QSize project1080(1920, 1080), out720(1280, 720);
+    clipanim::EvalEnv envOut720;
+    envOut720.canvas = out720;
+    const clipgeom::ClipTransform g9Exp1080 = clipanim::effectiveTransformAt(g9Clip, g9t, env1080);
+    const clipgeom::ClipTransform g9ByOutput = clipanim::effectiveTransformAt(g9Clip, g9t, envOut720);
+    const DiffStat g9d6a = compare(renderOne(g9Clip, project1080, g9t, out720),
+                                   renderOne(staticHolding(base, g9Exp1080), project1080, g9t, out720));
+    const DiffStat g9d6b = compare(renderOne(g9Clip, project1080, g9t, project1080),
+                                   renderOne(staticHolding(base, g9Exp1080), project1080, g9t, project1080));
+    const DiffStat g9d6c = compare(renderOne(g9Clip, project1080, g9t, out720),
+                                   renderOne(staticHolding(base, g9ByOutput), project1080, g9t, out720));
+    const bool g9ok6 = g9d6a.sizeMatch && g9d6a.maxDiff == 0 && g9d6b.sizeMatch && g9d6b.maxDiff == 0
+        && g9d6c.sizeMatch && g9d6c.diffPixels > 0;
+
+    std::cerr << std::setprecision(12)
+              << "special-composite G9 offset t=" << g9t << " px=(" << g9Off.positionOffset.x() << ','
+              << g9Off.positionOffset.y() << ") rot=" << g9Off.rotationOffsetDeg << " scale=" << g9Off.scaleMultiplier
+              << " sane=" << g9OffSane << '\n'
+              << "special-composite G9 (1) wiggle vs none sizeMatch=" << g9d1.sizeMatch << " maxDiff=" << g9d1.maxDiff
+              << " diffPixels=" << g9d1.diffPixels << " (expect >50) ok=" << g9ok1 << '\n'
+              << "special-composite G9 (2') env1920 dx=" << g9EnvA.videoDx << " expect=" << g9ExpDx
+              << " dy=" << g9EnvA.videoDy << " expect=" << g9ExpDy << " twoArg dx=" << g9Two.videoDx
+              << " dy=" << g9Two.videoDy << " (expect 0.1 / -0.05) byteEqual="
+              << (std::memcmp(&g9EnvA, &g9EnvB, sizeof g9EnvA) == 0) << " ok=" << g9ok2 << '\n'
+              << "special-composite G9 (3) envCanvas=" << g9Env.canvas.width() << 'x' << g9Env.canvas.height()
+              << " seeked=" << g9Seeked << " glBaked=" << glBaked << " gl local=" << glLocal << " dx=" << glDx
+              << " dy=" << glDy << " expect=" << glExp.videoDx << ',' << glExp.videoDy << " | vp recorded=" << vpRecorded
+              << " attempts=" << vpAttempts << " local=" << vpLocal << " dx=" << vpDx << " dy=" << vpDy
+              << " expect=" << vpExp.videoDx << ',' << vpExp.videoDy << " | renderFrameAt vs static(expected) maxDiff="
+              << g9d3.maxDiff << " (expect 0) ok=" << g9ok3 << '\n'
+              << "special-composite G9 (4') remap+wiggle windowOk=" << g9WOk << " rawSizeOk=" << g9Grab.rawSizeOk
+              << " baked=" << g9WBaked << " shiftPx=" << g9ShiftPx << " band=" << g9Band
+              << " glVsExport innerMaxDiff(rgb, band-cropped)=" << g9GlInner
+              << " specialVsExport full-frame RGBA sizeMatch=" << g9SpecialFull.sizeMatch
+              << " maxDiff=" << g9SpecialFull.maxDiff << " diffPixels=" << g9SpecialFull.diffPixels
+              << " (expect 0 / 0) wiggleVisible maxDiff=" << g9WigVisible.maxDiff << " diffPixels="
+              << g9WigVisible.diffPixels << " (expect >50) bakedMotion dx=" << g9BakedDx << " dy="
+              << g9BakedDy << " (expect keyframes-only " << remapWig.videoDx << ',' << remapWig.videoDy
+              << ") ok=" << g9ok4 << '\n'
+              << "special-composite G9 (5) arrange Left dx wiggle=" << arrangedWig.second << " (arranged="
+              << arrangedWig.first << ") plain=" << arrangedPlain.second << " (arranged=" << arrangedPlain.first
+              << ") ok=" << g9ok5 << '\n'
+              << "special-composite G9 (6) project1920x1080 out1280x720 vs static(norm 1920) maxDiff=" << g9d6a.maxDiff
+              << " out1920x1080 maxDiff=" << g9d6b.maxDiff << " (expect 0 / 0) control static(norm 1280) diffPixels="
+              << g9d6c.diffPixels << " (expect >0) dx1920=" << g9Exp1080.videoDx << " dx1280=" << g9ByOutput.videoDx
+              << " ok=" << g9ok6 << '\n';
+    tally.gate(9, g9ok1 && g9ok2 && g9ok3 && g9ok4 && g9ok5 && g9ok6,
+               "the clip wiggle is missing from the export or a preview, applied twice on the baked frame, "
+               "written back by arrange, or normalized by the output size (see values above)");
+
+    // G10 (US-1505): the expression bindings are ClipInfo::expressions, evaluated by the shared
+    // overlay (keyframes -> autoOrient -> expressions (replace) -> wiggle (add)); audioLevel()
+    // reads the Timeline's audio-level snapshot (Timeline::expressionAudioEnvForRead).
+    //   (1) renderFrameAt at t = 0.5 with transform.rotation = time*90 differs from without
+    //       (HEAD: the export ignores MainWindow's expression sidecar -> equal).
+    //   (2) effectiveTransformAt(clip, 0.5, env).rotationDeg == 45 (replaces a base 10).
+    //   (3) transform.opacity = 50 -> effectiveOpacityAt == 0.5.
+    //   (4) opacity = audioLevel()*100: env.audioLevelAtTime returning 0.5 -> 0.5, no sampler -> 0.
+    //   (5) empty bindings: the env form == the two-argument form (keyframed clip, byte-equal).
+    //   (6) position.x = 0.5 with the wiggle on: videoDx = 0.5 + wiggle offset (the wiggle after).
+    //   (7) time remap + rotation expression: the special composite == renderFrameAt, and the
+    //       expression is visible.
+    //   (8') a stepped WAV linked to V1 (opacity = audioLevel()*100): relinkMediaPaths, a gap
+    //        (ripple delete of an unlinked filler in front), applyTrimLinked (RippleIn, V1 moves
+    //        too) and unlinkClipGroupForTest each change the value after the 50 ms debounce (150 ms wait), with a new
+    //        snapshot pointer; the old snapshot still gives the old value. Mutation control:
+    //        no emit in unlinkClipGroup and no generation compare -> the unlink value stays.
+    //   (8'') regression item (HEAD reads the live clips and passes): setClipSpeed(2.0) on the
+    //        selected V1[0] changes the linked A1[0] speed (no emit) -> the value changes.
+    //        Mutation control: no generation compare -> stale.
+    //   (10) a RenderQueue export of the live Timeline: an expression without audioLevel() never
+    //        decodes (invocationCountForTest() == 0), one with audioLevel() does (> 0).
+    //   (9) a nested sequence's child clip with transform.position.x = audioLevel() and a root A1
+    //       of its link group renders at level 0 (the bar stays at x 224); the same clip at the
+    //       root moves by the level (bar gone). Position, not opacity: a lone V1 layer is drawn
+    //       without its opacity (HEAD's single-layer path).
+    //       Mutation control: the depth check removed -> the child reads the root audio.
+    std::cerr << "special-composite G10 begin\n";
+    const auto g10Wav = [&](const QString &name, double silentSec) {
+        const QString wavPath = dir.filePath(name);
+        constexpr int g10Sr = 48000;
+        QByteArray pcm;
+        pcm.reserve(g10Sr * 2 * 2);
+        for (int i = 0; i < g10Sr * 2; ++i) {
+            const bool loud = silentSec >= 0.0 && i >= int(silentSec * g10Sr);
+            pcm.append(char(0x00));
+            pcm.append(loud ? char(0x40) : char(0x00));
+        }
+        QString err;
+        return libavcore::writePcm16AsWav(wavPath, pcm, g10Sr, 1, &err) ? wavPath : QString();
+    };
+    const QString steppedWav = g10Wav(QStringLiteral("g10-stepped.wav"), 0.5); // silent [0, 0.5)
+    const QString loudWav = g10Wav(QStringLiteral("g10-loud.wav"), 0.0);
+    const QString silentWav = g10Wav(QStringLiteral("g10-silent.wav"), -1.0);
+    const bool g10Fixture = !steppedWav.isEmpty() && !loudWav.isEmpty() && !silentWav.isEmpty();
+    const auto audioClip = [](const QString &wavPath, double duration, int linkGroup) {
+        ClipInfo clip;
+        clip.filePath = wavPath;
+        clip.duration = clip.outPoint = duration;
+        clip.speed = 1.0;
+        clip.linkGroup = linkGroup;
+        return clip;
+    };
+    const double g10t = 0.5;
+
+    // (1)
+    ClipInfo rotClip = base;
+    rotClip.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    const DiffStat g10d1 = compare(renderOne(rotClip, size, g10t, size), renderOne(base, size, g10t, size));
+    const bool g10ok1 = g10d1.sizeMatch && g10d1.diffPixels > 50;
+
+    // (2) / (3) / (4) / (5) / (6): the shared evaluator.
+    clipanim::EvalEnv g10Env;
+    g10Env.fps = kFps;
+    g10Env.canvas = size;
+    ClipInfo rotBased = rotClip;
+    rotBased.rotation2DDegrees = 10.0;
+    const double g10Rot = clipanim::effectiveTransformAt(rotBased, g10t, g10Env).rotationDeg;
+    const bool g10ok2 = std::abs(g10Rot - 45.0) <= 1e-9
+        && clipanim::effectiveTransformAt(rotBased, g10t).rotationDeg == 10.0;
+    ClipInfo opClip = base;
+    opClip.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("50"));
+    const double g10Op = clipanim::effectiveOpacityAt(opClip, g10t, opClip.opacity, g10Env);
+    const bool g10ok3 = std::abs(g10Op - 0.5) <= 1e-12;
+    ClipInfo levelClip = base;
+    levelClip.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel()*100"));
+    clipanim::EvalEnv g10EnvLevel = g10Env;
+    g10EnvLevel.audioLevelAtTime = [](double) { return 0.5; };
+    const double g10OpLevel = clipanim::effectiveOpacityAt(levelClip, g10t, levelClip.opacity, g10EnvLevel);
+    const double g10OpNoSampler = clipanim::effectiveOpacityAt(levelClip, g10t, levelClip.opacity, g10Env);
+    const bool g10ok4 = std::abs(g10OpLevel - 0.5) <= 1e-12 && g10OpNoSampler == 0.0;
+    ClipInfo keyed = base;
+    keyed.keyframes.addTrack(audiokf::propertyTrack(QStringLiteral("transform.position.x"),
+        {KeyframePoint{0.0, 0.0}, KeyframePoint{1.0, 0.4}}, 0.0));
+    const clipgeom::ClipTransform g10Two = clipanim::effectiveTransformAt(keyed, g10t);
+    const clipgeom::ClipTransform g10EnvForm = clipanim::effectiveTransformAt(keyed, g10t, g10EnvLevel);
+    const bool g10KeyedDynamic = clipanim::hasAnyDynamicTransform(keyed) && keyed.expressions.isEmpty();
+    const bool g10ok5 = g10KeyedDynamic && std::memcmp(&g10Two, &g10EnvForm, sizeof g10Two) == 0
+        && std::abs(g10Two.videoDx - 0.2) <= 1e-9
+        && clipanim::effectiveOpacityAt(keyed, g10t, 0.7, g10EnvLevel)
+            == clipanim::effectiveOpacityAt(keyed, g10t, 0.7);
+    ClipInfo posWig = base;
+    posWig.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("0.5"));
+    posWig.wiggle = g9Wiggle;
+    const double g10PosX = clipanim::effectiveTransformAt(posWig, g10t, env1080).videoDx;
+    const double g10PosExp = 0.5 + g9Off.positionOffset.x() / 1920.0;
+    const bool g10ok6 = g9OffSane && std::abs(g10PosX - g10PosExp) <= 1e-9 && std::abs(g10PosX - 0.5) > 1e-4;
+
+    // (7) time remap + expression through the special composite.
+    ClipInfo remapRot = remapped;
+    remapRot.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*90"));
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapped}},
+        QVector<QVector<ClipInfo>>{}, g10t, -1.0, -1.0, 100);
+    const QImage g10RemapPlain = tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size);
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{remapRot}},
+        QVector<QVector<ClipInfo>>{}, g10t, -1.0, -1.0, 100);
+    const QImage g10RemapExport = tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size);
+    const QImage g10RemapSpecial = window.buildSpecialClipComposite(g10t);
+    const DiffStat g10d7 = compare(g10RemapSpecial, g10RemapExport);
+    const DiffStat g10d7v = compare(g10RemapExport, g10RemapPlain);
+    const bool g10ok7 = !g10RemapSpecial.isNull() && g10d7.sizeMatch && g10d7.maxDiff <= 2
+        && g10d7v.diffPixels > 50;
+
+    // (8') / (8''): the snapshot follows the audio edits.
+    ClipInfo linkedV = base;
+    linkedV.linkGroup = 9;
+    linkedV.expressions.setExpression(QStringLiteral("transform.opacity"), QStringLiteral("audioLevel()*100"));
+    const auto levelNow = [&](double local) {
+        const TimelineTrack *v1 = timeline->videoTracks().value(0);
+        if (!v1 || v1->clipCount() == 0) return -1.0;
+        const ClipInfo v = v1->clips().at(0);
+        clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+        env.audioLevelAtTime = timeline->expressionAudioLevelSampler(v, qMax(0.0, v.leadInSec));
+        return clipanim::effectiveOpacityAt(v, local, v.opacity, env);
+    };
+    struct SnapStep {
+        bool edited = false;
+        double before = -1.0, after = -1.0, oldHolder = -2.0;
+        bool ptrChanged = false;
+        bool ok() const
+        {
+            return edited && std::abs(after - before) > 0.2 && ptrChanged && std::abs(oldHolder - before) <= 1e-9;
+        }
+    };
+    const auto runStep = [&](const QVector<ClipInfo> &a1, double local, const std::function<bool()> &edit) {
+        SnapStep step;
+        timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{linkedV}}, QVector<QVector<ClipInfo>>{a1},
+            0.0, -1.0, -1.0, 100);
+        // The setup's own debounced (50 ms) sequence emit lands before the edit; 150 ms
+        // leaves room for the Windows timer granularity (a 60 ms wait let it land after).
+        QTest::qWait(150);
+        step.before = levelNow(local);
+        const auto envBefore = timeline->expressionAudioEnvForRead();
+        const ClipInfo vBefore = timeline->videoTracks().value(0)->clips().value(0);
+        step.edited = edit();
+        QTest::qWait(150); // past the 50 ms debounce of scheduleEmitSequenceChanged
+        QApplication::processEvents();
+        step.after = levelNow(local);
+        const auto envAfter = timeline->expressionAudioEnvForRead();
+        step.ptrChanged = envBefore && envAfter && envBefore.get() != envAfter.get();
+        if (envBefore) {
+            clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+            env.audioLevelAtTime = audiokf::makeLinkedAudioSamplerFrom(*envBefore, vBefore.linkGroup,
+                                                                       qMax(0.0, vBefore.leadInSec));
+            step.oldHolder = clipanim::effectiveOpacityAt(vBefore, local, vBefore.opacity, env);
+        }
+        return step;
+    };
+    QString g10Err;
+    const SnapStep relinkStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        return timeline->relinkMediaPaths(QHash<QString, QString>{{steppedWav, silentWav}}, &g10Err);
+    });
+    ClipInfo filler = audioClip(silentWav, 0.5, 0);
+    const SnapStep gapStep = runStep({filler, audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        return timeline->deleteClipByIndex(true, 0, 0, true, &g10Err);
+    });
+    const SnapStep trimStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.25, [&] {
+        return timeline->applyTrimLinked(timeline->trackAt(true, 0), 0, trimops::TrimType::RippleIn, 0.5, &g10Err);
+    });
+    const SnapStep unlinkStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.75, [&] {
+        timeline->unlinkClipGroupForTest(9);
+        return timeline->videoTracks().value(0)->clips().value(0).linkGroup == 0;
+    });
+    const SnapStep speedStep = runStep({audioClip(steppedWav, 2.0, 9)}, 0.4, [&] {
+        timeline->videoTracks().value(0)->setSelectedClip(0);
+        timeline->setClipSpeed(2.0);
+        return timeline->audioTracks().value(0)->clips().value(0).speed == 2.0;
+    });
+    const bool g10ok8 = g10Fixture && relinkStep.ok() && gapStep.ok() && trimStep.ok() && unlinkStep.ok()
+        && std::abs(unlinkStep.after) <= 1e-12 && std::abs(relinkStep.before - 0.5) < 0.05;
+    const bool g10ok8b = g10Fixture && speedStep.ok();
+
+    // (10) RenderQueue export of the live Timeline (render thread: atomic_load of the snapshot).
+    const auto exportLive = [&](const QString &expression, const QString &outName, QString *err) {
+        ClipInfo v = linkedV;
+        v.expressions = exprbind::ClipExpressionBindings{};
+        v.expressions.setExpression(QStringLiteral("transform.opacity"), expression);
+        timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{v}},
+            QVector<QVector<ClipInfo>>{{audioClip(loudWav, 2.0, 9)}}, 0.0, -1.0, -1.0, 100);
+        QTest::qWait(150);
+        audiokf::resetInvocationCountForTest();
+        const QString outPath = dir.filePath(outName);
+        RenderPreset preset{QStringLiteral("G10"), kW, kH, QStringLiteral("mpeg4"), 600000, QStringLiteral("mp4")};
+        RenderJob job = RenderQueue::jobFromPreset(preset, outPath, 0, 500000);
+        job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+        job.timeline = timeline;
+        job.exportConfig["fps"] = kFps;
+        job.exportConfig["videoCodec"] = QStringLiteral("mpeg4");
+        RenderQueue queue;
+        QEventLoop loop;
+        bool done = false, success = false;
+        QObject::connect(&queue, &RenderQueue::jobCompletedUuid, &loop,
+                         [&](const QString &uuid, bool okJob, const QString &message) {
+                             if (uuid != job.uuid) return;
+                             done = true;
+                             success = okJob;
+                             *err = message;
+                             loop.quit();
+                         });
+        queue.addJob(job);
+        queue.start();
+        if (!done) loop.exec();
+        return std::make_pair(success, audiokf::invocationCountForTest());
+    };
+    QString g10NoLevelErr, g10LevelErr;
+    const auto g10NoLevel = exportLive(QStringLiteral("time*100"), QStringLiteral("g10-nolevel.mp4"), &g10NoLevelErr);
+    const auto g10WithLevel = exportLive(QStringLiteral("audioLevel()*100"), QStringLiteral("g10-level.mp4"), &g10LevelErr);
+    const bool g10ok10 = g10Fixture && g10NoLevel.first && g10NoLevel.second == 0
+        && g10WithLevel.first && g10WithLevel.second > 0;
+
+    // (9) nested: the child clip reads level 0; the same clip at the root does not.
+    const auto barLevel = [](const QImage &img) {
+        if (img.isNull()) return -1;
+        const QRgb p = img.convertToFormat(QImage::Format_ARGB32).pixel(224, kH / 2);
+        return qRed(p) * qAlpha(p) / 255;
+    };
+    ClipInfo levelPosV = base;
+    levelPosV.linkGroup = 9;
+    levelPosV.expressions.setExpression(QStringLiteral("transform.position.x"), QStringLiteral("audioLevel()"));
+    timeline->restoreFromProject(QVector<QVector<ClipInfo>>{{levelPosV}},
+        QVector<QVector<ClipInfo>>{{audioClip(loudWav, 2.0, 9)}}, 0.0, -1.0, -1.0, 100);
+    QTest::qWait(150);
+    const int g10RootBar = barLevel(tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size));
+    TimelineSequence g10Child;
+    g10Child.id = g10Child.name = QStringLiteral("g10-child");
+    g10Child.videoTracks = {{levelPosV}};
+    g10Child.audioTracks = {{}};
+    ClipInfo g10Nested = base;
+    g10Nested.filePath = timeline_nesting::sequenceClipFilePath(g10Child.id);
+    g10Nested.sequenceRefId = g10Child.id;
+    TimelineSequence g10Main;
+    g10Main.id = g10Main.name = QStringLiteral("g10-main");
+    g10Main.videoTracks = {{g10Nested}};
+    g10Main.audioTracks = {{audioClip(loudWav, 2.0, 9)}};
+    timeline->setSequences({g10Main, g10Child}, g10Main.id);
+    QTest::qWait(150);
+    const bool g10NestedActive = timeline->videoTracks().value(0)
+        && timeline->videoTracks().value(0)->clipCount() == 1
+        && timeline->videoTracks().value(0)->clips().at(0).isSequenceReference()
+        && timeline->audioTracks().value(0) && timeline->audioTracks().value(0)->clipCount() == 1;
+    const int g10NestedBar = barLevel(tlrender::renderFrameAt(timeline, qint64(g10t * 1000000.0), size));
+    const bool g10ok9 = g10Fixture && g10NestedActive && g10RootBar >= 0 && g10RootBar < 20 && g10NestedBar > 200;
+
+    const auto stepText = [](const SnapStep &s) {
+        std::ostringstream out;
+        out << "edited=" << s.edited << " before=" << s.before << " after=" << s.after
+            << " ptrChanged=" << s.ptrChanged << " oldHolder=" << s.oldHolder << " ok=" << s.ok();
+        return out.str();
+    };
+    std::cerr << std::setprecision(12)
+              << "special-composite G10 (1) rotation expr vs none sizeMatch=" << g10d1.sizeMatch << " maxDiff="
+              << g10d1.maxDiff << " diffPixels=" << g10d1.diffPixels << " (expect >50) ok=" << g10ok1 << '\n'
+              << "special-composite G10 (2) rotationDeg=" << g10Rot << " (expect 45, base 10) ok=" << g10ok2 << '\n'
+              << "special-composite G10 (3) opacity=" << g10Op << " (expect 0.5) ok=" << g10ok3 << '\n'
+              << "special-composite G10 (4) audioLevel opacity sampler0.5=" << g10OpLevel << " none="
+              << g10OpNoSampler << " (expect 0.5 / 0) ok=" << g10ok4 << '\n'
+              << "special-composite G10 (5) keyed dynamic=" << g10KeyedDynamic << " twoArg dx=" << g10Two.videoDx
+              << " env dx=" << g10EnvForm.videoDx << " byteEqual="
+              << (std::memcmp(&g10Two, &g10EnvForm, sizeof g10Two) == 0) << " ok=" << g10ok5 << '\n'
+              << "special-composite G10 (6) position.x=0.5 + wiggle dx=" << g10PosX << " expect=" << g10PosExp
+              << " ok=" << g10ok6 << '\n'
+              << "special-composite G10 (7) remap+expr special vs export sizeMatch=" << g10d7.sizeMatch
+              << " maxDiff=" << g10d7.maxDiff << " (expect <=2) expr visible diffPixels=" << g10d7v.diffPixels
+              << " (expect >50) ok=" << g10ok7 << '\n'
+              << "special-composite G10 (8') fixture=" << g10Fixture << " err=[" << g10Err.toStdString() << "]\n"
+              << "special-composite G10 (8') relink " << stepText(relinkStep) << '\n'
+              << "special-composite G10 (8') gap " << stepText(gapStep) << '\n'
+              << "special-composite G10 (8') trimLinked " << stepText(trimStep) << '\n'
+              << "special-composite G10 (8') unlink " << stepText(unlinkStep) << " (expect after 0) ok=" << g10ok8 << '\n'
+              << "special-composite G10 (8'') setClipSpeed " << stepText(speedStep) << " ok=" << g10ok8b << '\n'
+              << "special-composite G10 (10) export no audioLevel ok=" << g10NoLevel.first << " ["
+              << g10NoLevelErr.toStdString() << "] invocations=" << g10NoLevel.second << " (expect 0) | audioLevel ok="
+              << g10WithLevel.first << " [" << g10LevelErr.toStdString() << "] invocations=" << g10WithLevel.second
+              << " (expect >0) ok=" << g10ok10 << '\n'
+              << "special-composite G10 (9) root bar@224=" << g10RootBar << " (expect <20, moved by the level) nested active="
+              << g10NestedActive << " nested child bar@224=" << g10NestedBar << " (expect >200, level 0) ok=" << g10ok9 << '\n';
+    tally.gate(10, g10ok1 && g10ok2 && g10ok3 && g10ok4 && g10ok5 && g10ok6 && g10ok7 && g10ok8 && g10ok8b
+                   && g10ok9 && g10ok10,
+               "the clip expressions are missing from the export / special composite, not replacing / ordered "
+               "before the wiggle, the audio-level snapshot did not follow an edit, a nested clip read the root "
+               "audio, or an expression without audioLevel() decoded (see values above)");
+
+    // G11 (US-1520 C-02): the file-backed export Timeline (RenderQueue::resolveTimeline) takes
+    // the project fps the expressions read. A 24 fps project whose clip has
+    // transform.rotation = time*fps*2 shows 24 degrees at t = 0.5 s (30 on a Timeline left at its
+    // 30 fps default). (0) the saved clip carries the binding, and it is not constant: the
+    // evaluator gives 24 / 30 for fps 24 / 30, and the live frames at 24 and 30 fps differ;
+    // (1) the file-backed export == the live 24 fps frame; (2) it differs from the live 30 fps
+    // frame. HEAD: resolveTimeline drops the fps, so the export equals the 30 fps frame.
+    const double g11t = 0.5;
+    ClipInfo g11Clip = base;
+    g11Clip.expressions.setExpression(QStringLiteral("transform.rotation"), QStringLiteral("time*fps*2"));
+    clipanim::EvalEnv g11Env24;
+    g11Env24.fps = 24.0;
+    g11Env24.canvas = size;
+    clipanim::EvalEnv g11Env30 = g11Env24;
+    g11Env30.fps = 30.0;
+    const double g11Rot24 = clipanim::effectiveTransformAt(g11Clip, g11t, g11Env24).rotationDeg;
+    const double g11Rot30 = clipanim::effectiveTransformAt(g11Clip, g11t, g11Env30).rotationDeg;
+    setClip(g11Clip);
+    timeline->setProjectOutputConfig(kW, kH, true, 24.0);
+    const QImage g11Live24 = liveFrame(g11t);
+    timeline->setProjectOutputConfig(kW, kH, true, 30.0);
+    const QImage g11Live30 = liveFrame(g11t);
+    timeline->setProjectOutputConfig(kW, kH, true, kFps);
+    ProjectData g11Project;
+    g11Project.config.width = kW;
+    g11Project.config.height = kH;
+    g11Project.config.fps = 24;
+    g11Project.config.explicitOutputResolution = true;
+    g11Project.videoTracks = QVector<QVector<ClipInfo>>{{g11Clip}};
+    const G8Export g11Export = exportFrame(g11Project, QStringLiteral("g11-fps24"), g11t);
+    ProjectData g11Loaded;
+    const bool g11Saved = ProjectFile::load(dir.filePath(QStringLiteral("g11-fps24.veditor")), g11Loaded)
+        && g11Loaded.config.fps == 24 && g11Loaded.videoTracks.size() == 1 && g11Loaded.videoTracks[0].size() == 1
+        && g11Loaded.videoTracks[0][0].expressions.expression(QStringLiteral("transform.rotation"))
+               == QStringLiteral("time*fps*2");
+    const G8Diff g11LiveDiff = diffImages(g11Live24, g11Live30);
+    const G8Diff g11Diff24 = diffImages(g11Export.image, g11Live24);
+    const G8Diff g11Diff30 = diffImages(g11Export.image, g11Live30);
+    const bool g11ok0 = g11Saved && std::abs(g11Rot24 - 24.0) <= 1e-9 && std::abs(g11Rot30 - 30.0) <= 1e-9
+        && g11LiveDiff.sameSize && g11LiveDiff.differing > 50;
+    const bool g11ok1 = g11Export.ok && g11Diff24.sameSize && g11Diff24.maxChannel <= 2;
+    const bool g11ok2 = g11Export.ok && g11Diff30.sameSize && g11Diff30.differing > 50;
+    std::cerr << "special-composite G11 (0) saved binding+fps=" << g11Saved << " rotation fps24=" << g11Rot24
+              << " fps30=" << g11Rot30 << " live24 vs live30 [" << diffText(g11LiveDiff) << "] ok=" << g11ok0 << '\n'
+              << "special-composite G11 (1) export ok=" << g11Export.ok << " vs live24 [" << diffText(g11Diff24)
+              << "] (expect maxChannelDiff<=2) ok=" << g11ok1 << '\n'
+              << "special-composite G11 (2) export vs live30 [" << diffText(g11Diff30)
+              << "] (expect differingPixels>50, HEAD equal) ok=" << g11ok2 << '\n';
+    tally.gate(11, g11ok0 && g11ok1 && g11ok2,
+               "the file-backed export evaluated the expressions at another fps than the project's "
+               "(see values above)");
+
+    // G12 (US-1520 C-02, roto side): the file-backed export Timeline's project fps is also the
+    // roto fallback fps (TimelineFrameRenderer rotoSourceFps -> roto::clipEffectiveSourceFps)
+    // when the source fps cannot be probed and there is no remap sourceFps. A shape clip has no
+    // file, so roto::probeVideoStreamFps returns 0. Its roto mask moves between keyframes 0 and
+    // 30, so at t = 0.5 s the 24 fps project reads mask frame 12 (a 30 fps Timeline reads 15).
+    // (0) probe == 0, the masks at frames 12 and 15 differ, and the live frames at 24 and 30 fps
+    // differ; (1) the file-backed export == the live 24 fps frame; (2) it differs from the live
+    // 30 fps frame. HEAD: resolveTimeline drops the fps, so the export reads mask frame 15.
+    const double g12t = 0.5;
+    ClipInfo g12Clip;
+    g12Clip.duration = g12Clip.outPoint = 1.0;
+    g12Clip.speed = 1.0;
+    g12Clip.opacity = 1.0;
+    Shape g12Shape;
+    g12Shape.type = ShapeType::Rectangle;
+    g12Shape.properties.size = QSizeF(2 * kW, 2 * kH);
+    g12Shape.position = QPointF(0, 0);
+    g12Shape.fill.color = QColor(230, 200, 40);
+    g12Shape.fill.opacity = 1.0;
+    g12Shape.fill.enabled = true;
+    g12Shape.fill.gradient = false;
+    g12Shape.stroke.enabled = false;
+    g12Clip.shapes = {g12Shape};
+    const auto g12Rect = [](double x0, double x1) {
+        RotoPath path;
+        RotoPoint p;
+        for (const QPointF &q : {QPointF(x0, 0), QPointF(x1, 0), QPointF(x1, kH), QPointF(x0, kH)}) {
+            p.position = p.handleIn = p.handleOut = q;
+            path.points.append(p);
+        }
+        path.closed = true;
+        return path;
+    };
+    RotoClipEntry g12Entry;
+    g12Entry.clipId = rotoKey;
+    g12Entry.keyframes = {RotoKeyframe{0, g12Rect(0, 40)}, RotoKeyframe{30, g12Rect(240, 280)}};
+    const double g12Probe = roto::probeVideoStreamFps(g12Clip.filePath);
+    const int g12Frame24 = roto::sourceFrameIndexFor(g12t, 24.0);
+    const int g12Frame30 = roto::sourceFrameIndexFor(g12t, 30.0);
+    QImage g12Solid(size, QImage::Format_ARGB32_Premultiplied);
+    g12Solid.fill(Qt::white);
+    const G8Diff g12MaskDiff = diffImages(flatten(roto::applyEntryToFrame(g12Entry, g12Solid, g12Frame24)),
+                                          flatten(roto::applyEntryToFrame(g12Entry, g12Solid, g12Frame30)));
+    setClip(g12Clip);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{{rotoKey, g12Entry}});
+    timeline->setProjectOutputConfig(kW, kH, true, 24.0);
+    const QImage g12Live24 = liveFrame(g12t);
+    timeline->setProjectOutputConfig(kW, kH, true, 30.0);
+    const QImage g12Live30 = liveFrame(g12t);
+    timeline->setProjectOutputConfig(kW, kH, true, kFps);
+    timeline->setRotoEntries(QHash<QString, RotoClipEntry>{});
+    ProjectData g12Project;
+    g12Project.config.width = kW;
+    g12Project.config.height = kH;
+    g12Project.config.fps = 24;
+    g12Project.config.explicitOutputResolution = true;
+    g12Project.videoTracks = QVector<QVector<ClipInfo>>{{g12Clip}};
+    g12Project.rotoClipEntries = {g12Entry};
+    const G8Export g12Export = exportFrame(g12Project, QStringLiteral("g12-roto-fps24"), g12t);
+    const int g12ExportFrame = roto::lastRenderSourceFrameIndex();
+    const G8Diff g12LiveDiff = diffImages(g12Live24, g12Live30);
+    const G8Diff g12Diff24 = diffImages(g12Export.image, g12Live24);
+    const G8Diff g12Diff30 = diffImages(g12Export.image, g12Live30);
+    const bool g12ok0 = g12Probe == 0.0 && g12Frame24 == 12 && g12Frame30 == 15 && g12MaskDiff.sameSize
+        && g12MaskDiff.differing > 50 && g12LiveDiff.sameSize && g12LiveDiff.differing > 50;
+    const bool g12ok1 = g12Export.ok && g12Diff24.sameSize && g12Diff24.maxChannel <= 2;
+    const bool g12ok2 = g12Export.ok && g12Diff30.sameSize && g12Diff30.differing > 50;
+    std::cerr << "special-composite G12 (0) probeVideoStreamFps=" << g12Probe << " (expect 0) mask frame fps24="
+              << g12Frame24 << " fps30=" << g12Frame30 << " mask12 vs mask15 [" << diffText(g12MaskDiff)
+              << "] live24 vs live30 [" << diffText(g12LiveDiff) << "] ok=" << g12ok0 << '\n'
+              << "special-composite G12 (1) export ok=" << g12Export.ok << " last mask frame=" << g12ExportFrame
+              << " vs live24 [" << diffText(g12Diff24) << "] (expect maxChannelDiff<=2) ok=" << g12ok1 << '\n'
+              << "special-composite G12 (2) export vs live30 [" << diffText(g12Diff30)
+              << "] (expect differingPixels>50, HEAD equal) ok=" << g12ok2 << '\n';
+    tally.gate(12, g12ok0 && g12ok1 && g12ok2,
+               "the file-backed export took the roto fallback fps from somewhere other than the project "
+               "fps for an unprobeable source (see values above)");
 
     return tally.finish("special-composite");
 }

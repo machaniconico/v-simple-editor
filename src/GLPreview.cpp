@@ -135,8 +135,14 @@ QImage applyPlanarRotation(const QImage &image, double degrees)
     return rotated;
 }
 
+// US-1504: one dynamic overlay per frame. A compositeBaked frame already holds
+// the special composite's wiggle, so it takes the keyframes only (two-argument
+// form); every other frame evaluates the env form with the Timeline's canvas
+// (US-1505: and, for expression bindings, the audioLevel() sampler of the clip
+// starting at clipStartSec).
 PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clipIdx,
-                                    double clipLocalSeconds)
+                                    double clipLocalSeconds, double clipStartSec,
+                                    bool compositeBaked, const Timeline *timeline)
 {
     PreviewClipMotion motion;
     motion.valid = true;
@@ -149,15 +155,27 @@ PreviewClipMotion makePreviewMotion(const ClipInfo &clip, int trackIdx, int clip
     motion.opacity = clip.opacity;
     motion.is3DLayer = clip.is3DLayer;
     motion.layer3D = clip.layer3D;
-    if (clip.keyframes.hasAnyKeyframes()) {
-        const clipgeom::ClipTransform transform =
-            clipanim::effectiveTransformAt(clip, clipLocalSeconds);
+    if (clipanim::hasAnyDynamicTransform(clip)) {
+        clipanim::EvalEnv env = tlrender::dynamicEvalEnv(timeline);
+        if (!compositeBaked && timeline && !clip.expressions.isEmpty())
+            env.audioLevelAtTime = timeline->expressionAudioLevelSampler(clip, clipStartSec);
+        const clipgeom::ClipTransform transform = compositeBaked
+            ? clipanim::effectiveTransformAt(clip, clipLocalSeconds)
+            : clipanim::effectiveTransformAt(clip, clipLocalSeconds, env);
         motion.scale = transform.videoScale;
         motion.dx = transform.videoDx;
         motion.dy = transform.videoDy;
         motion.rotation2D = transform.rotationDeg;
-        motion.opacity =
-            clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity);
+        motion.opacity = compositeBaked
+            ? clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity)
+            : clipanim::effectiveOpacityAt(clip, clipLocalSeconds, clip.opacity, env);
+    }
+    // US-1509: the same orient-towards-camera layer3D the export projection uses.
+    if (timeline && !compositeBaked) {
+        const Camera3DState camera = timeline->projectCameraAt(clipStartSec + clipLocalSeconds);
+        const QSize canvas = timeline->projectOutputSize();
+        motion.layer3D = camera3d::effectiveLayer3DAt(
+            clip, QPointF(motion.dx * canvas.width(), motion.dy * canvas.height()), camera);
     }
     return motion;
 }
@@ -209,7 +227,9 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
         return makePreviewMotion(*activeClips.first().clip,
                                  activeClips.first().trackIdx,
                                  activeClips.first().clipIdx,
-                                 timelineSec - activeClips.first().timelineStartSec);
+                                 timelineSec - activeClips.first().timelineStartSec,
+                                 activeClips.first().timelineStartSec,
+                                 compositeBaked, timeline);
 
     for (int trackIdx = 0; trackIdx < videoTracks.size(); ++trackIdx) {
         const auto *track = videoTracks[trackIdx];
@@ -221,14 +241,16 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
         for (const ActiveClipRef &ref : activeClips) {
             if (ref.trackIdx == trackIdx && ref.clipIdx == selectedClipIdx)
                 return makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
-                                         timelineSec - ref.timelineStartSec);
+                                         timelineSec - ref.timelineStartSec,
+                                         ref.timelineStartSec, false, timeline);
         }
     }
 
     for (const ActiveClipRef &ref : activeClips) {
         const PreviewClipMotion motion =
             makePreviewMotion(*ref.clip, ref.trackIdx, ref.clipIdx,
-                              timelineSec - ref.timelineStartSec);
+                              timelineSec - ref.timelineStartSec,
+                              ref.timelineStartSec, false, timeline);
         if (fuzzyMatchMotionValue(motion.scale, currentScale)
             && fuzzyMatchMotionValue(motion.dx, currentDx)
             && fuzzyMatchMotionValue(motion.dy, currentDy)) {
@@ -239,9 +261,18 @@ PreviewClipMotion resolvePreviewClipMotion(const Timeline *timeline, double time
     return makePreviewMotion(*activeClips.first().clip,
                              activeClips.first().trackIdx,
                              activeClips.first().clipIdx,
-                             timelineSec - activeClips.first().timelineStartSec);
+                             timelineSec - activeClips.first().timelineStartSec,
+                             activeClips.first().timelineStartSec,
+                             compositeBaked, timeline);
 }
 } // namespace
+
+// US-1509 selftest seam (camera3d G10, declared there): the layer3D the preview's projection
+// uses for the single clip active at timelineSec (makePreviewMotion, not compositeBaked).
+Layer3DTransform previewLayer3DForSelftest(const Timeline *timeline, double timelineSec)
+{
+    return resolvePreviewClipMotion(timeline, timelineSec, false, 1.0, 0.0, 0.0).layer3D;
+}
 
 // Vertex shader — simple fullscreen quad
 static const char *vertexShaderSrc = R"(
@@ -2054,8 +2085,15 @@ void GLPreview::paintGL()
     PreviewClipMotion previewMotion;
     if (m_timeline) {
         double timelineSec = 0.0;
-        if (auto *player = qobject_cast<VideoPlayer *>(parentWidget()))
-            timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
+        // US-1504: the view sits in the player's display stack, so the player is an
+        // ancestor rather than the direct parent; the clip motion (keyframes and the
+        // wiggle) is evaluated at the player's position.
+        for (QWidget *w = parentWidget(); w; w = w->parentWidget()) {
+            if (auto *player = qobject_cast<VideoPlayer *>(w)) {
+                timelineSec = static_cast<double>(player->timelinePositionUs()) / AV_TIME_BASE;
+                break;
+            }
+        }
         previewMotion = resolvePreviewClipMotion(m_timeline, timelineSec,
                                                  compositeBaked,
                                                  m_videoSourceScale,

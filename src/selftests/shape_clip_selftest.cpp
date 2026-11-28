@@ -703,6 +703,302 @@ int runShapeClipSelftest()
         reportGate(13, pathStable && sameSeed && otherSeed && offIdentity && legacyOk,
                    "Wiggle Path determinism/seed/disabled identity/legacy regression failed",
                    passed, failed);
+
+        // G14: Wiggle Path varies with clip-local time through wigglesPerSecond.
+        ShapeModifiers timeMods = wigMods;
+        timeMods.wigglePath.wigglesPerSecond = 2.0;
+        Shape timeShape = fullyPopulatedShape(ShapeType::Star);
+        timeShape.position = QPointF(90, 70);
+        timeShape.modifiers = timeMods;
+        Shape staticShape = timeShape;
+        staticShape.modifiers.wigglePath.wigglesPerSecond = 0.0;
+        const QImage t0 = ShapeLayer::renderShapesToImage({timeShape}, canvas, 0.0);
+        const QImage tQuarter = ShapeLayer::renderShapesToImage({timeShape}, canvas, 0.25);
+        const bool timeVaries = t0 != tQuarter;
+        const bool wpsZeroStable = ShapeLayer::renderShapesToImage({staticShape}, canvas, 0.25)
+            == ShapeLayer::renderShapesToImage({staticShape}, canvas, 0.0);
+        const bool t0IsStatic = t0 == wig7a;
+
+        auto exportAt = [&](const Shape &shape, qint64 us) {
+            Timeline exportTimeline;
+            exportTimeline.videoTracks().first()->setClips(QVector<ClipInfo>{makeShapeClip(shape)});
+            exportTimeline.refreshPlaybackSequence();
+            return tlrender::renderFrameAt(&exportTimeline, us, canvas);
+        };
+        const QImage expA = exportAt(timeShape, 500000), expB = exportAt(timeShape, 1000000);
+        const bool exportVaries = !expA.isNull() && !expB.isNull() && expA != expB;
+        const bool exportStatic = !exportAt(staticShape, 500000).isNull()
+            && exportAt(staticShape, 500000) == exportAt(staticShape, 1000000);
+
+        const ShapeModifiers timeBack = ShapeModifiers::fromJson(timeMods.toJson());
+        const bool timeJson = timeBack.wigglePath.wigglesPerSecond == 2.0
+            && timeBack.toJson() == timeMods.toJson()
+            && !wigMods.toJson()["wigglePath"].toObject().contains(QStringLiteral("wigglesPerSecond"));
+
+        QPainterPath polyLine;
+        polyLine.moveTo(0, 0);
+        polyLine.lineTo(100, 0);
+        auto displacements = [&](double timeSec) {
+            const QPainterPath out = shapemod::wigglePath(polyLine, 6.0, 20, 7, timeSec, 2.0);
+            QVector<QPointF> d;
+            for (int i = 0; i < out.elementCount(); ++i)
+                d.append(QPointF(out.elementAt(i).x - 100.0 * i / 20.0, out.elementAt(i).y));
+            return d;
+        };
+        const QVector<QPointF> d0 = displacements(0.0), d1 = displacements(0.5);
+        bool shifted = d0.size() == d1.size() && d0.size() > 2;
+        double maxDiff = 0.0, maxBound = 0.0;
+        for (int i = 0; shifted && i + 1 < d0.size(); ++i) {
+            maxDiff = std::max(maxDiff, QLineF(d1[i], d0[i + 1]).length());
+        }
+        for (int i = 0; shifted && i < d0.size(); ++i)
+            maxBound = std::max({maxBound, std::abs(d0[i].x()), std::abs(d0[i].y()),
+                                 std::abs(d1[i].x()), std::abs(d1[i].y())});
+        const bool notShifted = shifted && maxDiff > 1e-6 && maxBound <= 2.0 * 6.0 + 1e-9;
+        std::fprintf(stderr, "[shape-clip] G14 timeVaries=%d wpsZeroStable=%d t0IsStatic=%d exportVaries=%d "
+                     "exportStatic=%d json=%d notShifted=%d maxShiftDiff=%.6f maxDisp=%.6f\n",
+                     timeVaries, wpsZeroStable, t0IsStatic, exportVaries, exportStatic, timeJson,
+                     notShifted, maxDiff, maxBound);
+        reportGate(14, timeVaries && wpsZeroStable && t0IsStatic && exportVaries && exportStatic
+                       && timeJson && notShifted,
+                   "Wiggle Path time variation/static identity/export/JSON/shift failed",
+                   passed, failed);
+    }
+
+    // G15-G17: Offset Path / Pucker & Bloat / Twist (disabled by default).
+    {
+        auto polysOf = [](const QPainterPath &path) { return path.toSubpathPolygons(QTransform()); };
+        auto areaOf = [&](const QPainterPath &path) {
+            double total = 0.0;
+            for (const QPolygonF &poly : polysOf(path)) {
+                double a = 0.0;
+                for (int i = 0; i < poly.size(); ++i) {
+                    const QPointF p = poly[i], q = poly[(i + 1) % poly.size()];
+                    a += p.x() * q.y() - q.x() * p.y();
+                }
+                total += std::abs(a) / 2.0;
+            }
+            return total;
+        };
+        auto cross = [](const QPointF &o, const QPointF &a, const QPointF &b) {
+            return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x());
+        };
+        // True when any two non-adjacent edges of one subpath properly cross.
+        auto selfIntersects = [&](const QPainterPath &path) {
+            for (const QPolygonF &poly0 : polysOf(path)) {
+                QPolygonF poly = poly0;
+                if (poly.size() > 1 && QLineF(poly.first(), poly.last()).length() < 1e-9) poly.removeLast();
+                const int n = poly.size();
+                for (int i = 0; i < n; ++i)
+                    for (int j = i + 2; j < n; ++j) {
+                        if (i == 0 && j == n - 1) continue;
+                        const QPointF a = poly[i], b = poly[(i + 1) % n], c = poly[j], d = poly[(j + 1) % n];
+                        const double d1 = cross(a, b, c), d2 = cross(a, b, d);
+                        const double d3 = cross(c, d, a), d4 = cross(c, d, b);
+                        if (((d1 > 1e-9 && d2 < -1e-9) || (d1 < -1e-9 && d2 > 1e-9))
+                            && ((d3 > 1e-9 && d4 < -1e-9) || (d3 < -1e-9 && d4 > 1e-9)))
+                            return true;
+                    }
+            }
+            return false;
+        };
+        auto lShape = [](double arm) {
+            QPainterPath p;
+            p.moveTo(0, 0); p.lineTo(100, 0); p.lineTo(100, arm); p.lineTo(arm, arm);
+            p.lineTo(arm, 100); p.lineTo(0, 100); p.closeSubpath();
+            return p;
+        };
+        // Per-vertex naive inward offset (the mutation control: no boolean clean-up).
+        auto naiveOffset = [&](const QPainterPath &path, double amount) {
+            QPolygonF poly = polysOf(path).first();
+            if (QLineF(poly.first(), poly.last()).length() < 1e-9) poly.removeLast();
+            const int n = poly.size();
+            QPainterPath out;
+            for (int i = 0; i < n; ++i) {
+                const QPointF prev = poly[(i + n - 1) % n], cur = poly[i], next = poly[(i + 1) % n];
+                auto normal = [](const QPointF &a, const QPointF &b) {
+                    const QLineF l(a, b);
+                    return QPointF(l.dy(), -l.dx()) / l.length();
+                };
+                const QPointF nrm = normal(prev, cur) + normal(cur, next);
+                const double len = std::hypot(nrm.x(), nrm.y());
+                const QPointF moved = cur + nrm / len * amount * 1.4142135623730951 / (len > 1.9 ? 1.4142135623730951 : 1.0);
+                if (i == 0) out.moveTo(moved); else out.lineTo(moved);
+            }
+            out.closeSubpath();
+            return out;
+        };
+
+        QPainterPath square;
+        square.addRect(QRectF(0, 0, 100, 100));
+        const QPainterPath grown = shapemod::offsetPath(square, 10.0);
+        const QPainterPath shrunk = shapemod::offsetPath(square, -10.0);
+        auto near = [](double a, double b, double tol) { return std::abs(a - b) <= tol; };
+        const bool squareOk = near(grown.boundingRect().width(), 120.0, 1e-6)
+            && near(grown.boundingRect().height(), 120.0, 1e-6) && polysOf(grown).size() == 1
+            && near(shrunk.boundingRect().width(), 80.0, 1e-6)
+            && near(shrunk.boundingRect().height(), 80.0, 1e-6) && polysOf(shrunk).size() == 1;
+        const QPainterPath l60 = lShape(60), l60in = shapemod::offsetPath(l60, -20.0);
+        const bool l60Ok = !l60in.isEmpty() && !selfIntersects(l60in)
+            && areaOf(l60in) <= areaOf(l60) + 1e-6 && areaOf(l60in) > 1.0;
+        const QPainterPath l30 = lShape(30), l30in = shapemod::offsetPath(l30, -20.0);
+        const bool l30Empty = l30in.isEmpty() || areaOf(l30in) < 1e-6;
+        // Controls: the detector flags a bow-tie, and the naive offset fails the thin-arm criterion.
+        QPainterPath bowTie;
+        bowTie.moveTo(0, 0); bowTie.lineTo(10, 10); bowTie.lineTo(10, 0); bowTie.lineTo(0, 10);
+        bowTie.closeSubpath();
+        const QPainterPath naive30 = naiveOffset(l30, -20.0);
+        const bool controlsOk = selfIntersects(bowTie) && !(naive30.isEmpty() || areaOf(naive30) < 1e-6);
+        // Open path -> stroke outline; empty stays empty.
+        QPainterPath openLine;
+        openLine.moveTo(0, 0); openLine.lineTo(100, 0);
+        const QPainterPath outline = shapemod::offsetPath(openLine, 5.0);
+        const bool openOk = near(outline.boundingRect().height(), 10.0, 1e-6)
+            && shapemod::offsetPath(QPainterPath(), 5.0).isEmpty();
+        // Perf: 1000-vertex wavy circle, best of 20.
+        QPainterPath big;
+        for (int i = 0; i < 1000; ++i) {
+            const double a = 2.0 * M_PI * i / 1000.0, r = 100.0 + 3.0 * std::sin(a * 7.0);
+            const QPointF pt(r * std::cos(a), r * std::sin(a));
+            if (i == 0) big.moveTo(pt); else big.lineTo(pt);
+        }
+        big.closeSubpath();
+        qint64 bestGrowNs = -1, bestShrinkNs = -1;
+        for (int run = 0; run < 20; ++run) {
+            QElapsedTimer timer;
+            timer.start();
+            const QPainterPath r1 = shapemod::offsetPath(big, 10.0);
+            const qint64 growNs = timer.nsecsElapsed();
+            timer.restart();
+            const QPainterPath r2 = shapemod::offsetPath(big, -10.0);
+            const qint64 shrinkNs = timer.nsecsElapsed();
+            if (bestGrowNs < 0 || growNs < bestGrowNs) bestGrowNs = growNs;
+            if (bestShrinkNs < 0 || shrinkNs < bestShrinkNs) bestShrinkNs = shrinkNs;
+            if (r1.isEmpty()) bestGrowNs = 1000000000;
+            if (r2.isEmpty()) bestShrinkNs = 1000000000;
+        }
+        // The design target is 5 ms (measured ~4.6-5.5 ms on the dev host, logged above); the gate
+        // allows 3x so host load does not flake it while an order-of-magnitude regression still fails.
+        const bool perfOk = bestGrowNs <= 15000000 && bestShrinkNs <= 15000000;
+        // Regression: Offset keeps the input fill rule (overlap stays a hole) and a backtracking spike.
+        QPainterPath nested;
+        nested.addRect(QRectF(0, 0, 100, 100));
+        nested.addRect(QRectF(30, 30, 40, 40));
+        const bool holeGrowOk = !shapemod::offsetPath(nested, 1.0).contains(QPointF(50, 50));
+        const bool holeShrinkOk = !shapemod::offsetPath(nested, -1.0).contains(QPointF(50, 50));
+        const bool holeOk = holeGrowOk && holeShrinkOk
+            && shapemod::offsetPath(nested, 1.0).contains(QPointF(10, 10));
+        QPainterPath spike;
+        spike.moveTo(0, 0); spike.lineTo(200, 0); spike.lineTo(100, 0); spike.lineTo(100, 50);
+        spike.lineTo(0, 50); spike.closeSubpath();
+        const QPainterPath spikeOut = shapemod::offsetPath(spike, 5.0);
+        const bool spikeOk = spikeOut.boundingRect().right() >= 200.0;
+        std::fprintf(stderr, "[shape-clip] G15 square=%d l60=%d (area %.3f of %.3f) l30Empty=%d controls=%d "
+                     "open=%d offsetGrowMs=%.3f offsetShrinkMs=%.3f perf=%d holeGrow=%d holeShrink=%d "
+                     "spikeRight=%.3f spike=%d\n",
+                     squareOk, l60Ok, areaOf(l60in), areaOf(l60), l30Empty, controlsOk, openOk,
+                     bestGrowNs / 1e6, bestShrinkNs / 1e6, perfOk, holeGrowOk, holeShrinkOk,
+                     spikeOut.boundingRect().right(), spikeOk);
+        reportGate(15, squareOk && l60Ok && l30Empty && controlsOk && openOk && perfOk && holeOk && spikeOk,
+                   "Offset Path bounding/self-intersection/empty/control/open/perf failed", passed, failed);
+
+        // G16: Pucker & Bloat.
+        auto flatRef = [&](const QPainterPath &path) { return path.toFillPolygon(QTransform::fromScale(16, 16)); };
+        const QPainterPath pucker = shapemod::puckerBloat(square, 50.0);
+        const QPainterPath bloat = shapemod::puckerBloat(square, -50.0);
+        const QPainterPath zero = shapemod::puckerBloat(square, 0.0);
+        // Flattened sampling is coarse near x = 50, so read the apex from the exact curve.
+        auto apex = [&](const QPainterPath &path) {
+            double best = 1e300;
+            for (int i = 0; i < 2001; ++i) {
+                const QPointF pt = path.pointAtPercent(i / 2000.0);
+                if (std::abs(pt.x() - 50.0) < 1e-3) best = std::min(best, pt.y());
+            }
+            return best;
+        };
+        const bool puckerOk = near(pucker.boundingRect().width(), 125.0, 1e-6)
+            && near(pucker.boundingRect().height(), 125.0, 1e-6) && near(pucker.boundingRect().top(), -12.5, 1e-6);
+        const bool bloatOk = near(bloat.boundingRect().width(), 150.0, 1e-6)
+            && near(bloat.boundingRect().height(), 150.0, 1e-6);
+        const double puckerApex = apex(pucker), bloatApex = apex(bloat);
+        const bool midOk = near(puckerApex, 50.0 - 62.5, 0.05) && near(bloatApex, 50.0 - 37.5, 0.05);
+        const QPolygonF zf = flatRef(zero), sf = flatRef(square);
+        bool zeroSame = !zf.isEmpty() && !sf.isEmpty();
+        for (const QPointF &pt : zf) {
+            double nearest = 1e300;
+            for (int i = 0; i + 1 < sf.size(); ++i) {
+                const QLineF seg(sf[i], sf[i + 1]);
+                const double t = seg.length() > 0 ? std::clamp(QPointF::dotProduct(pt - seg.p1(), seg.p2() - seg.p1())
+                                                               / (seg.length() * seg.length()), 0.0, 1.0) : 0.0;
+                nearest = std::min(nearest, QLineF(pt, seg.p1() + (seg.p2() - seg.p1()) * t).length());
+            }
+            if (nearest > 1e-3 * 16.0) zeroSame = false;
+        }
+        zeroSame = zeroSame && near(areaOf(zero), areaOf(square), 1e-3);
+        std::fprintf(stderr, "[shape-clip] G16 pucker=%d bloat=%d apex=%.4f/%.4f (62.5 / 37.5 from centre) zero=%d\n",
+                     puckerOk, bloatOk, 50.0 - puckerApex, 50.0 - bloatApex, zeroSame);
+        reportGate(16, puckerOk && bloatOk && midOk && zeroSame,
+                   "Pucker & Bloat bounding/edge midpoint/zero identity failed", passed, failed);
+
+        // G17: Twist, plus JSON round trip of all three configs and the disabled default.
+        QPainterPath hline;
+        hline.moveTo(-100, 0);
+        hline.lineTo(100, 0);
+        const QPainterPath tw90 = shapemod::twist(hline, 90.0);
+        bool centreFixed = false, halfOk = false;
+        for (int i = 0; i < tw90.elementCount(); ++i) {
+            const QPointF pt(tw90.elementAt(i).x, tw90.elementAt(i).y);
+            if (QLineF(pt, QPointF(0, 0)).length() < 1e-6) centreFixed = true;
+            // Point that started at (50, 0) (R/2) must now sit at 45 degrees on the same radius.
+            if (QLineF(pt, QPointF(50 * std::cos(M_PI / 4), 50 * std::sin(M_PI / 4))).length() < 1e-6)
+                halfOk = true;
+        }
+        const QPainterPath tw0 = shapemod::twist(hline, 0.0);
+        bool zeroTwist = tw0.elementCount() > 1;
+        for (int i = 0; i < tw0.elementCount(); ++i)
+            zeroTwist = zeroTwist && near(tw0.elementAt(i).y, 0.0, 1e-9)
+                && near(tw0.elementAt(i).x, std::round(tw0.elementAt(i).x * 8) / 8, 1e-9);
+        zeroTwist = zeroTwist && near(tw0.boundingRect().width(), 200.0, 1e-9)
+            && near(tw0.boundingRect().height(), 0.0, 1e-9);
+        ShapeModifiers cfg;
+        cfg.puckerBloat = {true, -33.5};
+        cfg.twist = {true, 123.0};
+        cfg.offsetPath = {true, -7.25};
+        const ShapeModifiers back = ShapeModifiers::fromJson(cfg.toJson());
+        const bool jsonOk = back.puckerBloat.enabled && back.puckerBloat.amountPct == -33.5
+            && back.twist.enabled && back.twist.angleDeg == 123.0 && back.offsetPath.enabled
+            && back.offsetPath.amount == -7.25 && back.toJson() == cfg.toJson() && !cfg.isDefault();
+        ShapeModifiers off = cfg;
+        off.puckerBloat.enabled = off.twist.enabled = off.offsetPath.enabled = false;
+        const bool defaultOk = off.isDefault() && off.toJson().isEmpty();
+        Shape plain = fullyPopulatedShape(ShapeType::Star);
+        plain.position = QPointF(90, 70);
+        Shape offsetShape = plain;
+        offsetShape.modifiers.offsetPath = {true, 8.0};
+        Shape puckerShape = plain;
+        puckerShape.modifiers.puckerBloat = {true, 40.0};
+        Shape twistShape = plain;
+        twistShape.modifiers.twist = {true, 60.0};
+        Shape disabledShape = plain;
+        disabledShape.modifiers = off;
+        const QSize canvas(200, 160);
+        const bool renderOk = ShapeLayer::renderShapesToImage({disabledShape}, canvas)
+                == ShapeLayer::renderShapesToImage({plain}, canvas)
+            && ShapeLayer::renderShapesToImage({offsetShape}, canvas)
+                != ShapeLayer::renderShapesToImage({plain}, canvas);
+        // renderShape applies Pucker & Bloat and Twist between Wiggle and Offset; the path
+        // builder is private, so only "differs from the unmodified render" is checkable here.
+        const bool renderPucker = ShapeLayer::renderShapesToImage({puckerShape}, canvas)
+            != ShapeLayer::renderShapesToImage({plain}, canvas);
+        const bool renderTwist = ShapeLayer::renderShapesToImage({twistShape}, canvas)
+            != ShapeLayer::renderShapesToImage({plain}, canvas);
+        std::fprintf(stderr, "[shape-clip] G17 centreFixed=%d halfRadius45=%d zeroTwist=%d json=%d "
+                     "disabledDefault=%d render=%d renderPucker=%d renderTwist=%d\n",
+                     centreFixed, halfOk, zeroTwist, jsonOk, defaultOk, renderOk,
+                     renderPucker, renderTwist);
+        reportGate(17, centreFixed && halfOk && zeroTwist && jsonOk && defaultOk && renderOk
+                       && renderPucker && renderTwist,
+                   "Twist center/half-radius/zero/JSON/disabled default failed", passed, failed);
     }
 
     std::fprintf(stderr, "[shape-clip] summary: %d PASS, %d FAIL\n",

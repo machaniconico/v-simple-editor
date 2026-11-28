@@ -8,6 +8,7 @@
 #include <QLinearGradient>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPainterPathStroker>
 #include <QPen>
 #include <QTransform>
 #include <QtMath>
@@ -244,7 +245,8 @@ bool ShapeModifiers::isDefault() const
         && repeater.scale == 1.0 && repeater.opacityEnd == 1.0
         && !trim.enabled && trim.startPct == 0.0 && trim.endPct == 100.0
         && trim.offsetPct == 0.0
-        && !roundCorners.enabled && !zigZag.enabled && !wigglePath.enabled;
+        && !roundCorners.enabled && !zigZag.enabled && !wigglePath.enabled
+        && !puckerBloat.enabled && !twist.enabled && !offsetPath.enabled;
 }
 
 QJsonObject ShapeModifiers::toJson() const
@@ -272,9 +274,19 @@ QJsonObject ShapeModifiers::toJson() const
         obj["zigZag"] = QJsonObject{{"enabled", true}, {"size", zigZag.size},
                                     {"ridges", zigZag.ridgesPerSegment},
                                     {"smooth", zigZag.smooth}};
-    if (wigglePath.enabled)
-        obj["wigglePath"] = QJsonObject{{"enabled", true}, {"amplitude", wigglePath.amplitude},
-                                        {"detail", wigglePath.detail}, {"seed", wigglePath.seed}};
+    if (wigglePath.enabled) {
+        QJsonObject wp{{"enabled", true}, {"amplitude", wigglePath.amplitude},
+                       {"detail", wigglePath.detail}, {"seed", wigglePath.seed}};
+        if (wigglePath.wigglesPerSecond != 0.0)
+            wp["wigglesPerSecond"] = wigglePath.wigglesPerSecond;
+        obj["wigglePath"] = wp;
+    }
+    if (puckerBloat.enabled)
+        obj["puckerBloat"] = QJsonObject{{"enabled", true}, {"amountPct", puckerBloat.amountPct}};
+    if (twist.enabled)
+        obj["twist"] = QJsonObject{{"enabled", true}, {"angleDeg", twist.angleDeg}};
+    if (offsetPath.enabled)
+        obj["offsetPath"] = QJsonObject{{"enabled", true}, {"amount", offsetPath.amount}};
     return obj;
 }
 
@@ -306,6 +318,16 @@ ShapeModifiers ShapeModifiers::fromJson(const QJsonObject &obj)
     m.wigglePath.amplitude = qBound(-1000000.0, wp["amplitude"].toDouble(5.0), 1000000.0);
     m.wigglePath.detail = qBound(1, wp["detail"].toInt(4), 100);
     m.wigglePath.seed = wp["seed"].toInt(1);
+    m.wigglePath.wigglesPerSecond = qBound(0.0, wp["wigglesPerSecond"].toDouble(0.0), 100.0);
+    const QJsonObject pb = obj["puckerBloat"].toObject();
+    m.puckerBloat.enabled = pb["enabled"].toBool(false);
+    m.puckerBloat.amountPct = qBound(-1000.0, pb["amountPct"].toDouble(0.0), 1000.0);
+    const QJsonObject tw = obj["twist"].toObject();
+    m.twist.enabled = tw["enabled"].toBool(false);
+    m.twist.angleDeg = qBound(-100000.0, tw["angleDeg"].toDouble(30.0), 100000.0);
+    const QJsonObject op = obj["offsetPath"].toObject();
+    m.offsetPath.enabled = op["enabled"].toBool(false);
+    m.offsetPath.amount = qBound(-1000000.0, op["amount"].toDouble(10.0), 1000000.0);
     return m;
 }
 
@@ -659,7 +681,8 @@ QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment,
     return result;
 }
 
-QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, int seed)
+QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, int seed,
+                        double timeSec, double wigglesPerSecond)
 {
     if (!std::isfinite(amplitude)) return path;
     const int parts = qBound(1, detail, 100);
@@ -669,6 +692,14 @@ QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, 
     params.positionAmplitude = QPointF(amplitude, amplitude);
     params.octaves = 2;
     params.seed = static_cast<unsigned int>(seed);
+    // Time-varying part: 0.5 * (n2(counter * K + t * wps) - n2(counter * K)) on top of the
+    // static n(counter), so total amplitude stays <= 2A and t == 0 / wps == 0 is the static path.
+    // n2 is the separate series p2 = p with a shifted seed, so it does not replay the static pattern.
+    wiggle::WiggleParams params2 = params;
+    params2.seed = params.seed ^ 0x9E3779B9u;
+    constexpr double kTimeStride = 1024.0;
+    const double timeShift = std::isfinite(timeSec) && std::isfinite(wigglesPerSecond)
+        ? timeSec * wigglesPerSecond : 0.0;
     QPainterPath result;
     result.setFillRule(path.fillRule());
     int counter = 0; // running vertex index = noise time, shared across subpaths
@@ -683,9 +714,155 @@ QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, 
                 pts.append(a + (b - a) * (double(k) / parts));
         }
         if (!poly.closed) pts.append(p.last());
-        for (QPointF &pt : pts)
-            pt += wiggle::evaluate(params, double(counter++)).positionOffset;
+        for (QPointF &pt : pts) {
+            pt += wiggle::evaluate(params, double(counter)).positionOffset;
+            if (timeShift != 0.0)
+                pt += 0.5 * (wiggle::evaluate(params2, double(counter) * kTimeStride + timeShift).positionOffset
+                             - wiggle::evaluate(params2, double(counter) * kTimeStride).positionOffset);
+            ++counter;
+        }
         appendPoly(result, pts, poly.closed, false);
+    }
+    return result;
+}
+
+QPainterPath puckerBloat(const QPainterPath &path, double amountPct)
+{
+    if (path.isEmpty() || !std::isfinite(amountPct)) return path;
+    const QPointF c = path.boundingRect().center();
+    const double k = amountPct / 100.0;
+    auto anchor = [&](const QPointF &p) { return c + (p - c) * (1.0 - k); };
+    auto handle = [&](const QPointF &p) { return c + (p - c) * (1.0 + k); };
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    QList<QPainterPath> subpaths;
+    for (int i = 0; i < path.elementCount(); ++i) {
+        const QPainterPath::Element e = path.elementAt(i);
+        if (e.type == QPainterPath::MoveToElement) subpaths.append(QPainterPath());
+        if (subpaths.isEmpty()) continue;
+        if (e.type == QPainterPath::MoveToElement) subpaths.last().moveTo(e.x, e.y);
+        else if (e.type == QPainterPath::LineToElement) subpaths.last().lineTo(e.x, e.y);
+        else if (e.type == QPainterPath::CurveToElement && i + 2 < path.elementCount()) {
+            const QPainterPath::Element e2 = path.elementAt(i + 1), e3 = path.elementAt(i + 2);
+            subpaths.last().cubicTo(e.x, e.y, e2.x, e2.y, e3.x, e3.y);
+            i += 2;
+        }
+    }
+    for (const QPainterPath &sub : subpaths) {
+        const int n = sub.elementCount();
+        if (n == 0) continue;
+        const bool closed = n > 2 && sub.elementAt(0).x == sub.elementAt(n - 1).x
+            && sub.elementAt(0).y == sub.elementAt(n - 1).y;
+        QPointF cur(sub.elementAt(0).x, sub.elementAt(0).y);
+        result.moveTo(anchor(cur));
+        for (int i = 1; i < n; ++i) {
+            const QPainterPath::Element e = sub.elementAt(i);
+            if (e.type == QPainterPath::CurveToElement && i + 2 < n) {
+                const QPainterPath::Element e2 = sub.elementAt(i + 1), e3 = sub.elementAt(i + 2);
+                const QPointF end(e3.x, e3.y);
+                result.cubicTo(handle(QPointF(e.x, e.y)), handle(QPointF(e2.x, e2.y)), anchor(end));
+                cur = end;
+                i += 2;
+            } else if (e.type == QPainterPath::LineToElement) {
+                const QPointF end(e.x, e.y);
+                // A straight segment becomes a cubic with handles at 1/3 and 2/3.
+                result.cubicTo(handle(cur + (end - cur) / 3.0), handle(cur + (end - cur) * 2.0 / 3.0),
+                               anchor(end));
+                cur = end;
+            }
+        }
+        if (closed) result.closeSubpath();
+    }
+    return result;
+}
+
+QPainterPath twist(const QPainterPath &path, double angleDeg)
+{
+    if (path.isEmpty() || !std::isfinite(angleDeg)) return path;
+    const QPointF c = path.boundingRect().center();
+    constexpr int kSplit = 8;
+    QVector<Poly> polys = flatten(path);
+    double radius = 0.0;
+    for (const Poly &poly : polys)
+        for (const QPointF &p : poly.pts)
+            radius = std::max(radius, QLineF(c, p).length());
+    if (!(radius > 0.0)) return path;
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    for (const Poly &poly : polys) {
+        const int n = poly.pts.size();
+        const int segments = poly.closed ? n : n - 1;
+        QVector<QPointF> pts;
+        for (int i = 0; i < segments; ++i) {
+            const QPointF a = poly.pts[i], b = poly.pts[(i + 1) % n];
+            for (int k = 0; k < kSplit; ++k)
+                pts.append(a + (b - a) * (double(k) / kSplit));
+        }
+        if (!poly.closed) pts.append(poly.pts.last());
+        for (QPointF &pt : pts) {
+            const double d = QLineF(c, pt).length();
+            const double rad = angleDeg * qMax(0.0, 1.0 - d / radius) * M_PI / 180.0;
+            const QPointF v = pt - c;
+            pt = c + QPointF(v.x() * std::cos(rad) - v.y() * std::sin(rad),
+                             v.x() * std::sin(rad) + v.y() * std::cos(rad));
+        }
+        appendPoly(result, pts, poly.closed, false);
+    }
+    return result;
+}
+
+QPainterPath offsetPath(const QPainterPath &path, double amount)
+{
+    if (path.isEmpty() || !std::isfinite(amount) || amount == 0.0) return path;
+    QPainterPathStroker stroker;
+    // Drops points within 1e-3 px of the line through their neighbours (the stroker also emits
+    // redundant collinear join points); this keeps the boolean cheap without a visible change.
+    auto lean = [](const QPolygonF &poly) {
+        QVector<QPointF> pts;
+        for (const QPointF &pt : poly) {
+            if (!pts.isEmpty() && QLineF(pts.last(), pt).length() < 1e-6) continue;
+            while (pts.size() >= 2) {
+                const QPointF a = pts[pts.size() - 2], b = pts.last();
+                const double cross = (b.x() - a.x()) * (pt.y() - a.y()) - (b.y() - a.y()) * (pt.x() - a.x());
+                // b must also project inside a..pt: a reversal or cusp is not redundant.
+                const bool between = QPointF::dotProduct(b - a, pt - a) >= 0.0
+                    && QPointF::dotProduct(b - pt, a - pt) >= 0.0;
+                if (between && std::abs(cross) < 1e-3 * QLineF(a, pt).length()) pts.removeLast();
+                else break;
+            }
+            pts.append(pt);
+        }
+        return pts;
+    };
+    QPainterPath closedPart, openPart;
+    closedPart.setFillRule(path.fillRule());
+    for (const Poly &poly : flatten(path)) {
+        if (poly.closed) appendPoly(closedPart, lean(QPolygonF(poly.pts)), true, false);
+        else appendPoly(openPart, poly.pts, false, false);
+    }
+    auto strokeOf = [&](const QPainterPath &p) {
+        QPainterPath out;
+        out.setFillRule(Qt::WindingFill);
+        for (const QPolygonF &poly : stroker.createStroke(p).toSubpathPolygons(QTransform())) {
+            const QVector<QPointF> pts = lean(poly);
+            if (pts.size() > 2) {
+                out.addPolygon(QPolygonF(pts));
+                out.closeSubpath();
+            }
+        }
+        return out;
+    };
+    stroker.setWidth(2.0 * std::abs(amount));
+    stroker.setJoinStyle(Qt::MiterJoin);
+    stroker.setMiterLimit(4.0);
+    QPainterPath result;
+    if (!closedPart.isEmpty()) {
+        const QPainterPath band = strokeOf(closedPart);
+        result = amount > 0.0 ? closedPart.united(band) : closedPart.subtracted(band);
+    }
+    if (!openPart.isEmpty()) {
+        stroker.setCapStyle(Qt::FlatCap);
+        result = result.isEmpty() ? strokeOf(openPart) : result.united(strokeOf(openPart));
     }
     return result;
 }
@@ -745,7 +922,7 @@ QPainterPath ShapeLayer::trimPathRange(const QPainterPath &path, double startPct
     return result;
 }
 
-void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
+void ShapeLayer::renderShape(const Shape &shape, QPainter &painter, double timeSec)
 {
     painter.save();
 
@@ -763,8 +940,15 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
     }
     if (shape.modifiers.wigglePath.enabled) {
         const auto &w = shape.modifiers.wigglePath;
-        path = shapemod::wigglePath(path, w.amplitude, w.detail, w.seed);
+        path = shapemod::wigglePath(path, w.amplitude, w.detail, w.seed, timeSec,
+                                    w.wigglesPerSecond);
     }
+    if (shape.modifiers.puckerBloat.enabled)
+        path = shapemod::puckerBloat(path, shape.modifiers.puckerBloat.amountPct);
+    if (shape.modifiers.twist.enabled)
+        path = shapemod::twist(path, shape.modifiers.twist.angleDeg);
+    if (shape.modifiers.offsetPath.enabled)
+        path = shapemod::offsetPath(path, shape.modifiers.offsetPath.amount);
     if (shape.modifiers.trim.enabled) {
         const auto &trim = shape.modifiers.trim;
         path = trimPathRange(path, trim.startPct, trim.endPct, trim.offsetPct);
@@ -822,7 +1006,8 @@ QImage ShapeLayer::renderShapes(const QSize &canvasSize) const
 }
 
 QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
-                                       const QSize &canvasSize)
+                                       const QSize &canvasSize,
+                                       double timeSec)
 {
     if (canvasSize.isEmpty())
         return QImage();
@@ -835,7 +1020,7 @@ QImage ShapeLayer::renderShapesToImage(const QVector<Shape> &shapes,
     painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
     for (const Shape &shape : shapes)
-        renderShape(shape, painter);
+        renderShape(shape, painter, timeSec);
 
     painter.end();
     return image;

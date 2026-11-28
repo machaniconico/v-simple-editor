@@ -1,5 +1,6 @@
 #include "Camera3D.h"
 #include "LayerCompositor.h"
+#include "Timeline.h"
 
 #include <QPainter>
 #include <QMatrix4x4>
@@ -452,6 +453,42 @@ QImage Camera3D::applyTrueProjection(const QImage &image,
     painter.drawImage(QRectF(QPointF(0, 0), QSizeF(canvasSize)), image);
     return result;
 }
+
+namespace camera3d {
+
+Layer3DTransform effectiveLayer3DAt(const ClipInfo &clip, QPointF layerPosPx,
+                                    const Camera3DState &camera)
+{
+    if (!clip.autoOrientToCamera || !clip.is3DLayer || !camera.trueProjection)
+        return clip.layer3D;
+    // Layer -> camera. The layer is a plane, so the normal may point either way along
+    // that line: take the +z side, which is the identity rotation for a centred layer.
+    double dx = static_cast<double>(camera.position.x()) - layerPosPx.x();
+    double dy = static_cast<double>(camera.position.y()) - layerPosPx.y();
+    double dz = static_cast<double>(camera.position.z()) - clip.layer3D.positionZ;
+    const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (length < 1e-9)
+        return clip.layer3D;
+    if (dz < 0.0) {
+        dx = -dx;
+        dy = -dy;
+        dz = -dz;
+    }
+    // projectLayerQuad applies X, then Y, then Z (model = Rz*Ry*Rx), so the normal ends up at
+    // Rz*(Ry*Rx*(0,0,1)). Un-rotate the target direction by Rz^-1 first, then solve X/Y so that
+    // Ry*Rx*(0,0,1) = (sin(ry)cos(rx), -sin(rx), cos(ry)cos(rx)) equals that direction.
+    constexpr double kRadiansToDegrees = 180.0 / 3.14159265358979323846;
+    const double rz = clip.layer3D.rotationZ / kRadiansToDegrees;
+    const double c = std::cos(rz), s = std::sin(rz);
+    const double ux = c * dx + s * dy;
+    const double uy = -s * dx + c * dy;
+    Layer3DTransform result = clip.layer3D;
+    result.rotationX = -std::asin(std::clamp(uy / length, -1.0, 1.0)) * kRadiansToDegrees;
+    result.rotationY = std::atan2(ux, dz) * kRadiansToDegrees;
+    return result;
+}
+
+} // namespace camera3d
 
 QImage applyProjectCameraProjection(const QImage &image,
                                     const Layer3DTransform &layer3D,

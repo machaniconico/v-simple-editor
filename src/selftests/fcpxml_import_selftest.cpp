@@ -1,6 +1,7 @@
 #include "../FcpxmlImport.h"
 #include "../FcpxmlExporter.h"
 #include "../ProjectFile.h"
+#include "../Timeline.h"
 #include "../UndoManager.h"
 #include "SelftestGate.h"
 #include <QFile>
@@ -2283,6 +2284,52 @@ int runFcpxmlImportSelftest()
         && g39AtWarns == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")}
         && g39PastWarns2 == QStringList{g39HostTrim, g39Outside + QStringLiteral("MCC / m")};
     gate(39, g39Ok && g39SubOk && g39McOk);
+
+    // G40: an old-format project whose V2 clip repeats the uid of a V1 clip (and anchors to it) loads with
+    // the later V2 uid repaired and the V1 uid kept, so exporting and importing it again still connects b to a
+    // (a position guess would pick a2, which lies under b's start) with the original anchor offset.
+    {
+        auto g40Clip = [&](const QString &name, double lead, const QString &uid) {
+            ClipInfo c;
+            c.filePath = dir.filePath(name + QStringLiteral(".mov"));
+            c.displayName = name;
+            c.duration = c.outPoint = 2.0;
+            c.leadInSec = lead;
+            c.uid = uid;
+            return c;
+        };
+        ClipInfo g40A = g40Clip(QStringLiteral("a"), 0.0, QStringLiteral("g40-U"));
+        ClipInfo g40A2 = g40Clip(QStringLiteral("a2"), 0.0, QStringLiteral("g40-U2"));
+        ClipInfo g40B = g40Clip(QStringLiteral("b"), 2.5, QStringLiteral("g40-U"));
+        g40B.anchorUid = QStringLiteral("g40-U");
+        g40B.anchorOffsetSec = 2.5;
+        Timeline g40Timeline;
+        g40Timeline.restoreFromProject(ProjectTrackClips({{g40A, g40A2}, {g40B}}), ProjectTrackClips(), 0.0, -1.0, -1.0, 100);
+        const quint64 g40Repairs = g40Timeline.trackAt(false, 0)->duplicateUidRepairCountForTest()
+            + g40Timeline.trackAt(false, 1)->duplicateUidRepairCountForTest();
+        const QString g40Path = dir.filePath(QStringLiteral("g40.fcpxml"));
+        fcpx::xml::ExporterConfig g40Cfg; g40Cfg.projectName = QStringLiteral("g40");
+        const bool g40Exported = fcpx::xml::exportProject(g40Path, fcpx::buildExportClips(g40Timeline), g40Cfg);
+        const auto g40Imp = fcpx::xml::readFcpxml(g40Path);
+        const bool g40Shape = g40Imp.error.isEmpty() && g40Imp.videoTracks.size() == 2
+            && g40Imp.videoTracks[0].size() == 2 && g40Imp.videoTracks[1].size() == 1;
+        const ClipInfo *g40ImpA = g40Shape ? &g40Imp.videoTracks[0][0] : nullptr;
+        const ClipInfo *g40ImpA2 = g40Shape ? &g40Imp.videoTracks[0][1] : nullptr;
+        const ClipInfo *g40ImpB = g40Shape ? &g40Imp.videoTracks[1][0] : nullptr;
+        const bool g40Ok = g40Repairs == 1 && g40Exported && g40Shape
+            && g40ImpA->displayName == QStringLiteral("a") && g40ImpA2->displayName == QStringLiteral("a2")
+            && g40ImpB->displayName == QStringLiteral("b") && !g40ImpA->uid.isEmpty()
+            && g40ImpA2->uid != g40ImpA->uid
+            && g40ImpB->anchorUid == g40ImpA->uid && g40ImpB->anchorUid != g40ImpA2->uid
+            && near(g40ImpB->anchorOffsetSec, 2.5);
+        std::fprintf(stderr, "G40 repairs=%llu exported=%d shape=%d error=[%s] bParent=%s anchorOffset=%.9f "
+            "expected (repairs 1, parent a, offset 2.5; a2 means position guess)\n",
+            static_cast<unsigned long long>(g40Repairs), int(g40Exported), int(g40Shape),
+            g40Imp.error.toUtf8().constData(),
+            !g40Shape ? "?" : g40ImpB->anchorUid == g40ImpA->uid ? "a" : g40ImpB->anchorUid == g40ImpA2->uid ? "a2" : "other",
+            g40Shape ? g40ImpB->anchorOffsetSec : -99.0);
+        gate(40, g40Ok);
+    }
 
     return tally.finish();
 }

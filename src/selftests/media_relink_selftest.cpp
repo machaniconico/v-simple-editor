@@ -7,6 +7,7 @@
 #include "../Timeline.h"
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
+#include "SelftestRegistry.h"
 
 #include <QAction>
 #include <QApplication>
@@ -781,5 +782,7 @@ int runMediaRelinkSelftest()
 
     std::cerr << "[media-relink] summary: " << passed << " PASS, "
               << failed << " FAIL\n";
+    // The registry checks the declared "(N gates)" against this count.
+    selftests::reportTally(passed, failed, 0);
     return failed;
 }

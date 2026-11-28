@@ -13,6 +13,8 @@
 #include <QSpinBox>
 #include <QVBoxLayout>
 
+#include <utility>
+
 ShapeModifierDialog::ShapeModifierDialog(const ShapeModifiers &initial, QWidget *parent)
     : QDialog(parent)
 {
@@ -104,7 +106,7 @@ ShapeModifierDialog::ShapeModifierDialog(const ShapeModifiers &initial, QWidget 
     zigForm->addRow(m_zigSmooth);
     contentLayout->addWidget(zigBox);
 
-    auto *wiggleBox = new QGroupBox(QStringLiteral("パスのウィグル (静的)"), this);
+    auto *wiggleBox = new QGroupBox(QStringLiteral("パスのウィグル"), this);
     auto *wiggleForm = new QFormLayout(wiggleBox);
     m_wiggle = new QCheckBox(QStringLiteral("有効"), wiggleBox);
     m_wiggle->setChecked(initial.wigglePath.enabled);
@@ -115,7 +117,33 @@ ShapeModifierDialog::ShapeModifierDialog(const ShapeModifiers &initial, QWidget 
                              1, 100, initial.wigglePath.detail);
     m_wiggleSeed = intSpin(wiggleForm, QStringLiteral("シード"), QStringLiteral("wiggleSeed"),
                            -1000000, 1000000, initial.wigglePath.seed);
+    spin(wiggleForm, QStringLiteral("毎秒のウィグル数"), QStringLiteral("wigglesPerSecond"),
+         0, 100, initial.wigglePath.wigglesPerSecond, QString());
     contentLayout->addWidget(wiggleBox);
+
+    // Pucker & Bloat / Twist / Offset Path (found by object name in modifiers()).
+    auto extraBox = [&](const QString &title, const QString &checkName) {
+        auto *box = new QGroupBox(title, this);
+        auto *form = new QFormLayout(box);
+        auto *check = new QCheckBox(QStringLiteral("有効"), box);
+        check->setObjectName(checkName);
+        form->addRow(check);
+        connect(check, &QCheckBox::toggled, this, [this](bool) { emit modifiersChanged(); });
+        contentLayout->addWidget(box);
+        return std::pair<QFormLayout *, QCheckBox *>(form, check);
+    };
+    auto [puckerForm, puckerCheck] = extraBox(QStringLiteral("膨張・収縮"), QStringLiteral("puckerBloatEnabled"));
+    puckerCheck->setChecked(initial.puckerBloat.enabled);
+    spin(puckerForm, QStringLiteral("量 (+収縮 / -膨張)"), QStringLiteral("puckerBloatAmount"),
+         -1000, 1000, initial.puckerBloat.amountPct, QStringLiteral(" %"));
+    auto [twistForm, twistCheck] = extraBox(QStringLiteral("ひねり"), QStringLiteral("twistEnabled"));
+    twistCheck->setChecked(initial.twist.enabled);
+    spin(twistForm, QStringLiteral("角度"), QStringLiteral("twistAngle"),
+         -100000, 100000, initial.twist.angleDeg, QStringLiteral(" °"));
+    auto [offsetForm, offsetCheck] = extraBox(QStringLiteral("パスのオフセット"), QStringLiteral("offsetPathEnabled"));
+    offsetCheck->setChecked(initial.offsetPath.enabled);
+    spin(offsetForm, QStringLiteral("量 (+拡大 / -縮小)"), QStringLiteral("offsetPathAmount"),
+         -1000000, 1000000, initial.offsetPath.amount, QStringLiteral(" px"));
     contentLayout->addStretch();
     scroll->setWidget(content);
     layout->addWidget(scroll, 1);
@@ -160,5 +188,21 @@ ShapeModifiers ShapeModifierDialog::modifiers() const
     m.wigglePath.amplitude = m_wiggleAmp->value();
     m.wigglePath.detail = m_wiggleDetail->value();
     m.wigglePath.seed = m_wiggleSeed->value();
+    if (const auto *wps = findChild<QDoubleSpinBox *>(QStringLiteral("wigglesPerSecond")))
+        m.wigglePath.wigglesPerSecond = wps->value();
+    auto checked = [this](const char *name) {
+        const auto *c = findChild<QCheckBox *>(QString::fromLatin1(name));
+        return c && c->isChecked();
+    };
+    auto value = [this](const char *name, double fallback) {
+        const auto *b = findChild<QDoubleSpinBox *>(QString::fromLatin1(name));
+        return b ? b->value() : fallback;
+    };
+    m.puckerBloat.enabled = checked("puckerBloatEnabled");
+    m.puckerBloat.amountPct = value("puckerBloatAmount", m.puckerBloat.amountPct);
+    m.twist.enabled = checked("twistEnabled");
+    m.twist.angleDeg = value("twistAngle", m.twist.angleDeg);
+    m.offsetPath.enabled = checked("offsetPathEnabled");
+    m.offsetPath.amount = value("offsetPathAmount", m.offsetPath.amount);
     return m;
 }
