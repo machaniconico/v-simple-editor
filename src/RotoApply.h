@@ -42,6 +42,14 @@ int lastRenderSourceFrameIndex();
 // clipEffectiveSourceFps for the fallback.
 double probeVideoStreamFps(const QString &filePath);
 
+// US-1301: whether the media's first video stream carries alpha: decided by
+// its pixel format when known (an rgb24 PNG / 24-bit QTRLE is opaque); the
+// QTRLE / PNG codec fallback applies only when the pixel format is unknown.
+// Unlike the import probe (Timeline.cpp, ClipInfo hasAlpha), which ORs the
+// codec rule in unconditionally. Clip metadata, cached like
+// probeVideoStreamFps; false for an empty, veditor:// or unreadable path.
+bool probeMediaHasAlpha(const QString &filePath);
+
 // Per-pixel max of two masks as Format_Grayscale8; b is scaled to a's size.
 QImage combineMasksMax(const QImage &a, const QImage &b);
 
@@ -70,5 +78,11 @@ quint64 clampAlphaCallCountForTest();
 // Effects that move pixels (geometric / temporal); their output alpha is not
 // clamped to their input.
 bool effectMovesPixels(VideoEffectType type);
+
+// US-1301: measured table of the pixel-moving effects whose single-frame output
+// keeps alpha (roto G46): moved with RGB (geometric) or left untouched (Echo /
+// RollingShutterRepair are identity per frame; the renderer composes them).
+// Every listed type is also effectMovesPixels.
+bool effectCarriesAlpha(VideoEffectType type);
 
 } // namespace roto

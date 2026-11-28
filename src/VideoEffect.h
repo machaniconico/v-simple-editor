@@ -351,6 +351,20 @@ public:
     static void setLensDistortionEnabledForTesting(bool enabled);
     static void resetLensDistortionInvocationCount();
     static int lensDistortionInvocationCount();
+    // US-1301: calling-thread fill for pixels LensDistortion maps outside the
+    // source. Opaque black by default; the timeline renderer turns it
+    // transparent while it runs the effects of a clip whose media carries alpha
+    // (clip metadata, never frame content). The scope restores the previous fill.
+    class TransparentEdgeFillScope
+    {
+    public:
+        explicit TransparentEdgeFillScope(bool transparent);
+        ~TransparentEdgeFillScope();
+        TransparentEdgeFillScope(const TransparentEdgeFillScope &) = delete;
+        TransparentEdgeFillScope &operator=(const TransparentEdgeFillScope &) = delete;
+    private:
+        bool m_previous;
+    };
     // Calling-thread switch; also resets the Flip observation counter.
     static void setFlipEnabledForTesting(bool enabled);
     static int flipInvocationCountForTesting();

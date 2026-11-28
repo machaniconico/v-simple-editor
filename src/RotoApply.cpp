@@ -13,6 +13,7 @@
 
 extern "C" {
 #include <libavformat/avformat.h>
+#include <libavutil/pixdesc.h>
 }
 
 namespace roto {
@@ -127,6 +128,52 @@ double probeVideoStreamFps(const QString &filePath)
     return fps;
 }
 
+bool probeMediaHasAlpha(const QString &filePath)
+{
+    if (filePath.isEmpty() || filePath.startsWith(QStringLiteral("veditor://")))
+        return false;
+
+    static QMutex cacheMutex;
+    static QHash<QString, bool> cache;
+    const QFileInfo info(filePath);
+    QString cacheKey;
+    if (info.exists()) {
+        cacheKey = info.absoluteFilePath() + QLatin1Char('|') + QString::number(info.size())
+            + QLatin1Char('|') + QString::number(info.lastModified().toMSecsSinceEpoch());
+        QMutexLocker locker(&cacheMutex);
+        const auto it = cache.constFind(cacheKey);
+        if (it != cache.constEnd())
+            return it.value();
+    }
+
+    bool hasAlpha = false;
+    AVFormatContext *format = nullptr;
+    if (avformat_open_input(&format, filePath.toUtf8().constData(), nullptr, nullptr) < 0)
+        return hasAlpha;
+    if (avformat_find_stream_info(format, nullptr) >= 0) {
+        for (unsigned i = 0; i < format->nb_streams; ++i) {
+            const AVCodecParameters *codecpar = format->streams[i]->codecpar;
+            if (codecpar->codec_type != AVMEDIA_TYPE_VIDEO)
+                continue;
+            // The pix_fmt decides whenever it is known (opaque PNG / 24-bit
+            // QTRLE are rgb24); the codec fallback only covers an unknown one.
+            const AVPixelFormat pixFmt = static_cast<AVPixelFormat>(codecpar->format);
+            const AVPixFmtDescriptor *descriptor = av_pix_fmt_desc_get(pixFmt);
+            hasAlpha = pixFmt != AV_PIX_FMT_NONE
+                ? (descriptor && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0)
+                : (codecpar->codec_id == AV_CODEC_ID_QTRLE
+                   || codecpar->codec_id == AV_CODEC_ID_PNG);
+            break;
+        }
+    }
+    avformat_close_input(&format);
+    if (!cacheKey.isEmpty()) {
+        QMutexLocker locker(&cacheMutex);
+        cache.insert(cacheKey, hasAlpha);
+    }
+    return hasAlpha;
+}
+
 QImage combineMasksMax(const QImage &a, const QImage &b)
 {
     if (a.isNull())
@@ -229,6 +276,37 @@ bool effectMovesPixels(VideoEffectType type)
     case VideoEffectType::WarpSpherize:
     case VideoEffectType::WarpFisheye:
     case VideoEffectType::WarpPinch:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool effectCarriesAlpha(VideoEffectType type)
+{
+    switch (type) {
+    // Geometric: output alpha is the input alpha moved like RGB.
+    case VideoEffectType::DisplacementMap:
+    case VideoEffectType::WaveWarp:
+    case VideoEffectType::Ripple:
+    case VideoEffectType::Bulge:
+    case VideoEffectType::Twirl:
+    case VideoEffectType::Mirror:
+    case VideoEffectType::PolarCoordinates:
+    case VideoEffectType::MotionTile:
+    case VideoEffectType::CornerPinSimple:
+    case VideoEffectType::LensDistortion:
+    case VideoEffectType::Flip:
+    case VideoEffectType::RGBSplit:
+    case VideoEffectType::GlitchVHS:
+    case VideoEffectType::WarpWave:
+    case VideoEffectType::WarpRipple:
+    case VideoEffectType::WarpSpherize:
+    case VideoEffectType::WarpFisheye:
+    case VideoEffectType::WarpPinch:
+    // Single-frame identity: the input alpha is returned untouched.
+    case VideoEffectType::Echo:
+    case VideoEffectType::RollingShutterRepair:
         return true;
     default:
         return false;

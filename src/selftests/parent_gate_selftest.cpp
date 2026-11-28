@@ -13,9 +13,10 @@
 //   G5 outside the parent's interval: no hit.
 //   G6 renderFrameAt calls the gate at least once per parented layer (0 for a
 //      timeline without parent links).
-//   G7 visible V1 without a clip at t (V1 ended / V1 empty): renderFrameAt
-//      returns an empty frame before any upper layer, and the gate does not
-//      hit; an active upper shape clip keeps the frame and the hit.
+//   G7 visible V1 that has ended at t: renderFrameAt returns an empty frame
+//      before any upper layer, and the gate does not hit. A visible V1 with no
+//      clip at all is a transparent base (user decision 3, US-1312): the frame
+//      and the hit are both kept, as with an active upper shape clip.
 
 #include <QByteArray>
 #include <QDir>
@@ -458,7 +459,7 @@ int runParentGateSelftest()
         tally.gate(6, ok, "renderer did not route each parented layer through parentLayerAt");
     }
 
-    // ── G7: V1 without a clip at t -> empty frame and no hit ───────────────
+    // ── G7: V1 ended at t -> empty frame and no hit; clip-less V1 -> both ──
     {
         // (a) V1 clip [0, 1), parent V2 [0, 4): at 2.0 V1 has ended.
         Timeline ended;
@@ -466,7 +467,7 @@ int runParentGateSelftest()
         addClip(ended, 2, makeClip(bluePath, QStringLiteral("parent"), 0.0, 4.0, parentT));
         addClip(ended, 3, makeClip(redPath, QStringLiteral("child"), 0.0, 4.0, childT));
         ended.setClipParent(childKey, parentKey);
-        // (b) V1 track exists but has no clips.
+        // (b) V1 track exists but has no clips: a transparent base (US-1312).
         Timeline emptyV1;
         ensureTracks(emptyV1, 1);
         addClip(emptyV1, 2, makeClip(bluePath, QStringLiteral("parent"), 0.0, 4.0, parentT));
@@ -509,7 +510,7 @@ int runParentGateSelftest()
             && hShape->clipLocalSeconds == seenShape[0].localSec;
         const bool ok = hEndedIn && !endedInFrame.isNull()
             && !hEnded && endedFrame.isNull()
-            && !hEmpty && emptyFrame.isNull()
+            && hEmpty && !emptyFrame.isNull()
             && shapeAgrees;
         info(7, hitText("V1ended t=0.5", hEndedIn) + " frameNull="
                 + (endedInFrame.isNull() ? "1" : "0"));

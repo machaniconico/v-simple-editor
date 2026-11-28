@@ -89,8 +89,10 @@ bool applyTrim(QVector<ClipInfo> &clips, int index, TrimType type,
     }
 
     case TrimType::RippleOut: {
-        // clip[i] の右端。outPoint を delta*speed 分動かす。実尺が変わり、
-        // clip[i+1] 以降を deltaSec シフトする (clip[i+1].leadInSec を動かす)。
+        // clip[i] の右端。outPoint を delta*speed 分動かす。実尺が delta 分変わり、
+        // その差分だけ clip[i+1] 以降が自動的に deltaSec シフトする (下流の
+        // leadInSec は直前クリップ終端からの相対値なので一切触らない — RippleIn と
+        // 同じく実尺変化が ripple を生む)。
         ClipInfo &c = clips[index];
         const double srcDelta = deltaSec * safeSpeed(c);
         const double newOut = outEff(c) + srcDelta;
@@ -101,15 +103,6 @@ bool applyTrim(QVector<ClipInfo> &clips, int index, TrimType type,
         if (newOut > c.duration + kEps) {
             setErr(QObject::tr("リップル(右)が素材の末尾を超えています。"));
             return false;
-        }
-        // 下流が存在する場合、clip[i+1].leadInSec を deltaSec 動かして ripple。
-        if (index + 1 < clips.size()) {
-            const double newLeadNext = clips[index + 1].leadInSec + deltaSec;
-            if (newLeadNext < -kEps) {
-                setErr(QObject::tr("リップル(右)で後続クリップが重なります。"));
-                return false;
-            }
-            clips[index + 1].leadInSec = (newLeadNext < 0.0) ? 0.0 : newLeadNext;
         }
         c.outPoint = (newOut > c.duration) ? c.duration : newOut;
         return true;
@@ -296,14 +289,10 @@ double minTrimDelta(const QVector<ClipInfo> &clips, int index, TrimType type)
         return lim < 0.0 ? lim : 0.0;
     }
     case TrimType::RippleOut: {
-        // 負 delta: outPoint↓ (limit -(outEff - inPoint)/speed)、かつ下流 leadIn↓
-        //           (limit -leadInNext)。
+        // 負 delta: outPoint↓ (limit -(outEff - inPoint)/speed)。下流は左へ
+        //           追従するだけなので下流制約は無い。
         const ClipInfo &c = clips[index];
-        double lim = negativeSourceExclusive(-(outEff(c) - c.inPoint) / safeSpeed(c), c); // <=0
-        if (index + 1 < clips.size()) {
-            const double limLeadNext = -clips[index + 1].leadInSec; // <=0
-            if (limLeadNext > lim) lim = limLeadNext;               // 0 に近い方
-        }
+        const double lim = negativeSourceExclusive(-(outEff(c) - c.inPoint) / safeSpeed(c), c); // <=0
         return lim < 0.0 ? lim : 0.0;
     }
     case TrimType::Roll: {

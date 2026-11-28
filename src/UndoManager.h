@@ -44,6 +44,9 @@ struct TimelineState {
     // Bus routing snapshot (MainWindow::m_audioBusRouting stays the SSOT) taken
     // through Timeline::setBusRoutingBridge. Empty = not captured: restore skips it.
     QJsonObject audioBusRouting;
+    // US-1302: MainWindow's position-keyed sidecars, taken through
+    // Timeline::setSidecarStateHooks. Empty = not captured: restore skips it.
+    QJsonObject sidecarState;
     // Identity of the track structure, shared by ordinary edits. A new
     // add/remove/move gets a fresh revision, including compound operations.
     quint64 trackStructureRevision = 0;

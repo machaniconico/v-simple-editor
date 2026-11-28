@@ -7,6 +7,8 @@ struct ImportResult {
     QString title;
     QVector<QVector<ClipInfo>> videoTracks{QVector<ClipInfo>{}};
     QVector<QVector<ClipInfo>> audioTracks{QVector<ClipInfo>{}};
+    // An asset-clip with audio becomes a video + audio pair whose ClipInfo::linkGroup is
+    // a provisional number (1, 2, ... per sequence); applyImport maps it to Timeline's.
     // Compound clips (resources/media), inner sequences first. Each id is the
     // media id; ref-clips become ClipInfo::sequenceRefId to it.
     QVector<TimelineSequence> sequences;
@@ -22,7 +24,8 @@ struct ImportResult {
 ImportResult parseXml(const QString &xml, const QString &directory);
 ImportResult readFcpxml(const QString &filePath);
 // Adds result.sequences (ids made unique by Timeline::addSequence, references
-// rewritten in result) and then the imported sequence via createSequence.
+// rewritten in result, provisional linkGroups mapped to unused Timeline numbers)
+// and then the imported sequence via createSequence.
 // warnings receives result.warnings and any apply failure. On failure the
 // added nested sequences are removed again and false is returned.
 bool applyImport(Timeline &timeline, ImportResult &result, QStringList *warnings);

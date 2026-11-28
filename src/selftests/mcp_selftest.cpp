@@ -6387,9 +6387,11 @@ int runMcpSelftest()
                 .arg(exportRootReady).arg(presetDir.isValid());
             for (int n = 182; n <= 189; ++n)
                 tally.gate(n, false, why.toUtf8().constData());
+            tally.gate(194, false, why.toUtf8().constData());
         } else if (ffmpegExe.isEmpty()) {
             for (int n = 182; n <= 189; ++n)
                 tally.skip(n, "ffmpeg.exe unavailable");
+            tally.skip(194, "ffmpeg.exe unavailable");
         } else {
             const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
             std::vector<float> toneSamples(48000 * 2 * 4);
@@ -6819,6 +6821,66 @@ int runMcpSelftest()
                     "queued), or an empty V1 export (video on an upper track) did not get its silent audio track");
             }
 
+            // G194 (US-1312): V1 visible with no clip and an ordinary video clip on V2. export_video
+            // completes and the output has video frames (HEAD: the renderer returned a null frame and the
+            // job failed). Side check: with no video clip on any track export_video is still refused.
+            {
+                const bool addedUpper = projectTimeline->videoTracks().size() < 2;
+                if (addedUpper) projectTimeline->addVideoTrack(false);
+                TimelineTrack *upperTrack = projectTimeline->videoTracks().at(1);
+                const QVector<ClipInfo> savedUpperClips = upperTrack->clips();
+                const bool v1Visible = !videoTrack->isHidden();
+                videoTrack->setClips(QVector<ClipInfo>{});
+                upperTrack->setClips(QVector<ClipInfo>{videoClip});
+                const QString emptyV1UpperOut = exportRoot.filePath(QStringLiteral("us1312-v1-empty-upper.mp4"));
+                const Run upperRun = runExport(QJsonObject{{QStringLiteral("outputPath"), emptyV1UpperOut}});
+                QString upperJobError;
+                for (const RenderJob &job : queue->jobs())
+                    if (job.uuid == upperRun.jobId) upperJobError = job.error.isEmpty() ? job.errorMessage : job.error;
+                int upperVideoFrames = -1;
+                AVFormatContext *upperFormat = nullptr;
+                if (upperRun.terminal
+                    && avformat_open_input(&upperFormat, emptyV1UpperOut.toUtf8().constData(), nullptr, nullptr) >= 0) {
+                    if (avformat_find_stream_info(upperFormat, nullptr) >= 0) {
+                        const int videoStream = av_find_best_stream(upperFormat, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+                        if (videoStream >= 0) {
+                            upperVideoFrames = 0;
+                            AVPacket *packet = av_packet_alloc();
+                            while (packet && av_read_frame(upperFormat, packet) >= 0) {
+                                if (packet->stream_index == videoStream) ++upperVideoFrames;
+                                av_packet_unref(packet);
+                            }
+                            av_packet_free(&packet);
+                        }
+                    }
+                    avformat_close_input(&upperFormat);
+                }
+                upperTrack->setClips(QVector<ClipInfo>{});
+                const Run allEmptyRun = runExport(QJsonObject{{QStringLiteral("outputPath"),
+                    exportRoot.filePath(QStringLiteral("us1312-all-empty.mp4"))}}, false);
+                upperTrack->setClips(savedUpperClips);
+                videoTrack->setClips(QVector<ClipInfo>{videoClip});
+                if (addedUpper) projectTimeline->removeTrack(false, projectTimeline->videoTracks().size() - 1);
+                std::fprintf(stderr, "mcp G194 v1Visible=%d isError=%d err=[%s] captured=%d terminal=%d status=%d "
+                    "jobError=[%s] outputVideoFrames=%d | allEmpty isError=%d err=[%s] queueAfter=%lld addedUpper=%d "
+                    "(expect visible, ok, Completed=%d, frames > 0, all-empty refused, queue 0)\n",
+                    v1Visible, upperRun.isError, qPrintable(upperRun.errorText), upperRun.captured, upperRun.terminal,
+                    static_cast<int>(upperRun.finalStatus), qPrintable(upperJobError), upperVideoFrames,
+                    allEmptyRun.isError, qPrintable(allEmptyRun.errorText),
+                    static_cast<long long>(allEmptyRun.queueAfter), addedUpper,
+                    static_cast<int>(RenderJobStatus::Completed));
+                tallyObserved(194, observeTerm(194, "V1 visible", v1Visible)
+                    && observeTerm(194, "export_video ok", !upperRun.isError)
+                    && observeTerm(194, "job captured", upperRun.captured)
+                    && observeTerm(194, "job terminal", upperRun.terminal)
+                    && observeTerm(194, "job Completed", upperRun.finalStatus == RenderJobStatus::Completed)
+                    && observeTerm(194, "output video frames > 0", upperVideoFrames > 0)
+                    && observeTerm(194, "all-empty export refused", allEmptyRun.isError)
+                    && observeTerm(194, "all-empty nothing queued", allEmptyRun.queueAfter == 0),
+                    "export_video of a timeline whose visible V1 holds no clip (ordinary video on V2) did not "
+                    "complete with video frames, or a timeline without any video clip was not refused");
+            }
+
             // G189 (US-1127): export_video autoLoudness=true prepares the audio on a worker, so a client on
             // another thread (through the HTTP transport) gets get_export_status answered while the 500 ms
             // preparation runs. Terms are printed; the control blocks the GUI thread on purpose and must be
@@ -7089,6 +7151,57 @@ int runMcpSelftest()
             && observeTerm(192, "connected A2 clip deleted", a2Clips.isEmpty()),
             "delete_clip of the anchor kept its connected group, deleted the unconnected clip, or "
             "changed its response");
+    }
+
+    // G193 (US-1306): import_media honours a locked track. A1 locked + explicit trackIndex 0 is
+    // refused with the drop-path wording and the timeline keeps its clip counts.
+    {
+        Timeline* lockTimeline = projectInfoWindow.m_timeline;
+        ClipInfo lockedV;
+        lockedV.filePath = QStringLiteral("/selftests/mcp-lock-v.mp4");
+        lockedV.duration = lockedV.outPoint = 2.0;
+        ClipInfo lockedA = lockedV;
+        lockedA.filePath = QStringLiteral("/selftests/mcp-lock-a.wav");
+        lockTimeline->restoreFromProject(
+            QVector<QVector<ClipInfo>>{{lockedV}}, QVector<QVector<ClipInfo>>{{lockedA}},
+            0.0, -1.0, -1.0, 100);
+        const QString lockImportPath = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        const QJsonObject lockResponse = callProjectInfoTool(
+            1931, QStringLiteral("set_track_locked"), QJsonObject{
+                {QStringLiteral("kind"), QStringLiteral("audio")},
+                {QStringLiteral("trackIndex"), 0}, {QStringLiteral("locked"), true}});
+        const bool lockSet = toolPayload(lockResponse).value(QStringLiteral("ok")).toBool(false)
+            && lockTimeline->trackAt(true, 0)->isLocked();
+        const QJsonObject importResponse = callProjectInfoTool(
+            1932, QStringLiteral("import_media"), QJsonObject{
+                {QStringLiteral("filePath"), lockImportPath},
+                {QStringLiteral("trackIndex"), 0}, {QStringLiteral("startSec"), 10.0}});
+        const bool importIsError = toolResult(importResponse).value(QStringLiteral("isError")).toBool(false);
+        const QString importError = toolErrorText(importResponse);
+        const int v1Count = lockTimeline->trackAt(false, 0)->clipCount();
+        const int a1Count = lockTimeline->trackAt(true, 0)->clipCount();
+        const QJsonObject lockedReadback = toolPayload(callProjectInfoTool(
+            1933, QStringLiteral("get_timeline"), {}));
+        const QJsonArray readbackVideo = lockedReadback.value(QStringLiteral("video")).toArray();
+        const QJsonArray readbackAudio = lockedReadback.value(QStringLiteral("audio")).toArray();
+        const int mcpV1Clips = readbackVideo.isEmpty() ? -1
+            : readbackVideo.at(0).toObject().value(QStringLiteral("clips")).toArray().size();
+        const int mcpA1Clips = readbackAudio.isEmpty() ? -1
+            : readbackAudio.at(0).toObject().value(QStringLiteral("clips")).toArray().size();
+        std::fprintf(stderr, "mcp G193 lockSet=%d import isError=%d error=[%s] V1 clips=%d A1 clips=%d "
+                     "get_timeline V1 clips=%d A1 clips=%d "
+                     "(expect isError, locked wording, 1, 1, 1, 1)\n", lockSet, importIsError,
+                     qPrintable(importError), v1Count, a1Count, mcpV1Clips, mcpA1Clips);
+        tallyObserved(193, observeTerm(193, "A1 locked", lockSet)
+            && observeTerm(193, "import refused", importIsError)
+            && observeTerm(193, "locked wording",
+                           importError.contains(QStringLiteral("ロック中のトラックには配置できません")))
+            && observeTerm(193, "V1 clip count unchanged", v1Count == 1)
+            && observeTerm(193, "A1 clip count unchanged", a1Count == 1)
+            && observeTerm(193, "get_timeline video[0].clips unchanged", mcpV1Clips == 1)
+            && observeTerm(193, "get_timeline audio[0].clips unchanged", mcpA1Clips == 1),
+            "import_media placed a clip on a locked track or reported a different error");
     }
 
     server.stop();
