@@ -938,6 +938,13 @@ public:
     void selectAllClips();
     void selectClipsFromPlayhead(bool forward);
     void bladeAllTracksAtPlayhead();
+    // Wave 36: all-track blade ripple-cut before/after playhead (closes gap across unlocked tracks, 1 Undo).
+    bool rippleTrimBeforePlayhead();
+    bool rippleTrimAfterPlayhead();
+    // Wave 36: ripple-insert a clip at timeSec on the target track, splitting any
+    // straddling clip and shifting downstream clips right by clip.effectiveDuration() (1 Undo).
+    bool rippleInsertClipAtTime(bool audio, int trackIndex, const ClipInfo &clip,
+                                double timeSec, QString *errorOut = nullptr);
     void duplicateSelectedClips();
     void nudgeSelectedClips(int frames);
     void closeAllGaps();
