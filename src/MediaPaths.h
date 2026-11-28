@@ -31,6 +31,9 @@ private:
 
 QVector<PathSlot> enumeratePathSlots(ProjectData &data);
 QStringList missingFiles(const ProjectData &data);
+// True for a file path that is absent or not a regular file; null-object and
+// nested-sequence references are internal and never missing.
+bool isMissingFilesystemPath(const QString &path);
 int replacePaths(ProjectData &data,
                  const QHash<QString, QString> &oldToNew);
 

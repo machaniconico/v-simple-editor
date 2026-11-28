@@ -8,6 +8,7 @@
 #include "CaptionOverlayBuilder.h"
 #include "TimecodeBurnIn.h"
 #include "ShapeLayer.h"
+#include "TrackMatteKey.h"
 #include <QBuffer>
 #include <QFile>
 #include <QJsonDocument>
@@ -1052,6 +1053,44 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
         return false;
     }
     return file.commit();
+}
+
+void ProjectFile::applyTimeRemapEntries(Timeline *timeline,
+                                        const QVector<TimeRemapClipEntry> &entries)
+{
+    if (!timeline || entries.isEmpty())
+        return;
+
+    QHash<QString, const TimeRemapClipEntry *> byKey;
+    byKey.reserve(entries.size());
+    for (const TimeRemapClipEntry &entry : entries) {
+        if (!entry.clipId.isEmpty())
+            byKey.insert(canonicalClipKey(entry.clipId), &entry);
+    }
+
+    bool anyChanged = false;
+    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
+    for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
+        TimelineTrack *track = tracks[trackIdx];
+        if (!track)
+            continue;
+        QVector<ClipInfo> clips = track->clips();
+        bool trackChanged = false;
+        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
+            const auto it = byKey.constFind(trackMatteClipKey(trackIdx, clipIdx));
+            if (it == byKey.cend())
+                continue;
+            clips[clipIdx].timeRemapCurve = it.value()->curve;
+            trackChanged = true;
+        }
+        if (trackChanged) {
+            track->setClips(clips);
+            anyChanged = true;
+        }
+    }
+
+    if (anyChanged)
+        timeline->refreshPlaybackSequence();
 }
 
 bool ProjectFile::load(const QString &filePath, ProjectData &data)

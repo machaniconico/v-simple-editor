@@ -1,4 +1,6 @@
+#include "../MainWindow.h"
 #include "../MediaPaths.h"
+#include "../MediaRelinkDialog.h"
 #include "../ClipGeometry.h"
 #include "../ProjectCollector.h"
 #include "../ProjectFile.h"
@@ -6,11 +8,17 @@
 #include "../TrackMatteKey.h"
 #include "../UndoManager.h"
 
+#include <QAction>
+#include <QApplication>
+#include <QCoreApplication>
+#include <QDialog>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QSet>
+#include <QStatusBar>
 #include <QTemporaryDir>
 #include <QTimer>
 
@@ -573,6 +581,203 @@ int runMediaRelinkSelftest()
              : (!collectorOk
                     ? collectorMessage
                     : QStringLiteral("collected project paths were incomplete")));
+
+    // G7: MainWindow loads a project with an offline path -> the timeline badges
+    // every clip on it, the menu counts the unique path, a relink clears both and
+    // an undo re-judges only the unknown (original) path.
+    const QString g7Missing = QDir(fixtureDir.path()).filePath(
+        QStringLiteral("g7-offline.mp4"));
+    const QString g7Present = QDir(fixtureDir.path()).filePath(
+        QStringLiteral("g7-present.mp4"));
+    const QString g7Project = QDir(fixtureDir.path()).filePath(
+        QStringLiteral("g7.vproj"));
+    const QString g8Project = QDir(fixtureDir.path()).filePath(
+        QStringLiteral("g8-online.vproj"));
+    const auto makeClip = [](const QString &path) {
+        ClipInfo clip;
+        clip.filePath = path;
+        clip.duration = 1.0;
+        clip.outPoint = 1.0;
+        return clip;
+    };
+    bool g7Ready = touchFile(g7Present);
+    {
+        ProjectData data;
+        data.videoTracks = ProjectTrackClips{QVector<ClipInfo>{
+            makeClip(g7Missing), makeClip(g7Missing),
+            makeClip(clipgeom::nullObjectFilePath()), makeClip(QString()),
+            makeClip(timeline_nesting::sequenceClipFilePath(QStringLiteral("g7seq")))}};
+        g7Ready = g7Ready && ProjectFile::save(g7Project, data);
+        ProjectData online;
+        online.videoTracks = ProjectTrackClips{QVector<ClipInfo>{makeClip(g7Present)}};
+        g7Ready = g7Ready && ProjectFile::save(g8Project, online);
+    }
+
+    MainWindow window;
+    Timeline *timeline = window.findChild<Timeline *>(QStringLiteral("mainTimeline"));
+    QString g7Detail = QStringLiteral("fixture or MainWindow timeline unavailable");
+    bool g7 = false;
+    if (g7Ready && timeline) {
+        QString loadError;
+        const bool loaded = window.openProjectFromPath(g7Project, &loadError, false);
+        const auto menuCount = [&]() {
+            ProjectData data;
+            window.populateProjectData(data);
+            return mediapaths::missingFiles(data).size();
+        };
+        const auto clipPathSet = [&]() {
+            QSet<QString> paths;
+            for (const auto *tracks : {&timeline->videoTracks(), &timeline->audioTracks()}) {
+                for (const TimelineTrack *track : *tracks) {
+                    for (const ClipInfo &clip : track->clips()) {
+                        if (!clip.filePath.isEmpty())
+                            paths.insert(clip.filePath);
+                    }
+                }
+            }
+            return paths;
+        };
+        const int loadedBadges = timeline->offlineClipCount();
+        const int loadedMenu = menuCount();
+        const QStringList cachedKeys = timeline->offlineCachedPaths();
+        const bool keysMatchClips = QSet<QString>(cachedKeys.cbegin(), cachedKeys.cend())
+            == clipPathSet();
+        const bool internalClean = !timeline->isPathOffline(clipgeom::nullObjectFilePath())
+            && !timeline->isPathOffline(QString())
+            && !timeline->isPathOffline(timeline_nesting::sequenceClipFilePath(QStringLiteral("g7seq")));
+        // Undo straight after the full replacement: the path set is unchanged,
+        // so nothing is judged again.
+        const int probesBeforeFirstUndo = timeline->offlineProbeCount();
+        timeline->setClipEnabled(TrackKind::Video, 0, 0, false);
+        timeline->undo();
+        const int firstUndoProbes = timeline->offlineProbeCount() - probesBeforeFirstUndo;
+        const int afterFirstUndoBadges = timeline->offlineClipCount();
+
+        QString relinkError;
+        const bool relinked = window.relinkMediaPaths(
+            QHash<QString, QString>{{g7Missing, g7Present}}, &relinkError);
+        const int relinkedBadges = timeline->offlineClipCount();
+        const int relinkedMenu = menuCount();
+        const int probesBeforeUndo = timeline->offlineProbeCount();
+        timeline->undo();
+        const int undoProbes = timeline->offlineProbeCount() - probesBeforeUndo;
+        const int undoBadges = timeline->offlineClipCount();
+        const bool undoInternalClean = !timeline->isPathOffline(clipgeom::nullObjectFilePath())
+            && !timeline->isPathOffline(QString())
+            && !timeline->isPathOffline(timeline_nesting::sequenceClipFilePath(QStringLiteral("g7seq")));
+
+        // Catch-all refresh: A appears on disk, then an existing file B is imported
+        // through Timeline::importMedia (not a MainWindow wrapper). The mediaImported
+        // signal must replace the cache: A is no longer badged and B is judged.
+        const QString importPath = QDir::current().absoluteFilePath(
+            QStringLiteral("test_assets/e2e_clip.mp4"));
+        QString importError;
+        const bool aCreated = touchFile(g7Missing);
+        const bool bImported = timeline->importMedia(importPath, -1, -1.0, nullptr, &importError);
+        QCoreApplication::processEvents();
+        const int importBadges = timeline->offlineClipCount();
+        const bool aOffline = timeline->isPathOffline(g7Missing);
+        const bool bOffline = timeline->isPathOffline(importPath);
+        const bool importRefreshed = aCreated && bImported && importBadges == 0
+            && !aOffline && !bOffline;
+        QFile::remove(g7Missing);
+        std::cerr << "[media-relink] G7 import-refresh aCreated=" << aCreated
+                  << " imported=" << bImported << " badges=" << importBadges
+                  << " isPathOffline(A)=" << aOffline << " isPathOffline(B)=" << bOffline
+                  << " error='" << importError.toStdString() << "'\n";
+
+        // Sequence-creating import (the entry point of MCP import_edl and
+        // fcpx::xml::applyImport): A is cached offline, then appears on disk.
+        ClipInfo g7SeqClip;
+        g7SeqClip.filePath = g7Missing;
+        const QVector<QVector<ClipInfo>> g7SeqTracks{QVector<ClipInfo>{g7SeqClip}};
+        QFile::remove(g7Missing);
+        const bool seqPre = timeline->createSequence(QStringLiteral("g7pre"), g7SeqTracks, {{}});
+        QCoreApplication::processEvents();
+        timeline->setOfflinePaths(QStringList{g7Missing});
+        const bool seqCachedOffline = timeline->isPathOffline(g7Missing);
+        const bool seqCreatedA = touchFile(g7Missing);
+        const bool seqMade = timeline->createSequence(QStringLiteral("g7edl"), g7SeqTracks, {{}});
+        QCoreApplication::processEvents();
+        const bool seqAOffline = timeline->isPathOffline(g7Missing);
+        const int seqBadges = timeline->offlineClipCount();
+        const bool seqRefreshed = seqPre && seqCachedOffline && seqCreatedA && seqMade
+            && !seqAOffline && seqBadges == 0;
+        QFile::remove(g7Missing);
+        std::cerr << "[media-relink] G7 seq-import-refresh pre=" << seqPre
+                  << " cachedOffline(A)=" << seqCachedOffline << " created=" << seqMade
+                  << " isPathOffline(A)=" << seqAOffline << " badges=" << seqBadges << '\n';
+
+        std::cerr << "[media-relink] G7 loaded=" << loaded
+                  << " badges/menu on load=" << loadedBadges << '/' << loadedMenu
+                  << " cacheKeysEqualClipPaths=" << keysMatchClips
+                  << " firstUndoProbes=" << firstUndoProbes
+                  << " badgesAfterFirstUndo=" << afterFirstUndoBadges
+                  << " relinked=" << relinked << " badges/menu after relink="
+                  << relinkedBadges << '/' << relinkedMenu
+                  << " undoProbes=" << undoProbes << " badgesAfterUndo=" << undoBadges
+                  << " internalClean=" << (internalClean && undoInternalClean) << '\n';
+        g7 = loaded && loadedBadges == 2 && loadedMenu == 1 && keysMatchClips
+            && internalClean && firstUndoProbes == 0 && afterFirstUndoBadges == 2
+            && relinked && relinkedBadges == 0 && relinkedMenu == 0
+            && undoProbes == 1 && undoBadges == 2 && undoInternalClean
+            && importRefreshed && seqRefreshed;
+        g7Detail = QStringLiteral("badges/menu load=%1/%2 keys=%3 firstUndoProbes=%4 "
+                                  "relink=%5/%6 undoProbes=%7 undoBadges=%8 error=%9")
+            .arg(loadedBadges).arg(loadedMenu).arg(keysMatchClips).arg(firstUndoProbes)
+            .arg(relinkedBadges).arg(relinkedMenu).arg(undoProbes).arg(undoBadges)
+            .arg(loadError + relinkError + importError);
+    }
+    gate(g7, "G7", g7Detail);
+
+    // G8: File > メディアを再リンク… opens no dialog when nothing is offline and
+    // opens a MediaRelinkDialog when something is (a timer rejects it).
+    QAction *relinkAction = window.findChild<QAction *>(QStringLiteral("file.relink_media"));
+    QString g8Modal;
+    QString g8Status;
+    QString g8Detail = QStringLiteral("menu action file.relink_media is missing");
+    bool g8 = false;
+    if (relinkAction && g7Ready) {
+        // One periodic closer, started before each trigger and stopped right after,
+        // so no timer outlives this block (rule 62).
+        QTimer closer;
+        closer.setInterval(50);
+        QObject::connect(&closer, &QTimer::timeout, &closer, [&g8Modal]() {
+            if (QWidget *modal = QApplication::activeModalWidget()) {
+                g8Modal = QLatin1String(dynamic_cast<MediaRelinkDialog *>(modal)
+                                            ? "MediaRelinkDialog" : "other")
+                    + QLatin1Char('/') + modal->objectName();
+                if (auto *dialog = dynamic_cast<QDialog *>(modal))
+                    dialog->reject();
+            }
+        });
+        QString loadError;
+        bool onlineLoaded = window.openProjectFromPath(g8Project, &loadError, false);
+        window.statusBar()->clearMessage();
+        closer.start();
+        relinkAction->trigger();
+        closer.stop();
+        const QString modalWhenOnline = g8Modal;
+        g8Status = window.statusBar()->currentMessage();
+
+        g8Modal.clear();
+        onlineLoaded = onlineLoaded && window.openProjectFromPath(g7Project, &loadError, false);
+        closer.start();
+        relinkAction->trigger();
+        closer.stop();
+        const QString modalWhenOffline = g8Modal;
+        const bool noModalLeft = QApplication::activeModalWidget() == nullptr;
+        std::cerr << "[media-relink] G8 modalOnline='" << modalWhenOnline.toStdString()
+                  << "' status='" << g8Status.toStdString() << "' modalOffline='"
+                  << modalWhenOffline.toStdString() << "' noModalLeft=" << noModalLeft << '\n';
+        g8 = onlineLoaded && modalWhenOnline.isEmpty()
+            && g8Status == QStringLiteral("オフラインのメディアはありません")
+            && modalWhenOffline == QStringLiteral("MediaRelinkDialog/mediaRelinkDialog")
+            && noModalLeft;
+        g8Detail = QStringLiteral("online modal='%1' status='%2' offline modal='%3' load=%4")
+            .arg(modalWhenOnline, g8Status, modalWhenOffline, loadError);
+    }
+    gate(g8, "G8", g8Detail);
 
     std::cerr << "[media-relink] summary: " << passed << " PASS, "
               << failed << " FAIL\n";

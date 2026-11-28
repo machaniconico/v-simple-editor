@@ -16,10 +16,6 @@
 
 #include <cmath>
 
-void syncTimeRemapEntriesToTimeline(
-    Timeline *timeline,
-    const QHash<QString, TimeRemapClipEntry> &source);
-
 namespace {
 
 constexpr double kEps = 1e-6;
@@ -244,18 +240,6 @@ double rgbaMse(const QImage &a, const QImage &b)
     return denom > 0.0 ? sum / denom : 1.0e99;
 }
 
-QHash<QString, TimeRemapClipEntry> timeRemapEntryMap(
-    const QVector<TimeRemapClipEntry> &entries)
-{
-    QHash<QString, TimeRemapClipEntry> map;
-    map.reserve(entries.size());
-    for (const TimeRemapClipEntry &entry : entries) {
-        if (!entry.clipId.isEmpty())
-            map.insert(entry.clipId, entry);
-    }
-    return map;
-}
-
 ProjectData projectDataForTimelineFreeze(const Timeline &timeline)
 {
     ProjectData data;
@@ -418,8 +402,8 @@ int runFreezeFrameSelftest()
             loadedTimeline.restoreFromProject(loaded.videoTracks, loaded.audioTracks,
                                               loaded.playheadPos, loaded.markIn,
                                               loaded.markOut, loaded.zoomLevel);
-            syncTimeRemapEntriesToTimeline(
-                &loadedTimeline, timeRemapEntryMap(loaded.timeRemapClipEntries));
+            ProjectFile::applyTimeRemapEntries(
+                &loadedTimeline, loaded.timeRemapClipEntries);
             const QVector<ClipInfo> loadedClips = loadedTimeline.videoTracks()[0]->clips();
             saveLoadRoundtrip =
                 loaded.timeRemapClipEntries.size() == 1

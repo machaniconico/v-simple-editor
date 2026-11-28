@@ -137,6 +137,8 @@ void appendNestedSlots(QVector<PathSlot> &pathSlots, ProjectData &data)
     }
 }
 
+} // namespace
+
 bool isMissingFilesystemPath(const QString &path)
 {
     if (clipgeom::isNullObjectFilePath(path)
@@ -146,8 +148,6 @@ bool isMissingFilesystemPath(const QString &path)
     const QFileInfo info(path);
     return !info.exists() || !info.isFile();
 }
-
-} // namespace
 
 QVector<PathSlot> enumeratePathSlots(ProjectData &data)
 {

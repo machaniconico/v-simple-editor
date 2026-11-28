@@ -1,4 +1,5 @@
 #include "ShapeLayer.h"
+#include "WiggleTransform.h"
 
 #include <QFont>
 #include <QFontMetricsF>
@@ -242,7 +243,8 @@ bool ShapeModifiers::isDefault() const
         && repeater.offset == QPointF(40.0, 0.0) && repeater.rotationDeg == 0.0
         && repeater.scale == 1.0 && repeater.opacityEnd == 1.0
         && !trim.enabled && trim.startPct == 0.0 && trim.endPct == 100.0
-        && trim.offsetPct == 0.0;
+        && trim.offsetPct == 0.0
+        && !roundCorners.enabled && !zigZag.enabled && !wigglePath.enabled;
 }
 
 QJsonObject ShapeModifiers::toJson() const
@@ -263,6 +265,16 @@ QJsonObject ShapeModifiers::toJson() const
     QJsonObject obj;
     if (!r.isEmpty()) obj["repeater"] = r;
     if (!t.isEmpty()) obj["trim"] = t;
+    // New modifiers are written only while enabled so legacy JSON is unchanged.
+    if (roundCorners.enabled)
+        obj["roundCorners"] = QJsonObject{{"enabled", true}, {"radius", roundCorners.radius}};
+    if (zigZag.enabled)
+        obj["zigZag"] = QJsonObject{{"enabled", true}, {"size", zigZag.size},
+                                    {"ridges", zigZag.ridgesPerSegment},
+                                    {"smooth", zigZag.smooth}};
+    if (wigglePath.enabled)
+        obj["wigglePath"] = QJsonObject{{"enabled", true}, {"amplitude", wigglePath.amplitude},
+                                        {"detail", wigglePath.detail}, {"seed", wigglePath.seed}};
     return obj;
 }
 
@@ -281,6 +293,19 @@ ShapeModifiers ShapeModifiers::fromJson(const QJsonObject &obj)
     m.trim.startPct = qBound(0.0, t["startPct"].toDouble(0.0), 100.0);
     m.trim.endPct = qBound(0.0, t["endPct"].toDouble(100.0), 100.0);
     m.trim.offsetPct = t["offsetPct"].toDouble(0.0);
+    const QJsonObject rc = obj["roundCorners"].toObject();
+    m.roundCorners.enabled = rc["enabled"].toBool(false);
+    m.roundCorners.radius = qBound(0.0, rc["radius"].toDouble(10.0), 1000000.0);
+    const QJsonObject zz = obj["zigZag"].toObject();
+    m.zigZag.enabled = zz["enabled"].toBool(false);
+    m.zigZag.size = qBound(-1000000.0, zz["size"].toDouble(10.0), 1000000.0);
+    m.zigZag.ridgesPerSegment = qBound(1, zz["ridges"].toInt(4), 100);
+    m.zigZag.smooth = zz["smooth"].toBool(false);
+    const QJsonObject wp = obj["wigglePath"].toObject();
+    m.wigglePath.enabled = wp["enabled"].toBool(false);
+    m.wigglePath.amplitude = qBound(-1000000.0, wp["amplitude"].toDouble(5.0), 1000000.0);
+    m.wigglePath.detail = qBound(1, wp["detail"].toInt(4), 100);
+    m.wigglePath.seed = wp["seed"].toInt(1);
     return m;
 }
 
@@ -507,6 +532,166 @@ void ShapeLayer::applyStroke(QPainter &painter, const ShapeStroke &stroke)
     painter.setPen(pen);
 }
 
+// ===== shapemod — path-to-path modifiers =====
+
+namespace shapemod {
+namespace {
+
+constexpr double kFlatten = 16.0; // flatten at 1/16 px tolerance
+
+// Flattened subpaths with consecutive duplicate points removed; closed ones
+// drop the repeated end point and report closed = true.
+struct Poly { QVector<QPointF> pts; bool closed = false; };
+
+QVector<Poly> flatten(const QPainterPath &path)
+{
+    QVector<Poly> out;
+    for (const QPolygonF &polygon : path.toSubpathPolygons(QTransform::fromScale(kFlatten, kFlatten))) {
+        Poly p;
+        for (const QPointF &pt : polygon) {
+            const QPointF q = pt / kFlatten;
+            if (p.pts.isEmpty() || QLineF(p.pts.last(), q).length() > 1e-9)
+                p.pts.append(q);
+        }
+        if (p.pts.size() > 2 && QLineF(p.pts.first(), p.pts.last()).length() <= 1e-9) {
+            p.pts.removeLast();
+            p.closed = true;
+        } else if (polygon.isClosed() && p.pts.size() > 2) {
+            p.closed = true;
+        }
+        if (!p.pts.isEmpty()) out.append(p);
+    }
+    return out;
+}
+
+void appendPoly(QPainterPath &result, const QVector<QPointF> &pts, bool closed, bool smooth)
+{
+    if (pts.isEmpty()) return;
+    result.moveTo(pts[0]);
+    const int n = pts.size();
+    if (!smooth || n < 3) {
+        for (int i = 1; i < n; ++i) result.lineTo(pts[i]);
+    } else {
+        // Catmull-Rom through the points, expressed as cubic Beziers.
+        const int segments = closed ? n : n - 1;
+        for (int i = 0; i < segments; ++i) {
+            auto at = [&](int k) {
+                return closed ? pts[(k % n + n) % n] : pts[qBound(0, k, n - 1)];
+            };
+            const QPointF p0 = at(i - 1), p1 = at(i), p2 = at(i + 1), p3 = at(i + 2);
+            result.cubicTo(p1 + (p2 - p0) / 6.0, p2 - (p3 - p1) / 6.0, p2);
+        }
+    }
+    if (closed) result.closeSubpath();
+}
+
+} // namespace
+
+QPainterPath roundCorners(const QPainterPath &path, double radius)
+{
+    if (!(radius > 0.0) || !std::isfinite(radius)) return path;
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    for (const Poly &poly : flatten(path)) {
+        const QVector<QPointF> &p = poly.pts;
+        const int n = p.size();
+        if (n < 3) {
+            appendPoly(result, p, poly.closed, false);
+            continue;
+        }
+        // Tangent points of vertex i: cut distance is capped at half of each
+        // adjacent edge so neighbouring corners never overlap.
+        auto cut = [&](int i, QPointF &in, QPointF &out) {
+            const QPointF prev = p[(i + n - 1) % n], next = p[(i + 1) % n];
+            const double dIn = QLineF(p[i], prev).length();
+            const double dOut = QLineF(p[i], next).length();
+            const double d = qMin(radius, qMin(dIn, dOut) / 2.0);
+            in = p[i] + (prev - p[i]) * (d / dIn);
+            out = p[i] + (next - p[i]) * (d / dOut);
+        };
+        auto corner = [&](int i) {
+            QPointF in, out;
+            cut(i, in, out);
+            result.lineTo(in);
+            result.cubicTo(in + (p[i] - in) * (2.0 / 3.0), out + (p[i] - out) * (2.0 / 3.0), out);
+        };
+        QPointF in0, out0;
+        if (poly.closed) {
+            cut(0, in0, out0);
+            result.moveTo(out0);
+            for (int i = 1; i < n; ++i) corner(i);
+            result.lineTo(in0);
+            result.cubicTo(in0 + (p[0] - in0) * (2.0 / 3.0), out0 + (p[0] - out0) * (2.0 / 3.0), out0);
+            result.closeSubpath();
+        } else {
+            result.moveTo(p[0]);
+            for (int i = 1; i < n - 1; ++i) corner(i);
+            result.lineTo(p[n - 1]);
+        }
+    }
+    return result;
+}
+
+QPainterPath zigZag(const QPainterPath &path, double size, int ridgesPerSegment, bool smooth)
+{
+    const int ridges = qBound(1, ridgesPerSegment, 100);
+    if (!std::isfinite(size)) return path;
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    for (const Poly &poly : flatten(path)) {
+        const QVector<QPointF> &p = poly.pts;
+        const int n = p.size();
+        const int segments = poly.closed ? n : n - 1;
+        QVector<QPointF> pts;
+        for (int i = 0; i < segments; ++i) {
+            const QPointF a = p[i], b = p[(i + 1) % n];
+            pts.append(a);
+            const QLineF line(a, b);
+            const QPointF normal(-(b.y() - a.y()) / line.length(), (b.x() - a.x()) / line.length());
+            for (int k = 0; k < 2 * ridges; ++k) {
+                const double t = (k + 0.5) / (2.0 * ridges);
+                pts.append(a + (b - a) * t + normal * ((k % 2 == 0) ? size : -size));
+            }
+        }
+        if (!poly.closed) pts.append(p.last());
+        appendPoly(result, pts, poly.closed, smooth);
+    }
+    return result;
+}
+
+QPainterPath wigglePath(const QPainterPath &path, double amplitude, int detail, int seed)
+{
+    if (!std::isfinite(amplitude)) return path;
+    const int parts = qBound(1, detail, 100);
+    wiggle::WiggleParams params;
+    params.enabled = true;
+    params.positionFrequency = 1.0;
+    params.positionAmplitude = QPointF(amplitude, amplitude);
+    params.octaves = 2;
+    params.seed = static_cast<unsigned int>(seed);
+    QPainterPath result;
+    result.setFillRule(path.fillRule());
+    int counter = 0; // running vertex index = noise time, shared across subpaths
+    for (const Poly &poly : flatten(path)) {
+        const QVector<QPointF> &p = poly.pts;
+        const int n = p.size();
+        const int segments = poly.closed ? n : n - 1;
+        QVector<QPointF> pts;
+        for (int i = 0; i < segments; ++i) {
+            const QPointF a = p[i], b = p[(i + 1) % n];
+            for (int k = 0; k < parts; ++k)
+                pts.append(a + (b - a) * (double(k) / parts));
+        }
+        if (!poly.closed) pts.append(p.last());
+        for (QPointF &pt : pts)
+            pt += wiggle::evaluate(params, double(counter++)).positionOffset;
+        appendPoly(result, pts, poly.closed, false);
+    }
+    return result;
+}
+
+} // namespace shapemod
+
 // ===== ShapeLayer — rendering =====
 
 QPainterPath ShapeLayer::trimPathRange(const QPainterPath &path, double startPct,
@@ -570,6 +755,16 @@ void ShapeLayer::renderShape(const Shape &shape, QPainter &painter)
     painter.scale(shape.scale, shape.scale);
 
     QPainterPath path = buildShapePath(shape);
+    if (shape.modifiers.roundCorners.enabled)
+        path = shapemod::roundCorners(path, shape.modifiers.roundCorners.radius);
+    if (shape.modifiers.zigZag.enabled) {
+        const auto &z = shape.modifiers.zigZag;
+        path = shapemod::zigZag(path, z.size, z.ridgesPerSegment, z.smooth);
+    }
+    if (shape.modifiers.wigglePath.enabled) {
+        const auto &w = shape.modifiers.wigglePath;
+        path = shapemod::wigglePath(path, w.amplitude, w.detail, w.seed);
+    }
     if (shape.modifiers.trim.enabled) {
         const auto &trim = shape.modifiers.trim;
         path = trimPathRange(path, trim.startPct, trim.endPct, trim.offsetPct);

@@ -26,6 +26,9 @@
 //       the second and counts one repair; distinct uids are kept and counted 0.
 //   G4: undo / redo of a paste restore the exact uids of each state.
 //   G5: decomposing two baked clones on different audio tracks yields distinct uids
+//   G6 (US-1405): restoreFromProject keeps a uid shared by V1 and V2 on V1 only, mints a new one on
+//       V2 (counted on V2), leaves V2's position-keyed roto ("1:0") on V2's clip; a project without
+//       a repeated uid is untouched. Detects: HEAD, where both tracks keep the same uid.
 namespace {
 ClipInfo clipFor(const QString &path, double duration = 2.0)
 {
@@ -334,6 +337,53 @@ int runClipUidSelftest()
             "decomposed=%d,%d distinct=%d control decomposed=%d kept=%d", int(d1), int(d2),
             int(distinct), int(ds), int(kept)).toStdString();
         tally.gate(5, distinct && kept, detail);
+    }
+
+    // G6: restoreFromProject repairs a uid repeated across video tracks.
+    {
+        Timeline loaded;
+        ClipInfo v1 = clipFor(QStringLiteral("/selftests/x-v1.mp4"));
+        v1.uid = QStringLiteral("x-shared");
+        ClipInfo v2 = clipFor(QStringLiteral("/selftests/x-v2.mp4"));
+        v2.uid = QStringLiteral("x-shared");
+        ClipInfo a1 = clipFor(QStringLiteral("/selftests/x-a1.mp4"));
+        a1.uid = QStringLiteral("x-shared");
+        RotoClipEntry rotoEntry;
+        rotoEntry.clipId = QStringLiteral("1:0");
+        loaded.setRotoEntries({{rotoEntry.clipId, rotoEntry}});
+        loaded.restoreFromProject(ProjectTrackClips({{v1}, {v2}}), ProjectTrackClips({{a1}}),
+                                  0.0, -1.0, -1.0, 100);
+        const QString uidV1 = loaded.trackAt(false, 0)->clips().value(0).uid;
+        const QString uidV2 = loaded.trackAt(false, 1)->clips().value(0).uid;
+        const QString uidA1 = loaded.trackAt(true, 0)->clips().value(0).uid;
+        const quint64 repairV1 = loaded.trackAt(false, 0)->duplicateUidRepairCountForTest();
+        const quint64 repairV2 = loaded.trackAt(false, 1)->duplicateUidRepairCountForTest();
+        const bool rotoKept = loaded.rotoEntries().contains(QStringLiteral("1:0"))
+            && loaded.trackAt(false, 1)->clips().value(0).filePath == v2.filePath;
+        const bool repairedOk = uidV1 == QStringLiteral("x-shared") && !uidV2.isEmpty()
+            && uidV2 != uidV1 && repairV1 == 0 && repairV2 == 1 && rotoKept
+            && uidA1 == QStringLiteral("x-shared");
+        fprintf(stderr, "[clip-uid] G6 uidV1=%s uidV2=%s uidA1=%s repairV1=%llu repairV2=%llu "
+                        "roto1:0=%d\n", qPrintable(uidV1), qPrintable(uidV2), qPrintable(uidA1),
+                static_cast<unsigned long long>(repairV1), static_cast<unsigned long long>(repairV2),
+                int(rotoKept));
+
+        // Control: no repeated video uid -> nothing changes, nothing counted.
+        Timeline plain;
+        v2.uid = QStringLiteral("x-own");
+        plain.restoreFromProject(ProjectTrackClips({{v1}, {v2}}), ProjectTrackClips({{a1}}),
+                                 0.0, -1.0, -1.0, 100);
+        const bool controlOk = plain.trackAt(false, 0)->clips().value(0).uid == QStringLiteral("x-shared")
+            && plain.trackAt(false, 1)->clips().value(0).uid == QStringLiteral("x-own")
+            && plain.trackAt(false, 1)->duplicateUidRepairCountForTest() == 0;
+        fprintf(stderr, "[clip-uid] G6 control uidV1=%s uidV2=%s repairV2=%llu\n",
+                qPrintable(plain.trackAt(false, 0)->clips().value(0).uid),
+                qPrintable(plain.trackAt(false, 1)->clips().value(0).uid),
+                static_cast<unsigned long long>(
+                    plain.trackAt(false, 1)->duplicateUidRepairCountForTest()));
+        const std::string detail = QString::asprintf("repaired=%d control=%d", int(repairedOk),
+                                                     int(controlOk)).toStdString();
+        tally.gate(6, repairedOk && controlOk, detail);
     }
 
     return tally.finish("clip-uid");

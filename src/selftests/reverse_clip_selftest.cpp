@@ -637,6 +637,171 @@ int runReverseClipSelftest()
     check(6, "ネストした1キー time-remap の preview 区間を保持する",
           heldVideoIntervalOk && heldAudioIntervalOk);
 
+    // G7: splitting a reversed uniform-speed clip keeps the source frame of
+    // every local second on both halves (rule (69)). Reversed speed 2 over
+    // source [2, 8] is 3 s long; the split at local 1.2 sits at source 5.6.
+    // HEAD split it with the forward formula, so the left half started at
+    // source 4.4 and the right half at source 8 (main check FAILs).
+    {
+        constexpr double kFrameSec = 1.0 / 30.0;
+        constexpr double kSplitLocalSec = 1.2;
+        ClipInfo splitSource;
+        splitSource.filePath = QStringLiteral("reverse-split.mp4");
+        splitSource.displayName = QStringLiteral("reverse split");
+        splitSource.duration = 8.0;
+        splitSource.inPoint = 2.0;
+        splitSource.outPoint = 8.0;
+        splitSource.speed = 2.0;
+        splitSource.reversed = true;
+        const double totalSec = splitSource.effectiveDuration();
+        const double splitSourceSec = splitSource.outPoint
+            - kSplitLocalSec * splitSource.speed;
+
+        QStringList details;
+        // Compares every sampled local second of the two halves with the
+        // unsplit clip and prints timeline / local / source seconds.
+        const auto contractHolds = [&](const char *label, const ClipInfo &left,
+                                       const ClipInfo &right) {
+            bool ok = near(left.effectiveDuration(), kSplitLocalSec, 1e-6)
+                && near(right.effectiveDuration(), totalSec - kSplitLocalSec, 1e-6);
+            std::fprintf(stderr,
+                         "reverse-clip G7 %s: left in=%.6f out=%.6f effectiveDuration=%.6f "
+                         "(expect %.6f) right in=%.6f out=%.6f effectiveDuration=%.6f "
+                         "(expect %.6f)\n",
+                         label, left.inPoint, left.outPoint, left.effectiveDuration(),
+                         kSplitLocalSec, right.inPoint, right.outPoint,
+                         right.effectiveDuration(), totalSec - kSplitLocalSec);
+            const double rightSec = totalSec - kSplitLocalSec;
+            const double leftLocals[] = {0.0, kSplitLocalSec / 2.0,
+                                         kSplitLocalSec - kFrameSec};
+            const double rightLocals[] = {0.0, rightSec / 2.0, rightSec - kFrameSec};
+            for (int half = 0; half < 2; ++half) {
+                const ClipInfo &piece = half == 0 ? left : right;
+                const double *locals = half == 0 ? leftLocals : rightLocals;
+                const double pieceStartSec = half == 0 ? 0.0 : kSplitLocalSec;
+                for (int i = 0; i < 3; ++i) {
+                    const double localSec = locals[i];
+                    const double timelineSec = pieceStartSec + localSec;
+                    const double sourceSec = piece.sourceSecondAtLocalTime(localSec);
+                    const double expectedSourceSec =
+                        splitSource.sourceSecondAtLocalTime(timelineSec);
+                    const bool sampleOk = near(sourceSec, expectedSourceSec, 1e-6);
+                    std::fprintf(stderr,
+                                 "reverse-clip G7 %s: %s timelineSec=%.6f localSec=%.6f "
+                                 "sourceSec=%.6f (expect %.6f) %s\n",
+                                 label, half == 0 ? "left" : "right", timelineSec,
+                                 localSec, sourceSec, expectedSourceSec,
+                                 sampleOk ? "ok" : "MISMATCH");
+                    ok = ok && sampleOk;
+                }
+            }
+            if (!ok)
+                details << QString::fromLatin1(label);
+            return ok;
+        };
+
+        Timeline splitTimeline;
+        TimelineTrack *splitTrack = splitTimeline.videoTracks()[0];
+        splitTrack->setClips({splitSource});
+        splitTrack->splitClipAt(0, kSplitLocalSec);
+        const QVector<ClipInfo> halves = splitTrack->clips();
+        const bool splitOk = halves.size() == 2
+            && contractHolds("split", halves.value(0), halves.value(1));
+        if (halves.size() != 2)
+            details << QStringLiteral("clipCount=%1 (expect 2)").arg(halves.size());
+
+        // Save -> load keeps the contract.
+        bool reloadOk = false;
+        if (halves.size() == 2) {
+            ProjectData savedHalves;
+            savedHalves.videoTracks = QVector<QVector<ClipInfo>>{halves};
+            ProjectData loadedHalves;
+            const bool loadOk = ProjectFile::fromJsonString(
+                ProjectFile::toJsonString(savedHalves), loadedHalves);
+            reloadOk = loadOk && loadedHalves.videoTracks.size() == 1
+                && loadedHalves.videoTracks.first().size() == 2
+                && contractHolds("reload", loadedHalves.videoTracks.first().at(0),
+                                 loadedHalves.videoTracks.first().at(1));
+            if (!reloadOk && !loadOk)
+                details << QStringLiteral("reload parse failed");
+        }
+
+        // Forward uniform split keeps the forward formula: [in, in + L*speed]
+        // and [in + L*speed, out].
+        ClipInfo forwardSource = splitSource;
+        forwardSource.reversed = false;
+        Timeline forwardTimeline;
+        TimelineTrack *forwardTrack = forwardTimeline.videoTracks()[0];
+        forwardTrack->setClips({forwardSource});
+        forwardTrack->splitClipAt(0, kSplitLocalSec);
+        const QVector<ClipInfo> forwardHalves = forwardTrack->clips();
+        const double forwardSplitSec = forwardSource.inPoint
+            + kSplitLocalSec * forwardSource.speed;
+        const bool forwardOk = forwardHalves.size() == 2
+            && near(forwardHalves[0].inPoint, 2.0) && near(forwardHalves[0].outPoint, forwardSplitSec)
+            && near(forwardHalves[1].inPoint, forwardSplitSec) && near(forwardHalves[1].outPoint, 8.0);
+        std::fprintf(stderr,
+                     "reverse-clip G7 forward: halves=%d left [%.6f, %.6f] right [%.6f, %.6f] "
+                     "(expect [2, %.6f] [%.6f, 8]) %s\n",
+                     int(forwardHalves.size()), forwardHalves.value(0).inPoint,
+                     forwardHalves.value(0).outPoint, forwardHalves.value(1).inPoint,
+                     forwardHalves.value(1).outPoint, forwardSplitSec, forwardSplitSec,
+                     forwardOk ? "ok" : "MISMATCH");
+        if (!forwardOk)
+            details << QStringLiteral("forward");
+
+        // Reversed + speed ramp keeps the forward formula (not handled yet).
+        ClipInfo rampedSource = splitSource;
+        rampedSource.speed = 1.0;
+        rampedSource.speedRamp.addKeyframe(0, 2.0);
+        Timeline rampedTimeline;
+        TimelineTrack *rampedTrack = rampedTimeline.videoTracks()[0];
+        rampedTrack->setClips({rampedSource});
+        rampedTrack->splitClipAt(0, kSplitLocalSec);
+        const QVector<ClipInfo> rampedHalves = rampedTrack->clips();
+        const double rampedSplitSec = rampedSource.inPoint
+            + kSplitLocalSec * rampedSource.speed;
+        const bool rampedOk = !rampedSource.speedRamp.isIdentity()
+            && rampedHalves.size() == 2
+            && near(rampedHalves[0].inPoint, 2.0) && near(rampedHalves[0].outPoint, rampedSplitSec)
+            && near(rampedHalves[1].inPoint, rampedSplitSec) && near(rampedHalves[1].outPoint, 8.0);
+        std::fprintf(stderr,
+                     "reverse-clip G7 reversed+ramp: halves=%d left [%.6f, %.6f] right "
+                     "[%.6f, %.6f] (expect [2, %.6f] [%.6f, 8]) %s\n",
+                     int(rampedHalves.size()), rampedHalves.value(0).inPoint,
+                     rampedHalves.value(0).outPoint, rampedHalves.value(1).inPoint,
+                     rampedHalves.value(1).outPoint, rampedSplitSec, rampedSplitSec,
+                     rampedOk ? "ok" : "MISMATCH");
+        if (!rampedOk)
+            details << QStringLiteral("reversed+ramp");
+
+        // Freeze frame on a reversed clip holds the source frame under the
+        // playhead: the held right half maps local 0 to the split source.
+        Timeline freezeTimeline;
+        TimelineTrack *freezeTrack = freezeTimeline.videoTracks()[0];
+        freezeTrack->setClips({splitSource});
+        freezeTimeline.setPlayheadPosition(kSplitLocalSec);
+        const bool frozen = freezeTimeline.freezeFrameAtPlayhead(freezeTrack, 0);
+        const QVector<ClipInfo> frozenClips = freezeTrack->clips();
+        const double heldSourceSec = frozenClips.size() == 2
+            ? frozenClips[1].sourceSecondAtLocalTime(0.0)
+            : -1.0;
+        const bool freezeOk = frozen && frozenClips.size() == 2
+            && frozenClips[1].hasTimeRemap()
+            && near(heldSourceSec, splitSourceSec, 1e-6);
+        std::fprintf(stderr,
+                     "reverse-clip G7 freeze: applied=%d clips=%d timelineSec=%.6f localSec=0 "
+                     "sourceSec=%.6f (expect %.6f) %s\n",
+                     frozen, int(frozenClips.size()), kSplitLocalSec, heldSourceSec,
+                     splitSourceSec, freezeOk ? "ok" : "MISMATCH");
+        if (!freezeOk)
+            details << QStringLiteral("freeze");
+
+        check(7, "逆再生 (一様速度) の分割で両片の素材フレームを保つ",
+              splitOk && reloadOk && forwardOk && rampedOk && freezeOk,
+              details.join(QStringLiteral(", ")));
+    }
+
     std::fprintf(stderr, "summary: %d PASS, %d FAIL\n", passed, failed);
     return failed;
 }

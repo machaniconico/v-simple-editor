@@ -584,7 +584,16 @@ public:
         double newLeadIn = 0.0;
         double nextLeadInDelta = 0.0;
     };
-    DropPlan planDrop(double dropTime, double clipDuration) const;
+    // US-1403: ignoreIndexes (null: none) are planned as if they were not on the
+    // track (their span is free, insertIdx counts only the other clips).
+    DropPlan planDrop(double dropTime, double clipDuration,
+                      const QSet<int> *ignoreIndexes = nullptr) const;
+    // US-1403: a member of the dropped clip's link group taken off the drop
+    // track (index: its position there before anything moved).
+    struct DetachedClip {
+        int index = -1;
+        ClipInfo clip;
+    };
 
     void setSnapEnabled(bool enabled) { m_snapEnabled = enabled; }
     bool snapEnabled() const { return m_snapEnabled; }
@@ -655,6 +664,14 @@ public:
     // with nothing changed when the payload, the source or the slot is invalid.
     bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
                         bool toNewTrack = false);
+    // Whether clip (from src) dropped at dropTime may land here: the plain slot,
+    // or (US-1403) a slot held only by its own link group when that group can move
+    // to another unlocked track (groupIndexesOut: those members). Never mutates.
+    // acceptClipDrop and dragMoveEvent (the indicator) both use it.
+    bool dropEligible(const ClipInfo &clip, double dropTime, TimelineTrack *src, bool toNewTrack,
+                      QSet<int> *groupIndexesOut = nullptr) const;
+    // Selftest read of the drop indicator's valid flag.
+    bool dropIndicatorValid() const { return m_dropIndicatorValid; }
     // US-1202: the clip being moved by an in-track MoveClip drag and how far its
     // start has travelled from the press (seconds). False when no such drag.
     bool moveDragInfo(int *clipIndex, double *deltaSec) const;
@@ -701,6 +718,13 @@ signals:
     // Emitted by dropEvent after every cross-track move (linked or not) and
     // before crossTrackDropped, so Timeline remaps the clip-keyed carriers.
     void clipMovedAcrossTracks(TimelineTrack *src, int srcIdx, int destIdx);
+    // US-1403: in place of clipMovedAcrossTracks + crossTrackDropped when the
+    // slot was held by members of the dropped clip's link group: they were taken
+    // off this track (detached) after `before` was taken and before the clip
+    // moved, so Timeline moves them with the group and remaps the carriers once.
+    void sameGroupCrossTrackDropped(int clipIndex, int linkGroup, double dropTime, TimelineTrack *src,
+                                    const TrackClipSnapshot &before,
+                                    const QVector<TimelineTrack::DetachedClip> &detached);
     // US-1214: splitClipAt split the clip with uid leftUid at its local second
     // splitLocalSec; the right piece got rightUid.
     void clipSplit(const QString &leftUid, const QString &rightUid, double splitLocalSec);
@@ -1018,6 +1042,19 @@ public:
     // clip is connected. `painter` is in m_tracksWidget coordinates.
     void paintConnections(QPainter &painter) const;
     void updateConnectionOverlay();
+    // US-1408 offline badge. m_offlinePaths caches path -> missing and paint only
+    // reads it. setOfflinePaths() replaces the whole cache (every current clip path
+    // is judged: in `missing` = true, otherwise false). refreshOfflinePathsForUnknown()
+    // judges only clip paths the cache has not seen (undo / redo, sequence switch).
+    // Empty, null-object and nested-sequence paths are never badged.
+    void setOfflinePaths(const QStringList &missing);
+    void refreshOfflinePathsForUnknown();
+    bool isPathOffline(const QString &path) const { return m_offlinePaths.value(path, false); }
+    int offlineClipCount() const;
+    // Read-only probes for selftests: cached keys and the number of paths judged
+    // by refreshOfflinePathsForUnknown() so far.
+    QStringList offlineCachedPaths() const { return m_offlinePaths.keys(); }
+    int offlineProbeCount() const { return m_offlineProbeCount; }
     // Non-modal connection warnings (detached connections). MainWindow shows the
     // newest in the status bar on connectionWarningsChanged; selftests and MCP
     // drain them with takeConnectionWarnings.
@@ -1043,6 +1080,13 @@ public:
     // Track access for SnapEngine collection
     const QVector<TimelineTrack *> &videoTracks() const { return m_videoTracks; }
     const QVector<TimelineTrack *> &audioTracks() const { return m_audioTracks; }
+    // US-1313 / US-1403: the track a link-group member on tracks[memberTrack]
+    // moves to when a clip of the same kind is dropped from tracks[dragSourceIdx]
+    // onto tracks[destIdx]: the same offset, clamped at 0; it stays (returns
+    // memberTrack) with an unknown source, into the storyline, or when either
+    // track is locked. Shared by handleCrossTrackLinkedDrop and acceptClipDrop.
+    static int sameKindLinkTarget(const QVector<TimelineTrack *> &tracks, int memberTrack, int destIdx,
+                                  int dragSourceIdx, bool intoStoryline);
 
     // EPIC-7/NEST-1: multiple named sequences in a project. The active
     // sequence remains mirrored into the legacy video/audio track arrays so
@@ -1268,8 +1312,8 @@ public:
     // SM-3: アクティブ動画トラック (先頭 V1) へ委譲する 3点編集ラッパー。
     // ソースモニターから組み立てた ClipInfo を timelineStartSec に Insert / Overwrite で
     // 配置し、saveUndoState で 1 操作 = 1 Undo にまとめる。
-    void insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
-    void overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+    bool insertClip3PointActive(double timelineStartSec, const ClipInfo &clip);
+    bool overwriteClip3PointActive(double timelineStartSec, const ClipInfo &clip);
 
     // Insert a five-second media-less shape clip on the selected video track
     // at the current playhead. Returns false when no usable track/shape exists.
@@ -1507,6 +1551,10 @@ signals:
     // redo or load, which keep the keys valid for the restored layout).
     void clipKeysRemapped(const Timeline::ClipKeyRemap &remap);
     void trackStateRestored();
+    // US-1408: at the success return of importMedia() (every GUI / MCP / drop
+    // import) and of createSequence(name, tracks, tracks) with clips (GUI / MCP
+    // EDL and FCPXML); MainWindow refreshes the offline cache.
+    void mediaImported();
     void renderInPlaceRequested(int trackIndex, int clipIndex);
     void clipSelected(int index);
     // V3 sprint — track-aware overload. emitted alongside the int-only
@@ -1746,6 +1794,8 @@ private:
     QVector<DetachedSpan> m_pendingDetachedSpans;
     bool m_rederiveDisabledForTest = false;
     QStringList m_connectionWarnings;
+    QHash<QString, bool> m_offlinePaths;
+    int m_offlineProbeCount = 0;
     bool m_reconcilingConnections = false;
     bool m_storylineMode = false;
     QWidget *m_connectionOverlay = nullptr;
@@ -1755,6 +1805,9 @@ private:
     // The V1 clip overlapping startSec; with allowPreceding, else the last V1 clip before it.
     QString storylineAnchorAt(double startSec, double *anchorStartSec,
                              bool allowPreceding) const;
+    // US-1407: the V1 clip a media drop at startSec connects to (none for a V1 drop,
+    // which is a storyline insert). Shared by dropMediaOnTrack / dropMediaOnNewTrack.
+    QString dropAnchorUid(bool audio, int trackIndex, double startSec) const;
     QString reconcileSequenceKey() const;
     bool hasConnectedClips() const;
     void renameAnchorReferences(const QString &fromUid, const QString &toUid);
@@ -1912,14 +1965,25 @@ private:
     void applyLinkedTrimDelta(double deltaSec);
     // US-1313: moves every other member of linkGroup after the clip at
     // droppedIdx of destTrack (from dragSource) moved; one by-uid carrier remap.
+    // US-1403: with sameGroupBefore / detached (sameGroupCrossTrackDropped), the
+    // snapshot is the caller's (taken before any clip moved) and the detached
+    // members of destTrack move too.
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime,
-                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr);
+                                    int droppedIdx = -1, TimelineTrack *dragSource = nullptr,
+                                    const TrackClipSnapshot *sameGroupBefore = nullptr,
+                                    const QVector<TimelineTrack::DetachedClip> *detached = nullptr);
     // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
     // moves it there through TimelineTrack::acceptClipDrop (one undo point).
     // Only a timeline clip of the band's kind is accepted.
     friend class TimelineNewTrackDropZone;
     bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
                             TimelineTrack *src);
+    // US-1407: storyline mode on, a single local media file dropped on a new-track
+    // band creates V(n+1) / A(n+1) and imports there (one undo point). A video band
+    // takes a file with a video stream, an audio band a file with an audio stream
+    // (audio only); anything else is refused with *err and no track is left behind.
+    bool dropMediaOnNewTrack(bool audio, const QString &filePath, double dropTimeSec,
+                             QString *err = nullptr);
     // Explicit index map for one clip moved between tracks by dropEvent
     // (the linked members moved by handleCrossTrackLinkedDrop take
     // remapCarriersByUid instead):

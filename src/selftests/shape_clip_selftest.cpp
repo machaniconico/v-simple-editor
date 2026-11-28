@@ -17,6 +17,7 @@
 #include <QRect>
 #include <QTemporaryDir>
 #include <QDoubleSpinBox>
+#include <QScrollArea>
 #include <QLineF>
 #include <QPainter>
 #include <QPainterPathStroker>
@@ -544,7 +545,11 @@ int runShapeClipSelftest()
     modifiersOk = modifiersOk && modifierDialog.modifiers().toJson() == configured.modifiers.toJson()
         && endControl;
     if (endControl) endControl->setValue(60.0);
-    modifiersOk = modifiersOk && changes == 1
+    const int dialogMinHeight = modifierDialog.minimumSizeHint().height();
+    std::fprintf(stderr, "[shape-clip] modifier dialog minimumSizeHint height=%d scroll=%d\n", dialogMinHeight,
+            modifierDialog.findChild<QScrollArea *>() ? 1 : 0);
+    modifiersOk = modifiersOk && dialogMinHeight <= 700 && modifierDialog.findChild<QScrollArea *>()
+        && changes == 1
         && editTimeline.videoTracks()[0]->clips()[0].shapes[0].modifiers.trim.endPct == 60.0
         && editTimeline.undoManager()->saveSerial() == serial;
     editTimeline.setClipShapeModifiers(0, 0, rectangle.modifiers, false); // cancel
@@ -590,6 +595,115 @@ int runShapeClipSelftest()
     }
     reportGate(10, legacyPixels, "Disabled modifier pixels or legacy brush trim bytes changed",
                passed, failed);
+
+    // G11-G13: Round Corners / ZigZag / static Wiggle Path (disabled by default).
+    {
+        const QSize canvas(200, 160);
+        auto renderWith = [&](ShapeType type, const ShapeModifiers &mods) {
+            Shape shape = fullyPopulatedShape(type);
+            shape.position = QPointF(90, 70);
+            shape.modifiers = mods;
+            return ShapeLayer::renderShapesToImage({shape}, canvas);
+        };
+
+        QPainterPath square;
+        square.addRect(QRectF(0, 0, 100, 100));
+        const QPainterPath rounded = shapemod::roundCorners(square, 10.0);
+        const QRectF rb = rounded.boundingRect(), sb = square.boundingRect();
+        bool cornerGone = true;
+        for (int i = 0; i < rounded.elementCount(); ++i)
+            for (const QPointF &c : {QPointF(0, 0), QPointF(100, 0), QPointF(100, 100), QPointF(0, 100)})
+                if (QLineF(QPointF(rounded.elementAt(i).x, rounded.elementAt(i).y), c).length() < 1e-6)
+                    cornerGone = false;
+        const bool rectKept = std::abs(rb.left() - sb.left()) <= 1.0 && std::abs(rb.top() - sb.top()) <= 1.0
+            && std::abs(rb.right() - sb.right()) <= 1.0 && std::abs(rb.bottom() - sb.bottom()) <= 1.0;
+        ShapeModifiers roundMods;
+        roundMods.roundCorners.enabled = true;
+        roundMods.roundCorners.radius = 10.0;
+        const bool roundJson = ShapeModifiers::fromJson(roundMods.toJson()).toJson() == roundMods.toJson()
+            && ShapeModifiers::fromJson(roundMods.toJson()).roundCorners.enabled
+            && ShapeModifiers::fromJson(roundMods.toJson()).roundCorners.radius == 10.0;
+        const bool roundRendered = renderWith(ShapeType::Rectangle, roundMods)
+            != renderWith(ShapeType::Rectangle, ShapeModifiers());
+        std::fprintf(stderr, "[shape-clip] G11 elements=%d (square %d) rect=(%.3f,%.3f,%.3f,%.3f) "
+                     "cornerGone=%d rectKept=%d isDefault=%d json=%d rendered=%d\n",
+                     int(rounded.elementCount()), int(square.elementCount()),
+                     rb.left(), rb.top(), rb.right(), rb.bottom(), cornerGone, rectKept,
+                     roundMods.isDefault(), roundJson, roundRendered);
+        reportGate(11, cornerGone && rectKept && !roundMods.isDefault() && roundJson && roundRendered,
+                   "Round Corners corners/bounds/isDefault/JSON/raster wiring failed",
+                   passed, failed);
+
+        QPainterPath line;
+        line.moveTo(0, 0);
+        line.lineTo(100, 0);
+        const QPainterPath zig = shapemod::zigZag(line, 5.0, 4, false);
+        bool amplitudeOk = zig.elementCount() == 10;
+        double maxAbs = 0.0;
+        for (int i = 1; i < zig.elementCount() - 1; ++i) {
+            const double y = zig.elementAt(i).y;
+            maxAbs = std::max(maxAbs, std::abs(y));
+            const double expected = (i % 2 == 1) ? 5.0 : -5.0;
+            amplitudeOk = amplitudeOk && std::abs(y - expected) < 1e-6;
+        }
+        amplitudeOk = amplitudeOk && zig.elementCount() == 10
+            && std::abs(zig.elementAt(0).y) < 1e-9 && std::abs(zig.elementAt(9).y) < 1e-9
+            && std::abs(zig.elementAt(9).x - 100.0) < 1e-9;
+        ShapeModifiers zigMods;
+        zigMods.zigZag.enabled = true;
+        zigMods.zigZag.size = 5.0;
+        zigMods.zigZag.ridgesPerSegment = 4;
+        const bool zigJson = ShapeModifiers::fromJson(zigMods.toJson()).toJson() == zigMods.toJson()
+            && ShapeModifiers::fromJson(zigMods.toJson()).zigZag.ridgesPerSegment == 4
+            && !zigMods.isDefault();
+        const bool zigRendered = renderWith(ShapeType::Line, zigMods)
+            != renderWith(ShapeType::Line, ShapeModifiers());
+        std::fprintf(stderr, "[shape-clip] G12 vertices %d -> %d maxAbsY=%.9f amplitudeOk=%d json=%d rendered=%d\n",
+                     int(line.elementCount()), int(zig.elementCount()), maxAbs, amplitudeOk,
+                     zigJson, zigRendered);
+        reportGate(12, amplitudeOk && line.elementCount() == 2 && zigJson && zigRendered,
+                   "ZigZag vertex count/amplitude/JSON/raster wiring failed",
+                   passed, failed);
+
+        ShapeModifiers wigMods;
+        wigMods.wigglePath.enabled = true;
+        wigMods.wigglePath.amplitude = 6.0;
+        wigMods.wigglePath.detail = 4;
+        wigMods.wigglePath.seed = 7;
+        const QImage wig7a = renderWith(ShapeType::Star, wigMods);
+        const QImage wig7b = renderWith(ShapeType::Star, wigMods);
+        ShapeModifiers wig8 = wigMods;
+        wig8.wigglePath.seed = 8;
+        const QImage wig8img = renderWith(ShapeType::Star, wig8);
+        ShapeModifiers wigOff = wigMods;
+        wigOff.wigglePath.enabled = false;
+        const QImage base = renderWith(ShapeType::Star, ShapeModifiers());
+        const bool pathStable = shapemod::wigglePath(square, 6.0, 4, 7) == shapemod::wigglePath(square, 6.0, 4, 7)
+            && shapemod::wigglePath(square, 6.0, 4, 7) != shapemod::wigglePath(square, 6.0, 4, 8);
+        const bool sameSeed = wig7a == wig7b && wig7a != base;
+        const bool otherSeed = wig7a != wig8img;
+        const bool offIdentity = renderWith(ShapeType::Star, wigOff) == base;
+
+        // Regression: all three disabled (with custom values) stay default and byte-identical.
+        ShapeModifiers disabledNew;
+        disabledNew.roundCorners.radius = 33.0;
+        disabledNew.zigZag.size = 7.0;
+        disabledNew.wigglePath.seed = 99;
+        bool legacyOk = disabledNew.isDefault() && disabledNew.toJson().isEmpty();
+        Shape plainShape = fullyPopulatedShape(ShapeType::Rectangle);
+        const QStringList plainKeys = plainShape.toJson().keys();
+        plainShape.modifiers = disabledNew;
+        legacyOk = legacyOk && plainShape.toJson().keys() == plainKeys;
+        for (int ordinal = 0; ordinal <= static_cast<int>(ShapeType::Bezier); ++ordinal)
+            legacyOk = legacyOk && renderWith(static_cast<ShapeType>(ordinal), disabledNew)
+                == renderWith(static_cast<ShapeType>(ordinal), ShapeModifiers());
+        std::fprintf(stderr, "[shape-clip] G13 pathStable=%d sameSeedBytes=%d otherSeedDiffers=%d "
+                     "disabledIdentity=%d legacyIsDefault=%d legacyBytesAndKeys=%d\n",
+                     pathStable, sameSeed, otherSeed, offIdentity, disabledNew.isDefault(), legacyOk);
+        reportGate(13, pathStable && sameSeed && otherSeed && offIdentity && legacyOk,
+                   "Wiggle Path determinism/seed/disabled identity/legacy regression failed",
+                   passed, failed);
+    }
 
     std::fprintf(stderr, "[shape-clip] summary: %d PASS, %d FAIL\n",
                  passed, failed);

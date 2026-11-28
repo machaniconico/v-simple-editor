@@ -2089,39 +2089,6 @@ QString fcpxFrameDuration(int fps)
 }
 #endif
 
-void syncTimeRemapEntriesToTimelineImpl(
-    Timeline *timeline,
-    const QHash<QString, TimeRemapClipEntry> &source)
-{
-    if (!timeline)
-        return;
-
-    bool anyChanged = false;
-    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
-    for (int trackIdx = 0; trackIdx < tracks.size(); ++trackIdx) {
-        TimelineTrack *track = tracks[trackIdx];
-        if (!track)
-            continue;
-        QVector<ClipInfo> clips = track->clips();
-        bool trackChanged = false;
-        for (int clipIdx = 0; clipIdx < clips.size(); ++clipIdx) {
-            const QString clipId = trackMatteClipKey(trackIdx, clipIdx);
-            const auto it = source.constFind(clipId);
-            if (it == source.cend())
-                continue;
-            clips[clipIdx].timeRemapCurve = it.value().curve;
-            trackChanged = true;
-        }
-        if (trackChanged) {
-            track->setClips(clips);
-            anyChanged = true;
-        }
-    }
-
-    if (anyChanged)
-        timeline->refreshPlaybackSequence();
-}
-
 // RM-1.2 / RM-4: snapshotTrackClips is defined in TrackMatteKey.cpp
 // (hoisted for testability). The types
 // ClipKeyId and TrackClipSnapshot are declared in TrackMatteKey.h.
@@ -2589,13 +2556,6 @@ void loudnessauto::prepareJobAsync(RenderJob job, std::function<void(RenderJob, 
     });
 }
 
-void syncTimeRemapEntriesToTimeline(
-    Timeline *timeline,
-    const QHash<QString, TimeRemapClipEntry> &source)
-{
-    syncTimeRemapEntriesToTimelineImpl(timeline, source);
-}
-
 namespace effectmaskui {
 bool updateMask(VideoEffect &effect, const RotoPath &path, const QSize &frameSize,
                 double featherPercent, bool hasBrushResult)
@@ -2833,6 +2793,19 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::syncAudioFxDocks);
     connect(m_timeline, &Timeline::trackStateRestored,
             this, &MainWindow::syncAudioFxDocks);
+    // US-1408: every importMedia() success (storyline / track drops, ImportHub,
+    // loadMediaFile, MCP) replaces the offline cache once per event-loop turn.
+    // EDL / FCPXML imports (GUI and MCP) create a sequence through
+    // Timeline::createSequence(name, tracks, tracks), which also emits it.
+    connect(m_timeline, &Timeline::mediaImported, this, [this]() {
+        if (m_offlineRefreshQueued)
+            return;
+        m_offlineRefreshQueued = true;
+        QTimer::singleShot(0, this, [this]() {
+            m_offlineRefreshQueued = false;
+            refreshOfflineBadges();
+        });
+    });
     m_mediaRelinkObservedSaveSerial = m_timeline->undoManager()->saveSerial();
     m_mediaRelinkObservedUndoIndex = m_timeline->undoManager()->currentIndex();
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
@@ -4265,6 +4238,13 @@ void MainWindow::setupMenuBar()
     connect(collectAction, &QAction::triggered, this, &MainWindow::onCollectProject);
     m_menuHelpEntries.append({collectAction,
         QStringLiteral("プロジェクトと参照メディアを 1 フォルダにまとめる (Collect Files)。")});
+
+    // US-1408: relink offline media at any time (no shortcut).
+    auto *relinkMediaAction = fileMenu->addAction(QStringLiteral("メディアを再リンク…"));
+    relinkMediaAction->setObjectName(QStringLiteral("file.relink_media"));
+    connect(relinkMediaAction, &QAction::triggered, this, &MainWindow::relinkMediaFromMenu);
+    m_menuHelpEntries.append({relinkMediaAction,
+        QStringLiteral("参照先が見つからないメディアを新しい場所に付け替えます。読み込み後でもいつでも開けます。")});
     m_menuHelpEntries.append({remotionAction,
         QStringLiteral("プログラム（Remotion）で再編集できる形式に書き出します。上級者向けです。")});
 
@@ -9259,7 +9239,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                        data.markOut, data.zoomLevel);
         // US-1203: the toggle drives Timeline::setStorylineMode.
         if (m_storylineModeAction) m_storylineModeAction->setChecked(data.storylineMode);
-        syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
+        ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
     }
     // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
     // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).
@@ -9402,6 +9382,7 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
     updateEditActions();
     syncBrushAnimationPreviewForClip(0, m_timeline ? m_timeline->selectedVideoClipIndex() : -1);
     refreshSpecialClipPreview();
+    refreshOfflineBadges();
 }
 
 bool MainWindow::relinkMediaPaths(
@@ -9417,11 +9398,51 @@ bool MainWindow::relinkMediaPaths(
     // This also covers programmatic callers that populated sidecars after the
     // baseline TimelineState was created.
     captureMediaRelinkSidecarsAtCurrentUndoIndex();
-    return m_timeline->relinkMediaPaths(
+    const bool relinked = m_timeline->relinkMediaPaths(
         oldToNew, errorOut,
         [this](const QHash<QString, QString> &mapping) {
             return relinkMediaSidecars(mapping);
         });
+    if (relinked)
+        refreshOfflineBadges();
+    return relinked;
+}
+
+void MainWindow::refreshOfflineBadges()
+{
+    if (!m_timeline)
+        return;
+    ProjectData data;
+    populateProjectData(data);
+    m_timeline->setOfflinePaths(mediapaths::missingFiles(data));
+}
+
+void MainWindow::relinkMediaFromMenu()
+{
+    if (!m_timeline)
+        return;
+    ProjectData data;
+    populateProjectData(data);
+    const QStringList missing = mediapaths::missingFiles(data);
+    m_timeline->setOfflinePaths(missing);
+    if (missing.isEmpty()) {
+        statusBar()->showMessage(QStringLiteral("オフラインのメディアはありません"), 5000);
+        return;
+    }
+    MediaRelinkDialog dialog(missing, this);
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    const QHash<QString, QString> mapping = dialog.mapping();
+    if (mapping.isEmpty())
+        return;
+    QString error;
+    if (!relinkMediaPaths(mapping, &error)) {
+        statusBar()->showMessage(
+            QStringLiteral("メディアの再リンクに失敗しました: %1").arg(error), 5000);
+        return;
+    }
+    setWindowModified(true);
+    statusBar()->showMessage(QStringLiteral("メディアを再リンクしました"), 5000);
 }
 
 bool MainWindow::relinkMediaSidecars(
@@ -9733,11 +9754,60 @@ void MainWindow::rekeyPositionKeyedSidecars(const Timeline::ClipKeyRemap &remap)
         syncBrushAnimationPreviewForClip(m_selectedVideoTrackIndex, m_selectedVideoClipIndexTracked);
 }
 
+// US-1401: the timeRemap / text3D / expression / wiggle dialog commits. A value equal
+// to the current one (toJson() compared, nullopt = no entry) records nothing; any
+// other records one undo point, which carries the four by value.
+void MainWindow::commitTimeRemapEntry(const QString &clipId, const timeremap::TimeRemapCurve &curve)
+{
+    const auto old = m_timeRemapClipEntries.constFind(clipId);
+    if (old != m_timeRemapClipEntries.cend() && old->curve.toJson() == curve.toJson()) return;
+    TimeRemapClipEntry entry;
+    entry.clipId = clipId;
+    entry.curve = curve;
+    m_timeRemapClipEntries.insert(clipId, entry);
+    ProjectFile::applyTimeRemapEntries(m_timeline, m_timeRemapClipEntries.values());
+    m_timeline->saveUndoState(QStringLiteral("タイムリマップを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitText3DConfig(const QString &clipId, const std::optional<QJsonObject> &config)
+{
+    const auto old = m_text3DClipConfigs.constFind(clipId);
+    const bool had = old != m_text3DClipConfigs.cend();
+    if (had == config.has_value() && (!had || *old == *config)) return;
+    if (config) m_text3DClipConfigs.insert(clipId, *config);
+    else m_text3DClipConfigs.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("3D テキストを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitExpressionBindings(const QString &clipId,
+                                          const std::optional<exprbind::ClipExpressionBindings> &bindings)
+{
+    const auto old = m_clipExpressionBindings.constFind(clipId);
+    const bool had = old != m_clipExpressionBindings.cend();
+    if (had == bindings.has_value() && (!had || old->toJson() == bindings->toJson())) return;
+    if (bindings) m_clipExpressionBindings.insert(clipId, *bindings);
+    else m_clipExpressionBindings.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("エクスプレッションを変更"));
+    refreshSpecialClipPreview();
+}
+
+void MainWindow::commitWiggleParams(const QString &clipId, const std::optional<wiggle::WiggleParams> &params)
+{
+    const auto old = m_clipWiggleParams.constFind(clipId);
+    const bool had = old != m_clipWiggleParams.cend();
+    if (had == params.has_value() && (!had || wiggle::toJson(*old) == wiggle::toJson(*params))) return;
+    if (params) m_clipWiggleParams.insert(clipId, *params);
+    else m_clipWiggleParams.remove(clipId);
+    m_timeline->saveUndoState(QStringLiteral("ウィグルを変更"));
+    refreshSpecialClipPreview();
+}
+
 // US-1302 undo rule: adding a brush animation records an undo point (its progress
-// keyframes), so the brush entries are carried by value. timeRemap / text3D /
-// expression / wiggle edits record none, so only the clip each key names is
-// carried (clipUids: key -> uid) and an undo rekeys their live values instead of
-// rolling them back.
+// keyframes), so the brush entries are carried by value. US-1401: so are the
+// timeRemap / text3D / expression / wiggle values, whose dialog commits record one
+// too. The clip each key names (clipUids: key -> uid) still rekeys the live brush.
 QJsonObject MainWindow::collectSidecarState()
 {
     QJsonObject clipUids;
@@ -9754,8 +9824,21 @@ QJsonObject MainWindow::collectSidecarState()
     QJsonArray brushes;
     for (const auto &entry : m_brushAnimationEntries)
         brushes.append(QJsonObject{{"clipId", entry.clipId}, {"brushData", entry.brushData}});
+    QJsonObject timeRemaps, text3Ds, expressions, wiggles;
+    for (auto it = m_timeRemapClipEntries.cbegin(); it != m_timeRemapClipEntries.cend(); ++it)
+        timeRemaps.insert(it.key(), it.value().curve.toJson());
+    for (auto it = m_text3DClipConfigs.cbegin(); it != m_text3DClipConfigs.cend(); ++it)
+        text3Ds.insert(it.key(), it.value());
+    for (auto it = m_clipExpressionBindings.cbegin(); it != m_clipExpressionBindings.cend(); ++it)
+        expressions.insert(it.key(), it.value().toJson());
+    for (auto it = m_clipWiggleParams.cbegin(); it != m_clipWiggleParams.cend(); ++it)
+        wiggles.insert(it.key(), wiggle::toJson(it.value()));
     return QJsonObject{{"clipUids", clipUids},
                        {"brushAnimations", brushes},
+                       {"timeRemaps", timeRemaps},
+                       {"text3DConfigs", text3Ds},
+                       {"expressionBindings", expressions},
+                       {"wiggleParams", wiggles},
                        {"sequenceId", m_timeline->activeSequenceId()},
                        {"trackStructureRevision", QString::number(m_timeline->trackStructureRevision())}};
 }
@@ -9881,6 +9964,33 @@ void MainWindow::applySidecarState(const QJsonObject &state)
     m_sidecarClipUidByKey.clear();
     for (auto it = clipUids.constBegin(); it != clipUids.constEnd(); ++it)
         m_sidecarClipUidByKey.insert(it.key(), it.value().toString());
+    // US-1401: the four values are the snapshot's, keyed on the restored placement,
+    // whatever the rekey above made of the live ones (in this sequence or another).
+    if (state.contains("timeRemaps")) {
+        m_timeRemapClipEntries.clear();
+        const QJsonObject values = state.value("timeRemaps").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_timeRemapClipEntries.insert(it.key(), TimeRemapClipEntry{
+                it.key(), timeremap::TimeRemapCurve::fromJson(it.value().toObject())});
+    }
+    if (state.contains("text3DConfigs")) {
+        m_text3DClipConfigs.clear();
+        const QJsonObject values = state.value("text3DConfigs").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_text3DClipConfigs.insert(it.key(), it.value().toObject());
+    }
+    if (state.contains("expressionBindings")) {
+        m_clipExpressionBindings.clear();
+        const QJsonObject values = state.value("expressionBindings").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_clipExpressionBindings[it.key()].fromJson(it.value().toObject());
+    }
+    if (state.contains("wiggleParams")) {
+        m_clipWiggleParams.clear();
+        const QJsonObject values = state.value("wiggleParams").toObject();
+        for (auto it = values.constBegin(); it != values.constEnd(); ++it)
+            m_clipWiggleParams.insert(it.key(), wiggle::fromJson(it.value().toObject()));
+    }
 
     QVector<BrushAnimationEntry> brushes;
     for (const auto &value : state.value("brushAnimations").toArray()) {
@@ -10572,8 +10682,10 @@ void MainWindow::onSourceInsertRequested(const threepoint::SourceSelection &sel)
     }
     ClipInfo clip = threepoint::buildClipInfo(sel);
     const double playheadSec = currentPlayheadSeconds();
-    m_timeline->insertClip3PointActive(playheadSec, clip);
+    const bool placed = m_timeline->insertClip3PointActive(playheadSec, clip);
     updateStatusInfo();
+    if (!placed)
+        return;
     statusBar()->showMessage(
         QStringLiteral("再生ヘッド %1 秒に挿入しました: %2")
             .arg(playheadSec, 0, 'f', 2)
@@ -10598,8 +10710,10 @@ void MainWindow::onSourceOverwriteRequested(const threepoint::SourceSelection &s
     }
     ClipInfo clip = threepoint::buildClipInfo(sel);
     const double playheadSec = currentPlayheadSeconds();
-    m_timeline->overwriteClip3PointActive(playheadSec, clip);
+    const bool placed = m_timeline->overwriteClip3PointActive(playheadSec, clip);
     updateStatusInfo();
+    if (!placed)
+        return;
     statusBar()->showMessage(
         QStringLiteral("再生ヘッド %1 秒から上書きしました: %2")
             .arg(playheadSec, 0, 'f', 2)
@@ -14860,13 +14974,10 @@ void MainWindow::openTimeRemapDialog()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
-    entry.curve = dialog.curve();
-    if (entry.curve.sourceFps <= 0.0)
-        entry.curve.sourceFps = fps;
-    m_timeRemapClipEntries.insert(clipId, entry);
-    syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
-
-    refreshSpecialClipPreview();
+    timeremap::TimeRemapCurve curve = dialog.curve();
+    if (curve.sourceFps <= 0.0)
+        curve.sourceFps = fps;
+    commitTimeRemapEntry(clipId, curve);
     statusBar()->showMessage(QStringLiteral("タイムリマップを %1 に保存しました").arg(clip.displayName), 4000);
 }
 
@@ -15164,12 +15275,7 @@ void MainWindow::open3DExtrudedText()
     }
     const QJsonObject json = cfg->toJson();
     delete cfg;
-    if (json.isEmpty())
-        m_text3DClipConfigs.remove(clipId);
-    else
-        m_text3DClipConfigs.insert(clipId, json);
-
-    refreshSpecialClipPreview();
+    commitText3DConfig(clipId, json.isEmpty() ? std::nullopt : std::optional<QJsonObject>(json));
     statusBar()->showMessage(QStringLiteral("3D 押し出しテキストを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
@@ -15335,13 +15441,9 @@ void MainWindow::editClipExpressionBindings()
     if (dialog.exec() != QDialog::Accepted)
         return;
 
-    exprbind::ClipExpressionBindings bindings = dialog.bindings();
-    if (bindings.isEmpty())
-        m_clipExpressionBindings.remove(clipId);
-    else
-        m_clipExpressionBindings.insert(clipId, bindings);
-
-    refreshSpecialClipPreview();
+    const exprbind::ClipExpressionBindings bindings = dialog.bindings();
+    commitExpressionBindings(clipId, bindings.isEmpty() ? std::nullopt
+                                                        : std::optional<exprbind::ClipExpressionBindings>(bindings));
     statusBar()->showMessage(QStringLiteral("エクスプレッションを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
@@ -15373,6 +15475,7 @@ void MainWindow::editClipWiggle()
     auto *enabledCheck = new QCheckBox(QStringLiteral("有効"), &dialog);
     enabledCheck->setChecked(params.enabled);
     auto *posAmpXSpin = new QDoubleSpinBox(&dialog);
+    posAmpXSpin->setObjectName(QStringLiteral("wigglePositionAmplitudeX"));
     posAmpXSpin->setRange(-200.0, 200.0);
     posAmpXSpin->setValue(params.positionAmplitude.x());
     auto *posAmpYSpin = new QDoubleSpinBox(&dialog);
@@ -15432,16 +15535,11 @@ void MainWindow::editClipWiggle()
     params.octaves = octavesSpin->value();
     params.seed = static_cast<unsigned int>(seedSpin->value());
 
-    if (!params.enabled
+    const bool inert = !params.enabled
         && params.positionAmplitude.isNull()
         && qFuzzyIsNull(params.rotationAmplitudeDeg)
-        && qFuzzyIsNull(params.scaleAmplitude)) {
-        m_clipWiggleParams.remove(clipId);
-    } else {
-        m_clipWiggleParams.insert(clipId, params);
-    }
-
-    refreshSpecialClipPreview();
+        && qFuzzyIsNull(params.scaleAmplitude);
+    commitWiggleParams(clipId, inert ? std::nullopt : std::optional<wiggle::WiggleParams>(params));
     statusBar()->showMessage(QStringLiteral("ウィグルを %1 に設定しました").arg(clip.displayName), 4000);
 }
 
@@ -17554,10 +17652,14 @@ void MainWindow::onImportHub()
         m_importHubDialog->setObjectName(QStringLiteral("importHubDialog"));
 
         connect(m_importHubDialog, &ImportHubDialog::fcpxmlImportRequested,
-                this, [this](const QString &path) { importFcpxmlIntoTimeline(this, m_timeline, path); });
+                this, [this](const QString &path) {
+                    importFcpxmlIntoTimeline(this, m_timeline, path);
+                });
 
         connect(m_importHubDialog, &ImportHubDialog::edlImportRequested,
-                this, [this](const QString &path) { importEdlIntoTimeline(this, m_timeline, path); });
+                this, [this](const QString &path) {
+                    importEdlIntoTimeline(this, m_timeline, path);
+                });
 
         connect(m_importHubDialog, &ImportHubDialog::timelineImportRequested,
                 this, [this](const QList<obs::layout::TimelineClipPlacement> &placements) {
@@ -17595,7 +17697,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("画像をタイムラインに追加"),
@@ -17625,7 +17733,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("メッシュをタイムラインに追加 (頂点 %1 / 三角形 %2)")
@@ -17666,7 +17780,13 @@ void MainWindow::onImportHub()
                         }
                         return;
                     }
-                    m_timeline->addClip(tempPng);
+                    QString importErr;
+                    if (!m_timeline->importMedia(tempPng, -1, -1.0, nullptr, &importErr)) {
+                        QFile::remove(tempPng);
+                        if (statusBar())
+                            statusBar()->showMessage(importErr, 5000);
+                        return;
+                    }
                     if (statusBar()) {
                         statusBar()->showMessage(
                             QStringLiteral("EXR先頭フレームをタイムラインに追加 (%1)")
@@ -19456,8 +19576,9 @@ void MainWindow::loadMediaFile(const QString &filePath, bool addToTimeline, cons
         return;
 
     const QFileInfo fi(filePath);
-    if (addToTimeline && m_timeline)
+    if (addToTimeline && m_timeline) {
         m_timeline->addClip(filePath);
+    }
     if (m_recentFilesManager)
         m_recentFilesManager->addFile(filePath);
 

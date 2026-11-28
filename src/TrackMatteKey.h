@@ -16,6 +16,23 @@ inline QString trackMatteClipKey(int trackIdx, int clipIdx)
     return QStringLiteral("%1:%2").arg(trackIdx).arg(clipIdx);
 }
 
+// Re-canonicalises a persisted "track:clip" id through trackMatteClipKey so a
+// hand-edited / legacy project cannot desync the consumers (RenderQueue::
+// resolveTimeline, ProjectFile::applyTimeRemapEntries). Unparseable ids pass
+// through unchanged.
+inline QString canonicalClipKey(const QString &raw)
+{
+    const int colon = raw.indexOf(QLatin1Char(':'));
+    if (colon <= 0)
+        return raw;
+    bool okT = false, okC = false;
+    const int t = raw.left(colon).toInt(&okT);
+    const int c = raw.mid(colon + 1).toInt(&okC);
+    if (okT && okC && t >= 0 && c >= 0)
+        return trackMatteClipKey(t, c);
+    return raw;
+}
+
 // RM-4: hoisted remap types and functions (formerly MainWindow.cpp anon
 // namespace). Declared here so the reindex selftest in main.cpp can drive
 // them without coupling to MainWindow.
