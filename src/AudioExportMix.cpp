@@ -384,6 +384,7 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
             plan.useTrackFx = plan.useTrackFx || !route.isIdentity();
             plan.useTrackFx = plan.useTrackFx || chain.eqEnabled || chain.compEnabled
                 || chain.reverbEnabled || chain.nrEnabled || chain.deesser.enabled
+                || chain.multibandComp.enabled
                 || (plan.legacyEqEnabled.value(track) && !plan.legacyEqConfigs.value(track).isDefault());
         }
     }
@@ -405,7 +406,8 @@ audioexport::MixPlan audioexport::buildMixPlan(Timeline *timeline, AudioMixer *m
     // A clip pan has no passthrough / legacy-chain equivalent: it needs the DSP path's pan=.
     for (const PlaybackEntry &entry : entries)
         plan.useTrackFx = plan.useTrackFx || (entry.pan != 0.0 && !entry.audioMuted);
-    plan.useMasterEq = (plan.masterChain.eqEnabled || plan.masterChain.deesser.enabled)
+    plan.useMasterEq = (plan.masterChain.eqEnabled || plan.masterChain.deesser.enabled
+                        || plan.masterChain.multibandComp.enabled)
         && !audiofxexport::masterEqBypass;
     const QVector<bool> reversedFlags =
         audioReversedFlagsForPlaybackEntries(entries);
@@ -552,6 +554,7 @@ QString audioexport::executeMixPlan(const MixPlan &plan, const std::function<boo
         AudioMixer::MasterEqFilter masterProcessor;
         masterProcessor.setEq(plan.masterChain.eqEnabled ? plan.masterChain.eq : trackfx::EqSettings{});
         masterProcessor.setDeEsser(plan.masterChain.deesser);
+        masterProcessor.setMultibandComp(plan.masterChain.multibandComp, /*allowSolo=*/false);
         const size_t frames = samples.size() / channels;
         for (size_t frame = 0; frame < frames; frame += 4096)
             masterProcessor.process(samples.data() + frame * channels,
@@ -830,6 +833,7 @@ void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
     });
     if (order.empty()) return;
     trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
+    processor.setMultibandCompAllowSolo(false);
     processor.reset();
     std::array<std::array<double, 4>, 3> z{};
     const double preamp = std::pow(10.0, preampDb / 20.0);
@@ -879,6 +883,7 @@ void audioexport::processClipEq(DspEntry &entry, const trackfx::EqSettings &eq)
     chain.eq = eq;
     chain.eqEnabled = true;
     trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
+    processor.setMultibandCompAllowSolo(false);
     processor.reset();
     const qint64 frames = static_cast<qint64>(entry.samples.size() / 2);
     for (qint64 f = 0; f < frames; f += 1024)

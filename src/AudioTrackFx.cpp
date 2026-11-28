@@ -1,6 +1,7 @@
 #include "AudioTrackFx.h"
 #include "AudioMixer.h"
 
+#include <QJsonArray>
 #include <QVarLengthArray>
 #include <QtMath>
 #include <algorithm>
@@ -175,6 +176,255 @@ void DeEsserProcessor::processFrame(double &left, double &right)
     right = m_settings.listen ? band[1] : right - removed * band[1];
 }
 
+namespace {
+// 2nd-order Butterworth LP/HP (Q = 1/sqrt(2)) and matching 2nd-order all-pass
+// for phase-coherent 4th-order Linkwitz-Riley (LR4) 4-band crossover.
+BiquadCoefs calcButterworthLP2(double freq, double fs)
+{
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double alpha = sinW / std::sqrt(2.0);
+    const double a0 = 1.0 + alpha;
+    const double b1 = 1.0 - cosW;
+    return {0.5 * b1 / a0, b1 / a0, 0.5 * b1 / a0, -2.0 * cosW / a0, (1.0 - alpha) / a0};
+}
+
+BiquadCoefs calcButterworthHP2(double freq, double fs)
+{
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double alpha = sinW / std::sqrt(2.0);
+    const double a0 = 1.0 + alpha;
+    const double bp = 1.0 + cosW;
+    return {0.5 * bp / a0, -bp / a0, 0.5 * bp / a0, -2.0 * cosW / a0, (1.0 - alpha) / a0};
+}
+
+BiquadCoefs calcAllPass2(double freq, double fs)
+{
+    const double w = 2.0 * M_PI * freq / fs;
+    const double cosW = std::cos(w);
+    const double sinW = std::sin(w);
+    const double alpha = sinW / std::sqrt(2.0);
+    const double a0 = 1.0 + alpha;
+    return {(1.0 - alpha) / a0, -2.0 * cosW / a0, (1.0 + alpha) / a0,
+            -2.0 * cosW / a0, (1.0 - alpha) / a0};
+}
+
+MultibandCompSettings sanitizeMultibandSettings(const MultibandCompSettings &in, double fs)
+{
+    const auto bounded = [](double x, double fallback, double low, double high) {
+        return std::isfinite(x) ? std::clamp(x, low, high) : fallback;
+    };
+    const MultibandCompSettings def;
+    MultibandCompSettings out = in;
+    const double nyqLimit = std::max(500.0, std::min(18000.0, fs * 0.45));
+    double f1 = bounded(in.crossoverHz[0], def.crossoverHz[0], 40.0, nyqLimit - 40.0);
+    double f2 = bounded(in.crossoverHz[1], def.crossoverHz[1], 60.0, nyqLimit - 20.0);
+    double f3 = bounded(in.crossoverHz[2], def.crossoverHz[2], 80.0, nyqLimit);
+    if (f2 < f1 + 20.0) f2 = std::min(nyqLimit - 20.0, f1 + 20.0);
+    if (f3 < f2 + 20.0) f3 = std::min(nyqLimit, f2 + 20.0);
+    if (f2 > f3 - 20.0) f2 = std::max(60.0, f3 - 20.0);
+    if (f1 > f2 - 20.0) f1 = std::max(40.0, f2 - 20.0);
+    out.crossoverHz = {f1, f2, f3};
+
+    for (int b = 0; b < MultibandCompSettings::kBandCount; ++b) {
+        auto &dst = out.bands[b];
+        const auto &d = def.bands[b];
+        dst.thresholdDb = bounded(dst.thresholdDb, d.thresholdDb, -60.0, 0.0);
+        dst.ratio = bounded(dst.ratio, d.ratio, 1.0, 20.0);
+        dst.attackMs = bounded(dst.attackMs, d.attackMs, 0.1, 100.0);
+        dst.releaseMs = bounded(dst.releaseMs, d.releaseMs, 10.0, 1000.0);
+        dst.kneeDb = bounded(dst.kneeDb, d.kneeDb, 0.0, 12.0);
+        dst.makeupDb = bounded(dst.makeupDb, d.makeupDb, -12.0, 24.0);
+    }
+    out.outputGainDb = bounded(in.outputGainDb, 0.0, -24.0, 24.0);
+    out.wetMix = bounded(in.wetMix, 1.0, 0.0, 1.0);
+    return out;
+}
+} // namespace
+
+QStringList multibandCompPresetIds()
+{
+    return {
+        QStringLiteral("flat"),
+        QStringLiteral("vocal"),
+        QStringLiteral("master_punch"),
+        QStringLiteral("narration"),
+        QStringLiteral("podcast"),
+    };
+}
+
+QString multibandCompPresetLabel(const QString &presetId)
+{
+    if (presetId == QStringLiteral("flat")) return QStringLiteral("フラット（基準）");
+    if (presetId == QStringLiteral("vocal")) return QStringLiteral("ボーカル整音");
+    if (presetId == QStringLiteral("master_punch")) return QStringLiteral("マスターパンチ");
+    if (presetId == QStringLiteral("narration")) return QStringLiteral("ナレーション低域抑制");
+    if (presetId == QStringLiteral("podcast")) return QStringLiteral("ポッドキャスト放送");
+    return presetId;
+}
+
+MultibandCompSettings multibandCompPreset(const QString &presetId)
+{
+    MultibandCompSettings s;
+    s.enabled = true;
+    s.outputGainDb = 0.0;
+    s.wetMix = 1.0;
+    if (presetId == QStringLiteral("flat")) {
+        s.crossoverHz = {200.0, 1200.0, 5000.0};
+        for (auto &b : s.bands) {
+            b.thresholdDb = -18.0;
+            b.ratio = 1.0;
+            b.attackMs = 10.0;
+            b.releaseMs = 120.0;
+            b.kneeDb = 3.0;
+            b.makeupDb = 0.0;
+            b.bypass = false;
+            b.solo = false;
+        }
+    } else if (presetId == QStringLiteral("vocal")) {
+        s.crossoverHz = {180.0, 1000.0, 4800.0};
+        s.bands[0] = {-24.0, 4.0, 15.0, 160.0, 4.0, -1.0, false, false};
+        s.bands[1] = {-20.0, 2.5, 10.0, 120.0, 3.0,  0.5, false, false};
+        s.bands[2] = {-18.0, 3.0,  6.0, 100.0, 3.0,  1.5, false, false};
+        s.bands[3] = {-16.0, 3.5,  3.0,  70.0, 2.0,  1.0, false, false};
+    } else if (presetId == QStringLiteral("master_punch")) {
+        s.crossoverHz = {160.0, 1200.0, 6000.0};
+        s.bands[0] = {-16.0, 3.0, 25.0, 200.0, 4.0, 1.0, false, false};
+        s.bands[1] = {-18.0, 2.2, 15.0, 150.0, 3.0, 0.5, false, false};
+        s.bands[2] = {-17.0, 2.5, 10.0, 120.0, 3.0, 0.8, false, false};
+        s.bands[3] = {-15.0, 2.8,  5.0,  80.0, 3.0, 1.0, false, false};
+        s.outputGainDb = 0.5;
+    } else if (presetId == QStringLiteral("narration")) {
+        s.crossoverHz = {200.0, 1100.0, 4500.0};
+        s.bands[0] = {-28.0, 6.0, 12.0, 180.0, 4.0, -2.0, false, false};
+        s.bands[1] = {-20.0, 2.5, 10.0, 130.0, 3.0,  0.5, false, false};
+        s.bands[2] = {-18.0, 3.0,  6.0, 100.0, 3.0,  1.8, false, false};
+        s.bands[3] = {-18.0, 4.0,  3.0,  65.0, 2.0,  0.0, false, false};
+    } else if (presetId == QStringLiteral("podcast")) {
+        s.crossoverHz = {180.0, 1200.0, 5000.0};
+        s.bands[0] = {-22.0, 4.0, 18.0, 170.0, 4.0, 0.0, false, false};
+        s.bands[1] = {-20.0, 3.5, 10.0, 120.0, 4.0, 1.5, false, false};
+        s.bands[2] = {-18.0, 3.5,  6.0, 100.0, 3.0, 2.0, false, false};
+        s.bands[3] = {-16.0, 4.0,  3.0,  75.0, 2.0, 1.0, false, false};
+        s.outputGainDb = 1.0;
+    }
+    return s;
+}
+
+void MultibandCompProcessor::setSettings(const MultibandCompSettings &settings, int sampleRate)
+{
+    const int clampedSr = std::clamp(sampleRate, 1000, 384000);
+    const double fs = static_cast<double>(clampedSr);
+    const MultibandCompSettings next = sanitizeMultibandSettings(settings, fs);
+    const bool crossoverChanged = (clampedSr != m_sampleRate)
+        || (next.enabled != m_settings.enabled)
+        || (next.crossoverHz != m_settings.crossoverHz);
+    if (crossoverChanged)
+        reset();
+    m_sampleRate = clampedSr;
+    m_settings = next;
+
+    const auto toBiquad = [](const BiquadCoefs &c) -> Biquad {
+        return {c.b0, c.b1, c.b2, c.a1, c.a2};
+    };
+    const double f1 = m_settings.crossoverHz[0];
+    const double f2 = m_settings.crossoverHz[1];
+    const double f3 = m_settings.crossoverHz[2];
+    m_split1 = {toBiquad(calcButterworthLP2(f1, fs)), toBiquad(calcButterworthHP2(f1, fs))};
+    m_split2 = {toBiquad(calcButterworthLP2(f2, fs)), toBiquad(calcButterworthHP2(f2, fs))};
+    m_split3 = {toBiquad(calcButterworthLP2(f3, fs)), toBiquad(calcButterworthHP2(f3, fs))};
+    m_ap1 = toBiquad(calcAllPass2(f1, fs));
+    m_ap3 = toBiquad(calcAllPass2(f3, fs));
+
+    for (int b = 0; b < kBandCount; ++b) {
+        m_attack[b] = std::exp(-1.0 / (m_settings.bands[b].attackMs * fs * 0.001));
+        m_release[b] = std::exp(-1.0 / (m_settings.bands[b].releaseMs * fs * 0.001));
+    }
+    m_outputGainLin = std::pow(10.0, m_settings.outputGainDb / 20.0);
+}
+
+void MultibandCompProcessor::reset()
+{
+    for (auto &c : m_ch) c.reset();
+    m_env.fill(0.0);
+    m_currentGrDb.fill(0.0);
+}
+
+void MultibandCompProcessor::processFrame(double &left, double &right)
+{
+    if (!m_settings.enabled) return;
+    ++m_processCalls;
+
+    const double dryL = left;
+    const double dryR = right;
+    const double in[2] = {left, right};
+    double bands[2][kBandCount];
+
+    // Symmetric 4-band LR4 split with all-pass phase alignment:
+    //   input -> split(f2) -> loHalf, hiHalf
+    //   loHalf -> AP2(f3) -> split(f1) -> B0, B1
+    //   hiHalf -> AP2(f1) -> split(f3) -> B2, B3
+    // Sum of all 4 bands equals AP2(f1)*AP2(f2)*AP2(f3)*input (0.000 dB ripple).
+    for (int ch = 0; ch < 2; ++ch) {
+        double loHalf = 0.0, hiHalf = 0.0;
+        m_ch[ch].splitMid.process(in[ch], m_split2, loHalf, hiHalf);
+        const double loAligned = m_ch[ch].apLowPath.process(loHalf, m_ap3);
+        const double hiAligned = m_ch[ch].apHiPath.process(hiHalf, m_ap1);
+        m_ch[ch].splitLow.process(loAligned, m_split1, bands[ch][0], bands[ch][1]);
+        m_ch[ch].splitHigh.process(hiAligned, m_split3, bands[ch][2], bands[ch][3]);
+    }
+
+    bool anySolo = false;
+    if (m_allowSolo) {
+        for (int b = 0; b < kBandCount; ++b)
+            anySolo = anySolo || m_settings.bands[b].solo;
+    }
+
+    double sumL = 0.0;
+    double sumR = 0.0;
+    for (int b = 0; b < kBandCount; ++b) {
+        const auto &cfg = m_settings.bands[b];
+        const double xL = bands[0][b];
+        const double xR = bands[1][b];
+        double gainLin = 1.0;
+        if (cfg.bypass) {
+            m_currentGrDb[b] = 0.0;
+        } else {
+            const double level = std::max(std::abs(xL), std::abs(xR));
+            followEnvelope(level, m_env[b], m_attack[b], m_release[b]);
+            double grDb = 0.0;
+            if (cfg.ratio > 1.0001) {
+                const double envDb = 20.0 * std::log10(std::max(m_env[b], 1e-9) / 32768.0);
+                const double slope = 1.0 - 1.0 / cfg.ratio;
+                const double kneeHalf = 0.5 * cfg.kneeDb;
+                if (kneeHalf > 1e-6 && envDb > cfg.thresholdDb - kneeHalf
+                    && envDb < cfg.thresholdDb + kneeHalf) {
+                    const double x = envDb - (cfg.thresholdDb - kneeHalf);
+                    grDb = slope * (x * x) / (2.0 * cfg.kneeDb);
+                } else if (envDb > cfg.thresholdDb + kneeHalf) {
+                    grDb = slope * (envDb - cfg.thresholdDb);
+                }
+            }
+            m_currentGrDb[b] = grDb;
+            gainLin = std::pow(10.0, (cfg.makeupDb - grDb) / 20.0);
+        }
+        if (!anySolo || cfg.solo) {
+            sumL += xL * gainLin;
+            sumR += xR * gainLin;
+        }
+    }
+
+    const double wetL = sumL * m_outputGainLin;
+    const double wetR = sumR * m_outputGainLin;
+    const double wet = m_settings.wetMix;
+    const double dry = 1.0 - wet;
+    left = dry * dryL + wet * wetL;
+    right = dry * dryR + wet * wetR;
+}
+
 // Persist stage gates separately from settings.enabled, including dormant settings.
 QJsonObject Chain::toJson() const
 {
@@ -192,6 +442,48 @@ QJsonObject Chain::toJson() const
     if (deesser.listen != defaults.deesser.listen) deesserObject["listen"] = deesser.listen;
     if (deesser.enabled != defaults.deesser.enabled) deesserObject["enabled"] = deesser.enabled;
     if (!deesserObject.isEmpty()) object["deesser"] = deesserObject;
+    {
+        QJsonObject mb;
+        const auto &d = defaults.multibandComp;
+        if (multibandComp.enabled != d.enabled) mb["enabled"] = multibandComp.enabled;
+        if (multibandComp.outputGainDb != d.outputGainDb) mb["outputGainDb"] = multibandComp.outputGainDb;
+        if (multibandComp.wetMix != d.wetMix) mb["wetMix"] = multibandComp.wetMix;
+        if (multibandComp.crossoverHz != d.crossoverHz) {
+            QJsonArray xovers;
+            for (double hz : multibandComp.crossoverHz) xovers.append(hz);
+            mb["crossoverHz"] = xovers;
+        }
+        bool bandsDiffer = false;
+        for (int b = 0; b < MultibandCompSettings::kBandCount; ++b) {
+            const auto &cur = multibandComp.bands[b];
+            const auto &defB = d.bands[b];
+            if (cur.thresholdDb != defB.thresholdDb || cur.ratio != defB.ratio
+                || cur.attackMs != defB.attackMs || cur.releaseMs != defB.releaseMs
+                || cur.kneeDb != defB.kneeDb || cur.makeupDb != defB.makeupDb
+                || cur.bypass != defB.bypass || cur.solo != defB.solo) {
+                bandsDiffer = true;
+                break;
+            }
+        }
+        if (bandsDiffer) {
+            QJsonArray arr;
+            for (int b = 0; b < MultibandCompSettings::kBandCount; ++b) {
+                const auto &cur = multibandComp.bands[b];
+                QJsonObject bo;
+                bo["thresholdDb"] = cur.thresholdDb;
+                bo["ratio"] = cur.ratio;
+                bo["attackMs"] = cur.attackMs;
+                bo["releaseMs"] = cur.releaseMs;
+                bo["kneeDb"] = cur.kneeDb;
+                bo["makeupDb"] = cur.makeupDb;
+                if (cur.bypass) bo["bypass"] = true;
+                if (cur.solo) bo["solo"] = true;
+                arr.append(bo);
+            }
+            mb["bands"] = arr;
+        }
+        if (!mb.isEmpty()) object["multibandComp"] = mb;
+    }
     QJsonObject eqObject;
     {
         QJsonObject stage;
@@ -280,6 +572,32 @@ Chain Chain::fromJson(const QJsonObject &object)
     chain.deesser.rangeDb = number(deesserObject["rangeDb"], chain.deesser.rangeDb, 0.0, 24.0);
     chain.deesser.listen = deesserObject["listen"].toBool(false);
     chain.deesser.enabled = deesserObject["enabled"].toBool(false);
+    if (object.contains("multibandComp")) {
+        const QJsonObject mb = object["multibandComp"].toObject();
+        chain.multibandComp.enabled = mb["enabled"].toBool(false);
+        chain.multibandComp.outputGainDb = number(mb["outputGainDb"], 0.0, -24.0, 24.0);
+        chain.multibandComp.wetMix = number(mb["wetMix"], 1.0, 0.0, 1.0);
+        const QJsonArray xovers = mb["crossoverHz"].toArray();
+        if (xovers.size() == MultibandCompSettings::kCrossoverCount) {
+            for (int i = 0; i < MultibandCompSettings::kCrossoverCount; ++i)
+                chain.multibandComp.crossoverHz[i] =
+                    number(xovers[i], chain.multibandComp.crossoverHz[i], 40.0, 18000.0);
+        }
+        const QJsonArray bands = mb["bands"].toArray();
+        for (int b = 0; b < bands.size() && b < MultibandCompSettings::kBandCount; ++b) {
+            const QJsonObject bo = bands[b].toObject();
+            auto &dst = chain.multibandComp.bands[b];
+            dst.thresholdDb = number(bo["thresholdDb"], dst.thresholdDb, -60.0, 0.0);
+            dst.ratio = number(bo["ratio"], dst.ratio, 1.0, 20.0);
+            dst.attackMs = number(bo["attackMs"], dst.attackMs, 0.1, 100.0);
+            dst.releaseMs = number(bo["releaseMs"], dst.releaseMs, 10.0, 1000.0);
+            dst.kneeDb = number(bo["kneeDb"], dst.kneeDb, 0.0, 12.0);
+            dst.makeupDb = number(bo["makeupDb"], dst.makeupDb, -12.0, 24.0);
+            dst.bypass = bo["bypass"].toBool(false);
+            dst.solo = bo["solo"].toBool(false);
+        }
+        chain.multibandComp = sanitizeMultibandSettings(chain.multibandComp, 48000.0);
+    }
     chain.nrEnabled = object["nrEnabled"].toBool(chain.nrEnabled);
     chain.eqEnabled = object["eqEnabled"].toBool(chain.eqEnabled);
     chain.compEnabled = object["compEnabled"].toBool(chain.compEnabled);
@@ -358,6 +676,7 @@ void Processor::setChain(const Chain &chain)
 {
     m_chain = chain;
     m_deesser.setSettings(chain.deesser, m_sampleRate);
+    m_multibandComp.setSettings(chain.multibandComp, m_sampleRate);
     m_coefs[0] = computeEqBand(chain.eq.low, 0, m_sampleRate);
     m_coefs[1] = computeEqBand(chain.eq.lowMid, 1, m_sampleRate);
     m_coefs[2] = computeEqBand(chain.eq.highMid, 2, m_sampleRate);
@@ -368,6 +687,7 @@ void Processor::resetFeedback()
 {
     m_hist.fill(0.0);
     m_deesser.reset();
+    m_multibandComp.reset();
     m_compState.env = 0.0;
     m_nrState.env = 0.0;
     for (int ch = 0; ch < kChannels; ++ch) {
@@ -398,7 +718,8 @@ void Processor::process(float *interleaved, int frames)
     const bool eqActive = m_chain.eqEnabled && (m_coefs[0].active || m_coefs[1].active
         || m_coefs[2].active || m_coefs[3].active);
     const bool deesserActive = m_chain.deesser.enabled && !m_deesserBypassForTest;
-    if (!eqActive && !deesserActive
+    const bool multibandActive = m_chain.multibandComp.enabled;
+    if (!eqActive && !deesserActive && !multibandActive
         && !(m_chain.nrEnabled && m_chain.nr.enabled && m_chain.nr.reductionDb > 1e-6)
         && !(m_chain.compEnabled && m_chain.comp.enabled && m_chain.comp.ratio > 1.0001)
         && !(m_chain.reverbEnabled && m_chain.reverb.enabled && m_chain.reverb.mixRatio > 1e-6)) return;
@@ -653,6 +974,23 @@ void Processor::process(float *interleaved, int frames)
         m_compState.env = env;
         m_compState.currentGrDb = lastGrDb;
         src = scratchComp.data();
+    }
+
+    // Wave 34: 4-band phase-coherent LR4 Multiband Compressor (after single-band
+    // compressor, before reverb; shared by playback preview and offline export).
+    QVarLengthArray<int16_t, 8192> scratchMultiband;
+    if (multibandActive) {
+        scratchMultiband.resize(copySamples);
+        for (int i = 0; i + 1 < copySamples; i += 2) {
+            double left = src[i];
+            double right = src[i + 1];
+            m_multibandComp.processFrame(left, right);
+            scratchMultiband[i] = static_cast<int16_t>(std::clamp(left, -32768.0, 32767.0));
+            scratchMultiband[i + 1] = static_cast<int16_t>(std::clamp(right, -32768.0, 32767.0));
+        }
+        for (int i = copySamples & ~1; i < copySamples; ++i)
+            scratchMultiband[i] = src[i];
+        src = scratchMultiband.constData();
     }
 
     // Per-track reverb (Audition / Fairlight Multitap parity, simplified

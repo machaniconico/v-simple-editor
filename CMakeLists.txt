@@ -358,6 +358,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/LayerStyleUiSelftest.cpp
     src/selftests/RightclickPausePrefSelftest.cpp
     src/selftests/context_menu_order_selftest.cpp
+    src/selftests/multiband_comp_selftest.cpp
     src/selftests/platform_loudness_selftest.cpp
     src/selftests/wave25_parity_selftest.cpp
     src/selftests/ext_generator_selftest.cpp
@@ -749,6 +750,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/EqualizerPanel.h
     src/DeEsserPanel.cpp
     src/DeEsserPanel.h
+    src/MultibandCompressorPanel.cpp
+    src/MultibandCompressorPanel.h
     src/CompressorPanel.cpp
     src/CompressorPanel.h
     src/ReverbPanel.cpp
