@@ -3,6 +3,7 @@
 #include "libavcore/FrameGrab.h"
 #include "RenderInPlace.h"
 #include "MainWindow.h"
+#include "ContextMenuOrder.h"
 #include "JsonNumberClamp.h"
 #include <QCoreApplication>
 #include <cstdio>
@@ -3729,7 +3730,10 @@ void MainWindow::setupUI()
     m_player = new VideoPlayer(this);
     connect(m_player, &VideoPlayer::proxySettingsRequested,
             this, &MainWindow::openProxySettings);
-    // PV-B: プレビュー右クリックメニュー (表示トグル + 再生ヘッド直下クリップ操作)。
+    // PV-B / Context-aware customizable preview right-click menu:
+    // Hit-tests text overlay > video clip (including V2+ PiP) > background,
+    // builds actions in the user's customized per-target order, and pins
+    // "メニューをカスタマイズ…" at the bottom.
     connect(m_player, &VideoPlayer::previewContextMenuRequested,
             this, [this](const QPoint &gp) {
         if (pauseOnRightClickFromSettings()) {
@@ -3737,151 +3741,446 @@ void MainWindow::setupUI()
                 m_player->pause();
         }
 
+        GLPreview *glPreview = m_player ? m_player->glPreview() : nullptr;
+        const double playheadSec = m_timeline ? m_timeline->playheadPosition() : 0.0;
+        const QPointF localPos = glPreview ? QPointF(glPreview->mapFromGlobal(gp)) : QPointF(-1.0, -1.0);
+        const QRectF lbRect = glPreview ? glPreview->letterboxRect() : QRectF();
+        const ctxmenu::PreviewHit hit = ctxmenu::hitTestPreview(m_timeline, playheadSec, lbRect, localPos);
+
         QMenu menu;
-        QAction *pauseOnRightClickAct = menu.addAction(QStringLiteral("右クリックで一時停止"));
-        pauseOnRightClickAct->setCheckable(true);
-        pauseOnRightClickAct->setChecked(pauseOnRightClickFromSettings());
-        connect(pauseOnRightClickAct, &QAction::toggled, this, [](bool checked) {
-            QSettings("VSimpleEditor", "Preferences")
-                .setValue(rcpause::pauseOnRightClickKey(), checked);
-        });
-        menu.addSeparator();
 
-        // --- 表示系トグル (すべて表示専用・書き出し非変更) ---
-        QMenu *szMenu = menu.addMenu(QStringLiteral("SNS セーフゾーン"));
-        auto *szGroup = new QActionGroup(&menu);
-        szGroup->setExclusive(true);
-        const safezone::Platform currentSafeZone = m_player
-            ? m_player->safeZonePlatform()
-            : safezone::Platform::None;
-        const QPair<QString, safezone::Platform> szItems[] = {
-            { QStringLiteral("なし"),               safezone::Platform::None },
-            { QStringLiteral("TikTok"),             safezone::Platform::TikTok },
-            { QStringLiteral("Instagram Reels"),    safezone::Platform::InstagramReels },
-            { QStringLiteral("YouTube Shorts"),     safezone::Platform::YouTubeShorts },
-            { QStringLiteral("汎用"),               safezone::Platform::Generic },
-        };
-        for (const auto &it : szItems) {
-            const safezone::Platform p = it.second;
-            QAction *act = szMenu->addAction(it.first);
-            act->setCheckable(true);
-            act->setChecked(p == currentSafeZone);
-            szGroup->addAction(act);
-            connect(act, &QAction::triggered, this,
-                    [this, p]() { if (m_player) m_player->setSafeZonePlatform(p); });
-        }
-
-        QMenu *aidMenu = menu.addMenu(QStringLiteral("モニタリング (露出/フォーカス)"));
-        auto *aidGroup = new QActionGroup(&menu);
-        aidGroup->setExclusive(true);
-        const exposureaid::AidMode currentAid = m_player
-            ? m_player->exposureAidMode()
-            : exposureaid::AidMode::None;
-        const QPair<QString, exposureaid::AidMode> aidItems[] = {
-            { QStringLiteral("オフ"),               exposureaid::AidMode::None },
-            { QStringLiteral("フォルスカラー"),     exposureaid::AidMode::FalseColor },
-            { QStringLiteral("ゼブラ"),             exposureaid::AidMode::Zebra },
-            { QStringLiteral("フォーカスピーキング"), exposureaid::AidMode::FocusPeaking },
-        };
-        for (const auto &it : aidItems) {
-            const exposureaid::AidMode m = it.second;
-            QAction *act = aidMenu->addAction(it.first);
-            act->setCheckable(true);
-            act->setChecked(m == currentAid);
-            aidGroup->addAction(act);
-            connect(act, &QAction::triggered, this,
-                    [this, m]() { if (m_player) m_player->setExposureAidMode(m); });
-        }
-
-        QMenu *onionMenu = menu.addMenu(QStringLiteral("オニオンスキン"));
-        auto *onionGroup = new QActionGroup(&menu);
-        onionGroup->setExclusive(true);
-        const onionskin::Config currentOnion = m_player
-            ? m_player->onionSkinConfig()
-            : onionskin::Config{};
-        const QPair<QString, OnionSkinPreset> onionItems[] = {
-            { QStringLiteral("オフ"),     OnionSkinPreset::Off },
-            { QStringLiteral("前1後1"),   OnionSkinPreset::OneBeforeAfter },
-            { QStringLiteral("前2後2"),   OnionSkinPreset::TwoBeforeAfter },
-        };
-        for (const auto &it : onionItems) {
-            const OnionSkinPreset preset = it.second;
-            QAction *act = onionMenu->addAction(it.first);
-            act->setCheckable(true);
-            act->setChecked(onionSkinPresetMatches(currentOnion, preset));
-            onionGroup->addAction(act);
-            connect(act, &QAction::triggered, this, [this, preset]() {
-                if (!m_player)
-                    return;
-                m_player->setOnionSkinConfig(
-                    onionSkinConfigForPreset(m_player->onionSkinConfig(), preset));
+        auto addPauseToggle = [&](QMenu *targetMenu) {
+            QAction *pauseAct = targetMenu->addAction(QStringLiteral("右クリックで一時停止"));
+            pauseAct->setCheckable(true);
+            pauseAct->setChecked(pauseOnRightClickFromSettings());
+            connect(pauseAct, &QAction::toggled, this, [](bool checked) {
+                QSettings("VSimpleEditor", "Preferences")
+                    .setValue(rcpause::pauseOnRightClickKey(), checked);
             });
-        }
-        onionMenu->addSeparator();
-        QAction *opacityAct = onionMenu->addAction(onionSkinOpacityText(currentOnion));
-        connect(opacityAct, &QAction::triggered, this, [this]() {
-            if (!m_player)
-                return;
-            onionskin::Config cfg = m_player->onionSkinConfig();
-            bool ok = false;
-            const double pct = QInputDialog::getDouble(
-                this, QStringLiteral("オニオンスキン"),
-                QStringLiteral("不透明度 (%):"),
-                qBound(0.0, cfg.opacity, 1.0) * 100.0,
-                0.0, 100.0, 0, &ok);
-            if (!ok)
-                return;
-            cfg.opacity = qBound(0.0, pct / 100.0, 1.0);
-            m_player->setOnionSkinConfig(cfg);
-        });
-
-        QMenu *pqMenu = menu.addMenu(QStringLiteral("再生プレビュー品質"));
-        auto *pqGroup = new QActionGroup(&menu);
-        pqGroup->setExclusive(true);
-        const int currentProxyDivisor = m_player ? m_player->proxyDivisor() : 1;
-        const QPair<QString, int> pqItems[] = {
-            { QStringLiteral("フル解像度 (1x)"), 1 },
-            { QStringLiteral("1/2 解像度 (2x)"), 2 },
-            { QStringLiteral("1/4 解像度 (4x)"), 4 },
         };
-        for (const auto &it : pqItems) {
-            const int div = it.second;
-            QAction *act = pqMenu->addAction(it.first);
-            act->setCheckable(true);
-            act->setChecked(div == currentProxyDivisor);
-            pqGroup->addAction(act);
-            connect(act, &QAction::triggered, this,
-                    [this, div]() { if (m_player) m_player->setProxyDivisor(div); });
+
+        auto addSafeZoneSubmenu = [&](QMenu *targetMenu) {
+            QMenu *szMenu = targetMenu->addMenu(QStringLiteral("SNS セーフゾーン"));
+            auto *szGroup = new QActionGroup(szMenu);
+            szGroup->setExclusive(true);
+            const safezone::Platform currentSafeZone = m_player
+                ? m_player->safeZonePlatform()
+                : safezone::Platform::None;
+            const QPair<QString, safezone::Platform> szItems[] = {
+                { QStringLiteral("なし"),            safezone::Platform::None },
+                { QStringLiteral("TikTok"),          safezone::Platform::TikTok },
+                { QStringLiteral("Instagram Reels"), safezone::Platform::InstagramReels },
+                { QStringLiteral("YouTube Shorts"),  safezone::Platform::YouTubeShorts },
+                { QStringLiteral("汎用"),            safezone::Platform::Generic },
+            };
+            for (const auto &it : szItems) {
+                const safezone::Platform p = it.second;
+                QAction *act = szMenu->addAction(it.first);
+                act->setCheckable(true);
+                act->setChecked(p == currentSafeZone);
+                szGroup->addAction(act);
+                connect(act, &QAction::triggered, this,
+                        [this, p]() { if (m_player) m_player->setSafeZonePlatform(p); });
+            }
+        };
+
+        auto addMonitoringSubmenu = [&](QMenu *targetMenu) {
+            QMenu *aidMenu = targetMenu->addMenu(QStringLiteral("モニタリング (露出/フォーカス)"));
+            auto *aidGroup = new QActionGroup(aidMenu);
+            aidGroup->setExclusive(true);
+            const exposureaid::AidMode currentAid = m_player
+                ? m_player->exposureAidMode()
+                : exposureaid::AidMode::None;
+            const QPair<QString, exposureaid::AidMode> aidItems[] = {
+                { QStringLiteral("オフ"),               exposureaid::AidMode::None },
+                { QStringLiteral("フォルスカラー"),     exposureaid::AidMode::FalseColor },
+                { QStringLiteral("ゼブラ"),             exposureaid::AidMode::Zebra },
+                { QStringLiteral("フォーカスピーキング"), exposureaid::AidMode::FocusPeaking },
+            };
+            for (const auto &it : aidItems) {
+                const exposureaid::AidMode m = it.second;
+                QAction *act = aidMenu->addAction(it.first);
+                act->setCheckable(true);
+                act->setChecked(m == currentAid);
+                aidGroup->addAction(act);
+                connect(act, &QAction::triggered, this,
+                        [this, m]() { if (m_player) m_player->setExposureAidMode(m); });
+            }
+        };
+
+        auto addOnionSkinSubmenu = [&](QMenu *targetMenu) {
+            QMenu *onionMenu = targetMenu->addMenu(QStringLiteral("オニオンスキン"));
+            auto *onionGroup = new QActionGroup(onionMenu);
+            onionGroup->setExclusive(true);
+            const onionskin::Config currentOnion = m_player
+                ? m_player->onionSkinConfig()
+                : onionskin::Config{};
+            const QPair<QString, OnionSkinPreset> onionItems[] = {
+                { QStringLiteral("オフ"),   OnionSkinPreset::Off },
+                { QStringLiteral("前1後1"), OnionSkinPreset::OneBeforeAfter },
+                { QStringLiteral("前2後2"), OnionSkinPreset::TwoBeforeAfter },
+            };
+            for (const auto &it : onionItems) {
+                const OnionSkinPreset preset = it.second;
+                QAction *act = onionMenu->addAction(it.first);
+                act->setCheckable(true);
+                act->setChecked(onionSkinPresetMatches(currentOnion, preset));
+                onionGroup->addAction(act);
+                connect(act, &QAction::triggered, this, [this, preset]() {
+                    if (!m_player) return;
+                    m_player->setOnionSkinConfig(
+                        onionSkinConfigForPreset(m_player->onionSkinConfig(), preset));
+                });
+            }
+            onionMenu->addSeparator();
+            QAction *opacityAct = onionMenu->addAction(onionSkinOpacityText(currentOnion));
+            connect(opacityAct, &QAction::triggered, this, [this]() {
+                if (!m_player) return;
+                onionskin::Config cfg = m_player->onionSkinConfig();
+                bool ok = false;
+                const double pct = QInputDialog::getDouble(
+                    this, QStringLiteral("オニオンスキン"),
+                    QStringLiteral("不透明度 (%):"),
+                    qBound(0.0, cfg.opacity, 1.0) * 100.0,
+                    0.0, 100.0, 0, &ok);
+                if (!ok) return;
+                cfg.opacity = qBound(0.0, pct / 100.0, 1.0);
+                m_player->setOnionSkinConfig(cfg);
+            });
+        };
+
+        auto addPreviewQualitySubmenu = [&](QMenu *targetMenu) {
+            QMenu *pqMenu = targetMenu->addMenu(QStringLiteral("再生プレビュー品質"));
+            auto *pqGroup = new QActionGroup(pqMenu);
+            pqGroup->setExclusive(true);
+            const int currentProxyDivisor = m_player ? m_player->proxyDivisor() : 1;
+            const QPair<QString, int> pqItems[] = {
+                { QStringLiteral("フル解像度 (1x)"), 1 },
+                { QStringLiteral("1/2 解像度 (2x)"), 2 },
+                { QStringLiteral("1/4 解像度 (4x)"), 4 },
+            };
+            for (const auto &it : pqItems) {
+                const int div = it.second;
+                QAction *act = pqMenu->addAction(it.first);
+                act->setCheckable(true);
+                act->setChecked(div == currentProxyDivisor);
+                pqGroup->addAction(act);
+                connect(act, &QAction::triggered, this,
+                        [this, div]() { if (m_player) m_player->setProxyDivisor(div); });
+            }
+        };
+
+        auto addDisplaySettingsSubmenu = [&](QMenu *targetMenu) {
+            QMenu *dispMenu = targetMenu->addMenu(QStringLiteral("表示設定"));
+            addPauseToggle(dispMenu);
+            dispMenu->addSeparator();
+            addSafeZoneSubmenu(dispMenu);
+            addMonitoringSubmenu(dispMenu);
+            addOnionSkinSubmenu(dispMenu);
+            addPreviewQualitySubmenu(dispMenu);
+        };
+
+        // Header showing what was right-clicked so beginners always see the active target.
+        QString headerText = QStringLiteral("プレビュー (背景)");
+        if (hit.target == ctxmenu::Target::PreviewText && m_timeline) {
+            const auto overlays = m_timeline->timelineTextOverlays();
+            if (hit.overlayIndex >= 0 && hit.overlayIndex < overlays.size()) {
+                QString excerpt = overlays.at(hit.overlayIndex).text;
+                if (excerpt.size() > 18) excerpt = excerpt.left(18) + QStringLiteral("…");
+                headerText = QStringLiteral("テキスト: 「%1」").arg(excerpt);
+            }
+        } else if (hit.target == ctxmenu::Target::PreviewVideoClip && m_timeline) {
+            const auto tracks = m_timeline->videoTracks();
+            if (hit.videoTrackIndex >= 0 && hit.videoTrackIndex < tracks.size() && tracks[hit.videoTrackIndex]) {
+                const auto clips = tracks[hit.videoTrackIndex]->clips();
+                if (hit.videoClipIndex >= 0 && hit.videoClipIndex < clips.size()) {
+                    QString name = clips.at(hit.videoClipIndex).displayName;
+                    if (name.size() > 20) name = name.left(20) + QStringLiteral("…");
+                    headerText = QStringLiteral("クリップ: %1 (V%2)").arg(name).arg(hit.videoTrackIndex + 1);
+                }
+            }
+        }
+        QAction *hdrAct = menu.addAction(headerText);
+        hdrAct->setEnabled(false);
+        menu.addSeparator();
+
+        auto selectHitVideoClip = [this, hit]() -> TimelineTrack * {
+            if (!m_timeline) return nullptr;
+            const auto vTracks = m_timeline->videoTracks();
+            if (hit.videoTrackIndex < 0 || hit.videoTrackIndex >= vTracks.size())
+                return nullptr;
+            for (int t = 0; t < vTracks.size(); ++t) {
+                if (!vTracks[t]) continue;
+                vTracks[t]->setSelectedClip(t == hit.videoTrackIndex ? hit.videoClipIndex : -1);
+            }
+            for (TimelineTrack *aTrack : m_timeline->audioTracks()) {
+                if (aTrack) aTrack->setSelectedClip(-1);
+            }
+            return vTracks[hit.videoTrackIndex];
+        };
+
+        const QVector<ctxmenu::ResolvedItem> layout = ctxmenu::loadLayout(hit.target);
+        for (const auto &item : layout) {
+            if (!item.visible)
+                continue;
+            const QString &id = item.id;
+
+            if (hit.target == ctxmenu::Target::PreviewText) {
+                const int ovIdx = hit.overlayIndex;
+                if (id == QStringLiteral("text.inline_edit")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline || !m_player) return;
+                        const auto overlays = m_timeline->timelineTextOverlays();
+                        if (ovIdx < 0 || ovIdx >= overlays.size()) return;
+                        const EnhancedTextOverlay &ov = overlays.at(ovIdx);
+                        if (m_textToolAction && !m_textToolAction->isChecked()) {
+                            m_textToolAction->setChecked(true);
+                        } else if (!m_textToolActive) {
+                            onTextToolToggled(true);
+                        }
+                        if (GLPreview *gl = m_player->glPreview()) {
+                            if (!gl->beginInlineEditOverlay(ovIdx, QRectF(ov.x, ov.y, ov.width, ov.height), ov.text)) {
+                                bool ok = false;
+                                const QString edited = QInputDialog::getText(
+                                    this, QStringLiteral("テキストを編集"), QStringLiteral("テキスト:"),
+                                    QLineEdit::Normal, ov.text, &ok);
+                                if (ok && !edited.isEmpty())
+                                    onTextOverlayEditCommitted(ovIdx, edited);
+                            }
+                        }
+                    });
+                } else if (id == QStringLiteral("text.add_sfx")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        const auto overlays = m_timeline->timelineTextOverlays();
+                        if (ovIdx < 0 || ovIdx >= overlays.size()) return;
+                        const double startSec = overlays.at(ovIdx).startTime;
+                        const QString path = QFileDialog::getOpenFileName(
+                            this, QStringLiteral("効果音を選択"), QString(),
+                            QStringLiteral("音声ファイル (*.wav *.mp3 *.m4a *.aac *.ogg *.flac);;すべてのファイル (*.*)"));
+                        if (path.isEmpty()) return;
+                        if (ctxmenu::insertAudioClipAtTime(m_timeline, path, startSec, 2)) {
+                            statusBar()->showMessage(
+                                QStringLiteral("効果音を %1 秒に追加しました").arg(startSec, 0, 'f', 2), 4000);
+                        } else {
+                            QMessageBox::warning(this, QStringLiteral("効果音を追加"),
+                                                 QStringLiteral("音声ファイルを読み込めませんでした。"));
+                        }
+                    });
+                } else if (id == QStringLiteral("text.duration")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        const auto overlays = m_timeline->timelineTextOverlays();
+                        if (ovIdx < 0 || ovIdx >= overlays.size()) return;
+                        const EnhancedTextOverlay &ov = overlays.at(ovIdx);
+                        const double curDur = (ov.endTime > ov.startTime) ? (ov.endTime - ov.startTime) : 5.0;
+                        bool ok = false;
+                        const double newDur = QInputDialog::getDouble(
+                            this, QStringLiteral("表示時間を変更"),
+                            QStringLiteral("表示時間 (秒):"),
+                            curDur, 0.1, 36000.0, 2, &ok);
+                        if (!ok) return;
+                        if (m_timeline->updateTextOverlayTime(ovIdx, ov.startTime, ov.startTime + newDur, true)) {
+                            if (m_player)
+                                m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                            statusBar()->showMessage(
+                                QStringLiteral("テキストの表示時間を %1 秒に変更しました").arg(newDur, 0, 'f', 2), 3000);
+                        }
+                    });
+                } else if (id == QStringLiteral("text.style_color")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        const auto overlays = m_timeline->timelineTextOverlays();
+                        if (ovIdx < 0 || ovIdx >= overlays.size()) return;
+                        const QColor picked = QColorDialog::getColor(
+                            overlays.at(ovIdx).color, this, QStringLiteral("テキスト色を選択"));
+                        if (!picked.isValid()) return;
+                        if (ctxmenu::updateTextOverlayColor(m_timeline, ovIdx, picked) && m_player)
+                            m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                    });
+                } else if (id == QStringLiteral("text.font_size")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        const auto overlays = m_timeline->timelineTextOverlays();
+                        if (ovIdx < 0 || ovIdx >= overlays.size()) return;
+                        const int curPt = overlays.at(ovIdx).font.pointSize() > 0
+                            ? overlays.at(ovIdx).font.pointSize() : 32;
+                        bool ok = false;
+                        const int newPt = QInputDialog::getInt(
+                            this, QStringLiteral("フォントサイズを変更"),
+                            QStringLiteral("サイズ (pt):"), curPt, 6, 256, 1, &ok);
+                        if (!ok) return;
+                        if (ctxmenu::updateTextOverlayFontSize(m_timeline, ovIdx, newPt) && m_player)
+                            m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                    });
+                } else if (id == QStringLiteral("text.center")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        if (ctxmenu::centerTextOverlay(m_timeline, ovIdx) && m_player)
+                            m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                    });
+                } else if (id == QStringLiteral("text.duplicate")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        if (ctxmenu::duplicateTextOverlay(m_timeline, ovIdx) >= 0 && m_player)
+                            m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                    });
+                } else if (id == QStringLiteral("text.delete")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, ovIdx]() {
+                        if (!m_timeline) return;
+                        if (ctxmenu::removeTextOverlay(m_timeline, ovIdx) && m_player)
+                            m_player->setTextOverlays(m_timeline->timelineTextOverlays());
+                    });
+                } else if (id == QStringLiteral("common.display_settings")) {
+                    addDisplaySettingsSubmenu(&menu);
+                }
+            } else if (hit.target == ctxmenu::Target::PreviewVideoClip) {
+                if (id == QStringLiteral("video.split")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        if (!m_timeline) return;
+                        selectHitVideoClip();
+                        m_timeline->splitAtPlayhead();
+                    });
+                } else if (id == QStringLiteral("video.duplicate")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        if (!m_timeline) return;
+                        selectHitVideoClip();
+                        m_timeline->duplicateSelectedClips();
+                    });
+                } else if (id == QStringLiteral("video.delete")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        if (!m_timeline) return;
+                        selectHitVideoClip();
+                        m_timeline->deleteSelectedClip();
+                    });
+                } else if (id == QStringLiteral("video.speed")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        selectHitVideoClip();
+                        setClipSpeed();
+                    });
+                } else if (id == QStringLiteral("video.speed_ramp")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        selectHitVideoClip();
+                        openSpeedRampDialog();
+                    });
+                } else if (id == QStringLiteral("video.reset_transform")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, hit]() {
+                        if (!m_timeline) return;
+                        const auto tracks = m_timeline->videoTracks();
+                        if (hit.videoTrackIndex < 0 || hit.videoTrackIndex >= tracks.size() || !tracks[hit.videoTrackIndex])
+                            return;
+                        TimelineTrack *t = tracks[hit.videoTrackIndex];
+                        QVector<ClipInfo> clips = t->clips();
+                        if (hit.videoClipIndex < 0 || hit.videoClipIndex >= clips.size())
+                            return;
+                        ClipInfo &c = clips[hit.videoClipIndex];
+                        if (c.videoScale == 1.0 && c.videoDx == 0.0 && c.videoDy == 0.0 && c.rotation2DDegrees == 0.0)
+                            return;
+                        c.videoScale = 1.0;
+                        c.videoDx = 0.0;
+                        c.videoDy = 0.0;
+                        c.rotation2DDegrees = 0.0;
+                        t->setClips(clips);
+                        m_timeline->setClipVideoTransform(hit.videoTrackIndex, hit.videoClipIndex, 1.0, 0.0, 0.0);
+                        m_timeline->saveUndoState(QStringLiteral("変形をリセット"));
+                        if (m_player && m_player->glPreview())
+                            m_player->glPreview()->setVideoSourceTransform(1.0, 0.0, 0.0);
+                    });
+                } else if (id == QStringLiteral("video.effects")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        selectHitVideoClip();
+                        if (m_effectControlsPanel) {
+                            m_effectControlsPanel->refreshFromCurrentClip();
+                            m_effectControlsPanel->show();
+                            m_effectControlsPanel->raise();
+                        }
+                        if (m_effectLibraryPanel) {
+                            m_effectLibraryPanel->show();
+                            m_effectLibraryPanel->raise();
+                        }
+                    });
+                } else if (id == QStringLiteral("video.color")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip]() {
+                        selectHitVideoClip();
+                        if (m_colorGradingPanel) {
+                            m_colorGradingPanel->show();
+                            m_colorGradingPanel->raise();
+                        }
+                    });
+                } else if (id == QStringLiteral("video.sns_fit")) {
+                    QMenu *snsMenu = menu.addMenu(item.label);
+                    connect(snsMenu->addAction(QStringLiteral("SNS: 幅フィット中央(全表示)")), &QAction::triggered,
+                            this, [this, selectHitVideoClip, hit]() {
+                        if (TimelineTrack *t = selectHitVideoClip()) {
+                            m_timeline->applySnsFitToClip(t, hit.videoClipIndex, true, false,
+                                                          QStringLiteral("SNS width fit center"));
+                        }
+                    });
+                    connect(snsMenu->addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)")), &QAction::triggered,
+                            this, [this, selectHitVideoClip, hit]() {
+                        if (TimelineTrack *t = selectHitVideoClip()) {
+                            m_timeline->applySnsFitToClip(t, hit.videoClipIndex, false, true,
+                                                          QStringLiteral("SNS width fill crop"));
+                        }
+                    });
+                    connect(snsMenu->addAction(QStringLiteral("SNS: フィット解除(全画面)")), &QAction::triggered,
+                            this, [this, selectHitVideoClip, hit]() {
+                        if (TimelineTrack *t = selectHitVideoClip()) {
+                            m_timeline->applySnsFitToClip(t, hit.videoClipIndex, false, false,
+                                                          QStringLiteral("SNS restore fullscreen"));
+                        }
+                    });
+                } else if (id == QStringLiteral("video.silence_cut")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        if (TimelineTrack *t = selectHitVideoClip())
+                            m_timeline->applySilenceCutToClip(t, hit.videoClipIndex);
+                    });
+                } else if (id == QStringLiteral("video.beat_markers")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this, selectHitVideoClip, hit]() {
+                        if (TimelineTrack *t = selectHitVideoClip())
+                            m_timeline->applyBeatMarkersToClip(t, hit.videoClipIndex);
+                    });
+                } else if (id == QStringLiteral("common.display_settings")) {
+                    addDisplaySettingsSubmenu(&menu);
+                }
+            } else {
+                // Target::PreviewBackground
+                if (id == QStringLiteral("bg.add_text")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this]() {
+                        if (m_textToolAction && !m_textToolAction->isChecked()) {
+                            m_textToolAction->setChecked(true);
+                        } else if (!m_textToolActive) {
+                            onTextToolToggled(true);
+                        }
+                    });
+                } else if (id == QStringLiteral("bg.add_clip")) {
+                    connect(menu.addAction(item.label), &QAction::triggered, this, [this]() {
+                        openFile();
+                    });
+                } else if (id == QStringLiteral("common.pause_on_rightclick")) {
+                    addPauseToggle(&menu);
+                } else if (id == QStringLiteral("common.safe_zone")) {
+                    addSafeZoneSubmenu(&menu);
+                } else if (id == QStringLiteral("common.monitoring")) {
+                    addMonitoringSubmenu(&menu);
+                } else if (id == QStringLiteral("common.onion_skin")) {
+                    addOnionSkinSubmenu(&menu);
+                } else if (id == QStringLiteral("common.preview_quality")) {
+                    addPreviewQualitySubmenu(&menu);
+                }
+            }
+
+            if (item.separatorAfter)
+                menu.addSeparator();
         }
 
-        // --- 再生ヘッド直下の V1 クリップ操作 ---
+        // Pinned footer: customize menu order & visibility for any target.
         menu.addSeparator();
-        TimelineTrack *clipTrack = nullptr;
-        int clipIdx = -1;
-        if (m_timeline && m_timeline->clipUnderPlayhead(clipTrack, clipIdx) && clipTrack) {
-            connect(menu.addAction(QStringLiteral("無音を自動カット...")), &QAction::triggered,
-                    this, [this, clipTrack, clipIdx]() {
-                        if (m_timeline) m_timeline->applySilenceCutToClip(clipTrack, clipIdx); });
-            connect(menu.addAction(QStringLiteral("ビートでマーカー...")), &QAction::triggered,
-                    this, [this, clipTrack, clipIdx]() {
-                        if (m_timeline) m_timeline->applyBeatMarkersToClip(clipTrack, clipIdx); });
-            menu.addSeparator();
-            connect(menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示)")), &QAction::triggered,
-                    this, [this, clipTrack, clipIdx]() {
-                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, true, false,
-                            QStringLiteral("SNS width fit center")); });
-            connect(menu.addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)")), &QAction::triggered,
-                    this, [this, clipTrack, clipIdx]() {
-                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, false, true,
-                            QStringLiteral("SNS width fill crop")); });
-            connect(menu.addAction(QStringLiteral("SNS: フィット解除(全画面)")), &QAction::triggered,
-                    this, [this, clipTrack, clipIdx]() {
-                        if (m_timeline) m_timeline->applySnsFitToClip(clipTrack, clipIdx, false, false,
-                            QStringLiteral("SNS restore fullscreen")); });
-        } else {
-            QAction *noClip = menu.addAction(QStringLiteral("(再生ヘッド下に V1 クリップなし)"));
-            noClip->setEnabled(false);
-        }
+        connect(menu.addAction(QStringLiteral("メニューをカスタマイズ…")), &QAction::triggered,
+                this, [this, hit]() {
+            ctxmenu::ContextMenuCustomizeDialog dlg(hit.target, this);
+            dlg.exec();
+        });
 
         menu.exec(gp);
     });

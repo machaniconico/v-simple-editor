@@ -1,4 +1,6 @@
 #include "RenderInPlace.h"
+#include "ContextMenuOrder.h"
+#include "LoudnessPresets.h"
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
 #include "AudioKeyframes.h"
@@ -10341,73 +10343,197 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         const bool aHasTrans = aClip.leadIn.type != TransitionType::None
                             || aClip.trailOut.type != TransitionType::None;
         QMenu aMenu;
-        QAction *aCut = aMenu.addAction(QStringLiteral("カット"));
-        QAction *aCopy = aMenu.addAction(QStringLiteral("コピー"));
-        QAction *aDel = aMenu.addAction(QStringLiteral("削除"));
-        QAction *aReplace = aMenu.addAction(QStringLiteral("置き換え"));
-        aMenu.addSeparator();
-        QAction *aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
-        aUnlink->setEnabled(aLinkGroup > 0);
-        aMenu.addSeparator();
-        QAction *aNormalize = aMenu.addAction(QStringLiteral("ノーマライズ"));
-        QAction *aDialogueLevel = aMenu.addAction(
-            QStringLiteral("ダイアログレベラー…"));
-        QAction *aRemix = aMenu.addAction(QStringLiteral("ミュージックリミックス…"));
-        aMenu.addSeparator();
-        QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
-        QAction *aStereoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
-                                                        AudioChannelMode::Stereo);
-        QAction *aFillLeftAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
-                                                          AudioChannelMode::FillLeft);
-        QAction *aFillRightAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
-                                                           AudioChannelMode::FillRight);
-        QAction *aSwapAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
-                                                      AudioChannelMode::Swap);
-        QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
-                                                      AudioChannelMode::Mono);
-        aMenu.addSeparator();
-        QAction *aClipEq = aMenu.addAction(QStringLiteral("クリップ EQ…"));
-        QAction *aEnabledAction = aMenu.addAction(QStringLiteral("クリップを有効にする"));
-        aEnabledAction->setCheckable(true);
-        aEnabledAction->setChecked(track->clips()[clipIndex].visible);
-        aEnabledAction->setEnabled(!track->isLocked() && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
-        QMenu *aLabelMenu = aMenu.addMenu(QStringLiteral("ラベルカラー"));
-        const QList<QPair<QAction *, ClipLabel>> aLabelActions{
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::None), ClipLabel::None},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Red), ClipLabel::Red},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Orange), ClipLabel::Orange},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Yellow), ClipLabel::Yellow},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Green), ClipLabel::Green},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Cyan), ClipLabel::Cyan},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Blue), ClipLabel::Blue},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Purple), ClipLabel::Purple},
-            {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Pink), ClipLabel::Pink}
+        QAction *aCut = nullptr;
+        QAction *aCopy = nullptr;
+        QAction *aDel = nullptr;
+        QAction *aReplace = nullptr;
+        QAction *aUnlink = nullptr;
+        struct NormMenuAction {
+            QAction *act = nullptr;
+            loudnesspreset::NormalizeScope scope = loudnesspreset::NormalizeScope::SingleClip;
+            double lufs = -14.0;
+            double peak = -1.0;
+            QString label;
+            bool isCustom = false;
+            bool isDialog = false;
+            bool isPeak = false;
         };
-        aMenu.addSeparator();
-        QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
-        QAction *aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (コンスタントパワー)…"));
-        aXdAct->setEnabled(clipIndex + 1 < track->clips().size());
-        QAction *aFiAct = atMenu->addAction(QStringLiteral("フェードイン…"));
-        QAction *aFoAct = atMenu->addAction(QStringLiteral("フェードアウト…"));
+        QVector<NormMenuAction> aNormActions;
+        QAction *aDialogueLevel = nullptr;
+        QAction *aRemix = nullptr;
+        QAction *aStereoAct = nullptr;
+        QAction *aFillLeftAct = nullptr;
+        QAction *aFillRightAct = nullptr;
+        QAction *aSwapAct = nullptr;
+        QAction *aMonoAct = nullptr;
+        QAction *aClipEq = nullptr;
+        QAction *aEnabledAction = nullptr;
+        QList<QPair<QAction *, ClipLabel>> aLabelActions;
+        QAction *aXdAct = nullptr;
+        QAction *aFiAct = nullptr;
+        QAction *aFoAct = nullptr;
         QAction *aClearAct = nullptr;
-        if (aHasTrans) {
-            atMenu->addSeparator();
-            aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
-        }
-        QAction *aSequence = aMenu.addAction(QStringLiteral("このクリップから新規シーケンス"));
-        aSequence->setEnabled(aClip.sequenceRefId.isEmpty() && !aClip.filePath.isEmpty());
+        QAction *aSequence = nullptr;
+        QAction *aConnect = nullptr;
+        QAction *aDisconnect = nullptr;
         const ClipInfo sequenceSource = aClip;
-        // US-1202: primary-storyline connection of an audio clip (no shortcut).
+
+        const QVector<ctxmenu::ResolvedItem> aLayout =
+            ctxmenu::loadLayout(ctxmenu::Target::TimelineAudioClip);
+        for (const auto &item : aLayout) {
+            if (!item.visible)
+                continue;
+            const QString &id = item.id;
+            if (id == QStringLiteral("audio.cut")) {
+                aCut = aMenu.addAction(QStringLiteral("カット"));
+            } else if (id == QStringLiteral("audio.copy")) {
+                aCopy = aMenu.addAction(QStringLiteral("コピー"));
+            } else if (id == QStringLiteral("audio.delete")) {
+                aDel = aMenu.addAction(QStringLiteral("削除"));
+            } else if (id == QStringLiteral("audio.replace")) {
+                aReplace = aMenu.addAction(QStringLiteral("置き換え"));
+            } else if (id == QStringLiteral("audio.unlink")) {
+                aUnlink = aMenu.addAction(QStringLiteral("同期を切る"));
+                aUnlink->setEnabled(aLinkGroup > 0);
+            } else if (id == QStringLiteral("audio.normalize")) {
+                QMenu *aNormMenu = aMenu.addMenu(QStringLiteral("ノーマライズ"));
+                const auto presets = loudnesspreset::timelinePresets();
+                auto populateScopeMenu = [&](QMenu *sub, loudnesspreset::NormalizeScope scope, bool includePeak) {
+                    for (const auto &p : presets) {
+                        QAction *act = sub->addAction(p.displayName);
+                        aNormActions.append({act, scope, p.targetLufs, p.maxTruePeakDbtp,
+                                             p.displayName, false, false, false});
+                    }
+                    sub->addSeparator();
+                    QAction *actCustom = sub->addAction(QStringLiteral("カスタム LUFS…"));
+                    aNormActions.append({actCustom, scope, -14.0, -1.0,
+                                         QString(), true, false, false});
+                    if (includePeak) {
+                        QAction *actPeak = sub->addAction(QStringLiteral("ピーク正規化 (-1 dBFS)"));
+                        aNormActions.append({actPeak, scope, -14.0, -1.0,
+                                             QString(), false, false, true});
+                    }
+                };
+                QMenu *mSingle = aNormMenu->addMenu(QStringLiteral("このクリップ単体"));
+                populateScopeMenu(mSingle, loudnesspreset::NormalizeScope::SingleClip, true);
+                QMenu *mAllIndiv = aNormMenu->addMenu(QStringLiteral("全クリップ一括 (各クリップを個別に揃える)"));
+                populateScopeMenu(mAllIndiv, loudnesspreset::NormalizeScope::AllClipsIndividual, false);
+                QMenu *mAllUniform = aNormMenu->addMenu(QStringLiteral("全クリップ一括 (全体のバランスを維持して揃える)"));
+                populateScopeMenu(mAllUniform, loudnesspreset::NormalizeScope::AllClipsUniform, false);
+                aNormMenu->addSeparator();
+                QAction *actDialog = aNormMenu->addAction(QStringLiteral("ノーマライズ設定ダイアログ…"));
+                aNormActions.append({actDialog, loudnesspreset::NormalizeScope::SingleClip, -14.0, -1.0,
+                                     QString(), false, true, false});
+            } else if (id == QStringLiteral("audio.dialogue_leveler")) {
+                aDialogueLevel = aMenu.addAction(QStringLiteral("ダイアログレベラー…"));
+            } else if (id == QStringLiteral("audio.music_remix")) {
+                aRemix = aMenu.addAction(QStringLiteral("ミュージックリミックス…"));
+            } else if (id == QStringLiteral("audio.channel_map")) {
+                QMenu *aChannelMenu = aMenu.addMenu(QStringLiteral("チャンネルマッピング"));
+                aStereoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                       AudioChannelMode::Stereo);
+                aFillLeftAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                         AudioChannelMode::FillLeft);
+                aFillRightAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                          AudioChannelMode::FillRight);
+                aSwapAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                     AudioChannelMode::Swap);
+                aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
+                                                     AudioChannelMode::Mono);
+            } else if (id == QStringLiteral("audio.clip_eq")) {
+                aClipEq = aMenu.addAction(QStringLiteral("クリップ EQ…"));
+            } else if (id == QStringLiteral("audio.enabled")) {
+                aEnabledAction = aMenu.addAction(QStringLiteral("クリップを有効にする"));
+                aEnabledAction->setCheckable(true);
+                aEnabledAction->setChecked(track->clips()[clipIndex].visible);
+                aEnabledAction->setEnabled(!track->isLocked()
+                    && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
+            } else if (id == QStringLiteral("audio.label")) {
+                QMenu *aLabelMenu = aMenu.addMenu(QStringLiteral("ラベルカラー"));
+                aLabelActions = {
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::None), ClipLabel::None},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Red), ClipLabel::Red},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Orange), ClipLabel::Orange},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Yellow), ClipLabel::Yellow},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Green), ClipLabel::Green},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Cyan), ClipLabel::Cyan},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Blue), ClipLabel::Blue},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Purple), ClipLabel::Purple},
+                    {addClipLabelAction(aLabelMenu, aClip.label, ClipLabel::Pink), ClipLabel::Pink}
+                };
+            } else if (id == QStringLiteral("audio.transitions")) {
+                QMenu *atMenu = aMenu.addMenu(QStringLiteral("音声トランジション"));
+                aXdAct = atMenu->addAction(QStringLiteral("クロスフェード (コンスタントパワー)…"));
+                aXdAct->setEnabled(clipIndex + 1 < track->clips().size());
+                aFiAct = atMenu->addAction(QStringLiteral("フェードイン…"));
+                aFoAct = atMenu->addAction(QStringLiteral("フェードアウト…"));
+                if (aHasTrans) {
+                    atMenu->addSeparator();
+                    aClearAct = atMenu->addAction(QStringLiteral("音声トランジション削除"));
+                }
+            } else if (id == QStringLiteral("audio.new_sequence")) {
+                aSequence = aMenu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+                aSequence->setEnabled(aClip.sequenceRefId.isEmpty() && !aClip.filePath.isEmpty());
+            } else if (id == QStringLiteral("audio.storyline")) {
+                // US-1202: primary-storyline connection of an audio clip (no shortcut).
+                aConnect = aMenu.addAction(tr("主ストーリーラインに接続"));
+                aDisconnect = aMenu.addAction(tr("接続を解除"));
+                aDisconnect->setEnabled(!aClip.anchorUid.isEmpty());
+            }
+            if (item.separatorAfter)
+                aMenu.addSeparator();
+        }
         aMenu.addSeparator();
-        QAction *aConnect = aMenu.addAction(tr("主ストーリーラインに接続"));
-        QAction *aDisconnect = aMenu.addAction(tr("接続を解除"));
-        aDisconnect->setEnabled(!aClip.anchorUid.isEmpty());
+        QAction *aCustomize = aMenu.addAction(QStringLiteral("メニューをカスタマイズ…"));
         QAction *aChosen = aMenu.exec(globalPos);
+        if (!aChosen) return;
+        for (const auto &na : aNormActions) {
+            if (aChosen != na.act)
+                continue;
+            const int trackIdx = m_audioTracks.indexOf(track);
+            if (na.isPeak) {
+                normalizeAudioClipPeak(trackIdx, clipIndex);
+                return;
+            }
+            loudnesspreset::NormalizeScope scope = na.scope;
+            double targetLufs = na.lufs;
+            double maxPeak = na.peak;
+            QString label = na.label;
+            if (na.isDialog) {
+                loudnesspreset::NormalizeOptionsDialog dlg(
+                    loudnesspreset::NormalizeScope::SingleClip, -14.0, -1.0, this);
+                if (dlg.exec() != QDialog::Accepted)
+                    return;
+                scope = dlg.selectedScope();
+                targetLufs = dlg.targetLufs();
+                maxPeak = dlg.maxTruePeakDbtp();
+                label = dlg.selectedPresetLabel();
+            } else if (na.isCustom) {
+                bool accepted = false;
+                targetLufs = QInputDialog::getDouble(
+                    this, QStringLiteral("カスタム LUFS ノーマライズ"),
+                    QStringLiteral("目標ラウドネス (LUFS):"), -14.0, -70.0, -1.0, 1, &accepted);
+                if (!accepted)
+                    return;
+                label = QStringLiteral("カスタム %1 LUFS").arg(targetLufs, 0, 'f', 1);
+            }
+            const auto res = loudnesspreset::applyLoudnessNormalization(
+                this, scope, trackIdx, clipIndex, targetLufs, maxPeak, label);
+            if (!res.summary.isEmpty())
+                emit statusMessageRequested(res.summary, 5000);
+            if (res.ok)
+                scheduleEmitSequenceChanged();
+            return;
+        }
+        if (aChosen == aCustomize) {
+            ctxmenu::ContextMenuCustomizeDialog dlg(ctxmenu::Target::TimelineAudioClip, this);
+            dlg.exec();
+            return;
+        }
         if (aChosen == aSequence) {
             createSequenceFromClip(sequenceSource);
             return;
         }
-        if (!aChosen) return;
         if (aChosen == aConnect || aChosen == aDisconnect) {
             QString connErr;
             const int audioIdx = m_audioTracks.indexOf(track);
@@ -10469,10 +10595,6 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
             emit audioClipEqRequested(m_audioTracks.indexOf(track), clipIndex);
         }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
-        else if (aChosen == aNormalize) {
-            const int trackIdx = m_audioTracks.indexOf(track);
-            normalizeAudioClipPeak(trackIdx, clipIndex);
-        }
         else if (aChosen == aDialogueLevel) {
             if (!aClip.volumeEnvelope.isEmpty()
                 && QMessageBox::question(
