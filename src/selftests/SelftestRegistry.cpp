@@ -195,6 +195,7 @@ int runCompetitorGapP1Selftest();
 int runCompetitorGapP2Selftest();
 int runRadeonAmfSelftest();
 int runAmdGpuSupportSelftest();
+int runQrhiPreviewSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -987,6 +988,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 29 Phase 1 AMD Radeon AMF routing policy, runtime AvailabilityCache thread-safety, AV1 fallback, and 10-bit HDR vendor policy (18 gates)" },
     { "amd-gpu-support", "VEDITOR_AMD_GPU_SUPPORT_SELFTEST", runAmdGpuSupportSelftest, true,
       "Wave 29 Phases 1-5 AMD GPU full support: RDNA arch detection, D3D11VA matrix, WGL-DX circuit breaker, strict GLSL auditor, DirectML/Vulkan/ROCm backend routing, GpuDiagnosticsDialog (10 gates)" },
+    { "qrhi-preview", "VEDITOR_QRHI_PREVIEW_SELFTEST", runQrhiPreviewSelftest, true,
+      "Wave 30 Qt6 QRhi cross-vendor preview backend: Direct3D 11 / Vulkan / OpenGL / Null probe, real D3D11 QRhiTexture upload+readback pixel round-trip, QrhiPreviewWidget & Dialog (8 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

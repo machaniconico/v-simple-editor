@@ -4,9 +4,9 @@
 #   unparsed<TAB>doc:line<TAB>token<TAB>reason  a ':<digits>' token that is not a reference (token as reported, e.g. D:1)
 #   Every field is required: a row with a missing or empty field (reason included) is a usage error (exit 2).
 unparsed	README.md:314	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
-unparsed	README.md:802	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
-unparsed	ツールバーと機能ガイド.txt:2307	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
-unparsed	機能一覧と検証ガイド.txt:2016	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
-unparsed	機能一覧と検証ガイド.txt:2453	start={cx:0	MCP dynamic_zoom JSON argument example (start={cx:0), not a file:line reference
-unparsed	機能一覧と検証ガイド.txt:2453	cy:0	MCP dynamic_zoom JSON argument example (cy:0), not a file:line reference
-unparsed	機能一覧と検証ガイド.txt:2453	w:0	MCP dynamic_zoom JSON argument example (w:0), not a file:line reference
+unparsed	README.md:808	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
+unparsed	ツールバーと機能ガイド.txt:2327	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
+unparsed	機能一覧と検証ガイド.txt:2056	D:1	brush_progress reveal keyframe example {0:0, D:1}, not a file:line reference
+unparsed	機能一覧と検証ガイド.txt:2493	start={cx:0	MCP dynamic_zoom JSON argument example (start={cx:0), not a file:line reference
+unparsed	機能一覧と検証ガイド.txt:2493	cy:0	MCP dynamic_zoom JSON argument example (cy:0), not a file:line reference
+unparsed	機能一覧と検証ガイド.txt:2493	w:0	MCP dynamic_zoom JSON argument example (w:0), not a file:line reference

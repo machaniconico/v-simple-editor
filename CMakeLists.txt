@@ -24,6 +24,7 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets Gui Multimedia MultimediaWidgets Op
 # and the rest of the build still succeeds (the .cpp uses __has_include guards).
 find_package(Qt6 QUIET COMPONENTS Svg)
 find_package(Qt6 QUIET COMPONENTS Pdf)
+find_package(Qt6 QUIET COMPONENTS GuiPrivate)
 
 # Sprint 16 / US-BLE-1: optional FBX/Alembic mesh import via libassimp.
 # When unavailable, BlenderMeshImporter.cpp falls back to OBJ/glTF only.
@@ -365,6 +366,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/competitor_gap_p2_selftest.cpp
     src/selftests/radeon_amf_selftest.cpp
     src/selftests/amd_gpu_support_selftest.cpp
+    src/selftests/qrhi_preview_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp
@@ -791,6 +793,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AafExchange.cpp
     src/GpuVendorSupport.h
     src/GpuVendorSupport.cpp
+    src/QrhiPreviewWidget.h
+    src/QrhiPreviewWidget.cpp
     src/NoiseReductionPanel.cpp
     src/NoiseReductionPanel.h
     src/AudioMeterWidget.cpp
@@ -1166,6 +1170,10 @@ endif()
 if(TARGET Qt6::Pdf)
     target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::Pdf)
     target_compile_definitions(${PROJECT_NAME} PRIVATE VEDITOR_HAVE_QT_PDF=1)
+endif()
+if(TARGET Qt6::GuiPrivate)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Qt6::GuiPrivate)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE VEDITOR_HAVE_QRHI=1)
 endif()
 if(TARGET assimp::assimp)
     target_link_libraries(${PROJECT_NAME} PRIVATE assimp::assimp)
