@@ -6120,7 +6120,19 @@ void McpEditorTools::registerWriteTools()
                 return setError(err, QStringLiteral("require 0 <= startSec < endSec")), QJsonObject();
             if (!m_window || !timeline())
                 return setError(err, QStringLiteral("editor not available")), QJsonObject();
-            const bool ok = timeline()->rippleDeleteTimeRange(startSec, endSec, /*notify=*/true);
+            bool ok = false;
+            for (TimelineTrack *track : timeline()->videoTracks()) {
+                if (track && !track->isLocked())
+                    ok = track->rippleDeleteTimeRange(startSec, endSec, false) || ok;
+            }
+            for (TimelineTrack *track : timeline()->audioTracks()) {
+                if (track && !track->isLocked())
+                    ok = track->rippleDeleteTimeRange(startSec, endSec, false) || ok;
+            }
+            if (ok) {
+                timeline()->saveUndoState(QStringLiteral("範囲をリップル削除"));
+                timeline()->refreshPlaybackSequence();
+            }
             syncSelectionAfterEdit();
             return QJsonObject{
                 {QStringLiteral("ok"), ok},

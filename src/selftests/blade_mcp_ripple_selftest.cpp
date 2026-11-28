@@ -150,7 +150,7 @@ int runBladeMcpRippleSelftest()
     mcp::McpEditorTools tools(&win, &registry);
     tools.registerReadTools();
     tools.registerWriteTools();
-    Timeline *tl = win.timeline();
+    Timeline *tl = win.findChild<Timeline *>();
 
     auto callTool = [&](const QString &name, const QJsonObject &args, QString *errOut) {
         bool found = false;

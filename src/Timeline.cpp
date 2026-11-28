@@ -6493,7 +6493,7 @@ bool Timeline::rippleInsertClipAtTime(bool audio, int trackIndex, const ClipInfo
             const double offsetMedia = offsetTimeline * speed;
             ClipInfo left = clips[i];
             ClipInfo right = clips[i];
-            if (left.reverse) {
+            if (left.reversed) {
                 const double splitMedia = left.outPoint - offsetMedia;
                 left.inPoint = splitMedia;
                 right.outPoint = splitMedia;
