@@ -1,11 +1,11 @@
 ================================================================================
  V Simple Editor — 機能一覧と LLM(MCP) 検証ガイド
- 作成日: 2026-08-29   更新日: 2026-11-28 (Wave 30 実装済み)   対象ブランチ: feat/morph-cut-rhi-docs-wave30
+ 作成日: 2026-08-29   更新日: 2026-11-28 (Wave 32 実装済み)   対象ブランチ: feat/puppet-phase3-wave32
 ================================================================================
 
 このファイルは 3 部構成です。
   第1部  今ある機能の一覧 (Premiere / After Effects / DaVinci Resolve との対応つき)
-  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 30 = 実装済み / 今後の候補)
+  第2部  今後実装していく機能の一覧 (Wave 1 〜 Wave 32 = 実装済み / 今後の候補)
   第3部  LLM と MCP 連携しながら検証する手順 (準備 → 共通手順 → 機能別チェックリスト)
 
 凡例:  ○=同等機能あり  △=部分的  ×=無い  ★=Wave 1 追加  ☆=Wave 2 追加  ◆=Wave 3 追加  ◇=Wave 4 追加  ◈=Wave 5 追加  ✦=Wave 6 追加  ✧=Wave 7 追加  ❖=Wave 8 追加  ❂=Wave 9 追加  ❃=Wave 10 追加 (今回)
@@ -1240,6 +1240,10 @@
     ・5 種ピン（位置 / ベンド回転拡縮 / アドバンスド / スターチ剛性 / オーバーラップ Z 深度前後重なり）＋ プリマルチプライド SrcOver 合成
     ・クリップローカル時刻キーフレーム＆イージング補間・ドラッグ時オートキー・変形メッシュワイヤーフレーム表示・設定ダイアログ・
       SSOT 書き出し一致・1 Undo・.veditor 保存対応（既存静的パペットと完全後方互換）
+  ❏ Wave 32 (ARAP パペット Phase 3 — パペットスケッチ・揺れ物自動アニメ・MCP 連携、puppet-phase3 8 gates):
+    ・パペットスケッチ (Ctrl + ドラッグでリアルタイム軌跡録画 → Ramer-Douglas-Peucker 自動間引き → 1 Undo、軌跡 & REC バッジ表示)
+    ・ピン別 Wiggle & Expression 揺れ物自動アニメ (髪・リボン / 呼吸 / 風 1 クリックプリセット、exprX / exprY / exprRot / exprScale)
+    ・MCP ツール get_clip_puppet / set_clip_puppet 追加 (計 63 ツール、LLM からのピン配置・キーフレーム・揺れ物設定・1 Undo 対応)
 
 ■ Wave 24 (前回実装)  — 検証は 3.11 の Wave 24 分と、各機能の selftest 行
   ❏ Wave 24 の変更 (既存プロジェクトにも効くもの。書き出しの結果が変わるものは「書き出し例外」と明記します。書き出し例
@@ -2796,7 +2800,7 @@
                   Wave 10: roto を持つクリップは codec にかかわらずアルファ付き ProRes 4444 (.mov) で焼き込まれ、元クリ
                   ップの roto は外れる (Ctrl+Z で戻る。Wave 12 からは「元のクリップに戻す」でも戻る。3.10e (6))。
                   Wave 18: ブラシを持つクリップも codec にかかわらず ProRes 4444 (.mov) で焼き込まれ、差し替えクリップに
-                  ブラシは残らない (「元のクリップに戻す」/ Ctrl+Z で戻る。RenderInPlace.cpp:474-477、README.md:820。
+                  ブラシは残らない (「元のクリップに戻す」/ Ctrl+Z で戻る。RenderInPlace.cpp:474-477、README.md:821。
                   US-1803)。
      LLM:   「V1 の 1 番目のクリップを焼き込んで差し替えて」→ render_in_place
      呼び出し例:      render_in_place {"kind":"video","trackIndex":0,"clipIndex":0,"codec":"h264","handlesSec":0}
@@ -3915,8 +3919,8 @@
      ・[W10-LOUDWAV / 既存。Wave 10 で解消 (3.10c (10))] 自動ラウドネスの測定用 WAV は RenderQueue の一時ファイル登録を通らず直接削除されるため、削除に失敗しても
        再試行されず、ファイルが残ることがある。
      ・MCP の audioMixPath は Wave 10 で RenderQueue::addTempFile / setIntermediateProjectFile 経由になった
-       (McpEditorTools.cpp:3163-3173。audioMixPath は :3163、addTempFile は :3172、setIntermediateProjectFile は
-       :3173)。
+       (McpEditorTools.cpp:3236-3246。audioMixPath は :3236、addTempFile は :3245、setIntermediateProjectFile は
+       :3246)。
      ・[US-808 / Wave 10 で訂正] この項目 (start が 0 でない素材で右端を伸ばせる範囲が短くなる) は誤りだった。3.10c (9) 参照。
      ・[既存。Wave 10 の US-912 で原因を特定して修正 (3.10c (8))] mixer-dock selftest は起動直後に 1.7% の確率でハングする (完走した回を採用する)。
      ・Wave 8 までの制限事項 (3.10 冒頭) は上記で変わったもの以外そのまま据え置き。

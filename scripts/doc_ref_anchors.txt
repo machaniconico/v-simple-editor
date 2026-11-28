@@ -1,7 +1,7 @@
 # doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
 # The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
 # A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.
-README.md:820	ブラシを持つクリップの RenderInPlace
+README.md:821	ブラシを持つクリップの RenderInPlace
 src/AudioExportMix.cpp:211	audioexport::sortedDedupedEnvelope(
 src/AudioExportMix.cpp:223	audio::clampClipGain(point.gain)
 src/AudioExportMix.cpp:237	audioexport::mergeDuckingEnvelope(
@@ -54,5 +54,5 @@ src/VideoPlayer.cpp:4455	tlrender::EchoFrameProvider echoFrameProvider;
 src/VideoPlayer.cpp:4542	return VideoEffectProcessor::applyEffectStack(
 src/clipanim/ClipAnim.cpp:712	Layer3DTransform layer3DAt(
 src/clipanim/ClipAnim.cpp:739	clipLocalSeconds + clip.dynamicTimeOffsetSec
-src/mcp/McpEditorTools.cpp:3163-3173	windowGuard->prepareExportAudioMix(
-src/mcp/McpEditorTools.cpp:3173	RenderQueue::setIntermediateProjectFile(job, audioMixPath)
+src/mcp/McpEditorTools.cpp:3236-3246	windowGuard->prepareExportAudioMix(
+src/mcp/McpEditorTools.cpp:3246	RenderQueue::setIntermediateProjectFile(job, audioMixPath)

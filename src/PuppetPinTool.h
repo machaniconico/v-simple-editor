@@ -3,6 +3,7 @@
 #include "PuppetEngine.h"
 #include "SurfaceTool.h"
 #include "WarpDistortion.h"
+#include <QElapsedTimer>
 #include <QPointer>
 #include <QString>
 #include <functional>
@@ -21,6 +22,13 @@ public:
     void setToolMode(puppet::PinType mode) { m_toolMode = mode; }
     puppet::PinType toolMode() const { return m_toolMode; }
     void setTimeProvider(std::function<double()> provider) { m_timeProvider = std::move(provider); }
+
+    // Wave 32: Puppet Sketch (Ctrl+Drag real-time trajectory recording + RDP simplification)
+    void setSketchSpeed(double speed) { m_sketchSpeed = std::clamp(speed, 0.1, 4.0); }
+    void setSketchEpsilonUv(double eps) { m_sketchEpsilonUv = std::clamp(eps, 0.0005, 0.05); }
+    bool isSketchRecording() const { return m_sketchRecording; }
+    int sketchSampleCount() const { return m_sketchSamples.size(); }
+    bool recordSketchSampleAt(const QPoint &pos, double clipLocalSec);
 
     int hitTestCorner(const QPoint &pos, const QRectF &rect) const override;
     void cancelDrag();
@@ -62,6 +70,14 @@ private:
     puppet::PuppetRig m_dragRig;
     puppet::PuppetRig m_previewRig;
     double m_dragStartRotDeg = 0.0;
+
+    // Wave 32: Puppet Sketch recording state
+    bool m_sketchRecording = false;
+    double m_sketchStartSec = 0.0;
+    double m_sketchSpeed = 1.0;
+    double m_sketchEpsilonUv = 0.004;
+    QElapsedTimer m_sketchTimer;
+    QVector<puppet::SketchSample> m_sketchSamples;
 
     bool m_previewApplied = false;
     QPoint m_pressPos;

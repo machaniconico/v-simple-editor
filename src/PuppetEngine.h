@@ -19,6 +19,7 @@ class QComboBox;
 class QCheckBox;
 class QDoubleSpinBox;
 class QLabel;
+class QLineEdit;
 class QListWidget;
 class QSpinBox;
 
@@ -65,6 +66,29 @@ struct EvaluatedPin {
     double stiffness   = 0.5;
 };
 
+struct PinDynamics {
+    bool wiggleEnabled     = false;
+    double wiggleFreqHz    = 2.0;   // [0.05..20.0] Hz
+    double wiggleAmpUv     = 0.025; // [0.0..0.5] UV amplitude
+    double wiggleRotAmpDeg = 0.0;   // [0.0..90.0] degrees (Bend / Advanced)
+    int wiggleOctaves      = 2;     // [1..6]
+    unsigned int wiggleSeed = 1;
+    QString exprX;                  // Expression string (time, value -> UV x)
+    QString exprY;                  // Expression string (time, value -> UV y)
+    QString exprRot;                // Expression string (time, value -> degrees)
+    QString exprScale;              // Expression string (time, value -> scale)
+
+    bool isDefault() const;
+    bool operator==(const PinDynamics &o) const;
+    QJsonObject toJson() const;
+    static PinDynamics fromJson(const QJsonObject &obj);
+};
+
+struct SketchSample {
+    double timeSec = 0.0;
+    QPointF posUv  = QPointF(0.5, 0.5);
+};
+
 struct PuppetPin {
     int id           = 0;
     QString name;
@@ -73,6 +97,7 @@ struct PuppetPin {
     double radius    = 0.25;              // Normalized to min(w, h)
     double stiffness = 0.5;               // [0..1] (Starch rigidity multiplier)
     QVector<PinKeyframe> keyframes;       // Sorted by timeSec
+    PinDynamics dynamics;                 // Wave 32: Wiggle + Expression automation
 
     bool operator==(const PuppetPin &o) const;
     QJsonObject toJson() const;
@@ -133,6 +158,25 @@ QVector<EvaluatedPin> evaluateRigAt(const PuppetRig &rig, double clipLocalSec);
 // Insert or update a keyframe at clipLocalSec (merges within 1e-3 s).
 void upsertPinKeyframe(PuppetPin &pin, const PinKeyframe &kf);
 bool removePinKeyframeNear(PuppetPin &pin, double clipLocalSec, double epsSec = 0.02);
+
+// Wave 32: Puppet Sketch (real-time drag trajectory simplification via Ramer-Douglas-Peucker).
+QVector<SketchSample> simplifySketchRdp(const QVector<SketchSample> &samples,
+                                        double epsilonUv = 0.004,
+                                        double minDtSec = 1.0 / 30.0);
+int applySketchToPin(PuppetPin &pin,
+                     const QVector<SketchSample> &rawSamples,
+                     double epsilonUv = 0.004,
+                     EasingKind easing = EasingKind::Linear,
+                     bool replaceInRange = true);
+
+// Wave 32: Built-in Sway / Breathing presets for quick character secondary motion.
+enum class SwayPreset {
+    None = 0,
+    HairRibbon = 1, // Gentle organic wiggle
+    Breathing  = 2, // Smooth sinusoidal vertical breathing expression
+    WindGust   = 3, // Stronger wiggle + bend rotation
+};
+void applySwayPreset(PuppetPin &pin, SwayPreset preset);
 
 // Convert between legacy static WarpPin list and PuppetRig.
 PuppetRig rigFromLegacyPins(const QVector<WarpPin> &legacy);
@@ -220,6 +264,16 @@ private:
     QDoubleSpinBox *m_stiffnessSpin = nullptr;
     QDoubleSpinBox *m_inFrontSpin = nullptr;
     QComboBox *m_easingCombo = nullptr;
+
+    // Wave 32: Wiggle / Expression automation controls
+    QCheckBox *m_wiggleCheck = nullptr;
+    QDoubleSpinBox *m_wiggleFreqSpin = nullptr;
+    QDoubleSpinBox *m_wiggleAmpSpin = nullptr;
+    QDoubleSpinBox *m_wiggleRotSpin = nullptr;
+    QSpinBox *m_wiggleSeedSpin = nullptr;
+    QLineEdit *m_exprXEdit = nullptr;
+    QLineEdit *m_exprYEdit = nullptr;
+    QLineEdit *m_exprRotEdit = nullptr;
 };
 
 } // namespace puppet

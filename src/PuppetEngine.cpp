@@ -1,6 +1,8 @@
 #include "PuppetEngine.h"
 
+#include "Expression.h"
 #include "Timeline.h"
+#include "WiggleTransform.h"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -11,6 +13,7 @@
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QLabel>
+#include <QLineEdit>
 #include <QListWidget>
 #include <QMutex>
 #include <QMutexLocker>
@@ -488,13 +491,71 @@ PinKeyframe PinKeyframe::fromJson(const QJsonObject &obj)
     return k;
 }
 
+bool PinDynamics::isDefault() const
+{
+    return !wiggleEnabled
+        && exprX.trimmed().isEmpty()
+        && exprY.trimmed().isEmpty()
+        && exprRot.trimmed().isEmpty()
+        && exprScale.trimmed().isEmpty();
+}
+
+bool PinDynamics::operator==(const PinDynamics &o) const
+{
+    return wiggleEnabled == o.wiggleEnabled
+        && approxEq(wiggleFreqHz, o.wiggleFreqHz, 1e-4)
+        && approxEq(wiggleAmpUv, o.wiggleAmpUv, 1e-5)
+        && approxEq(wiggleRotAmpDeg, o.wiggleRotAmpDeg, 1e-4)
+        && wiggleOctaves == o.wiggleOctaves
+        && wiggleSeed == o.wiggleSeed
+        && exprX == o.exprX
+        && exprY == o.exprY
+        && exprRot == o.exprRot
+        && exprScale == o.exprScale;
+}
+
+QJsonObject PinDynamics::toJson() const
+{
+    QJsonObject o;
+    if (wiggleEnabled) {
+        o["wiggleEnabled"]   = true;
+        o["wiggleFreqHz"]    = wiggleFreqHz;
+        o["wiggleAmpUv"]     = wiggleAmpUv;
+        o["wiggleRotAmpDeg"] = wiggleRotAmpDeg;
+        o["wiggleOctaves"]   = wiggleOctaves;
+        o["wiggleSeed"]      = static_cast<int>(wiggleSeed);
+    }
+    if (!exprX.trimmed().isEmpty())     o["exprX"]     = exprX.trimmed();
+    if (!exprY.trimmed().isEmpty())     o["exprY"]     = exprY.trimmed();
+    if (!exprRot.trimmed().isEmpty())   o["exprRot"]   = exprRot.trimmed();
+    if (!exprScale.trimmed().isEmpty()) o["exprScale"] = exprScale.trimmed();
+    return o;
+}
+
+PinDynamics PinDynamics::fromJson(const QJsonObject &obj)
+{
+    PinDynamics d;
+    d.wiggleEnabled   = obj["wiggleEnabled"].toBool(false);
+    d.wiggleFreqHz    = std::clamp(obj["wiggleFreqHz"].toDouble(2.0), 0.05, 20.0);
+    d.wiggleAmpUv     = std::clamp(obj["wiggleAmpUv"].toDouble(0.025), 0.0, 0.5);
+    d.wiggleRotAmpDeg = std::clamp(obj["wiggleRotAmpDeg"].toDouble(0.0), 0.0, 90.0);
+    d.wiggleOctaves   = std::clamp(obj["wiggleOctaves"].toInt(2), 1, 6);
+    d.wiggleSeed      = static_cast<unsigned int>(std::max(1, obj["wiggleSeed"].toInt(1)));
+    d.exprX           = obj["exprX"].toString().trimmed();
+    d.exprY           = obj["exprY"].toString().trimmed();
+    d.exprRot         = obj["exprRot"].toString().trimmed();
+    d.exprScale       = obj["exprScale"].toString().trimmed();
+    return d;
+}
+
 bool PuppetPin::operator==(const PuppetPin &o) const
 {
     return id == o.id && name == o.name && type == o.type
         && approxPt(restPos, o.restPos, 1e-5)
         && approxEq(radius, o.radius, 1e-5)
         && approxEq(stiffness, o.stiffness, 1e-5)
-        && keyframes == o.keyframes;
+        && keyframes == o.keyframes
+        && dynamics == o.dynamics;
 }
 
 QJsonObject PuppetPin::toJson() const
@@ -510,6 +571,8 @@ QJsonObject PuppetPin::toJson() const
     QJsonArray kfs;
     for (const auto &kf : keyframes) kfs.append(kf.toJson());
     o["keyframes"] = kfs;
+    if (!dynamics.isDefault())
+        o["dynamics"] = dynamics.toJson();
     return o;
 }
 
@@ -527,6 +590,8 @@ PuppetPin PuppetPin::fromJson(const QJsonObject &obj)
         p.keyframes.append(PinKeyframe::fromJson(v.toObject()));
     std::stable_sort(p.keyframes.begin(), p.keyframes.end(),
                      [](const PinKeyframe &a, const PinKeyframe &b) { return a.timeSec < b.timeSec; });
+    if (obj.contains("dynamics"))
+        p.dynamics = PinDynamics::fromJson(obj["dynamics"].toObject());
     return p;
 }
 
@@ -613,9 +678,6 @@ EvaluatedPin evaluatePinAt(const PuppetPin &pin, double clipLocalSec)
     out.radius      = pin.radius;
     out.stiffness   = pin.stiffness;
 
-    if (pin.keyframes.isEmpty())
-        return out;
-
     const auto applyKf = [&](const PinKeyframe &k) {
         out.position    = (pin.type == PinType::Position || pin.type == PinType::Advanced)
                               ? k.position : pin.restPos;
@@ -624,32 +686,80 @@ EvaluatedPin evaluatePinAt(const PuppetPin &pin, double clipLocalSec)
         out.inFront     = k.inFront;
     };
 
-    if (pin.keyframes.size() == 1 || clipLocalSec <= pin.keyframes.first().timeSec) {
-        applyKf(pin.keyframes.first());
-        return out;
-    }
-    if (clipLocalSec >= pin.keyframes.last().timeSec) {
-        applyKf(pin.keyframes.last());
-        return out;
-    }
-
-    for (int i = 0; i + 1 < pin.keyframes.size(); ++i) {
-        const PinKeyframe &a = pin.keyframes[i];
-        const PinKeyframe &b = pin.keyframes[i + 1];
-        if (clipLocalSec >= a.timeSec && clipLocalSec <= b.timeSec) {
-            const double span = b.timeSec - a.timeSec;
-            const double rawU = (span > 1e-9) ? (clipLocalSec - a.timeSec) / span : 0.0;
-            const double t = applyEasing(a.easing, rawU);
-            const QPointF pos = a.position + (b.position - a.position) * t;
-            out.position    = (pin.type == PinType::Position || pin.type == PinType::Advanced)
-                                  ? pos : pin.restPos;
-            out.rotationDeg = a.rotationDeg + (b.rotationDeg - a.rotationDeg) * t;
-            out.scale       = a.scale + (b.scale - a.scale) * t;
-            out.inFront     = a.inFront + (b.inFront - a.inFront) * t;
-            return out;
+    if (!pin.keyframes.isEmpty()) {
+        if (pin.keyframes.size() == 1 || clipLocalSec <= pin.keyframes.first().timeSec) {
+            applyKf(pin.keyframes.first());
+        } else if (clipLocalSec >= pin.keyframes.last().timeSec) {
+            applyKf(pin.keyframes.last());
+        } else {
+            bool matched = false;
+            for (int i = 0; i + 1 < pin.keyframes.size(); ++i) {
+                const PinKeyframe &a = pin.keyframes[i];
+                const PinKeyframe &b = pin.keyframes[i + 1];
+                if (clipLocalSec >= a.timeSec && clipLocalSec <= b.timeSec) {
+                    const double span = b.timeSec - a.timeSec;
+                    const double rawU = (span > 1e-9) ? (clipLocalSec - a.timeSec) / span : 0.0;
+                    const double t = applyEasing(a.easing, rawU);
+                    const QPointF pos = a.position + (b.position - a.position) * t;
+                    out.position    = (pin.type == PinType::Position || pin.type == PinType::Advanced)
+                                          ? pos : pin.restPos;
+                    out.rotationDeg = a.rotationDeg + (b.rotationDeg - a.rotationDeg) * t;
+                    out.scale       = a.scale + (b.scale - a.scale) * t;
+                    out.inFront     = a.inFront + (b.inFront - a.inFront) * t;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) applyKf(pin.keyframes.last());
         }
     }
-    applyKf(pin.keyframes.last());
+
+    // Wave 32: Apply per-pin Wiggle & Expression secondary motion.
+    const PinDynamics &dyn = pin.dynamics;
+    if (!dyn.isDefault()) {
+        if (dyn.wiggleEnabled) {
+            wiggle::WiggleParams wp;
+            wp.enabled              = true;
+            wp.positionFrequency    = std::clamp(dyn.wiggleFreqHz, 0.05, 20.0);
+            wp.positionAmplitude    = QPointF(std::clamp(dyn.wiggleAmpUv, 0.0, 0.5),
+                                              std::clamp(dyn.wiggleAmpUv, 0.0, 0.5));
+            wp.rotationFrequency    = wp.positionFrequency;
+            wp.rotationAmplitudeDeg = std::clamp(dyn.wiggleRotAmpDeg, 0.0, 90.0);
+            wp.octaves              = std::clamp(dyn.wiggleOctaves, 1, 6);
+            wp.seed                 = dyn.wiggleSeed > 0 ? dyn.wiggleSeed : static_cast<unsigned int>(std::max(1, pin.id));
+            const wiggle::WiggleOffset wo = wiggle::evaluate(wp, clipLocalSec);
+            if (pin.type == PinType::Position || pin.type == PinType::Advanced) {
+                out.position = QPointF(std::clamp(out.position.x() + wo.positionOffset.x(), -0.5, 1.5),
+                                       std::clamp(out.position.y() + wo.positionOffset.y(), -0.5, 1.5));
+            }
+            if (pin.type == PinType::Bend || pin.type == PinType::Advanced) {
+                out.rotationDeg = std::clamp(out.rotationDeg + wo.rotationOffsetDeg, -3600.0, 3600.0);
+            }
+        }
+
+        auto evalExpr = [&](const QString &code, double baseVal, double lo, double hi) -> double {
+            const QString trimmed = code.trimmed();
+            if (trimmed.isEmpty()) return baseVal;
+            ExpressionContext ctx;
+            ctx.time = clipLocalSec;
+            ctx.layerIndex = pin.id;
+            ctx.value = baseVal;
+            const ExpressionResult res = Expression::evaluate(trimmed, ctx);
+            if (res.success && std::isfinite(res.value))
+                return std::clamp(res.value, lo, hi);
+            return baseVal;
+        };
+
+        if (pin.type == PinType::Position || pin.type == PinType::Advanced) {
+            out.position.setX(evalExpr(dyn.exprX, out.position.x(), -0.5, 1.5));
+            out.position.setY(evalExpr(dyn.exprY, out.position.y(), -0.5, 1.5));
+        }
+        if (pin.type == PinType::Bend || pin.type == PinType::Advanced) {
+            out.rotationDeg = evalExpr(dyn.exprRot, out.rotationDeg, -3600.0, 3600.0);
+            out.scale       = evalExpr(dyn.exprScale, out.scale, 0.1, 4.0);
+        }
+    }
+
     return out;
 }
 
@@ -689,6 +799,156 @@ bool removePinKeyframeNear(PuppetPin &pin, double clipLocalSec, double epsSec)
     if (bestIdx < 0) return false;
     pin.keyframes.removeAt(bestIdx);
     return true;
+}
+
+// ============================================================
+//  Wave 32: Puppet Sketch RDP Simplification & Sway Presets
+// ============================================================
+
+namespace {
+
+// Time-parameterized linear interpolation error in UV space:
+// measures how far sample[m] deviates from linear interpolation between sample[a] and sample[b].
+double rdpTemporalDeviation(const SketchSample &a, const SketchSample &b, const SketchSample &m)
+{
+    const double dt = b.timeSec - a.timeSec;
+    if (dt <= 1e-9)
+        return std::hypot(m.posUv.x() - a.posUv.x(), m.posUv.y() - a.posUv.y());
+    const double u = std::clamp((m.timeSec - a.timeSec) / dt, 0.0, 1.0);
+    const double ix = a.posUv.x() + (b.posUv.x() - a.posUv.x()) * u;
+    const double iy = a.posUv.y() + (b.posUv.y() - a.posUv.y()) * u;
+    return std::hypot(m.posUv.x() - ix, m.posUv.y() - iy);
+}
+
+void rdpRecurse(const QVector<SketchSample> &pts,
+                int first,
+                int last,
+                double eps,
+                QVector<bool> &keep)
+{
+    if (last <= first + 1) return;
+    double maxErr = -1.0;
+    int splitIdx = -1;
+    for (int i = first + 1; i < last; ++i) {
+        const double err = rdpTemporalDeviation(pts[first], pts[last], pts[i]);
+        if (err > maxErr) {
+            maxErr = err;
+            splitIdx = i;
+        }
+    }
+    if (maxErr > eps && splitIdx > first && splitIdx < last) {
+        keep[splitIdx] = true;
+        rdpRecurse(pts, first, splitIdx, eps, keep);
+        rdpRecurse(pts, splitIdx, last, eps, keep);
+    }
+}
+
+} // namespace
+
+QVector<SketchSample> simplifySketchRdp(const QVector<SketchSample> &samples,
+                                        double epsilonUv,
+                                        double minDtSec)
+{
+    if (samples.size() <= 2) return samples;
+
+    // 1. Sort monotonically by timeSec and pre-filter ultra-dense duplicate timestamps.
+    QVector<SketchSample> sorted = samples;
+    std::stable_sort(sorted.begin(), sorted.end(), [](const SketchSample &a, const SketchSample &b) {
+        return a.timeSec < b.timeSec;
+    });
+
+    QVector<SketchSample> clean;
+    clean.reserve(sorted.size());
+    clean.append(sorted.first());
+    const double minDt = std::max(0.0, minDtSec);
+    for (int i = 1; i + 1 < sorted.size(); ++i) {
+        if (sorted[i].timeSec - clean.last().timeSec >= minDt)
+            clean.append(sorted[i]);
+    }
+    if (sorted.last().timeSec > clean.last().timeSec + 1e-6)
+        clean.append(sorted.last());
+    else
+        clean.last() = sorted.last();
+
+    if (clean.size() <= 2) return clean;
+
+    // 2. Ramer-Douglas-Peucker recursion in time-UV trajectory space.
+    QVector<bool> keep(clean.size(), false);
+    keep[0] = true;
+    keep[clean.size() - 1] = true;
+    rdpRecurse(clean, 0, clean.size() - 1, std::max(1e-5, epsilonUv), keep);
+
+    QVector<SketchSample> out;
+    for (int i = 0; i < clean.size(); ++i) {
+        if (keep[i]) out.append(clean[i]);
+    }
+    return out;
+}
+
+int applySketchToPin(PuppetPin &pin,
+                     const QVector<SketchSample> &rawSamples,
+                     double epsilonUv,
+                     EasingKind easing,
+                     bool replaceInRange)
+{
+    if (rawSamples.isEmpty()) return 0;
+    const QVector<SketchSample> simplified = simplifySketchRdp(rawSamples, epsilonUv);
+    if (simplified.isEmpty()) return 0;
+
+    if (replaceInRange) {
+        const double t0 = simplified.first().timeSec - 1e-4;
+        const double t1 = simplified.last().timeSec + 1e-4;
+        QVector<PinKeyframe> kept;
+        kept.reserve(pin.keyframes.size());
+        for (const auto &kf : pin.keyframes) {
+            if (kf.timeSec < t0 || kf.timeSec > t1)
+                kept.append(kf);
+        }
+        pin.keyframes = kept;
+    }
+
+    for (const auto &s : simplified) {
+        const EvaluatedPin base = evaluatePinAt(pin, s.timeSec);
+        PinKeyframe kf;
+        kf.timeSec     = std::max(0.0, s.timeSec);
+        kf.position    = QPointF(std::clamp(s.posUv.x(), -0.5, 1.5),
+                                 std::clamp(s.posUv.y(), -0.5, 1.5));
+        kf.rotationDeg = base.rotationDeg;
+        kf.scale       = base.scale;
+        kf.inFront     = base.inFront;
+        kf.easing      = easing;
+        upsertPinKeyframe(pin, kf);
+    }
+    return simplified.size();
+}
+
+void applySwayPreset(PuppetPin &pin, SwayPreset preset)
+{
+    PinDynamics dyn;
+    dyn.wiggleSeed = static_cast<unsigned int>(std::max(1, pin.id * 17 + 3));
+    switch (preset) {
+    case SwayPreset::None:
+        break;
+    case SwayPreset::HairRibbon:
+        dyn.wiggleEnabled   = true;
+        dyn.wiggleFreqHz    = 1.8;
+        dyn.wiggleAmpUv     = 0.020;
+        dyn.wiggleRotAmpDeg = 4.0;
+        dyn.wiggleOctaves   = 2;
+        break;
+    case SwayPreset::Breathing:
+        dyn.wiggleEnabled = false;
+        dyn.exprY = QStringLiteral("value + sin(time * 2.0) * 0.015");
+        break;
+    case SwayPreset::WindGust:
+        dyn.wiggleEnabled   = true;
+        dyn.wiggleFreqHz    = 3.0;
+        dyn.wiggleAmpUv     = 0.045;
+        dyn.wiggleRotAmpDeg = 12.0;
+        dyn.wiggleOctaves   = 3;
+        break;
+    }
+    pin.dynamics = dyn;
 }
 
 PuppetRig rigFromLegacyPins(const QVector<WarpPin> &legacy)
@@ -1674,8 +1934,77 @@ PuppetRigDialog::PuppetRigDialog(Timeline *timeline,
     kfBtnRow->addWidget(delKfBtn);
     pinForm->addRow(kfBtnRow);
 
-    midRow->addWidget(pinGroup, 2);
+    // Wave 32: Secondary motion (Wiggle / Expression) controls + 1-click presets
+    auto *dynGroup = new QGroupBox(QStringLiteral("揺れ物自動アニメ (Wiggle / Expression)"), this);
+    auto *dynForm = new QFormLayout(dynGroup);
+
+    auto *presetRow = new QHBoxLayout();
+    auto *pHairBtn = new QPushButton(QStringLiteral("髪・リボン"), this);
+    auto *pBreathBtn = new QPushButton(QStringLiteral("呼吸"), this);
+    auto *pWindBtn = new QPushButton(QStringLiteral("風"), this);
+    auto *pClearDynBtn = new QPushButton(QStringLiteral("解除"), this);
+    presetRow->addWidget(pHairBtn);
+    presetRow->addWidget(pBreathBtn);
+    presetRow->addWidget(pWindBtn);
+    presetRow->addWidget(pClearDynBtn);
+    dynForm->addRow(QStringLiteral("プリセット"), presetRow);
+
+    m_wiggleCheck = new QCheckBox(QStringLiteral("Wiggle 有効"), this);
+    dynForm->addRow(m_wiggleCheck);
+
+    m_wiggleFreqSpin = new QDoubleSpinBox(this);
+    m_wiggleFreqSpin->setRange(0.05, 20.0);
+    m_wiggleFreqSpin->setDecimals(2);
+    m_wiggleFreqSpin->setSuffix(QStringLiteral(" Hz"));
+    m_wiggleFreqSpin->setValue(2.0);
+    dynForm->addRow(QStringLiteral("周波数"), m_wiggleFreqSpin);
+
+    m_wiggleAmpSpin = new QDoubleSpinBox(this);
+    m_wiggleAmpSpin->setRange(0.0, 0.5);
+    m_wiggleAmpSpin->setDecimals(3);
+    m_wiggleAmpSpin->setSingleStep(0.005);
+    m_wiggleAmpSpin->setValue(0.025);
+    dynForm->addRow(QStringLiteral("振幅 (UV)"), m_wiggleAmpSpin);
+
+    m_wiggleRotSpin = new QDoubleSpinBox(this);
+    m_wiggleRotSpin->setRange(0.0, 90.0);
+    m_wiggleRotSpin->setDecimals(1);
+    m_wiggleRotSpin->setSuffix(QStringLiteral(" °"));
+    dynForm->addRow(QStringLiteral("回転振幅"), m_wiggleRotSpin);
+
+    m_wiggleSeedSpin = new QSpinBox(this);
+    m_wiggleSeedSpin->setRange(1, 99999);
+    m_wiggleSeedSpin->setValue(1);
+    dynForm->addRow(QStringLiteral("乱数シード"), m_wiggleSeedSpin);
+
+    m_exprXEdit = new QLineEdit(this);
+    m_exprXEdit->setPlaceholderText(QStringLiteral("例: value + sin(time * 3) * 0.02"));
+    dynForm->addRow(QStringLiteral("式 X"), m_exprXEdit);
+
+    m_exprYEdit = new QLineEdit(this);
+    m_exprYEdit->setPlaceholderText(QStringLiteral("例: value + sin(time * 2) * 0.015"));
+    dynForm->addRow(QStringLiteral("式 Y"), m_exprYEdit);
+
+    m_exprRotEdit = new QLineEdit(this);
+    m_exprRotEdit->setPlaceholderText(QStringLiteral("例: value + sin(time * 4) * 10"));
+    dynForm->addRow(QStringLiteral("式 回転°"), m_exprRotEdit);
+
+    auto *rightCol = new QVBoxLayout();
+    rightCol->addWidget(pinGroup);
+    rightCol->addWidget(dynGroup);
+    midRow->addLayout(rightCol, 2);
     root->addLayout(midRow, 1);
+
+    auto applyPreset = [this](SwayPreset preset) {
+        const int row = m_pinList->currentRow();
+        if (row < 0 || row >= m_rig.pins.size()) return;
+        applySwayPreset(m_rig.pins[row], preset);
+        loadSelectedPinToEditor();
+    };
+    connect(pHairBtn,     &QPushButton::clicked, this, [applyPreset]() { applyPreset(SwayPreset::HairRibbon); });
+    connect(pBreathBtn,   &QPushButton::clicked, this, [applyPreset]() { applyPreset(SwayPreset::Breathing); });
+    connect(pWindBtn,     &QPushButton::clicked, this, [applyPreset]() { applyPreset(SwayPreset::WindGust); });
+    connect(pClearDynBtn, &QPushButton::clicked, this, [applyPreset]() { applyPreset(SwayPreset::None); });
 
     auto *buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
     buttons->button(QDialogButtonBox::Ok)->setText(QStringLiteral("適用"));
@@ -1767,6 +2096,14 @@ void PuppetRigDialog::loadSelectedPinToEditor()
     m_stiffnessSpin->setEnabled(valid);
     m_inFrontSpin->setEnabled(valid);
     m_easingCombo->setEnabled(valid);
+    m_wiggleCheck->setEnabled(valid);
+    m_wiggleFreqSpin->setEnabled(valid);
+    m_wiggleAmpSpin->setEnabled(valid);
+    m_wiggleRotSpin->setEnabled(valid);
+    m_wiggleSeedSpin->setEnabled(valid);
+    m_exprXEdit->setEnabled(valid);
+    m_exprYEdit->setEnabled(valid);
+    m_exprRotEdit->setEnabled(valid);
     if (!valid) return;
 
     m_updating = true;
@@ -1784,6 +2121,15 @@ void PuppetRigDialog::loadSelectedPinToEditor()
     if (!pin.keyframes.isEmpty()) easing = pin.keyframes.last().easing;
     const int eIdx = m_easingCombo->findData(static_cast<int>(easing));
     if (eIdx >= 0) m_easingCombo->setCurrentIndex(eIdx);
+
+    m_wiggleCheck->setChecked(pin.dynamics.wiggleEnabled);
+    m_wiggleFreqSpin->setValue(pin.dynamics.wiggleFreqHz);
+    m_wiggleAmpSpin->setValue(pin.dynamics.wiggleAmpUv);
+    m_wiggleRotSpin->setValue(pin.dynamics.wiggleRotAmpDeg);
+    m_wiggleSeedSpin->setValue(static_cast<int>(pin.dynamics.wiggleSeed));
+    m_exprXEdit->setText(pin.dynamics.exprX);
+    m_exprYEdit->setText(pin.dynamics.exprY);
+    m_exprRotEdit->setText(pin.dynamics.exprRot);
     m_updating = false;
 }
 
@@ -1795,6 +2141,15 @@ void PuppetRigDialog::applyEditorToSelectedPin()
     pin.type      = static_cast<PinType>(m_pinTypeCombo->currentData().toInt());
     pin.radius    = m_radiusSpin->value();
     pin.stiffness = m_stiffnessSpin->value();
+
+    pin.dynamics.wiggleEnabled   = m_wiggleCheck->isChecked();
+    pin.dynamics.wiggleFreqHz    = m_wiggleFreqSpin->value();
+    pin.dynamics.wiggleAmpUv     = m_wiggleAmpSpin->value();
+    pin.dynamics.wiggleRotAmpDeg = m_wiggleRotSpin->value();
+    pin.dynamics.wiggleSeed      = static_cast<unsigned int>(std::max(1, m_wiggleSeedSpin->value()));
+    pin.dynamics.exprX           = m_exprXEdit->text().trimmed();
+    pin.dynamics.exprY           = m_exprYEdit->text().trimmed();
+    pin.dynamics.exprRot         = m_exprRotEdit->text().trimmed();
 
     PinKeyframe kf;
     kf.timeSec     = m_clipLocalSec;
