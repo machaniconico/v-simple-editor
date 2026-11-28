@@ -112,7 +112,8 @@ QString ExportConfig::codecDisplayName() const
 {
     if (videoCodec == "libx264") return "H.264";
     if (videoCodec == "libx265") return "H.265 (HEVC)";
-    if (videoCodec == "libsvtav1") return "AV1";
+    if (videoCodec == "libaom-av1" || videoCodec == "libsvtav1"
+        || videoCodec == "librav1e") return "AV1";
     if (videoCodec == "libvpx-vp9") return "VP9";
     return videoCodec;
 }

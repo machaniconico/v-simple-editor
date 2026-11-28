@@ -1,4 +1,5 @@
 #include "GLPreview.h"
+#include "GpuVendorSupport.h"
 #include "Overlay.h"
 #include "Timeline.h"
 #include "VideoPlayer.h"
@@ -1561,10 +1562,23 @@ void GLPreview::detectInteropExtension()
         }
     }
 
+    const gpuvendor::WglDxInteropMode effectiveInteropMode =
+        gpuvendor::resolveEffectiveInteropMode(
+            qgetenv("VEDITOR_WGL_DX_INTEROP"), gpuvendor::wglDxInteropMode());
+    if (effectiveInteropMode == gpuvendor::WglDxInteropMode::ForceSafeCpu) {
+        qInfo() << "[interop] disabled by user/env safe-CPU policy (VEDITOR_WGL_DX_INTEROP / settings)";
+        return;
+    }
+
     m_interopAvailable = true;
+    const char *vendorStr = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
     const char *renderer = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    const auto gpuVendor = gpuvendor::classifyGpuVendor(
+        QString::fromUtf8(vendorStr ? vendorStr : ""),
+        QString::fromUtf8(renderer ? renderer : ""));
     qInfo() << "[interop] available (WGL_NV_DX_interop2, GL_RENDERER="
-            << (renderer ? renderer : "<unknown>") << ")";
+            << (renderer ? renderer : "<unknown>")
+            << ", vendor=" << gpuvendor::vendorDisplayName(gpuVendor) << ")";
 #else
     qInfo() << "[interop] disabled (non-Windows platform)";
 #endif
@@ -1649,12 +1663,29 @@ bool GLPreview::ensureInteropDeviceForPaint()
         return false;
     if (!gWglDXOpenDeviceNV)
         return false;
+    static gpuvendor::WglDxInteropCircuitBreaker s_interopBreaker;
+    const char *vendorStr = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
+    const char *rendererStr = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+    s_interopBreaker.setVendor(gpuvendor::classifyGpuVendor(
+        QString::fromUtf8(vendorStr ? vendorStr : ""),
+        QString::fromUtf8(rendererStr ? rendererStr : "")));
+    if (s_interopBreaker.isTripped()) {
+        m_interopAvailable = false;
+        return false;
+    }
     HANDLE h = gWglDXOpenDeviceNV(m_pendingD3D11Device);
     if (!h) {
         qWarning() << "[interop] device open failed (wglDXOpenDeviceNV returned null) for d3d11Device="
                    << m_pendingD3D11Device;
+        if (s_interopBreaker.recordFailure(QStringLiteral("wglDXOpenDeviceNV returned null"))) {
+            qWarning() << "[interop] circuit breaker tripped after"
+                       << s_interopBreaker.consecutiveFailures()
+                       << "failures — falling back to safe CPU texture upload";
+            m_interopAvailable = false;
+        }
         return false;
     }
+    s_interopBreaker.recordSuccess();
     m_interopDevice = h;
     m_currentInteropD3D11Device = m_pendingD3D11Device;
     qInfo() << "[interop] device opened (d3d11Device=" << m_pendingD3D11Device

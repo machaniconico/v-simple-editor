@@ -193,6 +193,8 @@ int runExtGeneratorSelftest();
 int runCompetitorGapSelftest();
 int runCompetitorGapP1Selftest();
 int runCompetitorGapP2Selftest();
+int runRadeonAmfSelftest();
+int runAmdGpuSupportSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -981,6 +983,10 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 27 P1 competitor-gap features: Subclips+Undo, TimelineMinimap overview, Film Halation, Posterize Time SSOT, 3D Camera DOF/Bokeh, Speed Graph |dv/dt|, Shy Layers, CreativeEffectsDialog (8 gates)" },
     { "competitor-gap-p2", "VEDITOR_COMPETITOR_GAP_P2_SELFTEST", runCompetitorGapP2Selftest, true,
       "Wave 28 P2 competitor-gap features: Lottie JSON vector animation SSOT, Pitch Shift & Voice Changer DSP + WAV bounce + Undo, MOGRT PKZIP archive & SSOT rendering, AAF OLE2/CFB v3 binary export/import round-trip (8 gates)" },
+    { "radeon-amf", "VEDITOR_RADEON_AMF_SELFTEST", runRadeonAmfSelftest, false,
+      "Wave 29 Phase 1 AMD Radeon AMF routing policy, runtime AvailabilityCache thread-safety, AV1 fallback, and 10-bit HDR vendor policy (18 gates)" },
+    { "amd-gpu-support", "VEDITOR_AMD_GPU_SUPPORT_SELFTEST", runAmdGpuSupportSelftest, true,
+      "Wave 29 Phases 1-5 AMD GPU full support: RDNA arch detection, D3D11VA matrix, WGL-DX circuit breaker, strict GLSL auditor, DirectML/Vulkan/ROCm backend routing, GpuDiagnosticsDialog (10 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

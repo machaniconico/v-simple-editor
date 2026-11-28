@@ -197,34 +197,92 @@ static void appendHardwareCandidates(std::vector<std::string>& names,
         appendUnique(names, "hevc_nvenc");
         appendUnique(names, "hevc_qsv");
         appendUnique(names, "hevc_amf");
+    } else if (family == EncoderFamily::AV1) {
+        if (vendor == "nvenc") { appendUnique(names, "av1_nvenc"); return; }
+        if (vendor == "qsv") { appendUnique(names, "av1_qsv"); return; }
+        if (vendor == "amf") { appendUnique(names, "av1_amf"); return; }
+        appendUnique(names, "av1_nvenc");
+        appendUnique(names, "av1_qsv");
+        appendUnique(names, "av1_amf");
     }
 }
 
 static void appendOrderedFamilyFallbacks(std::vector<std::string>& names,
-                                         EncoderFamily family)
+                                         EncoderFamily family,
+                                         bool allowOtherVendors = true)
 {
     if (family == EncoderFamily::H264) {
         appendUnique(names, "libx264");
         appendUnique(names, "h264_mf");
-        appendUnique(names, "h264_nvenc");
-        appendUnique(names, "h264_qsv");
-        appendUnique(names, "h264_amf");
-        appendUnique(names, "mpeg4");
+        if (allowOtherVendors) {
+            appendUnique(names, "h264_nvenc");
+            appendUnique(names, "h264_qsv");
+            appendUnique(names, "h264_amf");
+        }
     } else if (family == EncoderFamily::H265) {
         appendUnique(names, "libx265");
         appendUnique(names, "hevc_mf");
-        appendUnique(names, "hevc_nvenc");
-        appendUnique(names, "hevc_qsv");
-        appendUnique(names, "hevc_amf");
-        appendUnique(names, "mpeg4");
+        if (allowOtherVendors) {
+            appendUnique(names, "hevc_nvenc");
+            appendUnique(names, "hevc_qsv");
+            appendUnique(names, "hevc_amf");
+        }
+    } else if (family == EncoderFamily::AV1) {
+        appendUnique(names, "libaom-av1");
+        appendUnique(names, "libsvtav1");
+        appendUnique(names, "librav1e");
+        if (allowOtherVendors) {
+            appendUnique(names, "av1_nvenc");
+            appendUnique(names, "av1_qsv");
+            appendUnique(names, "av1_amf");
+        }
     }
 }
 
 static bool isVendorHardwareEncoderName(const std::string& name)
 {
     return name == "h264_nvenc" || name == "h264_qsv" || name == "h264_amf"
-        || name == "hevc_nvenc" || name == "hevc_qsv" || name == "hevc_amf";
+        || name == "hevc_nvenc" || name == "hevc_qsv" || name == "hevc_amf"
+        || name == "av1_nvenc"  || name == "av1_qsv"  || name == "av1_amf";
 }
+
+} // namespace
+
+bool isHardwareVideoEncoderName(const std::string& name)
+{
+    return isVendorHardwareEncoderName(name);
+}
+
+std::vector<std::string> videoEncoderCandidateNames(const EncodeRequest& req)
+{
+    std::vector<std::string> candidates;
+    const EncoderFamily family = detectEncoderFamily(req.videoCodecName);
+    const bool knownFamily = (family == EncoderFamily::H264
+                              || family == EncoderFamily::H265
+                              || family == EncoderFamily::AV1);
+    const bool wantHW = (req.useHardwareAccel || !req.hwVendorHint.empty())
+                       && req.hwVendorHint != "none";
+    const bool explicitVendor = (req.hwVendorHint == "nvenc"
+                                 || req.hwVendorHint == "qsv"
+                                 || req.hwVendorHint == "amf");
+
+    if (!knownFamily) {
+        if (!req.videoCodecName.empty())
+            appendUnique(candidates, req.videoCodecName.c_str());
+        else
+            appendUnique(candidates, "libx264");
+        return candidates;
+    }
+
+    if (wantHW)
+        appendHardwareCandidates(candidates, family, req.hwVendorHint);
+    if (!req.videoCodecName.empty())
+        appendUnique(candidates, req.videoCodecName.c_str());
+    appendOrderedFamilyFallbacks(candidates, family, !explicitVendor);
+    return candidates;
+}
+
+namespace {
 
 static bool encoderAllowedByHook(const EncodeRequest& req, const std::string& name)
 {
@@ -454,8 +512,15 @@ QList<QPair<QString, QString>> codecOptionsFor(
         add("cq", quality.c_str());
     } else if (name == "h264_qsv" || name == "hevc_qsv") {
         add("preset", "medium");
-    } else if (name == "h264_amf" || name == "hevc_amf") {
+    } else if (name == "h264_amf" || name == "hevc_amf" || name == "av1_amf") {
+        // AMD AMF (RDNA 1/2/3/4 & Ryzen iGPU): transcoding usage + balanced quality
+        // avoids RDNA generation mismatches on B-frame/profile defaults.
+        add("usage", "transcoding");
         add("quality", "balanced");
+        if (req.rateControl == EncodeRequest::RateControl::Bitrate
+            && name != "av1_amf") {
+            add("rc", "vbr_peak");
+        }
     } else if (name == "libx264" || name == "libx265") {
         add("preset", "medium");
         add("crf", quality.c_str());
@@ -641,28 +706,15 @@ bool FrameEncoder::openEncoderWithFallback(const EncodeRequest& req)
         primaryEncoder = findAllowedEncoderByName(req, resolved);
     }
 
-    const bool wantHW = (req.useHardwareAccel || !req.hwVendorHint.empty())
-                       && req.hwVendorHint != "none";
-
-    std::vector<std::string> candidates;
-    if (wantHW && primaryEncoder && isH264OrH265Family(family)) {
-        // Preserve the existing HW-preferred path when a primary encoder is
-        // present, then continue through the new MF/mpeg4 fallback chain if
-        // opening the selected encoder fails.
-        appendHardwareCandidates(candidates, family, req.hwVendorHint);
+    std::vector<std::string> candidates = videoEncoderCandidateNames(req);
+    if (family == EncoderFamily::Unknown && primaryEncoder) {
         appendUnique(candidates, primaryEncoder->name ? primaryEncoder->name : resolved.c_str());
-        appendOrderedFamilyFallbacks(candidates, family);
-    } else if (primaryEncoder) {
-        appendUnique(candidates, primaryEncoder->name ? primaryEncoder->name : resolved.c_str());
-        if (isH264OrH265Family(family)) {
-            appendOrderedFamilyFallbacks(candidates, family);
-        }
-    } else if (isH264OrH265Family(family)) {
-        // A missing libx264/libx265 primary must not short-circuit the open.
-        // Windows builds with Media Foundation can still supply h264_mf/hevc_mf,
-        // and mpeg4 remains a last-resort cross-build fallback.
-        appendOrderedFamilyFallbacks(candidates, family);
     }
+    // Preserve last-resort mpeg4 fallback for H.264/H.265 only inside openEncoderWithFallback
+    // when libx264/h264_mf/HW are all absent in a minimal stock DLL (videoEncoderCandidateNames
+    // stays strictly same-family).
+    if (isH264OrH265Family(family))
+        appendUnique(candidates, "mpeg4");
 
     // Quality mode: an AV1 hardware candidate the CRF filter rejects must fall
     // through to the family's software encoder, mirroring the H.264/H.265 chain.

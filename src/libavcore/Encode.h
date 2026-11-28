@@ -119,6 +119,10 @@ struct EncodeRequest {
 QList<QPair<QString, QString>> codecOptionsFor(
     const EncodeRequest& req, const QString& resolvedEncoderName);
 
+// Deterministic hardware/software encoder routing policy (H.264 / HEVC / AV1).
+std::vector<std::string> videoEncoderCandidateNames(const EncodeRequest& req);
+bool isHardwareVideoEncoderName(const std::string& name);
+
 // RAII encoder session. Construct, then call open(), then pushFrameRgb24()
 // repeatedly with monotonically-increasing pts, then finalize() once.
 // Errors are reported via std::optional<std::string> error messages and
