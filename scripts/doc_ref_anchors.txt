@@ -1,11 +1,11 @@
 # doc_ref_check anchors (UTF-8): path:range<TAB>literal. The first TAB splits; the literal may contain spaces.
 # The key is the resolved reference (a basename is enough when it is unique); the literal must appear in the range (+- --slack).
 # A literal shorter than 6 chars or on more than 3 lines of the target is a WEAK_ANCHOR; one no reference uses is an UNUSED_ANCHOR.
-README.md:823	ブラシを持つクリップの RenderInPlace
+README.md:824	ブラシを持つクリップの RenderInPlace
 src/AudioExportMix.cpp:211	audioexport::sortedDedupedEnvelope(
 src/AudioExportMix.cpp:223	audio::clampClipGain(point.gain)
 src/AudioExportMix.cpp:237	audioexport::mergeDuckingEnvelope(
-src/AudioExportMix.cpp:391-399	const auto trackAudible = [&](int track)
+src/AudioExportMix.cpp:392-400	const auto trackAudible = [&](int track)
 src/AudioExportMix.cpp:51	audio::clampClipGain(entry.volume)
 src/AudioMixer.cpp:934	double gain = audio::clampClipGain(clipGain);
 src/AudioMixerDock.cpp:198-203	m_timeline->toggleMuteTrack(i);
@@ -19,15 +19,15 @@ src/GLPreview.cpp:1259	if (m_brushAnimation && !cameraBaked && !specialComposite
 src/GLPreview.cpp:159	clipanim::layer3DAt(clip, clipLocalSeconds)
 src/GLPreview.cpp:2255	m_projectCameraFrame = tlrender::renderFrameAt(
 src/GLPreview.cpp:2998	!m_solvePointOverlay.isEmpty()
-src/MainWindow.cpp:13300	400% = max
-src/MainWindow.cpp:16962	MainWindow::createNullAtSolvePoint(int index)
-src/MainWindow.cpp:17856-17859	applied.poses.cbegin(), applied.poses.cend()
-src/MainWindow.cpp:17876-17884	3D カメラ解析を適用できませんでした
-src/MainWindow.cpp:9675	preview/text3dProxyThreshold
-src/MainWindow.cpp:10079	active.layer.zOrder = trackIdx;
-src/MainWindow.cpp:10080	active.layer.layer3D = clipanim::layer3DAt(
-src/MainWindow.cpp:10122	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
-src/MainWindow.cpp:10169-10176	if (!hasTrackMatteLayer)
+src/MainWindow.cpp:13351	400% = max
+src/MainWindow.cpp:17013	MainWindow::createNullAtSolvePoint(int index)
+src/MainWindow.cpp:17907-17910	applied.poses.cbegin(), applied.poses.cend()
+src/MainWindow.cpp:17927-17935	3D カメラ解析を適用できませんでした
+src/MainWindow.cpp:9686	preview/text3dProxyThreshold
+src/MainWindow.cpp:10090	active.layer.zOrder = trackIdx;
+src/MainWindow.cpp:10091	active.layer.layer3D = clipanim::layer3DAt(
+src/MainWindow.cpp:10133	activeLayers[a].layer.zOrder < activeLayers[b].layer.zOrder
+src/MainWindow.cpp:10180-10187	if (!hasTrackMatteLayer)
 src/PlanarTrackerDialog.cpp:920	m_cameraFovWarning->setText(
 src/ProjectFile.cpp:1706	clip.dynamicTimeOffsetSec != 0.0
 src/RenderInPlace.cpp:27-29	The brush (brushData, brush_progress) is drawn
@@ -41,12 +41,12 @@ src/Text3DExtrusionDialog.cpp:438-440	result->setTimeOffsetSec(timeOffset.toDoub
 src/Text3DLayer.cpp:382	kPreviewProxyLongEdge) / static_cast<double>(longDim)
 src/Text3DLayer.cpp:390	if (threshold <= 0 || !layer.extrudeEnabled())
 src/Text3DLayer.cpp:394	std::max(frameSize.width(), frameSize.height()) > threshold
-src/Timeline.cpp:1989	bool splitClipByConsumedSource(
-src/Timeline.cpp:2028	piece.timeRemapCurve = timeremap::TimeRemapCurve{};
-src/Timeline.cpp:2037	clip.timeRemapCurve.sliced(fromSec, toSec, mn)
-src/Timeline.cpp:2185-2188	secondHalf.timeRemapCurve = timeremap::TimeRemapCurve{};
-src/Timeline.cpp:2195	secondHalf.leadIn = Transition{};
-src/Timeline.cpp:2268	secondHalf.dynamicTimeOffsetSec += cutLocalSec;
+src/Timeline.cpp:2002	bool splitClipByConsumedSource(
+src/Timeline.cpp:2041	piece.timeRemapCurve = timeremap::TimeRemapCurve{};
+src/Timeline.cpp:2050	clip.timeRemapCurve.sliced(fromSec, toSec, mn)
+src/Timeline.cpp:2198-2201	secondHalf.timeRemapCurve = timeremap::TimeRemapCurve{};
+src/Timeline.cpp:2208	secondHalf.leadIn = Transition{};
+src/Timeline.cpp:2281	secondHalf.dynamicTimeOffsetSec += cutLocalSec;
 src/TimelineFrameRenderer.cpp:2136	bool timelineBrushWantsSpecialPath(
 src/TimelineFrameRenderer.cpp:2598-2601	hit.decodable = clipgeom::isNullObjectFilePath(
 src/TimelineFrameRenderer.cpp:3579	V1 base painted last
