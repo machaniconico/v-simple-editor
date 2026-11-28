@@ -21,7 +21,11 @@ enum class Target {
     PreviewText = 0,
     PreviewVideoClip = 1,
     PreviewBackground = 2,
-    TimelineAudioClip = 3
+    TimelineAudioClip = 3,
+    PreviewShape = 4,
+    PreviewExternalGenerator = 5,
+    TimelineVideoClip = 6,
+    TimelineGap = 7
 };
 
 struct ActionDef {
@@ -83,6 +87,15 @@ bool insertAudioClipAtTime(Timeline *timeline,
                            const QString &audioPath,
                            double startSec,
                            int trackIdxOneBased = 2);
+
+// Wave 33: Timeline gap / blank area editing helpers (1-step Undo).
+bool addMarkerAtTime(Timeline *timeline,
+                     double timeSec,
+                     const QString &name = QStringLiteral("マーカー"));
+bool addBlankTextAtTime(Timeline *timeline,
+                        double timeSec,
+                        const QString &text = QStringLiteral("テキスト"),
+                        double durationSec = 3.0);
 
 class ContextMenuCustomizeDialog : public QDialog {
     Q_OBJECT

@@ -9024,15 +9024,64 @@ void Timeline::showGapContextMenu(TimelineTrack *track, double timeSec, const QP
     }
 
     QMenu menu;
-    QAction *closeGapAct = menu.addAction(QStringLiteral("ギャップを詰める"));
-    closeGapAct->setEnabled(hasGap && !blockedByClip);
+    QAction *closeGapAct = nullptr;
+    QAction *addMarkerAct = nullptr;
+    QAction *addTextAct = nullptr;
+    QAction *addAdjustmentAct = nullptr;
+    QAction *pasteAct = nullptr;
+    QAction *movePlayheadAct = nullptr;
+
+    const QVector<ctxmenu::ResolvedItem> gLayout =
+        ctxmenu::loadLayout(ctxmenu::Target::TimelineGap);
+    for (const auto &item : gLayout) {
+        if (!item.visible)
+            continue;
+        const QString &id = item.id;
+        if (id == QStringLiteral("gap.close")) {
+            closeGapAct = menu.addAction(item.label);
+            closeGapAct->setEnabled(hasGap && !blockedByClip);
+        } else if (id == QStringLiteral("gap.add_marker")) {
+            addMarkerAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("gap.add_text")) {
+            addTextAct = menu.addAction(item.label);
+            addTextAct->setEnabled(!m_videoTracks.isEmpty() && !m_videoTracks.first()->clips().isEmpty());
+        } else if (id == QStringLiteral("gap.add_adjustment")) {
+            addAdjustmentAct = menu.addAction(item.label);
+            addAdjustmentAct->setEnabled(!m_videoTracks.isEmpty());
+        } else if (id == QStringLiteral("gap.paste")) {
+            pasteAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("gap.move_playhead")) {
+            movePlayheadAct = menu.addAction(item.label);
+        }
+        if (item.separatorAfter)
+            menu.addSeparator();
+    }
+
     menu.addSeparator();
-    QAction *addAdjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
-    addAdjustmentAct->setEnabled(!m_videoTracks.isEmpty());
+    QAction *customizeAct = menu.addAction(QStringLiteral("メニューをカスタマイズ…"));
+
     QAction *chosen = menu.exec(globalPos);
-    if (chosen == closeGapAct && closeGapAct->isEnabled())
+    if (!chosen) return;
+    if (chosen == customizeAct) {
+        ctxmenu::ContextMenuCustomizeDialog dlg(ctxmenu::Target::TimelineGap, this);
+        dlg.exec();
+        return;
+    }
+    if (chosen == closeGapAct && closeGapAct->isEnabled()) {
         closeGapAt(track, timeSec);
-    else if (chosen == addAdjustmentAct && addAdjustmentAct->isEnabled()) {
+    } else if (chosen == addMarkerAct) {
+        bool ok = false;
+        const QString name = QInputDialog::getText(
+            this, QStringLiteral("マーカーを追加"),
+            QStringLiteral("マーカー名 (%1 秒):").arg(qMax(0.0, timeSec), 0, 'f', 2),
+            QLineEdit::Normal, QStringLiteral("マーカー"), &ok);
+        if (ok) {
+            ctxmenu::addMarkerAtTime(this, qMax(0.0, timeSec), name);
+            emit positionChanged(m_playheadPos);
+        }
+    } else if (chosen == addTextAct && addTextAct->isEnabled()) {
+        ctxmenu::addBlankTextAtTime(this, qMax(0.0, timeSec));
+    } else if (chosen == addAdjustmentAct && addAdjustmentAct->isEnabled()) {
         int trackIndex = m_videoTracks.indexOf(track);
         if (trackIndex < 0)
             trackIndex = (m_activeVideoTrackIndex >= 0) ? m_activeVideoTrackIndex : 0;
@@ -9041,6 +9090,12 @@ void Timeline::showGapContextMenu(TimelineTrack *track, double timeSec, const QP
             startSec,
             startSec + static_cast<double>(kDefaultAdjustmentLayerDurationUs) / 1.0e6,
             trackIndex));
+    } else if (chosen == pasteAct) {
+        setPlayheadPosition(qMax(0.0, timeSec));
+        pasteClip();
+    } else if (chosen == movePlayheadAct) {
+        setPlayheadPosition(qMax(0.0, timeSec));
+        emit positionChanged(m_playheadPos);
     }
 }
 
@@ -10385,6 +10440,8 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aSequence = nullptr;
         QAction *aConnect = nullptr;
         QAction *aDisconnect = nullptr;
+        QAction *aPitchShiftAct = nullptr;
+        QList<QPair<QAction *, cliproles::Role>> aRoleActions;
         const ClipInfo sequenceSource = aClip;
 
         const QVector<ctxmenu::ResolvedItem> aLayout =
@@ -10488,22 +10545,22 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
                 aConnect = aMenu.addAction(tr("主ストーリーラインに接続"));
                 aDisconnect = aMenu.addAction(tr("接続を解除"));
                 aDisconnect->setEnabled(!aClip.anchorUid.isEmpty());
+            } else if (id == QStringLiteral("audio.pitch_shift")) {
+                aPitchShiftAct = aMenu.addAction(item.label);
+            } else if (id == QStringLiteral("audio.role")) {
+                QMenu *aRoleMenu = aMenu.addMenu(item.label);
+                const cliproles::Role curAudioRole = cliproles::effectiveRoleForClip(aClip, true);
+                for (const auto &rm : cliproles::allRoles()) {
+                    if (!rm.isAudioRole && rm.role != cliproles::Role::None)
+                        continue;
+                    QAction *ra = aRoleMenu->addAction(rm.displayName);
+                    ra->setCheckable(true);
+                    ra->setChecked(curAudioRole == rm.role);
+                    aRoleActions.append({ra, rm.role});
+                }
             }
             if (item.separatorAfter)
                 aMenu.addSeparator();
-        }
-        aMenu.addSeparator();
-        QAction *aPitchShiftAct = aMenu.addAction(QStringLiteral("ピッチシフト / ボイスチェンジャー…"));
-        QMenu *aRoleMenu = aMenu.addMenu(QStringLiteral("ロールを設定"));
-        QList<QPair<QAction *, cliproles::Role>> aRoleActions;
-        const cliproles::Role curAudioRole = cliproles::effectiveRoleForClip(aClip, true);
-        for (const auto &rm : cliproles::allRoles()) {
-            if (!rm.isAudioRole && rm.role != cliproles::Role::None)
-                continue;
-            QAction *ra = aRoleMenu->addAction(rm.displayName);
-            ra->setCheckable(true);
-            ra->setChecked(curAudioRole == rm.role);
-            aRoleActions.append({ra, rm.role});
         }
         aMenu.addSeparator();
         QAction *aCustomize = aMenu.addAction(QStringLiteral("メニューをカスタマイズ…"));
@@ -10843,48 +10900,10 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QMenu menu;
-    QAction *sequenceFromClip = menu.addAction(QStringLiteral("このクリップから新規シーケンス"));
-    sequenceFromClip->setEnabled(clipInfo.sequenceRefId.isEmpty() && !clipInfo.filePath.isEmpty());
     const ClipInfo sequenceSource = clipInfo;
     const int renderTrack = m_videoTracks.indexOf(track);
-    if (renderTrack >= 0) {
-        auto *bake = menu.addAction(QStringLiteral("効果を焼き込んで差し替え…"));
-        bake->setEnabled(!track->isLocked());
-        connect(bake, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
-            emit renderInPlaceRequested(renderTrack, clipIndex);
-        });
-        auto *restore = menu.addAction(QStringLiteral("元のクリップに戻す"));
-        restore->setEnabled(!track->isLocked() && bool(track->clips()[clipIndex].renderInPlaceOriginal));
-        connect(restore, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
-            renderinplace::decomposeRenderInPlace(*this, renderTrack, clipIndex);
-        });
-        menu.addSeparator();
-    }
-    // US-1202: primary-storyline connection of a V2+ clip (no shortcut). The
-    // audio branch above returns early and has its own entries.
     const TrackKind menuKind = TrackKind::Video;
     const int menuTrackIndex = m_videoTracks.indexOf(track);
-    if (menuTrackIndex > 0) {
-        auto *connectAct = menu.addAction(tr("主ストーリーラインに接続"));
-        connect(connectAct, &QAction::triggered, this, [this, menuKind, menuTrackIndex, clipIndex]() {
-            QString err;
-            if (!connectToStoryline(menuKind, menuTrackIndex, clipIndex, &err))
-                emit statusMessageRequested(err, 4000);
-        });
-        auto *disconnectAct = menu.addAction(tr("接続を解除"));
-        disconnectAct->setEnabled(!clipInfo.anchorUid.isEmpty());
-        connect(disconnectAct, &QAction::triggered, this, [this, menuKind, menuTrackIndex, clipIndex]() {
-            QString err;
-            if (!disconnectClip(menuKind, menuTrackIndex, clipIndex, &err))
-                emit statusMessageRequested(err, 4000);
-        });
-        menu.addSeparator();
-    }
-    QAction *cutAct = menu.addAction(QStringLiteral("カット"));
-    QAction *copyAct = menu.addAction(QStringLiteral("コピー"));
-    QAction *deleteAct = menu.addAction(QStringLiteral("削除"));
-    QAction *replaceAct = menu.addAction(QStringLiteral("置き換え"));
-    QAction *freezeFrameAct = menu.addAction(QStringLiteral("フリーズフレームを追加"));
     auto playheadInsideClickedClip = [&]() {
         const auto &clips = track->clips();
         double cursor = 0.0;
@@ -10897,174 +10916,306 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         }
         return false;
     };
-    freezeFrameAct->setEnabled(playheadInsideClickedClip());
-    QAction *silenceCutAct = menu.addAction(QStringLiteral("無音を自動カット..."));
-    QAction *beatMarkerAct = menu.addAction(QStringLiteral("ビートでマーカー..."));
-    menu.addSeparator();
-    QAction *unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
-    unlinkAct->setEnabled(linkGroup > 0);
-    QAction *relinkAct = menu.addAction(QStringLiteral("再同期"));
-    relinkAct->setEnabled(linkGroup == 0);
 
-    menu.addSeparator();
-    const AudioChannelMode currentChannelMode = currentLinkedAudioChannelMode();
-    QMenu *channelMenu = menu.addMenu(QStringLiteral("チャンネルマッピング"));
-    QAction *stereoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
-                                                   AudioChannelMode::Stereo);
-    QAction *fillLeftAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
-                                                     AudioChannelMode::FillLeft);
-    QAction *fillRightAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
-                                                      AudioChannelMode::FillRight);
-    QAction *swapAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
-                                                 AudioChannelMode::Swap);
-    QAction *monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode,
-                                                 AudioChannelMode::Mono);
-    menu.addSeparator();
-    QAction *enabledAction = menu.addAction(QStringLiteral("クリップを有効にする"));
-    enabledAction->setCheckable(true);
-    enabledAction->setChecked(track->clips()[clipIndex].visible);
-    enabledAction->setEnabled(!track->isLocked() && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
-    QMenu *labelMenu = menu.addMenu(QStringLiteral("ラベルカラー"));
-    const QList<QPair<QAction *, ClipLabel>> labelActions{
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::None), ClipLabel::None},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Red), ClipLabel::Red},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Orange), ClipLabel::Orange},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Yellow), ClipLabel::Yellow},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Green), ClipLabel::Green},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Cyan), ClipLabel::Cyan},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Blue), ClipLabel::Blue},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Purple), ClipLabel::Purple},
-        {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Pink), ClipLabel::Pink}
-    };
-    menu.addSeparator();
-    QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
-    QAction *xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
-    QAction *fdAct = transitionMenu->addAction(QStringLiteral("フィルムディゾルブ (1.0s)"));
-    QAction *ddAct = transitionMenu->addAction(QStringLiteral("ディザディゾルブ (1.0s)"));
-    QAction *blAct = transitionMenu->addAction(QStringLiteral("ブラーディゾルブ (1.0s)"));
-    QAction *pxAct = transitionMenu->addAction(QStringLiteral("ピクセレート (1.0s)"));
-    QAction *fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
-    QAction *foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
-    QAction *dbAct = transitionMenu->addAction(QStringLiteral("黒へディップ (1.0s)"));
-    QAction *dwAct = transitionMenu->addAction(QStringLiteral("白へディップ (1.0s)"));
-    transitionMenu->addSeparator();
-    QMenu *wipeMenu = transitionMenu->addMenu(QStringLiteral("ワイプ (1.0s)"));
-    QAction *wlAct = wipeMenu->addAction(QStringLiteral("左 → 右"));
-    QAction *wrAct = wipeMenu->addAction(QStringLiteral("右 → 左"));
-    QAction *wuAct = wipeMenu->addAction(QStringLiteral("上 → 下"));
-    QAction *wdAct = wipeMenu->addAction(QStringLiteral("下 → 上"));
-    QAction *cwAct  = wipeMenu->addAction(QStringLiteral("時計回り"));
-    QAction *cwcAct = wipeMenu->addAction(QStringLiteral("反時計回り"));
-    QAction *bhAct  = wipeMenu->addAction(QStringLiteral("バーンドア (水平・開く)"));
-    QAction *bhcAct = wipeMenu->addAction(QStringLiteral("バーンドア (水平・閉じる)"));
-    QAction *bvAct  = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・開く)"));
-    QAction *bvcAct = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・閉じる)"));
-    QMenu *slideMenu = transitionMenu->addMenu(QStringLiteral("スライド (1.0s)"));
-    QAction *slAct = slideMenu->addAction(QStringLiteral("左へ"));
-    QAction *srAct = slideMenu->addAction(QStringLiteral("右へ"));
-    QAction *suAct = slideMenu->addAction(QStringLiteral("上へ"));
-    QAction *sdAct = slideMenu->addAction(QStringLiteral("下へ"));
-    QMenu *pushMenu = transitionMenu->addMenu(QStringLiteral("プッシュ (1.0s)"));
-    QAction *plAct = pushMenu->addAction(QStringLiteral("左へ"));
-    QAction *prAct = pushMenu->addAction(QStringLiteral("右へ"));
-    QAction *puAct = pushMenu->addAction(QStringLiteral("上へ"));
-    QAction *pdAct = pushMenu->addAction(QStringLiteral("下へ"));
-    QMenu *irisMenu = transitionMenu->addMenu(QStringLiteral("アイリス (1.0s)"));
-    QAction *irAct  = irisMenu->addAction(QStringLiteral("円・開く"));
-    QAction *ircAct = irisMenu->addAction(QStringLiteral("円・閉じる"));
-    QAction *ibAct  = irisMenu->addAction(QStringLiteral("矩形・開く"));
-    QAction *ibcAct = irisMenu->addAction(QStringLiteral("矩形・閉じる"));
-    QAction *czAct = transitionMenu->addAction(QStringLiteral("クロスズーム (1.0s)"));
-    QMenu *spinMenu = transitionMenu->addMenu(QStringLiteral("スピン (1.0s)"));
-    QAction *scwAct  = spinMenu->addAction(QStringLiteral("時計回り"));
-    QAction *sccwAct = spinMenu->addAction(QStringLiteral("反時計回り"));
-    QMenu *whipMenu = transitionMenu->addMenu(QStringLiteral("ウィップパン (0.5s)"));
-    QAction *wplAct = whipMenu->addAction(QStringLiteral("左へ"));
-    QAction *wprAct = whipMenu->addAction(QStringLiteral("右へ"));
-    QAction *glAct  = transitionMenu->addAction(QStringLiteral("グリッチ (0.5s)"));
-    QAction *mcAct  = transitionMenu->addAction(QStringLiteral("モーフカット (1.0s)"));
-    QAction *llAct  = transitionMenu->addAction(QStringLiteral("ライトリーク (1.0s)"));
-    QAction *lfAct  = transitionMenu->addAction(QStringLiteral("レンズフレア (1.0s)"));
-    QAction *fbAct  = transitionMenu->addAction(QStringLiteral("フィルムバーン (1.0s)"));
-    QAction *skAct  = transitionMenu->addAction(QStringLiteral("カメラシェイク (0.5s)"));
-    QAction *chAct  = transitionMenu->addAction(QStringLiteral("チャンネルシフト (0.5s)"));
-    QMenu *flipMenu = transitionMenu->addMenu(QStringLiteral("フリップ (1.0s)"));
-    QAction *fhAct  = flipMenu->addAction(QStringLiteral("水平 (Y軸回転)"));
-    QAction *fvAct  = flipMenu->addAction(QStringLiteral("垂直 (X軸回転)"));
-    transitionMenu->addSeparator();
-    // User-saved presets — populated dynamically from QSettings via
-    // TransitionPresetStore. Empty submenu when nothing is saved.
-    QMenu *presetMenu = transitionMenu->addMenu(QStringLiteral("プリセット"));
+    QAction *sequenceFromClip = nullptr;
+    QAction *cutAct = nullptr;
+    QAction *copyAct = nullptr;
+    QAction *deleteAct = nullptr;
+    QAction *replaceAct = nullptr;
+    QAction *freezeFrameAct = nullptr;
+    QAction *silenceCutAct = nullptr;
+    QAction *beatMarkerAct = nullptr;
+    QAction *unlinkAct = nullptr;
+    QAction *relinkAct = nullptr;
+    QAction *stereoAct = nullptr;
+    QAction *fillLeftAct = nullptr;
+    QAction *fillRightAct = nullptr;
+    QAction *swapAct = nullptr;
+    QAction *monoAct = nullptr;
+    QAction *enabledAction = nullptr;
+    QList<QPair<QAction *, ClipLabel>> labelActions;
+    QAction *xdAct = nullptr;
+    QAction *fdAct = nullptr;
+    QAction *ddAct = nullptr;
+    QAction *blAct = nullptr;
+    QAction *pxAct = nullptr;
+    QAction *fiAct = nullptr;
+    QAction *foAct = nullptr;
+    QAction *dbAct = nullptr;
+    QAction *dwAct = nullptr;
+    QAction *wlAct = nullptr;
+    QAction *wrAct = nullptr;
+    QAction *wuAct = nullptr;
+    QAction *wdAct = nullptr;
+    QAction *cwAct = nullptr;
+    QAction *cwcAct = nullptr;
+    QAction *bhAct = nullptr;
+    QAction *bhcAct = nullptr;
+    QAction *bvAct = nullptr;
+    QAction *bvcAct = nullptr;
+    QAction *slAct = nullptr;
+    QAction *srAct = nullptr;
+    QAction *suAct = nullptr;
+    QAction *sdAct = nullptr;
+    QAction *plAct = nullptr;
+    QAction *prAct = nullptr;
+    QAction *puAct = nullptr;
+    QAction *pdAct = nullptr;
+    QAction *irAct = nullptr;
+    QAction *ircAct = nullptr;
+    QAction *ibAct = nullptr;
+    QAction *ibcAct = nullptr;
+    QAction *czAct = nullptr;
+    QAction *scwAct = nullptr;
+    QAction *sccwAct = nullptr;
+    QAction *wplAct = nullptr;
+    QAction *wprAct = nullptr;
+    QAction *glAct = nullptr;
+    QAction *mcAct = nullptr;
+    QAction *llAct = nullptr;
+    QAction *lfAct = nullptr;
+    QAction *fbAct = nullptr;
+    QAction *skAct = nullptr;
+    QAction *chAct = nullptr;
+    QAction *fhAct = nullptr;
+    QAction *fvAct = nullptr;
     QList<QPair<QAction *, TransitionPreset>> presetActs;
-    {
-        const auto loaded = TransitionPresetStore::loadAll();
-        if (loaded.isEmpty()) {
-            QAction *empty = presetMenu->addAction(QStringLiteral("(プリセット未登録)"));
-            empty->setEnabled(false);
-        } else {
-            for (const auto &p : loaded) {
-                const QString label = QStringLiteral("%1  (%2, %3s)")
-                    .arg(p.name)
-                    .arg(Transition::typeName(p.transition.type))
-                    .arg(p.transition.duration, 0, 'f', 1);
-                QAction *act = presetMenu->addAction(label);
-                presetActs.append({ act, p });
-            }
-        }
-    }
-    QAction *transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
+    QAction *transDialogAct = nullptr;
     QAction *transClearAct = nullptr;
-    if (hasTransition) {
-        transitionMenu->addSeparator();
-        transClearAct = transitionMenu->addAction(QStringLiteral("トランジションを削除"));
-    }
-
     QAction *shapeModifiersAct = nullptr;
-    if (!clipInfo.shapes.isEmpty())
-        shapeModifiersAct = menu.addAction(QStringLiteral("シェイプモディファイア…"));
-
     QAction *extGenConfigAct = nullptr;
     QAction *extGenBakeAct = nullptr;
-    if (extgen::isExternalGeneratorFilePath(clipInfo.filePath)) {
-        extGenConfigAct = menu.addAction(QStringLiteral("外部ジェネレータ設定…"));
-        extGenBakeAct = menu.addAction(QStringLiteral("外部ジェネレータを動画にベイク…"));
+    QAction *puppetRigAct = nullptr;
+    QAction *fxAct = nullptr;
+    QAction *ccAct = nullptr;
+    QAction *gradeVerAct = nullptr;
+    QAction *creativeFxAct = nullptr;
+    QAction *saveSubclipAct = nullptr;
+    QAction *beatCutAct = nullptr;
+    QList<QPair<QAction *, cliproles::Role>> vRoleActions;
+    QAction *adjustmentAct = nullptr;
+    QAction *parentAct = nullptr;
+    QAction *nullAct = nullptr;
+    QAction *autoOrientAct = nullptr;
+    QAction *autoOrientCameraAct = nullptr;
+    QAction *snsFitAct = nullptr;
+    QAction *snsCoverAct = nullptr;
+    QAction *snsFillAct = nullptr;
+
+    const QVector<ctxmenu::ResolvedItem> vLayout =
+        ctxmenu::loadLayout(ctxmenu::Target::TimelineVideoClip);
+    for (const auto &item : vLayout) {
+        if (!item.visible)
+            continue;
+        const QString &id = item.id;
+        if (id == QStringLiteral("tvideo.cut")) {
+            cutAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("tvideo.copy")) {
+            copyAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("tvideo.delete")) {
+            deleteAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("tvideo.replace")) {
+            replaceAct = menu.addAction(item.label);
+        } else if (id == QStringLiteral("tvideo.freeze_frame")) {
+            freezeFrameAct = menu.addAction(item.label);
+            freezeFrameAct->setEnabled(playheadInsideClickedClip());
+        } else if (id == QStringLiteral("tvideo.puppet_rig")) {
+            puppetRigAct = menu.addAction(item.label);
+            puppetRigAct->setEnabled(!track->isLocked() && !clipInfo.isAdjustment);
+        } else if (id == QStringLiteral("tvideo.shape_or_extgen")) {
+            if (!clipInfo.shapes.isEmpty())
+                shapeModifiersAct = menu.addAction(QStringLiteral("シェイプモディファイア…"));
+            if (extgen::isExternalGeneratorFilePath(clipInfo.filePath)) {
+                extGenConfigAct = menu.addAction(QStringLiteral("外部ジェネレータ設定…"));
+                extGenBakeAct = menu.addAction(QStringLiteral("外部ジェネレータを動画にベイク…"));
+            }
+        } else if (id == QStringLiteral("tvideo.render_in_place")) {
+            if (renderTrack >= 0) {
+                auto *bake = menu.addAction(QStringLiteral("効果を焼き込んで差し替え…"));
+                bake->setEnabled(!track->isLocked());
+                connect(bake, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+                    emit renderInPlaceRequested(renderTrack, clipIndex);
+                });
+                auto *restore = menu.addAction(QStringLiteral("元のクリップに戻す"));
+                restore->setEnabled(!track->isLocked() && bool(track->clips()[clipIndex].renderInPlaceOriginal));
+                connect(restore, &QAction::triggered, this, [this, renderTrack, clipIndex]() {
+                    renderinplace::decomposeRenderInPlace(*this, renderTrack, clipIndex);
+                });
+            }
+        } else if (id == QStringLiteral("tvideo.transitions")) {
+            QMenu *transitionMenu = menu.addMenu(QStringLiteral("トランジション"));
+            xdAct = transitionMenu->addAction(QStringLiteral("クロスディゾルブ (1.0s)"));
+            fdAct = transitionMenu->addAction(QStringLiteral("フィルムディゾルブ (1.0s)"));
+            ddAct = transitionMenu->addAction(QStringLiteral("ディザディゾルブ (1.0s)"));
+            blAct = transitionMenu->addAction(QStringLiteral("ブラーディゾルブ (1.0s)"));
+            pxAct = transitionMenu->addAction(QStringLiteral("ピクセレート (1.0s)"));
+            fiAct = transitionMenu->addAction(QStringLiteral("フェードイン (0.5s)"));
+            foAct = transitionMenu->addAction(QStringLiteral("フェードアウト (0.5s)"));
+            dbAct = transitionMenu->addAction(QStringLiteral("黒へディップ (1.0s)"));
+            dwAct = transitionMenu->addAction(QStringLiteral("白へディップ (1.0s)"));
+            transitionMenu->addSeparator();
+            QMenu *wipeMenu = transitionMenu->addMenu(QStringLiteral("ワイプ (1.0s)"));
+            wlAct = wipeMenu->addAction(QStringLiteral("左 → 右"));
+            wrAct = wipeMenu->addAction(QStringLiteral("右 → 左"));
+            wuAct = wipeMenu->addAction(QStringLiteral("上 → 下"));
+            wdAct = wipeMenu->addAction(QStringLiteral("下 → 上"));
+            cwAct  = wipeMenu->addAction(QStringLiteral("時計回り"));
+            cwcAct = wipeMenu->addAction(QStringLiteral("反時計回り"));
+            bhAct  = wipeMenu->addAction(QStringLiteral("バーンドア (水平・開く)"));
+            bhcAct = wipeMenu->addAction(QStringLiteral("バーンドア (水平・閉じる)"));
+            bvAct  = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・開く)"));
+            bvcAct = wipeMenu->addAction(QStringLiteral("バーンドア (垂直・閉じる)"));
+            QMenu *slideMenu = transitionMenu->addMenu(QStringLiteral("スライド (1.0s)"));
+            slAct = slideMenu->addAction(QStringLiteral("左へ"));
+            srAct = slideMenu->addAction(QStringLiteral("右へ"));
+            suAct = slideMenu->addAction(QStringLiteral("上へ"));
+            sdAct = slideMenu->addAction(QStringLiteral("下へ"));
+            QMenu *pushMenu = transitionMenu->addMenu(QStringLiteral("プッシュ (1.0s)"));
+            plAct = pushMenu->addAction(QStringLiteral("左へ"));
+            prAct = pushMenu->addAction(QStringLiteral("右へ"));
+            puAct = pushMenu->addAction(QStringLiteral("上へ"));
+            pdAct = pushMenu->addAction(QStringLiteral("下へ"));
+            QMenu *irisMenu = transitionMenu->addMenu(QStringLiteral("アイリス (1.0s)"));
+            irAct  = irisMenu->addAction(QStringLiteral("円・開く"));
+            ircAct = irisMenu->addAction(QStringLiteral("円・閉じる"));
+            ibAct  = irisMenu->addAction(QStringLiteral("矩形・開く"));
+            ibcAct = irisMenu->addAction(QStringLiteral("矩形・閉じる"));
+            czAct = transitionMenu->addAction(QStringLiteral("クロスズーム (1.0s)"));
+            QMenu *spinMenu = transitionMenu->addMenu(QStringLiteral("スピン (1.0s)"));
+            scwAct  = spinMenu->addAction(QStringLiteral("時計回り"));
+            sccwAct = spinMenu->addAction(QStringLiteral("反時計回り"));
+            QMenu *whipMenu = transitionMenu->addMenu(QStringLiteral("ウィップパン (0.5s)"));
+            wplAct = whipMenu->addAction(QStringLiteral("左へ"));
+            wprAct = whipMenu->addAction(QStringLiteral("右へ"));
+            glAct  = transitionMenu->addAction(QStringLiteral("グリッチ (0.5s)"));
+            mcAct  = transitionMenu->addAction(QStringLiteral("モーフカット (1.0s)"));
+            llAct  = transitionMenu->addAction(QStringLiteral("ライトリーク (1.0s)"));
+            lfAct  = transitionMenu->addAction(QStringLiteral("レンズフレア (1.0s)"));
+            fbAct  = transitionMenu->addAction(QStringLiteral("フィルムバーン (1.0s)"));
+            skAct  = transitionMenu->addAction(QStringLiteral("カメラシェイク (0.5s)"));
+            chAct  = transitionMenu->addAction(QStringLiteral("チャンネルシフト (0.5s)"));
+            QMenu *flipMenu = transitionMenu->addMenu(QStringLiteral("フリップ (1.0s)"));
+            fhAct  = flipMenu->addAction(QStringLiteral("水平 (Y軸回転)"));
+            fvAct  = flipMenu->addAction(QStringLiteral("垂直 (X軸回転)"));
+            transitionMenu->addSeparator();
+            QMenu *presetMenu = transitionMenu->addMenu(QStringLiteral("プリセット"));
+            const auto loaded = TransitionPresetStore::loadAll();
+            if (loaded.isEmpty()) {
+                QAction *empty = presetMenu->addAction(QStringLiteral("(プリセット未登録)"));
+                empty->setEnabled(false);
+            } else {
+                for (const auto &p : loaded) {
+                    const QString label = QStringLiteral("%1  (%2, %3s)")
+                        .arg(p.name)
+                        .arg(Transition::typeName(p.transition.type))
+                        .arg(p.transition.duration, 0, 'f', 1);
+                    QAction *act = presetMenu->addAction(label);
+                    presetActs.append({ act, p });
+                }
+            }
+            transDialogAct = transitionMenu->addAction(QStringLiteral("カスタム..."));
+            if (hasTransition) {
+                transitionMenu->addSeparator();
+                transClearAct = transitionMenu->addAction(QStringLiteral("トランジションを削除"));
+            }
+        } else if (id == QStringLiteral("tvideo.effects")) {
+            fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
+        } else if (id == QStringLiteral("tvideo.color")) {
+            ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
+        } else if (id == QStringLiteral("tvideo.grade_versions")) {
+            gradeVerAct = menu.addAction(QStringLiteral("カラーグレード・バージョン管理…"));
+        } else if (id == QStringLiteral("tvideo.creative_fx")) {
+            creativeFxAct = menu.addAction(QStringLiteral("フィルムハレーション / ポスタライズ時間 / 3D 被写界深度…"));
+        } else if (id == QStringLiteral("tvideo.sns_fit")) {
+            QMenu *snsMenu = menu.addMenu(QStringLiteral("SNS フィット"));
+            snsFitAct = snsMenu->addAction(QStringLiteral("SNS: 幅フィット中央(全表示・レターボックス)"));
+            snsCoverAct = snsMenu->addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)"));
+            snsFillAct = snsMenu->addAction(QStringLiteral("SNS: フィット解除(全画面)"));
+        } else if (id == QStringLiteral("tvideo.silence_beat")) {
+            silenceCutAct = menu.addAction(QStringLiteral("無音を自動カット..."));
+            beatMarkerAct = menu.addAction(QStringLiteral("ビートでマーカー..."));
+            beatCutAct = menu.addAction(QStringLiteral("ビート同期自動カット (A1 基準)…"));
+        } else if (id == QStringLiteral("tvideo.unlink_relink")) {
+            unlinkAct = menu.addAction(QStringLiteral("同期を切る"));
+            unlinkAct->setEnabled(linkGroup > 0);
+            relinkAct = menu.addAction(QStringLiteral("再同期"));
+            relinkAct->setEnabled(linkGroup == 0);
+        } else if (id == QStringLiteral("tvideo.channel_map")) {
+            const AudioChannelMode currentChannelMode = currentLinkedAudioChannelMode();
+            QMenu *channelMenu = menu.addMenu(QStringLiteral("チャンネルマッピング"));
+            stereoAct = addAudioChannelModeAction(channelMenu, currentChannelMode, AudioChannelMode::Stereo);
+            fillLeftAct = addAudioChannelModeAction(channelMenu, currentChannelMode, AudioChannelMode::FillLeft);
+            fillRightAct = addAudioChannelModeAction(channelMenu, currentChannelMode, AudioChannelMode::FillRight);
+            swapAct = addAudioChannelModeAction(channelMenu, currentChannelMode, AudioChannelMode::Swap);
+            monoAct = addAudioChannelModeAction(channelMenu, currentChannelMode, AudioChannelMode::Mono);
+        } else if (id == QStringLiteral("tvideo.enabled")) {
+            enabledAction = menu.addAction(QStringLiteral("クリップを有効にする"));
+            enabledAction->setCheckable(true);
+            enabledAction->setChecked(track->clips()[clipIndex].visible);
+            enabledAction->setEnabled(!track->isLocked() && !clipgeom::isNullObjectFilePath(track->clips()[clipIndex].filePath));
+        } else if (id == QStringLiteral("tvideo.label")) {
+            QMenu *labelMenu = menu.addMenu(QStringLiteral("ラベルカラー"));
+            labelActions = {
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::None), ClipLabel::None},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Red), ClipLabel::Red},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Orange), ClipLabel::Orange},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Yellow), ClipLabel::Yellow},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Green), ClipLabel::Green},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Cyan), ClipLabel::Cyan},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Blue), ClipLabel::Blue},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Purple), ClipLabel::Purple},
+                {addClipLabelAction(labelMenu, clipInfo.label, ClipLabel::Pink), ClipLabel::Pink}
+            };
+        } else if (id == QStringLiteral("tvideo.role")) {
+            QMenu *vRoleMenu = menu.addMenu(QStringLiteral("ロールを設定"));
+            const cliproles::Role curVideoRole = cliproles::effectiveRoleForClip(clipInfo, false);
+            for (const auto &rm : cliproles::allRoles()) {
+                if (rm.isAudioRole)
+                    continue;
+                QAction *ra = vRoleMenu->addAction(rm.displayName);
+                ra->setCheckable(true);
+                ra->setChecked(curVideoRole == rm.role);
+                vRoleActions.append({ra, rm.role});
+            }
+        } else if (id == QStringLiteral("tvideo.subclip")) {
+            saveSubclipAct = menu.addAction(QStringLiteral("サブクリップとして保存"));
+        } else if (id == QStringLiteral("tvideo.new_sequence")) {
+            sequenceFromClip = menu.addAction(QStringLiteral("このクリップから新規シーケンス"));
+            sequenceFromClip->setEnabled(clipInfo.sequenceRefId.isEmpty() && !clipInfo.filePath.isEmpty());
+        } else if (id == QStringLiteral("tvideo.storyline")) {
+            if (menuTrackIndex > 0) {
+                auto *connectAct = menu.addAction(tr("主ストーリーラインに接続"));
+                connect(connectAct, &QAction::triggered, this, [this, menuKind, menuTrackIndex, clipIndex]() {
+                    QString err;
+                    if (!connectToStoryline(menuKind, menuTrackIndex, clipIndex, &err))
+                        emit statusMessageRequested(err, 4000);
+                });
+                auto *disconnectAct = menu.addAction(tr("接続を解除"));
+                disconnectAct->setEnabled(!clipInfo.anchorUid.isEmpty());
+                connect(disconnectAct, &QAction::triggered, this, [this, menuKind, menuTrackIndex, clipIndex]() {
+                    QString err;
+                    if (!disconnectClip(menuKind, menuTrackIndex, clipIndex, &err))
+                        emit statusMessageRequested(err, 4000);
+                });
+            }
+        } else if (id == QStringLiteral("tvideo.compositing")) {
+            adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
+            parentAct = menu.addAction(QStringLiteral("ペアレント..."));
+            nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
+            autoOrientAct = menu.addAction(QStringLiteral("パスに沿って自動回転"));
+            autoOrientAct->setCheckable(true);
+            autoOrientAct->setChecked(clipInfo.autoOrientEnabled);
+            autoOrientCameraAct = menu.addAction(QStringLiteral("カメラへ自動的に向ける"));
+            autoOrientCameraAct->setCheckable(true);
+            autoOrientCameraAct->setChecked(clipInfo.autoOrientToCamera);
+            autoOrientCameraAct->setEnabled(clipInfo.is3DLayer);
+        }
+        if (item.separatorAfter)
+            menu.addSeparator();
     }
 
-    QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
-    QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
-    QAction *gradeVerAct = menu.addAction(QStringLiteral("カラーグレード・バージョン管理…"));
-    QAction *creativeFxAct = menu.addAction(QStringLiteral("フィルムハレーション / ポスタライズ時間 / 3D 被写界深度…"));
-    QAction *saveSubclipAct = menu.addAction(QStringLiteral("サブクリップとして保存"));
-    QAction *beatCutAct = menu.addAction(QStringLiteral("ビート同期自動カット (A1 基準)…"));
-    QMenu *vRoleMenu = menu.addMenu(QStringLiteral("ロールを設定"));
-    QList<QPair<QAction *, cliproles::Role>> vRoleActions;
-    const cliproles::Role curVideoRole = cliproles::effectiveRoleForClip(clipInfo, false);
-    for (const auto &rm : cliproles::allRoles()) {
-        if (rm.isAudioRole)
-            continue;
-        QAction *ra = vRoleMenu->addAction(rm.displayName);
-        ra->setCheckable(true);
-        ra->setChecked(curVideoRole == rm.role);
-        vRoleActions.append({ra, rm.role});
-    }
-    QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
-    QAction *parentAct = menu.addAction(QStringLiteral("ペアレント..."));
-    QAction *nullAct = menu.addAction(QStringLiteral("ヌルオブジェクトを作成"));
-    QAction *autoOrientAct = menu.addAction(QStringLiteral("パスに沿って自動回転"));
-    autoOrientAct->setCheckable(true);
-    autoOrientAct->setChecked(clipInfo.autoOrientEnabled);
-    QAction *autoOrientCameraAct = menu.addAction(QStringLiteral("カメラへ自動的に向ける"));
-    autoOrientCameraAct->setCheckable(true);
-    autoOrientCameraAct->setChecked(clipInfo.autoOrientToCamera);
-    autoOrientCameraAct->setEnabled(clipInfo.is3DLayer);
     menu.addSeparator();
-    // SNS 縦動画フィット (相互排他の3択): 幅フィット=レターボックスで全表示 /
-    // 幅埋め=中央クロップで枠を歪みなく充填 / 解除=既定 (IgnoreAspectRatio で
-    // 枠に伸ばす)。fitContain と fitCover は engine 側 (snsfit::maybeFit) で
-    // cover 優先の相互排他なので、ここでも片方を立てたら他方は必ず倒す。
-    QAction *snsFitAct = menu.addAction(QStringLiteral("SNS: 幅フィット中央(全表示・レターボックス)"));
-    QAction *snsCoverAct = menu.addAction(QStringLiteral("SNS: 幅埋め(クロップ・歪みなし)"));
-    QAction *snsFillAct = menu.addAction(QStringLiteral("SNS: フィット解除(全画面)"));
+    QAction *vCustomizeAct = menu.addAction(QStringLiteral("メニューをカスタマイズ…"));
 
     auto applyLinkedAudioChannelMode = [&](AudioChannelMode mode) {
         bool changed = false;
@@ -11100,6 +11251,29 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     };
 
     QAction *chosen = menu.exec(globalPos);
+    if (!chosen) return;
+    if (chosen == vCustomizeAct) {
+        ctxmenu::ContextMenuCustomizeDialog dlg(ctxmenu::Target::TimelineVideoClip, this);
+        dlg.exec();
+        return;
+    }
+    if (chosen == puppetRigAct) {
+        const int vIdx = m_videoTracks.indexOf(track);
+        if (vIdx >= 0) {
+            double clipStart = 0.0;
+            const auto &clips = track->clips();
+            for (int i = 0; i <= clipIndex && i < clips.size(); ++i) {
+                clipStart += qMax(0.0, clips[i].leadInSec);
+                if (i < clipIndex) clipStart += clips[i].effectiveDuration();
+            }
+            const double localSec = qMax(0.0, m_playheadPos - clipStart);
+            puppet::PuppetRigDialog dlg(this, vIdx, clipIndex, localSec, [this]() {
+                scheduleEmitSequenceChanged();
+            }, this);
+            dlg.exec();
+        }
+        return;
+    }
     if (chosen == sequenceFromClip) {
         createSequenceFromClip(sequenceSource);
         return;
@@ -11108,8 +11282,6 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         setClipEnabled(TrackKind::Video, m_videoTracks.indexOf(track), clipIndex, enabledAction->isChecked());
         return;
     }
-
-    if (!chosen) return;
     for (const auto &pair : vRoleActions) {
         if (chosen == pair.first) {
             cliproles::setRoleForClip(clipInfo.uid, pair.second);

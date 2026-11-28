@@ -973,7 +973,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "rightclick-pause-pref", "VEDITOR_RIGHTCLICK_PAUSE_PREF_SELFTEST", runRightclickPausePrefSelftest, false,
       "Right-click pause preference resolver: default, booleans, numeric strings, invalid fallback" },
     { "context-menu-order", "VEDITOR_CONTEXT_MENU_ORDER_SELFTEST", runContextMenuOrderSelftest, true,
-      "Preview & audio context menu hit-test, per-target customizable ordering, text/SFX helpers and inline edit (8 gates)" },
+      "Preview & timeline context menu hit-test (8 targets: text/video/shape/extgen/bg/tvideo/taudio/gap), per-target customizable ordering, text/SFX/gap helpers and inline edit (12 gates)" },
     { "platform-loudness", "VEDITOR_PLATFORM_LOUDNESS_SELFTEST", runPlatformLoudnessSelftest, true,
       "Platform-specific LUFS loudness normalization presets, true-peak clamp, single/all-clips scope, undo and ExportDialog sync (8 gates)" },
     { "wave25-parity", "VEDITOR_WAVE25_PARITY_SELFTEST", runWave25ParitySelftest, true,
