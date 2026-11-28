@@ -2601,10 +2601,19 @@ void AudioMixer::MasterEqFilter::setDeEsser(const trackfx::DeEsserSettings &sett
     m_deesser.setSettings(settings, kSampleRateHz);
 }
 
+void AudioMixer::MasterEqFilter::setMultibandComp(const trackfx::MultibandCompSettings &settings,
+                                                  bool allowSolo)
+{
+    m_multibandCompEnabled = settings.enabled;
+    m_multibandComp.setAllowSolo(allowSolo);
+    m_multibandComp.setSettings(settings, kSampleRateHz);
+}
+
 void AudioMixer::MasterEqFilter::reset()
 {
     m_history.fill(0.0);
     m_deesser.reset();
+    m_multibandComp.reset();
 }
 
 double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
@@ -2625,12 +2634,15 @@ double AudioMixer::MasterEqFilter::processSample(double sample, int channel)
 
 void AudioMixer::MasterEqFilter::process(float *samples, int frames)
 {
-    if (m_deesserEnabled) {
+    if (m_deesserEnabled || m_multibandCompEnabled) {
         for (int frame = 0; frame < frames; ++frame) {
             const int i = frame * kChannels;
             double left = processSample(samples[i], 0) * 32768.0;
             double right = processSample(samples[i + 1], 1) * 32768.0;
-            m_deesser.processFrame(left, right);
+            if (m_deesserEnabled)
+                m_deesser.processFrame(left, right);
+            if (m_multibandCompEnabled)
+                m_multibandComp.processFrame(left, right);
             samples[i] = static_cast<float>(left / 32768.0);
             samples[i + 1] = static_cast<float>(right / 32768.0);
         }
@@ -2645,12 +2657,15 @@ void AudioMixer::MasterEqFilter::process(float *samples, int frames)
 
 void AudioMixer::MasterEqFilter::process(int32_t *samples, int frames)
 {
-    if (m_deesserEnabled) {
+    if (m_deesserEnabled || m_multibandCompEnabled) {
         for (int frame = 0; frame < frames; ++frame) {
             const int i = frame * kChannels;
             double left = processSample(samples[i], 0);
             double right = processSample(samples[i + 1], 1);
-            m_deesser.processFrame(left, right);
+            if (m_deesserEnabled)
+                m_deesser.processFrame(left, right);
+            if (m_multibandCompEnabled)
+                m_multibandComp.processFrame(left, right);
             samples[i] = static_cast<int32_t>(left);
             samples[i + 1] = static_cast<int32_t>(right);
         }
@@ -2737,18 +2752,68 @@ void AudioMixer::setMasterDeEsser(const trackfx::DeEsserSettings &settings)
     applyMasterChainLocked(master);
 }
 
+void AudioMixer::setMasterMultibandComp(const trackfx::MultibandCompSettings &settings)
+{
+    trackfx::Chain chain;
+    chain.multibandComp = settings;
+    const auto restored = trackfx::Chain::fromJson(chain.toJson()).multibandComp;
+    QMutexLocker lock(&m_controlMutex);
+    trackfx::Chain master = m_masterFxChain;
+    master.multibandComp = restored;
+    applyMasterChainLocked(master);
+}
+
 void AudioMixer::setMasterChain(const EqSettings &eq, bool eqEnabled,
-                                const trackfx::DeEsserSettings &deesser)
+                                const trackfx::DeEsserSettings &deesser,
+                                const trackfx::MultibandCompSettings &multibandComp)
 {
     trackfx::Chain settings;
     settings.deesser = deesser;
-    const auto restored = trackfx::Chain::fromJson(settings.toJson()).deesser;
+    settings.multibandComp = multibandComp;
+    const auto restored = trackfx::Chain::fromJson(settings.toJson());
     QMutexLocker lock(&m_controlMutex);
     trackfx::Chain master = m_masterFxChain;
     master.eq = eq;
     master.eqEnabled = eqEnabled;
-    master.deesser = restored;
+    master.deesser = restored.deesser;
+    master.multibandComp = restored.multibandComp;
     applyMasterChainLocked(master);
+}
+
+void AudioMixer::setTrackMultibandComp(int trackId, const trackfx::MultibandCompSettings &settings)
+{
+    if (trackId == kMasterTrackId) {
+        setMasterMultibandComp(settings);
+        return;
+    }
+    if (trackId < 0 || trackId >= kMaxAudioTracks) return;
+    trackfx::Chain tmp;
+    tmp.multibandComp = settings;
+    const auto restored = trackfx::Chain::fromJson(tmp.toJson()).multibandComp;
+    QMutexLocker lock(&m_controlMutex);
+    auto &chain = m_trackFxChains[trackId];
+    chain.multibandComp = restored;
+    m_trackFxProcessors[trackId].setChain(chain);
+}
+
+trackfx::MultibandCompSettings AudioMixer::trackMultibandComp(int trackId) const
+{
+    if (trackId == kMasterTrackId)
+        return masterChain().multibandComp;
+    QMutexLocker lock(&m_controlMutex);
+    return m_trackFxChains.value(trackId).multibandComp;
+}
+
+std::array<double, trackfx::MultibandCompSettings::kBandCount>
+AudioMixer::multibandGainReductionDb(int trackId) const
+{
+    QMutexLocker lock(&m_controlMutex);
+    if (trackId == kMasterTrackId)
+        return m_masterEqFilter.currentMultibandGrDb();
+    const auto p = m_trackFxProcessors.constFind(trackId);
+    if (p == m_trackFxProcessors.constEnd())
+        return {0.0, 0.0, 0.0, 0.0};
+    return p.value().currentMultibandGrDb();
 }
 
 quint64 AudioMixer::applyMasterChainLockedCallCountForTest() const
@@ -2763,14 +2828,17 @@ void AudioMixer::applyMasterChainLocked(const trackfx::Chain &chain)
     m_masterFxChain.eq = chain.eq;
     m_masterFxChain.eqEnabled = chain.eqEnabled;
     m_masterFxChain.deesser = chain.deesser;
+    m_masterFxChain.multibandComp = chain.multibandComp;
     m_masterEqFilter.setEq(chain.eqEnabled ? chain.eq : EqSettings{});
     m_masterEqFilter.setDeEsser(chain.deesser);
+    m_masterEqFilter.setMultibandComp(chain.multibandComp, /*allowSolo=*/true);
 }
 
 void AudioMixer::processMasterEqLocked(int32_t *samples, int frames)
 {
     if (m_masterEqBypassForTest
-        || (!m_masterFxChain.eqEnabled && !m_masterFxChain.deesser.enabled)) return;
+        || (!m_masterFxChain.eqEnabled && !m_masterFxChain.deesser.enabled
+            && !m_masterFxChain.multibandComp.enabled)) return;
     ++m_masterEqProcessCalls;
     m_masterEqFilter.process(samples, frames);
 }

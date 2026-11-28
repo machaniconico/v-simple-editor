@@ -69,6 +69,7 @@ double exporter_loudnessGainDb();
 #include "GLPreview.h"
 #include "EqualizerPanel.h"
 #include "DeEsserPanel.h"
+#include "MultibandCompressorPanel.h"
 #include "CompressorPanel.h"
 #include "ReverbPanel.h"
 #include "NoiseReductionPanel.h"
@@ -6348,6 +6349,12 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({compPanelAction,
         QStringLiteral("音量の差をならし、急に大きくなりすぎる音を防ぐ画面を開きます。")});
 
+    auto *multibandCompAction = audioMenu->addAction("マルチバンドコンプレッサー...");
+    multibandCompAction->setObjectName("action_audio_multiband_comp");
+    connect(multibandCompAction, &QAction::triggered, this, &MainWindow::openMultibandCompressorPanel);
+    m_menuHelpEntries.append({multibandCompAction,
+        QStringLiteral("4 帯域（LR4 クロスオーバー）ごとに独立してコンプレッサーを掛けます。マスター・各トラック両対応です。")});
+
     auto *deesserAction = audioMenu->addAction("ディエッサー...");
     deesserAction->setObjectName("action_audio_deesser");
     connect(deesserAction, &QAction::triggered, this, &MainWindow::openDeEsserPanel);
@@ -11555,7 +11562,8 @@ void MainWindow::applyAudioState(const ProjectData &data)
         mixer->clearTrackFx();
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
             mixer->setTrackChain(it.key(), it.value());
-        mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled, data.masterFx.deesser);
+        mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled,
+                              data.masterFx.deesser, data.masterFx.multibandComp);
         // Fader gain and pan: tracks absent from trackMix return to the defaults.
         for (int i = 0; i < AudioMixer::kMaxAudioTracks; ++i) {
             const TrackMixState mix = i < data.trackMix.size() ? data.trackMix[i] : TrackMixState{};
@@ -22281,13 +22289,19 @@ void MainWindow::restoreAudioFxUndoState(const QJsonObject &audioFx)
     for (const QString &id : ids) {
         if (chains.value(id) == liveChains.value(id)) continue;
         auto chain = trackfx::Chain::fromJson(chains.value(id).toObject());
-        chain.deesser.listen = mixer->trackChain(id.toInt()).deesser.listen;
+        const auto liveChain = mixer->trackChain(id.toInt());
+        chain.deesser.listen = liveChain.deesser.listen;
+        for (int b = 0; b < trackfx::MultibandCompSettings::kBandCount; ++b)
+            chain.multibandComp.bands[b].solo = liveChain.multibandComp.bands[b].solo;
         mixer->setTrackChain(id.toInt(), chain);
     }
     if (audioFx.value("masterChain") != live.value("masterChain")) {
         auto master = trackfx::Chain::fromJson(audioFx.value("masterChain").toObject());
-        master.deesser.listen = mixer->masterChain().deesser.listen;
-        mixer->setMasterChain(master.eq, master.eqEnabled, master.deesser);
+        const auto liveMaster = mixer->masterChain();
+        master.deesser.listen = liveMaster.deesser.listen;
+        for (int b = 0; b < trackfx::MultibandCompSettings::kBandCount; ++b)
+            master.multibandComp.bands[b].solo = liveMaster.multibandComp.bands[b].solo;
+        mixer->setMasterChain(master.eq, master.eqEnabled, master.deesser, master.multibandComp);
     }
     const QJsonObject legacyEq = audioFx.value("legacyEq").toObject();
     for (auto it = legacyEq.begin(); it != legacyEq.end(); ++it) {
@@ -22379,6 +22393,38 @@ void MainWindow::openDeEsserPanel()
     m_deesserDock->raise();
 }
 
+void MainWindow::openMultibandCompressorPanel()
+{
+    auto *mixer = m_player ? m_player->audioMixer() : nullptr;
+    if (!mixer) {
+        QMessageBox::information(this, tr("マルチバンドコンプレッサー"),
+            tr("オーディオミキサーが利用できません。"));
+        return;
+    }
+
+    if (!m_multibandCompDock) {
+        m_multibandCompDock = new QDockWidget(tr("マルチバンドコンプレッサー"), this);
+        m_multibandCompDock->setObjectName("MultibandCompressorDock");
+        auto *panel = new MultibandCompressorPanel(m_multibandCompDock);
+        panel->setMixer(mixer);
+        m_multibandCompDock->setWidget(panel);
+        addDockWidget(Qt::RightDockWidgetArea, m_multibandCompDock);
+
+        connect(panel, &MultibandCompressorPanel::settingsChanged,
+                this, [this](int trackId, trackfx::MultibandCompSettings settings) {
+            auto *mx = m_player ? m_player->audioMixer() : nullptr;
+            if (!mx) return;
+            mx->setTrackMultibandComp(trackId, settings);
+            setWindowModified(true);
+        });
+        connectAudioFxDockUndo(panel, tr("マルチバンドコンプレッサーを変更"));
+    }
+
+    reseedAudioFxDocks();
+    m_multibandCompDock->setVisible(true);
+    m_multibandCompDock->raise();
+}
+
 // Mixer is the source of truth: re-seed every open audio FX dock (track list and
 // every stored value) without emitting, so a stale panel can never overwrite new
 // mixer state. Called on show and after project load / new / undo restore /
@@ -22420,6 +22466,15 @@ void MainWindow::reseedAudioFxDocks()
             for (int id : ids)
                 panel->setSettings(id, (id == AudioMixer::kMasterTrackId
                     ? mixer->masterChain() : mixer->trackChain(id)).deesser);
+        }
+    }
+    if (m_multibandCompDock) {
+        if (auto *panel = qobject_cast<MultibandCompressorPanel *>(m_multibandCompDock->widget())) {
+            panel->setMixer(mixer);
+            audiofxui::buildAudioTrackList(trackCount, names, ids);
+            panel->setTracks(names, ids);
+            for (int id : ids)
+                panel->setSettings(id, mixer->trackMultibandComp(id));
         }
     }
     // Compressor / reverb / NR have no master row: engine ids 0..n-1 only.
@@ -22466,6 +22521,9 @@ void MainWindow::syncAudioFxDocks()
     if (m_noiseReductionDock) stale |= comboCount(m_noiseReductionDock, "nr_track") != tracks;
     if (auto *panel = m_deesserDock
             ? qobject_cast<DeEsserPanel *>(m_deesserDock->widget()) : nullptr)
+        stale |= panel->targetCount() != tracks + 1;
+    if (auto *panel = m_multibandCompDock
+            ? qobject_cast<MultibandCompressorPanel *>(m_multibandCompDock->widget()) : nullptr)
         stale |= panel->targetCount() != tracks + 1;
     if (stale)
         reseedAudioFxDocks();

@@ -2221,7 +2221,7 @@
     同じ最大 4 倍になります。すべて 2.0 以下のプロジェクトの書き出しは変わりません (render-fixture 15 ファイ
     ルと audio-fixture 23 ファイルが基点 5d7b69e と IDENTICAL。clip-sidecar G12)。クリップ音量のスライダー
     (AudioClipEditor の「音量」) は 0〜400 %、スピンは 0〜4、MainWindow の「Set Clip Volume」ダイアログ
-    (MainWindow.cpp:13292) は 400 % まで、MCP の set_clip_property の volume は 0..4 (4 を超えると「volume
+    (MainWindow.cpp:13300) は 400 % まで、MCP の set_clip_property の volume は 0..4 (4 を超えると「volume
     out of range [0, 4]」で拒否) で、プレビュー / 書き出し / MCP / 音量ダイアログがすべて 4.0 で一致します。
   ● 解消 (Wave 20、US-2007): Wave 19 で制限としていたタイムラインのエンベロープ (rubber band) の表示上限 0..2 は、0..4
     (audio::kMaxClipGain) になりました。unity (1.0) は縦の中央のままで、1..4 は上半分に区分的な線形で割り当てます。2.0
@@ -2293,7 +2293,7 @@
     ますが評価されません。wiggle と式は 3D には掛かりません。「カメラへ自動回転」(autoOrientToCamera) はキー
     フレームした回転も静的な回転と同じく上書きします。ワールド X / Y のキーフレームの単位は静的な値と同じキ
     ャンバス px です。プレビューでは、一時停止中の GL プレビュー (静的な経路とカメラへ自動回転の経路。
-    GLPreview.cpp:159) と特殊合成のライティング入力 (MainWindow.cpp:10073) が評価値を使い、書き出しと一致
+    GLPreview.cpp:159) と特殊合成のライティング入力 (MainWindow.cpp:10080) が評価値を使い、書き出しと一致
     します (keyframe-anim-parity G12)。モーションセクションの位置 Z / 回転のツールチップは「プロジェクトカメ
     ラ (trueProjection) が ON の時だけ描画されます」です (MotionSectionWidget.cpp:108-111)。
   ● プレビュー (US-1910。書き出しは変わりません): プロジェクトカメラの真の透視投影 (trueProjection) が OFF
@@ -2417,8 +2417,8 @@
     端です。本 Wave は幾何を設定された f に対して正しくするだけで、fov の妥当性を確認する UI はありませんでした (Wave 19 で入りました。下の「Wave 19 の変更」の UI。US-1907)。Wave 18 の時点で、カメラモーションダイアログの fov スピンは [10, 170] (Wave 19 から [1, 100000])、位置 / 注視点のスピンは ±9999 にクランプされるため(CameraMotionDialog.cpp:213-219)、範囲外の fov のカメラや、大きな S で位置が ±9999 を超えるカメラをダイアログで開い
     て書き戻すとクランプされます。焦点距離が 0 以下、または S が非有限か 0 以下の解析は適用されず、カメラと undo は変わり
     ません (ステータスバーに「3D カメラ解析を適用できませんでした（焦点距離またはスケールが不正です）」。
-    MainWindow.cpp:17868-17876)。有効な姿勢が無い解析も適用されず、カメラと undo は変わりませんが、この場合はステータス
-    バーに何も表示されません (MainWindow.cpp:17848-17851。通常は解析ダイアログ側で止まり、適用に進みません)。
+    MainWindow.cpp:17876-17884)。有効な姿勢が無い解析も適用されず、カメラと undo は変わりませんが、この場合はステータス
+    バーに何も表示されません (MainWindow.cpp:17856-17859。通常は解析ダイアログ側で止まり、適用に進みません)。
   ● Wave 18 で書き出しの結果が変わるのは、この 4 項目 (ブラシ付きクリップのスマートレンダー (バイトのみ) / ブラシの焼き
     込み / 新しい解析写像とそのプロジェクトの既存 3D レイヤー / 音量エンベロープの 1 ms 以内の点 (US-1807 の欠陥修正))
     だけです。書き出しは従来、1 ms 以内に並ぶ音量エンベロープの点を最小ゲインの 1 点にまとめていましたが、プレビューが読
@@ -2429,7 +2429,7 @@
     ァイルと audio-fixture 23 ファイルは基点 f924c62 と IDENTICAL です (US-1820)。fixture には 1 ms 以内に並ぶエンベロー
     プの点がありません (render-fixture の audio.json は volumeEnvelope が空、audio-fixture はエンベロープを置きません)。
   ● プレビューの特殊合成経路 (buildSpecialClipComposite) は、そのフレームにトラックマットが無いときは V1 を手前に並べ替
-    え、書き出し (renderFrameAt) と同じ重なり順になります (MainWindow.cpp:10162-10169)。マットがあるフレームは従来どおり上
+    え、書き出し (renderFrameAt) と同じ重なり順になります (MainWindow.cpp:10169-10176)。マットがあるフレームは従来どおり上
     位トラックが手前で、並べ替えはフレーム単位で決まります (マット元が終わったフレームでは V1 が手前)。Normal 以外のブ
     レンドと調整レイヤーはこの経路の対象外でした (Wave 19 で変更: VFX 素材の実効ブレンドは対象になりました。調整レイヤ
     ーは対象外のままです。「Wave 19 の変更」を参照。Wave 22 で変更: 調整クリップと調整レイヤーも renderFrameAt と同じ
@@ -2438,7 +2438,7 @@
     ません。US-1804)。
   ● 一時停止中のプレビューで、ブラシを持つタイムラインは特殊合成経路を通り、全クリップのブラシを書き出しと同じ素材段階
     (roto の後、grade / fx の前) で描き、選択中のクリップのブラシを重ねて描きません (TimelineFrameRenderer.cpp:2136 の
-    timelineBrushWantsSpecialPath、MainWindow.cpp:9691 / :10280)。通る条件は、ブラシを持つクリップがあり、かつタイムライ
+    timelineBrushWantsSpecialPath、MainWindow.cpp:9698 / :10287)。通る条件は、ブラシを持つクリップがあり、かつタイムライ
     ンに Normal 以外のブレンド / 調整クリップ / clip mask / 親子付け (有効時) / シェイプクリップ / シーケンス参照 / 無効
     クリップ / brush_progress 以外のキーフレーム / fitContain・fitCover / レイヤースタイル / トランジション (leadIn /
     trailOut) のどれも無いことです。判定はタイムライン全体のクリップで行い、再生ヘッドの時刻に無いクリップも数えていました (Wave 19 で変更: 再生ヘッド時刻に有効なクリップだけで判定します。「Wave 19 の変更」を参照。US-1906)。再
@@ -2490,7 +2490,7 @@
     ラナー解析と旧 solve には点群が無いので何も出ません (solve-points G4-G6。US-1817)。
   ● 3D ヌルの作成: 点群を表示中にプレビューの十字 (8 px 以内、最も近い点) を左クリックすると、その解析点のワールド X / Y
     と位置 Z を持つ非表示の 3D ヌルオブジェクト (opacity 0、visible false) を新しい映像トラックに、解析の時間範囲
-    (`solveMapping` の startSec / sampleCount / fps。古い解析ではキーフレームから推定) で作ります (MainWindow.cpp:16954
+    (`solveMapping` の startSec / sampleCount / fps。古い解析ではキーフレームから推定) で作ります (MainWindow.cpp:16962
     の createNullAtSolvePoint、undo 1 段「解析点にヌルオブジェクトを作成」)。座標が ±10000 を超える点は拒否してステータ
     スバーに表示します。ヌルに親子付けした子はヌルの 3D 射影位置には追従しません (親子付けは 2D の当たり判定で整列するた
     め。Wave 25 候補) (solve-points G7-G8。US-1818)。
@@ -2542,18 +2542,18 @@
     断 M)。プレビューの特殊合成経路は clip mask を一切掛けないため、mask を設定したクリップでは書き出しだけが素材を mask
     で切ります (3D テキストはどちらでも mask で切られません)。プレビューの 3D テキストが proxy で描かれるのは、押し出し
     (extrusion) を有効にした 3D テキストだけです (Text3DLayer.cpp:390)。proxy になるのはフレームの長辺がしきい値を超えた
-    ときで (Text3DLayer.cpp:394)、しきい値は QSettings の preview/text3dProxyThreshold (既定 1280。MainWindow.cpp:9668)
+    ときで (Text3DLayer.cpp:394)、しきい値は QSettings の preview/text3dProxyThreshold (既定 1280。MainWindow.cpp:9675)
     です。proxy は縦横比を保ったまま min(1/2, 640 / 長辺) の倍率で縮小されるため、長辺は 640 以下になり
     (Text3DLayer.cpp:382)、16:9 で長辺が 1280 を超えるフレーム (例: 1920 x 1080 や 3840 x 2160) では 640 x 360 になりま
     す。書き出しはフル解像度で描くため、プレビューと書き出しが画素まで一致するのは、押し出しを無効にした 3D テキストか、
     長辺がしきい値以下のフレームだけです。Echo の過去フレームには 3D テキストが入りません (US-1707)。
     (Wave 20 で変更) ブラシは Echo / rolling shutter の過去フレームにも入ります (US-2010。Wave 20 の変更を参照)。
     プレビューの特殊合成経路 (buildSpecialClipComposite) は上位のトラックを手前に重ねます (zOrder = トラック番号。
-    MainWindow.cpp:10072、MainWindow.cpp:10115 で昇順に並べる)。書き出しは V1 を手前にする V1-wins の重なり順です
+    MainWindow.cpp:10079、MainWindow.cpp:10122 で昇順に並べる)。書き出しは V1 を手前にする V1-wins の重なり順です
     (TimelineFrameRenderer.cpp:3579)。このため、複数のトラックで不透明なレイヤーが重なる所ではプレビューと書き出しが異な
     ります (3D テキストの有無によらず。US-1707 の run2 で maxDiff 117 を計測)。G13 の一致検証が確かめるのは、重ならない
     配置だけです。 (Wave 18 で変更) マットが無いフレームでは V1 を手前に並べ替え、書き出しと同じ重なり順になります
-    (MainWindow.cpp:10162-10169。zOrder = トラック番号は MainWindow.cpp:10072 / :10115。US-1804。Wave 18 の変更を参照)。
+    (MainWindow.cpp:10169-10176。zOrder = トラック番号は MainWindow.cpp:10079 / :10122。US-1804。Wave 18 の変更を参照)。
   ● 書き出し例外: ブラシ (ブラシアニメーション) を持つクリップの書き出しにブラシが乗ります (全クリップ分。経路は 3D テキ
     ストと同じ)。従来はプレビューだけに乗り、書き出しには乗りませんでした。ブラシを設定していた既存プロジェクトの書き出
     し結果が変わります。ブラシは roto の後、grade / vfx / fx の前の素材段階で描かれるため、grade / fx を持つクリップでは
@@ -2610,7 +2610,7 @@
     ツールの required は変わりません。set は undo 1 段。mcp selftest は G1..G199。US-1711)。
   ● プロジェクト比較 (project-diff) には 3D テキストとブラシの差分は出ません (Wave 18 でも未対応)。
   ● トラックの mute / solo は書き出しに乗ります (W13-EXPORT-TRACK-MUTE は調査の結果、対応不要として終了)。書き出しのミッ
-    クスは AudioExportMix.cpp:462 の entry.audioMuted と :464 の trackAudible の呼び出し (solo の規則は :390-398) で決
+    クスは AudioExportMix.cpp:464 の entry.audioMuted と :464 の trackAudible の呼び出し (solo の規則は :391-399) で決
     まり、ミキサ
     ーストリップの mute / solo ボタンは Timeline のトラックを直接動かす (AudioMixerDock.cpp:198-203) ので UI からの操作
     も乗ります (audio-fixture G19 / G20)。乗らないのは AudioMixer のトラック状態の muted で、呼び手は

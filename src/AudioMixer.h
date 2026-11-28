@@ -225,9 +225,15 @@ public:
     trackfx::Chain masterChain() const;
     void setMasterEq(const EqSettings &eq, bool enabled = true);
     void setMasterDeEsser(const trackfx::DeEsserSettings &settings);
-    // Sets the master EQ and DeEsser together in one locked section.
+    void setMasterMultibandComp(const trackfx::MultibandCompSettings &settings);
+    // Sets the master EQ, DeEsser, and optional Multiband Compressor together in one locked section.
     void setMasterChain(const EqSettings &eq, bool eqEnabled,
-                        const trackfx::DeEsserSettings &deesser);
+                        const trackfx::DeEsserSettings &deesser,
+                        const trackfx::MultibandCompSettings &multibandComp = {});
+    void setTrackMultibandComp(int trackId, const trackfx::MultibandCompSettings &settings);
+    trackfx::MultibandCompSettings trackMultibandComp(int trackId) const;
+    std::array<double, trackfx::MultibandCompSettings::kBandCount>
+    multibandGainReductionDb(int trackId) const;
     quint64 applyMasterChainLockedCallCountForTest() const;
     void setMasterEqBypassForTest(bool bypass);
     quint64 masterEqProcessCallsForTest() const;
@@ -247,15 +253,21 @@ public:
     struct MasterEqFilter {
         void setEq(const EqSettings &eq);
         void setDeEsser(const trackfx::DeEsserSettings &settings);
+        void setMultibandComp(const trackfx::MultibandCompSettings &settings, bool allowSolo = true);
         void reset();
         void process(float *samples, int frames);
         void process(int32_t *samples, int frames);
+        std::array<double, trackfx::MultibandCompSettings::kBandCount> currentMultibandGrDb() const {
+            return m_multibandComp.currentGrDb();
+        }
     private:
         double processSample(double sample, int channel);
         std::array<EqBandCoefsParam, 4> m_coefs{};
         std::array<double, 16> m_history{};
         trackfx::DeEsserProcessor m_deesser;
         bool m_deesserEnabled = false;
+        trackfx::MultibandCompProcessor m_multibandComp;
+        bool m_multibandCompEnabled = false;
     };
 
     // Per-track feed-forward compressor / limiter (Audition / Resolve

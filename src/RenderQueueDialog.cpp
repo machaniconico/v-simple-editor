@@ -491,7 +491,7 @@ void RenderQueueDialog::onAddJobClicked()
         for (auto it = fileData.trackFx.cbegin(); it != fileData.trackFx.cend(); ++it)
             fileMixer->setTrackChain(it.key(), it.value());
         fileMixer->setMasterChain(fileData.masterFx.eq, fileData.masterFx.eqEnabled,
-                                  fileData.masterFx.deesser);
+                                  fileData.masterFx.deesser, fileData.masterFx.multibandComp);
         for (int i = 0; i < fileData.trackMix.size() && i < AudioMixer::kMaxAudioTracks; ++i) {
             fileMixer->setTrackGain(i, fileData.trackMix[i].gain);
             fileMixer->setTrackPan(i, fileData.trackMix[i].pan);

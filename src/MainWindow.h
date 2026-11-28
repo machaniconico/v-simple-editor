@@ -504,6 +504,7 @@ private slots:
     // earlier sprint stories into the menu bar.
     void openEqualizerPanel();
     void openDeEsserPanel();
+    void openMultibandCompressorPanel();
     void reseedAudioFxDocks();
     void syncAudioFxDocks();
     void openCompressorPanel();
@@ -1292,6 +1293,7 @@ private:
     // shows/hides the same dock.
     QDockWidget *m_equalizerDock = nullptr;
     QDockWidget *m_deesserDock = nullptr;
+    QDockWidget *m_multibandCompDock = nullptr;
     QDockWidget *m_compressorDock = nullptr;
     QDockWidget *m_reverbDock = nullptr;
     QDockWidget *m_noiseReductionDock = nullptr;
