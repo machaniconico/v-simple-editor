@@ -729,6 +729,11 @@ QJsonObject sequenceToStoreJson(const TimelineSequence &sequence)
     QJsonObject obj;
     obj[QStringLiteral("id")] = sequence.id;
     obj[QStringLiteral("name")] = sequence.name;
+    if (sequence.hasCustomSettings()) {
+        obj[QStringLiteral("width")] = sequence.width;
+        obj[QStringLiteral("height")] = sequence.height;
+        obj[QStringLiteral("fps")] = sequence.fps;
+    }
     obj[QStringLiteral("videoTracks")] = project.value(QStringLiteral("videoTracks")).toArray();
     obj[QStringLiteral("audioTracks")] = project.value(QStringLiteral("audioTracks")).toArray();
     obj[QStringLiteral("generatedCaptionOverlays")] =
@@ -741,6 +746,14 @@ TimelineSequence sequenceFromStoreJson(const QJsonObject &obj)
     TimelineSequence sequence;
     sequence.id = obj.value(QStringLiteral("id")).toString();
     sequence.name = obj.value(QStringLiteral("name")).toString();
+    const int rawW = obj.value(QStringLiteral("width")).toInt(0);
+    const int rawH = obj.value(QStringLiteral("height")).toInt(0);
+    const double rawFps = obj.value(QStringLiteral("fps")).toDouble(0.0);
+    if (rawW > 0 && rawH > 0 && std::isfinite(rawFps) && rawFps > 0.0) {
+        sequence.width = qBound(2, rawW & ~1, 7680);
+        sequence.height = qBound(2, rawH & ~1, 7680);
+        sequence.fps = std::clamp(rawFps, 1.0, 240.0);
+    }
 
     QJsonObject project;
     project[QStringLiteral("version")] = 2;
@@ -16616,6 +16629,11 @@ TimelineSequence Timeline::currentSequenceSnapshot(const QString &id,
     for (const TimelineTrack *track : m_audioTracks)
         sequence.audioTracks.append(track ? track->clips() : QVector<ClipInfo>{});
     sequence.generatedCaptionOverlays = m_generatedCaptionOverlays;
+    if (const TimelineSequence *existing = sequenceById(id)) {
+        sequence.width = existing->width;
+        sequence.height = existing->height;
+        sequence.fps = existing->fps;
+    }
     return sequence;
 }
 
@@ -16713,6 +16731,99 @@ bool Timeline::renameSequence(const QString &id, const QString &name)
     rebuildTimelineBreadcrumbBar(this);
     emit sequencesChanged();
     return true;
+}
+
+bool Timeline::setSequenceSettings(const QString &sequenceId, int width, int height, double fps)
+{
+    const bool clearCustom = (width <= 0 || height <= 0 || !std::isfinite(fps) || fps <= 0.0);
+    const int normW = clearCustom ? 0 : qBound(2, width & ~1, 7680);
+    const int normH = clearCustom ? 0 : qBound(2, height & ~1, 7680);
+    const double normFps = clearCustom ? 0.0 : std::clamp(fps, 1.0, 240.0);
+
+    if (!m_sequenceModelEnabled) {
+        if (sequenceId != QLatin1String(kDefaultSequenceId))
+            return false;
+        if (clearCustom)
+            return true;
+        m_sequenceModelEnabled = true;
+        m_activeSequenceId = sequenceId;
+        TimelineSequence snap = currentSequenceSnapshot(sequenceId, QStringLiteral("メインシーケンス"));
+        snap.width = normW;
+        snap.height = normH;
+        snap.fps = normFps;
+        upsertSequenceSnapshot(snap);
+    } else {
+        auto *sequence = sequenceById(sequenceId);
+        if (!sequence)
+            return false;
+        if (sequence->width == normW && sequence->height == normH
+            && std::abs(sequence->fps - normFps) < 1e-9)
+            return true;
+        sequence->width = normW;
+        sequence->height = normH;
+        sequence->fps = normFps;
+    }
+    saveUndoState(QStringLiteral("シーケンス設定を変更"));
+    emit sequenceSettingsChanged(sequenceId, normW, normH, normFps);
+    emit sequencesChanged();
+    return true;
+}
+
+bool Timeline::createSequenceWithSettings(const QString &name, int width, int height, double fps)
+{
+    if (name.trimmed().isEmpty()) return false;
+    const bool hasCustom = (width > 0 && height > 0 && std::isfinite(fps) && fps > 0.0);
+    const int normW = hasCustom ? qBound(2, width & ~1, 7680) : 0;
+    const int normH = hasCustom ? qBound(2, height & ~1, 7680) : 0;
+    const double normFps = hasCustom ? std::clamp(fps, 1.0, 240.0) : 0.0;
+
+    captureExternalTrackState();
+    if (m_sequenceModelEnabled) {
+        QJsonObject external = currentState().externalTrackState;
+        external.insert(QStringLiteral("_sequenceCreationActiveId"), m_activeSequenceId);
+        m_undoManager->updateCurrentExternalTrackState(external);
+    }
+    TimelineSequence sequence;
+    sequence.id = uniqueSequenceId(m_sequences, QStringLiteral("sequence"), m_sequences.size());
+    m_parkedSidecarsBySequence.remove(sequence.id);
+    sequence.name = name.trimmed();
+    sequence.width = normW;
+    sequence.height = normH;
+    sequence.fps = normFps;
+    sequence.videoTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+    sequence.audioTracks = QVector<QVector<ClipInfo>>{QVector<ClipInfo>{}};
+    if (!addSequence(sequence)) return false;
+    {
+        QScopedValueRollback<bool> covered(m_switchingInsideUndoPoint, true);
+        if (!setActiveSequence(sequence.id)) return false;
+    }
+    saveUndoState(QStringLiteral("新規シーケンス"));
+    if (hasCustom)
+        emit sequenceSettingsChanged(sequence.id, normW, normH, normFps);
+    return true;
+}
+
+void Timeline::effectiveSequenceSettings(const QString &sequenceId,
+                                         int &widthOut, int &heightOut, double &fpsOut) const
+{
+    const TimelineSequence *seq = sequenceById(sequenceId);
+    if (seq && seq->hasCustomSettings()) {
+        widthOut = seq->width;
+        heightOut = seq->height;
+        fpsOut = seq->fps;
+        return;
+    }
+    widthOut = m_projectWidth > 0 ? m_projectWidth : 1920;
+    heightOut = m_projectHeight > 0 ? m_projectHeight : 1080;
+    fpsOut = m_projectFrameRate > 0.0 ? m_projectFrameRate : 30.0;
+}
+
+void Timeline::activeSequenceEffectiveSettings(int &widthOut, int &heightOut, double &fpsOut) const
+{
+    const QString active = m_activeSequenceId.isEmpty()
+        ? QString::fromLatin1(kDefaultSequenceId)
+        : m_activeSequenceId;
+    effectiveSequenceSettings(active, widthOut, heightOut, fpsOut);
 }
 
 bool Timeline::createSequence(const QString &name)

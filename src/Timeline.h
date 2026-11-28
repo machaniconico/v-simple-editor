@@ -468,6 +468,12 @@ struct TimelineSequence {
     QVector<QVector<ClipInfo>> videoTracks;
     QVector<QVector<ClipInfo>> audioTracks;
     QVector<EnhancedTextOverlay> generatedCaptionOverlays;
+    // Wave 35: per-sequence resolution & FPS override (0 = inherit project config).
+    int width = 0;
+    int height = 0;
+    double fps = 0.0;
+
+    bool hasCustomSettings() const { return width > 0 && height > 0 && fps > 0.0; }
 
     double duration() const {
         auto tracksDuration = [](const QVector<QVector<ClipInfo>> &tracks) {
@@ -1189,6 +1195,13 @@ public:
     // UI/API snapshot includes the implicit root without enabling nesting.
     QVector<TimelineSequence> sequenceList() const;
     bool renameSequence(const QString &id, const QString &name);
+    // Wave 35: per-sequence resolution & FPS settings. Pass (0, 0, 0.0) to clear
+    // custom settings and inherit the project config. Records 1 Undo step.
+    bool setSequenceSettings(const QString &sequenceId, int width, int height, double fps);
+    bool createSequenceWithSettings(const QString &name, int width, int height, double fps);
+    void effectiveSequenceSettings(const QString &sequenceId,
+                                   int &widthOut, int &heightOut, double &fpsOut) const;
+    void activeSequenceEffectiveSettings(int &widthOut, int &heightOut, double &fpsOut) const;
     bool createSequence(const QString &name);
     // Atomically create, populate and activate a sequence (one undo entry).
     // Generic interchange import entry: accepts offline ClipInfo paths without probing.
@@ -1685,6 +1698,8 @@ signals:
     void positionChanged(double seconds);
     void sequenceChanged(const QVector<PlaybackEntry> &entries);
     void sequencesChanged();
+    // Wave 35: emitted when a sequence's per-sequence resolution/FPS changes.
+    void sequenceSettingsChanged(const QString &sequenceId, int width, int height, double fps);
     // US-2005: once per switch of the active sequence (setActiveSequence outside a
     // restore, or the end of a restoreState that lands in another sequence).
     void activeSequenceChanged(const QString &oldId, const QString &newId);
