@@ -368,6 +368,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/amd_gpu_support_selftest.cpp
     src/selftests/qrhi_preview_selftest.cpp
     src/selftests/puppet_arap_selftest.cpp
+    src/selftests/puppet_phase3_selftest.cpp
     src/selftests/WbEyedropperSelftest.cpp
     src/selftests/SubtitleCpsSelftest.cpp
     src/selftests/RgbParadeSelftest.cpp

@@ -197,6 +197,7 @@ int runRadeonAmfSelftest();
 int runAmdGpuSupportSelftest();
 int runQrhiPreviewSelftest();
 int runPuppetArapSelftest();
+int runPuppetPhase3Selftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -993,6 +994,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 30 Qt6 QRhi cross-vendor preview backend: Direct3D 11 / Vulkan / OpenGL / Null probe, real D3D11 QRhiTexture upload+readback pixel round-trip, QrhiPreviewWidget & Dialog (8 gates)" },
     { "puppet-arap", "VEDITOR_PUPPET_ARAP_SELFTEST", runPuppetArapSelftest, true,
       "Wave 31 AE-grade Animated Mesh Puppet: alpha silhouette & opaque grid mesh, 2-step ARAP solver, keyframes/easing, Starch/Bend/Advanced/Overlap Z-sort, SSOT renderFrameAt, Undo & ProjectFile round-trip, PuppetPinTool & Dialog (10 gates)" },
+    { "puppet-phase3", "VEDITOR_PUPPET_PHASE3_SELFTEST", runPuppetPhase3Selftest, true,
+      "Wave 32 ARAP Puppet Phase 3: Ctrl+Drag Puppet Sketch RDP simplification & trail, per-pin Wiggle & Expression secondary motion + Sway Presets, MCP get/set_clip_puppet + Undo + SSOT render (8 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

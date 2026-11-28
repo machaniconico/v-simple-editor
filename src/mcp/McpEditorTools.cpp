@@ -14,6 +14,8 @@
 #include "../MusicRemix.h"
 #include "../ProjectDiff.h"
 #include "../ProjectFile.h"
+#include "../PuppetEngine.h"
+#include "../Expression.h"
 #include "../RenderQueue.h"
 #include "../RenderInPlace.h"
 #include "../TimelineFrameRenderer.h"
@@ -990,6 +992,77 @@ QJsonObject sidecarSetInputSchema(const QJsonObject& clipProps, bool brush)
             {QStringLiteral("type"), QStringLiteral("number")},
             {QStringLiteral("minimum"), 0.001}}}
     }), {QStringLiteral("clipIndex"), QStringLiteral("brush")});
+}
+
+// Wave 32: get_clip_puppet / set_clip_puppet input schema & validator.
+QJsonObject puppetSetInputSchema(const QJsonObject& clipProps)
+{
+    return schemaWithRequired(mergedProperties(clipProps, QJsonObject{
+        {QStringLiteral("puppet"), QJsonObject{
+            {QStringLiteral("type"), QJsonArray{QStringLiteral("object"), QStringLiteral("null")}}}}
+    }), {QStringLiteral("clipIndex"), QStringLiteral("puppet")});
+}
+
+bool parsePuppetArgument(const QJsonValue& raw,
+                         puppet::PuppetRig* outRig,
+                         bool* clear,
+                         QString* err)
+{
+    *clear = false;
+    *outRig = puppet::PuppetRig{};
+    if (raw.isNull()) {
+        *clear = true;
+        return true;
+    }
+    if (!raw.isObject()) {
+        return setError(err, QStringLiteral("puppet must be an object or null")), false;
+    }
+    const QJsonObject obj = raw.toObject();
+    if (obj.isEmpty()) {
+        *clear = true;
+        return true;
+    }
+    if (!obj.contains(QStringLiteral("pins")) || !obj.value(QStringLiteral("pins")).isArray()) {
+        return setError(err, QStringLiteral("puppet.pins must be an array")), false;
+    }
+    const QJsonArray pinsArr = obj.value(QStringLiteral("pins")).toArray();
+    if (pinsArr.isEmpty()) {
+        *clear = true;
+        return true;
+    }
+    if (pinsArr.size() > 64) {
+        return setError(err, QStringLiteral("puppet.pins must have at most 64 pins")), false;
+    }
+    static const QSet<QString> kValidTypes = {
+        QStringLiteral("position"), QStringLiteral("bend"), QStringLiteral("advanced"),
+        QStringLiteral("starch"), QStringLiteral("overlap")
+    };
+    for (int i = 0; i < pinsArr.size(); ++i) {
+        if (!pinsArr[i].isObject())
+            return setError(err, QStringLiteral("puppet.pins[%1] must be an object").arg(i)), false;
+        const QJsonObject po = pinsArr[i].toObject();
+        if (po.contains(QStringLiteral("type"))) {
+            const QString t = po.value(QStringLiteral("type")).toString();
+            if (!kValidTypes.contains(t))
+                return setError(err, QStringLiteral("invalid puppet pin type: %1").arg(t)), false;
+        }
+        if (po.contains(QStringLiteral("dynamics")) && po.value(QStringLiteral("dynamics")).isObject()) {
+            const QJsonObject dyn = po.value(QStringLiteral("dynamics")).toObject();
+            for (const QString& ek : {QStringLiteral("exprX"), QStringLiteral("exprY"),
+                                      QStringLiteral("exprRot"), QStringLiteral("exprScale")}) {
+                const QString code = dyn.value(ek).toString().trimmed();
+                if (!code.isEmpty()) {
+                    const QString vErr = Expression::validate(code);
+                    if (!vErr.isEmpty()) {
+                        return setError(err, QStringLiteral("invalid %1 expression: %2").arg(ek, vErr)),
+                               false;
+                    }
+                }
+            }
+        }
+    }
+    *outRig = puppet::PuppetRig::fromJson(obj);
+    return true;
 }
 
 QJsonObject wiggleInputSchema()
@@ -4698,6 +4771,85 @@ void McpEditorTools::registerWriteTools()
             };
         })
     }, sidecarSetOutputSchema(QStringLiteral("brush"))));
+
+    // Wave 32: get_clip_puppet / set_clip_puppet (ARAP mesh puppet rig + keyframes + wiggle/expressions)
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("get_clip_puppet"),
+        QStringLiteral("映像クリップの ARAP パペット設定 (puppet: mesh / pins / keyframes / dynamics) を読む (読み取り専用)。未設定なら puppet は {} で present=false。音声クリップは拒否する。"),
+        schemaWithRequired(clipProperties, {QStringLiteral("clipIndex")}),
+        [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex")},
+                                        err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/false, &target, err))
+                return {};
+            const ClipInfo& clip = target.track->clips().at(target.clipIndex);
+            puppet::PuppetRig rig;
+            if (!clip.uid.isEmpty() && puppet::hasRig(clip.uid))
+                rig = puppet::rigForClip(clip.uid);
+            else if (!clip.puppetPins.isEmpty())
+                rig = puppet::rigFromLegacyPins(clip.puppetPins);
+            const QJsonObject payload = rig.isEmpty() ? QJsonObject() : rig.toJson();
+            return QJsonObject{
+                {QStringLiteral("puppet"), payload},
+                {QStringLiteral("present"), !payload.isEmpty()}
+            };
+        }
+    }, sidecarGetOutputSchema(QStringLiteral("puppet"))));
+
+    m_registry->registerTool(withOutputSchema({
+        QStringLiteral("set_clip_puppet"),
+        QStringLiteral("映像クリップの ARAP パペット設定 (mesh / pins / keyframes / dynamics) を全置換する。puppet に null か {} を渡すと解除。pins の type は position / bend / advanced / starch / overlap。dynamics に wiggleEnabled / wiggleFreqHz / wiggleAmpUv / wiggleRotAmpDeg や exprX / exprY / exprRot / exprScale を指定可能。変更が無ければ changed=false。Ctrl+Z / undo ツールで 1 回で戻せる。"),
+        puppetSetInputSchema(clipProperties),
+        guardedWrite(QStringLiteral("set_clip_puppet"),
+                     [this](const QJsonObject& args, QString* err) -> QJsonObject {
+            if (!rejectUnknownArguments(args,
+                                        {QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                         QStringLiteral("clipIndex"), QStringLiteral("puppet")},
+                                        err))
+                return {};
+            if (!args.contains(QStringLiteral("puppet")))
+                return setError(err, QStringLiteral("puppet is required (null clears it)")), QJsonObject();
+            puppet::PuppetRig parsedRig;
+            bool clear = false;
+            if (!parsePuppetArgument(args.value(QStringLiteral("puppet")), &parsedRig, &clear, err))
+                return {};
+            ClipTarget target;
+            if (!readVideoClipTarget(args, m_window, timeline(), /*forWrite=*/true, &target, err))
+                return {};
+
+            bool changed = false;
+            if (clear) {
+                const ClipInfo& clip = target.track->clips().at(target.clipIndex);
+                const bool hadAny = !clip.puppetPins.isEmpty()
+                    || (!clip.uid.isEmpty() && puppet::hasRig(clip.uid));
+                if (hadAny) {
+                    timeline()->setClipPuppetPins(target.trackIndex, target.clipIndex, {});
+                    changed = true;
+                }
+            } else {
+                changed = puppet::commitRigToTimeline(
+                    timeline(), target.trackIndex, target.clipIndex, parsedRig,
+                    QStringLiteral("Set clip puppet (MCP)"));
+            }
+            if (changed) {
+                syncSelectionAfterEdit();
+            }
+            const ClipInfo& updatedClip = target.track->clips().at(target.clipIndex);
+            const QJsonObject stored = (!updatedClip.uid.isEmpty() && puppet::hasRig(updatedClip.uid))
+                ? puppet::rigForClip(updatedClip.uid).toJson()
+                : QJsonObject();
+            return QJsonObject{
+                {QStringLiteral("ok"), true},
+                {QStringLiteral("changed"), changed},
+                {QStringLiteral("puppet"), stored},
+                {QStringLiteral("present"), !stored.isEmpty()}
+            };
+        })
+    }, sidecarSetOutputSchema(QStringLiteral("puppet"))));
 
     m_registry->registerTool(withOutputSchema({
         QStringLiteral("music_remix"),

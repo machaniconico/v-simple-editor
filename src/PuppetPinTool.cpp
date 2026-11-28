@@ -222,10 +222,29 @@ void PuppetPinTool::paintOverlay(QPainter &painter, const QRectF &rect)
             }
         }
 
+        // Wave 32: Draw live Puppet Sketch motion trail & REC badge while recording.
+        if (m_sketchRecording && m_sketchSamples.size() >= 2) {
+            QPolygonF trail;
+            trail.reserve(m_sketchSamples.size());
+            for (const auto &s : m_sketchSamples)
+                trail << toWidget(s.posUv);
+            painter.setPen(QPen(QColor(255, 70, 175, 220), 2.2));
+            painter.drawPolyline(trail);
+            const double dur = m_sketchSamples.last().timeSec - m_sketchSamples.first().timeSec;
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(220, 35, 50, 210));
+            painter.drawRoundedRect(QRectF(rect.right() - 175, rect.top() + 8, 165, 24), 4, 4);
+            painter.setPen(Qt::white);
+            painter.drawText(QRectF(rect.right() - 175, rect.top() + 8, 165, 24), Qt::AlignCenter,
+                             QStringLiteral("REC %1s (%2 pts)")
+                                 .arg(dur, 0, 'f', 2)
+                                 .arg(m_sketchSamples.size()));
+        }
+
         painter.setPen(Qt::white);
         painter.drawText(
             rect.adjusted(8, 8, -8, -8), Qt::AlignTop | Qt::AlignLeft,
-            QStringLiteral("ARAP パペット [%1 / t=%2s]  クリック:追加 / ドラッグ:移動(オートキー) / Shift+クリック:種別・回転・硬さ・Z深度 / 右クリック:削除")
+            QStringLiteral("ARAP パペット [%1 / t=%2s]  クリック:追加 / ドラッグ:移動 / Ctrl+ドラッグ:スケッチ録画 / Shift+クリック:設定 / 右クリック:削除")
                 .arg(puppet::pinTypeName(m_toolMode))
                 .arg(tSec, 0, 'f', 2));
         painter.restore();
@@ -378,6 +397,21 @@ bool PuppetPinTool::handleMousePress(const QPoint &pos, Qt::MouseButton button, 
         m_dragStartRotDeg = puppet::evaluatePinAt(rig.pins[m_handle], tSec).rotationDeg;
         m_previewRig = rig;
         m_previewApplied = true;
+
+        // Wave 32: Ctrl + Left-drag on an existing Position/Advanced pin starts Puppet Sketch recording.
+        m_sketchRecording = false;
+        m_sketchSamples.clear();
+        if (hit >= 0 && modifiers.testFlag(Qt::ControlModifier)) {
+            const auto pType = rig.pins[m_handle].type;
+            if (pType == puppet::PinType::Position || pType == puppet::PinType::Advanced) {
+                m_sketchRecording = true;
+                m_sketchStartSec = tSec;
+                m_sketchTimer.start();
+                const auto curEval = puppet::evaluatePinAt(rig.pins[m_handle], tSec);
+                m_sketchSamples.append({tSec, curEval.position});
+            }
+        }
+
         puppet::previewRigOnTimeline(m_timeline, m_trackIndex, m_clipIndex, rig, tSec);
         emit previewChanged();
         return true;
@@ -442,10 +476,40 @@ bool PuppetPinTool::handleMousePress(const QPoint &pos, Qt::MouseButton button, 
     return true;
 }
 
+bool PuppetPinTool::recordSketchSampleAt(const QPoint &pos, double clipLocalSec)
+{
+    if (!m_sketchRecording || m_handle < 0 || !isEnabled() || m_viewRect.isEmpty())
+        return false;
+    if (m_handle >= m_dragRig.pins.size()) return false;
+    const auto baseEval = puppet::evaluatePinAt(m_dragRig.pins[m_handle], m_sketchStartSec);
+    const QPointF uv = baseEval.position + widgetDeltaToUv(QPointF(pos - m_pressPos), m_viewRect);
+    const QPointF clamped(std::clamp(uv.x(), -0.25, 1.25), std::clamp(uv.y(), -0.25, 1.25));
+    const double t = std::max(m_sketchStartSec, clipLocalSec);
+    m_sketchSamples.append({t, clamped});
+
+    auto rig = m_dragRig;
+    puppet::PinKeyframe kf;
+    kf.timeSec     = t;
+    kf.position    = clamped;
+    kf.rotationDeg = baseEval.rotationDeg;
+    kf.scale       = baseEval.scale;
+    kf.inFront     = baseEval.inFront;
+    puppet::upsertPinKeyframe(rig.pins[m_handle], kf);
+    m_previewRig = rig;
+    puppet::previewRigOnTimeline(m_timeline, m_trackIndex, m_clipIndex, rig, t);
+    emit previewChanged();
+    return true;
+}
+
 bool PuppetPinTool::handleMouseMove(const QPoint &pos, Qt::KeyboardModifiers)
 {
     if (m_handle < 0 || !isEnabled() || m_viewRect.isEmpty()) return false;
     if (arapActive()) {
+        if (m_sketchRecording) {
+            const double elapsed = m_sketchTimer.isValid()
+                ? (static_cast<double>(m_sketchTimer.elapsed()) / 1000.0) : 0.0;
+            return recordSketchSampleAt(pos, m_sketchStartSec + elapsed * m_sketchSpeed);
+        }
         if (!(currentRig() == m_previewRig)) { m_handle = -1; return false; }
         auto rig = m_dragRig;
         if (m_handle >= rig.pins.size()) { m_handle = -1; return false; }
@@ -497,6 +561,27 @@ bool PuppetPinTool::handleMouseMove(const QPoint &pos, Qt::KeyboardModifiers)
 bool PuppetPinTool::handleMouseRelease(const QPoint &pos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     if (button != Qt::LeftButton || m_handle < 0) return false;
+    if (arapActive() && m_sketchRecording) {
+        const int pinIdx = m_handle;
+        const auto samples = m_sketchSamples;
+        const double tSec = m_sketchStartSec;
+        m_sketchRecording = false;
+        m_sketchSamples.clear();
+        m_handle = -1;
+        m_previewApplied = false;
+
+        auto finalRig = m_beforeRig;
+        if (pinIdx >= 0 && pinIdx < finalRig.pins.size() && !samples.isEmpty()) {
+            puppet::applySketchToPin(finalRig.pins[pinIdx], samples, m_sketchEpsilonUv,
+                                     puppet::EasingKind::Linear, /*replaceInRange=*/true);
+        }
+        puppet::previewRigOnTimeline(m_timeline, m_trackIndex, m_clipIndex, m_beforeRig, tSec);
+        puppet::commitRigToTimeline(m_timeline, m_trackIndex, m_clipIndex, finalRig,
+                                    QStringLiteral("パペットスケッチ録画"));
+        emit previewChanged();
+        return true;
+    }
+
     if (!handleMouseMove(pos, modifiers)) { m_handle = -1; return true; }
 
     if (arapActive()) {
@@ -524,6 +609,8 @@ void PuppetPinTool::cancelDrag()
 {
     if (m_handle < 0) return;
     m_handle = -1;
+    m_sketchRecording = false;
+    m_sketchSamples.clear();
     if (arapActive()) {
         if (isEnabled() && m_previewApplied && currentRig() == m_previewRig)
             puppet::previewRigOnTimeline(m_timeline, m_trackIndex, m_clipIndex, m_beforeRig,
