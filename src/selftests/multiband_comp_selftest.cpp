@@ -161,7 +161,8 @@ int runMultibandCompSelftest()
         }
         const double lowAttenDb = toneMagnitudeDb(dry, 8000, 80.0) - toneMagnitudeDb(wet, 8000, 80.0);
         const double midDiffDb  = std::abs(toneMagnitudeDb(dry, 8000, 2500.0) - toneMagnitudeDb(wet, 8000, 2500.0));
-        check("G4", lowAttenDb > 24.0 && midDiffDb < 0.5,
+        // Theoretical LR4 2-octave bandpass (1200-5000 Hz) skirt at 2500 Hz is -0.98 dB.
+        check("G4", lowAttenDb > 24.0 && midDiffDb < 1.2,
               QStringLiteral("soloLowAttenDb=%1 midDiffDb=%2").arg(lowAttenDb, 0, 'f', 2).arg(midDiffDb, 0, 'f', 3));
     }
 
