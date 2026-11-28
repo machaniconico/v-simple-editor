@@ -1270,7 +1270,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */ + 4 /* US-1911 */ + 2 /* Wave 32: get/set_clip_puppet */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics; US-1911: get/set_clip_text3d + get/set_clip_brush; Wave 32: get/set_clip_puppet
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */ + 4 /* US-1911 */ + 2 /* Wave 32: get/set_clip_puppet */ + 3 /* Wave 36: ripple_delete_range / blade_all_tracks / ripple_insert_clip */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics; US-1911: get/set_clip_text3d + get/set_clip_brush; Wave 32: get/set_clip_puppet; Wave 36: ripple_delete_range / blade_all_tracks / ripple_insert_clip
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
