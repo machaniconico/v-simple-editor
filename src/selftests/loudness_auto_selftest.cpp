@@ -1,24 +1,38 @@
+#include "../AudioExportMix.h"
 #include "../ExportDialog.h"
 #include "../ExportUserPresets.h"
 #include "../LoudnessMaster.h"
 #include "../MainWindow.h"
+#include "../MobileExportDialog.h"
+#include "../RenderInPlace.h"
 #include "../RenderQueue.h"
 #include "../Timeline.h"
 #include "../libavcore/AudioExtract.h"
 #include "SelftestGate.h"
+#include <QApplication>
 #include <QComboBox>
 #include <QDir>
 #include <QEventLoop>
 #include <QFile>
 #include <QImage>
 #include <QJsonArray>
+#include <QMessageBox>
+#include <QPointer>
+#include <QProgressDialog>
 #include <QStandardPaths>
+#include <QStatusBar>
+#include <QTest>
 #include <QTemporaryDir>
+#include <QThread>
 #include <QTimer>
+#include <QtConcurrent/QtConcurrentRun>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -128,6 +142,18 @@ double audioPeak(const QString &media, const QString &wavPath)
     double peak = 0.0;
     for (double value : mono) peak = std::max(peak, std::abs(value));
     return peak;
+}
+
+// The GUI entries' preparation (loudnessauto::prepareJobAsync), waited for on this thread.
+RenderJob prepareAsync(RenderJob job)
+{
+    auto result = std::make_shared<std::optional<RenderJob>>();
+    loudnessauto::prepareJobAsync(job, [result](RenderJob prepared, QString) {
+        *result = std::move(prepared);
+    }, [] { return false; });
+    if (!QTest::qWaitFor([result] { return result->has_value(); }, 120000))
+        std::fprintf(stderr, "[loudness-auto] prepareJobAsync did not finish within 120000 ms\n");
+    return result->has_value() ? **result : job;
 }
 
 QStringList tempFilesOf(const RenderJob &job)
@@ -266,8 +292,8 @@ int runLoudnessAutoSelftest()
         && batchMapped.value("targetLufs").toDouble() == -23.0;
     // The removed text check counted prepareJob calls inside two private UI
     // handlers. G2/G4 run prepareJob on both target profiles and render their
-    // audio; prepareJob itself now runs inside MainWindow::buildExportRenderJob,
-    // whose normal / mobile entries export-cfg G4-G6 cover.
+    // audio; the normal / mobile entries run prepareJobAsync after
+    // MainWindow::buildExportRenderJob (G14 / G15).
     const double normalMeasured = normal.exportConfig.value("measuredLufs").toDouble(
         std::numeric_limits<double>::quiet_NaN());
     const double batchMeasured = batch.exportConfig.value("measuredLufs").toDouble(
@@ -341,7 +367,7 @@ int runLoudnessAutoSelftest()
     }
 
     // G7: when exportVideo's audio step (MainWindow::finalizeExportJobAudio) fails after
-    // buildExportRenderJob -> prepareJob already created intermediates, it must return
+    // buildExportRenderJob -> prepareJobAsync already created intermediates, it must return
     // false and leave none behind. Detects removing that cleanup call (the temp file
     // would survive). The failure is forced via m_exportAudioMixErrorForTest; ffmpeg.exe
     // unavailable -> SKIP, a failed fixture -> FAIL (fixtureVerdict, G12).
@@ -352,7 +378,7 @@ int runLoudnessAutoSelftest()
         ExportConfig g7Config = settings;
         g7Config.outputPath = temporary.filePath("g7.mp4");
         g7Config.autoLoudness = true;
-        RenderJob g7 = window.buildExportRenderJob(g7Config, MainWindow::ExportEntry::Normal);
+        RenderJob g7 = prepareAsync(window.buildExportRenderJob(g7Config, MainWindow::ExportEntry::Normal));
         QStringList created;
         for (const QJsonValue &value : g7.exportConfig.value("tempFiles").toArray())
             created << value.toString();
@@ -470,7 +496,7 @@ int runLoudnessAutoSelftest()
     int outputSerial = 0;
     const auto buildJob = [&](MainWindow &window) {
         autoConfig.outputPath = temporary.filePath(QStringLiteral("g9-%1.mp4").arg(++outputSerial));
-        return window.buildExportRenderJob(autoConfig, MainWindow::ExportEntry::Normal);
+        return prepareAsync(window.buildExportRenderJob(autoConfig, MainWindow::ExportEntry::Normal));
     };
 
     // G9: ON + empty audio playback sequence (GUI normal entry): prepareJob puts a silent .m4a in
@@ -606,6 +632,290 @@ int runLoudnessAutoSelftest()
             && failedNoFfmpeg == FixtureVerdict::Fail && control == FixtureVerdict::Run
             && noFfmpeg == FixtureVerdict::Skip,
             "a failed fixture generation was classified as SKIP (or the environment rule changed)");
+    }
+
+    // G13: the export mix plan is a value snapshot. Per case (plain single-pass mix / track-FX
+    // path), buildMixPlan runs once on the GUI thread, then the Timeline and the mixer are deleted
+    // and the global channel-mode / reversed bindings cleared, and executeMixPlan runs under
+    // QtConcurrent::run. Its WAV must equal the synchronous wrapper's WAV (renderinplace::
+    // prepareAudioMix) byte for byte. Control: the plan a hidden read of the cleared bindings would
+    // execute (all Stereo, none reversed) must differ, so the comparison cannot pass vacuously.
+    {
+        const QString lrSource = temporary.filePath("g13-lr.wav");
+        std::vector<float> lr(48000 * 4 * 2);
+        for (int i = 0; i < 48000 * 4; ++i) {
+            lr[2 * i] = static_cast<float>(0.2 * std::sin(2.0 * 3.141592653589793 * 1000.0 * i / 48000.0));
+            lr[2 * i + 1] = static_cast<float>(0.1 * std::sin(2.0 * 3.141592653589793 * 440.0 * i / 48000.0));
+        }
+        QString lrError;
+        const bool lrFixture = temporary.isValid()
+            && libavcore::writeWavFloatInterleaved(lrSource, lr, 48000, 2, &lrError);
+        const FixtureVerdict verdict = fixtureVerdict(fixture && lrFixture, ffmpegFound);
+        if (verdict == FixtureVerdict::Skip) {
+            tally.skip(13, "ffmpeg.exe unavailable");
+        } else if (verdict == FixtureVerdict::Fail) {
+            std::fprintf(stderr, "[loudness-auto] G13 fixtureError=%s lrError=%s\n",
+                qPrintable(fixtureError), qPrintable(lrError));
+            tally.gate(13, false, "audio fixture generation (libavcore) failed");
+        } else {
+            ClipInfo first;
+            first.filePath = lrSource;
+            first.duration = 4.0;
+            first.outPoint = 1.5;
+            first.volume = 0.8;
+            first.audioChannelMode = AudioChannelMode::FillLeft;
+            ClipInfo second;
+            second.filePath = lrSource;
+            second.duration = 4.0;
+            second.inPoint = 1.0;
+            second.outPoint = 2.5;
+            second.reversed = true;
+            second.pan = 0.4;
+            const double durationSec = 3.0;
+            const auto readAll = [](const QString &path) {
+                QFile in(path);
+                return in.open(QIODevice::ReadOnly) ? in.readAll() : QByteArray();
+            };
+            const auto runAsync = [](const audioexport::MixPlan &plan, QThread **workerThread) {
+                QFuture<std::pair<QString, QString>> future = QtConcurrent::run([plan, workerThread]() {
+                    *workerThread = QThread::currentThread();
+                    QString error;
+                    const QString written = audioexport::executeMixPlan(plan, [] { return false; }, &error);
+                    return std::make_pair(written, error);
+                });
+                // waitForFinished() may run a not-yet-started task on the waiting (GUI) thread;
+                // polling isFinished() never steals it.
+                const bool finished = QTest::qWaitFor([&future]() { return future.isFinished(); }, 120000);
+                std::pair<QString, QString> result = future.result(); // the task writes *workerThread
+                if (!finished) result.second = QStringLiteral("executeMixPlan ran past 120000 ms");
+                return result;
+            };
+            bool ok = true;
+            for (const bool trackFx : {false, true}) {
+                const char *name = trackFx ? "trackfx" : "plain";
+                auto *mixer = new AudioMixer;
+                auto *planTimeline = new Timeline;
+                planTimeline->setAudioMixer(mixer);
+                // A clip pan != 0 takes the FX path since US-1114: only the trackfx case pans.
+                ClipInfo panned = second;
+                panned.pan = trackFx ? 0.4 : 0.0;
+                planTimeline->restoreFromProject(QVector<QVector<ClipInfo>>{{picture}},
+                    QVector<QVector<ClipInfo>>{{first, panned}}, 0, -1, -1, 10);
+                if (trackFx) mixer->setTrackGain(0, 0.5);
+                const QString syncPath = temporary.filePath(QStringLiteral("g13-%1-sync.wav").arg(name));
+                const QString asyncPath = temporary.filePath(QStringLiteral("g13-%1-async.wav").arg(name));
+                const QString controlPath = temporary.filePath(QStringLiteral("g13-%1-control.wav").arg(name));
+                QString syncError;
+                const bool syncOk = renderinplace::prepareAudioMix(planTimeline, syncPath, durationSec, &syncError)
+                    == syncPath;
+                const int guiBefore = audioexport::buildMixPlanGuiThreadCallsForTest();
+                const int otherBefore = audioexport::buildMixPlanOtherThreadCallsForTest();
+                const audioexport::MixPlan plan = audioexport::buildMixPlan(planTimeline, mixer,
+                    {asyncPath, durationSec});
+                delete planTimeline;
+                delete mixer;
+                setAudioChannelModePlaybackBindings({});
+                setAudioReversedPlaybackBindings({});
+                audioexport::MixPlan control = plan;
+                control.outputPath = controlPath;
+                control.channelModes.fill(AudioChannelMode::Stereo);
+                control.reversed.fill(false);
+                QThread *asyncThread = nullptr;
+                QThread *controlThread = nullptr;
+                const auto [asyncWritten, asyncError] = runAsync(plan, &asyncThread);
+                const auto [controlWritten, controlError] = runAsync(control, &controlThread);
+                const int guiDelta = audioexport::buildMixPlanGuiThreadCallsForTest() - guiBefore;
+                const int otherDelta = audioexport::buildMixPlanOtherThreadCallsForTest() - otherBefore;
+                const QByteArray syncBytes = readAll(syncPath);
+                const QByteArray asyncBytes = readAll(asyncPath);
+                const QByteArray controlBytes = readAll(controlPath);
+                const bool offGuiThread = asyncThread && asyncThread != QThread::currentThread()
+                    && controlThread && controlThread != QThread::currentThread();
+                const bool planShape = plan.entries.size() == 2 && plan.channelModes.size() == 2
+                    && plan.channelModes.contains(AudioChannelMode::FillLeft) && plan.reversed.contains(true)
+                    && plan.useTrackFx == trackFx && !plan.passthrough;
+                // >= 2.5 s of 48 kHz stereo pcm_s16le: the mix is not an empty / truncated file.
+                const bool sized = syncBytes.size() >= 48000 * 2 * 2 * 5 / 2;
+                const bool identical = syncOk && asyncWritten == asyncPath && asyncError.isEmpty() && sized
+                    && asyncBytes == syncBytes;
+                const bool controlDiffers = controlWritten == controlPath && controlBytes.size() >= 44
+                    && controlBytes != syncBytes;
+                std::fprintf(stderr, "[loudness-auto] G13 case=%s syncOk=%d syncBytes=%lld asyncBytes=%lld "
+                    "identical=%d controlBytes=%lld controlDiffers=%d guiDelta=%d otherDelta=%d offGuiThread=%d "
+                    "entries=%lld modes=[%d,%d] reversed=[%d,%d] useTrackFx=%d syncError=[%s] asyncError=[%s] "
+                    "controlError=[%s]\n",
+                    name, syncOk, static_cast<long long>(syncBytes.size()),
+                    static_cast<long long>(asyncBytes.size()), identical,
+                    static_cast<long long>(controlBytes.size()), controlDiffers, guiDelta, otherDelta,
+                    offGuiThread, static_cast<long long>(plan.entries.size()),
+                    static_cast<int>(plan.channelModes.value(0, AudioChannelMode::Stereo)),
+                    static_cast<int>(plan.channelModes.value(1, AudioChannelMode::Stereo)),
+                    plan.reversed.value(0, false), plan.reversed.value(1, false), plan.useTrackFx,
+                    qPrintable(syncError), qPrintable(asyncError), qPrintable(controlError));
+                ok = ok && planShape && identical && controlDiffers && guiDelta == 1 && otherDelta == 0
+                    && offGuiThread;
+            }
+            tally.gate(13, ok, "executeMixPlan off the GUI thread after the Timeline was deleted did not "
+                "reproduce the synchronous mix byte for byte (or the control / counters / plan shape failed)");
+        }
+    }
+
+    // G14: the GUI normal and mobile entries prepare auto loudness off the GUI thread behind the
+    // indeterminate "loudnessPrepareProgress" dialog. Right after the entry returns, the dialog
+    // is shown and no job is queued yet (a synchronous prepare would already have queued it);
+    // then done adds the prepared job: prepareJobCallCountForTest +1 and one jobsChanged with a
+    // new uuid per job. Mobile: two exportRequested emissions give +2 and two queued jobs.
+    // The two emissions model two separate dialog operations (one job per click), not a preset loop.
+    // Detects the entries going back to a synchronous prepare (US-1105-mutation.txt).
+    // G15: Cancel during the setPrepareDelayForTest delay queues no job, leaves nothing in the
+    // export audio-mix temp directory and reports the cancel. Detects ignoring Cancel.
+    {
+        const FixtureVerdict verdict = fixtureVerdict(fixture, ffmpegFound);
+        if (verdict != FixtureVerdict::Run) {
+            for (const int n : {14, 15}) {
+                if (verdict == FixtureVerdict::Skip) tally.skip(n, "ffmpeg.exe unavailable");
+                else tally.gate(n, false, "audio fixture generation (libavcore) failed");
+            }
+        } else {
+            // A failed export opens a modal QMessageBox from the entries' callbacks: close it and
+            // fail the gate instead of hanging.
+            QStringList modalTexts;
+            QTimer modalGuard;
+            QObject::connect(&modalGuard, &QTimer::timeout, &modalGuard, [&modalTexts]() {
+                for (QWidget *widget : QApplication::topLevelWidgets()) {
+                    auto *box = qobject_cast<QMessageBox *>(widget);
+                    if (!box || !box->isVisible()) continue;
+                    modalTexts << box->text();
+                    box->done(0);
+                }
+            });
+            modalGuard.start(200);
+            ExportConfig asyncConfig = settings;
+            asyncConfig.autoLoudness = true;
+            asyncConfig.targetLufs = -14.0;
+            asyncConfig.width = asyncConfig.height = 64;
+            asyncConfig.fps = 10;
+            asyncConfig.videoCodec = QStringLiteral("mpeg4");
+            asyncConfig.videoBitrate = 200;
+            const auto outputFor = [&](const char *name) {
+                ExportConfig config = asyncConfig;
+                config.outputPath = temporary.filePath(QString::fromLatin1(name));
+                return config;
+            };
+            const QString dialogName = QStringLiteral("loudnessPrepareProgress");
+            {
+                MainWindow window;
+                window.hide();
+                useTimeline(window, true);
+                RenderQueue *queue = window.ensureRenderQueue();
+                QStringList addedUuids;
+                int preparedAdded = 0;
+                int addEvents = 0;
+                QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                    bool fresh = false;
+                    for (const RenderJob &job : queue->jobs()) {
+                        if (addedUuids.contains(job.uuid)) continue;
+                        addedUuids << job.uuid;
+                        fresh = true;
+                        if (job.exportConfig.contains("loudnessAutoStatus")
+                            && !job.exportConfig.contains("loudnessAutoError")
+                            && job.projectFilePath.endsWith(QStringLiteral(".m4a")))
+                            ++preparedAdded;
+                    }
+                    if (fresh) ++addEvents;
+                });
+                const auto entryCase = [&](const char *name, int expected, const std::function<void()> &enter) {
+                    const int countBefore = loudnessauto::prepareJobCallCountForTest();
+                    const qsizetype uuidsBefore = addedUuids.size();
+                    const int eventsBefore = addEvents;
+                    const int preparedBefore = preparedAdded;
+                    enter();
+                    const int countAtReturn = loudnessauto::prepareJobCallCountForTest() - countBefore;
+                    const QList<QProgressDialog *> dialogs = window.findChildren<QProgressDialog *>(dialogName);
+                    bool shown = dialogs.size() == expected;
+                    for (QProgressDialog *dialog : dialogs)
+                        shown = shown && dialog->isVisible() && dialog->minimum() == 0 && dialog->maximum() == 0
+                            && dialog->labelText() == QStringLiteral("音声を準備しています…");
+                    const qsizetype queuedAtReturn = addedUuids.size() - uuidsBefore;
+                    const bool settled = QTest::qWaitFor([&]() {
+                        return addedUuids.size() - uuidsBefore >= expected
+                            && window.findChildren<QProgressDialog *>(dialogName).isEmpty();
+                    }, 120000);
+                    const qsizetype added = addedUuids.size() - uuidsBefore;
+                    const int events = addEvents - eventsBefore;
+                    const int prepared = preparedAdded - preparedBefore;
+                    std::fprintf(stderr, "[loudness-auto] G14 entry=%s countAtReturn=%d dialogs=%lld shown=%d "
+                        "queuedAtReturn=%lld settled=%d added=%lld jobsChangedAdds=%d preparedAdded=%d "
+                        "expected=%d\n", name, countAtReturn, static_cast<long long>(dialogs.size()), shown,
+                        static_cast<long long>(queuedAtReturn), settled, static_cast<long long>(added), events,
+                        prepared, expected);
+                    return countAtReturn == expected && shown && queuedAtReturn == 0 && settled
+                        && added == expected && events == expected && prepared == expected;
+                };
+                const bool normalOk = entryCase("normal", 1, [&]() {
+                    window.submitNormalExport(outputFor("g14-normal.mp4"));
+                });
+                window.onMobileExport();
+                auto *mobile = window.findChild<MobileExportDialog *>(QStringLiteral("mobileExportDialog"));
+                if (mobile) mobile->hide();
+                const bool mobileOk = mobile && entryCase("mobile", 2, [&]() {
+                    emit mobile->exportRequested(outputFor("g14-mobile-a.mp4"));
+                    emit mobile->exportRequested(outputFor("g14-mobile-b.mp4"));
+                });
+                const bool rendered = QTest::qWaitFor([&]() {
+                    if (queue->isRunning()) return false;
+                    for (const RenderJob &job : queue->jobs())
+                        if (job.status == RenderJobStatus::Pending || job.status == RenderJobStatus::Rendering)
+                            return false;
+                    return true;
+                }, 300000);
+                int completed = 0;
+                for (const RenderJob &job : queue->jobs())
+                    if (job.status == RenderJobStatus::Completed) ++completed;
+                std::fprintf(stderr, "[loudness-auto] G14 mobileDialog=%d normalOk=%d mobileOk=%d rendered=%d "
+                    "completed=%d modal=[%s]\n", mobile != nullptr, normalOk, mobileOk, rendered, completed,
+                    qPrintable(modalTexts.join(QLatin1Char('|'))));
+                tally.gate(14, normalOk && mobileOk && rendered && completed == 3 && modalTexts.isEmpty(),
+                    "an entry prepared synchronously (no dialog / job queued at return) or did not queue the "
+                    "prepared job");
+            }
+            {
+                MainWindow window;
+                window.hide();
+                useTimeline(window, true);
+                RenderQueue *queue = window.ensureRenderQueue();
+                int jobEvents = 0;
+                QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                    if (!queue->jobs().isEmpty()) ++jobEvents;
+                });
+                const QDir mixDir(QDir::tempPath() + QStringLiteral("/v-simple-editor-audio-mix"));
+                const QStringList filesBefore = mixDir.entryList(QDir::Files);
+                audioexport::setPrepareDelayForTest(1500);
+                const int countBefore = loudnessauto::prepareJobCallCountForTest();
+                window.submitNormalExport(outputFor("g15.mp4"));
+                QPointer<QProgressDialog> dialog = window.findChild<QProgressDialog *>(dialogName);
+                const bool found = !dialog.isNull();
+                if (dialog) emit dialog->canceled();
+                const bool settled = QTest::qWaitFor([&dialog]() { return dialog.isNull(); }, 120000);
+                // Boundary: done hides the dialog, calls deleteLater and then returns (cancel) or calls
+                // next, which runs submitNormalExport -> queueNormalExport -> addJob synchronously in that
+                // same call. Once dialog is null, any addJob (wanted or not) has already happened.
+                audioexport::setPrepareDelayForTest(0);
+                const int countDelta = loudnessauto::prepareJobCallCountForTest() - countBefore;
+                QStringList leftover;
+                for (const QString &file : mixDir.entryList(QDir::Files))
+                    if (!filesBefore.contains(file)) leftover << file;
+                const QString message = window.statusBar()->currentMessage();
+                std::fprintf(stderr, "[loudness-auto] G15 found=%d settled=%d countDelta=%d jobEvents=%d "
+                    "jobs=%lld leftover=[%s] status=[%s] modal=[%s]\n", found, settled, countDelta, jobEvents,
+                    static_cast<long long>(queue->jobs().size()), qPrintable(leftover.join(QLatin1Char(','))),
+                    qPrintable(message), qPrintable(modalTexts.join(QLatin1Char('|'))));
+                tally.gate(15, found && settled && countDelta == 1 && jobEvents == 0 && queue->jobs().isEmpty()
+                    && leftover.isEmpty() && message == QStringLiteral("音声の準備をキャンセルしました")
+                    && modalTexts.isEmpty(),
+                    "Cancel during the preparation delay still queued the job or left a temp file");
+            }
+        }
     }
     return tally.finish("loudness-auto");
 }

@@ -16,6 +16,10 @@
 
 #include <QDialog>
 #include <QPointer>
+#include <QSet>
+#include <QString>
+
+#include <functional>
 
 #include "RenderQueue.h"
 
@@ -38,8 +42,17 @@ public:
     RenderQueue *queue() const { return m_queue; }
 
     // Optional: reuse an externally-owned queue. The dialog takes ownership
-    // of signal connections only; lifetime stays with the caller.
+    // of signal connections only; lifetime stays with the caller. MainWindow
+    // passes ensureRenderQueue() so dialog jobs share the GUI / MCP queue (and
+    // its export notification); "停止" then stops that whole queue. The private
+    // queue made in the constructor stays the default for a standalone dialog.
     void setQueue(RenderQueue *queue);
+
+    // US-1125: on a shared queue the queue-wide defaults may belong to another
+    // job, so the dialog states the project's ACES pipeline and the loudness
+    // gain (non-zero only, like RenderQueue::addJob) on every job it adds.
+    void setAcesProvider(std::function<aces::AcesPipeline()> provider) { m_acesProvider = std::move(provider); }
+    void setLoudnessGainProvider(std::function<double()> provider) { m_loudnessGainProvider = std::move(provider); }
 
     // Default timeline range used by the "Add Job" sub-dialog when the
     // caller doesn't supply one. 0..0 means "whole timeline".
@@ -73,9 +86,12 @@ private:
 
     RenderQueue       *m_queue          = nullptr;
     bool               m_ownsQueue      = true;
+    QSet<QString>      m_ownJobUuids;   // jobs this dialog added; 削除 only touches these
     qint64             m_defaultStartUs = 0;
     qint64             m_defaultEndUs   = 0;
     Timeline          *m_liveTimeline   = nullptr;   // RM-1.4, not owned
+    std::function<aces::AcesPipeline()> m_acesProvider;
+    std::function<double()>             m_loudnessGainProvider;
 
     QTableWidget      *m_table          = nullptr;
     QPushButton       *m_addBtn         = nullptr;

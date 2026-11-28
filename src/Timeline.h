@@ -119,6 +119,7 @@ class QDragEnterEvent;
 class QDragMoveEvent;
 class QDragLeaveEvent;
 class QDropEvent;
+class QMimeData;
 class QTimer;
 
 // TR-3: トリム種別。実体は src/TrimOps.h。TrimOps.h は ClipInfo のために
@@ -214,6 +215,11 @@ struct ClipInfo {
     bool reversed = false; // OFF by default; fold the resolved source time around inPoint + outPoint
     double volume = 1.0;  // 0.0 - 2.0 (0=mute, 1=normal, 2=boost)
     double pan = 0.0;     // -1.0..+1.0 balance pan (-1=L, 0=center, +1=R)
+    // US-1110 per-clip 4-band EQ. Off by default; saved as "clipEq" only when
+    // clipEqEnabled. Nested sequences take the child's EQ when it is on,
+    // otherwise the parent's (child first, never both in series).
+    trackfx::EqSettings clipEq;
+    bool clipEqEnabled = false;
     AudioChannelMode audioChannelMode = AudioChannelMode::Stereo;
     // Pro-NLE "rubber band" volume automation. Each point is (clip-local
     // seconds, gain). Empty vector = static `volume` for the whole clip.
@@ -366,6 +372,15 @@ struct ClipInfo {
 
     // US-307: absent for ordinary clips; persistence retains one level only.
     std::shared_ptr<ClipInfo> renderInPlaceOriginal;
+    // The roto entry the bake removed from the timeline; decompose puts it back
+    // under the clip's key. Null when the original had no roto.
+    std::shared_ptr<RotoClipEntry> renderInPlaceOriginalRoto;
+
+    // US-1118 stable clip identity. Minted by TimelineTrack::ensureUid when a
+    // clip enters a track (add / insert / setClips), fresh for paste clones and
+    // the right half of a split. Saved as "uid" only when non-empty; never
+    // affects rendering, and ProjectDiff ignores it.
+    QString uid;
 
     double effectiveDuration() const {
         double out = (outPoint > 0.0) ? outPoint : duration;
@@ -487,6 +502,9 @@ public:
     QVector<FilmstripTile> filmstripTilesForTest(int clipIndex) const;
     quint64 filmstripBranchCountForTest() const { return m_filmstripBranchCount; }
     quint64 paintCountForTest() const { return m_paintCount; }
+    quint64 duplicateUidRepairCountForTest() const { return m_duplicateUidRepairCount; }
+    // US-1118: mint a fresh uid when the clip has none (an existing uid is kept).
+    static void ensureUid(ClipInfo &clip);
     quint64 filmstripDrawCountForTest() const { return m_filmstripDrawCount; }
     static int filmstripTileCount(int width, int thumbnailWidth);
     static int filmstripImageIndex(double sourceSeconds, double mediaDuration, int count = 8);
@@ -616,6 +634,19 @@ public:
     // track when source() is null. Production never sets it (nullptr).
     static void setSelftestDropSource(TimelineTrack *src);
 
+    // The one cross-track clip move (application/x-vse-clip payload from src,
+    // pos in this track's coordinates): move, clipMovedAcrossTracks, the
+    // linked-partner crossTrackDropped and one undo point. dropEvent and the
+    // new-track drop bands (toNewTrack, US-1117) both call it. Returns false
+    // with nothing changed when the payload, the source or the slot is invalid.
+    bool acceptClipDrop(const QMimeData *mime, const QPoint &pos, TimelineTrack *src,
+                        bool toNewTrack = false);
+    // Whether an in-track MoveClip drag at y (this track's coordinates) turns
+    // into a cross-track QDrag: CROSS_TRACK_DRAG_THRESHOLD px outside the row,
+    // or, on the last track of its kind, anywhere over that kind's new-track
+    // band (US-1117), which starts within the threshold.
+    bool promotesCrossTrackDrag(int y) const;
+
 signals:
     void clipClicked(int index);
     void selectionChanged(int primaryIndex, bool additive);
@@ -672,6 +703,7 @@ private:
     quint64 m_paintCount = 0;
     quint64 m_filmstripDrawCount = 0;
     quint64 m_filmstripBranchCount = 0;
+    quint64 m_duplicateUidRepairCount = 0;
     QHash<int, QVector<FilmstripTile>> m_filmstripTiles;
     QVector<ClipInfo> m_clips;
     QList<int> m_selectedClips;
@@ -877,6 +909,14 @@ public:
                                     std::function<void(const QJsonObject&)> apply);
     // Call once before a compound edit that changes tracks without recording undo.
     void captureExternalTrackStateForCompoundEdit();
+    // Bus routing undo carrier: currentState() stores provider() in
+    // TimelineState::audioBusRouting and restoreState() hands a non-empty one to
+    // applier() on every undo / redo. MainWindow keeps the routing SSOT.
+    void setBusRoutingBridge(std::function<QJsonObject()> provider,
+                             std::function<void(const QJsonObject&)> applier);
+    // Catch-all for edits that record no undo point (matte dialog, bus panel):
+    // folds currentState() into the current undo entry and drops the redo stack.
+    void absorbIntoCurrentUndoPoint();
     // MCP の各変更ツールが、検証済みの 1 操作を正確な説明で記録するための入口。
     void saveUndoState(const QString &description);
 
@@ -1055,6 +1095,10 @@ public:
     void setClipSpeed(double speed);
     void setClipVolume(double volume, bool recordUndo = true);
     void setClipPan(double pan, bool recordUndo = true);
+    // US-1110: per-clip EQ of audio track audioTrackIdx (0 = A1), clip clipIdx.
+    // Addressed by the audio clip itself, not by the V1 selection.
+    void setClipEq(int audioTrackIdx, int clipIdx, bool enabled,
+                   const trackfx::EqSettings &eq, bool recordUndo = true);
 
     // Per-clip speed-ramp (variable speed curve). Operates on V1 by clip
     // index. Returns the identity ramp for invalid indices so callers can
@@ -1304,10 +1348,11 @@ public:
                             const ProjectTrackClips &audioTracks,
                             double playhead, double markIn, double markOut, int zoom);
 
-    // TM-8: track-matte wiring SSOT. Producers (MainWindow on every
-    // m_trackMatteClipEntries mutation; RenderQueue::resolveTimeline after
-    // rebuilding a parentless Timeline from a loaded project) push the
-    // QHash here keyed by "trackIdx:clipIdx" (== MainWindow::brushClipId ==
+    // TM-8: track-matte wiring. Timeline is the SSOT of the matte carrier
+    // (MainWindow keeps no copy): MainWindow::configureTrackMatte and project
+    // load write it here, as does RenderQueue::resolveTimeline after
+    // rebuilding a parentless Timeline from a loaded project. Keyed by
+    // "trackIdx:clipIdx" (== MainWindow::brushClipId ==
     // tlrender::renderClipId). renderFrameAt reads ONLY this — never a live
     // MainWindow off the worker thread (kills the C2 data race + C1
     // edit≠export divergence on the queue/file export path).
@@ -1363,6 +1408,8 @@ signals:
     void videoEffectsDialogRequested();
     void colorCorrectionRequested();
     void replaceClipRequested(TrackKind kind, int trackIndex, int clipIndex);
+    // US-1110: audio clip context menu "クリップ EQ…" (audio track index, clip index).
+    void audioClipEqRequested(int trackIdx, int clipIndex);
     void clipParentDialogRequested();
     void nullObjectRequested();
     // Emitted from applyTransitionToSelected when the requested duration
@@ -1411,6 +1458,8 @@ private:
     void remapTrackIndices(bool audio, const QVector<int> &oldToNew);
     std::function<QJsonObject()> m_collectExternalTrackState;
     std::function<void(const QJsonObject&)> m_applyExternalTrackState;
+    std::function<QJsonObject()> m_busRoutingProvider;
+    std::function<void(const QJsonObject&)> m_busRoutingApplier;
     void captureExternalTrackState();
     quint64 m_trackStructureRevision = 0;
     quint64 m_nextTrackStructureRevision = 0;
@@ -1464,6 +1513,7 @@ private:
     QHash<QString, RotoClipEntry> m_rotoEntries;
     TrackClipSnapshot m_rotoRemapMemoAfter;
     bool m_rotoRemapMemoValid = false;
+    // Number of remapCarriersAfterCrossTrackMove calls (selftest counter).
     quint64 m_crossTrackMoveRemapCount = 0;
     QHash<QString, QString> m_clipParentEntries;
     QVector<TimelineSequence> m_sequences;
@@ -1483,6 +1533,10 @@ private:
     QWidget *m_magnetArea = nullptr;
     QWidget *m_vaSeparator = nullptr;
     QWidget *m_vaSeparatorHeader = nullptr;
+    // Header-column rows mirroring the new-track drop bands (US-1117): the
+    // V/A boundary row (band spacer + separator) and the audio band spacer.
+    QWidget *m_vaBoundaryHeader = nullptr;
+    QWidget *m_newAudioTrackDropZoneHeader = nullptr;
     int m_textStripCustomHeight = 0;  // 0 = follows m_trackHeight
     void refreshTextStrip();
     void beginTextOverlayTimeEdit();
@@ -1590,12 +1644,18 @@ private:
     void captureLinkedTrimPartners(TimelineTrack *source, int clipIdx, bool leftEdge);
     void applyLinkedTrimDelta(double deltaSec);
     void handleCrossTrackLinkedDrop(TimelineTrack *destTrack, int linkGroup, double dropTime);
+    // US-1117: a clip dropped on a new-track band creates V(n+1) / A(n+1) and
+    // moves it there through TimelineTrack::acceptClipDrop (one undo point).
+    // Only a timeline clip of the band's kind is accepted.
+    friend class TimelineNewTrackDropZone;
+    bool dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
+                            TimelineTrack *src);
     // Explicit index map for one clip moved between tracks by dropEvent, or
     // for the linked video partner moved by handleCrossTrackLinkedDrop:
     // (srcT, srcIdx) -> (destT, destIdx), (srcT, i > srcIdx) -> i-1,
     // (destT, i >= destIdx) -> i+1. Track indices are video-track indices or
-    // -1 for an audio track (not keyed). Applies to roto and clip-parent
-    // entries only; the matte carrier is overwritten by MainWindow's copy.
+    // -1 for an audio track (not keyed). Applies to the roto, clip-parent and
+    // matte carriers (the matte source key takes the same map).
     void remapCarriersAfterCrossTrackMove(int srcTrackIdx, int srcIdx,
                                           int destTrackIdx, int destIdx);
 

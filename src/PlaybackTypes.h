@@ -8,6 +8,7 @@
 #include "LayerStyle.h"
 #include "LayerCompositor.h"
 #include "color/ClipColor.h"
+#include "AudioTrackFx.h"
 
 // Volume automation point.
 //   time = clip-local TIMELINE-display seconds (0.0 == the entry's
@@ -57,6 +58,11 @@ struct PlaybackEntry {
     LayerStyle layerStyle;       // Per-clip layer style for preview/export parity; identity == no-op
     double volume = 1.0;         // Per-clip audio gain (0.0-2.0), propagated from ClipInfo::volume
     double pan = 0.0;            // Per-clip balance pan (-1.0..+1.0), propagated from ClipInfo::pan
+    // US-1110 per-clip 4-band EQ, propagated from ClipInfo::clipEq /
+    // clipEqEnabled. AudioMixer runs it before the track chain only when
+    // clipEqEnabled is true; false keeps the HEAD playback path.
+    trackfx::EqSettings clipEq;
+    bool clipEqEnabled = false;
     int sourceClipIndex = -1;    // Index into TimelineTrack::m_clips
 
     // STAGE4B (live GPU track-matte): carries the matte assignment from the

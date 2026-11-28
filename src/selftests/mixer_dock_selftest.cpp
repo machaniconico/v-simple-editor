@@ -1,14 +1,18 @@
+#include "../AudioBusRouting.h"
 #include "../AudioMixerDock.h"
 #include "../AudioMeterWidget.h"
 #include "../AudioMixer.h"
+#include "../MainWindow.h"
 #include "../Timeline.h"
 #include "../UndoManager.h"
+#include "../VideoPlayer.h"
 #include "../RenderInPlace.h"
 #include "../libavcore/AudioExtract.h"
 #include "SelftestGate.h"
 
 #include <QApplication>
 #include <QAction>
+#include <QComboBox>
 #include <QEvent>
 #include <QLabel>
 #include <QPushButton>
@@ -518,6 +522,119 @@ int runMixerDockSelftest()
         tally.gate(10, sourceOk && drained == 4800 && pcm.size() == 480 * AudioMixer::kBytesPerFrame
                    && clockAfter == clockBefore && copyDelta == 1 && taken == 480
                    && maxAbs == 0.0, detail);
+    }
+    {
+        // G11-G12: pan slider and bus combo of a real MainWindow's Dock. The Dock
+        // only requests; MainWindow owns the routing (SSOT) and the undo points.
+        MainWindow window;
+        window.hide();
+        Timeline *timeline = window.m_timeline;
+        AudioMixer *mixer = window.m_player->audioMixer();
+        auto *dock = window.findChild<AudioMixerDock *>();
+        if (dock && timeline && timeline->audioTrackCount() == 0) timeline->addAudioTrack();
+        if (dock) dock->synchronize();
+        const bool wired = dock && mixer && timeline->audioMixer() == mixer && dock->stripCount() >= 1;
+        const auto serial = [&]() { return timeline->undoManager()->saveSerial(); };
+        QSlider *pan = wired ? dock->findChild<QSlider *>(QStringLiteral("mixerPan0")) : nullptr;
+        QLabel *panText = wired ? dock->findChild<QLabel *>(QStringLiteral("mixerPanLabel0")) : nullptr;
+        if (wired) baseline(*timeline);
+        {
+            const quint64 serial0 = serial();
+            bool ok = wired && pan && panText && pan->minimum() == -100 && pan->maximum() == 100;
+            if (ok) {
+                // Near the centre a mouse drag snaps to 0: no write, no undo point.
+                drag(pan, -3);
+                const bool snapped = pan->value() == 0 && mixer->trackPan(0) == 0.0
+                    && serial() == serial0;
+                // One gesture with several moves: no undo point while held, exactly one on release.
+                pan->setSliderDown(true);
+                pan->setValue(-40);
+                pan->setValue(-70);
+                pan->setValue(-100);
+                const bool heldSilent = serial() == serial0;
+                pan->setSliderDown(false);
+                const bool applied = heldSilent && near(mixer->trackPan(0), -1.0) && serial() == serial0 + 1
+                    && panText->text() == QStringLiteral("L100");
+                timeline->undo();
+                const bool undone = near(mixer->trackPan(0), 0.0) && pan->value() == 0;
+                timeline->redo();
+                const bool redone = near(mixer->trackPan(0), -1.0) && pan->value() == -100;
+                std::fprintf(stderr, "mixer-dock pan: snapped=%d heldSilent=%d applied=%d undone=%d redone=%d serial=%llu->%llu\n",
+                             int(snapped), int(heldSilent), int(applied), int(undone), int(redone),
+                             static_cast<unsigned long long>(serial0),
+                             static_cast<unsigned long long>(serial()));
+                ok = snapped && applied && undone && redone;
+            }
+            gate(11, ok);
+        }
+        {
+            bool ok = wired;
+            QComboBox *combo = nullptr;
+            int busB = -1;
+            if (ok) {
+                window.m_audioBusRouting.addBus(QStringLiteral("バスA"));
+                busB = window.m_audioBusRouting.addBus(QStringLiteral("バスB"));
+                window.onAudioBusRoutingChanged();
+                baseline(*timeline);
+                combo = dock->findChild<QComboBox *>(QStringLiteral("mixerBus0"));
+                ok = combo && busB == 1 && combo->count() == 3
+                    && combo->itemText(0) == QStringLiteral("マスター")
+                    && combo->itemText(1) == QStringLiteral("バスA")
+                    && combo->itemText(2) == QStringLiteral("バスB")
+                    && window.m_audioBusRouting.trackBus(0) == -1;
+            }
+            if (ok) {
+                const quint64 serial0 = serial();
+                combo->setCurrentIndex(2);
+                const bool assigned = window.m_audioBusRouting.trackBus(0) == busB
+                    && serial() == serial0 + 1 && combo->currentIndex() == 2;
+                timeline->undo();
+                const bool undone = window.m_audioBusRouting.trackBus(0) == -1
+                    && combo->currentIndex() == 0;
+                timeline->redo();
+                const bool redone = window.m_audioBusRouting.trackBus(0) == busB
+                    && combo->currentIndex() == 2;
+                std::fprintf(stderr, "mixer-dock bus: assigned=%d undone=%d redone=%d trackBus=%d serial=%llu->%llu\n",
+                             int(assigned), int(undone), int(redone), window.m_audioBusRouting.trackBus(0),
+                             static_cast<unsigned long long>(serial0),
+                             static_cast<unsigned long long>(serial()));
+                ok = assigned && undone && redone;
+            }
+            gate(12, ok);
+        }
+    }
+    {
+        // G13 (negative control): a hidden Dock follows external pan / bus changes
+        // by synchronize() without writing anything. The control writes through
+        // the visible controls and must move the counter, so a counter that never
+        // counts (or a synchronize that writes) fails here.
+        auto mixer = std::make_unique<AudioMixer>();
+        Timeline timeline;
+        wire(timeline, *mixer);
+        audiobus::AudioBusRouting routing;
+        const int bus = routing.addBus(QStringLiteral("バスA"));
+        AudioMixerDock dock(&timeline, mixer.get());
+        dock.setBusRouting(&routing);
+        const quint64 writes0 = dock.gainWriteCountForTest();
+        const auto serial = timeline.undoManager()->saveSerial();
+        QSignalSpy requests(&dock, &AudioMixerDock::trackBusRequested);
+        mixer->setTrackPan(0, 0.5);
+        routing.assignTrackToBus(0, bus);
+        dock.synchronize();
+        auto *pan = dock.findChild<QSlider *>(QStringLiteral("mixerPan0"));
+        auto *combo = dock.findChild<QComboBox *>(QStringLiteral("mixerBus0"));
+        const bool hidden = dock.isHidden();
+        const bool followed = pan && combo && pan->value() == 50 && combo->currentIndex() == 1;
+        const bool silent = dock.gainWriteCountForTest() == writes0 && requests.count() == 0
+            && timeline.undoManager()->saveSerial() == serial;
+        // Control: the same kind of change through the controls is counted.
+        if (pan) pan->setValue(-20);
+        if (combo) combo->setCurrentIndex(0);
+        const quint64 controlWrites = dock.gainWriteCountForTest() - writes0;
+        std::fprintf(stderr, "mixer-dock hidden-sync: hidden=%d followed=%d silent=%d controlWrites=%llu requests=%d\n",
+                     int(hidden), int(followed), int(silent),
+                     static_cast<unsigned long long>(controlWrites), int(requests.count()));
+        gate(13, hidden && followed && silent && controlWrites == 2 && requests.count() == 1);
     }
     return tally.finish("mixer-dock");
 }

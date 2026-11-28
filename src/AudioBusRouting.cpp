@@ -252,6 +252,22 @@ double AudioBusRouting::resolveAuxSendGain(int trackIndex, int busId) const
     return found->sendLevel * chain;
 }
 
+RouteGains AudioBusRouting::resolveTrackRouteGains(int trackIndex) const
+{
+    RouteGains gains;
+    gains.post = resolveTrackToMasterGain(trackIndex);
+    for (const AuxSend& s : m_auxSends) {
+        if (s.trackIndex != trackIndex)
+            continue;
+        const double g = resolveAuxSendGain(trackIndex, s.busId);
+        if (s.preFader)
+            gains.pre += g;
+        else
+            gains.post += g;
+    }
+    return gains;
+}
+
 bool AudioBusRouting::hasCycle() const
 {
     // 各バスを起点に outputBusId 連鎖をたどり、訪問済みに再到達したら閉路。

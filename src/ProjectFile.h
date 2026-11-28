@@ -29,6 +29,13 @@
 
 // --- Audio mixer serialization sub-types ---
 
+// Fader gain and balance of one audio track (saved as audioMixer.trackMix[track]).
+struct TrackMixState {
+    double gain = 1.0;
+    double pan = 0.0;
+    bool isDefault() const { return gain == 1.0 && pan == 0.0; }
+};
+
 struct TrackEqState {
     int trackIdx = -1;
     bool enabled = false;
@@ -232,6 +239,7 @@ struct ProjectData {
     // Audio mixer state
     QVector<TrackEqState> trackEqStates;
     QMap<int, trackfx::Chain> trackFx; // Engine audio track indices (A1 = 0).
+    QVector<TrackMixState> trackMix; // Indexed by audio track; empty = all default.
     trackfx::Chain masterFx;
     CompressorState masterCompressor;
     AutoDuckState autoDuck;

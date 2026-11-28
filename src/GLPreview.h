@@ -44,6 +44,12 @@ public:
     // Test-only seam for selftests that verify VideoPlayer -> GLPreview wiring.
     ColorCorrection colorCorrectionForTest() const { return m_cc; }
     int colorCorrectionSetCountForTest() const { return m_colorCorrectionSetCountForTest; }
+    // US-1106: format the last displayFrame() stored for upload.
+    QImage::Format lastUploadFormatForTest() const { return m_currentFrame.format(); }
+    // US-1106: test-only. Samples the frame texture (m_texture only) with
+    // Nearest instead of Linear so a device-pixel grab maps 1:1 to frame
+    // pixels. Default off; applied to an allocated texture on the next paint.
+    void setFrameTextureNearestForTest(bool nearest);
     // 0 = none (SDR sRGB), 1 = PQ (SMPTE ST 2084), 2 = HLG (ARIB STD-B67)
     void setHdrTransfer(int transfer);
     int hdrTransfer() const { return m_hdrTransfer; }
@@ -335,6 +341,8 @@ private:
     double m_brushAnimationProgress = 0.0;
     ColorCorrection m_cc;
     int m_colorCorrectionSetCountForTest = 0;
+    bool m_frameTextureNearestForTest = false;
+    bool m_frameTextureFilterDirty = false;
     bool m_effectsEnabled = true;
     bool m_needsUpload = false;
     double m_displayAspectRatio = 0.0;

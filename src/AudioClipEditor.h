@@ -3,6 +3,9 @@
 #include <QWidget>
 #include <QList>
 
+#include "AudioTrackFx.h"
+
+class QCheckBox;
 class QDoubleSpinBox;
 class QLabel;
 class QResizeEvent;
@@ -36,14 +39,32 @@ public:
     double pan() const;
     static bool isSliderDragUndoSuppressed();
 
+    // US-1111 per-clip 4-band EQ. Band 1 = lowMid, Band 2 = highMid, Band 3 =
+    // low shelf (EqSettings::low), Band 4 = high shelf (EqSettings::high).
+    // setClipEq only updates the widgets (no clipEqChanged); the panel stays
+    // hidden until setClipEqVisible(true).
+    void setClipEq(bool enabled, const trackfx::EqSettings& eq);
+    bool clipEqEnabled() const;
+    trackfx::EqSettings clipEq() const;
+    void setClipEqVisible(bool visible);
+    // Hides / shows the volume and pan row (hidden when the editor edits an
+    // audio clip by (track, clip), where those controls would not reach it).
+    void setVolumePanVisible(bool visible);
+    // When false the envelope canvas ignores press / drag / double-click / context
+    // menu and is painted grey (disabled, not hidden).
+    void setEnvelopeEditable(bool editable);
+
 signals:
     void envelopeChanged(const QList<VolumeEnvelopePoint>& points);
     void volumeChanged(double volume);
     void panChanged(double pan);
+    void clipEqChanged(bool enabled, const trackfx::EqSettings& eq);
 
 protected:
     void resizeEvent(QResizeEvent* e) override;
     void paintEvent(QPaintEvent* e) override;
+    void changeEvent(QEvent* e) override;
+    bool eventFilter(QObject* watched, QEvent* e) override;
     void mousePressEvent(QMouseEvent* e) override;
     void mouseMoveEvent(QMouseEvent* e) override;
     void mouseReleaseEvent(QMouseEvent* e) override;
@@ -57,6 +78,7 @@ private:
     double m_volume = 1.0;
     double m_pan = 0.0;
     bool m_updatingControls = false;
+    bool m_envelopeEditable = true;
     bool m_volumeSliderDragging = false;
     bool m_panSliderDragging = false;
     int m_volumeSliderDragStartValue = 100;
@@ -68,6 +90,18 @@ private:
     QSlider* m_panSlider = nullptr;
     QDoubleSpinBox* m_panSpin = nullptr;
     QLabel* m_panLabel = nullptr;
+
+    QWidget* m_clipEqPanel = nullptr;
+    QCheckBox* m_clipEqEnable = nullptr;
+    QDoubleSpinBox* m_clipEqFreq[4] = {};
+    QDoubleSpinBox* m_clipEqGain[4] = {};
+    QDoubleSpinBox* m_clipEqQ[4] = {};
+    bool m_clipEqEnabled = false;
+    trackfx::EqSettings m_clipEq;
+    void emitClipEqChanged();
+    int eqReserve() const;
+    int clipEqPanelHeight() const;
+    void layoutClipEqPanel();
 
     // 座標変換
     QPointF pointToPixel(const VolumeEnvelopePoint& p) const;

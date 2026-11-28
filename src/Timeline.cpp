@@ -48,6 +48,7 @@
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonValue>
+#include <QUuid>
 #include <QMessageBox>
 #include <QMutexLocker>
 #include <QInputDialog>
@@ -1850,11 +1851,23 @@ void TimelineTrack::setRowHeight(int h)
     update();
 }
 
-void TimelineTrack::addClip(const ClipInfo &clip) { m_clips.append(clip); updateMinimumWidth(); update(); emit modified(); }
+void TimelineTrack::ensureUid(ClipInfo &clip)
+{
+    if (clip.uid.isEmpty()) clip.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+}
+
+void TimelineTrack::addClip(const ClipInfo &clip)
+{
+    ClipInfo added = clip;
+    ensureUid(added);
+    m_clips.append(added); updateMinimumWidth(); update(); emit modified();
+}
 void TimelineTrack::insertClip(int index, const ClipInfo &clip)
 {
     if (index < 0 || index > m_clips.size()) index = m_clips.size();
-    m_clips.insert(index, clip); updateMinimumWidth(); update(); emit modified();
+    ClipInfo inserted = clip;
+    ensureUid(inserted);
+    m_clips.insert(index, inserted); updateMinimumWidth(); update(); emit modified();
 }
 
 void TimelineTrack::removeClip(int index)
@@ -1903,6 +1916,9 @@ void TimelineTrack::splitClipAt(int index, double localSeconds, bool notify)
     // is no longer the original's trailOut. Reset those so neither transition
     // is duplicated onto both halves.
     secondHalf.leadIn = Transition{};
+    // The right half is a new clip; the left half keeps the original's uid.
+    secondHalf.uid.clear();
+    ensureUid(secondHalf);
     original.outPoint = splitPoint;
     original.trailOut = Transition{};
     m_clips.insert(index + 1, secondHalf);
@@ -1990,6 +2006,7 @@ void TimelineTrack::insertClipPreservingDownstream(int index, const ClipInfo &cl
     if (index < 0) index = 0;
     if (index > m_clips.size()) index = m_clips.size();
     ClipInfo newClip = clip;
+    ensureUid(newClip);
     newClip.leadInSec = qMax(0.0, leadInSec);
     const double consumed = newClip.leadInSec + newClip.effectiveDuration();
     m_clips.insert(index, newClip);
@@ -2157,7 +2174,22 @@ TimelineTrack::DropPlan TimelineTrack::planDrop(double dropTime, double clipDura
     return plan;
 }
 
-void TimelineTrack::setClips(const QVector<ClipInfo> &clips) { m_clips = clips; updateMinimumWidth(); update(); }
+void TimelineTrack::setClips(const QVector<ClipInfo> &clips)
+{
+    m_clips = clips;
+    // Every clip leaving setClips has a uid; a uid repeated within the track
+    // keeps it on the earlier clip and gives the later one a fresh uid.
+    QSet<QString> seen;
+    for (ClipInfo &clip : m_clips) {
+        if (!clip.uid.isEmpty() && seen.contains(clip.uid)) {
+            clip.uid.clear();
+            ++m_duplicateUidRepairCount;
+        }
+        ensureUid(clip);
+        seen.insert(clip.uid);
+    }
+    updateMinimumWidth(); update();
+}
 void TimelineTrack::setSelectedClip(int index) {
     QList<int> newSel;
     if (index >= 0) newSel.append(index);
@@ -3160,7 +3192,7 @@ void TimelineTrack::mouseMoveEvent(QMouseEvent *event)
         // row, promote the in-track leadInSec drag into a full Qt drag so
         // other tracks can accept it as a drop. Revert the leadInSec we
         // tentatively applied so canceling the drag leaves the clip alone.
-        if (y < -CROSS_TRACK_DRAG_THRESHOLD || y >= height() + CROSS_TRACK_DRAG_THRESHOLD) {
+        if (promotesCrossTrackDrag(y)) {
             // Snapshot the data we need before mutating the drag state.
             const int srcIdx = m_dragClipIndex;
             m_clips[srcIdx].leadInSec = m_dragOriginalLeadIn;
@@ -3496,6 +3528,12 @@ void TimelineTrack::setSelftestDropSource(TimelineTrack *src)
     s_selftestDropSource = src;
 }
 
+static TimelineTrack *dropSourceTrack(const QDropEvent *event)
+{
+    auto *src = qobject_cast<TimelineTrack *>(event->source());
+    return src ? src : s_selftestDropSource;
+}
+
 void TimelineTrack::dragEnterEvent(QDragEnterEvent *event)
 {
     if (event->mimeData()->hasFormat("application/x-vse-clip")
@@ -3576,32 +3614,30 @@ void TimelineTrack::dropEvent(QDropEvent *event)
         return;
     }
 
-    if (!event->mimeData()->hasFormat("application/x-vse-clip")) {
+    if (acceptClipDrop(event->mimeData(), event->position().toPoint(), dropSourceTrack(event)))
+        event->acceptProposedAction();
+    else
         event->ignore();
-        return;
-    }
-    auto *src = qobject_cast<TimelineTrack *>(event->source());
-    if (!src) src = s_selftestDropSource;
-    if (!src || src == this) {
-        event->ignore();
-        return;
-    }
+}
+
+bool TimelineTrack::acceptClipDrop(const QMimeData *mime, const QPoint &pos,
+                                   TimelineTrack *src, bool toNewTrack)
+{
+    if (!mime || !mime->hasFormat("application/x-vse-clip"))
+        return false;
+    if (!src || src == this)
+        return false;
     int grabOffsetPx = 0;
-    const int srcIdx = parseDropPayload(
-        event->mimeData()->data("application/x-vse-clip"), grabOffsetPx);
-    if (srcIdx < 0 || srcIdx >= src->m_clips.size()) {
-        event->ignore();
-        return;
-    }
+    const int srcIdx = parseDropPayload(mime->data("application/x-vse-clip"), grabOffsetPx);
+    if (srcIdx < 0 || srcIdx >= src->m_clips.size())
+        return false;
     const ClipInfo clipData = src->m_clips[srcIdx];
     const double clipDur = clipData.effectiveDuration();
-    const int dropX = event->position().toPoint().x() - grabOffsetPx;
+    const int dropX = pos.x() - grabOffsetPx;
     const double dropTime = qMax(0.0, dropX / m_pixelsPerSecond);
     const DropPlan plan = planDrop(dropTime, clipDur);
-    if (!plan.valid) {
-        event->ignore();
-        return;
-    }
+    if (!plan.valid)
+        return false;
 
     // Order matters: remove from source first (while our indices are still
     // valid — source and this track have separate m_clips, so removing from
@@ -3610,12 +3646,13 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     // through in the future).
     // A linked drop may create partner tracks through addAudioTrack(false) /
     // addVideoTrack(false), which skip the external-state capture; take it before
-    // the carrier remap so the undo snapshot keeps the live matte keys.
-    if (clipData.linkGroup > 0 && m_timeline) m_timeline->captureExternalTrackStateForCompoundEdit();
+    // the carrier remap so the undo snapshot keeps the live matte keys. A
+    // new-track drop already took it in dropClipOnNewTrack, before the track
+    // existed; a second capture here would record the added track.
+    if (clipData.linkGroup > 0 && m_timeline && !toNewTrack)
+        m_timeline->captureExternalTrackStateForCompoundEdit();
     src->removeClipPreservingDownstream(srcIdx);
     insertClipPreservingDownstream(plan.insertIdx, clipData, plan.newLeadIn);
-
-    event->acceptProposedAction();
 
     // Every cross-track move changes clip keys on both tracks; Timeline remaps
     // the carriers before any linked-partner move below.
@@ -3630,7 +3667,127 @@ void TimelineTrack::dropEvent(QDropEvent *event)
     // One drop = one undo point, taken after the partner move, track creation
     // and carrier remaps above (drag->exec in mouseMoveEvent returns without
     // an interactionCompleted of its own).
-    emit interactionCompleted(QStringLiteral("クリップをトラック間移動"));
+    emit interactionCompleted(toNewTrack ? QStringLiteral("クリップを新しいトラックへ移動")
+                                         : QStringLiteral("クリップをトラック間移動"));
+    return true;
+}
+
+bool TimelineTrack::promotesCrossTrackDrag(int y) const
+{
+    if (y < -CROSS_TRACK_DRAG_THRESHOLD || y >= height() + CROSS_TRACK_DRAG_THRESHOLD)
+        return true;
+    if (!m_timeline)
+        return false;
+    const auto &tracks = m_isAudioTrack ? m_timeline->audioTracks() : m_timeline->videoTracks();
+    if (tracks.isEmpty() || tracks.last() != this)
+        return false;
+    const QWidget *band = m_timeline->findChild<QWidget *>(
+        m_isAudioTrack ? QStringLiteral("newAudioTrackDropZone")
+                       : QStringLiteral("newVideoTrackDropZone"));
+    const QWidget *tracksWidget = parentWidget();
+    if (!band || !tracksWidget || !tracksWidget->isAncestorOf(band))
+        return false;
+    const int cursorY = mapToParent(QPoint(0, y)).y();
+    const int bandTop = band->mapTo(tracksWidget, QPoint(0, 0)).y();
+    return cursorY >= bandTop && cursorY < bandTop + band->height();
+}
+
+// US-1117: thin band at the end of the video block (above the V/A separator)
+// and at the end of the audio block. A timeline clip of the band's kind
+// dropped here creates V(n+1) / A(n+1) and moves there; media-bin drops and a
+// clip of the other kind are ignored. No shortcut.
+static constexpr int kNewTrackDropZoneHeight = 10;
+
+class TimelineNewTrackDropZone : public QWidget
+{
+public:
+    TimelineNewTrackDropZone(Timeline *timeline, bool audio, QWidget *parent)
+        : QWidget(parent), m_timeline(timeline), m_audio(audio)
+    {
+        setObjectName(audio ? QStringLiteral("newAudioTrackDropZone")
+                            : QStringLiteral("newVideoTrackDropZone"));
+        setFixedHeight(kNewTrackDropZoneHeight);
+        setAcceptDrops(true);
+        setToolTip(audio ? QStringLiteral("音声クリップをここへドロップすると新しい音声トラックへ移動")
+                         : QStringLiteral("映像クリップをここへドロップすると新しい映像トラックへ移動"));
+    }
+
+protected:
+    void paintEvent(QPaintEvent *) override
+    {
+        QPainter p(this);
+        p.fillRect(rect(), m_hover ? QColor(0x6a, 0xa0, 0xff) : QColor(0x2a, 0x2a, 0x2a));
+    }
+    void dragEnterEvent(QDragEnterEvent *event) override
+    {
+        if (!accepts(event)) {
+            event->ignore();
+            return;
+        }
+        event->acceptProposedAction();
+        setHover(true);
+    }
+    void dragMoveEvent(QDragMoveEvent *event) override
+    {
+        if (accepts(event))
+            event->acceptProposedAction();
+        else
+            event->ignore();
+    }
+    void dragLeaveEvent(QDragLeaveEvent *) override { setHover(false); }
+    void dropEvent(QDropEvent *event) override
+    {
+        setHover(false);
+        if (m_timeline && m_timeline->dropClipOnNewTrack(m_audio, event->mimeData(),
+                                                          event->position().toPoint(),
+                                                          dropSourceTrack(event)))
+            event->acceptProposedAction();
+        else
+            event->ignore();
+    }
+
+private:
+    bool accepts(const QDropEvent *event) const
+    {
+        auto *src = qobject_cast<TimelineTrack *>(event->source());
+        return event->mimeData()->hasFormat("application/x-vse-clip") && src
+            && src->isAudioTrack() == m_audio;
+    }
+    void setHover(bool on)
+    {
+        if (m_hover == on) return;
+        m_hover = on;
+        update();
+    }
+
+    Timeline *m_timeline = nullptr;
+    bool m_audio = false;
+    bool m_hover = false;
+};
+
+bool Timeline::dropClipOnNewTrack(bool audio, const QMimeData *mime, const QPoint &pos,
+                                  TimelineTrack *src)
+{
+    if (!mime || !mime->hasFormat("application/x-vse-clip") || !src
+        || src->isAudioTrack() != audio)
+        return false;
+    int grabOffsetPx = 0;
+    const int srcIdx = parseDropPayload(mime->data("application/x-vse-clip"), grabOffsetPx);
+    if (srcIdx < 0 || srcIdx >= src->clipCount())
+        return false;
+    // addVideoTrack(false) / addAudioTrack(false) skip the external-state
+    // capture; take it before the track exists so the drop's one undo point
+    // (acceptClipDrop's interactionCompleted) also removes the new track.
+    captureExternalTrackStateForCompoundEdit();
+    if (audio)
+        addAudioTrack(false);
+    else
+        addVideoTrack(false);
+    const auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (tracks.last()->acceptClipDrop(mime, pos, src, true))
+        return true;
+    removeTrackInternal(audio, int(tracks.size()) - 1);
+    return false;
 }
 
 // --- Timeline ---
@@ -3976,20 +4133,47 @@ void Timeline::setupUI()
     m_headerLayout->addWidget(createTrackHeader(m_videoTrack, "V1", false));
     m_tracksLayout->addWidget(m_videoTrack);
 
-    // Boundary separator between the video and audio categories — 3 px
-    // bright bar so the V/A split is immediately visible. Mirrored in the
-    // header column so the row ordering stays aligned.
-    m_vaSeparator = new QWidget(m_tracksWidget);
+    // Boundary row between the video and audio categories: the new-video-
+    // track drop band (US-1117) over a 3 px bright bar so the V/A split is
+    // immediately visible. Band and bar share one row widget, mirrored in the
+    // header column, so the row ordering stays aligned, A rows keep layout
+    // index videoTrackCount() + 2 + i and the band stays at the end of the
+    // video block whatever addVideoTrack / remapTrackIndices insert.
+    auto *vaBoundary = new QWidget(m_tracksWidget);
+    vaBoundary->setFixedHeight(kNewTrackDropZoneHeight + 3);
+    auto *vaBoundaryLayout = new QVBoxLayout(vaBoundary);
+    vaBoundaryLayout->setContentsMargins(0, 0, 0, 0);
+    vaBoundaryLayout->setSpacing(0);
+    vaBoundaryLayout->addWidget(new TimelineNewTrackDropZone(this, false, vaBoundary));
+    m_vaSeparator = new QWidget(vaBoundary);
     m_vaSeparator->setFixedHeight(3);
     m_vaSeparator->setStyleSheet("background-color: #6aa0ff;");
-    m_vaSeparatorHeader = new QWidget(m_headerColumn);
+    vaBoundaryLayout->addWidget(m_vaSeparator);
+    m_vaBoundaryHeader = new QWidget(m_headerColumn);
+    m_vaBoundaryHeader->setFixedHeight(kNewTrackDropZoneHeight + 3);
+    auto *vaBoundaryHeaderLayout = new QVBoxLayout(m_vaBoundaryHeader);
+    vaBoundaryHeaderLayout->setContentsMargins(0, 0, 0, 0);
+    vaBoundaryHeaderLayout->setSpacing(0);
+    auto *videoDropZoneSpacer = new QWidget(m_vaBoundaryHeader);
+    videoDropZoneSpacer->setFixedHeight(kNewTrackDropZoneHeight);
+    vaBoundaryHeaderLayout->addWidget(videoDropZoneSpacer);
+    m_vaSeparatorHeader = new QWidget(m_vaBoundaryHeader);
     m_vaSeparatorHeader->setFixedHeight(3);
     m_vaSeparatorHeader->setStyleSheet("background-color: #6aa0ff;");
-    m_headerLayout->addWidget(m_vaSeparatorHeader);
-    m_tracksLayout->addWidget(m_vaSeparator);
+    vaBoundaryHeaderLayout->addWidget(m_vaSeparatorHeader);
+    m_headerLayout->addWidget(m_vaBoundaryHeader);
+    m_tracksLayout->addWidget(vaBoundary);
 
     m_headerLayout->addWidget(createTrackHeader(m_audioTrack, "A1", true));
     m_tracksLayout->addWidget(m_audioTrack);
+
+    // New-audio-track drop band (US-1117) at the end of the audio block, just
+    // before the trailing stretch (addAudioTrack inserts in front of it), with
+    // a same-height spacer in the header column.
+    m_newAudioTrackDropZoneHeader = new QWidget(m_headerColumn);
+    m_newAudioTrackDropZoneHeader->setFixedHeight(kNewTrackDropZoneHeight);
+    m_headerLayout->addWidget(m_newAudioTrackDropZoneHeader);
+    m_tracksLayout->addWidget(new TimelineNewTrackDropZone(this, true, m_tracksWidget));
 
     m_tracksLayout->addStretch();
     m_headerLayout->addStretch();
@@ -4394,11 +4578,12 @@ void Timeline::addAudioTrack(bool recordUndo)
     track->setRowHeight(m_trackHeight);
     track->setTimeline(this);
 
-    // Insert at the end of the audio block (just before the trailing stretch
-    // of each layout). Both layouts have a trailing stretch so count()-1 is
-    // the right insert position for either.
-    const int trackInsertIdx = m_tracksLayout->count() - 1;
-    const int headerInsertIdx = m_headerLayout->count() - 1;
+    // Insert at the end of the audio block (just before the new-audio-track
+    // drop band and the trailing stretch of each layout; the header column
+    // mirrors the band with a spacer). Both layouts end with band + stretch
+    // so count()-2 is the right insert position for either.
+    const int trackInsertIdx = m_tracksLayout->count() - 2;
+    const int headerInsertIdx = m_headerLayout->count() - 2;
     m_tracksLayout->insertWidget(trackInsertIdx, track);
     m_headerLayout->insertWidget(headerInsertIdx,
         createTrackHeader(track, QString("A%1").arg(num), true));
@@ -4511,6 +4696,8 @@ void Timeline::remapTrackIndices(bool audio, const QVector<int> &oldToNew)
     for (int i = 0; i < tracks.size(); ++i) {
         auto *track = tracks[i];
         auto *header = m_trackHeaders.value(track, nullptr);
+        // Rows: text strip, V1..Vn, V/A boundary (new-video-track band +
+        // separator, one row), A1..Am, new-audio-track band, stretch.
         const int row = audio ? int(m_videoTracks.size()) + 2 + i : 1 + i;
         m_tracksLayout->insertWidget(row, track);
         if (header) {
@@ -4928,6 +5115,9 @@ bool Timeline::importMedia(const QString &filePath,
     const ImportPlacement placement = static_cast<ImportPlacement>(
         prefs.value("importPlacement", static_cast<int>(ImportPlacement::ParallelTrack)).toInt());
 
+    // addVideoTrack(false) / addAudioTrack(false) below skip the capture; take
+    // it before any track is created so undoing the import restores live state.
+    captureExternalTrackState();
     int videoTrackIdx = -1;
     int audioTrackIdx = -1;
     if (requestedTrackIndex >= 0) {
@@ -6930,6 +7120,32 @@ bool Timeline::replaceRenderedClip(int trackIndex, int clipIndex,
     TrackClipSnapshot before = snapshotTrackClips(this);
     auto clips = track->clips();
     clips[clipIndex] = clip;
+    if (decomposing) {
+        // The restored nested originals are shared with every clone of the
+        // baked clip, so a restored uid can collide across tracks (setClips
+        // only repairs within one track). Re-mint any that collides.
+        QSet<QString> taken;
+        for (const auto *videoTrack : m_videoTracks) {
+            const auto trackClips = videoTrack->clips();
+            for (int i = 0; i < trackClips.size(); ++i)
+                if (videoTrack != track || i != clipIndex) taken.insert(trackClips[i].uid);
+        }
+        for (const auto *audioTrack : m_audioTracks)
+            for (const ClipInfo &audioClip : audioTrack->clips())
+                if (previous.linkGroup == 0 || audioClip.linkGroup != previous.linkGroup)
+                    taken.insert(audioClip.uid);
+        const auto claim = [&taken](ClipInfo &restored) {
+            if (taken.contains(restored.uid)) restored.uid.clear();
+            else taken.insert(restored.uid);
+        };
+        claim(clips[clipIndex]);
+        for (int t = 0; t < m_audioTracks.size(); ++t) {
+            const auto currentClips = m_audioTracks[t]->clips();
+            for (int i = 0; i < audioReplacements[t].size(); ++i)
+                if (previous.linkGroup != 0 && currentClips[i].linkGroup == previous.linkGroup)
+                    claim(audioReplacements[t][i]);
+        }
+    }
     track->setClips(clips);
     for (int i = 0; i < m_audioTracks.size(); ++i)
         m_audioTracks[i]->setClips(audioReplacements[i]);
@@ -8284,6 +8500,9 @@ void Timeline::copySelectedClip()
 ClipInfo Timeline::copyClipForPaste(const ClipInfo &source, QHash<int, int> &groups)
 {
     ClipInfo result = source;
+    // A paste / duplicate is a new clip with its own identity.
+    result.uid.clear();
+    TimelineTrack::ensureUid(result);
     if (source.linkGroup <= 0) return result;
     if (!groups.contains(source.linkGroup)) {
         QSet<int> used;
@@ -8312,7 +8531,8 @@ void Timeline::pasteClip()
     // original together with the copy).
     QHash<int, int> groups;
     const ClipInfo pastedVideo = copyClipForPaste(m_clipboard.value(), groups);
-    const ClipInfo pastedAudio = pastedVideo;
+    // Same linkGroup through `groups`, own uid for the audio partner.
+    const ClipInfo pastedAudio = copyClipForPaste(m_clipboard.value(), groups);
     m_videoTrack->insertClip(insertAt, pastedVideo);
     m_audioTrack->insertClip(insertAt, pastedAudio);
     m_videoTrack->setSelectedClip(insertAt);
@@ -8890,6 +9110,7 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         QAction *aMonoAct = addAudioChannelModeAction(aChannelMenu, aClip.audioChannelMode,
                                                       AudioChannelMode::Mono);
         aMenu.addSeparator();
+        QAction *aClipEq = aMenu.addAction(QStringLiteral("クリップ EQ…"));
         QAction *aEnabledAction = aMenu.addAction(QStringLiteral("クリップを有効にする"));
         aEnabledAction->setCheckable(true);
         aEnabledAction->setChecked(track->clips()[clipIndex].visible);
@@ -8973,6 +9194,9 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
         else if (aChosen == aReplace) {
             emit replaceClipRequested(TrackKind::Audio,
                                       m_audioTracks.indexOf(track), clipIndex);
+        }
+        else if (aChosen == aClipEq) {
+            emit audioClipEqRequested(m_audioTracks.indexOf(track), clipIndex);
         }
         else if (aChosen == aUnlink) unlinkClipGroup(aLinkGroup);
         else if (aChosen == aNormalize) {
@@ -9965,6 +10189,23 @@ void Timeline::setClipPan(double pan, bool recordUndo)
     }
     if (recordUndo && !AudioClipEditor::isSliderDragUndoSuppressed())
         saveUndoState(QString("Set pan %1").arg(pan, 0, 'f', 2));
+    scheduleEmitSequenceChanged();
+}
+
+void Timeline::setClipEq(int audioTrackIdx, int clipIdx, bool enabled,
+                         const trackfx::EqSettings &eq, bool recordUndo)
+{
+    if (audioTrackIdx < 0 || audioTrackIdx >= m_audioTracks.size()
+        || !m_audioTracks[audioTrackIdx])
+        return;
+    auto clips = m_audioTracks[audioTrackIdx]->clips();
+    if (clipIdx < 0 || clipIdx >= clips.size())
+        return;
+    clips[clipIdx].clipEq = eq;
+    clips[clipIdx].clipEqEnabled = enabled;
+    m_audioTracks[audioTrackIdx]->setClips(clips);
+    if (recordUndo)
+        saveUndoState(QStringLiteral("クリップ EQ を変更"));
     scheduleEmitSequenceChanged();
 }
 
@@ -11822,9 +12063,10 @@ void Timeline::setTrackHeight(int h)
         for (int i = 0; i < m_headerLayout->count(); ++i) {
             if (auto *item = m_headerLayout->itemAt(i)) {
                 if (auto *hw = item->widget()) {
-                    // Keep the V/A separator at its fixed 3 px height so
-                    // it doesn't balloon with the rest of the headers.
-                    if (hw == m_vaSeparatorHeader)
+                    // Keep the V/A boundary row (drop-band spacer + 3 px
+                    // separator) and the audio drop-band spacer at their
+                    // fixed heights so they don't balloon with the headers.
+                    if (hw == m_vaBoundaryHeader || hw == m_newAudioTrackDropZoneHeader)
                         continue;
                     if (hw == m_textStripHeader && m_textStripCustomHeight > 0)
                         continue;
@@ -11989,6 +12231,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         LayerStyle layerStyle;
         double volume = 1.0;
         double pan = 0.0;
+        trackfx::EqSettings clipEq;
+        bool clipEqEnabled = false;
         QVector<AudioGainPoint> volumeEnvelope;
         TransitionAlignment leadInAlignment = TransitionAlignment::Center;
         QVector<StabilizerKeyframe> stabilizerKeyframes;
@@ -12093,6 +12337,11 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                     nested.opacity = child.opacity * parentClip.opacity;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    // US-1110 clip EQ: child first, else the parent's (never both).
+                    if (!child.clipEqEnabled) {
+                        nested.clipEq = parentClip.clipEq;
+                        nested.clipEqEnabled = parentClip.clipEqEnabled;
+                    }
                     appendSequenceIntervals(nested, childTimelineStart,
                                             parentTrackIdx, parentClipIdx,
                                             out, depth + 1, sequenceStack);
@@ -12138,6 +12387,9 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.layerStyle = child.layerStyle;
                 iv.volume = child.volume * parentClip.volume;
                 iv.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                const ClipInfo &clipEqOwner = child.clipEqEnabled ? child : parentClip;
+                iv.clipEq = clipEqOwner.clipEq;
+                iv.clipEqEnabled = clipEqOwner.clipEqEnabled;
                 iv.volumeEnvelope = child.volumeEnvelope;
                 iv.clipIdx = parentClipIdx;
                 iv.leadInType = child.leadIn.type;
@@ -12217,6 +12469,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
                 iv.layerStyle = c.layerStyle;
                 iv.volume = c.volume;
                 iv.pan = c.pan;
+                iv.clipEq = c.clipEq;
+                iv.clipEqEnabled = c.clipEqEnabled;
                 iv.volumeEnvelope = c.volumeEnvelope;
                 iv.clipIdx = ci;
                 iv.leadInType = c.leadIn.type;
@@ -12308,6 +12562,8 @@ QVector<PlaybackEntry> Timeline::computePlaybackSequenceImpl(
         e.layerStyle = iv.layerStyle;
         e.volume = iv.volume;
         e.pan = iv.pan;
+        e.clipEq = iv.clipEq;
+        e.clipEqEnabled = iv.clipEqEnabled;
         e.volumeEnvelope = iv.volumeEnvelope;
         e.sourceClipIndex = iv.clipIdx;
         e.leadInType = iv.leadInType;
@@ -12570,6 +12826,11 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                     nested.reversed = effectiveReversed;
                     nested.volume = child.volume * parentClip.volume;
                     nested.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                    // US-1110 clip EQ: child first, else the parent's (never both).
+                    if (!child.clipEqEnabled) {
+                        nested.clipEq = parentClip.clipEq;
+                        nested.clipEqEnabled = parentClip.clipEqEnabled;
+                    }
                     appendSequenceAudioEntries(nested, childTimelineStart,
                                                parentTrackIdx, parentClipIdx,
                                                trackMuted, depth + 1,
@@ -12591,6 +12852,10 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
                 e.audioMuted = trackMuted;
                 e.volume = child.volume * parentClip.volume;
                 e.pan = qBound(-1.0, child.pan + parentClip.pan, 1.0);
+                // US-1110 clip EQ: child first, else the parent's (never both).
+                const ClipInfo &clipEqOwner = child.clipEqEnabled ? child : parentClip;
+                e.clipEq = clipEqOwner.clipEq;
+                e.clipEqEnabled = clipEqOwner.clipEqEnabled;
                 e.volumeEnvelope = child.volumeEnvelope;
                 e.sourceClipIndex = parentClipIdx;
                 // Transitions are attached to timeline edges, not source
@@ -12663,6 +12928,8 @@ QVector<PlaybackEntry> Timeline::computeAudioPlaybackSequence() const
             e.audioMuted = trackMuted;
             e.volume = c.volume;
             e.pan = c.pan;
+            e.clipEq = c.clipEq;
+            e.clipEqEnabled = c.clipEqEnabled;
             e.volumeEnvelope = c.volumeEnvelope;
             e.sourceClipIndex = ci;
             e.leadInType = c.leadIn.type;
@@ -12723,6 +12990,18 @@ void Timeline::captureExternalTrackState()
 {
     if (m_collectExternalTrackState)
         m_undoManager->updateCurrentExternalTrackState(m_collectExternalTrackState());
+}
+
+void Timeline::setBusRoutingBridge(std::function<QJsonObject()> provider,
+                                   std::function<void(const QJsonObject&)> applier)
+{
+    m_busRoutingProvider = std::move(provider);
+    m_busRoutingApplier = std::move(applier);
+}
+
+void Timeline::absorbIntoCurrentUndoPoint()
+{
+    m_undoManager->updateCurrentState(currentState());
 }
 
 void Timeline::saveUndoState(const QString &description)
@@ -13300,11 +13579,15 @@ TimelineState Timeline::currentState() const
     if (m_audioMixer) {
         const int n = audioTrackCount();
         state.audioTrackGains.resize(n);
-        for (int i = 0; i < n; ++i)
+        state.audioTrackPans.resize(n);
+        for (int i = 0; i < n; ++i) {
             state.audioTrackGains[i] = m_audioMixer->trackGain(i);
+            state.audioTrackPans[i] = m_audioMixer->trackPan(i);
+        }
     }
 
     if (m_collectExternalTrackState) state.externalTrackState = m_collectExternalTrackState();
+    if (m_busRoutingProvider) state.audioBusRouting = m_busRoutingProvider();
     state.projectWidth = m_projectWidth;
     state.projectHeight = m_projectHeight;
     state.projectExplicitOutput = m_projectExplicitOutput;
@@ -13427,6 +13710,11 @@ void Timeline::restoreState(const TimelineState &state)
         for (int i = 0; i < n; ++i)
             m_audioMixer->setTrackGain(i, state.audioTrackGains[i]);
     }
+    if (m_audioMixer && !state.audioTrackPans.isEmpty()) {
+        const int n = qMin(state.audioTrackPans.size(), audioTrackCount());
+        for (int i = 0; i < n; ++i)
+            m_audioMixer->setTrackPan(i, state.audioTrackPans[i]);
+    }
 
     // スナップショットに捕捉されたプロジェクト出力ジオメトリ(サイズ)を復元する。
     // SNS プリセットのリサイズを undo したとき、プロジェクトサイズも一緒に戻して
@@ -13451,6 +13739,10 @@ void Timeline::restoreState(const TimelineState &state)
     // Restore external owners only when crossing a track-structure change.
     if (structureChanged && m_applyExternalTrackState)
         m_applyExternalTrackState(state.externalTrackState);
+    // Bus routing is ordinary undo state: applied on every restore, after the
+    // external "buses" capture above (same undo point), so this one wins.
+    if (m_busRoutingApplier && !state.audioBusRouting.isEmpty())
+        m_busRoutingApplier(state.audioBusRouting);
     emit trackStateRestored();
     syncActiveSequenceFromCurrentTracks();
     const QString beforeSequenceCreation = state.externalTrackState

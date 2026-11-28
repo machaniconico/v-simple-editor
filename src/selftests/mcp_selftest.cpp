@@ -31,6 +31,7 @@
 #include <QProcessEnvironment>
 #include <QPointer>
 #include <QTcpSocket>
+#include <QThread>
 #include <QTimer>
 #include <QUrl>
 #include <QUrlQuery>
@@ -41,10 +42,13 @@
 #include <QDebug>
 #include <QtGlobal>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "../clipanim/ClipAnim.h"
@@ -52,6 +56,7 @@
 #include "../mcp/McpHttpServer.h"
 #include "../mcp/McpProtocol.h"
 #include "../mcp/McpStdioBridge.h"
+#include "../AudioExportMix.h"
 #include "../mcp/McpToolRegistry.h"
 #include "SelftestGate.h"
 #include "../AiChatDock.h"
@@ -6380,10 +6385,10 @@ int runMcpSelftest()
             const QString why = QStringLiteral("fixture missing: timeline=%1 queue=%2 asset=%3 exportRoot=%4 presetDir=%5")
                 .arg(timelineReady).arg(queue != nullptr).arg(QFileInfo(videoAsset).isFile())
                 .arg(exportRootReady).arg(presetDir.isValid());
-            for (int n = 182; n <= 188; ++n)
+            for (int n = 182; n <= 189; ++n)
                 tally.gate(n, false, why.toUtf8().constData());
         } else if (ffmpegExe.isEmpty()) {
-            for (int n = 182; n <= 188; ++n)
+            for (int n = 182; n <= 189; ++n)
                 tally.skip(n, "ffmpeg.exe unavailable");
         } else {
             const QString tonePath = exportRoot.filePath(QStringLiteral("us909-tone.wav"));
@@ -6748,8 +6753,8 @@ int runMcpSelftest()
                     qPrintable(failError), jobsSeen, static_cast<long long>(jobsAfterFail), control.captured,
                     static_cast<int>(control.finalStatus));
 
-                // G188-emptyV1: V1 empty, video only on an upper track, empty audio sequence. The ordinary mix is a
-                // passthrough here (no mix), so prepareJob must leave the job as HEAD did: no silent track, no audio.
+                // G188-emptyV1: V1 empty, video only on an upper track, empty audio sequence. With V1 empty and video
+                // on an upper track the ordinary export makes a silent track (US-1109), so prepareJob must too: one silent mix, one audio stream.
                 // The upper clip is a shape clip: with V1 empty the renderer draws a frame only for an upper shape.
                 const bool addedUpper = projectTimeline->videoTracks().size() < 2;
                 if (addedUpper) projectTimeline->addVideoTrack(false);
@@ -6797,8 +6802,8 @@ int runMcpSelftest()
                 const bool emptyV1HasError = emptyV1.job.exportConfig.contains(QStringLiteral("loudnessAutoError"));
                 const bool emptyV1Ok = observeTerm(188, "!emptyV1.isError", static_cast<bool>(!emptyV1.isError)) && observeTerm(188, "emptyV1.captured", static_cast<bool>(emptyV1.captured)) && observeTerm(188, "emptyV1.terminal", static_cast<bool>(emptyV1.terminal))
                     && observeTerm(188, "emptyV1.finalStatus == RenderJobStatus::Completed", static_cast<bool>(emptyV1.finalStatus == RenderJobStatus::Completed))
-                    && observeTerm(188, "emptyV1.mixDelta == 0", static_cast<bool>(emptyV1.mixDelta == 0)) && observeTerm(188, "emptyV1.silentMixDelta == 0", static_cast<bool>(emptyV1.silentMixDelta == 0)) && observeTerm(188, "!emptyV1HasError", static_cast<bool>(!emptyV1HasError))
-                    && observeTerm(188, "!emptyV1.mixInTemp", static_cast<bool>(!emptyV1.mixInTemp)) && observeTerm(188, "emptyV1M4aTemps == 0", static_cast<bool>(emptyV1M4aTemps == 0)) && observeTerm(188, "emptyV1AudioStreams == 0", static_cast<bool>(emptyV1AudioStreams == 0));
+                    && observeTerm(188, "emptyV1.mixDelta == 0", static_cast<bool>(emptyV1.mixDelta == 0)) && observeTerm(188, "emptyV1.silentMixDelta == 1", static_cast<bool>(emptyV1.silentMixDelta == 1)) && observeTerm(188, "!emptyV1HasError", static_cast<bool>(!emptyV1HasError))
+                    && observeTerm(188, "emptyV1.mixInTemp", static_cast<bool>(emptyV1.mixInTemp)) && observeTerm(188, "emptyV1M4aTemps == 1", static_cast<bool>(emptyV1M4aTemps == 1)) && observeTerm(188, "emptyV1AudioStreams == 1", static_cast<bool>(emptyV1AudioStreams == 1));
                 std::fprintf(stderr, "mcp G188-emptyV1 ok=%d isError=%d captured=%d terminal=%d status=%d mixDelta=%d "
                     "silentMixDelta=%d loudnessAutoError=%d[%s] mixInTemp=%d m4aTemps=%d tempFiles=%lld "
                     "projectFilePath=[%s] outputAudioStreams=%d addedUpper=%d jobError=[%s]\n", emptyV1Ok, emptyV1.isError,
@@ -6811,7 +6816,146 @@ int runMcpSelftest()
                     && observeTerm(188, "!control.isError", static_cast<bool>(!control.isError)) && observeTerm(188, "control.captured", static_cast<bool>(control.captured)) && observeTerm(188, "control.measureDelta == 1", static_cast<bool>(control.measureDelta == 1))
                     && observeTerm(188, "control.terminal", static_cast<bool>(control.terminal)) && observeTerm(188, "control.finalStatus == RenderJobStatus::Completed", static_cast<bool>(control.finalStatus == RenderJobStatus::Completed)) && observeTerm(188, "emptyV1Ok", static_cast<bool>(emptyV1Ok)),
                     "a forced PCM mix failure under autoLoudness=true did not end as failed (or the control was not "
-                    "queued), or an empty V1 export got a silent track the ordinary passthrough does not make");
+                    "queued), or an empty V1 export (video on an upper track) did not get its silent audio track");
+            }
+
+            // G189 (US-1127): export_video autoLoudness=true prepares the audio on a worker, so a client on
+            // another thread (through the HTTP transport) gets get_export_status answered while the 500 ms
+            // preparation runs. Terms are printed; the control blocks the GUI thread on purpose and must be
+            // seen as slow by the same client, so a client that cannot observe blocking cannot pass the gate.
+            {
+                using SteadyClock = std::chrono::steady_clock;
+                const auto nowNs = []() {
+                    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        SteadyClock::now().time_since_epoch()).count();
+                };
+                mcp::McpHttpServer exportServer(&projectInfoRegistry);
+                const bool exportServerStarted = exportServer.start();
+                struct StatusReply {
+                    std::atomic<bool> done{false};
+                    std::atomic<long long> sentNs{0};
+                    std::atomic<long long> repliedNs{0};
+                    QString status;
+                    QString body;
+                };
+                // One get_export_status over the transport, blocking sockets on a non-GUI thread.
+                // The GUI thread must keep running its event loop meanwhile.
+                const auto askStatus = [&](const QString &jobId, int waitBeforeMs, StatusReply &reply) {
+                    const QUrl url(exportServer.endpointUrl());
+                    const QByteArray token = exportServer.token().toUtf8();
+                    const QByteArray body = compact(rpcRequest(
+                        7000, QStringLiteral("tools/call"), QJsonObject{
+                            {QStringLiteral("name"), QStringLiteral("get_export_status")},
+                            {QStringLiteral("arguments"), QJsonObject{{QStringLiteral("jobId"), jobId}}}}));
+                    return std::thread([&reply, url, token, body, waitBeforeMs, nowNs]() {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(waitBeforeMs));
+                        QTcpSocket socket;
+                        socket.connectToHost(QHostAddress::LocalHost, static_cast<quint16>(url.port()));
+                        reply.sentNs = nowNs();
+                        QByteArray response;
+                        if (socket.waitForConnected(10000)) {
+                            QByteArray request = "POST " + url.path().toUtf8() + " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                                "Content-Type: application/json\r\nAuthorization: Bearer " + token
+                                + "\r\nConnection: close\r\nContent-Length: " + QByteArray::number(body.size())
+                                + "\r\n\r\n" + body;
+                            socket.write(request);
+                            while (socket.state() == QAbstractSocket::ConnectedState
+                                   && socket.waitForReadyRead(10000)) {
+                                response += socket.readAll();
+                                const int headerEnd = response.indexOf("\r\n\r\n");
+                                if (headerEnd >= 0) {
+                                    const QByteArray head = response.left(headerEnd).toLower();
+                                    const int lenAt = head.indexOf("content-length:");
+                                    if (lenAt >= 0) {
+                                        int lenEnd = head.indexOf("\r\n", lenAt);
+                                        if (lenEnd < 0) lenEnd = head.size();
+                                        const int contentLength = head.mid(lenAt + 15, lenEnd - lenAt - 15).trimmed().toInt();
+                                        if (response.size() - (headerEnd + 4) >= contentLength) break;
+                                    }
+                                }
+                            }
+                            response += socket.readAll();
+                        }
+                        reply.repliedNs = nowNs();
+                        const int headerEnd = response.indexOf("\r\n\r\n");
+                        reply.body = QString::fromUtf8(headerEnd >= 0 ? response.mid(headerEnd + 4) : response);
+                        const QJsonObject payload = parseObject(reply.body.toUtf8())
+                            .value(QStringLiteral("result")).toObject()
+                            .value(QStringLiteral("structuredContent")).toObject();
+                        reply.status = payload.value(QStringLiteral("status")).toString();
+                        reply.done = true;
+                    });
+                };
+
+                bool controlSlow = false;
+                double controlMs = -1.0;
+                QString controlStatus;
+                bool preparingOk = false;
+                bool doneOk = false;
+                double latencyMs = -1.0;
+                double jobAddedAfterMs = -1.0;
+                double repliedBeforeAddMs = -1.0;
+                QString duringStatus, finalStatusText;
+                if (exportServerStarted) {
+                    // Control: the same client against a GUI thread that is blocked for 400 ms.
+                    StatusReply controlReply;
+                    std::thread controlClient = askStatus(QStringLiteral("g189-control"), 50, controlReply);
+                    QTimer::singleShot(0, &projectInfoWindow, []() { QThread::msleep(400); });
+                    (void)QTest::qWaitFor([&]() { return controlReply.done.load(); }, 20000);
+                    controlClient.join();
+                    controlMs = static_cast<double>(controlReply.repliedNs - controlReply.sentNs) / 1.0e6;
+                    controlStatus = controlReply.status;
+                    controlSlow = controlReply.done && controlMs > 100.0;
+
+                    queue->clear();
+                    std::atomic<long long> addedNs{0};
+                    const auto added = QObject::connect(queue, &RenderQueue::jobsChanged, queue, [&]() {
+                        if (!queue->jobs().isEmpty() && addedNs.load() == 0) addedNs = nowNs();
+                    });
+                    audioexport::setPrepareDelayForTest(500);
+                    const long long callNs = nowNs();
+                    const QJsonObject response = callProjectInfoTool(callId++, QStringLiteral("export_video"),
+                        QJsonObject{{QStringLiteral("autoLoudness"), true}, {QStringLiteral("width"), 320},
+                                    {QStringLiteral("height"), 180}, {QStringLiteral("fps"), 10},
+                                    {QStringLiteral("outputPath"), exportRoot.filePath(QStringLiteral("us1127-async.mp4"))}});
+                    const QString jobId = toolPayload(response).value(QStringLiteral("jobId")).toString();
+                    StatusReply reply;
+                    // 50 ms: the deferred step (singleShot(0)) has started preparing by then.
+                    std::thread client = askStatus(jobId, 50, reply);
+                    (void)QTest::qWaitFor([&]() { return reply.done.load(); }, 20000);
+                    client.join();
+                    audioexport::setPrepareDelayForTest(0);
+                    latencyMs = static_cast<double>(reply.repliedNs - reply.sentNs) / 1.0e6;
+                    duringStatus = reply.status;
+                    // Preparing was still running when the reply came back: the job was added after it.
+                    (void)QTest::qWaitFor([&]() { return addedNs.load() != 0; }, 60000);
+                    jobAddedAfterMs = static_cast<double>(addedNs - callNs) / 1.0e6;
+                    repliedBeforeAddMs = static_cast<double>(addedNs - reply.repliedNs) / 1.0e6;
+                    preparingOk = !jobId.isEmpty() && reply.done && latencyMs < 100.0
+                        && duringStatus == QStringLiteral("queued") && addedNs.load() > reply.repliedNs
+                        && jobAddedAfterMs > 400.0;
+                    doneOk = !jobId.isEmpty() && QTest::qWaitFor([&]() {
+                        finalStatusText = toolPayload(callProjectInfoTool(callId++,
+                            QStringLiteral("get_export_status"), QJsonObject{{QStringLiteral("jobId"), jobId}}))
+                            .value(QStringLiteral("status")).toString();
+                        return finalStatusText == QStringLiteral("done") || finalStatusText == QStringLiteral("failed");
+                    }, 120000) && finalStatusText == QStringLiteral("done");
+                    QObject::disconnect(added);
+                    queue->clear();
+                    exportServer.stop();
+                }
+                std::fprintf(stderr, "mcp G189 serverStarted=%d control: latencyMs=%.1f slow=%d status=[%s] | "
+                    "during: latencyMs=%.1f status=[%s] jobAddedAfterCallMs=%.1f repliedBeforeAddMs=%.1f preparing=%d | "
+                    "final status=[%s] done=%d\n", exportServerStarted, controlMs, controlSlow, qPrintable(controlStatus),
+                    latencyMs, qPrintable(duringStatus), jobAddedAfterMs, repliedBeforeAddMs, preparingOk,
+                    qPrintable(finalStatusText), doneOk);
+                tallyObserved(189, observeTerm(189, "exportServerStarted", static_cast<bool>(exportServerStarted))
+                    && observeTerm(189, "controlSlow", static_cast<bool>(controlSlow))
+                    && observeTerm(189, "preparingOk", static_cast<bool>(preparingOk))
+                    && observeTerm(189, "doneOk", static_cast<bool>(doneOk)),
+                    "get_export_status over the transport was not answered within 100 ms as queued while export_video "
+                    "prepared its auto loudness audio (500 ms), or the export did not end done, or the blocked-GUI "
+                    "control was not seen as slow");
             }
 
             queue->clear();

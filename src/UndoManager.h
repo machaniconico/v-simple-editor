@@ -39,7 +39,11 @@ struct TimelineState {
     QVector<QString> videoTrackNames, audioTrackNames;
     QVector<QColor> videoTrackColors, audioTrackColors;
     QVector<double> audioTrackGains;
+    QVector<double> audioTrackPans;
     QJsonObject externalTrackState;
+    // Bus routing snapshot (MainWindow::m_audioBusRouting stays the SSOT) taken
+    // through Timeline::setBusRoutingBridge. Empty = not captured: restore skips it.
+    QJsonObject audioBusRouting;
     // Identity of the track structure, shared by ordinary edits. A new
     // add/remove/move gets a fresh revision, including compound operations.
     quint64 trackStructureRevision = 0;
@@ -87,6 +91,10 @@ public:
 
     void clear();
     void updateCurrentExternalTrackState(const QJsonObject &state);
+    // Replaces the current entry's state (description kept) for an edit that
+    // records no undo point of its own. Drops the redo stack, leaves saveSerial
+    // unchanged and signals only when redo entries were dropped. No-op when empty.
+    void updateCurrentState(const TimelineState &state);
 
 signals:
     void stateChanged();

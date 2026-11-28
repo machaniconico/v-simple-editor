@@ -1,6 +1,9 @@
 #include "SpectrumAnalyzerDock.h"
 #include "AudioMixer.h"
+#include "Timeline.h"
+#include "UndoManager.h"
 
+#include <QComboBox>
 #include <QDateTime>
 #include <QHideEvent>
 #include <QPaintEvent>
@@ -8,6 +11,7 @@
 #include <QPainterPath>
 #include <QShowEvent>
 #include <QTimer>
+#include <QVBoxLayout>
 #include <QWidget>
 
 #include <algorithm>
@@ -18,7 +22,6 @@
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr float kFloorDb = -120.0f;
 
 // A pure radix-2 FFT. The Hann coherent gain makes a bin-centred sine's
 // magnitude read as its input amplitude; the floor keeps silence finite.
@@ -133,10 +136,34 @@ SpectrumAnalyzerDock::SpectrumAnalyzerDock(AudioMixer *mixer, QWidget *parent)
     : QDockWidget(QStringLiteral("スペクトラムアナライザ"), parent), m_mixer(mixer)
 {
     setObjectName(QStringLiteral("spectrumAnalyzerDock"));
-    m_view = new SpectrumView(this);
-    setWidget(m_view);
+    auto *body = new QWidget(this);
+    auto *layout = new QVBoxLayout(body);
+    layout->setContentsMargins(4, 4, 4, 4);
+    m_sourceCombo = new QComboBox(body);
+    m_sourceCombo->setObjectName(QStringLiteral("spectrumSourceCombo"));
+    m_sourceCombo->setToolTip(QStringLiteral("表示する信号 (マスター、またはトラックの FX 後・フェーダー前)"));
+    layout->addWidget(m_sourceCombo);
+    m_view = new SpectrumView(body);
+    layout->addWidget(m_view, 1);
+    setWidget(body);
+    rebuildSourceCombo();
+    connect(m_sourceCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (!m_mixer || index < 0) return;
+        m_mixer->setTapSource(AudioMixer::TapSource{m_sourceCombo->itemData(index).toInt()});
+        // Never splice two sources into one FFT window: drop the frames of the
+        // old source still queued in the tap ring and the old spectrum on
+        // screen. At most one in-flight callback block can still carry the
+        // old source.
+        QVector<float> discard;
+        m_mixer->takeMasterTap(&discard, AudioMixer::kMasterTapFrames);
+        m_mono.clear();
+        m_lastSpectrum.clear();
+        m_peakHold.clear();
+        m_peakUpdatedMs.clear();
+        static_cast<SpectrumView *>(m_view)->setSpectrum({}, {});
+    });
     m_redrawTimer = new QTimer(this);
-    m_redrawTimer->setInterval(34); // <= 30 frames per second
+    m_redrawTimer->setInterval(kRedrawIntervalMs); // <= 30 frames per second
     connect(m_redrawTimer, &QTimer::timeout, this, &SpectrumAnalyzerDock::drawPendingFrame);
     if (m_mixer)
         connect(m_mixer, &AudioMixer::masterTapAvailable,
@@ -147,6 +174,48 @@ SpectrumAnalyzerDock::SpectrumAnalyzerDock(AudioMixer *mixer, QWidget *parent)
 SpectrumAnalyzerDock::~SpectrumAnalyzerDock()
 {
     unsubscribe();
+}
+
+void SpectrumAnalyzerDock::setTimeline(Timeline *timeline)
+{
+    if (m_timeline) {
+        disconnect(m_timeline, nullptr, this, nullptr);
+        disconnect(m_timeline->undoManager(), nullptr, this, nullptr);
+    }
+    m_timeline = timeline;
+    if (timeline) {
+        connect(timeline, &Timeline::audioSequenceChanged, this,
+                &SpectrumAnalyzerDock::rebuildSourceCombo);
+        // Queued: MainWindow remaps the mixer (and with it the tap source) first.
+        connect(timeline, &Timeline::trackIndicesRemapped, this,
+                &SpectrumAnalyzerDock::rebuildSourceCombo, Qt::QueuedConnection);
+        // Adding an empty audio track emits neither signal, only an undo point.
+        connect(timeline->undoManager(), &UndoManager::historyChanged, this,
+                &SpectrumAnalyzerDock::rebuildSourceCombo, Qt::QueuedConnection);
+    }
+    rebuildSourceCombo();
+}
+
+void SpectrumAnalyzerDock::rebuildSourceCombo()
+{
+    // The mixer taps at most kMaxAudioTracks tracks; a higher index would read
+    // as master while the combo still named the track.
+    const int trackCount = qMin(m_timeline ? m_timeline->audioTrackCount() : 0,
+                                int(AudioMixer::kMaxAudioTracks));
+    const QSignalBlocker block(m_sourceCombo);
+    if (m_sourceCombo->count() != trackCount + 1) {
+        m_sourceCombo->clear();
+        m_sourceCombo->addItem(QStringLiteral("マスター"), -1);
+        for (int i = 0; i < trackCount; ++i)
+            m_sourceCombo->addItem(QStringLiteral("A%1").arg(i + 1), i);
+    }
+    // The mixer owns the source; a track that no longer exists reads as master.
+    int source = m_mixer ? m_mixer->tapSource().track : -1;
+    if (source >= trackCount) {
+        source = -1;
+        if (m_mixer) m_mixer->setTapSource(AudioMixer::TapSource{});
+    }
+    m_sourceCombo->setCurrentIndex(m_sourceCombo->findData(source));
 }
 
 QVector<float> SpectrumAnalyzerDock::computeSpectrumForTest(const QVector<float> &mono)
@@ -178,6 +247,11 @@ void SpectrumAnalyzerDock::unsubscribe()
     if (m_subscribed && m_mixer) m_mixer->unsubscribeMasterTap();
     m_subscribed = false;
     m_mono.clear();
+    // A later show starts empty instead of redrawing a stale spectrum.
+    m_lastSpectrum.clear();
+    m_peakHold.clear();
+    m_peakUpdatedMs.clear();
+    static_cast<SpectrumView *>(m_view)->setSpectrum({}, {});
 }
 
 void SpectrumAnalyzerDock::onMasterTapAvailable()
@@ -186,6 +260,7 @@ void SpectrumAnalyzerDock::onMasterTapAvailable()
     QVector<float> stereo;
     const int frames = m_mixer->takeMasterTap(&stereo, AudioMixer::kMasterTapFrames);
     if (frames <= 0) return;
+    m_lastTapMs = QDateTime::currentMSecsSinceEpoch();
     m_mono.reserve(kFftSize);
     for (int i = 0; i < frames; ++i)
         m_mono.append(0.5f * (stereo[2 * i] + stereo[2 * i + 1]));
@@ -210,10 +285,33 @@ void SpectrumAnalyzerDock::onMasterTapAvailable()
     }
 }
 
+void SpectrumAnalyzerDock::decayIdle(double seconds)
+{
+    const float dropDb = float(kIdleDecayDbPerSec * seconds);
+    for (float &db : m_lastSpectrum) {
+        const float decayed = std::max(kFloorDb, db - dropDb);
+        if (decayed != db) {
+            db = decayed;
+            m_dirty = true;
+        }
+    }
+}
+
+void SpectrumAnalyzerDock::idleDecayStepsForTest(int steps)
+{
+    for (int i = 0; i < steps; ++i) decayIdle(kRedrawIntervalMs / 1000.0);
+}
+
 void SpectrumAnalyzerDock::drawPendingFrame()
 {
     if (m_lastSpectrum.isEmpty()) return;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    // No tap for kIdleHoldMs (stopped transport): fall toward the floor.
+    const qint64 idleFromMs = m_lastTapMs + kIdleHoldMs;
+    if (nowMs > idleFromMs) {
+        decayIdle((nowMs - std::max(idleFromMs, m_lastDecayMs)) / 1000.0);
+        m_lastDecayMs = nowMs;
+    }
     QVector<float> visibleHold(m_peakHold.size());
     bool fading = false;
     for (int i = 0; i < visibleHold.size(); ++i) {

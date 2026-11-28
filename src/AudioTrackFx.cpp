@@ -103,13 +103,13 @@ bool eqFromLegacy(const AudioEQConfig &legacy, EqSettings *out)
     // the same RBJ formulas as computeEqBand's kinds 0 / 1 / 3.
     EqSettings eq;
     EqBand *const targets[3] = {&eq.low, &eq.lowMid, &eq.high};
-    constexpr double fs = AudioMixer::kSampleRateHz;
     int active = 0;
     for (int i = 0; i < legacy.bands.size() && i < 3; ++i) {
         const EQBand &band = legacy.bands[i];
         if (band.isFlat()) continue;
-        // computeEqBand would clamp these, so they cannot be carried over as is.
-        const bool inRange = band.frequency >= 20.0 && band.frequency <= fs / 2.0 - 100.0
+        // These 20..20000 Hz, +/-24 dB and Q 0.1..10 bounds match the
+        // EqSettings JSON clamps; out-of-range values cannot be carried over.
+        const bool inRange = band.frequency >= 20.0 && band.frequency <= 20000.0
             && band.gain >= -24.0 && band.gain <= 24.0
             && (i != 1 || (band.q >= 0.1 && band.q <= 10.0));
         if (!inRange || ++active > 2) return false;

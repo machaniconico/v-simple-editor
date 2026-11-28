@@ -186,6 +186,16 @@ public:
     QImage applyStillCompareForDisplay(const QImage &image,
                                        qint64 displayTimelineUsec,
                                        bool externalPreview = false);
+    // US-1106: special composites (roto / matte / time-remap / mesh warp ...)
+    // already carry every clip grade and alpha, so GL must not grade them
+    // again (baked mode + GL effects bypass). Both entries below go through
+    // the same presentation stage as displayFrame. The paused displayFrame
+    // pulls the composite from the provider; displaySpecialComposite pushes
+    // one (refreshSpecialClipPreview / applyStillCompareConfig). The baked
+    // state ends at the next ordinary displayFrame.
+    using SpecialCompositeProvider = std::function<QImage(qint64 timelineUsec)>;
+    void setSpecialCompositeProvider(SpecialCompositeProvider provider);
+    void displaySpecialComposite(const QImage &frame);
     void setPreviewEffectsPack(float sharpen, float blur, float lens);
     void setPreviewGlow(bool enabled, float threshold, float radius, float intensity);
     void setPreviewBloom(bool enabled, float threshold, float intensity, float spread);
@@ -231,6 +241,7 @@ public:
     // on setSequence's clamped restoration which drifts back to the head
     // when the new entries trigger a fresh decoder open.
     int64_t timelinePositionUs() const { return m_timelinePositionUs; }
+    bool hasActiveSequence() const { return sequenceActive(); }
 
     // Proxy preview divisor (1 = full, 2 = half, 4 = quarter, 8 = eighth)
     // exposed so the proxy settings dialog (opened from the seekbar-left
@@ -827,6 +838,11 @@ private:
     bool m_previewEffectsLive = false;
     bool m_gpuEffectsEnabled = true;
     bool m_clipCpuDisabledGlGrade = false;
+    // US-1106: set only by presentDisplay (true when the last GL upload was a
+    // special composite), cleared by setCompositeBakedModeForDisplay.
+    bool m_lastDisplayWasSpecial = false;
+    SpecialCompositeProvider m_specialCompositeProvider;
+    bool m_inSpecialCompositeProvider = false;
     // Preview proxy divisor (1=Full, 2=1/2, 4=1/4, 8=1/8). Applied only when
     // CPU-path effects are active during playback, so heavy Sharpen/Mosaic/
     // ChromaKey stay smooth. Persisted via QSettings "proxyDivisor".
@@ -975,7 +991,12 @@ private:
     QImage stillCompareDisplaySource(const QImage &fallback,
                                      qint64 displayTimelineUsec) const;
     QImage compositeStillCompare(const QImage &display) const;
+    QImage finalizeDisplayLocalCopy(QImage display) const;
+    QImage bakeTextOverlaysForDisplay(const QImage &source, qint64 timelineUsec) const;
+    QImage finishSpecialComposite(const QImage &frame, qint64 timelineUsec) const;
+    void presentDisplay(const QImage &composed, qint64 timelineUsec, const QImage &special);
     void setCompositeBakedModeForDisplay(bool baked);
+    void endSpecialDisplayLatch();
     void beginStillCompareGlBypass();
     void applyStillCompareGlBypass();
     void restoreStillCompareGlState();

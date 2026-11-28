@@ -546,10 +546,9 @@ RenderQueue::~RenderQueue()
     removeTempFiles(nullptr);
 }
 
-// AC: production export 経路の ACES パイプラインを設定する。UI スレッドから
-// start() 前に呼ばれる想定。レンダーワーカーはフレームループ開始前に 1 度だけ
-// m_acesMutex 越しにスナップショットを取るので、この代入とスナップショット取得
-// が同一 mutex で直列化される (mid-flight の競合は無い)。
+// AC: production export 経路の ACES パイプラインの既定値を設定する。UI スレッドから
+// addJob 前に呼ばれる想定。addJob が m_acesMutex 越しにジョブへ写す (投入済みの
+// ジョブには届かない) ので、この代入と写しが同一 mutex で直列化される。
 void RenderQueue::setAcesPipeline(const aces::AcesPipeline &p)
 {
     QMutexLocker locker(&m_acesMutex);
@@ -727,6 +726,10 @@ int RenderQueue::addJob(const QString &name, const QString &projectFilePath,
         job.exportConfig, m_loudnessGainDb);
     if (hasLoudnessGain(job.loudnessGainDb))
         job.exportConfig[QStringLiteral("loudnessGainDb")] = job.loudnessGainDb;
+    {
+        QMutexLocker locker(&m_acesMutex);
+        job.acesPipeline = m_acesPipeline;
+    }
     job.status = RenderJobStatus::Pending;
     job.progress = 0;
     job.progressPercent = 0;
@@ -751,6 +754,12 @@ void RenderQueue::addJob(const RenderJob &job)
         copy.uuid = makeUuid();
     if (copy.id == 0)
         copy.id = m_nextId++;
+    // The job keeps the pipeline current at submission; setAcesPipeline only sets
+    // the default for later jobs. A caller-set pipeline is kept as is.
+    if (!copy.acesPipeline) {
+        QMutexLocker locker(&m_acesMutex);
+        copy.acesPipeline = m_acesPipeline;
+    }
     if (copy.status == RenderJobStatus::Pending && copy.progress == 0)
         copy.progress = copy.progressPercent;
     if (copy.errorMessage.isEmpty())
@@ -818,6 +827,17 @@ void RenderQueue::removeJob(const QString &uuid)
 
     discardJob(idx);
     emit jobsChanged();
+}
+
+void RenderQueue::cancelJob(const QString &uuid)
+{
+    const int idx = findJobIndexByUuid(uuid);
+    if (idx < 0)
+        return;
+    if (m_jobs[idx].status == RenderJobStatus::Pending)
+        removeJob(uuid);
+    else if (m_jobs[idx].status == RenderJobStatus::Rendering && idx == m_currentJobIndex)
+        cancelCurrent();
 }
 
 void RenderQueue::clear()
@@ -1146,6 +1166,10 @@ bool RenderQueue::loadQueue(const QString &filePath)
             job.startTime = QDateTime::fromString(obj["startTime"].toString(), Qt::ISODate);
         if (obj.contains("endTime"))
             job.endTime = QDateTime::fromString(obj["endTime"].toString(), Qt::ISODate);
+        {
+            QMutexLocker locker(&m_acesMutex);
+            job.acesPipeline = m_acesPipeline;
+        }
 
         m_jobs.append(job);
     }
@@ -1516,13 +1540,13 @@ void RenderQueue::startRenderPipe(int jobIndex)
         ? cfg.value("proresProfile").toInt(1) : -1;
 
     // AC: ACES は 8bit RGBA 出力。10bit/HDR (HDR10/HLG/ProRes) 経路では適用
-    // しない。ここでスナップショットを取り (m_acesMutex で直列化)、適用可否を
-    // 1 つの bool に畳む。フレームループ内ではこの不変値だけ参照するので競合
-    // しない。enabled=false のときは applyAces=false となり一切呼ばれない。
+    // しない。ジョブが addJob 時に写した値を使い、適用可否を 1 つの bool に畳む。
+    // フレームループ内ではこの不変値だけ参照するので競合しない。
+    // enabled=false のときは applyAces=false となり一切呼ばれない。
     aces::AcesPipeline acesPipe;
     {
         QMutexLocker locker(&m_acesMutex);
-        acesPipe = m_acesPipeline;
+        acesPipe = jobCopy.acesPipeline.value_or(m_acesPipeline);
     }
     // When VEDITOR_HDR_ODT is ON with a 16-bit renderFrameAt path, that ODT
     // owns tonemap; otherwise the 8-bit ACES export pass must still run.
@@ -2451,8 +2475,8 @@ void RenderQueue::finishCurrentJob(bool success, const QString &errorMsg)
 // Resolve the Timeline a job renders. Priority:
 //   1. job.timeline (the additive in-memory seam) — used as-is, not owned.
 //      RM-1.5: track-matte wiring for THIS branch is NOT populated here —
-//      the producer must have synced the live Timeline's matte carrier
-//      (syncTrackMatteEntriesToTimeline) before submitting the job.
+//      the live Timeline's trackMatteEntries() is the matte SSOT (US-1016),
+//      so the render reads it directly and nothing is synced before submitting.
 //   2. ProjectFile::load(job.projectFilePath) into a fresh heap Timeline via
 //      the genuine Timeline::restoreFromProject path (the same call
 //      MainWindow::applyLoadedProjectData uses, MainWindow.cpp:3982). The
@@ -2498,10 +2522,9 @@ Timeline *RenderQueue::resolveTimeline(const RenderJob &job,
     // RM-1.5: this branch is reached ONLY for a parentless project-FILE
     // load (job.timeline == nullptr). The job.timeline != nullptr paths
     // (File→Export MainWindow.cpp, mobile export, the live-Timeline batch
-    // overload) early-return above at `if (job.timeline)` and therefore
-    // DEPEND on the producer having synced the live Timeline's matte
-    // carrier before submitting the job (RM-1.3 — MainWindow calls
-    // syncTrackMatteEntriesToTimeline right before addJob). This block
+    // overload) early-return above at `if (job.timeline)` and render the
+    // live Timeline's own matte entries (the matte SSOT since US-1016, so
+    // there is nothing to sync before addJob). This block
     // does NOT cover those paths. Here we populate the freshly-rebuilt
     // Timeline's intrinsic matte carrier straight from the persisted
     // ProjectData so a file-path export applies the EXACT same track

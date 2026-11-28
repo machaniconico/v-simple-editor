@@ -275,6 +275,7 @@ double exporter_loudnessGainDb();
 #include <QTimer>
 #include <QPointer>
 #include <QUrl>
+#include <QUuid>
 #include <QDebug>
 #include <QSizeF>
 #include <QActionGroup>
@@ -377,18 +378,6 @@ extern "C" {
 #include <libswresample/swresample.h>
 #include <libswscale/swscale.h>
 }
-
-namespace audiofxexport {
-// Thread-local instrumentation: export tests cannot alter another worker.
-thread_local bool masterEqBypass = false;
-thread_local quint64 masterEqPasses = 0;
-void setMasterEqBypassForTest(bool bypass)
-{
-    masterEqBypass = bypass;
-    masterEqPasses = 0;
-}
-quint64 masterEqPassesForTest() { return masterEqPasses; }
-} // namespace audiofxexport
 
 // Shared by the file menu and import hub; no persistent widget state needed.
 static void importEdlIntoTimeline(QWidget *parent, Timeline *timeline, const QString &path)
@@ -564,26 +553,8 @@ QString onionSkinOpacityText(const onionskin::Config &cfg)
     return QStringLiteral("不透明度... (%1%)").arg(pct);
 }
 
-QString findFfmpegBinary()
-{
-    QString path = QStandardPaths::findExecutable(QStringLiteral("ffmpeg"));
-    if (!path.isEmpty())
-        return path;
-
-    const QStringList searchPaths = {
-        QStringLiteral("/usr/local/bin"),
-        QStringLiteral("/opt/homebrew/bin"),
-        QStringLiteral("/usr/bin")
-    };
-    return QStandardPaths::findExecutable(QStringLiteral("ffmpeg"), searchPaths);
-}
-
-QString ffmpegNumber(double value)
-{
-    if (!std::isfinite(value))
-        value = 0.0;
-    return QString::number(value, 'f', 6);
-}
+using audioexport::findFfmpegBinary;
+using audioexport::ffmpegNumber;
 
 double dbToLinear(double db)
 {
@@ -614,26 +585,7 @@ double evaluateAudioGainAt(const QVector<AudioGainPoint> &env,
     return fallbackGain;
 }
 
-QVector<AudioGainPoint> sortedDedupedEnvelope(QVector<AudioGainPoint> env)
-{
-    std::sort(env.begin(), env.end(),
-              [](const AudioGainPoint &a, const AudioGainPoint &b) {
-                  return a.time < b.time;
-              });
-    QVector<AudioGainPoint> out;
-    out.reserve(env.size());
-    for (const AudioGainPoint &point : env) {
-        AudioGainPoint p;
-        p.time = qMax(0.0, point.time);
-        p.gain = qBound(0.0, point.gain, 2.0);
-        if (!out.isEmpty() && std::abs(out.last().time - p.time) <= 0.001) {
-            out.last().gain = qMin(out.last().gain, p.gain);
-        } else {
-            out.append(p);
-        }
-    }
-    return out;
-}
+using audioexport::sortedDedupedEnvelope;
 
 bool envelopesNearlyEqual(const QVector<AudioGainPoint> &a,
                           const QVector<AudioGainPoint> &b)
@@ -840,6 +792,39 @@ bool applyDuckingToTimeline(Timeline *timeline,
     return true;
 }
 
+// どの映像トラックにもクリップが無ければ書き出す映像が無い。
+bool timelineHasAnyVideoClip(Timeline *timeline)
+{
+    for (TimelineTrack *videoTrack : timeline->videoTracks()) {
+        if (videoTrack && !videoTrack->clips().isEmpty())
+            return true;
+    }
+    return false;
+}
+
+// GUI 書き出しの入口ガード。V1 に映像があるか、V1 が空でも上位トラックに図形
+// クリップがある(レンダラが描ける)ときだけ書き出せる。V1 が非表示のときは
+// レンダラが透明の下地から上位レイヤーまで描くので、上位の通常映像も書き出せる。
+// V1 が表示のまま空で上位が通常映像だけのプロジェクトは、レンダリング時に null
+// 画像で失敗するため従来どおり拒否する。
+bool timelineHasExportableVideo(Timeline *timeline)
+{
+    if (!timeline->videoClips().isEmpty())
+        return true;
+    const QVector<TimelineTrack *> tracks = timeline->videoTracks();
+    if (!tracks.isEmpty() && tracks.first() && tracks.first()->isHidden())
+        return timelineHasAnyVideoClip(timeline);
+    for (int i = 1; i < tracks.size(); ++i) {
+        if (!tracks[i])
+            continue;
+        for (const ClipInfo &clip : tracks[i]->clips()) {
+            if (!clip.shapes.isEmpty())
+                return true;
+        }
+    }
+    return false;
+}
+
 // RenderQueue の音声パススルーは「V1 先頭クリップの元ファイルの音声を 0 秒から
 // そのまま mux」する。音声タイムラインが厳密にそれと一致するときだけ省略できる。
 // トリム・分割・並べ替え・複数クリップ・音量/パン/エンベロープ/トランジション・
@@ -847,8 +832,11 @@ bool applyDuckingToTimeline(Timeline *timeline,
 bool timelineAudioMatchesPassthrough(Timeline *timeline)
 {
     const QVector<ClipInfo> &v1 = timeline->videoClips();
-    if (v1.isEmpty())
-        return true; // 映像が無ければ書き出し自体が成立しない
+    if (v1.isEmpty()) {
+        // 映像が無ければ書き出し自体が成立しない。V1 が空で上位に映像があるときは
+        // v1.first() に到達させず、無音 / 混合ミックスを作らせる。
+        return !timelineHasAnyVideoClip(timeline);
+    }
     const ClipInfo *only = nullptr;
     for (TimelineTrack *track : timeline->audioTracks()) {
         if (!track || track->isMuted())
@@ -897,97 +885,10 @@ bool timelineNeedsAudioMixForExport(Timeline *timeline)
     return !timelineAudioMatchesPassthrough(timeline);
 }
 
-QString volumeExpressionForEntry(const PlaybackEntry &entry)
-{
-    QVector<AudioGainPoint> env = sortedDedupedEnvelope(entry.volumeEnvelope);
-    if (env.isEmpty())
-        return ffmpegNumber(qBound(0.0, entry.volume, 2.0));
+using audioexport::nextExportAudioMixPath;
+using audioexport::runFfmpegForAudioMix;
 
-    auto linearExpr = [](const AudioGainPoint &a,
-                         const AudioGainPoint &b) {
-        const double span = b.time - a.time;
-        if (span <= 0.000001)
-            return ffmpegNumber(b.gain);
-        return QStringLiteral("(%1+(%2-%1)*(t-%3)/%4)")
-            .arg(ffmpegNumber(a.gain),
-                 ffmpegNumber(b.gain),
-                 ffmpegNumber(a.time),
-                 ffmpegNumber(span));
-    };
-
-    QString expr = ffmpegNumber(env.last().gain);
-    for (int i = env.size() - 2; i >= 0; --i) {
-        const QString segment = linearExpr(env[i], env[i + 1]);
-        expr = QStringLiteral("if(lt(t,%1),%2,%3)")
-            .arg(ffmpegNumber(env[i + 1].time), segment, expr);
-    }
-    expr = QStringLiteral("if(lt(t,%1),%2,%3)")
-        .arg(ffmpegNumber(env.first().time),
-             ffmpegNumber(env.first().gain),
-             expr);
-    return expr;
-}
-
-QString nextExportAudioMixPath()
-{
-    static int serial = 0;
-    const QString dirPath = QDir::tempPath()
-        + QStringLiteral("/v-simple-editor-audio-mix");
-    QDir().mkpath(dirPath);
-    return dirPath
-        + QStringLiteral("/ducking_mix_%1_%2.m4a")
-              .arg(QDateTime::currentMSecsSinceEpoch())
-              .arg(++serial);
-}
-
-QString exportAudioFilterChainForEntry(int inputIndex,
-                                       const PlaybackEntry &entry,
-                                       AudioChannelMode channelMode,
-                                       bool reversed)
-{
-    const int delayMs = qMax(0, qRound(entry.timelineStart * 1000.0));
-    return buildExportAudioMixEntryFilterChain(
-        inputIndex,
-        ffmpegNumber(entry.clipIn),
-        ffmpegNumber(entry.clipOut),
-        delayMs,
-        volumeExpressionForEntry(entry),
-        channelMode,
-        reversed,
-        entry.speed,
-        entry.leadInType,
-        entry.leadInDuration,
-        entry.trailOutType,
-        entry.trailOutDuration);
-}
-
-bool runFfmpegForAudioMix(const QStringList &args, QString *error)
-{
-    const QString ffmpeg = findFfmpegBinary();
-    if (ffmpeg.isEmpty()) {
-        if (error)
-            *error = QStringLiteral("ffmpeg が見つからないため、ダッキング済み audio mix を作成できません。");
-        return false;
-    }
-
-    QProcess process;
-    process.start(ffmpeg, args);
-    if (!process.waitForStarted(5000)) {
-        if (error)
-            *error = QStringLiteral("ffmpeg を起動できませんでした。");
-        return false;
-    }
-    process.waitForFinished(-1);
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        if (error) {
-            *error = QStringLiteral("audio mix の作成に失敗しました。\n%1")
-                .arg(QString::fromUtf8(process.readAllStandardError()));
-        }
-        return false;
-    }
-    return true;
-}
-
+// Synchronous plan + execute on the calling (GUI) thread, for every entry that mixes timeline audio.
 QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
                                          const QString &forcedOutputPath = {},
                                          double forcedDurationSeconds = 0.0,
@@ -995,278 +896,9 @@ QString prepareTimelineAudioMixForExport(Timeline *timeline, QString *error,
 {
     if (!timeline)
         return {};
-    QMap<int, trackfx::Chain> trackChains;
-    QMap<int, AudioEQConfig> legacyEqConfigs;
-    QMap<int, std::array<AudioMixer::EqBandCoefs, 3>> legacyEqCoeffs;
-    QMap<int, bool> legacyEqEnabled;
-    QMap<int, double> trackGains;
-    bool useTrackFx = false;
-    trackfx::Chain masterChain;
-    if (AudioMixer *mixer = timeline->audioMixer()) {
-        masterChain = mixer->masterChain();
-        for (int track = 0; track < timeline->audioTracks().size(); ++track) {
-            const trackfx::Chain chain = mixer->trackChain(track);
-            trackChains.insert(track, chain);
-            legacyEqConfigs.insert(track, mixer->trackEqConfig(track));
-            legacyEqCoeffs.insert(track, mixer->trackEqCoeffs(track));
-            legacyEqEnabled.insert(track, mixer->trackEqEnabled(track));
-            trackGains.insert(track, mixer->trackGain(track));
-            // MIXER-DOCK: non-unity gain needs the existing post-DSP gain path,
-            // including when no track effect is enabled.
-            useTrackFx = useTrackFx || mixer->trackGain(track) != 1.0;
-            useTrackFx = useTrackFx || chain.eqEnabled || chain.compEnabled
-                || chain.reverbEnabled || chain.nrEnabled || chain.deesser.enabled
-                || (legacyEqEnabled.value(track) && !legacyEqConfigs.value(track).isDefault());
-        }
-    }
-    const bool useMasterEq = (masterChain.eqEnabled || masterChain.deesser.enabled)
-        && !audiofxexport::masterEqBypass;
-    if (forcedOutputPath.isEmpty() && !useTrackFx && !useMasterEq
-        && timelineAudioMatchesPassthrough(timeline))
-        return {};
-
-    const QVector<PlaybackEntry> entries = timeline->computeAudioPlaybackSequence();
-    const bool renderInPlace = !forcedOutputPath.isEmpty();
-    const double durationSeconds = qMax(0.001, renderInPlace
-        ? forcedDurationSeconds : timeline->totalDuration());
-    const QString outputPath = forcedOutputPath.isEmpty()
-        ? nextExportAudioMixPath() : forcedOutputPath;
-    // Audio-only export uses a PCM intermediate so lossy encoding happens only
-    // at the final output. Keep the default video-export arguments unchanged.
-    const bool pcmIntermediate = renderInPlace
-        && QFileInfo(outputPath).suffix().compare(QStringLiteral("wav"), Qt::CaseInsensitive) == 0;
-    QStringList outputArgs;
-    if (pcmIntermediate) {
-        outputArgs << QStringLiteral("-c:a") << QStringLiteral("pcm_s16le");
-    } else {
-        outputArgs << exportaudio::aacAudioArgs(audioKbps)
-                   << QStringLiteral("-movflags") << QStringLiteral("+faststart");
-    }
-    outputArgs << outputPath;
-
-    // Default path retains precisely the original single-pass arguments.
-    // Enabled master EQ is applied once to the final amix output, including
-    // every track's clip/track gain and pan, using the playback EQ processor.
-    const auto finishMixUncleaned = [&](QStringList mixArgs) -> QString {
-        if (!useMasterEq) {
-            mixArgs << outputArgs;
-            return runFfmpegForAudioMix(mixArgs, error) ? outputPath : QString();
-        }
-        ++audiofxexport::masterEqPasses;
-        QTemporaryDir masterTemporary;
-        if (!masterTemporary.isValid()) {
-            if (error) *error = QStringLiteral("マスター EQ の一時フォルダーを作成できません。");
-            return {};
-        }
-        const QString mixPath = masterTemporary.filePath(QStringLiteral("master.wav"));
-        mixArgs << QStringLiteral("-ar") << QString::number(AudioMixer::kSampleRateHz)
-                << QStringLiteral("-ac") << QString::number(AudioMixer::kChannels)
-                << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le") << mixPath;
-        if (!runFfmpegForAudioMix(mixArgs, error)) return {};
-        std::vector<float> samples;
-        int rate = 0, channels = 0;
-        if (!libavcore::readWavFloatInterleaved(mixPath, &samples, &rate, &channels, error))
-            return {};
-        if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
-            if (error) *error = QStringLiteral("マスター音声の形式が不正です。");
-            return {};
-        }
-        AudioMixer::MasterEqFilter masterProcessor;
-        masterProcessor.setEq(masterChain.eqEnabled ? masterChain.eq : trackfx::EqSettings{});
-        masterProcessor.setDeEsser(masterChain.deesser);
-        const size_t frames = samples.size() / channels;
-        for (size_t frame = 0; frame < frames; frame += 4096)
-            masterProcessor.process(samples.data() + frame * channels,
-                static_cast<int>(std::min<size_t>(4096, frames - frame)));
-        if (!libavcore::writeWavFloatInterleaved(mixPath, samples, rate, channels, error))
-            return {};
-        QStringList encodeArgs{QStringLiteral("-y"), QStringLiteral("-i"), mixPath,
-                               QStringLiteral("-vn")};
-        encodeArgs << outputArgs;
-        return runFfmpegForAudioMix(encodeArgs, error) ? outputPath : QString();
-    };
-    // Whoever creates the intermediate removes it again when the mix fails: ffmpeg may have
-    // written part of outputPath, and the caller only gets an empty path back.
-    const auto finishMix = [&](QStringList mixArgs) -> QString {
-        QString result = finishMixUncleaned(mixArgs);
-        if (exportaudio::failAfterWriteForTest && !result.isEmpty()) {
-            exportaudio::outputExistedBeforeCleanupForTest = QFile::exists(outputPath);
-            if (error) *error = QStringLiteral("test: forced failure after write");
-            result.clear();
-        }
-        if (result.isEmpty())
-            QFile::remove(outputPath);
-        return result;
-    };
-
-    QStringList args;
-    args << QStringLiteral("-y");
-
-    QVector<PlaybackEntry> validEntries;
-    QVector<bool> validReversedFlags;
-    const QVector<bool> reversedFlags =
-        audioReversedFlagsForPlaybackEntries(entries);
-    validEntries.reserve(entries.size());
-    validReversedFlags.reserve(entries.size());
-    for (int entryIndex = 0; entryIndex < entries.size(); ++entryIndex) {
-        const PlaybackEntry &entry = entries[entryIndex];
-        if (entry.audioMuted)
-            continue;
-        if (entry.timelineEnd <= entry.timelineStart)
-            continue;
-        if (entry.clipOut <= entry.clipIn)
-            continue;
-        if (!QFileInfo::exists(entry.filePath))
-            continue;
-        const bool reversed = reversedFlags.value(entryIndex, false);
-        if (reversed && entry.clipOut - entry.clipIn > 10.0 * 60.0) {
-            qWarning().noquote()
-                << QStringLiteral("音声の逆再生クリップが10分の上限を超えたため、書き出しでは無音にします: %1")
-                       .arg(entry.filePath);
-            continue;
-        }
-        validEntries.append(entry);
-        validReversedFlags.append(reversed);
-        args << QStringLiteral("-i") << entry.filePath;
-    }
-
-    if (validEntries.isEmpty()) {
-        args << QStringLiteral("-f") << QStringLiteral("lavfi")
-             << QStringLiteral("-i")
-             << QStringLiteral("anullsrc=channel_layout=stereo:sample_rate=48000")
-             << QStringLiteral("-t") << ffmpegNumber(durationSeconds)
-             << QStringLiteral("-vn");
-        return finishMix(args);
-    }
-
-    if (useTrackFx) {
-        // Snapshot settings above, before starting any potentially long render.
-        // Every track (including dry tracks) remains float until the master mix.
-        QTemporaryDir temporary;
-        if (!temporary.isValid()) {
-            if (error) *error = QStringLiteral("トラック音声の一時フォルダーを作成できません。");
-            return {};
-        }
-        // Process source clips in timeline order, retaining each track's DSP
-        // histories across clips. Gaps/delays never enter the DSP or NR detector.
-        QVector<int> orderedEntries;
-        for (int i = 0; i < validEntries.size(); ++i)
-            orderedEntries.append(i);
-        std::stable_sort(orderedEntries.begin(), orderedEntries.end(), [&](int a, int b) {
-            return validEntries[a].timelineStart < validEntries[b].timelineStart;
-        });
-        QMap<int, QVector<int>> entriesByTrack;
-        for (int i : orderedEntries)
-            entriesByTrack[validEntries[i].sourceTrack].append(i);
-        QVector<QString> clipPaths(validEntries.size());
-        for (auto it = entriesByTrack.cbegin(); it != entriesByTrack.cend(); ++it) {
-            const int track = it.key();
-            std::vector<audioexport::DspEntry> buffers;
-            buffers.reserve(it.value().size());
-            for (int i : it.value()) {
-                const PlaybackEntry &entry = validEntries[i];
-                const QString clipPath = temporary.filePath(QStringLiteral("clip_%1.wav").arg(i));
-                const QString filter = buildExportAudioMixEntryPreFxFilterChain(0,
-                    ffmpegNumber(entry.clipIn), ffmpegNumber(entry.clipOut),
-                    audioChannelModeForPlaybackEntry(entry), validReversedFlags.value(i, false),
-                    entry.speed);
-                QStringList clipArgs{QStringLiteral("-y"), QStringLiteral("-i"), entry.filePath};
-                clipArgs << QStringLiteral("-filter_complex") << filter
-                         << QStringLiteral("-map") << QStringLiteral("[prefx0]")
-                         << QStringLiteral("-vn") << QStringLiteral("-c:a") << QStringLiteral("pcm_f32le")
-                         << clipPath;
-                if (!runFfmpegForAudioMix(clipArgs, error)) return {};
-                std::vector<float> samples;
-                int rate = 0, channels = 0;
-                if (!libavcore::readWavFloatInterleaved(clipPath, &samples, &rate, &channels, error))
-                    return {};
-                if (rate != AudioMixer::kSampleRateHz || channels != AudioMixer::kChannels) {
-                    if (error) *error = QStringLiteral("トラック音声の形式が不正です。");
-                    return {};
-                }
-                buffers.push_back({qRound64(entry.timelineStart * AudioMixer::kSampleRateHz),
-                                   std::move(samples)});
-                clipPaths[i] = clipPath;
-            }
-            audioexport::processTrackEntries(buffers, trackChains.value(track),
-                legacyEqCoeffs.value(track), legacyEqEnabled.value(track, false),
-                legacyEqConfigs.value(track).preamp);
-            for (size_t index = 0; index < buffers.size(); ++index) {
-                if (!libavcore::writeWavFloatInterleaved(clipPaths[it.value()[static_cast<int>(index)]],
-                        buffers[index].samples, AudioMixer::kSampleRateHz, AudioMixer::kChannels, error))
-                    return {};
-            }
-        }
-        QStringList finalArgs{QStringLiteral("-y")};
-        QStringList finalInputs, finalChains;
-        for (int i = 0; i < validEntries.size(); ++i) {
-            const PlaybackEntry &entry = validEntries[i];
-            finalArgs << QStringLiteral("-i") << clipPaths[i];
-            const double clipDuration = std::isfinite(entry.speed) && entry.speed > 0.0
-                ? qMax(0.0, (entry.clipOut - entry.clipIn) / entry.speed)
-                : qMax(0.0, entry.clipOut - entry.clipIn);
-            QString post = buildExportAudioMixEntryPostFxFilterChain(i,
-                qMax(0, qRound(entry.timelineStart * 1000.0)),
-                volumeExpressionForEntry(entry), clipDuration,
-                entry.leadInType, entry.leadInDuration, entry.trailOutType, entry.trailOutDuration);
-            // Static track gain and clip balance also belong after the DSP.
-            const auto pan = audiopan::balanceGains(entry.pan);
-            const double gain = trackGains.value(entry.sourceTrack, 1.0);
-            if (gain != 1.0 || entry.pan != 0.0) {
-                post.insert(QStringLiteral("[%1:a]").arg(i).size(),
-                    QStringLiteral("pan=stereo|c0=%1*c0|c1=%2*c1,")
-                        .arg(ffmpegNumber(gain * pan.left), ffmpegNumber(gain * pan.right)));
-            }
-            finalChains << post;
-            if (renderInPlace) {
-                finalChains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
-                finalInputs << QStringLiteral("[rip%1]").arg(i);
-            } else {
-                finalInputs << QStringLiteral("[a%1]").arg(i);
-            }
-        }
-        finalChains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
-                                      "%4atrim=duration=%3,asetpts=PTS-STARTPTS[aout]")
-            .arg(finalInputs.join(QString()), QString::number(finalInputs.size()),
-                 ffmpegNumber(durationSeconds),
-                 renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
-        const QString finalFilter = finalChains.join(QLatin1Char(';'));
-        finalArgs << QStringLiteral("-filter_complex") << finalFilter
-                  << QStringLiteral("-map") << QStringLiteral("[aout]") << QStringLiteral("-vn");
-        return finishMix(finalArgs);
-    }
-
-    QStringList chains;
-    QStringList mixInputs;
-    for (int i = 0; i < validEntries.size(); ++i) {
-        const PlaybackEntry &entry = validEntries[i];
-        chains << exportAudioFilterChainForEntry(
-            i,
-            entry,
-            audioChannelModeForPlaybackEntry(entry),
-            validReversedFlags.value(i, false));
-        if (renderInPlace) {
-            // adelay can leave unset timestamps on its generated silence.
-            // amix propagates them; atrim then cuts at the first real PTS.
-            // Count samples after delay so both silence and content are 0-origin.
-            chains << QStringLiteral("[a%1]asetpts=N/SR/TB[rip%1]").arg(i);
-            mixInputs << QStringLiteral("[rip%1]").arg(i);
-        } else {
-            mixInputs << QStringLiteral("[a%1]").arg(i);
-        }
-    }
-
-    chains << QStringLiteral("%1amix=inputs=%2:normalize=0:duration=longest,"
-                             "%4atrim=duration=%3,"
-                             "asetpts=PTS-STARTPTS[aout]")
-        .arg(mixInputs.join(QString()), QString::number(validEntries.size()),
-             ffmpegNumber(durationSeconds),
-             renderInPlace ? QStringLiteral("asetpts=N/SR/TB,apad,") : QString());
-
-    args << QStringLiteral("-filter_complex") << chains.join(QStringLiteral(";"))
-         << QStringLiteral("-map") << QStringLiteral("[aout]")
-         << QStringLiteral("-vn");
-    return finishMix(args);
+    const audioexport::MixPlan plan = audioexport::buildMixPlan(timeline, timeline->audioMixer(),
+        {forcedOutputPath, forcedDurationSeconds, audioKbps});
+    return audioexport::executeMixPlan(plan, [] { return false; }, error);
 }
 
 QGroupBox *findVfxGroup(VfxControlsPanel *panel, const QString &title)
@@ -2828,62 +2460,6 @@ LoudnessMeasureResult measureTimelineLoudness(const QVector<PlaybackEntry> &entr
 
 } // namespace
 
-void audioexport::processTrackEntries(std::vector<DspEntry> &entries,
-                                      const trackfx::Chain &chain,
-                                      const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
-                                      bool eqEnabled, double preampDb)
-{
-    // Sort indices so callers retain their clip-to-buffer mapping.
-    std::vector<size_t> order;
-    for (size_t i = 0; i < entries.size(); ++i)
-        if (!entries[i].samples.empty()) order.push_back(i);
-    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return entries[a].frameStart < entries[b].frameStart;
-    });
-    if (order.empty()) return;
-    trackfx::Processor processor(chain, AudioMixer::kSampleRateHz, AudioMixer::kChannels);
-    processor.reset();
-    std::array<std::array<double, 4>, 3> z{};
-    const double preamp = std::pow(10.0, preampDb / 20.0);
-    qint64 end = entries[order.front()].frameStart;
-    for (size_t i : order)
-        end = std::max(end, entries[i].frameStart + static_cast<qint64>(entries[i].samples.size() / 2));
-    for (qint64 t = entries[order.front()].frameStart; t < end;) {
-        const qint64 blockEnd = std::min(t + 1024, end);
-        qint64 next = end;
-        bool active = false;
-        for (size_t i : order) {
-            auto &entry = entries[i];
-            const qint64 first = std::max(t, entry.frameStart);
-            const qint64 last = std::min(blockEnd,
-                entry.frameStart + static_cast<qint64>(entry.samples.size() / 2));
-            if (entry.frameStart >= blockEnd) next = std::min(next, entry.frameStart);
-            if (first >= last) continue;
-            active = true;
-            float *block = entry.samples.data() + 2 * static_cast<size_t>(first - entry.frameStart);
-            const int count = static_cast<int>(last - first);
-            processor.process(block, count);
-            if (!eqEnabled) continue;
-            // Same double cascade as MixerIODevice::readData. In particular,
-            // never saturate/quantize between the legacy EQ and preamp/gain.
-            for (int sample = 0; sample < count * 2; ++sample) {
-                double value = block[sample];
-                const int ch = sample & 1;
-                for (int b = 0; b < 3; ++b) {
-                    const auto &c = coeffs[b];
-                    const double w = value - c.a1 * z[b][ch] - c.a2 * z[b][ch + 2];
-                    value = c.b0 * w + c.b1 * z[b][ch] + c.b2 * z[b][ch + 2];
-                    z[b][ch + 2] = z[b][ch];
-                    z[b][ch] = w;
-                }
-                block[sample] = static_cast<float>(value * preamp);
-            }
-        }
-        // Gaps do not advance DSP histories or feed silence to NR/reverb.
-        t = active ? blockEnd : next;
-    }
-}
-
 namespace {
 std::atomic<int> prepareAudioMixCalls{0};
 }
@@ -2908,40 +2484,46 @@ std::atomic<loudnessauto::ForcedFailure> s_forcedFailure{loudnessauto::ForcedFai
 
 int loudnessauto::prepareJobCallCountForTest() { return s_prepareJobCalls.load(); }
 int loudnessauto::silentMixCallCountForTest() { return s_silentMixCalls.load(); }
+bool loudnessauto::timelineAudioMatchesPassthrough(Timeline *timeline)
+{
+    return ::timelineAudioMatchesPassthrough(timeline);
+}
 void loudnessauto::setForcedFailureForTest(ForcedFailure failure) { s_forcedFailure = failure; }
 
-// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here, so a
-// failed mix never falls back to the unnormalized V1 source audio: it sets loudnessAutoError
-// and RenderQueue::addJob rejects the job.
-QString loudnessauto::prepareJob(RenderJob &job)
+namespace {
+// prepareJob in three steps so prepareJobAsync can run the middle one on a worker: begin (GUI
+// thread: reads the Timeline / mixer into the plan), run (value fields of the job only, never
+// job.timeline: executeMixPlan + measureAndConvert, and the silent track's executeMixPlan), finish
+// (GUI thread: registers the silent track).
+struct PrepareJobState {
+    loudnessauto::ForcedFailure forced = loudnessauto::ForcedFailure::None;
+    bool hasIntermediate = false;
+    bool hasDuration = false;
+    bool hasSequence = false;
+    bool hasSilentPlan = false;
+    bool cancelled = false;
+    audioexport::MixPlan plan;
+    audioexport::MixPlan silentPlan;
+    QString mix;
+    QString message;
+    QString silent;
+    QString silentError;
+};
+
+PrepareJobState beginPrepareJob(RenderJob &job)
 {
-    if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    PrepareJobState state;
     ++s_prepareJobCalls;
     job.exportConfig.remove("loudnessAutoError");
-    const ForcedFailure forced = s_forcedFailure.load();
-    const bool hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
-    const bool hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
-    const bool hasSequence = hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
-    QString error;
-    QString mix;
-    if (hasSequence) {
+    state.forced = s_forcedFailure.load();
+    state.hasIntermediate = job.exportConfig.contains(QStringLiteral("sourceProjectFilePath"));
+    state.hasDuration = job.timeline && job.timeline->totalDuration() > 0.0;
+    state.hasSequence = state.hasDuration && !job.timeline->computeAudioPlaybackSequence().isEmpty();
+    if (state.hasSequence) {
         // Force the existing mixer to produce PCM even for passthrough clips.
-        mix = prepareTimelineAudioMixForExport(job.timeline, &error,
-            nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration());
-        if (forced == ForcedFailure::PcmMix) {
-            QFile::remove(mix); // a failed mix leaves no output behind (finishMix)
-            mix.clear();
-            error = QStringLiteral("test: forced PCM mix failure");
-        }
-        if (mix.isEmpty() && !hasIntermediate)
-            job.exportConfig["loudnessAutoError"] = error.isEmpty()
-                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
-    }
-    // The measurement WAV is removed below; registering it makes removeTempFiles retry if that fails.
-    if (!mix.isEmpty()) RenderQueue::addTempFile(job.exportConfig, mix);
-    QString measurementPath = mix;
-    QTemporaryDir rangeTemporary;
-    if (!mix.isEmpty() && job.timeline) {
+        state.plan = audioexport::buildMixPlan(job.timeline, job.timeline->audioMixer(),
+            {nextExportAudioMixPath() + QStringLiteral(".wav"), job.timeline->totalDuration()});
+        // The measure range is read only when the mix exists (measureAndConvert).
         double start = qMax(0.0, job.startUs / 1000000.0);
         double end = job.endUs > 0 ? job.endUs / 1000000.0 : job.timeline->totalDuration();
         if (job.exportConfig.value("exportMarkedRangeOnly").toBool()
@@ -2949,55 +2531,66 @@ QString loudnessauto::prepareJob(RenderJob &job)
             start = qBound(0.0, job.timeline->markedIn(), job.timeline->totalDuration());
             end = qBound(start, job.timeline->markedOut(), job.timeline->totalDuration());
         }
-        if (start > 0.0 || end < job.timeline->totalDuration()) {
-            measurementPath = rangeTemporary.filePath(QStringLiteral("range.wav"));
-            const QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix,
-                QStringLiteral("-ss"), ffmpegNumber(start), QStringLiteral("-t"), ffmpegNumber(end - start),
-                QStringLiteral("-vn"), QStringLiteral("-c:a"), QStringLiteral("pcm_s16le"), measurementPath};
-            if (!rangeTemporary.isValid() || !runFfmpegForAudioMix(args, &error)) measurementPath.clear();
-        }
+        state.plan.trimMeasurement = start > 0.0 || end < job.timeline->totalDuration();
+        state.plan.measureStartSec = start;
+        state.plan.measureEndSec = end;
     }
-    QString message = RenderQueue::measureAutoLoudness(job.exportConfig, measurementPath);
-    if (!error.isEmpty()) {
-        message += QStringLiteral(" / 警告: ") + error;
-        job.exportConfig["loudnessAutoStatus"] = message;
-        qWarning().noquote() << message;
-    }
-    if (!mix.isEmpty()) {
-        // The existing queue muxes compressed audio by stream copy. Use the
-        // same AAC intermediate as the ordinary timeline mix after measuring PCM.
-        const QString muxPath = nextExportAudioMixPath();
-        QStringList args{QStringLiteral("-y"), QStringLiteral("-i"), mix, QStringLiteral("-vn")};
-        args << exportaudio::aacAudioArgs(job.exportConfig.value("audioBitrate").toInt()) << muxPath;
-        RenderQueue::addTempFile(job.exportConfig, muxPath);
-        bool converted = runFfmpegForAudioMix(args, &error);
-        if (converted && forced == ForcedFailure::AacConvert) {
-            converted = false;
-            error = QStringLiteral("test: forced AAC conversion failure");
-        }
-        if (converted) RenderQueue::setIntermediateProjectFile(job, muxPath);
-        else {
-            message += QStringLiteral(" / 音声ミックス変換失敗: ") + error;
-            job.exportConfig["loudnessAutoStatus"] = message;
-            job.exportConfig["loudnessAutoError"] = error;
-            qWarning().noquote() << message;
-        }
-        QFile::remove(mix);
-    } else if (hasDuration && !hasSequence && !hasIntermediate
-               && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath)) {
-        // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
-        // removed. Make the silent track the ordinary export makes (nothing to measure: 0 dB).
+    state.plan.failAacConvertForTest = state.forced == loudnessauto::ForcedFailure::AacConvert;
+    // Empty audio playback sequence: RenderQueue would mux the V1 source audio the user
+    // removed. Plan the silent track the ordinary export makes (nothing to measure: 0 dB).
+    state.hasSilentPlan = state.hasDuration && !state.hasSequence && !state.hasIntermediate
+        && !job.exportConfig.value(QStringLiteral("tempFiles")).toArray().contains(job.projectFilePath);
+    if (state.hasSilentPlan) {
         const int audioKbps = job.exportConfig.value("audioBitrate").toInt();
-        QString silentError;
-        const QString silent = prepareTimelineAudioMixForExport(job.timeline, &silentError,
-            {}, 0.0, audioKbps > 0 ? audioKbps : 192);
-        // Passthrough (V1 empty): the ordinary export makes no mix either, so leave the job as is.
+        state.silentPlan = audioexport::buildMixPlan(job.timeline, job.timeline->audioMixer(),
+            {QString(), 0.0, audioKbps > 0 ? audioKbps : 192});
+    }
+    return state;
+}
+
+void runPrepareJob(PrepareJobState &state, RenderJob &job, const std::function<bool()> &cancelled)
+{
+    QString error;
+    if (state.hasSequence) {
+        state.mix = audioexport::executeMixPlan(state.plan, cancelled, &error);
+        if (state.forced == loudnessauto::ForcedFailure::PcmMix) {
+            QFile::remove(state.mix); // a failed mix leaves no output behind (finishMix)
+            state.mix.clear();
+            error = QStringLiteral("test: forced PCM mix failure");
+        }
+        if (state.mix.isEmpty() && !state.hasIntermediate)
+            job.exportConfig["loudnessAutoError"] = error.isEmpty()
+                ? QStringLiteral("音声ミックスの作成に失敗しました") : error;
+    }
+    if (cancelled()) {
+        // The caller drops the job: register the mix so its removeTempFiles deletes it.
+        state.cancelled = true;
+        RenderQueue::addTempFile(job.exportConfig, state.mix);
+        return;
+    }
+    state.message = audioexport::measureAndConvert(state.plan, state.mix, job, &error, cancelled);
+    if (state.hasSilentPlan)
+        state.silent = audioexport::executeMixPlan(state.silentPlan, cancelled, &state.silentError);
+    if (cancelled()) {
+        // Cancelled during the measurement or the silent track: the caller drops the job.
+        state.cancelled = true;
+        RenderQueue::addTempFile(job.exportConfig, state.silent);
+    }
+}
+
+QString finishPrepareJob(PrepareJobState &state, RenderJob &job)
+{
+    QString message = state.message;
+    if (state.hasSilentPlan) {
+        const QString &silent = state.silent;
+        QString silentError = state.silentError;
+        // Passthrough (no clip on any video track): nothing to export, so leave the job as is.
         const bool passthrough = silent.isEmpty() && silentError.isEmpty()
-            && timelineAudioMatchesPassthrough(job.timeline);
+            && (!job.timeline || timelineAudioMatchesPassthrough(job.timeline));
         if (!passthrough) {
             ++s_silentMixCalls;
             RenderQueue::addTempFile(job.exportConfig, silent);
-            if (forced == ForcedFailure::SilentMix && silentError.isEmpty())
+            if (state.forced == loudnessauto::ForcedFailure::SilentMix && silentError.isEmpty())
                 silentError = QStringLiteral("test: forced silent mix failure");
             if (!silent.isEmpty() && silentError.isEmpty()) RenderQueue::setIntermediateProjectFile(job, silent);
             else {
@@ -3012,6 +2605,47 @@ QString loudnessauto::prepareJob(RenderJob &job)
     job.loudnessGainDb = job.exportConfig.value("loudnessGainDb").toDouble();
     qInfo().noquote() << job.name << message;
     return message;
+}
+} // namespace
+
+// Every auto loudness entry (normal / mobile, batch, MCP export_video) goes through here or
+// prepareJobAsync, so a failed mix never falls back to the unnormalized V1 source audio: it sets
+// loudnessAutoError and RenderQueue::addJob rejects the job.
+QString loudnessauto::prepareJob(RenderJob &job)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) return {};
+    PrepareJobState state = beginPrepareJob(job);
+    runPrepareJob(state, job, [] { return false; });
+    return finishPrepareJob(state, job);
+}
+
+void loudnessauto::prepareJobAsync(RenderJob job, std::function<void(RenderJob, QString)> done,
+                                   std::function<bool()> cancelled)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) {
+        done(std::move(job), {});
+        return;
+    }
+    auto state = std::make_shared<PrepareJobState>(beginPrepareJob(job));
+    // Timeline is a QWidget: the worker's copy never carries it; the GUI side restores it.
+    QPointer<Timeline> timeline = job.timeline;
+    job.timeline = nullptr;
+    (void)QtConcurrent::run([state, job = std::move(job), done = std::move(done),
+                             cancelled = std::move(cancelled), timeline = std::move(timeline)]() mutable {
+        runPrepareJob(*state, job, cancelled);
+        RenderQueue orphan; // local queue: the GUI side may never run (the app quits after a cancel)
+        if (state->cancelled) orphan.removeTempFiles(&job);
+        RenderJob leftover;
+        leftover.exportConfig[QStringLiteral("tempFiles")] = job.exportConfig.value(QStringLiteral("tempFiles"));
+        QCoreApplication *app = QCoreApplication::instance();
+        const bool posted = app && QMetaObject::invokeMethod(app,
+            [state, job = std::move(job), done = std::move(done), timeline = std::move(timeline)]() mutable {
+                job.timeline = timeline.data();
+                const QString message = state->cancelled ? QString() : finishPrepareJob(*state, job);
+                done(std::move(job), message);
+            }, Qt::QueuedConnection);
+        if (!posted) orphan.removeTempFiles(&leftover);
+    });
 }
 
 void syncTimeRemapEntriesToTimeline(
@@ -3203,6 +2837,8 @@ MainWindow::MainWindow(QWidget *parent)
     });
     connect(m_timeline, &Timeline::renderInPlaceRequested,
             this, &MainWindow::renderClipInPlaceDialog);
+    connect(m_timeline, &Timeline::audioClipEqRequested, this,
+            qOverload<int, int>(&MainWindow::openAudioClipEditorDialog));
     connect(m_timeline, &Timeline::replaceClipRequested, this,
             [this](TrackKind kind, int trackIndex, int clipIndex) {
                 replaceClipFromMediaPool(kind, trackIndex, clipIndex);
@@ -3577,9 +3213,7 @@ void MainWindow::applyStillCompareConfig()
         return;
     const QImage special = buildSpecialClipComposite(m_timeline->playheadPosition());
     if (!special.isNull()) {
-        m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(
-                special, m_player->timelinePositionUs(), true));
+        m_player->displaySpecialComposite(special);
     }
 }
 
@@ -4369,14 +4003,22 @@ void MainWindow::setupUI()
         // paused seeks and stop's rewind-to-zero display. Calling
         // refreshSpecialClipPreview() here can fall back to previewSeek(),
         // re-arming VideoPlayer's deferred seek timer while playback is
-        // stopped and creating a self-sustaining repaint loop.
-        const QImage composed = buildSpecialClipComposite(m_timeline->playheadPosition());
-        if (!composed.isNull())
-            m_player->glPreview()->displayFrame(
-                m_player->applyStillCompareForDisplay(
-                    composed, m_player->timelinePositionUs(), true));
+        // stopped and creating a self-sustaining repaint loop. The special
+        // composite of that frame comes from the provider below instead.
         if (m_effectLibraryPanel && m_effectLibraryPanel->previewEnabled())
             refreshEffectLibraryPreview();
+    });
+    // US-1106: the paused displayFrame pulls the special composite (roto /
+    // matte / time-remap ...) and presents it in place of the ordinary frame.
+    m_player->setSpecialCompositeProvider([this](qint64 tUs) -> QImage {
+        if (!m_timeline || !m_player || !m_player->glPreview())
+            return {};
+        // Player-driven seeks update the Timeline playhead only afterwards, so
+        // build at the displayed frame's time, not the (stale) playhead.
+        const double sec = m_player->hasActiveSequence()
+            ? static_cast<double>(tUs) / AV_TIME_BASE
+            : m_timeline->playheadPosition();
+        return buildSpecialClipComposite(sec);
     });
 
     // Restore master loudness normalizer settings on startup.
@@ -5727,7 +5369,8 @@ void MainWindow::setupMenuBar()
     // US-WF-D: Sprint 11 workflow — per-clip volume envelope editor (AudioClipEditor).
     auto *clipVolumeEditorAction = audioMenu->addAction("クリップボリュームエンベロープエディタ…");
     clipVolumeEditorAction->setObjectName("action_audio_clip_editor");
-    connect(clipVolumeEditorAction, &QAction::triggered, this, &MainWindow::openAudioClipEditorDialog);
+    connect(clipVolumeEditorAction, &QAction::triggered, this,
+            qOverload<>(&MainWindow::openAudioClipEditorDialog));
     m_menuHelpEntries.append({clipVolumeEditorAction,
         QStringLiteral("クリップ内のボリュームエンベロープ (時間 × dB) を点で編集する画面を開きます。")});
 
@@ -6749,6 +6392,34 @@ void MainWindow::setupMenuBar()
     m_audioBusPanel->setVisible(false);
     connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
             this, &MainWindow::onAudioBusRoutingChanged);
+    // Undo carries the routing in TimelineState through this bridge; panel
+    // edits record no undo point and are folded into the current one.
+    m_timeline->setBusRoutingBridge(
+        [this] { return m_audioBusRouting.toJson(); },
+        [this](const QJsonObject &routing) {
+            m_audioBusRouting.fromJson(routing);
+            onAudioBusRoutingChanged();
+            m_audioBusPanel->setRouting(&m_audioBusRouting);
+        });
+    connect(m_audioBusPanel, &AudioBusPanel::routingChanged,
+            m_timeline, &Timeline::absorbIntoCurrentUndoPoint);
+    // An AUX send edit is one undo point: sendEdited fires before routingChanged,
+    // so the absorb above only refreshes the point recorded here.
+    connect(m_audioBusPanel, &AudioBusPanel::sendEdited, this, [this] {
+        m_timeline->saveUndoState(tr("AUX センドを変更"));
+    });
+    m_audioBusPanel->setTrackCountProvider([this] { return m_timeline->audioTrackCount(); });
+    // Timeline::addAudioTrack emits no audioSequenceChanged (it only saves an undo
+    // state), so UndoManager::stateChanged also drives the refresh; it covers
+    // track add and its undo / redo.
+    connect(m_timeline, &Timeline::audioSequenceChanged, m_audioBusPanel, [this] {
+        if (m_audioBusPanel->isVisible())
+            m_audioBusPanel->refresh();
+    });
+    connect(m_timeline->undoManager(), &UndoManager::stateChanged, m_audioBusPanel, [this] {
+        if (m_audioBusPanel->isVisible())
+            m_audioBusPanel->refresh();
+    });
 
     // US-SNS-7: 配信向け submenu
     auto *streamMenu = menuBar()->addMenu("配信向け(&S)");
@@ -8122,12 +7793,22 @@ void MainWindow::setupMenuBar()
     m_menuHelpEntries.append({m_llmAssistantToggleAction,
         QStringLiteral("画面右下の「LLM に指示を出す」ボタンを表示するかどうかを切り替えます。")});
 
-    m_audioMixerDock = new AudioMixerDock(m_timeline, m_player->audioMixer(), this);
+    auto *mixerDock = new AudioMixerDock(m_timeline, m_player->audioMixer(), this);
+    m_audioMixerDock = mixerDock;
+    mixerDock->setBusRouting(&m_audioBusRouting);
+    // The Dock only requests; the routing stays owned here (m_audioBusRouting is the SSOT).
+    connect(mixerDock, &AudioMixerDock::trackBusRequested, this, [this](int track, int busId) {
+        if (!m_audioBusRouting.assignTrackToBus(track, busId)) return;
+        m_timeline->saveUndoState(tr("トラックのバスを変更"));
+        onAudioBusRoutingChanged();
+        if (m_audioBusPanel) m_audioBusPanel->setRouting(&m_audioBusRouting);
+    });
     addDockWidget(Qt::BottomDockWidgetArea, m_audioMixerDock);
     m_audioMixerDock->hide();
     viewMenu->addAction(m_audioMixerDock->toggleViewAction());
 
     m_spectrumAnalyzerDock = new SpectrumAnalyzerDock(m_player->audioMixer(), this);
+    m_spectrumAnalyzerDock->setTimeline(m_timeline);
     addDockWidget(Qt::RightDockWidgetArea, m_spectrumAnalyzerDock);
     m_spectrumAnalyzerDock->hide();
     viewMenu->addAction(m_spectrumAnalyzerDock->toggleViewAction());
@@ -9191,9 +8872,7 @@ void MainWindow::refreshSpecialClipPreview()
     const QImage composed = buildSpecialClipComposite(playheadSeconds);
     if (!composed.isNull()) {
         s_refreshingPreview = true;
-        m_player->glPreview()->displayFrame(
-            m_player->applyStillCompareForDisplay(
-                composed, m_player->timelinePositionUs(), true));
+        m_player->displaySpecialComposite(composed);
         s_refreshingPreview = false;
     } else if (!m_player->isPlaying()) {
         s_refreshingPreview = true;
@@ -9570,6 +9249,9 @@ void MainWindow::applyLoadedProjectData(const ProjectData &loadedData,
                                        data.markOut, data.zoomLevel);
         syncTimeRemapEntriesToTimeline(m_timeline, m_timeRemapClipEntries);
     }
+    // US-1111: restoreFromProject replaced every clip but emits no signal the EQ editor reloads
+    // on, so unbind and hide it here (a same-uid clip would otherwise take its stale EQ).
+    syncAudioClipEditorEq(true);
 
     rebuildAudioMeters();
     applyAudioState(data);
@@ -9806,15 +9488,17 @@ void MainWindow::handleMediaRelinkHistoryChanged()
             m_projectOverlays, m_particleClipConfigs,
             mixer ? audiofxui::undoState(mixer) : QJsonObject{}
         };
-    } else if (index < m_mediaRelinkSidecarHistory.size()) {
+    } else if (index != m_mediaRelinkObservedUndoIndex
+               && index < m_mediaRelinkSidecarHistory.size()) {
+        // Undo / redo / history jump. An absorbed edit (same serial and index,
+        // redo dropped) moves nothing and must not reload these sidecars.
         const MediaRelinkSidecarState &state =
             m_mediaRelinkSidecarHistory.at(index);
         m_projectOverlays = state.overlays;
         m_particleClipConfigs = state.particleClipConfigs;
-        // Undo / redo / history jump: the Timeline carrier reaches the mixer only
-        // across track-structure changes, so the dock-edited FX follow here.
-        if (index != m_mediaRelinkObservedUndoIndex)
-            restoreAudioFxUndoState(QJsonObject(state.audioFx));
+        // The Timeline carrier reaches the mixer only across track-structure
+        // changes, so the dock-edited FX follow here.
+        restoreAudioFxUndoState(QJsonObject(state.audioFx));
     }
 
     m_mediaRelinkObservedSaveSerial = saveSerial;
@@ -9928,11 +9612,18 @@ void MainWindow::remapExternalTrackIndices(bool audio, const QVector<int> &oldTo
 void MainWindow::collectAudioState(ProjectData &data)
 {
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr) {
         const int n = m_timeline ? m_timeline->audioTrackCount() : 0;
         data.trackEqStates.resize(n);
         data.masterFx = mixer->masterChain();
+        // Fader gain and pan (decision 3-1); trimmed to the last non-default track.
+        int mixCount = 0;
+        for (int i = 0; i < n; ++i)
+            if (mixer->trackGain(i) != 1.0 || mixer->trackPan(i) != 0.0) mixCount = i + 1;
+        for (int i = 0; i < mixCount; ++i)
+            data.trackMix.append({mixer->trackGain(i), mixer->trackPan(i)});
         for (int i = 0; i < n; ++i) {
             const trackfx::Chain chain = mixer->trackChain(i);
             if (!chain.isDefault()) data.trackFx.insert(i, chain);
@@ -9993,6 +9684,12 @@ void MainWindow::applyAudioState(const ProjectData &data)
         for (auto it = data.trackFx.cbegin(); it != data.trackFx.cend(); ++it)
             mixer->setTrackChain(it.key(), it.value());
         mixer->setMasterChain(data.masterFx.eq, data.masterFx.eqEnabled, data.masterFx.deesser);
+        // Fader gain and pan: tracks absent from trackMix return to the defaults.
+        for (int i = 0; i < AudioMixer::kMaxAudioTracks; ++i) {
+            const TrackMixState mix = i < data.trackMix.size() ? data.trackMix[i] : TrackMixState{};
+            if (mixer->trackGain(i) != mix.gain) mixer->setTrackGain(i, mix.gain);
+            if (mixer->trackPan(i) != mix.pan) mixer->setTrackPan(i, mix.pan);
+        }
         for (const auto &s : data.trackEqStates) {
             AudioEQConfig cfg;
             cfg.bands.resize(3);
@@ -10042,6 +9739,7 @@ void MainWindow::newProject()
         stopMeshEditTool();
         stopPuppetPinTool();
         applyAudioState(ProjectData{});
+        syncAudioClipEditorEq(true);
         if (m_light3DDialog)
             m_light3DDialog->close();
         m_projectCamera = Camera3D{};
@@ -10617,6 +10315,9 @@ void MainWindow::onAudioBusRoutingChanged()
 {
     if (auto *mixer = m_player ? m_player->audioMixer() : nullptr)
         mixer->setBusRouting(m_audioBusRouting);
+    // Panel edits, the Dock's own requests and the undo bridge all land here.
+    if (auto *dock = qobject_cast<AudioMixerDock *>(m_audioMixerDock))
+        dock->synchronize();
 }
 
 // TR-4: 選択クリップの先頭を再生ヘッドへ合わせる (RippleIn)。
@@ -10848,6 +10549,8 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
                                            double *projectLoudnessGainDb)
 {
     RenderJob job;
+    // The progress dialog follows this job by uuid on the shared queue (see showExportProgressDialog).
+    job.uuid = QUuid::createUuid().toString(QUuid::WithoutBraces);
     job.name = QFileInfo(config.outputPath).fileName();
     job.projectFilePath = m_projectFilePath;
     job.outputPath = config.outputPath;
@@ -10872,11 +10575,11 @@ RenderJob MainWindow::buildExportRenderJob(const ExportConfig &config, ExportEnt
     job.loudnessGainDb = exporter_loudnessGainDb();
     job.exportConfig["loudnessGainDb"] = job.loudnessGainDb;
     RenderQueue::appendSubtitleTrack(job.exportConfig, m_subtitleSegments, m_subtitleStyle, this);
-    // prepareJob overwrites job.loudnessGainDb with the measured value. Callers hand the
-    // pre-measurement project gain to RenderQueue::setLoudnessGainDb (its fallback), so
-    // report it before preparing. Its status text stays in exportConfig["loudnessAutoStatus"].
+    // The callers run loudnessauto::prepareJobAsync next, which overwrites job.loudnessGainDb
+    // with the measured value. They hand the pre-measurement project gain to
+    // RenderQueue::setLoudnessGainDb (its fallback), so report it here. The status text of the
+    // preparation stays in exportConfig["loudnessAutoStatus"].
     if (projectLoudnessGainDb) *projectLoudnessGainDb = job.loudnessGainDb;
-    loudnessauto::prepareJob(job);
     return job;
 }
 
@@ -10887,7 +10590,7 @@ RenderQueue *MainWindow::ensureRenderQueue()
     m_renderQueue = new RenderQueue(this);
     // 書き出し完了の通知 (既定 OFF)。jobsChanged で終端ジョブを控え、allCompleted で集計する
     // (終端後の jobs() 読み取りは空振りになるため)。バッチの専用キュー・RenderInPlace のローカル
-    // キュー・RenderQueueDialog の手動追加 (ダイアログは専用キューを持つ) はここを通らないので対象外。
+    // キューは対象外。RenderQueueDialog は US-1125 以降この共有キューを使うので、手動追加ジョブも集計に入る。
     connect(m_renderQueue, &RenderQueue::jobsChanged, this, [this]() {
         m_renderNotifyTerminal.clear();
         for (const RenderJob &job : m_renderQueue->jobs()) {
@@ -10928,7 +10631,7 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
             : prepareTimelineAudioMixForExport(m_timeline, &mixError, {}, 0.0, config.audioBitrate));
     if (mixError.isEmpty()) mixError = m_exportAudioMixErrorForTest;
     // Register before judging the result so an intermediate left by a failed mix is
-    // removed together with whatever buildExportRenderJob (prepareJob) already queued.
+    // removed together with whatever prepareJobAsync already queued.
     if (!preparedAudioMixPath.isEmpty())
         RenderQueue::addTempFile(job.exportConfig, preparedAudioMixPath);
     if (!mixError.isEmpty()) {
@@ -10943,6 +10646,76 @@ bool MainWindow::finalizeExportJobAudio(RenderJob &job, const ExportConfig &conf
     // is a .veditor / empty path (RenderQueue.cpp:551-563).
     if (!preparedAudioMixPath.isEmpty()) RenderQueue::setIntermediateProjectFile(job, preparedAudioMixPath);
     return true;
+}
+
+void MainWindow::prepareExportJobAsync(RenderJob job, std::function<void(RenderJob)> next)
+{
+    if (!job.exportConfig.value("autoLoudness").toBool(false)) {
+        next(std::move(job));
+        return;
+    }
+    auto *progress = new QProgressDialog(QStringLiteral("音声を準備しています…"),
+                                         QStringLiteral("キャンセル"), 0, 0, this);
+    progress->setObjectName(QStringLiteral("loudnessPrepareProgress"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    connect(progress, &QProgressDialog::canceled, progress, [cancelled]() { cancelled->store(true); });
+    progress->show();
+    QPointer<MainWindow> self(this);
+    QPointer<QProgressDialog> dialog(progress);
+    loudnessauto::prepareJobAsync(std::move(job),
+        [self, dialog, cancelled, next = std::move(next)](RenderJob prepared, const QString &) {
+            const bool wasCancelled = cancelled->load();
+            if (dialog) { // hide, not close: QProgressDialog::closeEvent emits canceled
+                dialog->hide();
+                dialog->deleteLater();
+            }
+            if (!self) {
+                RenderQueue orphan; // the window (and its queue) is gone: a local queue cleans up
+                orphan.removeTempFiles(&prepared);
+                return;
+            }
+            if (wasCancelled) {
+                self->ensureRenderQueue()->removeTempFiles(&prepared);
+                self->statusBar()->showMessage(QStringLiteral("音声の準備をキャンセルしました"), 10000);
+                return;
+            }
+            next(std::move(prepared));
+        },
+        [cancelled]() { return cancelled->load(); });
+}
+
+void MainWindow::showExportProgressDialog(const QString &jobUuid, const QString &label,
+    const QString &cancelText, const std::function<void(bool, const QString &)> &onFinished)
+{
+    auto *progress = new QProgressDialog(label, cancelText, 0, 100, this);
+    progress->setObjectName(QStringLiteral("exportProgressDialog"));
+    progress->setWindowModality(Qt::WindowModal);
+    progress->setMinimumDuration(0);
+
+    // The queue is shared with MCP export_video, so only this job drives the dialog.
+    // Connections are scoped to `progress` so they auto-disconnect when it is destroyed.
+    connect(m_renderQueue, &RenderQueue::jobProgressUuid, progress,
+            [this, progress, jobUuid](const QString &uuid, int percent) {
+        if (uuid != jobUuid) return;
+        ++m_progressDialogUpdatesForTest[jobUuid];
+        progress->setValue(percent);
+    });
+    connect(m_renderQueue, &RenderQueue::jobCompletedUuid, progress,
+            [progress, jobUuid, onFinished](const QString &uuid, bool success, const QString &err) {
+        if (uuid != jobUuid) return;
+        progress->close();
+        progress->deleteLater();
+        onFinished(success, err);
+    });
+    connect(progress, &QProgressDialog::canceled, m_renderQueue, [this, progress, jobUuid]() {
+        m_renderQueue->cancelJob(jobUuid);
+        // A pending job is removed without jobCompletedUuid, so close the dialog here.
+        for (const RenderJob &job : m_renderQueue->jobs())
+            if (job.uuid == jobUuid) return;
+        progress->deleteLater();
+    });
 }
 
 void MainWindow::exportVideo()
@@ -10972,13 +10745,15 @@ void MainWindow::exportVideo()
         else statusBar()->showMessage(tr("音声の書き出しが完了しました: %1").arg(exportCfg.outputPath), 10000);
         return;
     }
-    const auto &clips = m_timeline->videoClips();
-
-    if (clips.isEmpty()) {
+    if (!timelineHasExportableVideo(m_timeline)) {
         QMessageBox::warning(this, "Export", "No clips in timeline to export.");
         return;
     }
+    submitNormalExport(exportCfg);
+}
 
+void MainWindow::submitNormalExport(const ExportConfig &exportCfg)
+{
     // S12 single-path: the File->Export action now routes through RenderQueue,
     // which renders the FULL live edit graph via tlrender::renderFrameAt (S8)
     // — pixel-identical to the GLPreview composite. The legacy CPU-only
@@ -10989,6 +10764,15 @@ void MainWindow::exportVideo()
 
     double projectLoudnessGainDb = 0.0;
     RenderJob job = buildExportRenderJob(exportCfg, ExportEntry::Normal, &projectLoudnessGainDb);
+    prepareExportJobAsync(std::move(job), [this, exportCfg, projectLoudnessGainDb](RenderJob prepared) {
+        queueNormalExport(std::move(prepared), exportCfg, projectLoudnessGainDb);
+    });
+}
+
+void MainWindow::queueNormalExport(RenderJob job, const ExportConfig &exportCfg,
+                                   double projectLoudnessGainDb)
+{
+    const auto &clips = m_timeline->videoClips();
     QString audioMixError;
     if (!finalizeExportJobAudio(job, exportCfg, &audioMixError)) {
         QMessageBox::warning(this, QStringLiteral("Export"),
@@ -11037,29 +10821,16 @@ void MainWindow::exportVideo()
         }
     }
 
-    auto *progress = new QProgressDialog("Exporting...", "Cancel", 0, 100, this);
-    progress->setWindowModality(Qt::WindowModal);
-    progress->setMinimumDuration(0);
-
     // Bridge RenderQueue's uuid-keyed signals to the same progress/finish UX
-    // the old Exporter path showed. Connections are scoped to `progress` so
-    // they auto-disconnect when the dialog is destroyed.
-    connect(m_renderQueue, &RenderQueue::jobProgressUuid, progress,
-            [progress](const QString &, int percent) {
-        progress->setValue(percent);
-    });
-    connect(m_renderQueue, &RenderQueue::jobCompletedUuid, progress,
-            [this, progress](const QString &, bool success, const QString &err) {
-        progress->close();
-        progress->deleteLater();
+    // the old Exporter path showed.
+    showExportProgressDialog(job.uuid, QStringLiteral("Exporting..."), QStringLiteral("Cancel"),
+                             [this](bool success, const QString &err) {
         if (success)
             statusBar()->showMessage("Export complete: rendered via timeline SSOT");
         else
             QMessageBox::critical(this, "Export Failed",
                 err.isEmpty() ? QStringLiteral("Export failed") : err);
     });
-    connect(progress, &QProgressDialog::canceled, m_renderQueue,
-            &RenderQueue::stop);
 
     // RM-1.3: this is a job.timeline != nullptr path — RenderQueue's
     // resolveTimeline early-returns before its persisted-project matte
@@ -14829,11 +14600,16 @@ void MainWindow::configureTrackMatte()
 
     const TrackMatteType matteType = static_cast<TrackMatteType>(typeCombo->currentData().toInt());
     const QString matteSourceId = sourceCombo->currentData().toString();
-    // Matte edits do not save an undo state; the external "mattes" capture keeps them.
+    // Matte edits record no undo point of their own: each one is folded into
+    // the current undo point (which also drops the redo stack). A dialog that
+    // leaves the matte unchanged absorbs nothing, so redo survives it.
     auto mattes = m_timeline->trackMatteEntries();
     if (matteType == TrackMatteType::None || matteSourceId.isEmpty()) {
-        mattes.remove(targetClipId);
-        m_timeline->setTrackMatteEntries(mattes);
+        const bool removed = mattes.remove(targetClipId);
+        if (removed) {
+            m_timeline->setTrackMatteEntries(mattes);
+            m_timeline->absorbIntoCurrentUndoPoint();
+        }
         refreshSpecialClipPreview();
         statusBar()->showMessage(QStringLiteral("トラックマットを解除しました"), 3000);
         return;
@@ -14844,11 +14620,18 @@ void MainWindow::configureTrackMatte()
         return;
     }
 
-    TimelineTrackMatteEntry entry;
-    entry.matteType = matteType;
-    entry.matteSourceClipId = matteSourceId;
-    mattes.insert(targetClipId, entry);
-    m_timeline->setTrackMatteEntries(mattes);
+    const auto current = mattes.constFind(targetClipId);
+    const bool unchanged = current != mattes.constEnd()
+        && current->matteType == matteType
+        && current->matteSourceClipId == matteSourceId;
+    if (!unchanged) {
+        TimelineTrackMatteEntry entry;
+        entry.matteType = matteType;
+        entry.matteSourceClipId = matteSourceId;
+        mattes.insert(targetClipId, entry);
+        m_timeline->setTrackMatteEntries(mattes);
+        m_timeline->absorbIntoCurrentUndoPoint();
+    }
 
     refreshSpecialClipPreview();
     statusBar()->showMessage(QStringLiteral("%1 に %2 を設定しました")
@@ -15867,6 +15650,8 @@ void MainWindow::openAudioClipEditorDialog()
 
     double selectedVolume = selectedClip.volume;
     double selectedPan = selectedClip.pan;
+    int eqTrackIdx = -1;
+    int eqClipIdx = -1;
     const auto &audioTracks = m_timeline->audioTracks();
     const auto *audioTrack = audioTracks.value(0, nullptr);
     if (audioTrack && clipIdx >= 0 && clipIdx < audioTrack->clips().size()) {
@@ -15874,9 +15659,47 @@ void MainWindow::openAudioClipEditorDialog()
         selectedVolume = audioClip.volume;
         selectedPan = audioClip.pan;
     }
+    // The EQ target is the selected clip's real audio link partner (same linkGroup), not the A1
+    // clip at the V1 index: that is an unrelated clip for a V2+ or unlinked selection. No
+    // partner -> no EQ panel in this mode. Volume / pan keep reading A1:clipIdx as before.
+    if (selectedClip.linkGroup != 0) {
+        for (int ti = 0; ti < audioTracks.size() && eqTrackIdx < 0; ++ti) {
+            const auto *t = audioTracks.at(ti);
+            if (!t) continue;
+            for (int ci = 0; ci < t->clips().size(); ++ci) {
+                if (t->clips().at(ci).linkGroup == selectedClip.linkGroup) {
+                    eqTrackIdx = ti;
+                    eqClipIdx = ci;
+                    break;
+                }
+            }
+        }
+    }
     const qint64 selectedDurationMs = qMax<qint64>(
         1, qRound64(qMax(0.0, selectedClip.effectiveDuration()) * 1000.0));
 
+    showAudioClipEditorDialog(eqTrackIdx, eqClipIdx, true, selectedDurationMs, selectedVolume, selectedPan);
+}
+
+// US-1111: edits audio clip `clipIdx` of audio track `audioTrackIdx` (0 = A1) itself, not the V1
+// selection. Only the clip EQ is editable here: volume / pan write through the V1 selection into
+// A1 (Timeline::setClipVolume / setClipPan), which would hit the wrong clip, so those handlers are
+// disconnected and the row hidden. The envelope is not wired to the Timeline in either mode, so
+// in this mode the envelope canvas is disabled (greyed, ignores edits), not hidden.
+void MainWindow::openAudioClipEditorDialog(int audioTrackIdx, int clipIdx)
+{
+    const auto &audioTracks = m_timeline->audioTracks();
+    const auto *audioTrack = audioTracks.value(audioTrackIdx, nullptr);
+    if (!audioTrack || clipIdx < 0 || clipIdx >= audioTrack->clips().size())
+        return;
+    const ClipInfo clip = audioTrack->clips().at(clipIdx);
+    const qint64 durationMs = qMax<qint64>(1, qRound64(qMax(0.0, clip.effectiveDuration()) * 1000.0));
+    showAudioClipEditorDialog(audioTrackIdx, clipIdx, false, durationMs, clip.volume, clip.pan);
+}
+
+void MainWindow::showAudioClipEditorDialog(int eqTrackIdx, int clipIdx, bool volumePanEditable,
+                                           qint64 durationMs, double volume, double pan)
+{
     if (!m_audioClipEditorDialog) {
         m_audioClipEditorDialog = new QDialog(this);
         m_audioClipEditorDialog->setWindowTitle(QStringLiteral("クリップボリュームエンベロープ"));
@@ -15884,35 +15707,140 @@ void MainWindow::openAudioClipEditorDialog()
         auto *layout = new QVBoxLayout(m_audioClipEditorDialog);
         auto *editor = new AudioClipEditor(m_audioClipEditorDialog);
         editor->setObjectName(QStringLiteral("audioClipEditor"));
-        {
-            const QSignalBlocker blocker(editor);
-            editor->setClipDuration(selectedDurationMs);
-            editor->setVolume(selectedVolume);
-            editor->setPan(selectedPan);
-        }
-        connect(editor, &AudioClipEditor::volumeChanged, this, [this](double volume) {
-            if (m_timeline && m_timeline->hasSelection())
-                m_timeline->setClipVolume(volume);
-        });
-        connect(editor, &AudioClipEditor::panChanged, this, [this](double pan) {
-            if (m_timeline && m_timeline->hasSelection())
-                m_timeline->setClipPan(pan);
-        });
         layout->addWidget(editor);
         m_audioClipEditorDialog->resize(640, 240);
     }
 
     auto *editor = m_audioClipEditorDialog->findChild<AudioClipEditor *>(QStringLiteral("audioClipEditor"));
     if (editor) {
-        const QSignalBlocker blocker(editor);
-        editor->setClipDuration(selectedDurationMs);
-        editor->setVolume(selectedVolume);
-        editor->setPan(selectedPan);
+        {
+            const QSignalBlocker blocker(editor);
+            editor->setClipDuration(durationMs);
+            editor->setVolume(volume);
+            editor->setPan(pan);
+        }
+        // Rebind every handler per open so an earlier (track, clip) target cannot leak through.
+        editor->disconnect(this);
+        editor->setVolumePanVisible(volumePanEditable);
+        editor->setEnvelopeEditable(volumePanEditable);
+        if (volumePanEditable) {
+            connect(editor, &AudioClipEditor::volumeChanged, this, [this](double v) {
+                if (m_timeline && m_timeline->hasSelection())
+                    m_timeline->setClipVolume(v);
+            });
+            connect(editor, &AudioClipEditor::panChanged, this, [this](double p) {
+                if (m_timeline && m_timeline->hasSelection())
+                    m_timeline->setClipPan(p);
+            });
+        }
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+        const auto *eqTrack = eqTrackIdx >= 0 ? m_timeline->audioTracks().value(eqTrackIdx, nullptr) : nullptr;
+        if (eqTrack && clipIdx >= 0 && clipIdx < eqTrack->clips().size()
+            && !eqTrack->clips().at(clipIdx).uid.isEmpty()) {
+            // Target the clip by its uid, not the (track, index) pair: a delete before it or a
+            // track reorder moves the index while the editor stays open. audioTracks() holds
+            // only the active sequence and a sequence copy keeps the uid, so the target is also
+            // pinned to the sequence the panel was opened on.
+            m_clipEqTargetUid = eqTrack->clips().at(clipIdx).uid;
+            m_clipEqTargetSeqId = m_timeline->activeSequenceId();
+            if (m_clipEqTargetSeqId.isEmpty())
+                m_clipEqTargetSeqId = QStringLiteral("main");
+            connect(editor, &AudioClipEditor::clipEqChanged, this,
+                    [this](bool enabled, const trackfx::EqSettings &eq) {
+                        int track = -1;
+                        int clip = -1;
+                        if (resolveClipEqTarget(track, clip))
+                            m_timeline->setClipEq(track, clip, enabled, eq);
+                        else
+                            syncAudioClipEditorEq();
+                    });
+            // Every Timeline path that replaces or re-indexes clips while the dialog is open
+            // lands in syncAudioClipEditorEq: undo / redo (trackStateRestored), sequence create /
+            // delete / switch and parent entries (sequencesChanged), every clip edit, delete,
+            // move, split and restoreFromProject (audioSequenceChanged, debounced) and track
+            // remove / move (trackIndicesRemapped). Project load / new project call it directly.
+            const auto sync = [this]() { syncAudioClipEditorEq(); };
+            connect(m_timeline, &Timeline::trackStateRestored, editor, sync);
+            connect(m_timeline, &Timeline::sequencesChanged, editor, sync);
+            connect(m_timeline, &Timeline::audioSequenceChanged, editor, sync);
+            connect(m_timeline, &Timeline::trackIndicesRemapped, editor, sync);
+            syncAudioClipEditorEq();
+        } else {
+            editor->setClipEqVisible(false);
+        }
+        m_audioClipEditorDialog->setWindowTitle(volumePanEditable
+            ? QStringLiteral("クリップボリュームエンベロープ")
+            : QStringLiteral("クリップ EQ"));
     }
 
     m_audioClipEditorDialog->show();
     m_audioClipEditorDialog->raise();
     m_audioClipEditorDialog->activateWindow();
+}
+
+// US-1111: finds the EQ target (m_clipEqTargetUid on m_clipEqTargetSeqId) in the active sequence.
+bool MainWindow::resolveClipEqTarget(int &track, int &clip, bool *foreignSequence) const
+{
+    QString seqId = m_timeline ? m_timeline->activeSequenceId() : QString();
+    if (seqId.isEmpty())
+        seqId = QStringLiteral("main");
+    if (foreignSequence)
+        *foreignSequence = seqId != m_clipEqTargetSeqId;
+    if (!m_timeline || m_clipEqTargetUid.isEmpty() || seqId != m_clipEqTargetSeqId)
+        return false;
+    const auto &tracks = m_timeline->audioTracks();
+    for (int ti = 0; ti < tracks.size(); ++ti) {
+        const auto *t = tracks.at(ti);
+        if (!t) continue;
+        for (int ci = 0; ci < t->clips().size(); ++ci) {
+            if (t->clips().at(ci).uid == m_clipEqTargetUid) {
+                track = ti;
+                clip = ci;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// US-1111: the single catch-all that keeps the open editor's EQ equal to the clip it writes to.
+// Found -> reload the widgets from that clip (no clipEqChanged: setClipEq is guarded). Foreign
+// sequence -> hide the panel, stay bound (reloaded on return). Uid gone -> unbind the EQ and hide
+// the panel. projectReplaced (project load / new project) -> unbind every handler and hide the
+// dialog; the next "クリップ EQ…" request or menu open rebinds through showAudioClipEditorDialog.
+void MainWindow::syncAudioClipEditorEq(bool projectReplaced)
+{
+    auto *editor = m_audioClipEditorDialog
+        ? m_audioClipEditorDialog->findChild<AudioClipEditor *>(QStringLiteral("audioClipEditor"))
+        : nullptr;
+    if (!editor)
+        return;
+    if (projectReplaced) {
+        editor->disconnect(this);
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+        editor->setClipEqVisible(false);
+        m_audioClipEditorDialog->hide();
+        return;
+    }
+    if (m_clipEqTargetUid.isEmpty())
+        return;
+    int track = -1;
+    int clip = -1;
+    bool foreignSequence = false;
+    if (resolveClipEqTarget(track, clip, &foreignSequence)) {
+        const ClipInfo &c = m_timeline->audioTracks().at(track)->clips().at(clip);
+        editor->setClipEq(c.clipEqEnabled, c.clipEq);
+        editor->setClipEqVisible(true);
+        return;
+    }
+    if (!foreignSequence) {
+        disconnect(editor, &AudioClipEditor::clipEqChanged, this, nullptr);
+        disconnect(m_timeline, nullptr, editor, nullptr);
+        m_clipEqTargetUid.clear();
+    }
+    editor->setClipEqVisible(false);
 }
 
 void MainWindow::runMagneticTimelineDemo()
@@ -17199,8 +17127,7 @@ void MainWindow::onMobileExport()
         connect(m_mobileExportDialog, &MobileExportDialog::exportRequested,
                 this, [this](const ExportConfig &cfg) {
                     if (!m_timeline) return;
-                    const auto &clips = m_timeline->videoClips();
-                    if (clips.isEmpty()) {
+                    if (!timelineHasExportableVideo(m_timeline)) {
                         QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
                             QStringLiteral("タイムラインにクリップがありません。"));
                         return;
@@ -17213,48 +17140,47 @@ void MainWindow::onMobileExport()
                     double projectLoudnessGainDb = 0.0;
                     RenderJob job = buildExportRenderJob(cfg, ExportEntry::MobileBatch,
                                                          &projectLoudnessGainDb);
+                    prepareExportJobAsync(std::move(job),
+                        [this, cfg, projectLoudnessGainDb](RenderJob job) {
+                        // V1 が空で上位に映像がある書き出しは、ON 時は prepareJob が無音トラックを
+                        // 作る。OFF 時だけここで無音 / 混合トラックを作る。
+                        if (!cfg.autoLoudness && m_timeline->videoClips().isEmpty()) {
+                            QString audioMixError;
+                            if (!finalizeExportJobAudio(job, cfg, &audioMixError)) {
+                                QMessageBox::warning(this, QStringLiteral("モバイル書き出し"),
+                                                     audioMixError);
+                                return;
+                            }
+                        }
 
-                    auto *progress = new QProgressDialog(
-                        QStringLiteral("モバイル向けエクスポート中..."),
-                        QStringLiteral("キャンセル"), 0, 100, this);
-                    progress->setWindowModality(Qt::WindowModal);
-                    progress->setMinimumDuration(0);
-                    connect(m_renderQueue, &RenderQueue::jobProgressUuid,
-                            progress,
-                            [progress](const QString &, int percent) {
-                                progress->setValue(percent);
-                            });
-                    connect(m_renderQueue, &RenderQueue::jobCompletedUuid,
-                            progress,
-                            [this, progress](const QString &, bool ok,
-                                             const QString &err) {
-                                progress->close();
-                                progress->deleteLater();
-                                if (ok)
-                                    statusBar()->showMessage(QStringLiteral(
-                                        "モバイル書き出し完了 (timeline SSOT)"));
-                                else
-                                    QMessageBox::critical(this,
-                                        QStringLiteral("モバイル書き出し失敗"),
-                                        err.isEmpty()
-                                            ? QStringLiteral("Export failed")
-                                            : err);
-                            });
-                    connect(progress, &QProgressDialog::canceled,
-                            m_renderQueue, &RenderQueue::stop);
-                    // RM-1.3: job.timeline != nullptr path — exports the
-                    // live matte carrier, as File→Export above.
-                    syncProjectLightingToTimeline();
-                    // AC: production export 経路に ACES SSOT を push (start()
-                    // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
-                    m_renderQueue->setAcesPipeline(m_acesPipeline);
-                    m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
-                    statusBar()->showMessage(
-                        QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
-                    const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
-                    if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
-                    m_renderQueue->addJob(job);
-                    m_renderQueue->start();
+                        showExportProgressDialog(job.uuid,
+                            QStringLiteral("モバイル向けエクスポート中..."),
+                            QStringLiteral("キャンセル"),
+                                [this](bool ok, const QString &err) {
+                                    if (ok)
+                                        statusBar()->showMessage(QStringLiteral(
+                                            "モバイル書き出し完了 (timeline SSOT)"));
+                                    else
+                                        QMessageBox::critical(this,
+                                            QStringLiteral("モバイル書き出し失敗"),
+                                            err.isEmpty()
+                                                ? QStringLiteral("Export failed")
+                                                : err);
+                                });
+                        // RM-1.3: job.timeline != nullptr path — exports the
+                        // live matte carrier, as File→Export above.
+                        syncProjectLightingToTimeline();
+                        // AC: production export 経路に ACES SSOT を push (start()
+                        // 前)。8bit 経路のみ適用、enabled=false 時はビット同一。
+                        m_renderQueue->setAcesPipeline(m_acesPipeline);
+                        m_renderQueue->setLoudnessGainDb(projectLoudnessGainDb);
+                        statusBar()->showMessage(
+                            QStringLiteral("モバイル書き出し: ") + cfg.outputPath);
+                        const QString loudnessStatus = job.exportConfig.value("loudnessAutoStatus").toString();
+                        if (!loudnessStatus.isEmpty()) statusBar()->showMessage(loudnessStatus, 30000);
+                        m_renderQueue->addJob(job);
+                        m_renderQueue->start();
+                    });
                 });
     }
     m_mobileExportDialog->show();
@@ -20507,6 +20433,11 @@ void MainWindow::openRenderQueueDialog()
 {
     if (!m_renderQueueDialog) {
         m_renderQueueDialog = new RenderQueueDialog(this);
+        // US-1125: share the GUI / MCP queue (and its export notification); the dialog's
+        // jobs state the project's ACES pipeline and loudness gain themselves.
+        m_renderQueueDialog->setQueue(ensureRenderQueue());
+        m_renderQueueDialog->setAcesProvider([this]() { return m_acesPipeline; });
+        m_renderQueueDialog->setLoudnessGainProvider([]() { return exporter_loudnessGainDb(); });
         if (m_timeline) {
             const qint64 totalUs =
                 static_cast<qint64>(m_timeline->totalDuration() * 1000000.0);
@@ -20516,8 +20447,6 @@ void MainWindow::openRenderQueueDialog()
         // carry the live edit-graph instead of resolving to nullptr.
         m_renderQueueDialog->setLiveTimeline(m_timeline);
     }
-    if (m_renderQueueDialog->queue())
-        m_renderQueueDialog->queue()->setLoudnessGainDb(exporter_loudnessGainDb());
     // RM-1.4/RM-1.3: a "current project" queue job exports the live
     // Timeline's matte carrier, the same one the GUI preview shows.
     syncProjectLightingToTimeline();

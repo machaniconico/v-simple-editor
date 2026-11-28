@@ -479,6 +479,8 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/selftests/playback_quality_policy_selftests.cpp
     src/selftests/sns_fit_selftest.cpp
     src/selftests/clip_enable_selftest.cpp
+    src/selftests/clip_eq_selftest.cpp
+    src/selftests/clip_uid_selftest.cpp
     src/selftests/clip_parent_parity_selftest.cpp
     src/selftests/parent_gate_selftest.cpp
     src/selftests/video_player_parent_selftest.cpp
@@ -536,6 +538,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/playback/LiveMatteResolve.cpp
     src/selftests/live_matte_resolve_selftests.cpp
     src/selftests/matte_ssot_selftest.cpp
+    src/selftests/matte_export_selftest.cpp
     src/selftests/render_notify_selftest.cpp
     src/SourceMonitorDock.cpp
     src/MarkerPanelDock.cpp
@@ -680,6 +683,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioTrackFx.h
     src/AudioTrackFx.cpp
     src/AudioMixer.cpp
+    src/AudioExportMix.cpp
     src/PlanarTracker.cpp
     src/FeatureTracker.cpp
     src/FeatureTracker.h
@@ -717,6 +721,7 @@ add_executable(${PROJECT_NAME} ${APP_EXECUTABLE_TYPE}
     src/AudioMixerDock.cpp
     src/AudioMixerDock.h
     src/selftests/mixer_dock_selftest.cpp
+    src/selftests/aux_send_selftest.cpp
     src/SpectrumAnalyzerDock.cpp
     src/SpectrumAnalyzerDock.h
     src/selftests/spectrum_selftest.cpp

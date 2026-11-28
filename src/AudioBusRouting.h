@@ -53,13 +53,22 @@ struct AudioBus {
     int outputBusId = -1;   // -1 = master、他バス id = そのバスへサブミックス
 };
 
-// トラック → バスへの並列 AUX センド。preFader はフェーダー前送り (現状は
-// メタ情報として保持、ゲイン解決では sendLevel のみ使用)。
+// トラック → バスへの並列 AUX センド。preFader = true はフェーダー前送り
+// (トラックのフェーダー gain を通らない。track mute / solo には従う)、false は
+// フェーダー後送り (メイン経路と同じくフェーダー gain が掛かる)。
 struct AuxSend {
     int trackIndex = -1;
     int busId = -1;
     double sendLevel = 1.0;
     bool preFader = false;
+};
+
+// トラック 1 本がマスターに届く実効ゲインの組 (resolveTrackRouteGains)。
+// 出力 = 入力 × (trackGain × post + pre)。ルーティングが空なら {1, 0}。
+struct RouteGains {
+    double post = 1.0;  // メイン経路 + post-fader send (フェーダー gain を掛ける側)
+    double pre = 0.0;   // pre-fader send の和 (フェーダー gain を通らない側)
+    bool isIdentity() const { return post == 1.0 && pre == 0.0; }
 };
 
 // バス / サブミックス / AUX センドのルーティングを保持する値クラス。
@@ -127,6 +136,11 @@ public:
     // busId が存在しなければ 0。経路上の mute は 0、solo 規則を適用、循環は安全
     // 打ち切り。該当 aux send が無ければ 0。
     double resolveAuxSendGain(int trackIndex, int busId) const;
+
+    // トラックの全経路: post = resolveTrackToMasterGain + Σ(post-fader send の
+    // resolveAuxSendGain)、pre = Σ(pre-fader send の resolveAuxSendGain)。
+    // 再生と書き出しはこの 1 関数だけからバス / AUX のゲインを得る。
+    RouteGains resolveTrackRouteGains(int trackIndex) const;
 
     // bus.outputBusId の連鎖に閉路があれば true。
     bool hasCycle() const;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <optional>
 #include <QObject>
 #include <QString>
 #include <QStringList>
@@ -54,6 +56,9 @@ struct RenderJob {
     // Legacy fields (still populated for backwards compatibility).
     QJsonObject exportConfig;
     double loudnessGainDb = 0.0;
+    // ACES pipeline this job renders with. Unset: addJob copies the queue's
+    // setAcesPipeline value, so a later setAcesPipeline does not reach queued jobs.
+    std::optional<aces::AcesPipeline> acesPipeline;
     QString dolbyVisionXml;
     int progress = 0;
     QDateTime startTime;
@@ -107,6 +112,9 @@ public:
     // Spec API — preferred for new code (uuid-keyed).
     void addJob(const RenderJob &job);
     void removeJob(const QString &uuid);
+    // Cancels only this job: a pending one is removed, the running one is cancelled,
+    // anything else (unknown / finished uuid) is left alone. The queue keeps running.
+    void cancelJob(const QString &uuid);
     void clear();
     QVector<RenderJob> jobs() const { return m_jobs; }
     bool isRunning() const { return m_running; }
@@ -117,6 +125,7 @@ public:
     // ACES カラーマネジメント パイプラインを設定する。MainWindow の SSOT
     // m_acesPipeline を start() 前に push する想定 (UI スレッドから呼ばれる)。
     // enabled=false (既定) のときレンダーワーカーは一切適用せずビット同一。
+    // 以後 addJob されるジョブの既定値になる (投入済みのジョブは addJob 時の値を保つ)。
     void setAcesPipeline(const aces::AcesPipeline &p);
     void setLoudnessGainDb(double gainDb);
 
@@ -295,11 +304,22 @@ private:
 // MainWindow export submission seam, shared by normal and batch/mobile export.
 namespace loudnessauto {
 QString prepareJob(RenderJob &job);
-// Number of prepareJob calls that ran with autoLoudness ON (selftest counter).
+// GUI normal / mobile entry (call on the GUI thread): plans on the calling thread, runs the mix,
+// measurement and silent track (executeMixPlan + measureAndConvert) on a worker that gets a value
+// copy of the job with job.timeline cleared, then finishes on the GUI thread and calls
+// done(prepared job, status). cancelled is polled from the worker before each ffmpeg run (a running
+// ffmpeg is not stopped); once it returns true the remaining steps are skipped, the worker removes
+// the job's temp files and done still runs: the caller drops the job. autoLoudness OFF calls done
+// at once with the job untouched.
+void prepareJobAsync(RenderJob job, std::function<void(RenderJob, QString)> done,
+                     std::function<bool()> cancelled);
+// Number of prepareJob / prepareJobAsync calls that ran with autoLoudness ON (selftest counter).
 int prepareJobCallCountForTest();
 // Selftest: makes one prepareJob step report failure (after it ran). None (default) = production.
 enum class ForcedFailure { None, PcmMix, SilentMix, AacConvert };
 void setForcedFailureForTest(ForcedFailure failure);
 // Number of silent tracks prepareJob made for an empty audio playback sequence (selftest counter).
 int silentMixCallCountForTest();
+// True when the ordinary export needs no audio mix (RenderQueue muxes the V1 source audio as is).
+bool timelineAudioMatchesPassthrough(Timeline *timeline);
 }

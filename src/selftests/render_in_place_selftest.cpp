@@ -136,8 +136,12 @@ QJsonObject clipJson(const ClipInfo &clip)
 {
     ProjectData data;
     data.videoTracks = QVector<QVector<ClipInfo>>{{clip}};
-    return QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object()
+    QJsonObject obj = QJsonDocument::fromJson(ProjectFile::toJsonString(data).toUtf8()).object()
         .value("videoTracks").toArray().at(0).toArray().at(0).toObject();
+    // The clip uid (US-1118) is identity minted when a clip enters a track; the
+    // gates compare clip properties against locally built ClipInfo values.
+    obj.remove("uid");
+    return obj;
 }
 // Independent encode/decode control: export the untouched, one-clip timeline
 // directly. This deliberately does not call renderClipInPlace or construct its

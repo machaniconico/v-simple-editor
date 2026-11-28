@@ -50,6 +50,7 @@ class PuppetPinTool;
 #include "SpeedRamp.h"
 #include "AudioEQ.h"
 #include "AudioMixer.h"
+#include "AudioExportMix.h"
 #include <vector>
 #include "TimelineMarker.h"
 #include "RenderQueue.h"
@@ -260,6 +261,8 @@ class MainWindow : public QMainWindow
     friend int runRotoSelftest();
     friend int runMatteSsotSelftest();
     friend int runRenderNotifySelftest();
+    friend int runClipEqSelftest();
+    friend int runMixerDockSelftest();
 
 public:
     explicit MainWindow(QWidget *parent = nullptr);
@@ -549,6 +552,8 @@ private slots:
     // US-WF-D: Sprint 11 workflow — 3 new menu actions
     void openAIMaskDialog();
     void openAudioClipEditorDialog();
+    // US-1111: edits the EQ of audio clip (audioTrackIdx, clipIdx) itself; volume / pan hidden.
+    void openAudioClipEditorDialog(int audioTrackIdx, int clipIdx);
     void runMagneticTimelineDemo();
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog
@@ -694,11 +699,20 @@ protected:
 
 private:
     enum class ExportEntry { Normal, MobileBatch };
-    // Also runs loudnessauto::prepareJob (the single normal / mobile call site). When
-    // projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
+    // Returns the job unprepared: the normal / mobile callers run prepareExportJobAsync next.
+    // When projectLoudnessGainDb is given it receives job.loudnessGainDb as it was BEFORE
     // measurement (what RenderQueue::setLoudnessGainDb must keep receiving).
     RenderJob buildExportRenderJob(const ExportConfig &config, ExportEntry entry,
                                    double *projectLoudnessGainDb = nullptr);
+    // Normal / mobile export: runs loudnessauto::prepareJobAsync behind an indeterminate
+    // progress dialog (objectName "loudnessPrepareProgress", Cancel) and then calls next with
+    // the prepared job. A cancelled preparation removes the job's temp files and never calls
+    // next. autoLoudness OFF calls next at once without a dialog.
+    void prepareExportJobAsync(RenderJob job, std::function<void(RenderJob)> next);
+    // exportVideo after its dialog: builds the job, prepares it (prepareExportJobAsync) and
+    // hands it to queueNormalExport, which finalizes the audio and adds it to the shared queue.
+    void submitNormalExport(const ExportConfig &exportCfg);
+    void queueNormalExport(RenderJob job, const ExportConfig &exportCfg, double projectLoudnessGainDb);
     noiseprint::NoisePrint m_noisePrint;
     QPointer<TimelineTrack> m_noisePrintMenuTrack;
     int m_noisePrintMenuClip = -1;
@@ -763,6 +777,14 @@ private:
     // 共有 RenderQueue (通常 / モバイル / MCP export_video) の唯一の生成点。
     RenderQueue *ensureRenderQueue();
     int renderCompleteNotificationCountForTest = 0; // selftest: shown completion notifications
+    // Normal / mobile export progress dialog (objectName "exportProgressDialog") for the
+    // shared queue's job `jobUuid` only: other jobs' progress / completion are ignored and
+    // Cancel calls RenderQueue::cancelJob(jobUuid). onFinished runs once that job ends.
+    void showExportProgressDialog(const QString &jobUuid, const QString &label,
+        const QString &cancelText, const std::function<void(bool, const QString &)> &onFinished);
+    QHash<QString, int> m_progressDialogUpdatesForTest; // selftest: dialog progress updates per job
+    int progressDialogUpdateCountForTest(const QString &jobUuid) const
+    { return m_progressDialogUpdatesForTest.value(jobUuid); }
     bool exportAudioOnly(const ExportConfig &config, QString *error);
     void updateTitle();
     void populateProjectData(ProjectData &data);
@@ -1161,6 +1183,13 @@ private:
     // is a lightweight QDialog wrapper around an AudioClipEditor widget.
     class AIMaskDialog *m_aiMaskDialog = nullptr;
     class QDialog *m_audioClipEditorDialog = nullptr;
+    void showAudioClipEditorDialog(int eqTrackIdx, int clipIdx, bool volumePanEditable,
+                                   qint64 durationMs, double volume, double pan);
+    // US-1111: the clip the editor's EQ panel writes to (uid on the sequence it was opened on).
+    QString m_clipEqTargetUid;
+    QString m_clipEqTargetSeqId;
+    bool resolveClipEqTarget(int &track, int &clip, bool *foreignSequence = nullptr) const;
+    void syncAudioClipEditorEq(bool projectReplaced = false);
     QPointer<CredentialDialog> m_credentialDialog = nullptr;
 
     // US-PT-B: Sprint 15 — Planar (4-corner) tracker dialog, kept alive between invocations.
@@ -1263,18 +1292,6 @@ private:
     void onNodeSelected(int id);
 };
 
-// Shared by audio export and its DSP regression gates. Entries are stereo 48kHz
-// PreFx buffers; processing retains per-track histories and skips timeline gaps.
-namespace audioexport {
-struct DspEntry {
-    qint64 frameStart = 0;
-    std::vector<float> samples;
-};
-void processTrackEntries(std::vector<DspEntry> &entries, const trackfx::Chain &chain,
-                         const std::array<AudioMixer::EqBandCoefs, 3> &coeffs,
-                         bool eqEnabled, double preampDb);
-}
-
 class QComboBox;
 class EqualizerPanel;
 
@@ -1288,8 +1305,4 @@ void setTrackComboItems(QComboBox *combo, const QStringList &names,
 // Undo-relevant FX of the mixer: per-track chains + master EQ / DeEsser
 // ("chains" / "masterChain"), with the DeEsser listen monitor cleared.
 QJsonObject undoState(AudioMixer *mixer);
-}
-namespace audiofxexport {
-void setMasterEqBypassForTest(bool bypass);
-quint64 masterEqPassesForTest();
 }

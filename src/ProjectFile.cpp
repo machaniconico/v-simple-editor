@@ -753,6 +753,14 @@ bool ProjectFile::save(const QString &filePath, const ProjectData &data)
             fxArray.append(chain);
         }
         if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        // Only written when a track has a non-default fader gain or pan.
+        QJsonArray mixArray;
+        bool anyMix = false;
+        for (const auto &mix : data.trackMix) {
+            anyMix = anyMix || !mix.isDefault();
+            mixArray.append(QJsonObject{{"gain", mix.gain}, {"pan", mix.pan}});
+        }
+        if (anyMix) am["trackMix"] = mixArray;
         const QJsonObject masterFx = data.masterFx.toJson();
         if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
@@ -1077,6 +1085,7 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
     data.trackEqStates.clear();
     // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
@@ -1088,6 +1097,10 @@ bool ProjectFile::load(const QString &filePath, ProjectData &data)
             if (!chain.isDefault()) data.trackFx.insert(track, chain);
         }
         data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
+        for (const auto &value : am["trackMix"].toArray()) {
+            const QJsonObject object = value.toObject();
+            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
+        }
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1387,6 +1400,14 @@ QString ProjectFile::toJsonString(const ProjectData &data)
             fxArray.append(chain);
         }
         if (!fxArray.isEmpty()) am["trackFx"] = fxArray;
+        // Only written when a track has a non-default fader gain or pan.
+        QJsonArray mixArray;
+        bool anyMix = false;
+        for (const auto &mix : data.trackMix) {
+            anyMix = anyMix || !mix.isDefault();
+            mixArray.append(QJsonObject{{"gain", mix.gain}, {"pan", mix.pan}});
+        }
+        if (anyMix) am["trackMix"] = mixArray;
         const QJsonObject masterFx = data.masterFx.toJson();
         if (!masterFx.isEmpty()) am["masterFx"] = masterFx;
         root["audioMixer"] = am;
@@ -1681,6 +1702,7 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
     data.trackEqStates.clear();
     // Both project readers restore de-esser settings through the shared Chain codec.
     data.trackFx.clear();
+    data.trackMix.clear();
     data.masterFx = trackfx::Chain{};
     if (root.contains("audioMixer")) {
         QJsonObject am = root["audioMixer"].toObject();
@@ -1692,6 +1714,10 @@ bool ProjectFile::fromJsonString(const QString &json, ProjectData &data)
             if (!chain.isDefault()) data.trackFx.insert(track, chain);
         }
         data.masterFx = trackfx::Chain::fromJson(am["masterFx"].toObject());
+        for (const auto &value : am["trackMix"].toArray()) {
+            const QJsonObject object = value.toObject();
+            data.trackMix.append({object["gain"].toDouble(1.0), object["pan"].toDouble(0.0)});
+        }
         if (am.contains("trackEq")) {
             for (const auto &v : am["trackEq"].toArray())
                 data.trackEqStates.append(trackEqFromJson(v.toObject()));
@@ -1987,6 +2013,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         obj["visible"] = false;
     obj["filePath"] = clip.filePath;
     obj["displayName"] = clip.displayName;
+    if (!clip.uid.isEmpty())
+        obj["uid"] = clip.uid;
     if (!clip.shapes.isEmpty()) {
         QJsonArray shapes;
         for (const Shape &shape : clip.shapes)
@@ -2010,6 +2038,13 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
     obj["volume"] = clip.volume;
     if (clip.pan != 0.0)
         obj["pan"] = clip.pan;
+    // US-1110: the clip EQ is written only while it is on, in the same form as
+    // the "eq" part of trackfx::Chain::toJson (default band fields omitted).
+    if (clip.clipEqEnabled) {
+        trackfx::Chain chain;
+        chain.eq = clip.clipEq;
+        obj["clipEq"] = chain.toJson()["eq"].toObject();
+    }
     if (clip.audioChannelMode != AudioChannelMode::Stereo)
         obj["audioChannelMode"] = audioChannelModeToProjectString(clip.audioChannelMode);
     obj["videoScale"] = clip.videoScale;
@@ -2104,6 +2139,8 @@ QJsonObject ProjectFile::clipToJson(const ClipInfo &clip)
         original.renderInPlaceOriginal.reset();
         obj["renderInPlaceOriginal"] = clipToJson(original);
     }
+    if (clip.renderInPlaceOriginalRoto)
+        obj["renderInPlaceOriginalRoto"] = rotoClipEntryToJson(*clip.renderInPlaceOriginalRoto);
 
     return obj;
 }
@@ -2115,6 +2152,8 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.visible = !clipgeom::isNullObjectFilePath(clip.filePath)
         && obj.value("visible").toBool(true);
     clip.displayName = obj["displayName"].toString();
+    // Read as saved; a missing uid is minted by TimelineTrack::setClips on load.
+    clip.uid = obj["uid"].toString();
     if (obj.contains("shapes")) {
         for (const QJsonValue &value : obj["shapes"].toArray())
             clip.shapes.append(Shape::fromJson(value.toObject()));
@@ -2132,6 +2171,12 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
     clip.reversed = obj["reversed"].toBool(false);
     clip.volume = obj["volume"].toDouble(1.0);
     clip.pan = obj["pan"].toDouble(0.0);
+    if (obj.contains("clipEq")) {
+        QJsonObject chainObj;
+        chainObj["eq"] = obj["clipEq"].toObject();
+        clip.clipEq = trackfx::Chain::fromJson(chainObj).eq;
+        clip.clipEqEnabled = true;
+    }
     clip.audioChannelMode = obj.contains("audioChannelMode")
         ? audioChannelModeFromProjectValue(obj["audioChannelMode"])
         : AudioChannelMode::Stereo;
@@ -2227,6 +2272,9 @@ ClipInfo ProjectFile::clipFromJson(const QJsonObject &obj)
         original.remove("renderInPlaceOriginal");
         clip.renderInPlaceOriginal = std::make_shared<ClipInfo>(clipFromJson(original));
     }
+    if (obj.value("renderInPlaceOriginalRoto").isObject())
+        clip.renderInPlaceOriginalRoto = std::make_shared<RotoClipEntry>(
+            rotoClipEntryFromJson(obj.value("renderInPlaceOriginalRoto").toObject()));
 
     return clip;
 }

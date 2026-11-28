@@ -62,6 +62,7 @@ int runAutoColorSelftest();
 int runAutoDuckingSelftest();
 int runAutoMatteSelftest();
 int runAutoProxyPolicySelftest();
+int runAuxSendSelftest();
 int runBatchExportE2ESelftest();
 int runBatchExportSelftest();
 int runBeatDetectSelftest();
@@ -81,6 +82,7 @@ int runChromaSelftest();
 int runClipColorSelftest();
 int runClipCurvesSelftest();
 int runClipEnableSelftest();
+int runClipEqSelftest();
 int runClipFilmstripSelftest();
 int runClipGroupSelftest();
 int runClipIdtSelftest();
@@ -88,6 +90,7 @@ int runClipLutSelftest();
 int runClipMaskSelftest();
 int runClipOdtSelftest();
 int runClipParentParitySelftest();
+int runClipUidSelftest();
 int runCloudRenderSelftest();
 int runCollabSelftest();
 int runColorMatchApplySelftest();
@@ -181,6 +184,7 @@ int runLoudnessSelftest();
 int runLowerThirdSelftest();
 int runMainWindowLifecycleSelftest();
 int runMatte16ParitySelftest();
+int runMatteExportSelftest();
 int runMatteSsotSelftest();
 int runMcpSelftest();
 int runMediaPoolDragSelftest();
@@ -649,13 +653,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "hdr-routing",       "VEDITOR_HDR_ROUTING_SELFTEST",        runHdrRoutingSelftest,         false,
       "HDR10 3-way routing (in-process 8-bit / in-process HDR / subprocess fallback)" },
     { "renderqueue-aces",  "VEDITOR_RENDERQUEUE_ACES_SELFTEST",   runRenderQueueAcesDecisionSelftest, false,
-      "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (2 gates)" },
+      "RenderQueue ACES/ODT ownership decision for 8-bit vs 16-bit tonemap paths (5 gates)" },
     { "renderqueue-fps-rational", "VEDITOR_RENDERQUEUE_FPS_RATIONAL_SELFTEST", runRenderQueueFpsRationalSelftest, false,
       "RenderQueue in-process export fps rational derivation (6 gates)" },
     { "legacy-kf", nullptr, runLegacyKfSelftest, true,
       "Legacy colorCorrection.* keyframe tracks migrate to grade.* on project load + dialog initial values + nested sequences (8 gates)" },
     { "loudness-auto", nullptr, runLoudnessAutoSelftest, true,
-      "Automatic export loudness normalization (12 gates)" },
+      "Automatic export loudness normalization (15 gates)" },
     { "loudness-persist", nullptr, runLoudnessPersistSelftest, true,
       "Project loudness gain and playback normalizer persistence (4 gates)" },
     { "loudness-export-wire", "VEDITOR_LOUDNESS_EXPORT_WIRE_SELFTEST", runLoudnessExportWireSelftest, false,
@@ -679,7 +683,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "export-range",      "VEDITOR_EXPORT_RANGE_SELFTEST",       runExportRangeSelftest,       false,
       "Marked In/Out export frame-range helper (5 gates)" },
     { "tracker-preset",    "VEDITOR_TRACKER_PRESET_SELFTEST",     runTrackerPresetSelftest,      false,
-      "MotionTracker preset 7 built-in + Registry + JSON round-trip (7 gates)" },
+      "MotionTracker preset 7 built-in + Registry + JSON round-trip (10 gates)" },
 #ifdef HAVE_PLANARTRACKER_PRESET
     { "planar-preset",     "VEDITOR_PLANAR_PRESET_SELFTEST",      runPlanarPresetSelftest,       false,
       "PlanarTracker preset 5 built-in + Registry + JSON round-trip (10 gates)" },
@@ -697,7 +701,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "aihighlight",       "VEDITOR_AIHIGHLIGHT_SELFTEST",        runAIHighlightSelftest,        false,
       "AIHighlight config defaults / Highlight struct helpers (singleton-free) (6 gates)" },
     { "videostab-deshake", "VEDITOR_VIDEOSTAB_DESHAKE_SELFTEST",  runVideostabDeshakeSelftest,   false,
-      "VideoStabilizer in-process deshake filter-graph + cancel UX (9 gates)" },
+      "VideoStabilizer in-process deshake filter-graph + cancel UX (7 gates); source sections are numbered (1)-(5),(8),(9) with no (6)/(7)" },
     { "cred-ttl",          "VEDITOR_CRED_TTL_SELFTEST",           runCredTtlSelftest,            false,
       "CredentialStore TTL helper (setExpiry/getExpiry/clearExpiry/isExpired) round-trip + past/future detection (8 gates). QApplication 不要." },
     { "credential-vault",  "VEDITOR_CREDENTIAL_VAULT_SELFTEST",   runCredentialVaultSelftest,    false,
@@ -749,11 +753,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "spatial-path",      "VEDITOR_SPATIAL_PATH_SELFTEST",        runSpatialPathSelftest,        false,
       "AE-ANIM-2 spatial Bezier position path and auto-orient (9 gates)" },
     { "special-composite", "VEDITOR_SPECIAL_COMPOSITE_SELFTEST",   runSpecialCompositeSelftest,   true,
-      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (4 gates)" },
+      "Special-composite preview parity: time-remap + mesh warp preview == renderFrameAt, warp off parity, non-special clip skips path (7 gates)" },
     { "spectral-edit",     "VEDITOR_SPECTRAL_EDIT_SELFTEST",      runSpectralEditSelftest,       false,
       "SpectralEngine: FFT/STFT/iSTFT round-trip + region attenuation" },
     { "spectrum", nullptr, runSpectrumSelftest, true,
-      "2048-point Hann FFT and visible-only master tap spectrum dock (4 gates)" },
+      "2048-point Hann FFT and visible-only master tap spectrum dock (8 gates)" },
     { "noise-print", "VEDITOR_NOISE_PRINT_SELFTEST", runNoisePrintSelftest, false,
       "Noise print: SNR, amplitude, bypass, stereo independence, validation and determinism (6 gates)" },
     { "voice-isolation",   "VEDITOR_VOICE_ISOLATION_SELFTEST",    runVoiceIsolationSelftest,     true,
@@ -765,23 +769,23 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "aces-color",        "VEDITOR_ACES_COLOR_SELFTEST",         runAcesColorSelftest,          false,
       "AcesColor: primaries matrices, Bradford, IDT/RRT/ODT round-trip" },
     { "ae-fx-blur",        "VEDITOR_AE_FX_BLUR_SELFTEST",         runAeFxBlurSelftest,           false,
-      "AE-FX-1 Blur Family: Gaussian, directional, radial implementation (6 gates)" },
+      "AE-FX-1 Blur Family: Gaussian, directional, radial implementation (7 gates)" },
     { "ae-fx-color",       "VEDITOR_AE_FX_COLOR_SELFTEST",        runAeFxColorSelftest,          false,
       "AE-FX-3 Color Family: levels, tint, blackwhite, exposure, hue/saturation (6 gates)" },
     { "ae-fx-color2",      "VEDITOR_AE_FX_COLOR2_SELFTEST",       runAeFxColor2Selftest,         true,
-      "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (6 gates)" },
+      "AE-FX-6 Color/Channel Family: curves, mixer, vibrance, filter, tritone, brightness/contrast (12 gates)" },
     { "log-to-rec709", "VEDITOR_LOG_TO_REC709_SELFTEST", runLogToRec709Selftest, false,
       "Camera Log decoding, output transfer, gamut and presets (G1-G7)" },
     { "lens-distort", "VEDITOR_LENS_DISTORT_SELFTEST", runLensDistortSelftest, false,
       "Lens distortion identity, geometry and preset round-trip (G1-G6)" },
     { "ae-fx-distort",     "VEDITOR_AE_FX_DISTORT_SELFTEST",      runAeFxDistortSelftest,        false,
-      "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch (6 gates)" },
+      "AE-FX-4 Distort & Glitch Family: RGB split, wave warp, ripple, VHS glitch (7 gates)" },
     { "ae-fx-distort2",    "VEDITOR_AE_FX_DISTORT2_SELFTEST",     runAeFxDistort2Selftest,       false,
       "AE-FX-7 Distort/Transform Family: bulge, twirl, mirror, polar, motion tile, corner pin (7 gates)" },
     { "ae-fx-generate",    "VEDITOR_AE_FX_GENERATE_SELFTEST",     runAeFxGenerateSelftest,       false,
       "AE-FX-5 Generate Family: gradient ramp, fill, bloom, scanlines, halftone (6 gates)" },
     { "ae-fx-stylize",     "VEDITOR_AE_FX_STYLIZE_SELFTEST",      runAeFxStylizeSelftest,        false,
-      "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize (7 gates)" },
+      "AE-FX-2 Stylize Family: glow, edges, emboss, posterize, threshold, solarize (9 gates)" },
     { "puppet-pin", "VEDITOR_PUPPET_PIN_SELFTEST", runPuppetPinSelftest, true,
       "正規化パペットピン・描画・保存・Undo・クリップ変換込みの配置 (6 gates)" },
     { "mesh-warp", "VEDITOR_MESH_WARP_SELFTEST", runMeshWarpSelftest, true,
@@ -858,20 +862,24 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Linked edge-drag trim across AV pairs / groups, Alt solo, clamps, locked partners and undo (9 gates)" },
     { "clip-enable", "VEDITOR_CLIP_ENABLE_SELFTEST", runClipEnableSelftest, true,
       "Clip enable: rendering, persistence, undo, audio and Null Object parenting (5 gates)" },
+    { "clip-eq", "VEDITOR_CLIP_EQ_SELFTEST", runClipEqSelftest, true,
+      "Clip EQ: audio-clip setter, save/load, undo, playback entries, nested child-first rule, mixer playback and the editor EQ panel (6 gates)" },
     { "clip-parent-parity", "VEDITOR_CLIP_PARENT_PARITY_SELFTEST", runClipParentParitySelftest, true,
       "Clip parenting: render parity, composeParented math, cycle/self/null guards" },
+    { "clip-uid", "VEDITOR_CLIP_UID_SELFTEST", runClipUidSelftest, true,
+      "Clip uid: minted at add / load, fresh for split right half and paste / duplicate clones, save / load, duplicate repair, ProjectDiff ignores it, undo / redo, decompose collision (5 gates)" },
     { "clip-idt",         "VEDITOR_CLIP_IDT_SELFTEST",           runClipIdtSelftest,            false,
       "Clip IDT: per-clip RGBA64 premul input color transform into common 16bit blend space (13 gates)" },
     { "clip-odt",         "VEDITOR_CLIP_ODT_SELFTEST",           runClipOdtSelftest,            false,
       "Clip ODT: linear Rec2020 RGBA64 premul output transform + ACES tonemap contract (10 gates)" },
     { "silence-cut",      "VEDITOR_SILENCE_CUT_SELFTEST",        runSilenceCutSelftest,         false,
-      "SilenceCut RMS silence detection: keep/silence segmentation + consistency (9 gates)" },
+      "SilenceCut RMS silence detection: keep/silence segmentation + consistency (12 gates)" },
     { "beat-detect",      "VEDITOR_BEAT_DETECT_SELFTEST",         runBeatDetectSelftest,         false,
       "BeatDetect energy-flux onset detection + median-interval BPM estimate (7 gates)" },
     { "safe-leavecolor", "VEDITOR_SAFE_LEAVECOLOR_SELFTEST", runSafeLeaveColorSelftest, false,
       "放送セーフと色を残す (6 gates)" },
     { "safe-zone",        "VEDITOR_SAFE_ZONE_SELFTEST",           runSafeZoneSelftest,           false,
-      "SafeZone: SNS platform UI guide rects + apply display-local overlay (9 gates)" },
+      "SafeZone: SNS platform UI guide rects + apply display-local overlay (13 gates)" },
     { "still-compare",    "VEDITOR_STILL_COMPARE_SELFTEST",       runStillCompareSelftest,       false,
       "StillCompare: horizontal/vertical wipe + split compositing + StillStore round-trip (5 gates)" },
     { "onion-skin",       "VEDITOR_ONION_SKIN_SELFTEST",          runOnionSkinSelftest,          false,
@@ -901,7 +909,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,
-      "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (15 gates)" },
+      "GpuCompositeMath: paint order, layer transform matrix, premul source-over, matte validity (24 gates)" },
     { "hdr-composite-math", "VEDITOR_HDR_COMPOSITE_MATH_SELFTEST", runHdrCompositeMathSelftest, false,
       "HdrCompositeMath: 16-bit premul source-over + 8-bit SSOT parity + extra-precision proof + paint order (6 gates)" },
     { "hdr-export16",     "VEDITOR_HDR_EXPORT16_SELFTEST",       runHdrExport16Selftest,       false,
@@ -913,9 +921,11 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "preview16-policy", "VEDITOR_PREVIEW16_POLICY_SELFTEST", runPreview16PolicySelftest, false,
       "preview16 policy predicate checks" },
     { "live-matte-resolve", "VEDITOR_LIVE_MATTE_RESOLVE_SELFTEST", runLiveMatteResolveSelftest, false,
-      "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (6 gates)" },
+      "LiveMatteResolve: clipId->index matte source resolution (STAGE4B) — valid + self/base/unknown rejection + no-matte/multi-matte (8 gates)" },
+    { "matte-export", "VEDITOR_MATTE_EXPORT_SELFTEST", runMatteExportSelftest, true,
+      "Luma matte RenderQueue live, no-matte control, projectFilePath, repeat, MCP export_video (5 gates)" },
     { "matte-ssot", "VEDITOR_MATTE_SSOT_SELFTEST", runMatteSsotSelftest, true,
-      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (6 gates)" },
+      "Timeline matte carrier: concurrent getter/setter snapshot, delete/split/external remap of owner and source keys, undo/redo restoration (13 gates)" },
     { "auto-proxy-policy",  "VEDITOR_AUTO_PROXY_POLICY_SELFTEST",  runAutoProxyPolicySelftest,     false,
       "AutoProxyPolicy: heavy-clip detection (width/codec) + useProxyFor/generateFor split + dedup (12 gates)" },
     { "exposure-aids",      "VEDITOR_EXPOSURE_AIDS_SELFTEST",      runExposureAidsSelftest,        false,
@@ -936,7 +946,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "render-in-place", nullptr, runRenderInPlaceSelftest, true,
       "Render in place: image, handles, decompose, undo, persistence, overlap rejection, composition, chroma rejection (8 gates)" },
     { "render-notify", nullptr, runRenderNotifySelftest, true,
-      "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (4 gates)" },
+      "Export-complete notification: OFF silent, ON message and counter, failure count, no notify before allCompleted (7 gates)" },
     { "deflicker",         "VEDITOR_DEFLICKER_SELFTEST",          runDeflickerSelftest,         true,
       "Deflicker: global luma/RGB, streaming apply, cancellation, source resolution, and mask bounds (14 gates)" },
     { "adjustment-layer", "VEDITOR_ADJUSTMENT_LAYER_SELFTEST", runAdjustmentLayerSelftest, true,
@@ -960,7 +970,7 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "colormatch-apply",  "VEDITOR_COLORMATCH_APPLY_SELFTEST",    runColorMatchApplySelftest,    true,
       "ColorMatch apply: generated .cube -> selected clip LUT fields + undo + renderFrameAt reflection" },
     { "audio-fixture", nullptr, runAudioFixtureSelftest, true,
-      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (10 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
+      "Export PCM fixture: deterministic WAV data, track gain, flat EQ and band EQ (18 gates); VEDITOR_AUDIO_FIXTURE_OUT required" },
     { "render-fixture", "VEDITOR_RENDER_FIXTURE_SELFTEST", runRenderFixtureSelftest, true,
       "Deterministic acceptance-lane render/audio dump (G1-G3; VEDITOR_RENDER_FIXTURE_OUT required)" },
     { "parity",            "VEDITOR_PARITY_SELFTEST",             runParitySelftest,             true,
@@ -971,13 +981,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "keyframe-copy", "VEDITOR_KEYFRAME_COPY_SELFTEST", runKeyframeCopySelftest, true,
       "Graph editor keyframe clipboard: payload, cross-clip paste, collision, undo, transform track creation and placeholder isolation (7 gates)" },
     { "keyframe-anim-parity", "VEDITOR_KEYFRAME_ANIM_PARITY_SELFTEST", runKeyframeAnimParitySelftest, true,
-      "Render-time per-clip motion/opacity keyframe evaluation parity (5 gates); byte-identical no-keyframe guard" },
+      "Render-time per-clip motion/opacity keyframe evaluation parity (6 gates); byte-identical no-keyframe guard" },
     { "motion-blur-p2", "VEDITOR_MOTION_BLUR_P2_SELFTEST", runMotionBlurP2Selftest, true,
       "Motion blur P2 activation: env force OR per-clip opt-in + ProjectFile true-only persistence (5 gates)" },
     { "motion-blur-parity", "VEDITOR_MOTION_BLUR_PARITY_SELFTEST", runMotionBlurParitySelftest, true,
-      "Export SSOT motion blur OFF-path parity + premultiplied temporal averaging helper (3 gates)" },
+      "Export SSOT motion blur OFF-path parity + premultiplied temporal averaging helper (7 gates)" },
     { "effect-keyframe-parity", "VEDITOR_EFFECT_KEYFRAME_PARITY_SELFTEST", runEffectKeyframeParitySelftest, true,
-      "Render-time per-clip effect parameter keyframe evaluation parity (4 gates); byte-identical no-keyframe guard" },
+      "Render-time per-clip effect parameter keyframe evaluation parity (9 gates); byte-identical no-keyframe guard" },
     { "effect-timing", "VEDITOR_EFFECT_TIMING_SELFTEST", runEffectTimingSelftest, true,
       "Clip-local VideoEffect active range filtering + ProjectFile JSON round-trip (4 gates)" },
     { "mediapool-drag", "VEDITOR_MEDIAPOOL_DRAG_SELFTEST", runMediaPoolDragSelftest, true,
@@ -1013,13 +1023,13 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "ripple-delete", "VEDITOR_RIPPLE_DELETE_SELFTEST", runRippleDeleteSelftest, true,
       "Ripple delete and gap close: all-track time-range ripple, one-step undo, and no-selection no-op" },
     { "roto", "VEDITOR_ROTO_SELFTEST", runRotoSelftest, true,
-      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (36 gates)" },
+      "Roto carrier mutation keys, idempotence, undo, project JSON, queue restore, and drag reorder (44 gates)" },
     { "e2e",               "VEDITOR_E2E_SELFTEST",                runE2eSelftest,                true,
       "Real-media end-to-end smoke (ColorMatch decode + deHum + processAll)" },
     { "trackmatte-parity", "VEDITOR_TRACKMATTE_PARITY_SELFTEST",  runTrackMatteParitySelftest,   true,
       "Track matte SSOT pixel-match across 4 matte types (luma/alpha/chroma/inv)" },
     { "gpu-composite-parity", "VEDITOR_GPU_COMPOSITE_PARITY_SELFTEST", runGpuCompositeParitySelftest, true,
-      "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, graceful GL skip) (7 gates)" },
+      "GPU (GpuLayerCompositor FBO) vs CPU SSOT parity, matte-free scenes (SSIM>=0.98, MAE<=3..6/255, graceful GL skip) (16 gates)" },
     { "gpu-composite-parity-16-matte", "VEDITOR_GPU_COMPOSITE_PARITY_16_MATTE_SELFTEST", runGpuCompositeParity16MatteSelftest, true,
       "GPU RGBA16 track-matte (composite16Matte) vs CPU 16-bit matte oracle, all 4 matte types + premul + precision proof, graceful GL skip" },
     { "gpu-idt-parity", "VEDITOR_GPU_IDT_PARITY_SELFTEST", runGpuIdtParitySelftest, true,
@@ -1063,13 +1073,15 @@ const ArgvSelftestEntry kArgvSelftests[] = {
     { "reduce-project", "VEDITOR_REDUCE_PROJECT_SELFTEST", runReduceProjectSelftest, true,
       "Unused media removal: shared provider, nested/sidecar references, confirmation and disk preservation (4 gates)" },
     { "mcp",              "VEDITOR_MCP_SELFTEST",                runMcpSelftest,                true,
-      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (188 gates)" },
+      "MCP server: JSON-RPC framing + tool registry dispatch + HTTP transport auth + write-tool validation + AI chat helpers (189 gates)" },
     { "music-remix",      nullptr,                                  runMusicRemixSelftest,        true,
       "Music Remix: beat-boundary shortening/extension, intro/outro retention, crossfade, and one-step undo" },
     { "deesser", nullptr, runDeEsserSelftest, true,
       "De-esser: disabled bypass, band-only attenuation, threshold, playback/export parity, persistence, live dock, seek counter, dock follows project/track changes (8 gates)" },
     { "mixer-dock", nullptr, runMixerDockSelftest, true,
-      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock (10 gates)" },
+      "Audio mixer dock: track strips, existing gain path, flags, gesture undo, hidden identity, message handler under Qt signal/slot lock, pan slider and bus combo, hidden sync writes nothing (13 gates)" },
+    { "aux-send", nullptr, runAuxSendSelftest, true,
+      "AUX send table: per-bus send level and pre-fader edit with one undo point per edit, hidden refresh writes nothing (3 gates)" },
     { "dialogue-leveler", nullptr,                                runDialogueLevelerSelftest,    true,
       "Dialogue Leveler: K-weighted envelope, silence gate, gain clamps, determinism, undo, and persistence" },
     { "auto-clip-gen",     "VEDITOR_AUTO_CLIP_GEN_SELFTEST",      runAutoClipGenSelftest,        true,

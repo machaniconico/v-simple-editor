@@ -28,17 +28,16 @@ struct TrackMatteClipEntry;
 struct TimelineTrackMatteEntry;
 
 // Per-clip identity key used for order-preserving survivor alignment.
-// Invariant across all four mutation slots (delete / rippleDelete /
-// splitAtPlayhead / pasteClip): a surviving clip's filePath, linkGroup, and
-// inPoint are never mutated by those ops.
-//
-// paste() can create byte-identical ClipInfo copies. The monotonic walk
-// binds each old duplicate to the next new duplicate at or after its low
-// water mark. See alignedClipKeyMap for the tie-break logic.
+// US-1119: sameAs compares ClipInfo::uid when both keys carry one, so paste
+// clones (equal filePath, linkGroup and inPoint, distinct uid) stay apart.
+// When either uid is empty (a hand-made ClipInfo or snapshot, or a pre-uid
+// key) it falls back to filePath, linkGroup and inPoint. A surviving clip's
+// uid is never changed by a mutation; split keeps it on the left half.
 struct ClipKeyId {
     QString filePath;
     int linkGroup = 0;
     double inPoint = 0.0;
+    QString uid;
 
     bool sameAs(const ClipKeyId &o) const;
 };
@@ -58,7 +57,8 @@ QHash<QString, QString> alignedClipKeyMap(
 // Timeline state via an order-preserving monotonic two-pointer walk and
 // rewrite every positional key in `entries` (MainWindow GUI map type).
 // Entries whose owning clip or matte-source clip no longer exists are dropped.
-// Ownership: called by MainWindow mutation slots on m_trackMatteClipEntries.
+// Selftest only: production keeps no GUI matte map (the Timeline carrier is
+// the matte SSOT), so only the trackmatte reindex / RM-6 selftests call it.
 // This and the two helpers below first call Timeline's roto remap. Its
 // post-mutation snapshot memo skips repeated calls for the same placement.
 void remapTrackMatteEntriesAfterMutation(
@@ -68,15 +68,13 @@ void remapTrackMatteEntriesAfterMutation(
 
 // RM-5: Timeline-carrier sibling — same alignment logic but operates on
 // Timeline's own m_trackMatteEntries (TimelineTrackMatteEntry type, keyed by
-// clipId, no separate clipId field inside the value). Called by Timeline
-// itself after moveClip / cross-track drop / deleteSelectedClip so the
-// carrier stays correct without any MainWindow involvement.
-// Ownership rule: Timeline owns its carrier remap on reorder/drop/delete
-// paths; MainWindow slots own m_trackMatteClipEntries remap on their 4
-// mutation paths and then sync the carrier via syncTrackMatteEntriesToTimeline.
-// Timeline and MainWindow may both remap a mutation. Each helper calls
-// Timeline::remapRotoEntriesAfterMutation first; its memo prevents a repeated
-// roto remap when the clip placement has not changed.
+// clipId, no separate clipId field inside the value). Timeline is the matte
+// SSOT: its edit paths remap the carrier themselves (Timeline::
+// remapTrackMatteLocked), and MainWindow edits that change clips outside
+// Timeline call Timeline::remapCarriersAfterExternalMutation. MainWindow keeps
+// no matte copy. Each helper calls Timeline::remapRotoEntriesAfterMutation
+// first; its memo prevents a repeated roto remap when the clip placement has
+// not changed.
 void remapTimelineCarrierAfterMutation(
     Timeline *timeline,
     QHash<QString, TimelineTrackMatteEntry> &carrier,

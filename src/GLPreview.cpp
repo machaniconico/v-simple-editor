@@ -1728,14 +1728,10 @@ void GLPreview::displayFrame(const QImage &frame)
     // texture().rgb sampling produces the same visible pixels. Disable
     // path: VEDITOR_BGRA_UPLOAD_DISABLE=1.
     //
-    // INVARIANT (architect NIT-1): the alpha=1.0 invariant relies on
-    // overlay layer pixels themselves being opaque (alpha=1.0). The
-    // current decode pipeline emits RGB24 frames (no alpha), which
-    // QPainter promotes to alpha=0xFF when drawing — preserving the
-    // invariant. If a future overlay format introduces non-opaque
-    // pixels (transparent PNG / sticker), this fast path's premul=
-    // straight assumption breaks for those pixels and Win #8 must
-    // gate on an opacity check or fall back to RGBA8888.
+    // NOTE (US-1106 measurement): the premultiplied BGRA bytes are also
+    // correct for alpha < 1 because the output stage interprets the texture
+    // as premultiplied. Converting a translucent frame to straight RGBA8888
+    // is the wrong direction (it brightens, e.g. (211,112,52) vs (113,63,33)).
     static const bool bgraUploadEnabled =
         qEnvironmentVariableIntValue("VEDITOR_BGRA_UPLOAD_DISABLE") == 0;
     if (is16) {
@@ -1777,6 +1773,16 @@ void GLPreview::setColorCorrection(const ColorCorrection &cc)
         {cc.logHighR, cc.logHighG, cc.logHighB}
     }};
     ++m_colorCorrectionSetCountForTest;
+    update();
+}
+
+void GLPreview::setFrameTextureNearestForTest(bool nearest)
+{
+    if (m_frameTextureNearestForTest == nearest)
+        return;
+    m_frameTextureNearestForTest = nearest;
+    // paintGL applies it to an already allocated m_texture (context current).
+    m_frameTextureFilterDirty = true;
     update();
 }
 
@@ -2181,8 +2187,10 @@ void GLPreview::paintGL()
                 pixType   = QOpenGLTexture::UInt8;
             }
             m_texture->setFormat(texFormat);
-            m_texture->setMinificationFilter(QOpenGLTexture::Linear);
-            m_texture->setMagnificationFilter(QOpenGLTexture::Linear);
+            const QOpenGLTexture::Filter frameFilter = m_frameTextureNearestForTest
+                ? QOpenGLTexture::Nearest : QOpenGLTexture::Linear;
+            m_texture->setMinificationFilter(frameFilter);
+            m_texture->setMagnificationFilter(frameFilter);
             m_texture->setWrapMode(QOpenGLTexture::ClampToEdge);
             m_texture->allocateStorage(pixFormat, pixType);
             m_textureFormat = frameFmt;
@@ -2210,6 +2218,14 @@ void GLPreview::paintGL()
     if (!m_texture || !m_program) {
         undotrace::log("gl:paintGL:exit");
         return;
+    }
+
+    if (m_frameTextureFilterDirty) {
+        const QOpenGLTexture::Filter frameFilter = m_frameTextureNearestForTest
+            ? QOpenGLTexture::Nearest : QOpenGLTexture::Linear;
+        m_texture->setMinificationFilter(frameFilter);
+        m_texture->setMagnificationFilter(frameFilter);
+        m_frameTextureFilterDirty = false;
     }
 
     m_program->bind();
