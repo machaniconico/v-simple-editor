@@ -6370,6 +6370,165 @@ void Timeline::bladeAllTracksAtPlayhead()
     emit positionChanged(m_playheadPos);
 }
 
+bool Timeline::rippleTrimBeforePlayhead()
+{
+    constexpr double kMinTrimSec = 0.05;
+    double clipStart = -1.0;
+    auto findSpanOnTrack = [&](TimelineTrack *track) -> bool {
+        if (!track || track->isLocked()) return false;
+        double cursor = 0.0;
+        for (const ClipInfo &c : track->clips()) {
+            const double start = cursor + c.leadInSec;
+            const double end = start + c.effectiveDuration();
+            if (m_playheadPos > start + kMinTrimSec && m_playheadPos < end - kMinTrimSec) {
+                clipStart = start;
+                return true;
+            }
+            cursor = end;
+        }
+        return false;
+    };
+    bool found = false;
+    if (m_activeVideoTrackIndex >= 0 && m_activeVideoTrackIndex < m_videoTracks.size())
+        found = findSpanOnTrack(m_videoTracks[m_activeVideoTrackIndex]);
+    for (int i = 0; !found && i < m_videoTracks.size(); ++i)
+        found = findSpanOnTrack(m_videoTracks[i]);
+    for (int i = 0; !found && i < m_audioTracks.size(); ++i)
+        found = findSpanOnTrack(m_audioTracks[i]);
+    if (!found || clipStart < 0.0 || m_playheadPos - clipStart <= kMinTrimSec) {
+        emit statusMessageRequested(QStringLiteral("再生ヘッド位置にリップルカットできるクリップがありません。"), 3000);
+        return false;
+    }
+    const bool ok = applyRippleDeleteTimeRangesToAllTracks(
+        {{clipStart, m_playheadPos}},
+        QStringLiteral("再生ヘッドより前をリップルカット"),
+        /*skipLocked=*/true);
+    if (ok)
+        setPlayheadPosition(clipStart);
+    return ok;
+}
+
+bool Timeline::rippleTrimAfterPlayhead()
+{
+    constexpr double kMinTrimSec = 0.05;
+    double clipEnd = -1.0;
+    auto findSpanOnTrack = [&](TimelineTrack *track) -> bool {
+        if (!track || track->isLocked()) return false;
+        double cursor = 0.0;
+        for (const ClipInfo &c : track->clips()) {
+            const double start = cursor + c.leadInSec;
+            const double end = start + c.effectiveDuration();
+            if (m_playheadPos > start + kMinTrimSec && m_playheadPos < end - kMinTrimSec) {
+                clipEnd = end;
+                return true;
+            }
+            cursor = end;
+        }
+        return false;
+    };
+    bool found = false;
+    if (m_activeVideoTrackIndex >= 0 && m_activeVideoTrackIndex < m_videoTracks.size())
+        found = findSpanOnTrack(m_videoTracks[m_activeVideoTrackIndex]);
+    for (int i = 0; !found && i < m_videoTracks.size(); ++i)
+        found = findSpanOnTrack(m_videoTracks[i]);
+    for (int i = 0; !found && i < m_audioTracks.size(); ++i)
+        found = findSpanOnTrack(m_audioTracks[i]);
+    if (!found || clipEnd <= m_playheadPos + kMinTrimSec) {
+        emit statusMessageRequested(QStringLiteral("再生ヘッド位置にリップルカットできるクリップがありません。"), 3000);
+        return false;
+    }
+    return applyRippleDeleteTimeRangesToAllTracks(
+        {{m_playheadPos, clipEnd}},
+        QStringLiteral("再生ヘッドより後をリップルカット"),
+        /*skipLocked=*/true);
+}
+
+bool Timeline::rippleInsertClipAtTime(bool audio, int trackIndex, const ClipInfo &clip,
+                                      double timeSec, QString *errorOut)
+{
+    auto &tracks = audio ? m_audioTracks : m_videoTracks;
+    if (trackIndex < 0 || trackIndex >= tracks.size() || !tracks[trackIndex]) {
+        if (errorOut) *errorOut = QStringLiteral("invalid track index");
+        return false;
+    }
+    TimelineTrack *track = tracks[trackIndex];
+    if (track->isLocked()) {
+        if (errorOut) *errorOut = QStringLiteral("track is locked");
+        return false;
+    }
+    if (!std::isfinite(timeSec) || timeSec < 0.0) {
+        if (errorOut) *errorOut = QStringLiteral("timeSec must be >= 0");
+        return false;
+    }
+    if (!std::isfinite(clip.effectiveDuration()) || clip.effectiveDuration() <= 1e-4) {
+        if (errorOut) *errorOut = QStringLiteral("clip duration must be positive");
+        return false;
+    }
+
+    const TrackClipSnapshot snapBefore = snapshotTrackClips(this);
+    QVector<ClipInfo> clips = track->clips();
+    ClipInfo inserted = clip;
+    inserted.leadInSec = 0.0;
+    if (inserted.uid.isEmpty())
+        inserted.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+
+    constexpr double kEps = 0.02;
+    double cursor = 0.0;
+    bool placed = false;
+    for (int i = 0; i < clips.size(); ++i) {
+        const double start = cursor + clips[i].leadInSec;
+        const double end = start + clips[i].effectiveDuration();
+        if (timeSec <= start + kEps) {
+            const double lead = qMax(0.0, timeSec - cursor);
+            const double remGap = qMax(0.0, start - (cursor + lead));
+            inserted.leadInSec = lead;
+            clips[i].leadInSec = remGap;
+            clips.insert(i, inserted);
+            placed = true;
+            break;
+        }
+        if (timeSec > start + kEps && timeSec < end - kEps) {
+            const double offsetTimeline = timeSec - start;
+            const double speed = qMax(0.01, std::abs(clips[i].speed));
+            const double offsetMedia = offsetTimeline * speed;
+            ClipInfo left = clips[i];
+            ClipInfo right = clips[i];
+            if (left.reversed) {
+                const double splitMedia = left.outPoint - offsetMedia;
+                left.inPoint = splitMedia;
+                right.outPoint = splitMedia;
+            } else {
+                const double splitMedia = left.inPoint + offsetMedia;
+                left.outPoint = splitMedia;
+                right.inPoint = splitMedia;
+            }
+            right.leadInSec = 0.0;
+            right.uid = QUuid::createUuid().toString(QUuid::WithoutBraces);
+            if (right.linkGroup > 0)
+                right.linkGroup = allocateLinkGroup();
+            clips[i] = left;
+            clips.insert(i + 1, inserted);
+            clips.insert(i + 2, right);
+            placed = true;
+            break;
+        }
+        cursor = end;
+    }
+    if (!placed) {
+        inserted.leadInSec = qMax(0.0, timeSec - cursor);
+        clips.append(inserted);
+    }
+
+    track->setClips(clips);
+    remapTrackMatteLocked(snapBefore);
+    remapClipParentEntriesAfterMutation(this, m_clipParentEntries, snapBefore);
+    saveUndoState(QStringLiteral("リップル挿入"));
+    ensureSequenceFitsViewport();
+    scheduleEmitSequenceChanged();
+    updateInfoLabel();
+    return true;
+}
+
 void Timeline::splitAtPlayhead()
 {
     // Split only the clips the user has explicitly selected (on any track),

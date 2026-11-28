@@ -200,6 +200,7 @@ int runPuppetArapSelftest();
 int runPuppetPhase3Selftest();
 int runMultibandCompSelftest();
 int runSequenceSettingsSelftest();
+int runBladeMcpRippleSelftest();
 int runLoudnessExportWireSelftest();
 int runLoudnessPersistSelftest();
 int runLoudnessSelftest();
@@ -1002,6 +1003,8 @@ const ArgvSelftestEntry kArgvSelftests[] = {
       "Wave 34 4-band phase-aligned LR4 Multiband Compressor: bit-exact bypass, flat crossover reconstruction, band isolation, solo audition, bypass/makeup/wet-dry, JSON round-trip, Master+Track AudioMixer GR & Undo, Export SSOT parity, Presets & UI Panel (9 gates)" },
     { "sequence-settings", "VEDITOR_SEQUENCE_SETTINGS_SELFTEST", runSequenceSettingsSelftest, true,
       "Wave 35 Per-Sequence Resolution & FPS Settings: project inheritance, independent W/H/FPS overrides, createSequenceWithSettings + 1-step Undo/Redo, active sequence switching, reset to inherit, sparse .veditor JSON round-trip, SequenceListDock & Dialog (7 gates)" },
+    { "blade-mcp-ripple", "VEDITOR_BLADE_MCP_RIPPLE_SELFTEST", runBladeMcpRippleSelftest, true,
+      "Wave 36 Blade Tool & MCP Ripple Editing: all-track rippleTrimBefore/AfterPlayhead (Ctrl+Shift+Q/W), rippleInsertClipAtTime (split+shift/gap/locked), MCP ripple_delete_range / blade_all_tracks / ripple_insert_clip (total 66 MCP tools) & 1-step Undo (8 gates)" },
     { "gpu-composite-flag", "VEDITOR_GPU_COMPOSITE_FLAG_SELFTEST", runGpuCompositeFlagSelftest, false,
       "GPU合成フラグ解決(env OR settings)の純粋リゾルバ検証" },
     { "gpu-composite-math", "VEDITOR_GPU_COMPOSITE_MATH_SELFTEST", runGpuCompositeMathSelftest, false,

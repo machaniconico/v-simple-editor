@@ -1270,7 +1270,7 @@ int runMcpSelftest()
             rpcRequest(73, QStringLiteral("tools/list")))))
         .value(QStringLiteral("result")).toObject()
         .value(QStringLiteral("tools")).toArray();
-    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */ + 4 /* US-1911 */ + 2 /* Wave 32: get/set_clip_puppet */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics; US-1911: get/set_clip_text3d + get/set_clip_brush; Wave 32: get/set_clip_puppet
+    constexpr int kExpectedProjectInfoToolCount = 36 + 1 + 2 + 2 + 1 + 2 + 3 + 1 + 2 + 1 + 1 + 2 + 3 /* US-1711 */ + 4 /* US-1911 */ + 2 /* Wave 32: get/set_clip_puppet */ + 3 /* Wave 36: ripple_delete_range / blade_all_tracks / ripple_insert_clip */; // US-308: compare_project; US-312: render/decompose; US-400: color/LUT; US-406: track properties; US-509: sequences; US-511: track operations; US-605: group/ungroup; US-1201: connect/disconnect_clip; US-1711: set_clip_wiggle/set_clip_expression/get_clip_dynamics; US-1911: get/set_clip_text3d + get/set_clip_brush; Wave 32: get/set_clip_puppet; Wave 36: ripple_delete_range / blade_all_tracks / ripple_insert_clip
     bool outputSchemasDeclared = projectInfoToolDescriptors.size()
         == kExpectedProjectInfoToolCount;
     for (const QJsonValue& value : projectInfoToolDescriptors) {
@@ -7703,12 +7703,15 @@ int runMcpSelftest()
                     && names.contains(QStringLiteral("get_clip_brush"))
                     && names.contains(QStringLiteral("set_clip_brush"))
                     && names.contains(QStringLiteral("get_clip_puppet"))
-                    && names.contains(QStringLiteral("set_clip_puppet"));
-                std::fprintf(stderr, "mcp G201 tools=%d all6=%d (expect 63, 1)\n",
+                    && names.contains(QStringLiteral("set_clip_puppet"))
+                    && names.contains(QStringLiteral("ripple_delete_range"))
+                    && names.contains(QStringLiteral("blade_all_tracks"))
+                    && names.contains(QStringLiteral("ripple_insert_clip"));
+                std::fprintf(stderr, "mcp G201 tools=%d all9=%d (expect 66, 1)\n",
                              static_cast<int>(names.size()), all4);
-                tallyObserved(201, observeTerm(201, "tools/list has the sidecar tools", all4)
-                    && observeTerm(201, "tools/list total is 63", names.size() == 63),
-                    "tools/list is missing get/set_clip_text3d / brush / puppet or the total is not 63");
+                tallyObserved(201, observeTerm(201, "tools/list has the sidecar & ripple tools", all4)
+                    && observeTerm(201, "tools/list total is 66", names.size() == 66),
+                    "tools/list is missing sidecar/ripple tools or the total is not 66");
             }
 
             // G202: text3d round trip (timeOffsetSec 0 accepted and omitted by toJson, 1.5 kept),

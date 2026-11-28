@@ -1072,6 +1072,8 @@ private:
     QAction *m_selectForwardAction = nullptr;
     QAction *m_selectBackwardAction = nullptr;
     QAction *m_bladeAllAction = nullptr;
+    QAction *m_rippleTrimBeforeAction = nullptr;
+    QAction *m_rippleTrimAfterAction = nullptr;
     QAction *m_liftAction = nullptr;
     QAction *m_duplicateAction = nullptr;
     QAction *m_nudgeLeftAction = nullptr;

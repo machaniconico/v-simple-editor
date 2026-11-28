@@ -27,6 +27,7 @@
 #include "../VideoPlayer.h"
 #include "../WaveformGenerator.h"
 #include "../TimecodeBurnIn.h"
+#include "../libavcore/Probe.h"
 
 #include <QAction>
 #include <QBuffer>
@@ -6085,6 +6086,277 @@ void McpEditorTools::registerWriteTools()
             return QJsonObject{{QStringLiteral("ok"), true}};
         })
     }, redoOutputSchema));
+
+    // Keep Wave 36 ripple tools in a separate non-inlined stack frame so
+    // registerWriteTools() does not exceed Windows's 1 MB default stack limit.
+    auto registerRippleTools =
+#if defined(_MSC_VER)
+        static_cast<void (*)(MainWindow *, McpToolRegistry *,
+                             const std::function<Timeline *()> &,
+                             const std::function<ToolHandler(const QString &, ToolHandler)> &,
+                             const std::function<void()> &)>(
+#endif
+        [](MainWindow *win, McpToolRegistry *reg,
+           const std::function<Timeline *()> &getTl,
+           const std::function<ToolHandler(const QString &, ToolHandler)> &wrap,
+           const std::function<void()> &syncSel) {
+            const QJsonObject rippleRangeOutputSchema = outputSchemaOf(QJsonObject{
+                {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+                {QStringLiteral("startSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+                {QStringLiteral("endSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+                {QStringLiteral("removedSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}}
+            }, {QStringLiteral("ok"), QStringLiteral("startSec"), QStringLiteral("endSec"), QStringLiteral("removedSec")});
+
+            reg->registerTool(withOutputSchema({
+                QStringLiteral("ripple_delete_range"),
+                QStringLiteral("指定した時間範囲 [startSec, endSec] を全アンロックトラックから一括でリップル削除し、ギャップを詰める破壊的操作。1 回の Undo で戻せる。"),
+                schemaWithRequired(QJsonObject{
+                    {QStringLiteral("startSec"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("minimum"), 0.0}
+                    }},
+                    {QStringLiteral("endSec"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("exclusiveMinimum"), 0.0}
+                    }}
+                }, {QStringLiteral("startSec"), QStringLiteral("endSec")}),
+                wrap(QStringLiteral("ripple_delete_range"),
+                     [win, getTl, syncSel](const QJsonObject& args, QString* err) -> QJsonObject {
+                    if (!rejectUnknownArguments(args, {QStringLiteral("startSec"), QStringLiteral("endSec")}, err))
+                        return {};
+                    double startSec = 0.0, endSec = 0.0;
+                    if (!requiredFiniteNumber(args, QStringLiteral("startSec"), &startSec, err)
+                        || !requiredFiniteNumber(args, QStringLiteral("endSec"), &endSec, err))
+                        return {};
+                    if (startSec < 0.0 || endSec <= startSec + 1e-4)
+                        return setError(err, QStringLiteral("require 0 <= startSec < endSec")), QJsonObject();
+                    Timeline *tl = getTl();
+                    if (!win || !tl)
+                        return setError(err, QStringLiteral("editor not available")), QJsonObject();
+                    bool ok = false;
+                    for (TimelineTrack *track : tl->videoTracks()) {
+                        if (track && !track->isLocked())
+                            ok = track->rippleDeleteTimeRange(startSec, endSec, false) || ok;
+                    }
+                    for (TimelineTrack *track : tl->audioTracks()) {
+                        if (track && !track->isLocked())
+                            ok = track->rippleDeleteTimeRange(startSec, endSec, false) || ok;
+                    }
+                    if (ok) {
+                        tl->saveUndoState(QStringLiteral("範囲をリップル削除"));
+                        tl->refreshPlaybackSequence();
+                    }
+                    syncSel();
+                    return QJsonObject{
+                        {QStringLiteral("ok"), ok},
+                        {QStringLiteral("startSec"), startSec},
+                        {QStringLiteral("endSec"), endSec},
+                        {QStringLiteral("removedSec"), ok ? (endSec - startSec) : 0.0}
+                    };
+                })
+            }, rippleRangeOutputSchema));
+
+            const QJsonObject bladeAllOutputSchema = outputSchemaOf(QJsonObject{
+                {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+                {QStringLiteral("timeSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+                {QStringLiteral("rippleTrim"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+            }, {QStringLiteral("ok"), QStringLiteral("timeSec"), QStringLiteral("rippleTrim")});
+
+            reg->registerTool(withOutputSchema({
+                QStringLiteral("blade_all_tracks"),
+                QStringLiteral("全アンロックトラックを指定時刻（省略時は現在の再生ヘッド）で一括ブレード分割、または前後リップルカットする破壊的操作。rippleTrim='none'(既定)で全トラック分割、'before'で再生ヘッドより前をリップルカット、'after'で再生ヘッドより後をリップルカット。1 回の Undo で戻せる。"),
+                objectSchema(QJsonObject{
+                    {QStringLiteral("timeSec"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("minimum"), 0.0}
+                    }},
+                    {QStringLiteral("rippleTrim"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("string")},
+                        {QStringLiteral("enum"), QJsonArray{QStringLiteral("none"), QStringLiteral("before"), QStringLiteral("after")}},
+                        {QStringLiteral("default"), QStringLiteral("none")}
+                    }}
+                }),
+                wrap(QStringLiteral("blade_all_tracks"),
+                     [win, getTl, syncSel](const QJsonObject& args, QString* err) -> QJsonObject {
+                    if (!rejectUnknownArguments(args, {QStringLiteral("timeSec"), QStringLiteral("rippleTrim")}, err))
+                        return {};
+                    Timeline *tl = getTl();
+                    if (!win || !tl)
+                        return setError(err, QStringLiteral("editor not available")), QJsonObject();
+                    double timeSec = tl->playheadPosition();
+                    if (args.contains(QStringLiteral("timeSec"))) {
+                        if (!requiredFiniteNumber(args, QStringLiteral("timeSec"), &timeSec, err))
+                            return {};
+                        if (timeSec < 0.0)
+                            return setError(err, QStringLiteral("timeSec must be >= 0")), QJsonObject();
+                        tl->setPlayheadPosition(timeSec);
+                    }
+                    QString mode = QStringLiteral("none");
+                    if (args.contains(QStringLiteral("rippleTrim"))) {
+                        if (!args.value(QStringLiteral("rippleTrim")).isString())
+                            return setError(err, QStringLiteral("rippleTrim must be a string")), QJsonObject();
+                        mode = args.value(QStringLiteral("rippleTrim")).toString();
+                        if (mode != QStringLiteral("none") && mode != QStringLiteral("before") && mode != QStringLiteral("after"))
+                            return setError(err, QStringLiteral("rippleTrim must be none, before, or after")), QJsonObject();
+                    }
+                    bool ok = false;
+                    if (mode == QStringLiteral("before")) {
+                        ok = tl->rippleTrimBeforePlayhead();
+                    } else if (mode == QStringLiteral("after")) {
+                        ok = tl->rippleTrimAfterPlayhead();
+                    } else {
+                        const auto serialBefore = tl->undoManager()->saveSerial();
+                        tl->bladeAllTracksAtPlayhead();
+                        ok = (tl->undoManager()->saveSerial() > serialBefore);
+                    }
+                    syncSel();
+                    return QJsonObject{
+                        {QStringLiteral("ok"), ok},
+                        {QStringLiteral("timeSec"), tl->playheadPosition()},
+                        {QStringLiteral("rippleTrim"), mode}
+                    };
+                })
+            }, bladeAllOutputSchema));
+
+            const QJsonObject rippleInsertOutputSchema = outputSchemaOf(QJsonObject{
+                {QStringLiteral("ok"), QJsonObject{{QStringLiteral("type"), QStringLiteral("boolean")}}},
+                {QStringLiteral("kind"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+                {QStringLiteral("trackIndex"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}},
+                {QStringLiteral("insertedAtSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+                {QStringLiteral("durationSec"), QJsonObject{{QStringLiteral("type"), QStringLiteral("number")}}},
+                {QStringLiteral("clipCount"), QJsonObject{{QStringLiteral("type"), QStringLiteral("integer")}}}
+            }, {QStringLiteral("ok"), QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                QStringLiteral("insertedAtSec"), QStringLiteral("durationSec"), QStringLiteral("clipCount")});
+
+            reg->registerTool(withOutputSchema({
+                QStringLiteral("ripple_insert_clip"),
+                QStringLiteral("指定トラックの timeSec 位置へクリップをリップル挿入する破壊的操作。timeSec に跨がる既存クリップがあれば自動分割し、後続クリップを挿入尺だけ後ろへ押し出す。1 回の Undo で戻せる。"),
+                schemaWithRequired(QJsonObject{
+                    {QStringLiteral("filePath"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}},
+                    {QStringLiteral("timeSec"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("minimum"), 0.0}
+                    }},
+                    {QStringLiteral("kind"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("string")},
+                        {QStringLiteral("enum"), QJsonArray{QStringLiteral("video"), QStringLiteral("audio")}},
+                        {QStringLiteral("default"), QStringLiteral("video")}
+                    }},
+                    {QStringLiteral("trackIndex"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("integer")},
+                        {QStringLiteral("minimum"), 0},
+                        {QStringLiteral("default"), 0}
+                    }},
+                    {QStringLiteral("durationSec"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("exclusiveMinimum"), 0.0}
+                    }},
+                    {QStringLiteral("inPoint"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("minimum"), 0.0}
+                    }},
+                    {QStringLiteral("outPoint"), QJsonObject{
+                        {QStringLiteral("type"), QStringLiteral("number")},
+                        {QStringLiteral("exclusiveMinimum"), 0.0}
+                    }},
+                    {QStringLiteral("displayName"), QJsonObject{{QStringLiteral("type"), QStringLiteral("string")}}}
+                }, {QStringLiteral("filePath"), QStringLiteral("timeSec")}),
+                wrap(QStringLiteral("ripple_insert_clip"),
+                     [win, getTl, syncSel](const QJsonObject& args, QString* err) -> QJsonObject {
+                    if (!rejectUnknownArguments(args, {QStringLiteral("filePath"), QStringLiteral("timeSec"),
+                                                       QStringLiteral("kind"), QStringLiteral("trackIndex"),
+                                                       QStringLiteral("durationSec"), QStringLiteral("inPoint"),
+                                                       QStringLiteral("outPoint"), QStringLiteral("displayName")}, err))
+                        return {};
+                    QString filePath;
+                    double timeSec = 0.0;
+                    if (!requiredString(args, QStringLiteral("filePath"), &filePath, err)
+                        || !requiredFiniteNumber(args, QStringLiteral("timeSec"), &timeSec, err))
+                        return {};
+                    if (filePath.trimmed().isEmpty())
+                        return setError(err, QStringLiteral("filePath must not be empty")), QJsonObject();
+                    if (timeSec < 0.0)
+                        return setError(err, QStringLiteral("timeSec must be >= 0")), QJsonObject();
+                    QString kind = QStringLiteral("video");
+                    if (args.contains(QStringLiteral("kind"))) {
+                        if (!args.value(QStringLiteral("kind")).isString())
+                            return setError(err, QStringLiteral("kind must be video or audio")), QJsonObject();
+                        kind = args.value(QStringLiteral("kind")).toString();
+                        if (kind != QStringLiteral("video") && kind != QStringLiteral("audio"))
+                            return setError(err, QStringLiteral("kind must be video or audio")), QJsonObject();
+                    }
+                    int trackIndex = 0;
+                    if (!nonNegativeInteger(args, QStringLiteral("trackIndex"), 0, &trackIndex, err))
+                        return {};
+                    Timeline *tl = getTl();
+                    if (!win || !tl)
+                        return setError(err, QStringLiteral("editor not available")), QJsonObject();
+
+                    double durationSec = 0.0;
+                    if (args.contains(QStringLiteral("durationSec"))) {
+                        if (!requiredFiniteNumber(args, QStringLiteral("durationSec"), &durationSec, err))
+                            return {};
+                    } else {
+                        const auto us = libavcore::probeDurationMicroseconds(filePath.toStdString());
+                        if (us.has_value() && *us > 0)
+                            durationSec = static_cast<double>(*us) / 1000000.0;
+                    }
+                    if (durationSec <= 1e-4)
+                        return setError(err, QStringLiteral("unable to determine clip duration; specify durationSec or a valid media file")), QJsonObject();
+
+                    double inPoint = 0.0;
+                    double outPoint = durationSec;
+                    if (args.contains(QStringLiteral("inPoint"))) {
+                        if (!requiredFiniteNumber(args, QStringLiteral("inPoint"), &inPoint, err))
+                            return {};
+                    }
+                    if (args.contains(QStringLiteral("outPoint"))) {
+                        if (!requiredFiniteNumber(args, QStringLiteral("outPoint"), &outPoint, err))
+                            return {};
+                    }
+                    if (inPoint < 0.0 || outPoint <= inPoint + 1e-4)
+                        return setError(err, QStringLiteral("require 0 <= inPoint < outPoint")), QJsonObject();
+
+                    ClipInfo clip;
+                    clip.filePath = filePath;
+                    clip.displayName = args.value(QStringLiteral("displayName")).toString();
+                    if (clip.displayName.isEmpty())
+                        clip.displayName = QFileInfo(filePath).fileName();
+                    clip.duration = qMax(durationSec, outPoint);
+                    clip.inPoint = inPoint;
+                    clip.outPoint = outPoint;
+
+                    const bool isAudio = (kind == QStringLiteral("audio"));
+                    if (!tl->rippleInsertClipAtTime(isAudio, trackIndex, clip, timeSec, err))
+                        return {};
+                    syncSel();
+                    const auto &tracks = isAudio ? tl->audioTracks() : tl->videoTracks();
+                    const int clipCount = (trackIndex >= 0 && trackIndex < tracks.size() && tracks[trackIndex])
+                        ? tracks[trackIndex]->clipCount() : 0;
+                    return QJsonObject{
+                        {QStringLiteral("ok"), true},
+                        {QStringLiteral("kind"), kind},
+                        {QStringLiteral("trackIndex"), trackIndex},
+                        {QStringLiteral("insertedAtSec"), timeSec},
+                        {QStringLiteral("durationSec"), clip.effectiveDuration()},
+                        {QStringLiteral("clipCount"), clipCount}
+                    };
+                })
+            }, rippleInsertOutputSchema));
+        }
+#if defined(_MSC_VER)
+        )
+#endif
+        ;
+    void (*volatile invokeRippleTools)(MainWindow *, McpToolRegistry *,
+                                       const std::function<Timeline *()> &,
+                                       const std::function<ToolHandler(const QString &, ToolHandler)> &,
+                                       const std::function<void()> &) = registerRippleTools;
+    invokeRippleTools(
+        m_window, m_registry,
+        [this]() { return timeline(); },
+        [this](const QString &n, ToolHandler h) { return guardedWrite(n, std::move(h)); },
+        [this]() { syncSelectionAfterEdit(); });
 }
 
 } // namespace mcp

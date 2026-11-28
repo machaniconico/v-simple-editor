@@ -3296,6 +3296,10 @@ void MainWindow::registerCoreShortcuts()
         QStringLiteral("再生ヘッド以前を選択"), QStringLiteral("編集"));
     reg(m_bladeAllAction, "timeline.blade_all",
         QStringLiteral("全トラックを再生ヘッドで分割"), QStringLiteral("編集"));
+    reg(m_rippleTrimBeforeAction, "timeline.ripple_trim_before",
+        QStringLiteral("全トラック: 再生ヘッドより前をリップルカット"), QStringLiteral("編集"));
+    reg(m_rippleTrimAfterAction, "timeline.ripple_trim_after",
+        QStringLiteral("全トラック: 再生ヘッドより後をリップルカット"), QStringLiteral("編集"));
     reg(m_duplicateAction, "timeline.duplicate",
         QStringLiteral("複製"), QStringLiteral("編集"));
     reg(m_nudgeLeftAction, "timeline.nudge_left",
@@ -5142,6 +5146,8 @@ void MainWindow::setupMenuBar()
     m_selectForwardAction = editMenu->addAction("再生ヘッド以降を選択");
     m_selectBackwardAction = editMenu->addAction("再生ヘッド以前を選択");
     m_bladeAllAction = editMenu->addAction("全トラックを再生ヘッドで分割");
+    m_rippleTrimBeforeAction = editMenu->addAction("全トラック: 再生ヘッドより前をリップルカット");
+    m_rippleTrimAfterAction = editMenu->addAction("全トラック: 再生ヘッドより後をリップルカット");
     m_duplicateAction = editMenu->addAction("複製");
     m_duplicateAction->setShortcut(QKeySequence("Ctrl+D"));
     connect(m_duplicateAction, &QAction::triggered, this, [this]() {
@@ -5184,6 +5190,8 @@ void MainWindow::setupMenuBar()
     m_liftAction = editMenu->addAction("リフト (ギャップを残して削除)");
     m_selectAllClipsAction->setShortcut(QKeySequence("Ctrl+A"));
     m_bladeAllAction->setShortcut(QKeySequence("Ctrl+Shift+K"));
+    m_rippleTrimBeforeAction->setShortcut(QKeySequence("Ctrl+Shift+Q"));
+    m_rippleTrimAfterAction->setShortcut(QKeySequence("Ctrl+Shift+W"));
     connect(m_timeline, &Timeline::statusMessageRequested, this,
             [this](const QString &message, int timeout) { statusBar()->showMessage(message, timeout); });
     // US-1201: detached connections are reported without a modal dialog.
@@ -5205,6 +5213,14 @@ void MainWindow::setupMenuBar()
     });
     connect(m_bladeAllAction, &QAction::triggered, this, [this]() {
         m_timeline->bladeAllTracksAtPlayhead();
+        updateEditActions();
+    });
+    connect(m_rippleTrimBeforeAction, &QAction::triggered, this, [this]() {
+        m_timeline->rippleTrimBeforePlayhead();
+        updateEditActions();
+    });
+    connect(m_rippleTrimAfterAction, &QAction::triggered, this, [this]() {
+        m_timeline->rippleTrimAfterPlayhead();
         updateEditActions();
     });
     connect(m_liftAction, &QAction::triggered, this, [this]() {
