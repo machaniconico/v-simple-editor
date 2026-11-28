@@ -134,9 +134,17 @@ double audioexport::exportAudioRampFactor(const ClipInfo &clip, bool reversed, d
     if (nonConstant)
         *nonConstant = false;
     if (reversed || clip.isSequenceReference()
-        || !resolveAudioAtempoEnabled(envForce, clip.atempoEnabled)
-        || clip.speedRamp.isIdentity())
+        || !resolveAudioAtempoEnabled(envForce, clip.atempoEnabled))
         return 1.0;
+    const double uniform = entrySpeed > 0.0 ? entrySpeed : 1.0;
+    if (clip.speedRamp.isIdentity()) {
+        // Wave 25 (B5): forward uniform-speed clips (no ramp or identity ramp)
+        // with atempo enabled resample by their uniform speed and cut at timeline
+        // length so audio does not spill into the following clip.
+        const double factor = qBound(speedramp::SpeedRamp::kMinSpeed, uniform,
+                                     speedramp::SpeedRamp::kMaxSpeed);
+        return std::abs(factor - 1.0) <= 1e-9 ? 1.0 : factor;
+    }
     const auto &keys = clip.speedRamp.keyframes;
     if (keys.isEmpty())
         return 1.0;
@@ -155,7 +163,6 @@ double audioexport::exportAudioRampFactor(const ClipInfo &clip, bool reversed, d
         }
     }
     // AudioMixer readData: speedMul = ramp slope x entry speed, bounded to the ramp range.
-    const double uniform = entrySpeed > 0.0 ? entrySpeed : 1.0;
     const double factor = qBound(speedramp::SpeedRamp::kMinSpeed, keys.first().speed * uniform,
                                  speedramp::SpeedRamp::kMaxSpeed);
     return std::abs(factor - 1.0) <= 1e-9 ? 1.0 : factor;

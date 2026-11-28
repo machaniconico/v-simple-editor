@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Lower Third External Generator (Plan C - Edge Headless CDP)</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: transparent;
+      font-family: "Segoe UI", "Yu Gothic UI", sans-serif;
+    }
+    .card {
+      position: absolute;
+      left: 6%;
+      bottom: 10%;
+      padding: 20px 34px;
+      border-radius: 14px;
+      background: rgba(16, 22, 36, 0.88);
+      border-left: 8px solid var(--accent, #f5b82e);
+      color: #ffffff;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+      transform-origin: left center;
+    }
+    .title {
+      font-size: 42px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .subtitle {
+      margin-top: 6px;
+      font-size: 22px;
+      color: #cbd5e1;
+    }
+  </style>
+</head>
+<body>
+  <div id="card" class="card">
+    <div id="title" class="title">Lower Third</div>
+    <div id="subtitle" class="subtitle">Rendered via Edge Headless CDP</div>
+  </div>
+  <script>
+    function easeOutCubic(t) {
+      const clamped = Math.max(0, Math.min(1, t));
+      return 1 - Math.pow(1 - clamped, 3);
+    }
+
+    // Contract called by v-simple-editor ExternalGeneratorEdge CDP client:
+    window.setFrame = function setFrame(frame, fps = 30, params = {}) {
+      const card = document.getElementById("card");
+      const titleEl = document.getElementById("title");
+      const subEl = document.getElementById("subtitle");
+
+      if (params.title) titleEl.textContent = String(params.title);
+      if (params.subtitle) subEl.textContent = String(params.subtitle);
+      if (params.accent) card.style.setProperty("--accent", String(params.accent));
+
+      const t = frame / Math.max(1, fps);
+      const enter = easeOutCubic(t / 0.5);
+      const tx = (1 - enter) * -80;
+      card.style.opacity = String(enter);
+      card.style.transform = `translateX(${tx.toFixed(2)}px)`;
+    };
+
+    window.setFrame(0, 30, {});
+  </script>
+</body>
+</html>

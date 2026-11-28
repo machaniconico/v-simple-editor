@@ -1,6 +1,8 @@
 #include "RenderInPlace.h"
 #include "ContextMenuOrder.h"
+#include "ExternalGenerator.h"
 #include "LoudnessPresets.h"
+#include <QFileDialog>
 #include "Timeline.h"
 #include "TimelineFrameRenderer.h"
 #include "AudioKeyframes.h"
@@ -10965,6 +10967,13 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     if (!clipInfo.shapes.isEmpty())
         shapeModifiersAct = menu.addAction(QStringLiteral("シェイプモディファイア…"));
 
+    QAction *extGenConfigAct = nullptr;
+    QAction *extGenBakeAct = nullptr;
+    if (extgen::isExternalGeneratorFilePath(clipInfo.filePath)) {
+        extGenConfigAct = menu.addAction(QStringLiteral("外部ジェネレータ設定…"));
+        extGenBakeAct = menu.addAction(QStringLiteral("外部ジェネレータを動画にベイク…"));
+    }
+
     QAction *fxAct = menu.addAction(QStringLiteral("ビデオエフェクト..."));
     QAction *ccAct = menu.addAction(QStringLiteral("色補正 / グレーディング..."));
     QAction *adjustmentAct = menu.addAction(QStringLiteral("調整レイヤーを作成"));
@@ -11181,6 +11190,46 @@ void Timeline::showClipContextMenu(TimelineTrack *track, int clipIndex, const QP
     }
     else if (chosen == transDialogAct) emit transitionDialogRequested();
     else if (transClearAct && chosen == transClearAct) clearTransitionsOnSelected();
+    else if (extGenConfigAct && chosen == extGenConfigAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0 || track->isLocked()) return;
+        const ClipInfo cur = track->clips()[clipIndex];
+        extgen::ExternalGeneratorDialog dlg(
+            extgen::parseGeneratorUri(cur.filePath), cur.effectiveDuration(), this);
+        if (dlg.exec() != QDialog::Accepted) return;
+        const extgen::GeneratorSpec newSpec = dlg.spec();
+        if (!newSpec.entryPath.isEmpty() && newSpec.renderer != QStringLiteral("dummy"))
+            extgen::ensureEntryTrustedInteractive(newSpec.entryPath, this);
+        auto clips = track->clips();
+        clips[clipIndex].filePath = extgen::buildGeneratorUri(newSpec);
+        clips[clipIndex].duration = dlg.durationSec();
+        clips[clipIndex].inPoint = 0.0;
+        clips[clipIndex].outPoint = dlg.durationSec();
+        clips[clipIndex].displayName = QStringLiteral("ジェネレータ (%1)").arg(newSpec.renderer);
+        track->setClips(clips);
+        saveUndoState(QStringLiteral("外部ジェネレータ設定変更"));
+        scheduleEmitSequenceChanged();
+    }
+    else if (extGenBakeAct && chosen == extGenBakeAct) {
+        const int trackIdx = m_videoTracks.indexOf(track);
+        if (trackIdx < 0 || track->isLocked()) return;
+        const QString outPath = QFileDialog::getSaveFileName(
+            this, QStringLiteral("外部ジェネレータを動画にベイク"),
+            QStringLiteral("baked_generator.mp4"),
+            QStringLiteral("MP4 Video (*.mp4)"));
+        if (outPath.isEmpty()) return;
+        const QSize projSz = projectOutputSize();
+        const QSize sz = (projSz.isValid() && !projSz.isEmpty()) ? projSz : QSize(1920, 1080);
+        const extgen::BakeResult res = extgen::bakeExternalGeneratorClip(
+            this, trackIdx, clipIndex, outPath, sz, 0.0);
+        if (res.ok) {
+            emit statusMessageRequested(
+                QStringLiteral("ベイク完了 (%1 フレーム): %2").arg(res.framesRendered).arg(res.outputPath), 5000);
+            scheduleEmitSequenceChanged();
+        } else {
+            QMessageBox::warning(this, QStringLiteral("ベイク失敗"), res.error);
+        }
+    }
     else if (shapeModifiersAct && chosen == shapeModifiersAct) {
         const int trackIdx = m_videoTracks.indexOf(track);
         if (trackIdx < 0 || track->isLocked()) return;

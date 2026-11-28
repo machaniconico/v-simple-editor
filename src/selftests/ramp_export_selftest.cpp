@@ -1419,15 +1419,31 @@ int runRampExportSelftest()
             a.speedRamp = ramp(1.5);
             bOk = lonePin("g6.reversed15", a) && bOk;
         }
-        for (bool atempo : {false, true}) {
-            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, atempo);
-            a.speed = 2.0;
-            bOk = lonePin(atempo ? "g6.speed2on" : "g6.speed2off", a) && bOk;
-        }
+        // Wave 25 (B5): speed=2 with atempo off stays pinned at 1x HEAD hash;
+        // speed=2 with atempo on (no ramp or identity ramp) resamples at 2x and cuts at 2.0s.
         {
-            ClipInfo a = audioClip(wav, 0.5, 4.0, 1.0, true);
+            ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, false);
             a.speed = 2.0;
-            bOk = lonePin("g6.speed2identity", a) && bOk;
+            bOk = lonePin("g6.speed2off", a) && bOk;
+        }
+        for (double rampSpeed : {0.0, 1.0}) {
+            ClipInfo a = audioClip(wav, 0.5, 4.0, rampSpeed, true);
+            a.speed = 2.0;
+            loadAV(v1Other, {{a}});
+            const audioexport::MixPlan plan = planNow();
+            const int i = planIndex(plan, 0);
+            const QStringList chains = i >= 0 ? chainsOf(plan, i) : QStringList{};
+            const bool spOk = i >= 0 && std::abs(plan.rampFactors.value(i, 1.0) - 2.0) <= 1e-12
+                && chains.size() == 3
+                && chains[0].contains(QStringLiteral("asetrate=96000"))
+                && chains[0].contains(QStringLiteral("atrim=end=2.000000"))
+                && chains[1].contains(QStringLiteral("asetrate=96000"))
+                && chains[1].contains(QStringLiteral("atrim=end=2.000000"));
+            if (!spOk)
+                d << " speed2(on,r=" << rampSpeed << ")[FAIL] f="
+                  << (i >= 0 ? plan.rampFactors.value(i, 1.0) : -1.0)
+                  << " single=" << (chains.isEmpty() ? "" : chains[0].toStdString());
+            bOk = bOk && spOk;
         }
         {
             ClipInfo a = audioClip(wav, 0.5, 4.0, 0.0, true);

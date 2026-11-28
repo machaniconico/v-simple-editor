@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://v-simple-editor.local/schemas/project-schema.v1.json",
+  "title": "v-simple-editor Project Schema (Plan A Code-Generated Projects)",
+  "description": "Canonical .vseproj JSON schema matching ProjectFile::buildProjectDocument for generating v-simple-editor projects from Python, Node.js, or other scripts, including External Generator clips (veditor://extgen?...).",
+  "type": "object",
+  "required": ["version", "videoTracks", "audioTracks"],
+  "properties": {
+    "version": { "type": "integer", "minimum": 1, "maximum": 2, "default": 2 },
+    "config": {
+      "type": "object",
+      "properties": {
+        "width": { "type": "integer", "minimum": 16, "default": 1920 },
+        "height": { "type": "integer", "minimum": 16, "default": 1080 },
+        "fps": { "type": "number", "minimum": 1, "maximum": 240, "default": 30 }
+      }
+    },
+    "videoTracks": {
+      "type": "array",
+      "description": "Array of video tracks (index 0 = V1 frontmost). Each track is an array of clip objects.",
+      "items": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/clip" }
+      }
+    },
+    "audioTracks": {
+      "type": "array",
+      "description": "Array of audio tracks. Each track is an array of clip objects.",
+      "items": {
+        "type": "array",
+        "items": { "$ref": "#/$defs/clip" }
+      }
+    }
+  },
+  "$defs": {
+    "clip": {
+      "type": "object",
+      "required": ["filePath", "duration", "inPoint", "outPoint"],
+      "properties": {
+        "filePath": {
+          "type": "string",
+          "description": "Media file path OR External Generator URI: veditor://extgen?renderer=<dummy|edge|quickjs|plugin>&entry=<encodedPath>&params=<encodedJson>&fps=<fps>"
+        },
+        "displayName": { "type": "string" },
+        "duration": { "type": "number", "minimum": 0.01 },
+        "inPoint": { "type": "number", "minimum": 0 },
+        "outPoint": { "type": "number", "minimum": 0.01 },
+        "leadInSec": { "type": "number", "minimum": 0, "default": 0 },
+        "speed": { "type": "number", "minimum": 0.1, "maximum": 10, "default": 1.0 },
+        "volume": { "type": "number", "minimum": 0, "maximum": 4, "default": 1.0 },
+        "opacity": { "type": "number", "minimum": 0, "maximum": 1, "default": 1.0 },
+        "videoScale": { "type": "number", "default": 1.0 },
+        "videoDx": { "type": "number", "default": 0.0 },
+        "videoDy": { "type": "number", "default": 0.0 },
+        "rotation2DDegrees": { "type": "number", "default": 0.0 }
+      }
+    }
+  }
+}

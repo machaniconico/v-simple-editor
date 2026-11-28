@@ -1,4 +1,5 @@
 #include "VideoPlayer.h"
+#include "ExternalGenerator.h"
 #include <QScopedValueRollback>
 #include <QSet>
 #include "GLPreview.h"
@@ -105,7 +106,8 @@ QImage prepareClipForCpuComposite(
     double sourceSeconds,
     const std::function<QImage(double, double)> &frameProvider,
     const QVector<Mask> &masks,
-    const PlaybackEntry *v1Entry = nullptr, int trackIdx = -1)
+    const PlaybackEntry *v1Entry = nullptr, int trackIdx = -1,
+    const tlrender::RampSourceMapping *rampMapping = nullptr)
 {
     // US-2204: V1's stabilizer goes on the source before the clip-local FX, and on
     // every echo sample at its own source time, as tlrender::renderClipSource does.
@@ -135,7 +137,7 @@ QImage prepareClipForCpuComposite(
         || tlrender::hasActiveRollingShutter(clip, clipLocalSeconds)
         || tlrender::hasActiveMeshWarp(clip) || clip.hasPuppetPins())
         ? tlrender::applyClipFxStackWithEchoFromSource(
-              stabilized, clip, clipLocalSeconds, sourceSeconds, sampleProvider)
+              stabilized, clip, clipLocalSeconds, sourceSeconds, sampleProvider, rampMapping)
         : tlrender::applyClipFxStackFromSource(
               stabilized, clip, clipLocalSeconds);
     if (effected.isNull() || masks.isEmpty())
@@ -493,7 +495,7 @@ bool timelineHasActiveShapeClip(const Timeline *timeline, qint64 timelineUsec)
         if (!track || track->isHidden())
             continue;
         const ClipInfo *clip = activeClipOnTrack(track->clips(), targetSec);
-        if (clip && !clip->shapes.isEmpty())
+        if (clip && (!clip->shapes.isEmpty() || extgen::isExternalGeneratorFilePath(clip->filePath)))
             return true;
     }
     return false;
@@ -2482,6 +2484,17 @@ int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) cons
         return qRound64(mappedClip.sourceSecondAtLocalTime(offsetIntoEntry)
                         * AV_TIME_BASE);
     }
+    // Wave 25 (CHANGE 6): Time remap takes precedence over speed ramp in preview,
+    // matching export (TimelineFrameRenderer::exportRampMapsClip).
+    if (clip && !clip->isSequenceReference() && !clip->timeRemapCurve.keys.isEmpty()) {
+        const double sourceOut = (clip->outPoint > 0.0) ? clip->outPoint : clip->duration;
+        const double remappedLocal =
+            qMax(0.0, clip->timeRemapCurve.srcTimeAt(offsetIntoEntry));
+        const double mappedSec = (sourceOut <= clip->inPoint)
+            ? clip->inPoint
+            : qBound(clip->inPoint, clip->inPoint + remappedLocal, sourceOut);
+        return qRound64(mappedSec * AV_TIME_BASE);
+    }
     // US-INT-2 Phase A: ramp-aware reprojection. The legacy uniform
     // `clip.speed` (carried on PlaybackEntry as `e.speed`) and the
     // per-clip SpeedRamp curve compose multiplicatively — first scale
@@ -2502,7 +2515,14 @@ int64_t VideoPlayer::entryLocalPositionUs(int entryIdx, int64_t timelineUs) cons
     const qint64 srcOffsetUs =
         m_speedRamps[entryIdx].timelineToSourceUs(scaledTlUs);
     const int64_t clipInUs = static_cast<int64_t>(e.clipIn * AV_TIME_BASE);
-    return clipInUs + srcOffsetUs;
+    // Wave 25 (B2): clamp ramped source position to [clipIn, clipOut], matching
+    // ClipInfo::sourceSecondAtLocalTime / TimelineFrameRenderer export clamp.
+    int64_t targetUs = clipInUs + srcOffsetUs;
+    if (e.clipOut > e.clipIn) {
+        const int64_t clipOutUs = qRound64(e.clipOut * AV_TIME_BASE);
+        targetUs = qBound(clipInUs, targetUs, clipOutUs);
+    }
+    return targetUs;
 }
 
 int64_t VideoPlayer::fileLocalToTimelineUs(int entryIdx, int64_t fileLocalUs) const
@@ -2566,8 +2586,11 @@ bool VideoPlayer::displayNestedSequenceFrameAt(const Timeline *timeline,
     if (renderSize.isEmpty())
         return false;
 
+    const bool prevHint = extgen::previewModeHintForCurrentThread();
+    extgen::setPreviewModeHintForCurrentThread(true);
     const QImage ssotFrame = tlrender::renderFrameAt(
         timeline, timelineUs, renderSize);
+    extgen::setPreviewModeHintForCurrentThread(prevHint);
     if (ssotFrame.isNull())
         return false;
     if (m_glPreview)
@@ -4443,10 +4466,27 @@ QImage VideoPlayer::preparePreviewClipFrame(
             }
             const QVector<Mask> masks = previewMasksForFrame(
                 *sourceClip, sourceSeconds, sourceSize, source.size());
+            // Wave 25 (C-03): pass RampSourceMapping for ramped Echo / RollingShutter
+            // clips so preview matches TimelineFrameRenderer inside borrowed intervals.
+            OverlapInterval rampInterval{};
+            tlrender::RampSourceMapping rampMap{};
+            const tlrender::RampSourceMapping *rampMapPtr = nullptr;
+            if (hasEcho && !sourceClip->speedRamp.isIdentity()
+                && sourceClip->timeRemapCurve.keys.isEmpty()
+                && !sourceClip->reversed && !sourceClip->isSequenceReference()) {
+                rampInterval.timelineStart = entry.timelineStart;
+                rampInterval.timelineEnd = entry.timelineEnd;
+                rampInterval.clipIn = entry.clipIn;
+                rampInterval.clipOut = entry.clipOut;
+                rampInterval.speed = entry.speed;
+                rampMap.interval = &rampInterval;
+                rampMap.localOffsetSec = 0.0;
+                rampMapPtr = &rampMap;
+            }
             prepared = videopreview::prepareClipForCpuComposite(
                 source, previewClip, clipLocalSec, sourceSeconds,
                 echoFrameProvider, masks, stabV1 ? &entry : nullptr,
-                entry.sourceTrack);
+                entry.sourceTrack, rampMapPtr);
             if (clipFxApplied)
                 *clipFxApplied = true;
             return prepared;
@@ -5720,6 +5760,27 @@ bool VideoPlayer::seekInternal(int64_t positionUs, bool displayFrame, bool preci
         foundFrame = true;
         if (!precise || m_currentPositionUs >= targetUs)
             break;
+    }
+    // Wave 25 (B2): seeking directly to EOF (e.g. an untrimmed ramp > 1 clip
+    // clamped at clipOut == duration) may yield no frame at targetUs; step back
+    // one frame to decode and hold the true tail frame instead of a stale frame.
+    if ((!foundFrame || !m_frame || !m_frame->data[0])
+        && targetUs > 0 && m_durationUs > 0) {
+        const int64_t stepBackUs = qMax<int64_t>(1, m_frameDurationUs > 0 ? m_frameDurationUs : 33333);
+        if (targetUs >= m_durationUs - stepBackUs) {
+            const int64_t tailUs = qMax<int64_t>(0, m_durationUs - stepBackUs);
+            const int64_t tailTs = streamTimestampForPosition(tailUs);
+            if (av_seek_frame(m_formatCtx, m_videoStreamIndex, tailTs, AVSEEK_FLAG_BACKWARD) >= 0) {
+                avcodec_flush_buffers(m_codecCtx);
+                m_currentPositionUs = tailUs;
+                m_deliveredPtsUs = -1;
+                while (decodeNextFrame(false)) {
+                    foundFrame = true;
+                    if (m_currentPositionUs >= tailUs)
+                        break;
+                }
+            }
+        }
     }
     undotrace::log("seek:afterDecodeLoop");
 
